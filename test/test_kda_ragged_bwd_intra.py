@@ -32,13 +32,13 @@ pytestmark = pytest.mark.skipif(
 def test_bwd_intra_compiles_for_portable_targets(architecture: str):
     """Compile the portable specialization without SM100-only instructions."""
     source = """
-import torch
+import cutlass
 from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as module
 
 module._compile_chunk_kda_bwd_intra(
     heads=1,
     ragged=False,
-    io_type=module._IO_TYPES[torch.bfloat16],
+    io_type=cutlass.BFloat16,
     use_int64_offsets=False,
 )
 """

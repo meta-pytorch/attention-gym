@@ -29,7 +29,7 @@ from attn_gym._backends.cute.utils import (
     initialized_cuda_device,
     requires_int64_abi,
 )
-from attn_gym.utils import ceildiv
+from attn_gym.utils import cdiv
 
 from .common.host import get_dtype
 from .common.split_k import WORK_ITEM_FIELDS
@@ -118,7 +118,7 @@ def _summary_rows(
     selected = torch.empty(bounds.shape[0], heads, rows, k, device=maps.device, dtype=maps.dtype)
     if bounds.shape[0]:
         block = 1024
-        _gather_summary_rows[(bounds.shape[0], heads, ceildiv(rows * k, block))](
+        _gather_summary_rows[(bounds.shape[0], heads, cdiv(rows * k, block))](
             maps, cu_seqlens, bounds, selected, heads, sequences, rows - k, k, block
         )
     return selected

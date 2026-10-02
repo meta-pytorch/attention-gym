@@ -178,61 +178,24 @@ def _compile_topk(
     return compile_tvm_ffi(operation, scores, output, integer(0))
 
 
-def _validate(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    weights: torch.Tensor,
-    topk: int,
-    compress_ratio: int,
-    candidate_bounds: torch.Tensor | None = None,
-) -> None:
-    """Validate SM100/SM103 indexer tensor metadata and base alignment."""
-    if q.ndim != 4:
-        raise ValueError(f"q must have shape [B,T,H,D], got {tuple(q.shape)}")
-    if k.ndim != 3:
-        raise ValueError(f"k must have shape [B,S,D], got {tuple(k.shape)}")
-    if weights.ndim != 3:
-        raise ValueError(f"weights must have shape [B,T,H], got {tuple(weights.shape)}")
+def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
+    """Validate SM100/SM103 kernel limits and Q/K base alignment.
 
-    batch, queries, heads, head_dim = q.shape
-    if compress_ratio < 1:
-        raise ValueError(f"compress_ratio must be positive, got {compress_ratio}")
-    candidates = k.shape[1] if candidate_bounds is not None else queries // compress_ratio
-    if tuple(k.shape) != (batch, candidates, head_dim):
-        raise ValueError(
-            f"k must have shape {(batch, candidates, head_dim)} for T={queries} and "
-            f"compress_ratio={compress_ratio}, got {tuple(k.shape)}"
-        )
-    if tuple(weights.shape) != (batch, queries, heads):
-        raise ValueError(
-            f"weights must have shape {(batch, queries, heads)}, got {tuple(weights.shape)}"
-        )
-    if batch <= 0:
-        raise ValueError(f"batch must be positive, got {batch}")
-    if queries <= 0 or queries > _MAX_SEQUENCE:
+    Ranks, shape agreement, devices, dtype agreement, and ``topk``/``compress_ratio``
+    are checked by the public ``lightning_indexer`` API.
+    """
+    _, queries, heads, head_dim = q.shape
+    if queries > _MAX_SEQUENCE:
         raise ValueError(f"sequence length must be in [1, {_MAX_SEQUENCE}], got {queries}")
-    if heads <= 0 or heads % 2:
+    if heads % 2:
         raise ValueError(f"number of heads must be a positive multiple of 2, got {heads}")
-    if head_dim <= 0 or head_dim % _HEAD_DIM_GRANULARITY:
+    if head_dim % _HEAD_DIM_GRANULARITY:
         raise ValueError(
             "head dimension must be positive and divisible by "
             f"{_HEAD_DIM_GRANULARITY}, got {head_dim}"
         )
-    if not isinstance(topk, int) or isinstance(topk, bool):
-        raise TypeError(f"topk must be an int, got {type(topk).__name__}")
-    if topk < 0:
-        raise ValueError(f"topk must be non-negative, got {topk}")
-    tensors = (q, k, weights)
-    if any(not tensor.is_cuda for tensor in tensors):
-        raise ValueError("q, k, and weights must all be CUDA tensors")
-    if len({tensor.device for tensor in tensors}) != 1:
-        raise ValueError("q, k, and weights must be on the same CUDA device")
     if q.dtype not in (torch.float16, torch.bfloat16):
         raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
-    if k.dtype != q.dtype or weights.dtype != q.dtype:
-        raise TypeError(
-            f"q, k, and weights must have one dtype, got {q.dtype}, {k.dtype}, {weights.dtype}"
-        )
     # Singleton strides do not address another slice; TVM-FFI normalizes them for TMA.
     if any(tensor.numel() and not tensor_supports_tma(tensor.squeeze()) for tensor in (q, k)):
         raise ValueError(
@@ -265,7 +228,7 @@ def launch(
     """
     import cutlass
 
-    _validate(q, k, weights, topk, compress_ratio, candidate_bounds)
+    _validate(q, k)
     batch, tokens, heads, head_dim = q.shape
     candidates = k.shape[1]
     output = torch.empty((batch, tokens, topk), dtype=torch.int32, device=q.device)

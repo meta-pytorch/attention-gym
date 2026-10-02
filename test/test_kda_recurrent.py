@@ -16,12 +16,12 @@ pytest.importorskip("triton")
 
 from attn_gym.linear import recurrent_kda
 from attn_gym.linear.kda.constants import LOG2_E
-from attn_gym.linear.kda.fwd.triton.recurrent import (
-    _recurrent_fwd_no_state_op,
-    _recurrent_fwd_op,
-    _recurrent_fwd_paged_op,
-)
 from attn_gym.linear.kda.naive import naive_recurrent_kda
+from attn_gym.linear.kda.ops import (
+    recurrent_fwd_no_state_op,
+    recurrent_fwd_op,
+    recurrent_fwd_paged_op,
+)
 from attn_gym.testing import cumulative_sequence_offsets, strided_state_pool
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
@@ -262,7 +262,7 @@ def test_recurrent_grouped_heads_registration():
     gate = gate.repeat_interleave(3, dim=2).contiguous()
     state = torch.randn(1, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
-        _recurrent_fwd_op,
+        recurrent_fwd_op,
         (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
     )
 
@@ -615,11 +615,11 @@ def test_recurrent_custom_op_registration(packed: bool, state_dtype: torch.dtype
     num_sequences = 3 if packed else batch
     state = torch.randn(num_sequences, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
-        _recurrent_fwd_op,
+        recurrent_fwd_op,
         (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
     )
     torch.library.opcheck(
-        _recurrent_fwd_no_state_op,
+        recurrent_fwd_no_state_op,
         (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
     )
     _, state_pool = strided_state_pool(
@@ -627,7 +627,7 @@ def test_recurrent_custom_op_registration(packed: bool, state_dtype: torch.dtype
     )
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
-        _recurrent_fwd_paged_op,
+        recurrent_fwd_paged_op,
         (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens, q.shape[-1] ** -0.5),
     )
 
@@ -641,15 +641,15 @@ def test_recurrent_custom_op_registration_mixed_dtype():
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
 
     torch.library.opcheck(
-        _recurrent_fwd_op,
+        recurrent_fwd_op,
         (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
     )
     torch.library.opcheck(
-        _recurrent_fwd_no_state_op,
+        recurrent_fwd_no_state_op,
         (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
     )
     torch.library.opcheck(
-        _recurrent_fwd_paged_op,
+        recurrent_fwd_paged_op,
         (q, k, v, gate, beta, state_pool, slots, None, None, q.shape[-1] ** -0.5),
     )
 
@@ -724,12 +724,12 @@ def test_recurrent_cuda_graph_replay():
     cu_seqlens = cumulative_sequence_offsets([11, 16, 5])
     initial_state = torch.randn(3, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     scale = 0.25
-    _recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True)
+    recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output, captured_state = _recurrent_fwd_op(
+        captured_output, captured_state = recurrent_fwd_op(
             q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
         )
 
@@ -742,7 +742,7 @@ def test_recurrent_cuda_graph_replay():
     graph.replay()
     torch.cuda.synchronize()
 
-    expected_output, expected_state = _recurrent_fwd_op(
+    expected_output, expected_state = recurrent_fwd_op(
         q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
     )
     torch.testing.assert_close(
@@ -761,12 +761,12 @@ def test_recurrent_paged_cuda_graph_replay(state_dtype: torch.dtype):
     storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype)
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
     scale = 0.25
-    _recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale)
+    recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured_output = _recurrent_fwd_paged_op(
+        captured_output = recurrent_fwd_paged_op(
             q, k, v, gate, beta, pool, slots, None, None, scale
         )
 

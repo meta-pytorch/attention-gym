@@ -36,7 +36,7 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym._backends.cute import normalize_compact_tensor, tensor_supports_tma
+from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
@@ -134,15 +134,8 @@ def _normalize_cudnn_state(state: torch.Tensor | None) -> torch.Tensor | None:
     """FP32 state as cuDNN's launchers read it through TMA.
 
     Unit-stride keys and 16-byte-aligned outer strides suffice, so only other layouts are copied.
-    The copy is a ``clone``: ``.contiguous()`` returns a contiguous view unchanged even when its
-    storage offset breaks the alignment.
     """
-    if state is None:
-        return None
-    state = state.float()
-    if tensor_supports_tma(state):
-        return state
-    return state.clone(memory_format=torch.contiguous_format)
+    return None if state is None else normalize_tma_tensor(state.float())
 
 
 @dataclass

@@ -325,14 +325,9 @@ R11, R13, R14 (pruning) and R12 (notices) are listed with their gates in the led
 - Run S10 (ruff) last so upstream diffs stay readable during replay.
 - Append to, never replace, per-file notices (R12).
 
-S15 follow-up, "Pass state-chain storage before runtime arguments": moved `shared_type` before
-runtime arguments and derived product/partial row counts once in the launcher. Before/after
-GB200 snapshots (`python -m tools.cudnn_fe.sass snapshot <out> --cases chain`) covered eight
-GDN/KDA forward/backward cases, including int64. The corrected strict gate reported all ten
-compile artifacts identical; all twelve state-chain instances had byte-identical raw instruction
-lines, unchanged resources and unchanged shared-memory layout. Only symbol names changed.
-Performance was not measured. Snapshots: `agent_space/f3/{before,after}`, report:
-`agent_space/f3/diff-final.log` (local, gitignored).
+S15 follow-up, "Pass state-chain storage before runtime arguments": the strict SASS gate over
+eight GDN/KDA chain cases (including int64) found identical instructions, resources and
+shared-memory layout; only symbol names changed. Performance was not measured.
 
 ## Decisions
 
@@ -382,32 +377,22 @@ Performance was not measured. Snapshots: `agent_space/f3/{before,after}`, report
 4. **A work-item count is not proof of non-vacuity (B9).** Counts grow from orthogonal tiling; pin
    the plan before asserting on them. Likewise, after deleting code, re-check that forced-path tests
    still reach the path (R4/S14).
-5. **Shared-worktree commits.** Several agents committed on this stack at once. Commit with
-   `git commit --only -- <paths>` (a bare commit picks up another agent's staged files), never
-   stash in a multi-worktree repo (the stash list is shared), and never amend or reset a branch
-   others are reading; key ledger rows on subjects, not hashes.
-6. **Repro before patching upstream.** Two drafted fixes (B2, S12) reproduce nothing on stock v1.30,
+5. **Repro before patching upstream.** Two drafted fixes (B2, S12) reproduce nothing on stock v1.30,
    and one (B14) targets an ABI upstream lacks; the repros and `verify_fixes.py` classification keep
    hardening drafts from being filed as bug fixes.
 
 ## Verification baseline (v1.30)
 
-`verify_fixes.py --tree <v1.30 stack> --upstream-python <env with stock nvidia-cudnn-frontend
-1.30.0>` on GB200 (2026-09-27), run with the pre-repo version of the script at "Add a cuDNN vendoring
-audit and a mechanical restyle codemod", before S15 existed. The in-repo script has not been re-run
-on the final branch yet.
+Last recorded `verify_fixes.py --tree <v1.30 stack> --upstream-python <stock 1.30.0 env>` run on
+GB200 (2026-09-27), with a pre-S15 version of the script; not yet re-run on the final branch.
 
-- **Tree:** all 53 guarding node ids collected and passed (pytest: 177 passed + 6 xfailed in the
-  main group; 4 passed in the stress group with `ATTN_GYM_RUN_STRESS_TESTS=1`). The ledger now has
-  **40 rows**, including S15. In that earlier run, 30 fixes and all 5 superseded/inherited guards
-  reported `pass`; the other 9 then-present fixes (R1, R3,
-  R11, R12, R13, R14, R16, S8/S6/S3, S10) are gated by SASS, bench or review only, as is S15 (added
-  later). The 6 xfails are R8's FP16 CP cases.
-- **Upstream (stock v1.30.0):** every reproducible bug is still present (B7, B6, B8, B10, B13, R7).
-  The hardening drafts (B2 → 07, S12 → 08) report no isolated bug (smoke passes on stock). B14's
-  scope check confirms upstream still lacks the optional-scheduler ABI.
-- **Positive control:** against the combined patched v1.30 checkout via `--upstream-pythonpath`, B8, B13
-  and R7 flip to "fixed upstream"; B10 stays "bug" by design (patch 04 is opt-in).
+- **Tree:** all 53 guarding node ids passed (177 passed + 6 xfailed, the xfails being R8's FP16
+  CP cases; 4 stress tests passed with `ATTN_GYM_RUN_STRESS_TESTS=1`). SASS/bench/review-gated rows
+  have no pytest guard.
+- **Upstream (stock v1.30.0):** B7, B6, B8, B10, B13 and R7 still reproduce; B2 (07) and S12 (08)
+  report no isolated bug; B14's scope check confirms upstream lacks the optional-scheduler ABI.
+- **Positive control:** against the combined patched tree, B8, B13 and R7 flip to "fixed
+  upstream"; B10 stays "bug" by design (patch 04 is opt-in).
 
-After the next rebase, compare against this: any upstream row that flips to "fixed" is a candidate
-to drop (keep its test); any tree row that is not `pass` / `no pytest guard` blocks the upgrade.
+After the next rebase, any upstream row that flips to "fixed" is a candidate to drop (keep its
+test); any tree row that is not `pass` / `no pytest guard` blocks the upgrade.

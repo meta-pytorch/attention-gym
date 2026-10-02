@@ -199,6 +199,14 @@ def assert_rms_matches_low_precision_reference(
     )
 
 
+def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
+    """Return ``RMS(actual - reference) / RMS(reference)``, computed in float64."""
+    reference = reference.double()
+    return (
+        ((actual.double() - reference).square().mean() / reference.square().mean()).sqrt().item()
+    )
+
+
 def assert_relative_rms_within(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -439,4 +447,5 @@ __all__ = [
     "cumulative_sequence_offsets",
     "kda_reference",
     "make_kda_test_inputs",
+    "relative_rms_error",
 ]

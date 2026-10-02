@@ -10,6 +10,8 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
     ScheduleRequest,
     prepare_ragged_chunk_metadata,
 )
+from attn_gym.linear._delta_rule.span import pack_dense_batch
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -221,17 +223,14 @@ def chunk_forward(
     q, k, v = (tensor.to(kernel_dtype) for tensor in (q, k, v))
     gate = gate.float()
     beta = beta.float().contiguous()
-    batch, tokens, heads, head_dim = output_shape
+    batch, tokens = output_shape[:2]
     metadata = (
         prepare_ragged_chunk_metadata(cu_seqlens, tokens, _CHUNK_SIZE)
         if cu_seqlens is not None
         else None
     )
     if metadata is None and (batch != 1 or tokens % _CHUNK_SIZE != 0):
-        packed_shape = (1, batch * tokens, heads, head_dim)
-        q, k, v, gate = (tensor.reshape(packed_shape) for tensor in (q, k, v, gate))
-        beta = beta.reshape(packed_shape[:3])
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
     if initial_state is not None:
         initial_state = initial_state.float().contiguous()
@@ -290,14 +289,10 @@ def paged_chunk_forward(
 ) -> torch.Tensor:
     """Run paged chunk prefill or replay-backed decode."""
     _validate_fused_constraints(q, v)
-    if torch.is_grad_enabled() and any(
-        tensor.requires_grad
-        for tensor in (q, k, v, gate, beta, state_cache, *(replay_state or ()))
-    ):
-        raise RuntimeError(
-            "paged_chunk_kda is inference-only; call under torch.no_grad() or "
-            "torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, v, gate, beta, state_cache, *(replay_state or ())),
+        "paged_chunk_kda is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
 
     if replay_state is None:
         return _paged_chunk_state_forward(
@@ -476,12 +471,9 @@ def _paged_chunk_state_forward(
     gate = gate.float()
     beta = beta.float().contiguous()
 
-    batch, tokens, heads, head_dim = output_shape
+    batch, tokens = output_shape[:2]
     if cu_seqlens is None:
-        packed_shape = (1, batch * tokens, heads, head_dim)
-        q, k, v, gate = (tensor.reshape(packed_shape) for tensor in (q, k, v, gate))
-        beta = beta.reshape(packed_shape[:3])
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, batch * tokens, _CHUNK_SIZE)
     cumulative_gate = _plain_gate_scan_op(
         gate,

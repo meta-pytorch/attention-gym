@@ -6,15 +6,13 @@
 
 """Shared mathematical and structural constants for KDA implementations."""
 
-from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE, LN2, LOG2_E
-
-SM100_KDA_CAPABILITIES = frozenset(((10, 0), (10, 3)))
-
-
-def is_sm100_kda_capability(capability: tuple[int, int] | None) -> bool:
-    """Return whether a CUDA capability supports the SM100-specific KDA kernels."""
-    return capability in SM100_KDA_CAPABILITIES
-
+from attn_gym.linear._delta_rule.constants import (
+    DEFAULT_CHUNK_SIZE,
+    LN2,
+    LOG2_E,
+    SM100_KDA_CAPABILITIES,
+    is_sm100_kda_capability,
+)
 
 # The causal intra-chunk reference spans 15 steps. Keep the rebase exponent below
 # FP32's overflow boundary; equality can round to exp2(128) and produce non-finite values.

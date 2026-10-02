@@ -9,6 +9,9 @@ import torch
 from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear._delta_rule.span import pack_dense_batch
+from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear._lazy import register_lazy_cuda_impls
 
 _CHUNK_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
@@ -76,34 +79,6 @@ def _chunk_backend():
         raise ImportError("chunk_gdn(impl='fused') requires CUDA with Triton support") from error
 
 
-def _chunk_fwd_cuda(*args):
-    return _chunk_backend()._gdn_chunk_fwd_cuda(*args)
-
-
-def _chunk_fwd_with_state_cuda(*args):
-    return _chunk_backend()._gdn_chunk_fwd_with_state_cuda(*args)
-
-
-def _chunk_bwd_cuda(*args):
-    return _chunk_backend()._gdn_chunk_bwd_cuda(*args)
-
-
-def _chunk_bwd_with_state_grad_cuda(*args):
-    return _chunk_backend()._gdn_chunk_bwd_with_state_grad_cuda(*args)
-
-
-def _chunk_fwd_packed_cuda(*args):
-    return _chunk_backend()._gdn_chunk_fwd_packed_cuda(*args)
-
-
-def _chunk_fwd_packed_with_state_cuda(*args):
-    return _chunk_backend()._gdn_chunk_fwd_packed_with_state_cuda(*args)
-
-
-def _chunk_fwd_packed_paged_cuda(*args):
-    return _chunk_backend()._gdn_chunk_fwd_packed_paged_cuda(*args)
-
-
 def _recurrent_backend():
     try:
         return importlib.import_module("attn_gym.linear.gdn.impl.fused")
@@ -113,60 +88,32 @@ def _recurrent_backend():
         ) from error
 
 
-def _recurrent_fwd_cuda(*args):
-    return _recurrent_backend()._gdn_recurrent_fwd_cuda(*args)
-
-
-def _recurrent_fwd_no_state_cuda(*args):
-    return _recurrent_backend()._gdn_recurrent_fwd_no_state_cuda(*args)
-
-
-def _recurrent_fwd_paged_cuda(*args):
-    return _recurrent_backend()._gdn_recurrent_fwd_paged_cuda(*args)
-
-
-def _recurrent_decode_cuda(*args):
-    return _recurrent_backend()._gdn_recurrent_decode_cuda(*args)
-
-
-torch.library.impl("attn_gym::gdn_chunk_fwd", "CUDA", _chunk_fwd_cuda)
-torch.library.impl(
-    "attn_gym::gdn_chunk_fwd_with_state",
-    "CUDA",
-    _chunk_fwd_with_state_cuda,
+register_lazy_cuda_impls(
+    _chunk_backend,
+    {
+        f"gdn_{op}": f"_gdn_{op}_cuda"
+        for op in (
+            "chunk_fwd",
+            "chunk_fwd_with_state",
+            "chunk_bwd",
+            "chunk_bwd_with_state_grad",
+            "chunk_fwd_packed",
+            "chunk_fwd_packed_with_state",
+            "chunk_fwd_packed_paged",
+        )
+    },
 )
-torch.library.impl("attn_gym::gdn_chunk_bwd", "CUDA", _chunk_bwd_cuda)
-torch.library.impl(
-    "attn_gym::gdn_chunk_bwd_with_state_grad",
-    "CUDA",
-    _chunk_bwd_with_state_grad_cuda,
-)
-torch.library.impl("attn_gym::gdn_chunk_fwd_packed", "CUDA", _chunk_fwd_packed_cuda)
-torch.library.impl(
-    "attn_gym::gdn_chunk_fwd_packed_with_state",
-    "CUDA",
-    _chunk_fwd_packed_with_state_cuda,
-)
-torch.library.impl(
-    "attn_gym::gdn_chunk_fwd_packed_paged",
-    "CUDA",
-    _chunk_fwd_packed_paged_cuda,
-)
-torch.library.impl("attn_gym::gdn_recurrent_fwd", "CUDA", _recurrent_fwd_cuda)
-torch.library.impl(
-    "attn_gym::gdn_recurrent_fwd_no_state",
-    "CUDA",
-    _recurrent_fwd_no_state_cuda,
-)
-torch.library.impl(
-    "attn_gym::gdn_recurrent_fwd_paged",
-    "CUDA",
-    _recurrent_fwd_paged_cuda,
-)
-torch.library.impl(
-    "attn_gym::gdn_recurrent_decode",
-    "CUDA",
-    _recurrent_decode_cuda,
+register_lazy_cuda_impls(
+    _recurrent_backend,
+    {
+        f"gdn_{op}": f"_gdn_{op}_cuda"
+        for op in (
+            "recurrent_fwd",
+            "recurrent_fwd_no_state",
+            "recurrent_fwd_paged",
+            "recurrent_decode",
+        )
+    },
 )
 
 
@@ -551,12 +498,7 @@ def chunk_forward(
     # The dense kernels specialize for complete BT64 chunks. Flatten other dense inputs and
     # synthesize one packed segment per batch row so tails stay masked and never cross batches.
     if cu_seqlens is None and (batch != 1 or tokens % 64):
-        q = q.reshape(1, batch * tokens, q.shape[2], q.shape[3])
-        k = k.reshape(1, batch * tokens, k.shape[2], k.shape[3])
-        v = v.reshape(1, batch * tokens, v.shape[2], v.shape[3])
-        gate = gate.reshape(1, batch * tokens, gate.shape[2])
-        beta = beta.reshape(1, batch * tokens, beta.shape[2])
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
 
     metadata = (
         prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
@@ -603,22 +545,14 @@ def paged_chunk_forward(
 ) -> torch.Tensor:
     """Normalize inputs and advance selected state-cache slots with chunk GDN."""
     _validate_fused_chunk_qkv(q, k, v)
-    tensors = (q, k, v, gate, beta, state_cache)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
-        raise RuntimeError(
-            "paged_chunk_gdn is inference-only; call under torch.no_grad() or "
-            "torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, v, gate, beta, state_cache),
+        "paged_chunk_gdn is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
 
     output_shape = v.shape
-    batch, tokens = q.shape[:2]
     if cu_seqlens is None:
-        q = q.reshape(1, batch * tokens, q.shape[2], q.shape[3])
-        k = k.reshape(1, batch * tokens, k.shape[2], k.shape[3])
-        v = v.reshape(1, batch * tokens, v.shape[2], v.shape[3])
-        gate = gate.reshape(1, batch * tokens, gate.shape[2])
-        beta = beta.reshape(1, batch * tokens, beta.shape[2])
-        cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+        cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
 
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
     gate = gate.float()
@@ -665,12 +599,11 @@ def recurrent_forward(
         raise ValueError("recurrent_gdn(impl='fused') requires CUDA tensors")
     if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError("recurrent_gdn(impl='fused') requires float16, bfloat16, or float32 QKV")
-    tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in tensors):
-        raise RuntimeError(
-            "recurrent_gdn(impl='fused') is inference-only and has no backward; "
-            "call under torch.no_grad() or torch.inference_mode()"
-        )
+    require_inference_only(
+        (q, k, v, gate, beta, initial_state),
+        "recurrent_gdn(impl='fused') is inference-only and has no backward; "
+        "call under torch.no_grad() or torch.inference_mode()",
+    )
 
     q, k, v = (tensor.contiguous() for tensor in (q, k, v))
     gate, beta = (tensor.float().contiguous() for tensor in (gate, beta))
@@ -711,12 +644,11 @@ def recurrent_decode_forward(
     """Invoke the lazily loaded fused decode implementation."""
     if not packed_qkv.is_cuda:
         raise ValueError("recurrent_gdn_decode requires CUDA tensors")
-    data_tensors = (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, out)
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in data_tensors):
-        raise RuntimeError(
-            "recurrent_gdn_decode is inference-only and has no backward; "
-            "call under torch.no_grad() / torch.inference_mode()"
-        )
+    require_inference_only(
+        (packed_qkv, raw_gate, raw_beta, A_log, dt_bias, state_cache, out),
+        "recurrent_gdn_decode is inference-only and has no backward; "
+        "call under torch.no_grad() / torch.inference_mode()",
+    )
     recurrent_decode_op(
         packed_qkv,
         raw_gate,

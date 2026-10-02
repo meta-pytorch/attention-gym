@@ -3,6 +3,7 @@
 import torch
 from torch import Tensor
 
+from attn_gym._cu_seqlens import validate_cu_seqlens_pair
 from attn_gym.types import Impl, resolve_impl
 
 from .ops import _indexer_op
@@ -84,26 +85,7 @@ def _validate_inputs(
     if topk < 0:
         raise ValueError(f"topk must be non-negative, got {topk}.")
 
-    if (cu_seqlens is None) != (cu_seqlens_k is None):
-        raise ValueError("cu_seqlens and cu_seqlens_k must be supplied together")
-    if cu_seqlens is not None:
-        if batch != 1:
-            raise ValueError("packed cu_seqlens require q to have batch size one")
-        for name, offsets in (("cu_seqlens", cu_seqlens), ("cu_seqlens_k", cu_seqlens_k)):
-            if not isinstance(offsets, Tensor):
-                raise TypeError(f"{name} must be a torch.Tensor")
-            if offsets.ndim != 1 or offsets.shape[0] < 2:
-                raise ValueError(f"{name} must have shape [num_sequences + 1]")
-            if (
-                offsets.dtype != torch.int32
-                or not offsets.is_contiguous()
-                or offsets.device != q.device
-            ):
-                raise ValueError(f"{name} must be contiguous int32 on q.device")
-        if cu_seqlens.shape != cu_seqlens_k.shape:
-            raise ValueError(
-                "cu_seqlens and cu_seqlens_k must describe the same number of sequences"
-            )
+    validate_cu_seqlens_pair(cu_seqlens, cu_seqlens_k, batch=batch, device=q.device)
 
     # Packed pools contain the sum of independently floored document lengths.
     # Their device-resident offsets and per-document counts are caller invariants.
@@ -223,22 +205,9 @@ def lightning_indexer(
                 raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
-            candidate_bounds = None
-            if cu_seqlens is not None:
-                positions = torch.arange(q.shape[1], device=q.device, dtype=torch.int32)
-                # Empty documents are skipped; capacity tails receive an empty interval.
-                documents = torch.searchsorted(
-                    cu_seqlens[1:], positions, right=True, out_int32=True
-                )
-                starts = cu_seqlens_k.index_select(0, documents)
-                ends = cu_seqlens_k.index_select(
-                    0, (documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1)
-                )
-                if causal:
-                    local_positions = positions - cu_seqlens.index_select(0, documents)
-                    ends = torch.minimum(ends, starts + (local_positions + 1) // compress_ratio)
-                candidate_bounds = torch.stack((starts, ends), dim=-1)
-            return reference.launch(q, k, weights, topk, causal, compress_ratio, candidate_bounds)
+            return reference.launch(
+                q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k
+            )
         case Impl.FUSED:
             if kernel_options not in (
                 None,

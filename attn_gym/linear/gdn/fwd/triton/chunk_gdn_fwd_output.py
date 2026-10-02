@@ -14,13 +14,12 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.tune import TritonTuner
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import exp2, ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
-from attn_gym.linear.kda.utils import exp2
 
 
 @triton.jit(do_not_specialize=["T", "num_sequences"])

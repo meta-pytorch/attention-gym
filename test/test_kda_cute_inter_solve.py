@@ -95,15 +95,8 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
     diagonal_inverse = torch.randn(1, 128, 1, 16, device="cuda") * 0.01
 
     def run_inter_solve():
-        Akk = torch.full((1, 128, 1, 64), torch.nan, device="cuda", dtype=q.dtype)
         return chunk_kda_fwd_inter_solve_cute(
-            q,
-            k,
-            cumulative_gate,
-            beta,
-            diagonal_inverse,
-            128**-0.5,
-            Akk=Akk,
+            q, k, cumulative_gate, beta, diagonal_inverse, 128**-0.5
         )
 
     run_inter_solve()

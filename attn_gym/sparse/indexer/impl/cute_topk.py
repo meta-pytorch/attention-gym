@@ -32,6 +32,8 @@ from cutlass.cutlass_dsl import dsl_user_op
 
 from attn_gym._backends.cute.compat import SmemAllocator
 
+from .cute_kernel_base import IndexerKernelBase
+
 _NUM_BINS_11 = 2048
 _NUM_BINS_10 = 1024
 _SHRINK_MAX = 2048  # 16 KiB for ordered keys and local KV indices.
@@ -86,7 +88,7 @@ def _block_scan_inclusive(
     return value
 
 
-class IndexerTopKKernel:
+class IndexerTopKKernel(IndexerKernelBase):
     """Select static K indices per row from a contiguous symbolic [P, 2, S] slab.
 
     ``pair_start`` locates the slab in flattened (batch, query-pair) order; odd
@@ -125,13 +127,6 @@ class IndexerTopKKernel:
     def upcast_offset(self, value):
         """Widen indices before any address arithmetic in the wide specialization."""
         return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
-
-    @cute.jit
-    def visible_candidates(self, query):
-        """Causal candidate count for query; the static ratio keeps r=1 division-free."""
-        if cutlass.const_expr(self.compress_ratio == 1):
-            return query + 1
-        return (query + 1) // self.compress_ratio
 
     @cute.jit
     def select_lowest_ties(

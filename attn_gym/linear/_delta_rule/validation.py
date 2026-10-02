@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import sys
+from collections.abc import Collection, Iterable, Mapping
 from numbers import Real
 
 import torch
 
+from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -53,16 +55,7 @@ def validate_delta_rule_inputs(
         raise ValueError(f"beta must have shape {(batch, tokens, heads)}, got {tuple(beta.shape)}")
 
     if cu_seqlens is not None:
-        if batch != 1:
-            raise ValueError("packed cu_seqlens require q to have batch size one")
-        if cu_seqlens.ndim != 1 or cu_seqlens.shape[0] < 2:
-            raise ValueError("cu_seqlens must have shape [num_sequences + 1]")
-        if (
-            cu_seqlens.dtype != torch.int32
-            or not cu_seqlens.is_contiguous()
-            or cu_seqlens.device != q.device
-        ):
-            raise ValueError("cu_seqlens must be contiguous int32 on q.device")
+        validate_cu_seqlens(batch, q.device, cu_seqlens=cu_seqlens)
 
     state_batch = batch if cu_seqlens is None else cu_seqlens.shape[0] - 1
     expected_state = (state_batch, heads, v.shape[-1], key_dim)
@@ -74,6 +67,43 @@ def validate_delta_rule_inputs(
     tensors = (q, k, v, gate, beta) + (() if initial_state is None else (initial_state,))
     if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("all inputs must be on the same device")
+
+
+def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str) -> None:
+    """Raise ``RuntimeError(message)`` if autograd would track any given tensor."""
+    if torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in tensors
+    ):
+        raise RuntimeError(message)
+
+
+def resolve_backend_options(
+    kernel_options: Mapping[str, object],
+    *,
+    op_name: str,
+    fields: Collection[str],
+) -> tuple[str, bool, bool]:
+    """Validate the shared chunk ``backend``/``split_*`` options.
+
+    Returns ``(backend, split_backward, split_forward)``; ``fields`` lists every key the
+    caller accepts, so family-specific keys are validated by the caller.
+    """
+    unknown = kernel_options.keys() - fields
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported {op_name} kernel options: {names}")
+    backend = kernel_options.get("backend", "fused")
+    if backend not in ("fused", "cudnn"):
+        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
+    splits = []
+    for name in ("split_backward", "split_forward"):
+        value = kernel_options.get(name, False)
+        if not isinstance(value, bool):
+            raise TypeError(f"kernel_options['{name}'] must be a bool")
+        if value and backend != "cudnn":
+            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
+        splits.append(value)
+    return backend, *splits
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -194,6 +224,8 @@ def validate_paged_state(
 
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
+    "require_inference_only",
+    "resolve_backend_options",
     "resolve_decode_out",
     "resolve_scale",
     "validate_decode_inputs",

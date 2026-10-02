@@ -67,45 +67,50 @@ def validate_cudnn_available(q: torch.Tensor) -> None:
 
 
 def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
-    backend = _backend(q)
-    return backend.chunk_delta_rule_fwd_cudnn(
+    output, _ = _backend(q).run_forward(
         q,
         k,
         value,
         gate,
         beta,
         cu_seqlens,
-        scale,
+        None,
+        scale=scale,
+        output_final_state=False,
         split=split,
     )
+    return output
 
 
 def _packed_fwd_with_initial_state_cuda(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
-    backend = _backend(q)
-    return backend.chunk_delta_rule_fwd_cudnn_unsplit_with_initial_state(
+    output, _ = _backend(q).run_forward(
         q,
         k,
         value,
         gate,
         beta,
-        initial_state,
         cu_seqlens,
-        scale,
+        initial_state,
+        scale=scale,
+        output_final_state=False,
     )
+    return output
 
 
 def _packed_fwd_with_state_cuda(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
-    backend = _backend(q)
-    return backend.chunk_delta_rule_fwd_cudnn_unsplit_with_state(
+    output, final_state = _backend(q).run_forward(
         q,
         k,
         value,
         gate,
         beta,
-        initial_state,
         cu_seqlens,
-        scale,
+        initial_state,
+        scale=scale,
+        output_final_state=True,
     )
+    assert final_state is not None
+    return output, final_state
 
 
 def _packed_fwd_paged_cuda(

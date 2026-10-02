@@ -7,7 +7,10 @@ from typing import Literal, NamedTuple
 
 import torch
 
-from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
+from attn_gym.linear._delta_rule.validation import (
+    resolve_backend_options,
+    validate_delta_rule_inputs,
+)
 
 
 class ResolvedKernelOptions(NamedTuple):
@@ -24,22 +27,11 @@ def resolve_kernel_options(
     """Validate chunk backend options while keeping the repo-local path as default."""
     if kernel_options is None:
         return ResolvedKernelOptions("fused", False, False)
-    unknown = kernel_options.keys() - ResolvedKernelOptions._fields
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unsupported chunk_gdn kernel options: {names}")
-    backend = kernel_options.get("backend", "fused")
-    if backend not in ("fused", "cudnn"):
-        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
-    splits = []
-    for name in ("split_backward", "split_forward"):
-        value = kernel_options.get(name, False)
-        if not isinstance(value, bool):
-            raise TypeError(f"kernel_options['{name}'] must be a bool")
-        if value and backend != "cudnn":
-            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
-        splits.append(value)
-    return ResolvedKernelOptions(backend, *splits)
+    return ResolvedKernelOptions(
+        *resolve_backend_options(
+            kernel_options, op_name="chunk_gdn", fields=ResolvedKernelOptions._fields
+        )
+    )
 
 
 def validate_gdn_inputs(

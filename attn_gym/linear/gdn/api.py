@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
     resolve_scale,
@@ -12,7 +13,7 @@ from attn_gym.linear._delta_rule.validation import (
 )
 from attn_gym.linear.gdn.impl.cudnn import chunk_forward as cudnn_chunk_forward
 from attn_gym.linear.gdn.impl.cudnn import paged_chunk_forward as cudnn_paged_chunk_forward
-from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward, reference_gdn
+from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
 from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
@@ -104,13 +105,14 @@ def chunk_gdn(
             output_final_state=output_final_state,
         )
 
-    return reference_gdn(
+    return reference_delta_rule(
         chunk_forward,
         q,
         k,
         v,
         gate,
         beta,
+        compute_dtype=torch.promote_types(q.dtype, torch.float32),
         scale=scale,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,
@@ -285,13 +287,14 @@ def recurrent_gdn(
             autotune=autotune,
         )
 
-    return reference_gdn(
+    return reference_delta_rule(
         recurrent_forward,
         q,
         k,
         v,
         gate,
         beta,
+        compute_dtype=torch.promote_types(q.dtype, torch.float32),
         scale=scale,
         initial_state=initial_state,
         cu_seqlens=cu_seqlens,

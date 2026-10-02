@@ -18,7 +18,7 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.utils import (
     PinnedConfigKernel,
-    can_use_tma,
+    can_use_tensor_descriptors,
     ptr_offset,
     requires_int64_offsets,
 )
@@ -500,11 +500,6 @@ def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
         )
 
 
-def _can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
-    """Return whether all fixed KDA tensors satisfy host TMA requirements."""
-    return all(can_use_tma(tensor) for tensor in tensors)
-
-
 _PINNED_FWD_O = PinnedConfigKernel(chunk_gla_fwd_kernel_o)
 
 
@@ -560,7 +555,7 @@ def chunk_gla_fwd_o_gk(
         metadata is not None
         and batch == 1
         and (key_dim, value_dim, chunk_size) == (128, 128, 64)
-        and _can_use_tensor_descriptors(q, v, g, h, output, A)
+        and can_use_tensor_descriptors(q, v, g, h, output, A)
     )
     if metadata is not None:
         subtasks = heads * triton.cdiv(value_dim, 64)  # 64 = the persistent kernel's BV tile
@@ -576,7 +571,7 @@ def chunk_gla_fwd_o_gk(
     if (
         metadata is None
         and (key_dim, value_dim, chunk_size) == (128, 128, 64)
-        and _can_use_tensor_descriptors(q, v, g, h, output, A)
+        and can_use_tensor_descriptors(q, v, g, h, output, A)
     ):
         block_key_dim = 32
         block_value_dim = 64

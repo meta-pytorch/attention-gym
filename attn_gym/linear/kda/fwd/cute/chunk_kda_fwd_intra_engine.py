@@ -35,7 +35,7 @@ from cutlass.cute.typing import Float32, Int32, Int64
 from attn_gym._backends.cute import (
     TMA_ALIGNMENT_BYTES,
     make_fake_strided_tensor,
-    tensor_supports_contiguous_dim,
+    normalize_compact_tensor,
 )
 from attn_gym._backends.cute.cache import jit_cache
 from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
@@ -1020,15 +1020,6 @@ def _compile_intra_engine_fwd(
     )
 
 
-def normalize_compact_tensor(tensor: torch.Tensor, alignment_bytes: int) -> torch.Tensor:
-    """Copy compact tensors whose storage does not satisfy the compiled alignment."""
-    if tensor.is_contiguous() and tensor_supports_contiguous_dim(
-        tensor, alignment_bytes=alignment_bytes
-    ):
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
-
-
 def kda_intra_engine_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1065,8 +1056,8 @@ def kda_intra_engine_fwd(
 
     q_flat = q[0]
     k_flat = k[0]
-    g_flat = normalize_compact_tensor(g[0], 128)
-    beta_flat = normalize_compact_tensor(beta[0], 8)
+    g_flat = normalize_compact_tensor(g[0])
+    beta_flat = normalize_compact_tensor(beta[0], alignment_bytes=8)
     aqk_flat = aqk[0]
     akkd_flat = akkd[0]
     use_int64_offsets = requires_int64_abi(

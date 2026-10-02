@@ -13,8 +13,6 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
-
 import cutlass
 import torch
 from cutlass import cute
@@ -23,7 +21,8 @@ from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.target import get_compile_target
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
+from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear._delta_rule.chunk_schedule import (
     RaggedChunkMetadata,
     ResolvedSchedule,
@@ -50,10 +49,7 @@ _SUPPORTED_NUM_SUBCHUNKS = 4
 # three-wave crossover because the persistent chunk loop can otherwise lose.
 _INTER_SOLVE_SHORT_AUTO_WAVES = 1
 _INTER_SOLVE_LONG_AUTO_WAVES = 3
-_IO_TYPES = {
-    torch.float16: (cutlass.Float16, "fp16"),
-    torch.bfloat16: (cutlass.BFloat16, "bf16"),
-}
+_IO_TYPES = (torch.float16, torch.bfloat16)
 
 
 def _check_compile_target() -> None:
@@ -308,7 +304,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
 
     if q.dtype != k.dtype or q.dtype != Aqk.dtype or q.dtype not in _IO_TYPES:
         raise TypeError("q, k, and Aqk must share dtype float16 or bfloat16")
-    io_type, io_name = _IO_TYPES[q.dtype]
+    io_type, io_name = cute_dtype(q.dtype)
     q_flat = q[0].reshape(tokens, heads * head_dim)
     k_flat = k[0].reshape(tokens, heads * head_dim)
     g_flat = gk.reshape(tokens, heads * head_dim).contiguous()
@@ -395,7 +391,7 @@ def _chunk_kda_fwd_k4b_ragged_impl(
     # metadata and must not read capacity slack.
     if output_dtype not in _IO_TYPES:
         raise TypeError("Akk output dtype must be float16 or bfloat16")
-    io_type, io_name = _IO_TYPES[output_dtype]
+    io_type, io_name = cute_dtype(output_dtype)
     Akk = torch.empty(
         (batch, tokens, heads, chunk_size),
         dtype=output_dtype,
@@ -469,7 +465,7 @@ def chunk_kda_fwd_k4b_dense_cute(
 
     if output_dtype not in _IO_TYPES:
         raise TypeError("Akk output dtype must be float16 or bfloat16")
-    io_type, io_name = _IO_TYPES[output_dtype]
+    io_type, io_name = cute_dtype(output_dtype)
     Akk = torch.empty(
         (batch, tokens, heads, chunk_size),
         dtype=output_dtype,
@@ -524,9 +520,6 @@ def chunk_kda_fwd_inter_solve_cute(
     scale: float,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     Aqk: torch.Tensor | None = None,
-    Akk: torch.Tensor | None = None,
-    AkkOD: torch.Tensor | None = None,
-    profile_ranges: bool = False,
     fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run dense K3 and K4; ``fastmath`` selects K3's rebasing ``exp2`` as in the ragged path."""
@@ -553,20 +546,14 @@ def chunk_kda_fwd_inter_solve_cute(
         )
         Aqk_flat = Aqk.reshape(B * T, H * BT)
 
-    if Akk is None:
-        Akk_flat = torch.empty(B * T, H * BT, device=k.device, dtype=k.dtype)
-        Akk = Akk_flat.reshape(B, T, H, BT)
-    else:
-        assert Akk.shape == (B, T, H, BT), (
-            f"Akk must have shape {(B, T, H, BT)}, got {tuple(Akk.shape)}"
-        )
-        Akk_flat = Akk.reshape(B * T, H * BT)
+    Akk_flat = torch.empty(B * T, H * BT, device=k.device, dtype=k.dtype)
+    Akk = Akk_flat.reshape(B, T, H, BT)
 
     if q.dtype != k.dtype or q.dtype not in _IO_TYPES:
         raise TypeError("q and k must share dtype float16 or bfloat16")
-    if Aqk.dtype != q.dtype or Akk.dtype != q.dtype:
-        raise TypeError("Aqk and Akk must match the Q/K dtype")
-    io_type, io_name = _IO_TYPES[q.dtype]
+    if Aqk.dtype != q.dtype:
+        raise TypeError("Aqk must match the Q/K dtype")
+    io_type, io_name = cute_dtype(q.dtype)
     if isinstance(k, FakeTensor):
         return Aqk, Akk
 
@@ -576,18 +563,9 @@ def chunk_kda_fwd_inter_solve_cute(
     g_flat = gk.reshape(B * T, H * K).contiguous()
     beta_flat = beta.reshape(B * T, H).contiguous()
     akkd_flat = Akkd.reshape(B * T, H * BC).contiguous()
-    akk_od_shape = (NT * offdiag_blocks, H * BC * BC)
-    if AkkOD is None:
-        akk_od = torch.empty(akk_od_shape, device=k.device, dtype=torch.float32)
-    else:
-        assert AkkOD.shape == akk_od_shape, (
-            f"AkkOD must have shape {akk_od_shape}, got {tuple(AkkOD.shape)}"
-        )
-        akk_od = AkkOD
+    akk_od = torch.empty(NT * offdiag_blocks, H * BC * BC, device=k.device, dtype=torch.float32)
 
-    with (
-        torch.profiler.record_function("kda/cute/k3b_offdiag") if profile_ranges else nullcontext()
-    ):
+    with profiler_range("kda/cute/k3b_offdiag"):
         k3b = _compile_k3b(
             H,
             K,
@@ -615,9 +593,7 @@ def chunk_kda_fwd_inter_solve_cute(
             None,
             None,
         )
-    with (
-        torch.profiler.record_function("kda/cute/k4b_inverse") if profile_ranges else nullcontext()
-    ):
+    with profiler_range("kda/cute/k4b_inverse"):
         k4b = _compile_k4b(
             H,
             K,

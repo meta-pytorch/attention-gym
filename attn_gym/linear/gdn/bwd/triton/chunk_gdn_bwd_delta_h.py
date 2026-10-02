@@ -13,14 +13,13 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import autotune_cache_kwargs, ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
     load_ragged_chunk_work,
     load_ragged_sequence_work,
 )
-from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})

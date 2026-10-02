@@ -156,6 +156,15 @@ mask_mod = generate_packed_causal_doc_mask_mod(offsets)
 
 ::: attn_gym.masks.document_mask.generate_packed_causal_doc_mask_mod
 
+## Shared Prefix
+
+Packs a shared prompt document with several continuation documents without duplicating the prompt
+tokens: each continuation attends to its full prefix document and causally within itself.
+[`examples/flex_attention/shared_prefix_split_attention.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_attention/shared_prefix_split_attention.py)
+shows the alternative of attending over the prefix and response separately and merging the results.
+
+::: attn_gym.masks.shared_prefix.generate_shared_prefix_mask_mod
+
 ## Neighborhood Attention (NATTEN)
 
 Multi-dimensional neighborhood attention patterns.

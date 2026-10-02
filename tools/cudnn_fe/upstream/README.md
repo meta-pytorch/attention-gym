@@ -118,132 +118,29 @@ dependencies**:
 - 08 (S12): the arrival-count part of the three "Validate … launch contracts …" commits only, not
   AG's launch-validation framework.
 
-## Draft issue 01 — GDN backward loses dBeta at zero and tiny post-activation beta
+## Draft issues
 
-**Symptom.** For two tokens with q=k=e₀, v=(e₀,2e₀), log-gate=0, beta=(1,b), and loss=o₁, the exact
-recurrence gives loss=1+b and dBeta₁=1, including b=0. FROST returns dBeta₁=0 at zero.
+Each draft's symptom, root cause, repro and fix narrative lives in the
+[`WORKLOG.md`](../../../attn_gym/linear/_delta_rule/cudnn_fe/WORKLOG.md) entry for its ledger ID; [`../fixes.toml`](../fixes.toml) maps the ID to the
+patch, repro and expected result.
 
-**Root cause.** Backward recovers an already beta-scaled quantity by dividing by `beta + 1e-10`.
-This is undefined at zero and attenuates tiny-beta gradients. Removing the constant or clamping beta
-cannot restore the missing unscaled value.
-
-**Repro.** `repro_01_gdn_beta.py` via `cudnn.pygraph().gdn_bwd()` with sigmoid and QK normalization
-disabled: four zero-beta failures on stock across both dtypes and both factor sources; 16 exact
-five-gradient cases patched.
-
-**Fix.** Keep beta-free inverse factors and stage Z separately from beta·Z; compute dBeta directly.
-Retains the AG fix's coupled GEMM issue order and scratch-lifetime changes. Covers compute and gmem
-factor sources, including reconstructing the beta-free inverse from gmem factors.
-
-**Draft limitations.** The patch adds explicit guards for:
-
-1. `d_k != d_v`: sdQ is borrowed for a value-width Z tile; K≠V needs independent Z storage or a
-   correctly dimensioned view, MMA descriptors and layout/stride handling.
-2. Multiple dQ/dK SMEM stages: the fix uses one-stage sdQ/sdK lifetimes and reduction scratch;
-   general support needs stage-indexed scratch plus barriers proving every async consumer finished.
-3. Fused QK L2 normalization at `d_v=128`: its scratch overlaps the beta-free path's sDm lifetime.
-
-**Historical performance (AG port, not this export).** GB200 fwd+bwd +0.4% to +3.6% across four
-workloads (lower is better).
-
-## Draft issue 02 — KDA rounds away the delta residual before subtraction and beta scaling
-
-**Symptom.** A small delta next to a large state contraction disappears: 4098 rounds to 4096 in BF16
-and FP16, so V=4096 minus the packed contraction gives 0 instead of −2. The exact 64-token fixture
-expects output=1.5, dBeta₁₆=−256, dQ₃₂=96; stock yields 2, 0, 128.
-
-**Root cause.** The state·K accumulator is packed before subtraction, then residual/beta are packed
-again. Backward consumes the rounded residual for its value contribution to dBeta.
-
-**Repro.** `repro_02_kda_residual.py` (default and `--scheme dv|prep|chain`) fails on stock at the
-exact probes; patched passes 16 forward cases (4 plans × 2 dtypes × seed absent/present) and four
-uncut backward cases.
-
-**Fix.** A packed helper unpacks V, subtracts FP32 state·K, applies FP32 beta and packs once for MMA,
-keeping the FP32 residual for dBeta. Covers prefill, prep-prefill, summary, recompute and bprop. Prep
-keeps residual-only staging because its factors already contain beta.
-
-**Historical performance (AG port).** T=32768, H=48 chain forward 1360→1378 µs (+1.3%, lower is
-better), others within noise; backward ≈+1% at T2048/H8 and packed; REG/STACK unchanged.
-
-## Draft issue 03 — Empty packed intervals consume unsplit scheduling slots
-
-**Symptom.** Padding `cu_seqlens` with repeated boundaries increases main-kernel work despite adding
-no tokens.
-
-**Root cause.** `order_body(gen=True)` synthesizes every sequence×head item and the THD builders
-construct descriptors even for empty intervals. Empty stateful items own required pass-through
-stores, so blindly dropping zero-length intervals introduces a separate correctness bug.
-
-**Repro.** `repro_03_empty_unsplit.py`: stock passes 12 checks and fails the 8 work-count checks;
-patched passes all 20, including deterministic order, capacity fallbacks, forward zero/seeded/indexed
-state and backward cotangents with/without exit input.
-
-**Fix.** Deterministic ballot/prefix compaction keeping original sequence IDs and destinations; skip
-empty descriptors in the three shared THD builders. Internal `skip_empty=False` opt-in, enabled only
-by uncut GDN/KDA forward hosts when `state_out is None`.
-
-**Scope.** Stateful outputs, backward, chain, KDA prep, GDN2/GDP and >4096-sequence batches stay
-uncompacted. Upstream has no per-sequence has-initial/fresh-state mask, so AG's fresh-empty paged
-clearing is not transplanted.
-
-**Historical performance (AG PR #603).** 71 padded empty intervals: GDN forward 29.9→96.3 µs before
-compaction, 32.3 µs after (lower is better). This narrower draft was not timed.
-
-## Draft issue 04 — Split walk emits zero-chunk items
-
-**Symptom.** Bounds `[0,32,32,48,48]`, H=2: eight items instead of four; all-empty bounds also emit
-work. A scheduler inefficiency, not a reproduced persistent-TMEM hang.
-
-**Root cause.** The no-cut branch emits a whole-sequence item unconditionally.
-
-**Fix / safety.** Compile-time `skip_empty=False` threaded through launch and compile cache; zero
-chunks omitted only when opted in (split-forward hosts without a final state). State/cotangent-
-writing callers keep empty items. Distinct from 03's unsplit compaction.
-
-## Draft issue 05 — Scalar split scan ignores the head stride
-
-**Symptom.** A gate view in alternating columns of a poisoned `[4096,4]` tensor produces wrong
-per-head decay sums (logical heads −0.1 and −0.2; unused columns +37).
-
-**Root cause.** The scalar load adds bare `h` rather than `h * stride[1]`; the standalone host also
-marks the last dimension unit-stride, blocking legitimate non-unit-head-stride replay.
-
-**Repro.** `--raw`: stock 256/516 entries differ, max abs error 4.6166239; patched exact. Default:
-stock compact→strided replay raises a TVM-FFI stride mismatch; patched passes.
-
-**Fix.** Widen before multiplying by the actual head stride; explicit symbolic-stride fake signature
-for scalar gates. `mark_layout_dynamic(leading_dim=None)` is not enough: it infers stride 1 from a
-compact first call.
-
-## Draft issue 06 — Reject misaligned channel-gate rows before vectorized scan loads
-
-**Symptom.** `split_table_facts` accepts per-channel gates whose base, token stride or head stride
-violate the scan's vector-load alignment (acceptance reproduced, not a device fault).
-
-**Root cause.** For channel counts divisible by 128 a lane loads four adjacent channels: 16-byte
-alignment for FP32, 8-byte for FP16/BF16. Contiguous channels do not imply aligned row/head starts.
-
-**Fix.** Validate base pointer and token/head strides before compiling/launching the vectorized path,
-via upstream `cudnn.frost.buffers.data_ptr` and tensor-like `stride()`. Metadata-only checks.
-
-## Draft issue 07 — Initialize each GDN CTA mbarrier from one thread
-
-**Hardening, not a reproduced deadlock.** GDN prefill, recompute, bprop, bprop-summary and forward
-summary initialize mbarriers from every CTA thread; each sync object should have one initializer.
-`repro_07_mbarrier_stress.py` (32 sequences × 128 tokens, H=32, D=128, seeded state, backward; 1024
-items across persistent waves) passes 32 iterations on both stock and patched.
-
-**Fix.** Wrap each init inventory in `if tidx == 0`, keeping the init fence and CTA sync outside. No
-counts or steady-state handshakes change.
-
-## Draft issue 08 — Derive scheduler consumer arrivals from the active warp roles
-
-**Maintenance hardening, not a current bug.** Several GDN/KDA barriers use literal 11/15 arrivals
-though the consumer count follows the role map. For fully occupied role maps the patch derives CTA
-warps minus the TMA publisher; KDA bprop-summary derives two compute groups plus three scalar
-consumer roles (warps 8–11 idle), so it stays 11. `repro_08_scheduler_counts.py` passes on stock and
-patched. AG's broader commits produced identical default-kernel SASS (8 KDA backward cubins).
+- **01 (B7)** — GDN backward loses dBeta at zero and tiny post-activation beta
+  (`repro_01_gdn_beta.py`). The draft guards three unsupported specializations: `d_k != d_v`,
+  multiple dQ/dK SMEM stages, and fused QK L2 normalization at `d_v=128`.
+- **02 (B6)** — KDA rounds away the delta residual before subtraction and beta scaling
+  (`repro_02_kda_residual.py`).
+- **03 (B8)** — Empty packed intervals consume unsplit scheduling slots
+  (`repro_03_empty_unsplit.py`); compaction is opt-in and only when no state output is written.
+- **04 (B10)** — Split walk emits zero-chunk items (`repro_04_zero_chunk_walk.py`); opt-in
+  `skip_empty`, distinct from 03.
+- **05 (B13)** — Scalar split scan ignores the head stride (`repro_05_scalar_head_stride.py`);
+  the fix also uses an explicit symbolic-stride fake signature for scalar gates.
+- **06 (R7)** — Reject misaligned channel-gate rows before vectorized scan loads
+  (`repro_06_channel_alignment.py`; validation only).
+- **07 (B2)** — Initialize each GDN CTA mbarrier from one thread; hardening, stock passes
+  `repro_07_mbarrier_stress.py`.
+- **08 (S12)** — Derive scheduler consumer arrivals from the active warp roles; hardening, stock
+  passes `repro_08_scheduler_counts.py`.
 
 ## Excluded — split-table replay absent-scheduler ABI (B14)
 

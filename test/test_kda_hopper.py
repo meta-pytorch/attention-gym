@@ -15,11 +15,11 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
 )
 from attn_gym.linear.kda.constants import LOG2_E
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
-    _chunk_kda_bwd_with_state_grad_op,
-    _chunk_kda_fwd_with_state_op,
-)
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
+from attn_gym.linear.kda.ops import (
+    chunk_bwd_with_state_grad_op,
+    chunk_fwd_with_state_op,
+)
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     assert_rms_matches_low_precision_reference,
@@ -297,15 +297,15 @@ def test_hopper_raw_operator_registration():
         "auto",
     )
     torch.library.opcheck(
-        _chunk_kda_fwd_with_state_op,
+        chunk_fwd_with_state_op,
         forward_args,
         rtol=2e-2,
         atol=2e-3,
     )
     with torch.no_grad():
-        _output, state, aqk, akk = _chunk_kda_fwd_with_state_op(*forward_args)
+        _output, state, aqk, akk = chunk_fwd_with_state_op(*forward_args)
     torch.library.opcheck(
-        _chunk_kda_bwd_with_state_grad_op,
+        chunk_bwd_with_state_grad_op,
         (
             q.detach(),
             k.detach(),
