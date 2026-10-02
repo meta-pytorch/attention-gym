@@ -100,6 +100,13 @@ def token_strided_like(tensor: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def token_innermost_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Copy into the token-innermost layout of ``F.conv1d(x_BCT).transpose(1, 2)``."""
+    result = tensor.movedim(1, -1).contiguous().movedim(-1, 1)
+    assert result.stride(1) == 1 and not result.is_contiguous()
+    return result
+
+
 def run_with_gradients(
     inputs: tuple[torch.Tensor, ...],
     impl: str,
@@ -989,7 +996,7 @@ def test_raw_ops_reject_pre_ampere_devices(monkeypatch):
         chunk_fwd_with_state_op(*args)
 
 
-def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128):
+def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128, token_innermost: bool = False):
     """Construct detached raw-op arguments and their forward tapes."""
     q, k, v, gate, beta, state = make_inputs(
         tokens=tokens,
@@ -997,6 +1004,8 @@ def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128):
         value_heads=heads,
         head_dim=head_dim,
     )
+    if token_innermost:
+        q, k, v, beta = (token_innermost_like(tensor) for tensor in (q, k, v, beta))
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
     args = (q, k, v, cumulative, beta, state, head_dim**-0.5)
     with torch.no_grad():
@@ -1004,10 +1013,13 @@ def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128):
     return args, output, final_state, inverse
 
 
+@pytest.mark.parametrize("token_innermost", [False, True], ids=["compact", "token-innermost"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_dense_raw_operator_registration(head_dim: int):
+def test_dense_raw_operator_registration(head_dim: int, token_innermost: bool):
     """Validate dense forward/backward schemas, fakes, and AOT dispatch."""
-    args, output, final_state, inverse = raw_args(head_dim=head_dim)
+    args, output, final_state, inverse = raw_args(
+        head_dim=head_dim, token_innermost=token_innermost
+    )
     torch.library.opcheck(chunk_fwd_op, args)
     torch.library.opcheck(chunk_fwd_with_state_op, args)
     backward_args = (
@@ -1025,10 +1037,13 @@ def test_dense_raw_operator_registration(head_dim: int):
     torch.library.opcheck(chunk_bwd_with_state_grad_op, backward_args, test_utils=utilities)
 
 
+@pytest.mark.parametrize("token_innermost", [False, True], ids=["compact", "token-innermost"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_packed_raw_operator_registration(head_dim: int):
+def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
     """Validate fixed-capacity packed forward/backward registrations."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128, head_dim=head_dim)
+    if token_innermost:
+        q, k, v, beta = (token_innermost_like(tensor) for tensor in (q, k, v, beta))
     state = torch.randn(2, v.shape[2], head_dim, head_dim, device="cuda")
     cu_seqlens = torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)

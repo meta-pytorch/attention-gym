@@ -129,7 +129,9 @@ def _chunk_fwd_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, cumulative_gate, beta, initial_state, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
-    return torch.empty_like(v, dtype=q.dtype), inverse
+    # The kernels write a contiguous output for any input layout (for example the
+    # token-innermost values of a causal conv), so do not inherit v's strides.
+    return v.new_empty(v.shape), inverse
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_fwd_with_state")
@@ -164,7 +166,8 @@ def _chunk_fwd_packed_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, capacity, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
-    return torch.empty_like(v, dtype=q.dtype), inverse
+    # Contiguous, as in _chunk_fwd_fake.
+    return v.new_empty(v.shape), inverse
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_fwd_packed_with_state")
@@ -236,13 +239,8 @@ def _chunk_bwd_fake(
     scale: float,
 ) -> tuple[torch.Tensor, ...]:
     del inverse, d_output, d_final_state, initial_state, cu_seqlens, chunk_offsets, scale
-    return (
-        torch.empty_like(q),
-        torch.empty_like(k),
-        torch.empty_like(v),
-        torch.empty_like(cumulative_gate),
-        torch.empty_like(beta),
-    )
+    # Gradients are contiguous whatever the input layout, like the forward output.
+    return tuple(tensor.new_empty(tensor.shape) for tensor in (q, k, v, cumulative_gate, beta))
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_bwd_with_state_grad")
