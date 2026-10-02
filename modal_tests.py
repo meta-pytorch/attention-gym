@@ -26,6 +26,11 @@ COMPILE_CACHE_PATH = Path("/tmp/compile-cache")
 # Every cache is content-keyed, so pruning costs only recompiles. CuTe and Inductor keys include
 # the torch version, and the nightly changes daily, so older entries are rarely reusable.
 CACHE_MAX_AGE_SECONDS = 3 * 24 * 60 * 60
+# The first run after the daily nightly rebuild recompiles every kernel; compilation is
+# CPU-bound per pytest worker, so give each worker its own core. Keep the timeout well above a
+# cold run: a timed-out container never saves its compile cache, so the next run is cold again.
+PYTEST_WORKERS = 12
+SUITE_TIMEOUT_SECONDS = 45 * 60
 CACHE_ENV = {
     "ATTN_GYM_CUTE_CACHE_DIR": f"{COMPILE_CACHE_PATH}/attn_gym_cute",
     "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": f"{COMPILE_CACHE_PATH}/flash_attn_cute",
@@ -138,7 +143,7 @@ def verify_wheel_install() -> None:
 
 
 def execute_pytest(
-    test_paths: list[str], report_path: Path, title: str, *, workers: int = 4
+    test_paths: list[str], report_path: Path, title: str, *, workers: int = PYTEST_WORKERS
 ) -> tuple[int, str]:
     """Run one isolated dependency-compatible pytest suite."""
     verify_wheel_install()
@@ -213,8 +218,12 @@ def persistent_compile_cache(suite: str) -> Iterator[None]:
         CACHE_VOLUME.commit()
 
 
-# Four compile-heavy pytest workers should not depend on spare host CPU capacity.
-@app.function(gpu="B200", cpu=4.0, timeout=30 * 60, volumes={CACHE_VOLUME_PATH: CACHE_VOLUME})
+@app.function(
+    gpu="B200",
+    cpu=float(PYTEST_WORKERS),
+    timeout=SUITE_TIMEOUT_SECONDS,
+    volumes={CACHE_VOLUME_PATH: CACHE_VOLUME},
+)
 def run_pytest() -> tuple[int, str]:
     """Check FA4 sink support before running the ordinary repository suite."""
     with persistent_compile_cache("main"):
@@ -235,8 +244,8 @@ def run_pytest() -> tuple[int, str]:
 @app.function(
     image=cudnn_image,
     gpu="B200",
-    cpu=4.0,
-    timeout=30 * 60,
+    cpu=float(PYTEST_WORKERS),
+    timeout=SUITE_TIMEOUT_SECONDS,
     volumes={CACHE_VOLUME_PATH: CACHE_VOLUME},
 )
 def run_cudnn_pytest() -> tuple[int, str]:
