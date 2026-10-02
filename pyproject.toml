@@ -26,7 +26,7 @@ dependencies = [
 
 [project.optional-dependencies]
 linear = [
-    "nvidia-cutlass-dsl[cu13]>=4.6.2; sys_platform == 'linux'",
+    "nvidia-cutlass-dsl[cu13]>=4.6.0; sys_platform == 'linux'",
     "apache-tvm-ffi>=0.1.11",
     "packaging",
 ]
