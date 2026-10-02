@@ -14,11 +14,12 @@ from attn_gym.linear._delta_rule.validation import (
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_gdn`` backend selection and cuDNN split switches."""
+    """Validated ``chunk_gdn`` backend selection and backend-specific switches."""
 
     backend: Literal["fused", "cudnn"]
     split_backward: bool
     split_forward: bool
+    save_chunk_states: bool = False
 
 
 def resolve_kernel_options(
@@ -27,11 +28,15 @@ def resolve_kernel_options(
     """Validate chunk backend options while keeping the repo-local path as default."""
     if kernel_options is None:
         return ResolvedKernelOptions("fused", False, False)
-    return ResolvedKernelOptions(
-        *resolve_backend_options(
-            kernel_options, op_name="chunk_gdn", fields=ResolvedKernelOptions._fields
-        )
+    backend, split_backward, split_forward = resolve_backend_options(
+        kernel_options, op_name="chunk_gdn", fields=ResolvedKernelOptions._fields
     )
+    save_chunk_states = kernel_options.get("save_chunk_states", False)
+    if not isinstance(save_chunk_states, bool):
+        raise TypeError("kernel_options['save_chunk_states'] must be a bool")
+    if save_chunk_states and backend != "fused":
+        raise ValueError("save_chunk_states requires kernel_options['backend']='fused'")
+    return ResolvedKernelOptions(backend, split_backward, split_forward, save_chunk_states)
 
 
 def validate_gdn_inputs(
