@@ -516,6 +516,10 @@ Do not infer CUDA Graph compatibility from a successful `torch.compile` call.
   supported dynamic-shape contract.
 - **Compile-only mismatch:** compare eager and compiled calls to the same selected backend before
   debugging the low-level kernel.
+- **`assert_size_stride` failure only in a warm cache:** Inductor's graph caches do not key on fake
+  implementations, so after changing a fake's strides a persistent `TORCHINDUCTOR_CACHE_DIR`
+  replays graphs built from the old fake. Rerun with a fresh cache dir before debugging; after
+  such a change lands, clear the Modal `attention-gym-compile-cache` Volume tarballs.
 
 ## Required completion report
 
