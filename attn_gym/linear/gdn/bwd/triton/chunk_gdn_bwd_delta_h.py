@@ -30,7 +30,7 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
         triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
         triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
     ],
-    key=["T", "H", "HK", "K", "V", "IS_VARLEN"],
+    key=["H", "HK", "K", "V", "IS_VARLEN"],
     prune_configs_by={
         "early_config_prune": lambda configs, _named_args, K, V, **_: [
             config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
