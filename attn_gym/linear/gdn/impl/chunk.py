@@ -65,7 +65,7 @@ def use_blackwell_backward(q: torch.Tensor, v: torch.Tensor) -> bool:
 
 
 def require_fp32(**tensors: torch.Tensor | None) -> None:
-    """Pin the FP32 gate/beta/state contract that the registered fakes advertise."""
+    """Require the FP32 gate, beta, and state that the kernels and fakes assume."""
     for name, tensor in tensors.items():
         if tensor is not None and tensor.dtype != torch.float32:
             raise TypeError(f"fused chunk_gdn requires float32 {name}, got {tensor.dtype}")

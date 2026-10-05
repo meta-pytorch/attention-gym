@@ -10,17 +10,15 @@ Use this workflow whenever adding a backend under `attn_gym/linear/<variant>/imp
 
 ## New operator checklist
 
-1. Register a fixed-arity `define`/`impl` pair, with a `torch.autograd.Function` wrapper for
-   training (pattern below).
-2. Write each fake from the launcher's real allocations: same shapes, dtypes, and strides.
-3. `opcheck` every op with compact inputs and with a dense permuted layout of each tensor
-   input (`p.t().contiguous().t()`; token-innermost `x.movedim(1, -1).contiguous()
-   .movedim(-1, 1)`, the `conv1d(...).transpose(1, 2)` layout). Padded or sliced inputs do not
-   substitute: `empty_like` of a non-dense tensor is already contiguous, so a buggy fake passes
-   (the GDN chunk fakes hid behind `token_strided_like` this way).
-4. Compare against the reference oracle, compile the public function with `fullgraph=True`
-   (dynamic shapes and CUDA Graphs when claimed), and run on every supported architecture;
-   Hopper and Blackwell often dispatch different backends with different allocations.
+1. Pick the integration below; for an opaque kernel, register a fixed-arity `define`/`impl`
+   pair plus an autograd wrapper.
+2. Write each fake from the launcher's real allocations (see the fake rules below).
+3. `opcheck` with compact inputs and a dense permuted layout of each tensor input
+   (`p.t().contiguous().t()`, or token-innermost `x.movedim(1, -1).contiguous().movedim(-1, 1)`).
+   Padded or sliced inputs do not substitute: `empty_like` of a non-dense tensor is already
+   contiguous, so a stride-copying fake still passes.
+4. Validate numerics and `fullgraph=True` compile on every supported architecture; Hopper and
+   Blackwell often dispatch backends that allocate differently.
 
 ## Choose the least opaque integration
 
@@ -397,8 +395,7 @@ Create separate cases for materially different registration paths:
 - each supported device and dtype;
 - inference and gradient-requiring inputs;
 - optional arguments and outputs;
-- contiguous and intentionally supported non-contiguous layouts, including at least one dense
-  permuted layout per tensor input (see the checklist above);
+- contiguous, dense permuted (see the checklist), and other supported layouts;
 - boundary, non-aligned, and zero-size shapes when supported;
 - mutable inputs;
 - dynamic dimensions.

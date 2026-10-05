@@ -129,7 +129,7 @@ def _chunk_fwd_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, cumulative_gate, beta, initial_state, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
-    # Kernels write contiguous outputs; empty_like would inherit permuted input strides.
+    # The chunk fakes mirror the kernels' fresh contiguous outputs, not the input strides.
     return v.new_empty(v.shape), inverse
 
 

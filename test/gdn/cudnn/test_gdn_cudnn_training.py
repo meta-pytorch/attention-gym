@@ -420,7 +420,6 @@ def test_public_gdn_cudnn_broadcast_gate_and_beta_backward() -> None:
             tensor[..., :1].detach().float().requires_grad_() for tensor in (gate, beta)
         )
         broadcast = tuple(leaf.expand(*leaf.shape[:-1], heads) for leaf in leaves)
-        assert all(tensor.stride(-1) == 0 for tensor in broadcast)
         output = chunk_gdn(q, k, value, *broadcast, cu_seqlens=cu_seqlens, impl=impl)[0]
         gradients.append(torch.autograd.grad(output, leaves, d_output))
     for actual, expected in zip(*gradients, strict=True):

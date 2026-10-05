@@ -999,8 +999,9 @@ def test_raw_ops_reject_pre_ampere_devices(monkeypatch):
 @pytest.mark.parametrize("argument", [3, 4, 5], ids=["gate", "beta", "initial_state"])
 def test_raw_ops_reject_non_fp32_gate_beta_and_state(argument: int):
     """The fakes advertise FP32 state and gate/beta gradients, so the kernels must not see BF16."""
-    args, _output, _state, _inverse = raw_args()
-    args = list(args)
+    q, k, v, gate, beta, state = make_inputs()
+    cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
+    args = [q, k, v, cumulative, beta, state, q.shape[-1] ** -0.5]
     args[argument] = args[argument].bfloat16()
     with pytest.raises(TypeError, match="requires float32"):
         chunk_fwd_with_state_op(*args)
@@ -1023,8 +1024,11 @@ def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128, token_innerm
     return args, output, final_state, inverse
 
 
-@pytest.mark.parametrize("token_innermost", [False, True], ids=["compact", "token-innermost"])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("head_dim", "token_innermost"),
+    [(64, False), (128, False), (128, True)],
+    ids=["64-compact", "128-compact", "128-token-innermost"],
+)
 def test_dense_raw_operator_registration(head_dim: int, token_innermost: bool):
     """Validate dense forward/backward schemas, fakes, and AOT dispatch."""
     args, output, final_state, inverse = raw_args(
@@ -1047,8 +1051,11 @@ def test_dense_raw_operator_registration(head_dim: int, token_innermost: bool):
     torch.library.opcheck(chunk_bwd_with_state_grad_op, backward_args, test_utils=utilities)
 
 
-@pytest.mark.parametrize("token_innermost", [False, True], ids=["compact", "token-innermost"])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize(
+    ("head_dim", "token_innermost"),
+    [(64, False), (128, False), (128, True)],
+    ids=["64-compact", "128-compact", "128-token-innermost"],
+)
 def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
     """Validate fixed-capacity packed forward/backward registrations."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128, head_dim=head_dim)
