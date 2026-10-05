@@ -8,6 +8,20 @@ description: Ensures new Attention Gym eager, Triton, CuTeDSL, and external-libr
 Use this workflow whenever adding a backend under `attn_gym/linear/<variant>/impl/` or
 `attn_gym/sparse/<variant>/impl/`.
 
+## New operator checklist
+
+1. Register a fixed-arity `define`/`impl` pair, with a `torch.autograd.Function` wrapper for
+   training (pattern below).
+2. Write each fake from the launcher's real allocations: same shapes, dtypes, and strides.
+3. `opcheck` every op with compact inputs and with a dense permuted layout of each tensor
+   input (`p.t().contiguous().t()`; token-innermost `x.movedim(1, -1).contiguous()
+   .movedim(-1, 1)`, the `conv1d(...).transpose(1, 2)` layout). Padded or sliced inputs do not
+   substitute: `empty_like` of a non-dense tensor is already contiguous, so a buggy fake passes
+   (the GDN chunk fakes hid behind `token_strided_like` this way).
+4. Compare against the reference oracle, compile the public function with `fullgraph=True`
+   (dynamic shapes and CUDA Graphs when claimed), and run on every supported architecture;
+   Hopper and Blackwell often dispatch different backends with different allocations.
+
 ## Choose the least opaque integration
 
 1. **Eager/reference implementation:** keep ordinary PyTorch code traceable. Do not create a custom
@@ -126,7 +140,7 @@ torch.library.impl("attn_gym::example_fwd", "CUDA", _example_fwd_cuda)
 def _example_fwd_fake(
     query: Tensor, key: Tensor, value: Tensor, initial_state: Tensor | None
 ) -> tuple[Tensor, Tensor]:
-    return torch.empty_like(value), query.new_empty(query.shape[:2])
+    return value.new_empty(value.shape), query.new_empty(query.shape[:2])
 
 
 _example_fwd = torch.ops.attn_gym.example_fwd.default
@@ -181,11 +195,11 @@ Schema rules:
 The fake implementation describes output metadata without running the kernel. It must:
 
 - return the same output structure as the real implementation;
-- preserve shape, dtype, device, layout, and relevant strides. For outputs the kernel allocates
-  fresh, use `x.new_empty(shape)` / `torch.empty(...)`, never `torch.empty_like(x)`:
-  `empty_like` preserves the strides of a dense-but-permuted input while the kernel writes a
-  contiguous result, and Inductor then fails `assert_size_stride`. Include a transposed
-  parameter (`p.t().contiguous().t()`) in the `opcheck` inputs to pin this;
+- preserve shape, dtype, device, layout, and relevant strides. Allocate outputs contiguously
+  in both the launcher and the fake (`x.new_empty(shape)` / `torch.empty(...)`), not with
+  `torch.empty_like(x)`: it copies a dense permuted input's strides, so the fake can disagree
+  with the kernel (Inductor `assert_size_stride` failure) and a kernel indexing outputs with
+  contiguous offsets writes the wrong elements;
 - avoid reading tensor values, storage, data pointers, or calling `.item()`;
 - use symbolic shape arithmetic rather than data-dependent Python branches.
 
@@ -383,7 +397,8 @@ Create separate cases for materially different registration paths:
 - each supported device and dtype;
 - inference and gradient-requiring inputs;
 - optional arguments and outputs;
-- contiguous and intentionally supported non-contiguous layouts;
+- contiguous and intentionally supported non-contiguous layouts, including at least one dense
+  permuted layout per tensor input (see the checklist above);
 - boundary, non-aligned, and zero-size shapes when supported;
 - mutable inputs;
 - dynamic dimensions.

@@ -152,13 +152,15 @@ def test_recomputed_factors_backward_with_state_matches_saved_factors():
         torch.testing.assert_close(got, ref, rtol=0, atol=0)
 
 
-def test_recomputed_factors_backward_op_registration():
+@pytest.mark.parametrize("head_major_state", [False, True], ids=["compact", "head-major-state"])
+def test_recomputed_factors_backward_op_registration(head_major_state: bool):
     from attn_gym.linear.kda.ops import (
         chunk_bwd_recompute_factors_op,
         chunk_bwd_recompute_factors_with_state_grad_op,
     )
 
-    q, k, v, gate, beta, _ = inputs([64], heads=1)
+    heads = 2 if head_major_state else 1
+    q, k, v, gate, beta, _ = inputs([64], heads=heads)
     d_output = torch.randn_like(v)
     torch.library.opcheck(
         chunk_bwd_recompute_factors_op,
@@ -167,7 +169,10 @@ def test_recomputed_factors_backward_op_registration():
         rtol=2e-2,
         atol=2e-3,
     )
-    initial_state = torch.randn(1, 1, D, D, device="cuda") / 8
+    initial_state = torch.randn(1, heads, D, D, device="cuda") / 8
+    if head_major_state:
+        # Dense but permuted: Hopper and SM100 must both return a contiguous gradient.
+        initial_state = initial_state.transpose(1, 2).contiguous().transpose(1, 2)
     torch.library.opcheck(
         chunk_bwd_recompute_factors_with_state_grad_op,
         (

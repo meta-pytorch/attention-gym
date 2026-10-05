@@ -463,7 +463,8 @@ def _delta_h_launch(
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
-    v_new = torch.empty_like(u)
+    # Contiguous: the kernel also stores v_new through raw (H * V, V, 1) offsets.
+    v_new = u.new_empty(u.shape)
     scalar_gate = gk.ndim == 3
     if scalar_gate:
         gk = gk.contiguous()
@@ -791,7 +792,7 @@ def chunk_gated_delta_rule_fwd_h(
                 if initial_state is not None
                 else torch.zeros(expected_state_shape, dtype=torch.float32, device=k.device)
             )
-        return h, torch.empty_like(u), final_state
+        return h, u.new_empty(u.shape), final_state
 
     if not all(can_use_tensor_descriptor(t) for t in (k, w, u)):
         raise ValueError(

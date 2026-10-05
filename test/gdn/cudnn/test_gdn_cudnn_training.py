@@ -23,7 +23,11 @@ from attn_gym.linear.gdn.impl.cudnn_ops import (
     chunk_gdn_cudnn_packed_fwd_with_state_op,
 )
 from attn_gym.testing import make_gdn_test_inputs
-from attn_gym.testing.kda import assert_matches_low_precision_reference, clone_kda_inputs
+from attn_gym.testing.kda import (
+    assert_matches_low_precision_reference,
+    clone_kda_inputs,
+    relative_rms_error,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
@@ -401,6 +405,26 @@ def test_public_gdn_cudnn_casts_low_precision_gate_and_beta_with_gradients() -> 
             f"low-precision gate {name}",
             source_dtype=torch.bfloat16,
         )
+
+
+def test_public_gdn_cudnn_broadcast_gate_and_beta_backward() -> None:
+    """Stride-0 FP32 gate/beta reach the cuDNN ops unchanged; backward must still run."""
+    q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
+        (65, 63), key_heads=2, value_heads=2, seed=331
+    )
+    heads = gate.shape[-1]
+    d_output = torch.randn_like(value)
+    gradients = []
+    for impl in ("fused", "reference"):
+        leaves = tuple(
+            tensor[..., :1].detach().float().requires_grad_() for tensor in (gate, beta)
+        )
+        broadcast = tuple(leaf.expand(*leaf.shape[:-1], heads) for leaf in leaves)
+        assert all(tensor.stride(-1) == 0 for tensor in broadcast)
+        output = chunk_gdn(q, k, value, *broadcast, cu_seqlens=cu_seqlens, impl=impl)[0]
+        gradients.append(torch.autograd.grad(output, leaves, d_output))
+    for actual, expected in zip(*gradients, strict=True):
+        assert relative_rms_error(actual, expected) < 2e-2
 
 
 def test_public_gdn_cudnn_no_state_backward_initializes_cuda_device() -> None:

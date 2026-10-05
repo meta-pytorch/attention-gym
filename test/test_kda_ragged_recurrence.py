@@ -421,19 +421,23 @@ def test_ragged_recurrence_persistent_cuda_graph_replays_active_sequences(
         assert final_state is None and expected_final is None
 
 
-def test_delta_h_opcheck():
+@pytest.mark.parametrize("head_major_u", [False, True], ids=["compact", "head-major-u"])
+def test_delta_h_opcheck(head_major_u: bool):
     """Schema/fake consistency for the registered op pair, dense and ragged."""
     from attn_gym.linear.kda.ops import delta_h_op, delta_h_with_state_op
 
     torch.manual_seed(5)
     lengths = [65, 63]
     tokens = sum(lengths)
-    shape = (1, tokens, 1, 128)
+    shape = (1, tokens, 2, 128)
     k = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
     w = torch.randn_like(k) / 8
     u = torch.randn_like(k) / 8
+    if head_major_u:
+        # Dense but permuted: empty_like(u) would inherit these strides for v_new.
+        u = u.transpose(1, 2).contiguous().transpose(1, 2)
     gk = -torch.rand(shape, device="cuda")
-    initial_state = torch.randn(2, 1, 128, 128, device="cuda") / 8
+    initial_state = torch.randn(2, 2, 128, 128, device="cuda") / 8
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
     ragged_args = (
         k,

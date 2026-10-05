@@ -996,6 +996,16 @@ def test_raw_ops_reject_pre_ampere_devices(monkeypatch):
         chunk_fwd_with_state_op(*args)
 
 
+@pytest.mark.parametrize("argument", [3, 4, 5], ids=["gate", "beta", "initial_state"])
+def test_raw_ops_reject_non_fp32_gate_beta_and_state(argument: int):
+    """The fakes advertise FP32 state and gate/beta gradients, so the kernels must not see BF16."""
+    args, _output, _state, _inverse = raw_args()
+    args = list(args)
+    args[argument] = args[argument].bfloat16()
+    with pytest.raises(TypeError, match="requires float32"):
+        chunk_fwd_with_state_op(*args)
+
+
 def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128, token_innermost: bool = False):
     """Construct detached raw-op arguments and their forward tapes."""
     q, k, v, gate, beta, state = make_inputs(

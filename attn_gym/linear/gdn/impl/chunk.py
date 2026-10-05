@@ -64,6 +64,13 @@ def use_blackwell_backward(q: torch.Tensor, v: torch.Tensor) -> bool:
     )
 
 
+def require_fp32(**tensors: torch.Tensor | None) -> None:
+    """Pin the FP32 gate/beta/state contract that the registered fakes advertise."""
+    for name, tensor in tensors.items():
+        if tensor is not None and tensor.dtype != torch.float32:
+            raise TypeError(f"fused chunk_gdn requires float32 {name}, got {tensor.dtype}")
+
+
 def reject_int64_offsets(*tensors: torch.Tensor | None) -> None:
     """Reject layouts that need the not-yet-implemented wide-address specialization."""
     if requires_int64_offsets(*tensors):
@@ -147,6 +154,7 @@ def chunk_gdn_fwd_dense(
         raise ValueError("dense fused chunk GDN requires matching Q/K and H % HK == 0")
     if cumulative_gate.shape != v.shape[:3] or beta.shape != v.shape[:3]:
         raise ValueError("cumulative_gate and beta must have shape [B,T,H]")
+    require_fp32(cumulative_gate=cumulative_gate, beta=beta, initial_state=initial_state)
     if initial_state is None:
         initial_state = zero_state(q, v, None)
     reject_int64_offsets(q, k, v, cumulative_gate, beta, initial_state)
@@ -214,6 +222,7 @@ def chunk_gdn_fwd_packed(
         raise ValueError("packed fused chunk GDN requires B=1 and K=V in {64, 128}")
     if k.shape != q.shape or v.shape[:2] != q.shape[:2] or value_heads % key_heads:
         raise ValueError("packed fused chunk GDN requires matching Q/K and H % HK == 0")
+    require_fp32(cumulative_gate=cumulative_gate, beta=beta, initial_state=initial_state)
     reject_int64_offsets(q, k, v, cumulative_gate, beta, initial_state)
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     cumulative_gate, beta = (
@@ -291,6 +300,7 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         raise ValueError("paged fused chunk GDN requires matching Q/K and H % HK == 0")
     if cumulative_gate.shape != v.shape[:3] or beta.shape != v.shape[:3]:
         raise ValueError("cumulative_gate and beta must have shape [B,T,H]")
+    require_fp32(cumulative_gate=cumulative_gate, beta=beta)
     validate_paged_state(
         q,
         v,
@@ -377,6 +387,7 @@ def chunk_gdn_bwd(
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate dense or packed fused chunk GDN through one shared protocol."""
     validate_supported_device(q)
+    require_fp32(cumulative_gate=cumulative_gate, beta=beta, initial_state=initial_state)
     reject_int64_offsets(
         q,
         k,

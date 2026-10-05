@@ -567,7 +567,7 @@ def _chunk_bwd_with_state_grad_fake(
     )
     return (
         *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
-        torch.empty_like(initial_state),
+        initial_state.new_empty(initial_state.shape, dtype=torch.float32),
     )
 
 
@@ -613,7 +613,7 @@ def _chunk_bwd_recompute_factors_with_state_grad_fake(
     del cu_seqlens, chunk_offsets, d_output, d_final_state, scale, fastmath, autotune, schedule
     return (
         *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
-        torch.empty_like(initial_state),
+        initial_state.new_empty(initial_state.shape, dtype=torch.float32),
     )
 
 
@@ -741,7 +741,7 @@ def _delta_h_with_state_fake(
     h, v_new = _delta_h_fake_common(k, u, capacity)
     state_batch = k.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     final_state = k.new_empty(
-        (state_batch, k.shape[2], k.shape[3], u.shape[-1]), dtype=torch.float32
+        (state_batch, k.shape[2], u.shape[-1], k.shape[3]), dtype=torch.float32
     )
     return h, v_new, final_state
 

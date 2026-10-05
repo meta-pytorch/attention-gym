@@ -2489,7 +2489,10 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         raise ValueError(f"bv must be 16 or 32, got {bv}")
 
     chunk_state = q.new_empty(1, metadata.capacity, heads, key_dim, value_dim)
-    d_initial_state = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
+    # Contiguous like the Hopper backward, so one fake describes both; strides are dynamic.
+    d_initial_state = (
+        torch.empty(h0.shape, dtype=torch.float32, device=h0.device) if h0 is not None else None
+    )
     d_value = torch.empty_like(do)
     if active_fake_mode() is not None:
         return chunk_state, d_initial_state, d_value
@@ -2606,7 +2609,9 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
             raise TypeError(f"{name} must be float32 with a contiguous key mode on q.device")
 
     dh_out = q.new_empty(B, T // BT, H, K, V)
-    dh0_out = torch.empty_like(h0, dtype=torch.float32) if h0 is not None else None
+    dh0_out = (
+        torch.empty(h0.shape, dtype=torch.float32, device=h0.device) if h0 is not None else None
+    )
     dv2 = torch.empty_like(do)
 
     if active_fake_mode() is not None:

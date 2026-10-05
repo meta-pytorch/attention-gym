@@ -82,7 +82,9 @@ def _validate_packed_boundaries(cu_seqlens: Tensor, q: Tensor) -> None:
 
 
 def _empty_with_layout(template: Tensor) -> Tensor:
-    """Allocate a tensor with exactly the template's shape, dtype, device, and strides."""
+    """Allocate with the template's strides, or contiguously if it broadcasts (stride 0)."""
+    if 0 in template.stride():
+        return template.new_empty(template.shape)
     return torch.empty_strided(
         template.shape,
         template.stride(),
