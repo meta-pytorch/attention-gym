@@ -129,8 +129,7 @@ def _chunk_fwd_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, cumulative_gate, beta, initial_state, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
-    # The kernels write a contiguous output for any input layout (for example the
-    # token-innermost values of a causal conv), so do not inherit v's strides.
+    # The chunk fakes mirror the kernels' fresh contiguous outputs, not the input strides.
     return v.new_empty(v.shape), inverse
 
 
@@ -166,7 +165,6 @@ def _chunk_fwd_packed_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, capacity, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
-    # Contiguous, as in _chunk_fwd_fake.
     return v.new_empty(v.shape), inverse
 
 
@@ -239,7 +237,6 @@ def _chunk_bwd_fake(
     scale: float,
 ) -> tuple[torch.Tensor, ...]:
     del inverse, d_output, d_final_state, initial_state, cu_seqlens, chunk_offsets, scale
-    # Gradients are contiguous whatever the input layout, like the forward output.
     return tuple(tensor.new_empty(tensor.shape) for tensor in (q, k, v, cumulative_gate, beta))
 
 

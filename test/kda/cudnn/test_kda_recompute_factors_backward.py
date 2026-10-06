@@ -158,7 +158,7 @@ def test_recomputed_factors_backward_op_registration():
         chunk_bwd_recompute_factors_with_state_grad_op,
     )
 
-    q, k, v, gate, beta, _ = inputs([64], heads=1)
+    q, k, v, gate, beta, _ = inputs([64])
     d_output = torch.randn_like(v)
     torch.library.opcheck(
         chunk_bwd_recompute_factors_op,
@@ -167,26 +167,28 @@ def test_recomputed_factors_backward_op_registration():
         rtol=2e-2,
         atol=2e-3,
     )
-    initial_state = torch.randn(1, 1, D, D, device="cuda") / 8
-    torch.library.opcheck(
-        chunk_bwd_recompute_factors_with_state_grad_op,
-        (
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            None,
-            None,
-            d_output,
-            torch.randn_like(initial_state),
-            initial_state,
-            D**-0.5,
-            False,
-            False,
-            "auto",
-        ),
-        test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
-        rtol=2e-2,
-        atol=2e-3,
-    )
+    state = torch.randn(1, q.shape[2], D, D, device="cuda") / 8
+    head_major_state = state.transpose(1, 2).contiguous().transpose(1, 2)
+    for initial_state in (state, head_major_state):
+        torch.library.opcheck(
+            chunk_bwd_recompute_factors_with_state_grad_op,
+            (
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                None,
+                None,
+                d_output,
+                torch.randn_like(initial_state),
+                initial_state,
+                D**-0.5,
+                False,
+                False,
+                "auto",
+            ),
+            test_utils=("test_schema", "test_faketensor", "test_aot_dispatch_dynamic"),
+            rtol=2e-2,
+            atol=2e-3,
+        )

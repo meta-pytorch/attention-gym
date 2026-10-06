@@ -3811,7 +3811,7 @@ def _default_backward_fake(
     activation: str | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del grad_output, cu_seqlens, activation
-    return x.new_empty(x.shape), torch.empty_like(weight)
+    return x.new_empty(x.shape), weight.new_empty(weight.shape)
 
 
 def _cute_short_conv_configured_fwd_cuda(
@@ -3994,7 +3994,7 @@ def _backward_fake(
         persistent_tma_input_gradient,
         activation,
     )
-    return x.new_empty(x.shape), torch.empty_like(weight)
+    return x.new_empty(x.shape), weight.new_empty(weight.shape)
 
 
 @torch.library.register_fake("attn_gym::_cute_short_conv_configured_bwd_with_state_grad")
@@ -4029,7 +4029,7 @@ def _backward_with_state_grad_fake(
     )
     return (
         x.new_empty(x.shape),
-        torch.empty_like(weight),
+        weight.new_empty(weight.shape),
         torch.empty_like(initial_state),
     )
 

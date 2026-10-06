@@ -8,6 +8,18 @@ description: Ensures new Attention Gym eager, Triton, CuTeDSL, and external-libr
 Use this workflow whenever adding a backend under `attn_gym/linear/<variant>/impl/` or
 `attn_gym/sparse/<variant>/impl/`.
 
+## New operator checklist
+
+1. Pick the integration below; for an opaque kernel, register a fixed-arity `define`/`impl`
+   pair plus an autograd wrapper.
+2. Write each fake from the launcher's real allocations (see the fake rules below).
+3. `opcheck` with compact inputs and a dense permuted layout of each tensor input
+   (`p.t().contiguous().t()`, or token-innermost `x.movedim(1, -1).contiguous().movedim(-1, 1)`).
+   Padded or sliced inputs do not substitute: `empty_like` of a non-dense tensor is already
+   contiguous, so a stride-copying fake still passes.
+4. Validate numerics and `fullgraph=True` compile on every supported architecture; Hopper and
+   Blackwell often dispatch backends that allocate differently.
+
 ## Choose the least opaque integration
 
 1. **Eager/reference implementation:** keep ordinary PyTorch code traceable. Do not create a custom
@@ -126,7 +138,7 @@ torch.library.impl("attn_gym::example_fwd", "CUDA", _example_fwd_cuda)
 def _example_fwd_fake(
     query: Tensor, key: Tensor, value: Tensor, initial_state: Tensor | None
 ) -> tuple[Tensor, Tensor]:
-    return torch.empty_like(value), query.new_empty(query.shape[:2])
+    return value.new_empty(value.shape), query.new_empty(query.shape[:2])
 
 
 _example_fwd = torch.ops.attn_gym.example_fwd.default
@@ -181,11 +193,11 @@ Schema rules:
 The fake implementation describes output metadata without running the kernel. It must:
 
 - return the same output structure as the real implementation;
-- preserve shape, dtype, device, layout, and relevant strides. For outputs the kernel allocates
-  fresh, use `x.new_empty(shape)` / `torch.empty(...)`, never `torch.empty_like(x)`:
-  `empty_like` preserves the strides of a dense-but-permuted input while the kernel writes a
-  contiguous result, and Inductor then fails `assert_size_stride`. Include a transposed
-  parameter (`p.t().contiguous().t()`) in the `opcheck` inputs to pin this;
+- preserve shape, dtype, device, layout, and relevant strides. Allocate outputs contiguously
+  in both the launcher and the fake (`x.new_empty(shape)` / `torch.empty(...)`), not with
+  `torch.empty_like(x)`: it copies a dense permuted input's strides, so the fake can disagree
+  with the kernel (Inductor `assert_size_stride` failure) and a kernel indexing outputs with
+  contiguous offsets writes the wrong elements;
 - avoid reading tensor values, storage, data pointers, or calling `.item()`;
 - use symbolic shape arithmetic rather than data-dependent Python branches.
 
@@ -383,7 +395,7 @@ Create separate cases for materially different registration paths:
 - each supported device and dtype;
 - inference and gradient-requiring inputs;
 - optional arguments and outputs;
-- contiguous and intentionally supported non-contiguous layouts;
+- contiguous, dense permuted (see the checklist), and other supported layouts;
 - boundary, non-aligned, and zero-size shapes when supported;
 - mutable inputs;
 - dynamic dimensions.
@@ -504,6 +516,10 @@ Do not infer CUDA Graph compatibility from a successful `torch.compile` call.
   supported dynamic-shape contract.
 - **Compile-only mismatch:** compare eager and compiled calls to the same selected backend before
   debugging the low-level kernel.
+- **`assert_size_stride` failure only in a warm cache:** Inductor's graph caches do not key on fake
+  implementations, so after changing a fake's strides a persistent `TORCHINDUCTOR_CACHE_DIR`
+  replays graphs built from the old fake. Rerun with a fresh cache dir before debugging; after
+  such a change lands, clear the Modal `attention-gym-compile-cache` Volume tarballs.
 
 ## Required completion report
 
