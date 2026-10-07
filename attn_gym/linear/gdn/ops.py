@@ -17,15 +17,19 @@ _CHUNK_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor? initial_state, float scale)"
 )
-torch.library.define("attn_gym::gdn_chunk_fwd", _CHUNK_ARGS + " -> (Tensor, Tensor)")
+# Chunk forwards return (output, [final_state,] inverse, h, v_new). inverse, h, and v_new are
+# backward tapes; _ChunkGDN drops the chunk states h and v_new unless save_chunk_states is set.
+torch.library.define(
+    "attn_gym::gdn_chunk_fwd", _CHUNK_ARGS + " -> (Tensor, Tensor, Tensor, Tensor)"
+)
 torch.library.define(
     "attn_gym::gdn_chunk_fwd_with_state",
-    _CHUNK_ARGS + " -> (Tensor, Tensor, Tensor)",
+    _CHUNK_ARGS + " -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 _CHUNK_BWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor inverse, "
     "Tensor d_output, Tensor? d_final_state, Tensor? initial_state, Tensor? cu_seqlens, "
-    "Tensor? chunk_offsets, float scale)"
+    "Tensor? chunk_offsets, float scale, Tensor? h=None, Tensor? v_new=None)"
 )
 torch.library.define(
     "attn_gym::gdn_chunk_bwd",
@@ -41,11 +45,11 @@ _CHUNK_PACKED_ARGS = (
 )
 torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed",
-    _CHUNK_PACKED_ARGS + " -> (Tensor, Tensor)",
+    _CHUNK_PACKED_ARGS + " -> (Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed_with_state",
-    _CHUNK_PACKED_ARGS + " -> (Tensor, Tensor, Tensor)",
+    _CHUNK_PACKED_ARGS + " -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed_paged",
@@ -126,11 +130,12 @@ def _chunk_fwd_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, ...]:
     del k, cumulative_gate, beta, initial_state, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
+    h = q.new_empty(q.shape[0], q.shape[1] // 64, v.shape[2], q.shape[-1], v.shape[-1])
     # The chunk fakes mirror the kernels' fresh contiguous outputs, not the input strides.
-    return v.new_empty(v.shape), inverse
+    return v.new_empty(v.shape), inverse, h, v.new_empty(v.shape)
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_fwd_with_state")
@@ -142,12 +147,14 @@ def _chunk_fwd_with_state_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    output, inverse = _chunk_fwd_fake(q, k, v, cumulative_gate, beta, initial_state, scale)
+) -> tuple[torch.Tensor, ...]:
+    output, inverse, h, v_new = _chunk_fwd_fake(
+        q, k, v, cumulative_gate, beta, initial_state, scale
+    )
     final_state = q.new_empty(
         q.shape[0], v.shape[2], v.shape[-1], q.shape[-1], dtype=torch.float32
     )
-    return output, final_state, inverse
+    return output, final_state, inverse, h, v_new
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_fwd_packed")
@@ -162,10 +169,11 @@ def _chunk_fwd_packed_fake(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, capacity, scale
+) -> tuple[torch.Tensor, ...]:
+    del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, scale
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
-    return v.new_empty(v.shape), inverse
+    h = q.new_empty(q.shape[0], capacity, v.shape[2], q.shape[-1], v.shape[-1])
+    return v.new_empty(v.shape), inverse, h, v.new_empty(v.shape)
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_fwd_packed_with_state")
@@ -180,8 +188,8 @@ def _chunk_fwd_packed_with_state_fake(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    output, inverse = _chunk_fwd_packed_fake(
+) -> tuple[torch.Tensor, ...]:
+    output, inverse, h, v_new = _chunk_fwd_packed_fake(
         q,
         k,
         v,
@@ -200,7 +208,7 @@ def _chunk_fwd_packed_with_state_fake(
         q.shape[-1],
         dtype=torch.float32,
     )
-    return output, final_state, inverse
+    return output, final_state, inverse, h, v_new
 
 
 @torch.library.register_fake("attn_gym::gdn_chunk_fwd_packed_paged")
@@ -235,8 +243,10 @@ def _chunk_bwd_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     scale: float,
+    h: torch.Tensor | None = None,
+    v_new: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    del inverse, d_output, d_final_state, initial_state, cu_seqlens, chunk_offsets, scale
+    del inverse, d_output, d_final_state, initial_state, cu_seqlens, chunk_offsets, scale, h, v_new
     return tuple(tensor.new_empty(tensor.shape) for tensor in (q, k, v, cumulative_gate, beta))
 
 
@@ -254,6 +264,8 @@ def _chunk_bwd_with_state_grad_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     scale: float,
+    h: torch.Tensor | None = None,
+    v_new: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
     outputs = _chunk_bwd_fake(
         q,
@@ -376,6 +388,7 @@ class _ChunkGDN(torch.autograd.Function):
         capacity,
         scale,
         output_final_state,
+        save_chunk_states,
     ):
         cumulative_gate = _plain_gate_scan_op(
             gate.unsqueeze(-1), cu_seqlens, chunk_offsets, False
@@ -383,9 +396,9 @@ class _ChunkGDN(torch.autograd.Function):
         if cu_seqlens is None:
             args = (q, k, v, cumulative_gate, beta, initial_state, scale)
             if output_final_state:
-                output, final_state, inverse = chunk_fwd_with_state_op(*args)
+                output, final_state, inverse, h, v_new = chunk_fwd_with_state_op(*args)
             else:
-                output, inverse = chunk_fwd_op(*args)
+                output, inverse, h, v_new = chunk_fwd_op(*args)
         else:
             args = (
                 q,
@@ -400,9 +413,11 @@ class _ChunkGDN(torch.autograd.Function):
                 scale,
             )
             if output_final_state:
-                output, final_state, inverse = chunk_fwd_packed_with_state_op(*args)
+                output, final_state, inverse, h, v_new = chunk_fwd_packed_with_state_op(*args)
             else:
-                output, inverse = chunk_fwd_packed_op(*args)
+                output, inverse, h, v_new = chunk_fwd_packed_op(*args)
+        if not save_chunk_states:
+            h = v_new = None  # Free them now; the backward recomputes them.
         ctx.save_for_backward(
             q,
             k,
@@ -413,6 +428,8 @@ class _ChunkGDN(torch.autograd.Function):
             initial_state,
             cu_seqlens,
             chunk_offsets,
+            h,
+            v_new,
         )
         ctx.scale = scale
         ctx.set_materialize_grads(False)
@@ -433,6 +450,8 @@ class _ChunkGDN(torch.autograd.Function):
             initial_state,
             cu_seqlens,
             chunk_offsets,
+            h,
+            v_new,
         ) = ctx.saved_tensors
         if d_output is None:
             d_output = torch.zeros_like(v)
@@ -449,13 +468,15 @@ class _ChunkGDN(torch.autograd.Function):
             cu_seqlens,
             chunk_offsets,
             ctx.scale,
+            h,
+            v_new,
         )
         if initial_state is not None:
             dq, dk, dv, d_gate, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
         else:
             dq, dk, dv, d_gate, db = chunk_bwd_op(*args)
             d_initial_state = None
-        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None
+        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None, None
 
 
 def _validate_fused_chunk_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -483,6 +504,7 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     output_final_state: bool,
+    save_chunk_states: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Route dense inputs and invoke the fused scalar chunk forward operator."""
     _validate_fused_chunk_qkv(q, k, v)
@@ -518,6 +540,7 @@ def chunk_forward(
         capacity,
         scale,
         output_final_state,
+        save_chunk_states,
     )
     if output_final_state:
         output, final_state = result
