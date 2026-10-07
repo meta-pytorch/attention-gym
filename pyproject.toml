@@ -100,6 +100,8 @@ markers = ["full_autotune: exercise every production Triton autotuning candidate
 [tool.ruff]
 target-version = "py310"
 line-length = 99
+# Apply excludes to paths passed explicitly, as pre-commit does.
+force-exclude = true
 # Exclude a variety of commonly ignored directories.
 exclude = [
     ".bzr",
@@ -130,6 +132,11 @@ exclude = [
     "venv",
     "*.ipynb",
 ]
+
+[tool.ruff.format]
+# Markdown code blocks hold pymdownx snippet directives (`--8<-- "file:section"`) that the
+# formatter rewrites as Python expressions, breaking the includes.
+exclude = ["*.md"]
 
 [tool.ruff.lint]
 ignore = ['E231', 'E731']
