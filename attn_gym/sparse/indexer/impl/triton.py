@@ -64,7 +64,7 @@ def _index_kernel(
         if CAUSAL:
             local_position = query - tl.load(CuQ + offset)
             end = tl.minimum(end, begin + (local_position + 1) // RATIO)
-    if end - begin <= TOPK:
+    if S <= TOPK or end - begin <= TOPK:
         # Every visible candidate is selected, so scores cannot change membership.
         indices = tl.where(rank < end - begin, rank, -1)
         tl.store(Out + ptr_offset((batch, query, rank), (T * TOPK, TOPK, 1)), indices, rank < TOPK)
