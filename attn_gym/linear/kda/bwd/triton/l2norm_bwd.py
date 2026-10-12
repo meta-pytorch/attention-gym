@@ -30,7 +30,8 @@ _BT_LIST = [8, 16, 32, 64, 128]
 
 
 @triton.autotune(
-    configs=[triton.Config({"BT": bt}, num_warps=w) for w in [1, 2, 4, 8, 16] for bt in _BT_LIST],
+    # The first config is the pinned autotune=False schedule: BT=8 with two warps.
+    configs=[triton.Config({"BT": bt}, num_warps=w) for w in [2, 1, 4, 8, 16] for bt in _BT_LIST],
     # NB selects a tuned schedule, not a different binary for each row count.
     key=["D", "NB"],
     **autotune_cache_kwargs,
