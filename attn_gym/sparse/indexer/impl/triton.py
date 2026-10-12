@@ -53,15 +53,6 @@ def _index_kernel(
     if WIDE:
         batch = batch.to(tl.int64)
         query = query.to(tl.int64)
-    heads = tl.arange(0, BH)
-    if WIDE:
-        heads = heads.to(tl.int64)
-    weights = tl.load(W + ptr_offset((batch, query, heads), (WB, WT, WH)), heads < H, 0).to(
-        tl.float32
-    )
-    # TMA coordinates are int32; the descriptor handles wide byte strides.
-    q = Q.load([batch.to(tl.int32), query.to(tl.int32), 0, 0]).reshape(BH, BD)
-    best = tl.full((KEEP,), -9223372036854775808, tl.int64)
     rank = tl.arange(0, KEEP)
     begin = 0
     end = (query + 1) // RATIO if CAUSAL else S
@@ -73,6 +64,21 @@ def _index_kernel(
         if CAUSAL:
             local_position = query - tl.load(CuQ + offset)
             end = tl.minimum(end, begin + (local_position + 1) // RATIO)
+    if S <= TOPK or end - begin <= TOPK:
+        # Every visible candidate is selected, so scores cannot change membership.
+        indices = tl.where(rank < end - begin, rank, -1)
+        tl.store(Out + ptr_offset((batch, query, rank), (T * TOPK, TOPK, 1)), indices, rank < TOPK)
+        return
+
+    heads = tl.arange(0, BH)
+    if WIDE:
+        heads = heads.to(tl.int64)
+    weights = tl.load(W + ptr_offset((batch, query, heads), (WB, WT, WH)), heads < H, 0).to(
+        tl.float32
+    )
+    # TMA coordinates are int32; the descriptor handles wide byte strides.
+    q = Q.load([batch.to(tl.int32), query.to(tl.int32), 0, 0]).reshape(BH, BD)
+    best = tl.full((KEEP,), -9223372036854775808, tl.int64)
     for start in tl.range(begin, end, BN):
         k = K.load([batch.to(tl.int32), start.to(tl.int32), 0]).reshape(BN, BD)
         dots = tl.dot(k, tl.trans(q))
