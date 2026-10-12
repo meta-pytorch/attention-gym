@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import PinnedConfigKernel, ptr_offset
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
@@ -178,7 +178,8 @@ def _l2norm_fwd_fake(
 
 torch.library.define(
     "attn_gym::kda_l2norm_bwd",
-    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None) -> Tensor",
+    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None, bool autotune=True) "
+    "-> Tensor",
 )
 
 
@@ -187,6 +188,7 @@ def _l2norm_bwd_cuda(
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """Launch L2Norm backward behind the same opaque stride boundary."""
     from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
@@ -198,7 +200,8 @@ def _l2norm_bwd_cuda(
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
     row_stride = _l2norm_row_stride(x)
     dy_row_stride = _l2norm_row_stride(d_output)
-    l2norm_bwd_kernel[grid](
+    kernel = l2norm_bwd_kernel if autotune else PinnedConfigKernel(l2norm_bwd_kernel)
+    kernel[grid](
         x,
         rstd,
         d_output,
@@ -231,9 +234,10 @@ def _l2norm_bwd_fake(
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """Describe input-gradient metadata without reading the packed endpoint."""
-    del rstd, d_output, cu_seqlens
+    del rstd, d_output, cu_seqlens, autotune
     return torch.empty_like(x, memory_format=torch.contiguous_format)
 
 
@@ -248,6 +252,7 @@ class _L2Norm(torch.autograd.Function):
         x: torch.Tensor,
         eps: float,
         cu_seqlens: torch.Tensor | None,
+        autotune: bool,
     ) -> torch.Tensor:
         output, rstd = _l2norm_fwd_op(x, eps, cu_seqlens)
         # Save the exact x, not the rounded output; see the numerics note in l2norm_bwd.py.
@@ -256,6 +261,7 @@ class _L2Norm(torch.autograd.Function):
         else:
             ctx.save_for_backward(x, rstd, cu_seqlens)
         ctx.is_ragged = cu_seqlens is not None
+        ctx.autotune = autotune
         return output
 
     @staticmethod
@@ -263,7 +269,7 @@ class _L2Norm(torch.autograd.Function):
     def backward(ctx, d_output: torch.Tensor):
         x, rstd, *metadata = ctx.saved_tensors
         cu_seqlens = metadata[0] if ctx.is_ragged else None
-        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens), None, None
+        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, ctx.autotune), None, None, None
 
 
 def l2norm(
@@ -271,12 +277,17 @@ def l2norm(
     eps: float = 1e-6,
     *,
     cu_seqlens: torch.Tensor | None = None,
+    autotune: bool = True,
 ) -> torch.Tensor:
     """Normalize rows, optionally stopping at a packed device endpoint.
 
     With ``cu_seqlens``, only rows before ``cu_seqlens[-1]`` are defined in the
     output and input gradient. Packed callers must hide the inactive suffix from
     later consumers and parameter reductions.
+
+    ``autotune`` benchmarks backward tile configurations when true. False launches one
+    fixed configuration, so the input gradient is reproducible across processes and
+    autotune cache states. The forward always uses a fixed launch policy.
     """
     if not x.is_cuda:
         raise ValueError("l2norm requires a CUDA tensor")
@@ -297,7 +308,7 @@ def l2norm(
             raise ValueError("cu_seqlens must be contiguous int32")
         if cu_seqlens.device != x.device:
             raise ValueError("cu_seqlens must be on the same device as x")
-    return _L2Norm.apply(x, eps, cu_seqlens)
+    return _L2Norm.apply(x, eps, cu_seqlens, autotune)
 
 
 __all__ = ["l2norm"]

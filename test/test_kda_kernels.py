@@ -344,6 +344,22 @@ def test_l2norm_op_registration():
     torch.library.opcheck(_l2norm_bwd_op, (x, rstd, d_output))
     _, ragged_rstd = _l2norm_fwd_op(x, 1e-6, cu_seqlens)
     torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens))
+    torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens, False))
+
+
+def test_l2norm_pinned_backward_skips_autotuning(monkeypatch):
+    """autotune=False launches the first config without consulting the autotuner."""
+    torch.manual_seed(4)
+    x = torch.randn(1, 33, 3, 128, device=DEV, dtype=torch.bfloat16, requires_grad=True)
+    d_output = torch.randn_like(x)
+    expected = torch.autograd.grad(l2norm(x), x, d_output)[0]
+
+    def autotuner_run(*args, **kwargs):
+        raise AssertionError("autotune=False reached the autotuner")
+
+    monkeypatch.setattr(l2norm_bwd_kernel, "run", autotuner_run)
+    actual = torch.autograd.grad(l2norm(x, autotune=False), x, d_output)[0]
+    torch.testing.assert_close(actual, expected)
 
 
 def test_l2norm_blackwell_kda_decode_matches_reference_and_replays():
