@@ -35,7 +35,10 @@ jobs:
 
       - run: pip install -e ".[docs]"
 
+      # The dashboard is best-effort: on GitHub API failure, deploy the committed
+      # docs/assets/ci-health.json instead of blocking the docs.
       - name: Generate CI health data
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: python .github/scripts/generate_ci_health.py

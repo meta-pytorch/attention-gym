@@ -7,6 +7,8 @@ import json
 import os
 import re
 import subprocess
+import sys
+import time
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,15 +19,37 @@ FAILURE_CONCLUSIONS = {"failure", "startup_failure", "stale", "timed_out"}
 IGNORED_CONCLUSIONS = {"action_required", "cancelled", "neutral", "skipped"}
 ANSI_ESCAPE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 PYTEST_FAILURE = re.compile(r"(?:FAILED|ERROR)\s+([^\s]+::[^\s]+)")
+API_ATTEMPTS = 4
+API_RETRY_BASE_SECONDS = 5
 
 
 def run(*args: str) -> str:
-    """Run a command and return its standard output."""
-    return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+    """Run a command and return its standard output.
+
+    On failure, print the command's stderr so the GitHub API error (HTTP status,
+    rate-limit message) appears in the job log instead of being discarded.
+    """
+    try:
+        return subprocess.run(args, check=True, text=True, capture_output=True).stdout
+    except subprocess.CalledProcessError as error:
+        print(
+            f"{' '.join(args)} failed with exit {error.returncode}: {error.stderr.strip()}",
+            file=sys.stderr,
+        )
+        raise
 
 
 def github_api(endpoint: str) -> object:
-    """Load one GitHub REST API response through the authenticated gh CLI."""
+    """Load one GitHub REST API response through the authenticated gh CLI.
+
+    Retry with exponential backoff so one transient API error (5xx, secondary rate
+    limit) does not fail the whole dashboard.
+    """
+    for attempt in range(API_ATTEMPTS - 1):
+        try:
+            return json.loads(run("gh", "api", endpoint))
+        except subprocess.CalledProcessError:
+            time.sleep(API_RETRY_BASE_SECONDS * 2**attempt)
     return json.loads(run("gh", "api", endpoint))
 
 

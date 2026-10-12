@@ -1,6 +1,9 @@
 """Test CI health aggregation with only the Python standard library."""
 
+import io
+import subprocess
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -8,6 +11,7 @@ from generate_ci_health import (
     build_dashboard,
     duration_seconds,
     extract_pytest_failures,
+    github_api,
     percentile,
     summarize_jobs,
     summarize_runs,
@@ -125,6 +129,32 @@ class TestAggregation(unittest.TestCase):
         self.assertEqual(dashboard["overall"]["failures"], 1)
         self.assertEqual(dashboard["failures"][0]["jobs"][0]["failed_steps"], ["pytest"])
         self.assertEqual(dashboard["failures"][0]["jobs"][0]["tests"], ["test/test_ci.py::test_x"])
+
+
+class TestGitHubApi(unittest.TestCase):
+    @patch("generate_ci_health.time.sleep")
+    @patch("generate_ci_health.subprocess.run")
+    def test_retries_transient_failure_and_reports_stderr(self, run_mock, _sleep) -> None:
+        error = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 502: Bad Gateway")
+        run_mock.side_effect = [
+            error,
+            subprocess.CompletedProcess(["gh"], 0, stdout='{"jobs": []}'),
+        ]
+        stderr = io.StringIO()
+
+        with redirect_stderr(stderr):
+            response = github_api("repos/x/actions/runs/1/jobs")
+
+        self.assertEqual(response, {"jobs": []})
+        self.assertIn("HTTP 502: Bad Gateway", stderr.getvalue())
+
+    @patch("generate_ci_health.time.sleep")
+    @patch("generate_ci_health.subprocess.run")
+    def test_raises_after_persistent_failure(self, run_mock, _sleep) -> None:
+        run_mock.side_effect = subprocess.CalledProcessError(1, ["gh"], stderr="HTTP 404")
+
+        with redirect_stderr(io.StringIO()), self.assertRaises(subprocess.CalledProcessError):
+            github_api("repos/x/actions/runs/1/jobs")
 
 
 if __name__ == "__main__":
