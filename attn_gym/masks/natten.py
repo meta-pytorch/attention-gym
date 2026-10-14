@@ -24,7 +24,7 @@ def generate_natten(
     """
 
     def get_x_y(idx: IntTensor) -> tuple[IntTensor, IntTensor]:
-        return idx // canvas_w, idx % canvas_w
+        return idx % canvas_w, idx // canvas_w
 
     def natten_mask_mod(
         b: IntTensor,

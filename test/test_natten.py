@@ -1,9 +1,43 @@
 import pytest
 import torch
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import create_block_mask, create_mask, flex_attention
 
 from attn_gym.masks import generate_morton_natten, generate_natten, generate_tiled_natten
 from attn_gym.masks.natten import morton_decode, morton_encode
+
+
+@pytest.mark.parametrize(
+    "canvas_w,canvas_h,kernel_w,kernel_h",
+    [
+        pytest.param(7, 5, 3, 3, id="wide-canvas"),
+        pytest.param(5, 7, 3, 3, id="tall-canvas"),
+        pytest.param(7, 7, 5, 3, id="wide-kernel"),
+        pytest.param(7, 7, 3, 5, id="tall-kernel"),
+        pytest.param(7, 7, 3, 3, id="square-control"),
+    ],
+)
+def test_natten_row_major_neighborhood(
+    canvas_w: int, canvas_h: int, kernel_w: int, kernel_h: int
+) -> None:
+    seq_len = canvas_w * canvas_h
+    mask = create_mask(
+        generate_natten(canvas_w, canvas_h, kernel_w, kernel_h),
+        B=1,
+        H=1,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device="cpu",
+    )
+
+    # Build windows in canvas coordinates, then flatten both query and key axes row-major.
+    expected = torch.zeros(canvas_h, canvas_w, canvas_h, canvas_w, dtype=torch.bool)
+    for row in range(canvas_h):
+        top = min(max(row - kernel_h // 2, 0), canvas_h - kernel_h)
+        for col in range(canvas_w):
+            left = min(max(col - kernel_w // 2, 0), canvas_w - kernel_w)
+            expected[row, col, top : top + kernel_h, left : left + kernel_w] = True
+
+    torch.testing.assert_close(mask[0, 0], expected.reshape(seq_len, seq_len))
 
 
 def run_natten(
