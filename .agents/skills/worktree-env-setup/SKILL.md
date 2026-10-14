@@ -20,7 +20,7 @@ From the worktree root (mirrors `.github/workflows/test.yml`):
 ```bash
 uv venv --python 3.13
 source .venv/bin/activate
-uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
+uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu134
 uv pip install --prerelease allow -e '.[tests,linear,dev]'
 ```
 

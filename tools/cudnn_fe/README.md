@@ -65,5 +65,5 @@ Upstream env recipe (swap in the new tag):
 
 ```bash
 uv venv agent_space/cmp_env_<tag> --python 3.13
-uv pip install --python agent_space/cmp_env_<tag>/bin/python --prerelease allow --index-url https://download.pytorch.org/whl/nightly/cu132 --extra-index-url https://pypi.org/simple torch "nvidia-cudnn-frontend==<tag>" nvidia-cutlass-dsl apache-tvm-ffi
+uv pip install --python agent_space/cmp_env_<tag>/bin/python --prerelease allow --index-url https://download.pytorch.org/whl/nightly/cu134 --extra-index-url https://pypi.org/simple torch "nvidia-cudnn-frontend==<tag>" nvidia-cutlass-dsl apache-tvm-ffi
 ```

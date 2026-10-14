@@ -11,8 +11,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test_cuda132_h100:
-    name: test-cuda13.2-py${{ matrix.python-version }}-h100
+  test_cuda134_h100:
+    name: test-cuda13.4-py${{ matrix.python-version }}-h100
     strategy:
       fail-fast: true
       matrix:
@@ -20,9 +20,9 @@ jobs:
         include:
           - name: H100
             runs-on: mt-l-x86iamx-22-225-h100
-            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu132'
+            torch-spec: '--pre torch --index-url https://download.pytorch.org/whl/nightly/cu134'
             gpu-arch-type: "cuda"
-            gpu-arch-version: "13.2"
+            gpu-arch-version: "13.4"
     permissions:
       id-token: write
       contents: read

@@ -8,7 +8,7 @@ Use an isolated `.venv` in each checkout, with the same nightly and test extra a
 
 ```bash
 uv venv --python 3.13
-uv pip install --python .venv/bin/python --pre torch --index-url https://download.pytorch.org/whl/nightly/cu132
+uv pip install --python .venv/bin/python --pre torch --index-url https://download.pytorch.org/whl/nightly/cu134
 uv pip install --python .venv/bin/python --prerelease allow -e '.[tests,linear,dev]'
 uv run --no-sync pytest -n 6 test
 ```

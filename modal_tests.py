@@ -12,7 +12,7 @@ from pathlib import Path
 import modal
 
 ROOT_PATH = Path(__file__).parent
-PYTORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu132"
+PYTORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu134"
 WHEEL_PATH = Path(os.environ["ATTN_GYM_WHEEL"]).resolve() if os.getenv("ATTN_GYM_WHEEL") else None
 REMOTE_WHEEL_PATH = f"/tmp/{WHEEL_PATH.name}" if WHEEL_PATH else None
 # Rebuild once per UTC day without disabling Modal's cache for every commit.
