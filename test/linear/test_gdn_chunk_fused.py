@@ -1020,7 +1020,7 @@ def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128, token_innerm
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
     args = (q, k, v, cumulative, beta, state, head_dim**-0.5)
     with torch.no_grad():
-        output, final_state, inverse = chunk_fwd_with_state_op(*args)
+        output, final_state, inverse, _h, _v_new = chunk_fwd_with_state_op(*args)
     return args, output, final_state, inverse
 
 
@@ -1082,7 +1082,7 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
     torch.library.opcheck(chunk_fwd_packed_op, args)
     torch.library.opcheck(chunk_fwd_packed_with_state_op, args)
     with torch.no_grad():
-        output, final_state, inverse = chunk_fwd_packed_with_state_op(*args)
+        output, final_state, inverse, h, v_new = chunk_fwd_packed_with_state_op(*args)
     backward_args = (
         *args[:5],
         inverse,
@@ -1094,12 +1094,9 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
         head_dim**-0.5,
     )
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
-    torch.library.opcheck(chunk_bwd_op, backward_args, test_utils=utilities)
-    torch.library.opcheck(
-        chunk_bwd_with_state_grad_op,
-        backward_args,
-        test_utils=utilities,
-    )
+    for chunk_states in ((), (h, v_new)):
+        for operator in (chunk_bwd_op, chunk_bwd_with_state_grad_op):
+            torch.library.opcheck(operator, (*backward_args, *chunk_states), test_utils=utilities)
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -1292,3 +1289,58 @@ def test_packed_no_state_forward_ignores_empty_padding_intervals():
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     per_interval_state = 4 * v.shape[2] * v.shape[3] * q.shape[3]
     assert peak_growth < padding * per_interval_state
+
+
+@pytest.mark.parametrize(
+    ("lengths", "with_state", "portable"),
+    [
+        (None, False, False),
+        (None, True, True),
+        ([65, 0, 127], False, False),
+        ([65, 0, 127], True, True),
+    ],
+)
+def test_save_chunk_states_skips_backward_recurrence_bitwise(
+    lengths: list[int] | None, with_state: bool, portable: bool, monkeypatch
+):
+    """Saved chunk states replace the backward's recurrence without changing any bit."""
+    import attn_gym.linear.gdn.impl.chunk as chunk_impl
+
+    if portable:
+        force_portable_backward(monkeypatch)
+    tokens = 128 if lengths is None else sum(lengths)
+    cu_seqlens = None if lengths is None else cumulative_sequence_offsets(lengths)
+    inputs = make_inputs(tokens=tokens, key_heads=1, value_heads=4, requires_grad=True)[:5]
+    if with_state:
+        num_states = 1 if lengths is None else len(lengths)
+        inputs = (*inputs, torch.randn(num_states, 4, 128, 128, device="cuda", requires_grad=True))
+    recurrence = "chunk_gdn_fwd_recurrence_" + ("dense" if lengths is None else "packed")
+    results = []
+    for kernel_options, expected_calls in ((None, 2), ({"save_chunk_states": True}, 1)):
+        with patch.object(chunk_impl, recurrence, wraps=getattr(chunk_impl, recurrence)) as calls:
+            output, final_state = chunk_gdn(
+                *inputs,
+                cu_seqlens=cu_seqlens,
+                output_final_state=with_state,
+                kernel_options=kernel_options,
+            )
+            loss = output.float().square().mean()
+            if with_state:
+                loss = loss + final_state.square().mean()
+            results.append((output, final_state, *torch.autograd.grad(loss, inputs)))
+        assert calls.call_count == expected_calls
+    for recomputed, saved in zip(*results, strict=True):
+        torch.testing.assert_close(saved, recomputed, rtol=0, atol=0)
+
+
+def test_save_chunk_states_fullgraph_forward_backward():
+    """Compile the state-saving forward and backward with strict capture."""
+    inputs = make_inputs(tokens=128, key_heads=1, value_heads=4, requires_grad=True)[:5]
+    cu_seqlens = torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32)
+    run = partial(chunk_gdn, cu_seqlens=cu_seqlens, kernel_options={"save_chunk_states": True})
+    results = []
+    for function in (run, torch.compile(run, fullgraph=True)):
+        output, _ = function(*inputs)
+        results.append((output, *torch.autograd.grad(output.float().square().mean(), inputs)))
+    for eager, compiled in zip(*results, strict=True):
+        torch.testing.assert_close(compiled, eager, rtol=0, atol=0)
