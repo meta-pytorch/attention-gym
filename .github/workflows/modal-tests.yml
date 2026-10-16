@@ -36,4 +36,4 @@ jobs:
         run: python -m pip install modal
 
       - name: Run pytest on a B200
-        run: exec modal run -m modal_tests
+        run: exec modal run -m tools.modal_tests

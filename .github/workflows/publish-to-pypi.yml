@@ -94,7 +94,7 @@ jobs:
           echo "Expected exactly one wheel, found ${#wheels[@]}" >&2
           exit 1
         fi
-        ATTN_GYM_WHEEL="${wheels[0]}" modal run -m modal_tests
+        ATTN_GYM_WHEEL="${wheels[0]}" modal run -m tools.modal_tests
 
   publish-to-pypi:
     name: Publish distribution 📦 to PyPI
