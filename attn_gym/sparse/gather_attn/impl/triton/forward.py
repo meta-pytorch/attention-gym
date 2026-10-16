@@ -97,7 +97,7 @@ def _gather_attn_fwd(
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
     # Each query has its own set of selected sparse entries.
-    for selected_slot in tl.static_range(0, TOPK):
+    for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
             kv_indices_ptr
             + batch * KV_INDICES_STRIDES[0]
@@ -382,7 +382,7 @@ def _gather_attn_fwd_tma(
     running_sum = tl.full((BLOCK_M,), 1.0, tl.float32)
     accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
 
-    for selected_slot in tl.static_range(0, TOPK):
+    for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
             kv_indices_ptr
             + batch * KV_INDICES_STRIDES[0]
