@@ -11,7 +11,7 @@ from pathlib import Path
 
 import modal
 
-ROOT_PATH = Path(__file__).parent
+ROOT_PATH = Path(__file__).parents[1]
 PYTORCH_NIGHTLY_INDEX = "https://download.pytorch.org/whl/nightly/cu134"
 WHEEL_PATH = Path(os.environ["ATTN_GYM_WHEEL"]).resolve() if os.getenv("ATTN_GYM_WHEEL") else None
 REMOTE_WHEEL_PATH = f"/tmp/{WHEEL_PATH.name}" if WHEEL_PATH else None
@@ -69,6 +69,7 @@ def configure_local_image(
     else:
         # Tool tests also inspect vendored notices and the generated maintenance ledger.
         configured = configured.add_local_dir(ROOT_PATH / "attn_gym", remote_path="/root/attn_gym")
+    # tools/ also ships this runner, which Modal imports remotely as tools.modal_tests.
     # test_examples_layout checks README.md and docs/ against examples/, so ship them too.
     return (
         configured.add_local_dir(ROOT_PATH / "tools", remote_path="/root/tools")
@@ -77,7 +78,6 @@ def configure_local_image(
         .add_local_dir(ROOT_PATH / "benchmarks", remote_path="/root/benchmarks")
         .add_local_dir(ROOT_PATH / "docs", remote_path="/root/docs")
         .add_local_file(ROOT_PATH / "README.md", remote_path="/root/README.md")
-        .add_local_file(ROOT_PATH / "modal_tests.py", remote_path="/root/modal_tests.py")
     )
 
 

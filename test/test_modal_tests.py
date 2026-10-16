@@ -21,7 +21,7 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     monkeypatch.delenv("ATTN_GYM_WHEEL", raising=False)
     monkeypatch.setattr(modal, "is_local", lambda: False)
     spec = spec_from_file_location(
-        "_modal_test_runner", Path(__file__).resolve().parents[1] / "modal_tests.py"
+        "_modal_test_runner", Path(__file__).resolve().parents[1] / "tools" / "modal_tests.py"
     )
     assert spec is not None and spec.loader is not None
     module = module_from_spec(spec)
@@ -40,10 +40,7 @@ def test_image_ships_runner_with_requested_dependencies(runner: ModuleType, extr
 
     assert runner.configure_local_image(image, extras) is image
 
-    image.add_local_file.assert_any_call(
-        runner.ROOT_PATH / "modal_tests.py", remote_path="/root/modal_tests.py"
-    )
-    # Maintenance tests need tools data files and package Markdown, not just Python modules.
+    # tools/ ships the runner itself plus the maintenance tests' data files.
     image.add_local_dir.assert_any_call(runner.ROOT_PATH / "tools", remote_path="/root/tools")
     image.add_local_dir.assert_any_call(
         runner.ROOT_PATH / "attn_gym", remote_path="/root/attn_gym"

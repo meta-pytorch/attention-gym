@@ -45,7 +45,8 @@ watch:
 
 plugins:
   - search
-  - macros
+  - macros:
+      module_name: tools/mkdocs_macros
   - redirects:
       redirect_maps:
         tutorials/cuda-graphs.md: guides/ragged-cuda-graphs.md
