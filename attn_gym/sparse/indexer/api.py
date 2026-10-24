@@ -17,8 +17,14 @@ class IndexerKernelOptions(TypedDict, total=False):
     backend: Literal["cute", "triton"]
     """See :func:`lightning_indexer` for default selection and backend requirements."""
 
+    selector: Literal["auto", "default", "gvr2"]
+    """Exact Top-K algorithm, independent of the scoring precision."""
 
-KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), None)}
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    "backend": (("cute", "triton"), None),
+    "selector": (("auto", "default", "gvr2"), "auto"),
+}
 
 
 def _validate_inputs(
@@ -175,6 +181,13 @@ def lightning_indexer(
             ``{"backend": "cute"}`` or ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100-family GPUs and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
+            ``"selector"`` chooses the exact Top-K algorithm: ``"auto"`` (the value when
+            omitted) lets CuTe use GVR2 when ``topk < 2048`` and radix otherwise,
+            and keeps Triton's streaming Top-K; ``"default"`` forces CuTe radix /
+            Triton streaming; ``"gvr2"`` forces GVR2 on either backend. CuTe auto
+            uses radix for deterministic or packed calls and on SM107. Explicit CuTe GVR2
+            requires SM100/SM103 and nondeterministic mode. Neither GVR2 backend supports
+            packed offsets.
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are unspecified, and
@@ -191,10 +204,12 @@ def lightning_indexer(
     D divisible by 16, and Q/K with unit last strides and 16-byte-aligned bases and
     non-singleton outer strides. Other Q/K strides may vary independently;
     weights may have arbitrary strides and need only element alignment.
-    Triton requires SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with
-    unit last strides and 16-byte-aligned bases and outer strides; weights may be strided.
-    Its register-resident selection makes per-tile cost grow with topk.
-    CuTe reuses a per-call FP32 score workspace capped at 32 MiB and 1024 query
+    Triton requires SM90 or newer, H <= 256 and D <= 256 divisible by 8. Its streaming
+    FP16/BF16 path requires Q/K unit last strides and 16-byte-aligned bases and outer strides;
+    weights may be strided, and its register-resident selection cost grows with topk.
+    Triton GVR2 accepts arbitrary nonnegative input strides and uses its own tiled scorer,
+    so its scores may round differently from the streaming path.
+    CuTe and Triton GVR2 reuse a per-call FP32 score workspace capped at 32 MiB and 1024 query
     rows. For nonzero topk, candidate capacity S must be at most 2**22 so one query
     pair fits that budget. Large inputs use slabs rather than an unbounded quadratic
     score allocation.
@@ -211,9 +226,9 @@ def lightning_indexer(
 
     selected_impl = resolve_impl(impl)
     _validate_inputs(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
-    backend = validate_kernel_options(
+    options = validate_kernel_options(
         kernel_options, KERNEL_OPTION_SPEC, op_name="lightning_indexer"
-    )["backend"]
+    )
     match selected_impl:
         case Impl.REFERENCE:
             from .impl import reference
@@ -231,7 +246,8 @@ def lightning_indexer(
                 topk,
                 causal,
                 compress_ratio,
-                backend or "auto",
+                options["backend"] or "auto",
                 cu_seqlens,
                 cu_seqlens_k,
+                options["selector"],
             )

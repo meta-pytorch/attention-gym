@@ -33,22 +33,34 @@ def require_backend(backend: str | None = None) -> str:
 
 
 @pytest.mark.parametrize(
-    "capability,backend,expected",
+    "capability,backend,expected,selector,fails,deterministic",
     [
-        ((9, 0), "auto", "triton"),
-        ((10, 0), "auto", "cute"),
-        ((10, 3), "auto", "cute"),
-        ((10, 7), "auto", "cute"),
-        ((12, 0), "auto", "triton"),
-        ((10, 0), "triton", "triton"),
-        ((10, 3), "triton", "triton"),
-        ((9, 0), "cute", "cute"),
+        ((9, 0), "auto", "triton", None, False, False),
+        ((10, 0), "auto", "cute", None, False, False),
+        ((10, 3), "auto", "cute", None, False, False),
+        ((10, 7), "auto", "cute", None, False, False),
+        ((12, 0), "auto", "triton", None, False, False),
+        ((10, 0), "triton", "triton", None, False, False),
+        ((10, 3), "triton", "triton", None, False, False),
+        ((9, 0), "cute", "cute", None, False, False),
+        ((10, 3), "cute", "cute", "auto", False, False),
+        ((10, 3), "cute", "cute", "default", False, False),
+        ((10, 3), "cute", "cute", "gvr2", False, False),
+        ((10, 3), "triton", "triton", "auto", False, False),
+        ((10, 3), "triton", "triton", "default", False, False),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", False, False),
+        # Forward deterministic mode through each launcher.
+        ((10, 3), "cute", "cute", "default", False, True),
+        ((10, 3), "triton", "triton", "default", False, True),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", False, True),
+        # Propagate the original launch failure without retrying another backend.
+        ((10, 3), "cute", "cute", "default", True, False),
+        ((10, 3), "triton", "triton", "default", True, False),
+        ((10, 3), "triton", "triton_gvr2", "gvr2", True, False),
     ],
 )
-@pytest.mark.parametrize("fails", [False, True])
-@pytest.mark.parametrize("deterministic", [False, True])
 def test_backend_dispatch_uses_input_device(
-    monkeypatch, capability, backend, expected, fails, deterministic
+    monkeypatch, capability, backend, expected, selector, fails, deterministic
 ):
     """Dispatch once on the input device and propagate launch errors without retrying.
 
@@ -58,6 +70,7 @@ def test_backend_dispatch_uses_input_device(
     q = torch.empty(1, 2, 2, 16)
     k = torch.empty(1, 2, 16)
     weights = torch.empty(1, 2, 2)
+    kwargs = {} if selector is None else {"selector": selector}
     failure = RuntimeError("selected backend failed")
     launch = Mock(
         return_value=torch.empty(1, 2, 1, dtype=torch.int32),
@@ -68,7 +81,7 @@ def test_backend_dispatch_uses_input_device(
     monkeypatch.setattr(torch.cuda, "get_device_capability", device_capability)
     monkeypatch.setattr(arch, "cutedsl_targets_rubin", lambda: True)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: deterministic)
-    for name in ("cute", "triton"):
+    for name in ("cute", "triton", "triton_gvr2"):
         monkeypatch.setitem(
             sys.modules,
             f"attn_gym.sparse.indexer.impl.{name}",
@@ -76,12 +89,15 @@ def test_backend_dispatch_uses_input_device(
         )
     if fails:
         with pytest.raises(RuntimeError) as exc:
-            ops._indexer_cuda(q, k, weights, 1, True, 1, backend)
+            ops._indexer_cuda(q, k, weights, 1, True, 1, backend, **kwargs)
         assert exc.value is failure
     else:
-        assert ops._indexer_cuda(q, k, weights, 1, True, 1, backend) is launch.return_value
+        assert (
+            ops._indexer_cuda(q, k, weights, 1, True, 1, backend, **kwargs) is launch.return_value
+        )
     metadata = (deterministic, None) if expected == "cute" else (None, None)
-    launch.assert_called_once_with(q, k, weights, 1, True, 1, *metadata)
+    forwarded = {"selector": selector or "default"} if expected == "cute" else {}
+    launch.assert_called_once_with(q, k, weights, 1, True, 1, *metadata, **forwarded)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
@@ -94,6 +110,7 @@ def test_backend_dispatch_uses_input_device(
     [
         ({"backend": "auto"}, "'backend'. must be 'cute' or 'triton'"),
         ({"backend": None}, "'backend'. must be 'cute' or 'triton'"),
+        ({"selector": "unknown"}, "'selector'. must be"),
         ({"other": "triton"}, "unsupported lightning_indexer kernel options: other"),
         (
             {"backend": "triton", "other": "x"},
@@ -108,6 +125,14 @@ def test_invalid_backend_options(options, message):
         lightning_indexer(q, k, weights, 1, kernel_options=options)
     with pytest.raises(ValueError, match=message):
         lightning_indexer(q, k, weights, 1, impl="reference", kernel_options=options)
+
+
+def test_reference_accepts_valid_fused_options():
+    q, k, w = make_indexer_test_inputs(3, 2, 16, torch.float32, device="cpu")
+    options = {"backend": "cute", "selector": "gvr2"}
+    expected = lightning_indexer(q, k, w, 1, impl="reference")
+    actual = lightning_indexer(q, k, w, 1, impl="reference", kernel_options=options)
+    torch.testing.assert_close(actual, expected)
 
 
 def test_fused_cpu_rejected():

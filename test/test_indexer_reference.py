@@ -27,6 +27,22 @@ def test_basic_correctness():
     assert actual[0, 1, 0].item() == 1
 
 
+def test_reference_does_not_save_scoring_tiles_for_backward():
+    q = torch.ones(1, 257, 1, 1)
+    k = torch.arange(257, dtype=torch.float32).view(1, 257, 1)
+    weights = torch.ones(1, 257, 1, requires_grad=True)
+
+    def reject_saved_tensor(tensor):
+        pytest.fail(f"index-only selection saved a tensor of shape {tuple(tensor.shape)}")
+
+    with (
+        torch.enable_grad(),
+        torch.autograd.graph.saved_tensors_hooks(reject_saved_tensor, lambda t: t),
+    ):
+        actual = lightning_indexer(q, k, weights, 1, impl="reference")
+    assert (actual == 256).all()
+
+
 def test_causal_masking():
     """Causal: no index exceeds query position; overflow slots get -1 sentinels."""
     B, T, H, D = 1, 4, 2, 3
