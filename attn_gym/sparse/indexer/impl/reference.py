@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 
+@torch.no_grad()
 def score_and_select(
     q: Tensor,
     k: Tensor,
@@ -18,9 +19,14 @@ def score_and_select(
     # Autocast can downcast even explicitly promoted einsum operands before the head sum.
     dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
     with torch.autocast(device_type=q.device.type, enabled=False):
-        dots = torch.einsum("...thd,...sd->...ths", q.to(dtype), k.to(dtype))
-        scores = (dots.relu() * weights.to(dtype).unsqueeze(-1)).sum(dim=-2)
-        scores *= 1.0 / math.sqrt(q.shape[-2] * q.shape[-1])
+        q, k, weights = q.to(dtype), k.to(dtype), weights.to(dtype)
+        scores = q.new_empty((*q.shape[:-2], k.shape[-2]))
+        scale = 1.0 / math.sqrt(q.shape[-2] * q.shape[-1])
+        # Bound the per-head temporaries for dense and paged queries alike.
+        for offset in range(0, q.shape[-3], 128):
+            rows = slice(offset, offset + 128)
+            dots = torch.einsum("...thd,...sd->...ths", q[..., rows, :, :], k)
+            scores[..., rows, :] = (dots.relu() * weights[..., rows, :, None]).sum(-2) * scale
     scores.masked_fill_(~valid, -torch.inf)
     indices = scores.topk(min(topk, k.shape[-2]), dim=-1).indices
     selected = valid.expand_as(scores).gather(-1, indices)

@@ -1,4 +1,4 @@
-"""Bounded-workspace indexer for SM100-family scoring followed by radix Top-K.
+"""Bounded-workspace indexer for SM100-family scoring followed by exact Top-K.
 
 A slab contains at most 1024 query rows and 32 MiB of FP32 scores, independent
 of batch size and sequence length. Consecutive launches reuse that per-call
@@ -137,16 +137,24 @@ def _compile_topk(
     use_int64_offsets: bool,
     deterministic: bool,
     has_candidate_bounds: bool,
+    selector: str = "default",
 ) -> Callable[..., None]:
-    from .cute_topk import IndexerTopKKernel
+    if selector == "gvr2":
+        from .cute_topk_gvr2 import IndexerGVR2TopKKernel
 
-    operation = IndexerTopKKernel.get_or_build(
-        topk,
-        causal,
-        use_int64_offsets,
-        compress_ratio=compress_ratio,
-        deterministic=deterministic,
-    )
+        operation = IndexerGVR2TopKKernel.get_or_build(
+            topk, causal, use_int64_offsets, compress_ratio=compress_ratio
+        )
+    else:
+        from .cute_topk import IndexerTopKKernel
+
+        operation = IndexerTopKKernel.get_or_build(
+            topk,
+            causal,
+            use_int64_offsets,
+            compress_ratio=compress_ratio,
+            deterministic=deterministic,
+        )
     return _compile_topk_kernel(operation, has_candidate_bounds)
 
 
@@ -184,7 +192,7 @@ def _compile_topk_kernel(operation, has_candidate_bounds: bool) -> Callable[...,
     )
 
 
-def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
+def _validate(q: torch.Tensor, k: torch.Tensor) -> tuple[int, int]:
     """Validate SM100-family kernel limits and Q/K base alignment.
 
     Ranks, shape agreement, devices, dtype agreement, and ``topk``/``compress_ratio``
@@ -209,8 +217,30 @@ def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
             "bases and non-singleton outer strides"
         )
     properties = get_device_properties(q.device)
-    if not runs_sm100_kernels((properties.major, properties.minor)):
+    capability = (properties.major, properties.minor)
+    if not runs_sm100_kernels(capability):
         raise RuntimeError(f"this tcgen05 kernel requires {SM100_KERNELS_REQUIREMENT}")
+    return capability
+
+
+def resolve_selector(
+    selector: str, topk: int, *, deterministic: bool, packed: bool, supports_gvr2: bool = True
+) -> str:
+    """Auto keeps radix where GVR2 cannot serve the contract or must refine with radix."""
+    if selector not in ("auto", "default", "gvr2"):
+        raise ValueError(f"unknown indexer selector {selector!r}")
+    if selector == "gvr2":
+        if deterministic or packed:
+            raise ValueError("CuTe GVR2 does not support deterministic mode or packed cu_seqlens")
+        if not supports_gvr2:
+            raise ValueError("CuTe GVR2 requires an SM100 or SM103 GPU")
+    if selector == "auto":
+        if deterministic or packed or not supports_gvr2:
+            return "default"
+        from .cute_topk_gvr2 import NATIVE_TOPK_LIMIT
+
+        return "gvr2" if topk < NATIVE_TOPK_LIMIT else "default"
+    return selector
 
 
 def launch(
@@ -222,6 +252,7 @@ def launch(
     compress_ratio: int = 1,
     deterministic: bool = False,
     candidate_bounds: torch.Tensor | None = None,
+    selector: str = "default",
 ) -> torch.Tensor:
     """Compute weighted-ReLU Top-K with bounded per-call score storage.
 
@@ -234,7 +265,15 @@ def launch(
     """
     import cutlass
 
-    _validate(q, k)
+    capability = _validate(q, k)
+    packed = candidate_bounds is not None
+    selector = resolve_selector(
+        selector,
+        topk,
+        deterministic=deterministic,
+        packed=packed,
+        supports_gvr2=capability in ((10, 0), (10, 3)),
+    )
     batch, tokens, heads, head_dim = q.shape
     candidates = k.shape[1]
     output = torch.empty((batch, tokens, topk), dtype=torch.int32, device=q.device)
@@ -252,7 +291,6 @@ def launch(
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(q.device.index))
-        packed = candidate_bounds is not None
         # Packed bounds already contain both mask decisions; neither kernel reads these flags.
         if packed:
             causal, compress_ratio = False, 1
@@ -268,7 +306,13 @@ def launch(
             packed,
         )
         topk_kernel = _compile_topk(
-            topk, causal, compress_ratio, use_int64_offsets, deterministic, packed
+            topk,
+            causal,
+            compress_ratio,
+            use_int64_offsets,
+            deterministic,
+            packed,
+            selector=selector,
         )
     finally:
         set_compile_target(previous)
