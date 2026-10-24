@@ -49,6 +49,14 @@ def float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @cute.jit
+def ordered_key(value: Float32, paged: cutlass.Constexpr = False) -> Uint32:
+    """Map scores to radix order; only paged selection treats the two zero signs as equal."""
+    bits = float_bits(value)
+    negative = Uint32(0) - bits if cutlass.const_expr(paged) else ~bits
+    return negative if bits & Uint32(0x80000000) else bits | Uint32(0x80000000)
+
+
+@cute.jit
 def warp_scan_inclusive(value: Int32, lane_id: Int32, lanes: cutlass.Constexpr) -> Int32:
     """Inclusive sum across the first power-of-two number of participating lanes."""
     mask = cutlass.const_expr(((1 << lanes) - 1) & 0xFFFFFFFF)
@@ -207,11 +215,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
     @cute.jit
     def ordered_key(self, value: Float32) -> Uint32:
         """Map finite FP32 scores to unsigned radix keys in increasing score order."""
-        bits = float_bits(value)
-        # Negation maps -0 to the +0 key; complement preserves the document
-        # selector's established -0 < +0 order. Both reverse negative magnitudes.
-        negative = Uint32(0) - bits if cutlass.const_expr(self.paged) else ~bits
-        return negative if bits & Uint32(0x80000000) else bits | Uint32(0x80000000)
+        return ordered_key(value, self.paged)
 
     @cute.jit
     def select_lowest_ties(

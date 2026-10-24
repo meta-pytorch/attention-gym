@@ -126,7 +126,6 @@ def _selection_errors(
     q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
-    counts: torch.Tensor,
     visible: torch.Tensor,
     causal: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -153,16 +152,19 @@ def _selection_errors(
         scores.masked_fill_(future, -torch.inf)
         magnitude.masked_fill_(future, 0)
         eager_scores.masked_fill_(future, -torch.inf)
-    boundary = scores.sort(-1, descending=True).values.gather(
-        -1, (counts - 1).clamp_min(0).expand(q.shape[0], -1, -1)
-    )
-    eager = eager_scores.topk(actual.shape[-1], dim=-1).indices
-    eager_valid = eager < visible if causal else torch.ones_like(eager, dtype=torch.bool)
-    actual_scores = scores.gather(-1, actual.long().clamp_min(0))
-    reference_scores = scores.gather(-1, eager)
-    actual_error = (boundary - actual_scores).clamp_min(0).masked_fill(actual < 0, 0)
-    eager_error = (boundary - reference_scores).clamp_min(0).masked_fill(~eager_valid, 0)
-    return actual_error, eager_error, magnitude.amax(-1, keepdim=True)
+    topk = actual.shape[-1]
+    best = scores.topk(topk, dim=-1).values
+    padded = best == -torch.inf
+    best.masked_fill_(padded, 0)
+
+    def rank_regret(indices: torch.Tensor) -> torch.Tensor:
+        selected = scores.gather(-1, indices.long().clamp_min(0))
+        selected.masked_fill_(indices < 0, -torch.inf)
+        ranked = selected.sort(dim=-1, descending=True).values
+        return best - ranked.masked_fill_(padded, 0)
+
+    eager = eager_scores.topk(topk, dim=-1, sorted=False).indices
+    return rank_regret(actual), rank_regret(eager), magnitude.amax(-1, keepdim=True)
 
 
 @torch.no_grad()
@@ -175,11 +177,11 @@ def assert_indexer_selection(
     causal: bool,
     compress_ratio: int = 1,
 ) -> None:
-    """Check index invariants and FP64 boundary regret against eager's regret.
+    """Check index invariants and rankwise FP64 Top-K regret against eager's regret.
 
-    Absolute products bound FP32 dot, weighting, head reduction and scaling
-    errors without cancellation shrinking the budget. Twice that score error
-    bounds a selection boundary swap; scores have no FP16/BF16 output rounding.
+    Compare sorted score values, not IDs: exact ties may select different candidates.
+    Absolute products bound FP32 dot, weighting, head reduction and scaling errors
+    without cancellation shrinking the budget. Twice that error bounds rankwise regret.
     """
     batch, tokens, heads, dim = q.shape
     candidates = k.shape[1]
@@ -193,13 +195,15 @@ def assert_indexer_selection(
     assert not ((actual < -1) | (actual >= candidates)).any()
     row = torch.arange(tokens, device=q.device).view(1, tokens, 1)
     visible = (row + 1) // compress_ratio
-    counts = visible.clamp_max(topk) if causal else torch.full_like(row, topk)
-    assert torch.equal(valid.sum(-1, keepdim=True), counts.expand(batch, -1, -1))
+    counts = visible.clamp_max(topk) if causal else torch.full_like(row, min(topk, candidates))
+    expected_valid = torch.arange(topk, device=q.device) < counts
+    assert torch.equal(valid, expected_valid.expand_as(valid)), "expected trailing -1 padding"
     if causal:
         assert not (valid & (actual >= visible)).any()
     ordered = actual.sort(-1).values
     assert not ((ordered[..., 1:] == ordered[..., :-1]) & (ordered[..., 1:] >= 0)).any()
-    if topk == 0:
+    # When the whole pool fits, range, mask, count and uniqueness prove exact selection.
+    if topk == 0 or topk >= candidates:
         return
 
     tile_rows = max(1, _SCORE_TILE_BYTES // (batch * heads * candidates * 8))
@@ -213,7 +217,6 @@ def assert_indexer_selection(
             q[:, rows],
             k,
             weights[:, rows],
-            counts[:, rows],
             visible[:, rows],
             causal,
         )
@@ -274,3 +277,46 @@ def assert_paged_indexer_selection(args, actual, topk, ratio=4, positions=None):
                 torch.ones_like(error, dtype=torch.bool),
                 2 * eps / (1 - eps),
             )
+
+
+def assert_indexer_topk_values(indices: torch.Tensor, rows: torch.Tensor) -> None:
+    """Selection preserves input values: FP64 selected value multisets must be exact."""
+    indices = indices.long()
+    assert ((indices >= 0) & (indices < rows.shape[-1])).all()
+    ordered = indices.sort(-1).values
+    assert not (ordered[..., 1:] == ordered[..., :-1]).any()
+    rows64 = rows.double()
+    actual = rows64.gather(-1, indices).sort(-1).values
+    expected = rows64.topk(indices.shape[-1], sorted=False).values.sort(-1).values
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def indexer_gvr2_sample_positions(candidates: int, topk: int, threads: int = 512) -> torch.Tensor:
+    """Mirror ``IndexerGVR2TopKKernel.sample_plan`` for a 16-byte aligned row.
+
+    Returns every element index the kernel samples (float4 pairs), so a test can
+    place values on exactly the sampled positions and force a sampling outcome.
+    """
+    quads = candidates // 4
+    aim = 11 * topk // 8 if topk >= 1024 else 3 * topk // 2
+    aim = max(min(aim, 4096 // 2), topk)
+    aim = min(max(aim, int(math.sqrt(6 * candidates) + 0.5)), 4096 // 2)
+    factor = 64 if topk >= 1024 else 32
+    selected = min(max(factor * candidates // aim, 256), candidates // 2)
+    half = max(quads >> 1, 1)
+    pairs = min(max(selected >> 3, 1), half, threads)
+    stride = max(half // pairs, 1)
+    sample_threads = 0 if quads < 4 else min(half // stride, threads)
+    quad = torch.arange(sample_threads) * stride * 2
+    return (quad[:, None] * 4 + torch.arange(8)[None, :]).flatten().cuda()
+
+
+def compile_indexer_topk(
+    topk: int, causal: bool = False, ratio: int = 1, wide: bool = False, selector: str = "gvr2"
+):
+    """Compile the production selector ABI on the current device for direct tests."""
+    from attn_gym.sparse.indexer.impl.cute import _compile_topk
+    from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
+
+    with compile_target_scope(detect_compile_target(torch.cuda.current_device())):
+        return _compile_topk(topk, causal, ratio, wide, False, False, selector=selector)

@@ -32,7 +32,9 @@ def test_selection_oracle_handles_different_row_magnitudes(dtype, causal, topk):
     q, k, weights = make_indexer_test_inputs(17, 3, 8, dtype, device="cpu")
     q.mul_(torch.logspace(-3, 3, 17).view(1, 17, 1, 1))
     actual = lightning_indexer(q, k, weights, topk, causal=causal, impl="reference")
-    assert_indexer_selection(actual.roll(1, dims=-1), q, k, weights, topk, causal)
+    assert_indexer_selection(
+        actual.sort(dim=-1, descending=True).values, q, k, weights, topk, causal
+    )
 
 
 def test_relative_rms_detects_distributed_errors_hidden_by_absolute_mean():

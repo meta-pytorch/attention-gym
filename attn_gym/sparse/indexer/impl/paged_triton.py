@@ -358,7 +358,7 @@ def launch(
                 select_wide,
                 torch.are_deterministic_algorithms_enabled(),
                 True,
-                True,
+                paged=True,
             )
         integer = cutlass.Int64 if select_wide else cutlass.Int32
     else:
