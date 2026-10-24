@@ -1,8 +1,18 @@
 The score-generation and radix-selection kernels in cute_score.py,
-cute_score_generic.py and cute_topk.py adapt cuDNN Frontend source at commit
+cute_score_generic.py, cute_topk.py and cute_topk_gvr2.py adapt cuDNN Frontend source at commit
 1ab7d63be81f1ef2eb3b2dea5367219cf9674a5f. Attention Gym changes their interfaces,
 workspace layout, scheduling and outputs; they do not depend on the cuDNN
 Frontend package. The applicable license is in LICENSE.Apache-2.0.
+
+cute_topk_gvr2.py adapts the streaming main-family algorithm and float4 load
+helper from FlashInfer's topk_varlen/kernels/gvr2_topk_decode.py at commit
+c11c1090172f578bad37b8bca2b40e4161d72144 (derived from TensorRT-LLM PR #17821,
+ed94d4cfbf), Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+The applicable Apache-2.0 terms are in LICENSE.Apache-2.0. Attention Gym changes
+the interface, finite-score arithmetic, scratch ownership, exact refinement,
+and fallback behavior; it does not port the other three kernel families.
+triton_gvr2.py is independently implemented from the same GVR2 algorithm.
+Neither selector introduces a FlashInfer runtime dependency.
 
 Upstream attribution:
 
