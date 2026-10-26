@@ -18,6 +18,18 @@ Helper functions for visualization, benchmarking, and profiling.
 
 ::: attn_gym.utils.cuda_kernel_profiler
 
+## Distributed
+
+Copy-engine transfers into symmetric memory, for groups inside one NVLink domain (one node or
+an NVL72 rack). Payload copies do not occupy SMs, so they overlap attention kernels well; they
+still share memory and NVLink bandwidth.
+
+::: attn_gym.distributed.CopyEngineAllGather
+
+::: attn_gym.distributed.CopyEngineChannel
+
+::: attn_gym.distributed.single_node
+
 ## Misc
 
 ::: attn_gym.utils.get_flash_block_size
