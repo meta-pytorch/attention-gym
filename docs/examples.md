@@ -97,6 +97,21 @@ Implements a generic single-node ring-attention example launched with `torchrun`
 torchrun --standalone --nproc_per_node=4 examples/flex_attention/ring_attention.py --seq-len 131072
 ```
 
+## Context-Parallel Attention Styles
+
+[`examples/flex_attention/context_parallel_styles.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/flex_attention/context_parallel_styles.py) — Compare the common ways to shard softmax attention over the sequence, all starting from the same zigzag-sharded `q/k/v`:
+
+- `allgather` / `allgather-overlap`: gather `k/v` before one attention call, or attend to the local shard while the gather is in flight and merge by log-sum-exp.
+- `ulysses` / `ulysses-overlap`: all-to-all from sequence to head sharding and back, optionally pipelined over head groups.
+- `ring`: rotate `k/v` with a prefetched point-to-point shift and merge each step by log-sum-exp; a hand-written backward overlaps the `k/v` and `dk/dv` rotations with compute.
+
+Ring shards move over NCCL or, when every rank is on one node, as copy-engine pushes into symmetric memory (`--ring-transport auto|nccl|copy-engine`; `auto` picks copy engines on a single node). The other styles use `torch.distributed._functional_collectives`, whose async tensors make the overlap explicit; the all-gather and Ulysses backwards come from their autograd formulas. `--cuda-graph` replays each step from a CUDA graph to remove host launch overhead. `--validate` checks outputs and gradients against single-device attention, and `--trace-dir` writes per-rank Perfetto traces through `transformer_nuggets`.
+
+```bash
+torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py --seq-len 16384 --validate
+torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py --seq-len 131072 --backend FLASH --trace-dir traces/
+```
+
 ## Delta-Rule Context Parallelism
 
 [`examples/linear/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/delta_rule_context_parallel.py)

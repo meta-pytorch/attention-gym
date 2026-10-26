@@ -6,7 +6,7 @@ dependencies required by the example.
 
 | Directory | Contents |
 | --- | --- |
-| `flex_attention/` | FlexAttention masks/score mods, walkthroughs, MLA, paged and ring attention, compilation, CUDA Graphs, and tuning |
+| `flex_attention/` | FlexAttention masks/score mods, walkthroughs, MLA, paged attention, context-parallel styles (all-gather, Ulysses, ring), compilation, CUDA Graphs, and tuning |
 | `linear/` | KDA/GDN training, context parallelism, and recurrent decoding |
 | `sparse/` | Compressed sparse attention, VSA, and FastWan integration |
 
