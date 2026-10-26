@@ -167,8 +167,8 @@ def _recurrent_delta_rule_fwd_kernel(
 recurrent_delta_rule_fwd_kernel = triton.autotune(
     configs=[
         triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
-        for block_v in (32, 16, 8)
-        for num_warps in (2, 4)
+        for block_v in (32, 16, 8, 4)
+        for num_warps in (1, 2, 4)
     ],
     key=[
         "T",
@@ -274,13 +274,28 @@ def launch_recurrent_delta_rule_fwd(
     kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
     launch_options = {}
     if not use_autotune:
-        # Offline B200 sweeps favor small tiles for long scans and low-occupancy decode.
+        # Offline B200 sweeps set the one-token tiles and GB200 sweeps the multi-token ones.
+        # Multi-token scans favor one warp: with more warps, every token
+        # converts the 1D q/k/v vectors into the state tile's layout through shared memory and
+        # CTA barriers, while a single warp keeps those exchanges in registers. The value tile
+        # then grows with the sequence-head count to keep the grid full. For K >= 128, packed
+        # lengths may be skewed and the longest sequence's programs then bound latency, so
+        # varlen keeps the narrowest tile. Public entry points cap K at 256, where a one-warp
+        # BV=16 tile still fits in registers.
         average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
         sequence_heads = num_sequences * heads
-        if average_tokens >= 32:
-            block_v_limit, num_warps = 8, 4
+        if average_tokens > 1 and key_dim >= 128:
+            num_warps = 1
+            if cu_seqlens is not None or sequence_heads <= 64:
+                block_v_limit = 4
+            else:
+                block_v_limit = 8 if sequence_heads <= 1024 else 16
         elif average_tokens > 1:
-            block_v_limit, num_warps = 32, 2
+            # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
+            if sequence_heads >= 2048:
+                block_v_limit, num_warps = 32, 2
+            else:
+                block_v_limit, num_warps = (4 if sequence_heads <= 256 else 8), 1
         elif value_dim >= 128:
             block_v_limit, num_warps = 16, 4
         elif sequence_heads <= 8:
