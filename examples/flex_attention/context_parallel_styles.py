@@ -17,20 +17,22 @@ output, so they can be swapped inside a model and compared on equal footing:
   K/V and dK/dV rotations also overlap compute.
 
 All styles use load-balanced "zigzag" sharding for causal attention: with ``2P`` sequence
-chunks, rank ``r`` owns chunks ``r`` and ``2P - 1 - r``. Ring shards move either over NCCL or, when
-every rank is on one node, as copy-engine pushes into symmetric memory (``--ring-transport``).
-The other collectives come from ``torch.distributed._functional_collectives``: in eager mode they return asynchronous tensors that
+chunks, rank ``r`` owns chunks ``r`` and ``2P - 1 - r``.
+
+``--transport`` picks how the all-gather and ring styles move K/V: NCCL, or copy-engine pushes into
+symmetric memory (``attn_gym.distributed``), which need every rank in one NVLink domain and
+default on when all ranks share a node. The copy-engine all-gather writes each shard straight into
+the layout attention reads. The NCCL path and Ulysses use
+``torch.distributed._functional_collectives``: in eager mode they return asynchronous tensors that
 wait on first use, which is what lets the overlap variants issue communication before compute.
-They also have autograd formulas (all-gather backward is a reduce-scatter, all-to-all backward is
-the inverse all-to-all), so the all-gather and Ulysses backwards are derived by autograd. Those
-backward collectives wait as soon as they are issued, so they do not overlap compute.
+Their autograd formulas give the backward collectives (all-gather backward is a reduce-scatter,
+all-to-all backward the inverse all-to-all); those wait as soon as they are issued.
 
 Launch with:
     torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py \
-        --seq-len 131072 --backend FLASH --trace-dir traces/
+        --seq-len 131072 --backend FLASH --cuda-graph --validate
 """
 
-import argparse
 import importlib.util
 import json
 import math
@@ -38,12 +40,14 @@ import os
 import statistics
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from typing import Annotated
 
 import torch
 import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
-import torch.distributed._symmetric_memory as symm_mem
+import typer
 from torch.nn.attention.flex_attention import (
     AuxRequest,
     BlockMask,
@@ -51,6 +55,7 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
+from attn_gym.distributed import CopyEngineAllGather, CopyEngineChannel, single_node
 from attn_gym.testing.profiling import (
     graph_annotations_available,
     kernel_stage,
@@ -99,6 +104,8 @@ class CPContext:
     head_groups: int
     kernel_options: dict[str, str]
     ring: "RingChannels | None"
+    gather: CopyEngineAllGather | None
+    """Copy-engine K/V all-gather; ``None`` gathers over NCCL."""
     global_mask_mod: Callable
     annotate: bool
     """Label captured CUDA Graph kernels with ``mark_kernels`` (eager ranges are always on)."""
@@ -144,20 +151,26 @@ def wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def start_kv_all_gather(k: torch.Tensor, v: torch.Tensor, ctx: CPContext) -> torch.Tensor:
+def start_kv_all_gather(k: torch.Tensor, v: torch.Tensor, ctx: CPContext) -> torch.Tensor | None:
+    if ctx.gather is not None:
+        ctx.gather.start((k, v))
+        return None
     # Gather on dim 0: any other gather_dim makes funcol concatenate, and so wait, immediately.
     return funcol.all_gather_single(torch.stack([k, v]), 0, ctx.group)
 
 
-def wait_kv_all_gather(pending_kv: torch.Tensor, world_size: int) -> torch.Tensor:
-    """(P * 2, 1, Hkv, S/P, D) in rank order -> (2, 1, Hkv, S, D)."""
-    kv = wait(pending_kv).unflatten(0, (world_size, 2))
+def wait_kv_all_gather(pending_kv, k: torch.Tensor, v: torch.Tensor, ctx: CPContext):
+    """K/V of the full sequence as (2, 1, Hkv, S, D), shards in rank order."""
+    if ctx.gather is not None:
+        return ctx.gather.wait((k, v))
+    # (P * 2, 1, Hkv, S/P, D) in rank order -> (2, 1, Hkv, S, D).
+    kv = wait(pending_kv).unflatten(0, (ctx.layout.world_size, 2))
     return kv.permute(1, 2, 3, 0, 4, 5).flatten(3, 4)
 
 
 def allgather_attention(q, k, v, ctx: CPContext) -> torch.Tensor:
     with kernel_stage("cp/allgather/kv-gather", ctx.annotate):
-        kv = wait_kv_all_gather(start_kv_all_gather(k, v, ctx), ctx.layout.world_size)
+        kv = wait_kv_all_gather(start_kv_all_gather(k, v, ctx), k, v, ctx)
     with kernel_stage("cp/allgather/attention", ctx.annotate):
         out, _ = compiled_flex_with_lse(q, kv[0], kv[1], ctx.masks["full"], ctx.kernel_options)
     return out
@@ -171,7 +184,7 @@ def allgather_overlap_attention(q, k, v, ctx: CPContext) -> torch.Tensor:
             q, k, v, ctx.masks["local"], ctx.kernel_options
         )
     with kernel_stage("cp/allgather-overlap/attention-remote", ctx.annotate):
-        kv = wait_kv_all_gather(pending_kv, ctx.layout.world_size)
+        kv = wait_kv_all_gather(pending_kv, k, v, ctx)
         remote_out, remote_lse = compiled_flex_with_lse(
             q, kv[0], kv[1], ctx.masks["remote"], ctx.kernel_options
         )
@@ -285,64 +298,7 @@ class NcclRingChannel:
         pass
 
 
-class CopyEngineRingChannel:
-    """One ring hop per step as a copy-engine push into the next rank's symmetric memory.
-
-    Only valid when every rank is on one node. Copy engines move data without SMs, so the hop
-    neither competes with attention for SMs nor is limited by NCCL's per-peer channel count
-    (on B200 NVLink: ~640 GB/s vs ~160 GB/s for a default NCCL send/recv).
-
-    Each rank owns two receive slots that the previous rank writes alternately. A slot moves
-    between ranks with two signals on the symmetric-memory signal pad: ``FREE`` (receiver ->
-    sender: you may overwrite it) and ``READY`` (sender -> receiver: the data has landed). The
-    receiver frees a slot only after its compute and any onward push from that slot are done.
-    """
-
-    READY, FREE = 0, 1
-
-    def __init__(self, layout: CPLayout, group: dist.ProcessGroup, shape, dtype, device):
-        self.next_rank = (layout.rank + 1) % layout.world_size
-        self.prev_rank = (layout.rank - 1) % layout.world_size
-        self.slots = symm_mem.empty((2, *shape), dtype=dtype, device=device)
-        self.handle = symm_mem.rendezvous(self.slots, group.group_name)
-        self.peer_slots = self.handle.get_buffer(self.next_rank, (2, *shape), dtype)
-        self.stream = torch.cuda.Stream(device)
-        for slot in range(2):
-            self.handle.put_signal(self.prev_rank, self.channel(slot, self.FREE))
-
-    @staticmethod
-    def channel(slot: int, signal: int) -> int:
-        return 2 * slot + signal
-
-    def send(self, parts: tuple[torch.Tensor, torch.Tensor], step: int) -> None:
-        """Push ``parts`` (e.g. K and V) into the slot the next rank reads at ``step + 1``."""
-        slot = (step + 1) % 2
-        self.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.stream):
-            self.handle.wait_signal(self.next_rank, self.channel(slot, self.FREE))
-            for peer_part, part in zip(self.peer_slots[slot], parts):
-                peer_part.copy_(part)
-            self.handle.put_signal(self.next_rank, self.channel(slot, self.READY))
-        for part in parts:
-            part.record_stream(self.stream)
-
-    def recv(self, step: int) -> torch.Tensor:
-        slot = step % 2
-        self.handle.wait_signal(self.prev_rank, self.channel(slot, self.READY))
-        return self.slots[slot]
-
-    def release(self, step: int) -> None:
-        """Hand the slot read at ``step`` back once queued compute and pushes from it finish."""
-        self.stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(self.stream):
-            self.handle.put_signal(self.prev_rank, self.channel(step % 2, self.FREE))
-
-    def join(self) -> None:
-        """Order the copy stream's remaining work before later compute (required by graph capture)."""
-        torch.cuda.current_stream().wait_stream(self.stream)
-
-
-RingChannel = NcclRingChannel | CopyEngineRingChannel
+RingChannel = NcclRingChannel | CopyEngineChannel
 
 
 @dataclass(frozen=True)
@@ -351,18 +307,20 @@ class RingChannels:
     dkv: RingChannel
 
 
-def make_ring_channels(transport: str, layout: CPLayout, group, shape, device) -> RingChannels:
-    match transport:
-        case "nccl":
-            return RingChannels(NcclRingChannel(layout, group), NcclRingChannel(layout, group))
-        case "copy-engine":
-            return RingChannels(
-                *(
-                    CopyEngineRingChannel(layout, group, shape, torch.bfloat16, device)
-                    for _ in range(2)
-                )
-            )
-    raise ValueError(f"unknown ring transport {transport!r}")
+def make_ring_channels(
+    transport: "Transport", layout: CPLayout, group, part_shape, device
+) -> RingChannels:
+    """K/V and dK/dV hops to the next rank; each carries two parts (K and V, or dK and dV)."""
+    if transport is Transport.NCCL:
+        return RingChannels(NcclRingChannel(layout, group), NcclRingChannel(layout, group))
+    prev_rank = (layout.rank - 1) % layout.world_size
+    next_rank = (layout.rank + 1) % layout.world_size
+    return RingChannels(
+        *(
+            CopyEngineChannel(group, prev_rank, next_rank, 2, part_shape, torch.bfloat16, device)
+            for _ in range(2)
+        )
+    )
 
 
 class RingAttention(torch.autograd.Function):
@@ -534,56 +492,49 @@ def mask_work(masks: dict[str, BlockMask], world_size: int) -> dict[str, int]:
     }
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seq-len", type=int, default=131072, help="Global sequence length.")
-    parser.add_argument("--heads", type=int, default=32)
-    parser.add_argument("--kv-heads", type=int, default=8)
-    parser.add_argument("--head-dim", type=int, default=128)
-    parser.add_argument(
-        "--backend",
-        choices=["TRITON", "FLASH"],
-        default="TRITON",
-        help="FlexAttention backend; FLASH needs flash-attn-4 and uses 256-row Q blocks.",
-    )
-    parser.add_argument(
-        "--mask", choices=["causal", "document", "sliding-window"], default="causal"
-    )
-    parser.add_argument("--window", type=int, default=8192, help="Sliding-window size.")
-    parser.add_argument("--num-docs", type=int, default=12, help="Documents for --mask document.")
-    parser.add_argument("--head-groups", type=int, default=2, help="Groups for ulysses-overlap.")
-    parser.add_argument("--styles", nargs="+", choices=list(STYLE_FNS), default=list(STYLE_FNS))
-    parser.add_argument("--iters", type=int, default=10)
-    parser.add_argument(
-        "--ring-transport",
-        choices=["auto", "nccl", "copy-engine"],
-        default="auto",
-        help="How ring moves shards; auto uses copy engines when all ranks share one node.",
-    )
-    parser.add_argument(
-        "--cuda-graph",
-        action="store_true",
-        help="Replay each step from a CUDA graph to remove host launch overhead.",
-    )
-    parser.add_argument(
-        "--validate",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Check outputs and gradients against single-device attention on the full sequence.",
-    )
-    parser.add_argument(
-        "--results-json",
-        type=Path,
-        default=None,
-        help="Append one JSON line per style (slowest-rank timings and peak memory).",
-    )
-    parser.add_argument(
-        "--trace-dir",
-        type=Path,
-        default=None,
-        help="Write per-rank and merged Perfetto traces (needs transformer-nuggets).",
-    )
-    return parser.parse_args()
+class Backend(str, Enum):
+    TRITON = "TRITON"
+    FLASH = "FLASH"
+
+
+class Mask(str, Enum):
+    CAUSAL = "causal"
+    DOCUMENT = "document"
+    SLIDING_WINDOW = "sliding-window"
+
+
+class Style(str, Enum):
+    ALLGATHER = "allgather"
+    ALLGATHER_OVERLAP = "allgather-overlap"
+    ULYSSES = "ulysses"
+    ULYSSES_OVERLAP = "ulysses-overlap"
+    RING = "ring"
+
+
+class Transport(str, Enum):
+    AUTO = "auto"
+    NCCL = "nccl"
+    COPY_ENGINE = "copy-engine"
+
+
+@dataclass(frozen=True)
+class Config:
+    seq_len: int
+    heads: int
+    kv_heads: int
+    head_dim: int
+    backend: Backend
+    mask: Mask
+    window: int
+    num_docs: int
+    head_groups: int
+    styles: list[Style]
+    iters: int
+    transport: Transport
+    cuda_graph: bool
+    validate: bool
+    results_json: Path | None
+    trace_dir: Path | None
 
 
 def init_distributed(seq_len: int) -> tuple[torch.device, CPLayout, bool]:
@@ -598,18 +549,18 @@ def init_distributed(seq_len: int) -> tuple[torch.device, CPLayout, bool]:
     return device, CPLayout(dist.get_rank(), dist.get_world_size(), seq_len), created
 
 
-def make_inputs(args, layout: CPLayout, device: torch.device, full: bool, seed: int = 0):
+def make_inputs(cfg: Config, layout: CPLayout, device: torch.device, full: bool, seed: int = 0):
     seq_len = layout.seq_len if full else layout.shard_len
     generator = torch.Generator(device=device).manual_seed(seed if full else layout.rank + 1)
 
     def randn(heads: int) -> torch.Tensor:
-        shape = (1, heads, seq_len, args.head_dim)
+        shape = (1, heads, seq_len, cfg.head_dim)
         return torch.randn(shape, device=device, dtype=torch.bfloat16, generator=generator)
 
-    return randn(args.heads), randn(args.kv_heads), randn(args.kv_heads), randn(args.heads)
+    return randn(cfg.heads), randn(cfg.kv_heads), randn(cfg.kv_heads), randn(cfg.heads)
 
 
-def validate(args, style: str, ctx: CPContext, device: torch.device) -> None:
+def check_against_reference(cfg: Config, style: str, ctx: CPContext, device: torch.device) -> None:
     layout = ctx.layout
     ids = layout.local_token_ids(device)
     reference_mask = create_block_mask(
@@ -625,7 +576,7 @@ def validate(args, style: str, ctx: CPContext, device: torch.device) -> None:
 
     def reference(seed: int) -> list[torch.Tensor]:
         """Single-device fwd+bwd on the full sequence; returns this rank's shards of q, k, v, dO."""
-        full = make_inputs(args, layout, device, full=True, seed=seed)
+        full = make_inputs(cfg, layout, device, full=True, seed=seed)
         ref["inputs"] = [x.clone().requires_grad_(True) for x in full[:3]]
         ref["out"], _ = compiled_flex_with_lse(*ref["inputs"], reference_mask, ctx.kernel_options)
         ref["out"].backward(full[3])
@@ -650,7 +601,7 @@ def validate(args, style: str, ctx: CPContext, device: torch.device) -> None:
 
     step()
     check("eager")
-    if args.cuda_graph:
+    if cfg.cuda_graph:
         # Fresh leaves: the eager step's autograd nodes are bound to the default stream and would
         # invalidate capture.
         outputs.clear()
@@ -718,66 +669,80 @@ def capture_cuda_graph(step: Callable[[], None], annotate: bool = False) -> torc
     return graph
 
 
-def main() -> None:
-    args = parse_args()
-    if args.trace_dir is not None and importlib.util.find_spec("transformer_nuggets") is None:
+def runnable_styles(cfg: Config, world_size: int) -> list[str]:
+    """Requested styles, minus Ulysses variants whose head split does not divide the KV heads."""
+    styles = []
+    for style in cfg.styles:
+        groups = {Style.ULYSSES: 1, Style.ULYSSES_OVERLAP: cfg.head_groups}.get(style)
+        if groups and cfg.kv_heads % (world_size * groups) != 0:
+            if dist.get_rank() == 0:
+                print(
+                    f"skipping {style.value}: kv_heads must be divisible by {world_size * groups}"
+                )
+            continue
+        styles.append(style.value)
+    return styles
+
+
+def run(cfg: Config) -> None:
+    if cfg.trace_dir is not None and importlib.util.find_spec("transformer_nuggets") is None:
         # Optional dependency, checked up front so a missing install fails before any GPU work.
         raise RuntimeError("--trace-dir needs transformer-nuggets installed.")
-    device, layout, owns_process_group = init_distributed(args.seq_len)
-    annotate = args.cuda_graph and graph_annotations_available()
-    if args.cuda_graph and not annotate and layout.rank == 0:
+    device, layout, owns_process_group = init_distributed(cfg.seq_len)
+    annotate = cfg.cuda_graph and graph_annotations_available()
+    if cfg.cuda_graph and not annotate and layout.rank == 0:
         print("Capturing without kernel labels: graph annotations need a newer PyTorch/driver.")
-    styles = list(args.styles)
-    for style, groups in (("ulysses", 1), ("ulysses-overlap", args.head_groups)):
-        if style in styles and args.kv_heads % (layout.world_size * groups) != 0:
-            # Ulysses shards heads, so it cannot use more ranks than KV heads (per head group).
-            styles.remove(style)
-            if layout.rank == 0:
-                print(
-                    f"skipping {style}: kv_heads must be divisible by {layout.world_size * groups}"
-                )
-    block_size = (256, 128) if args.backend == "FLASH" else (128, 128)
+    styles = runnable_styles(cfg, layout.world_size)
+    block_size = (256, 128) if cfg.backend is Backend.FLASH else (128, 128)
     seq_len_unit = 2 * layout.world_size * block_size[0]
-    if args.seq_len % seq_len_unit != 0:
+    if cfg.seq_len % seq_len_unit != 0:
         raise RuntimeError(f"seq_len must be divisible by {seq_len_unit}.")
-    global_mask_mod = make_global_mask_mod(args.mask, args.seq_len, args.window, args.num_docs)
+    global_mask_mod = make_global_mask_mod(cfg.mask.value, cfg.seq_len, cfg.window, cfg.num_docs)
     masks = build_masks(layout, device, block_size, global_mask_mod)
     work = [None] * layout.world_size
     dist.all_gather_object(work, mask_work(masks, layout.world_size))
     if layout.rank == 0:
-        print(f"mask={args.mask}: nonzero tiles per rank (max/mean = load imbalance)")
+        print(f"mask={cfg.mask.value}: nonzero tiles per rank (max/mean = load imbalance)")
         for style in work[0]:
             counts = [w[style] for w in work]
             imbalance = max(counts) / (sum(counts) / len(counts))
             print(f"  {style:<18} {counts}  max/mean {imbalance:.2f}")
-    kernel_options = {"BACKEND": args.backend}
+    kernel_options = {"BACKEND": cfg.backend.value}
 
-    q, k, v, grad_out = make_inputs(args, layout, device, full=False)
+    q, k, v, grad_out = make_inputs(cfg, layout, device, full=False)
     q, k, v = (x.requires_grad_(True) for x in (q, k, v))
-    transport = args.ring_transport
-    if transport == "auto":
-        single_node = int(os.environ["LOCAL_WORLD_SIZE"]) == layout.world_size
-        transport = "copy-engine" if single_node else "nccl"
-    ring = None
+    transport = cfg.transport
+    if transport is Transport.AUTO:
+        transport = Transport.COPY_ENGINE if single_node() else Transport.NCCL
+    # Persistent communication buffers, built once and shared by every style that needs them.
+    kv_part = (1, cfg.kv_heads, layout.shard_len, cfg.head_dim)
+    ring = gather = None
     if "ring" in styles:
-        kv_shape = (2, 1, args.kv_heads, layout.shard_len, args.head_dim)
-        ring = make_ring_channels(transport, layout, dist.group.WORLD, kv_shape, device)
-    slot_gib = 0.0
-    if transport == "copy-engine" and ring is not None:
-        slot_gib = 2 * 2 * 2 * args.kv_heads * layout.shard_len * args.head_dim * 2 / 2**30
+        ring = make_ring_channels(transport, layout, dist.group.WORLD, kv_part, device)
+    copy_engine = transport is Transport.COPY_ENGINE
+    if copy_engine and {"allgather", "allgather-overlap"} & set(styles):
+        gather = CopyEngineAllGather(
+            dist.group.WORLD, 2, kv_part, dim=2, dtype=torch.bfloat16, device=device
+        )
+    gib = 2 * math.prod(kv_part) * 2 / 2**30  # one K/V shard pair, bf16
+    persistent_gib = {
+        "ring": 4 * gib if copy_engine else 0.0,  # two channels x two slots
+        "allgather": layout.world_size * gib if gather else 0.0,
+    }
+    persistent_gib["allgather-overlap"] = persistent_gib["allgather"]
     if layout.rank == 0:
         print(
-            f"\nP={layout.world_size} S={args.seq_len} H={args.heads} H_kv={args.kv_heads} "
-            f"D={args.head_dim} bf16 {args.mask} zigzag {args.backend}"
-            f"{' cudagraph' if args.cuda_graph else ''} ring={transport} "
-            f"(median of {args.iters}, slowest rank)"
+            f"\nP={layout.world_size} S={cfg.seq_len} H={cfg.heads} H_kv={cfg.kv_heads} "
+            f"D={cfg.head_dim} bf16 {cfg.mask.value} zigzag {cfg.backend.value}"
+            f"{' cudagraph' if cfg.cuda_graph else ''} transport={transport.value} "
+            f"(median of {cfg.iters}, slowest rank)"
         )
-        if slot_gib:
-            print(f"copy-engine ring also holds {slot_gib:.2f} GiB of symmetric-memory slots")
-        print(f"{'style':<20}{'fwd ms':>10}{'fwd+bwd ms':>12}{'eager peak GiB':>16}", flush=True)
+        print(
+            f"{'style':<20}{'fwd ms':>10}{'fwd+bwd ms':>12}{'eager peak GiB':>16}{'symm GiB':>10}",
+            flush=True,
+        )
     for style in styles:
-        graphs = []
-        head_groups = args.head_groups if style.endswith("overlap") else 1
+        head_groups = cfg.head_groups if style.endswith("overlap") else 1
         ctx = CPContext(
             layout,
             dist.group.WORLD,
@@ -785,94 +750,171 @@ def main() -> None:
             head_groups,
             kernel_options,
             ring,
+            gather,
             global_mask_mod,
             annotate,
         )
-        if args.validate:
-            validate(args, style, ctx, device)
-
-        def forward(style=style, ctx=ctx) -> None:
-            with kernel_stage(f"cp/{style}/forward", annotate, backward=False):
-                STYLE_FNS[style](q, k, v, ctx)
-
-        def train_step(style=style, ctx=ctx) -> None:
-            with kernel_stage(f"cp/{style}/forward", annotate, backward=False):
-                out = STYLE_FNS[style](q, k, v, ctx)
-            with kernel_stage(f"cp/{style}/backward", annotate, backward=False):
-                out.backward(grad_out)
-
-        for _ in range(3):
-            train_step()
-        peak_gib = step_peak_gib(train_step)
-        with torch.no_grad():
-            for _ in range(3):
-                forward()
-            if args.cuda_graph:
-                graphs.append(capture_cuda_graph(forward, annotate))
-                forward = graphs[-1].replay
-        if args.cuda_graph:
-            graphs.append(capture_cuda_graph(train_step, annotate))
-            train_step = graphs[-1].replay
-        torch.cuda.synchronize()
-        dist.barrier()
-        with torch.no_grad():
-            fwd_ms = time_steps(forward, args.iters)
-        step_ms = time_steps(train_step, args.iters)
-        # Report the slowest rank: every rank waits for it at the next collective.
-        worst = torch.tensor([fwd_ms, step_ms, peak_gib], device=device)
-        dist.all_reduce(worst, op=dist.ReduceOp.MAX)
-        fwd_ms, step_ms, peak_gib = worst.tolist()
+        if cfg.validate:
+            check_against_reference(cfg, style, ctx, device)
+        fwd_ms, step_ms, peak_gib, trace = benchmark_style(
+            cfg, style, ctx, (q, k, v, grad_out), device, transport
+        )
+        symm_gib = persistent_gib.get(style, 0.0)
         if layout.rank == 0:
-            print(f"{style:<20}{fwd_ms:>10.2f}{step_ms:>12.2f}{peak_gib:>16.2f}", flush=True)
-            if args.results_json is not None:
+            print(
+                f"{style:<20}{fwd_ms:>10.2f}{step_ms:>12.2f}{peak_gib:>16.2f}{symm_gib:>10.2f}",
+                flush=True,
+            )
+            if trace is not None:
+                print(f"trace={trace}", flush=True)
+            if cfg.results_json is not None:
                 row = {
                     "style": style,
                     "world_size": layout.world_size,
-                    "seq_len": args.seq_len,
-                    "heads": args.heads,
-                    "kv_heads": args.kv_heads,
-                    "head_dim": args.head_dim,
+                    "seq_len": cfg.seq_len,
+                    "heads": cfg.heads,
+                    "kv_heads": cfg.kv_heads,
+                    "head_dim": cfg.head_dim,
                     "head_groups": head_groups,
-                    "mask": args.mask,
-                    "window": args.window,
-                    "num_docs": args.num_docs,
-                    "backend": args.backend,
-                    "cuda_graph": args.cuda_graph,
-                    "ring_transport": transport,
+                    "mask": cfg.mask.value,
+                    "window": cfg.window,
+                    "num_docs": cfg.num_docs,
+                    "backend": cfg.backend.value,
+                    "cuda_graph": cfg.cuda_graph,
+                    "transport": transport.value,
                     "fwd_ms": fwd_ms,
                     "step_ms": step_ms,
-                    "iters": args.iters,
-                    # Eager step peak beyond live inputs; persistent ring slots are separate.
+                    "iters": cfg.iters,
+                    # Eager step peak beyond live inputs; persistent symmetric buffers separate.
                     "peak_gib": peak_gib,
-                    "ring_slot_gib": slot_gib if style == "ring" else 0.0,
+                    "symm_gib": symm_gib,
                     "device": torch.cuda.get_device_name(device),
                     "torch": torch.__version__,
                 }
-                with args.results_json.open("a") as results:
+                with cfg.results_json.open("a") as results:
                     results.write(json.dumps(row) + "\n")
-
-        if args.trace_dir is not None:
-            graph_suffix = "_cudagraph" if args.cuda_graph else ""
-            style_tag = f"ring-{transport}" if style == "ring" else style
-            trace_name = (
-                f"{style_tag}_{args.mask}_{args.backend.lower()}{graph_suffix}_seq{args.seq_len}"
-            )
-            merged = record_distributed_profile(
-                train_step, args.trace_dir / trace_name, style, device, warmup_steps=2
-            )
-            if merged is not None:
-                print(f"trace={merged}", flush=True)
-
-        # Release this style's graphs (and their memory pools) before the next style. Graphs that
-        # captured NCCL work must also be released before teardown, or it hangs.
-        for graph in graphs:
-            graph.reset()
-        torch.cuda.empty_cache()
 
     dist.barrier()
     if owns_process_group:
         dist.destroy_process_group()
 
 
+def benchmark_style(cfg: Config, style: str, ctx: CPContext, tensors, device, transport):
+    """Slowest-rank fwd and fwd+bwd median ms, eager step peak GiB, and optional merged trace."""
+    q, k, v, grad_out = tensors
+    annotate = ctx.annotate
+    graphs = []
+
+    def forward() -> None:
+        with kernel_stage(f"cp/{style}/forward", annotate, backward=False):
+            STYLE_FNS[style](q, k, v, ctx)
+
+    def train_step() -> None:
+        with kernel_stage(f"cp/{style}/forward", annotate, backward=False):
+            out = STYLE_FNS[style](q, k, v, ctx)
+        with kernel_stage(f"cp/{style}/backward", annotate, backward=False):
+            out.backward(grad_out)
+
+    for _ in range(3):
+        train_step()
+    peak_gib = step_peak_gib(train_step)
+    run_forward, run_step = forward, train_step
+    with torch.no_grad():
+        for _ in range(3):
+            forward()
+        if cfg.cuda_graph:
+            graphs.append(capture_cuda_graph(forward, annotate))
+            run_forward = graphs[-1].replay
+    if cfg.cuda_graph:
+        graphs.append(capture_cuda_graph(train_step, annotate))
+        run_step = graphs[-1].replay
+    torch.cuda.synchronize()
+    dist.barrier()
+    with torch.no_grad():
+        fwd_ms = time_steps(run_forward, cfg.iters)
+    step_ms = time_steps(run_step, cfg.iters)
+    # Report the slowest rank: every rank waits for it at the next collective.
+    worst = torch.tensor([fwd_ms, step_ms, peak_gib], device=device)
+    dist.all_reduce(worst, op=dist.ReduceOp.MAX)
+
+    trace = None
+    if cfg.trace_dir is not None:
+        # Only the all-gather and ring styles depend on the transport.
+        uses_transport = style in ("allgather", "allgather-overlap", "ring")
+        style_tag = f"{style}-{transport.value}" if uses_transport else style
+        graph_suffix = "_cudagraph" if cfg.cuda_graph else ""
+        name = f"{style_tag}_{cfg.mask.value}_{cfg.backend.value.lower()}{graph_suffix}"
+        trace = record_distributed_profile(
+            run_step, cfg.trace_dir / f"{name}_seq{cfg.seq_len}", style, device, warmup_steps=2
+        )
+    # Release this style's graphs (and their memory pools) before the next style. Graphs that
+    # captured NCCL work must also be released before teardown, or it hangs.
+    for graph in graphs:
+        graph.reset()
+    torch.cuda.empty_cache()
+    return (*worst.tolist(), trace)
+
+
+app = typer.Typer(add_completion=False, pretty_exceptions_enable=False)
+
+
+@app.command()
+def main(
+    seq_len: Annotated[int, typer.Option(help="Global sequence length.")] = 131072,
+    heads: int = 32,
+    kv_heads: int = 8,
+    head_dim: int = 128,
+    backend: Annotated[
+        Backend, typer.Option(help="FlexAttention backend; FLASH needs flash-attn-4.")
+    ] = Backend.TRITON,
+    mask: Mask = Mask.CAUSAL,
+    window: Annotated[int, typer.Option(help="Sliding-window size.")] = 8192,
+    num_docs: Annotated[int, typer.Option(help="Documents for --mask document.")] = 12,
+    head_groups: Annotated[int, typer.Option(help="Head groups for ulysses-overlap.")] = 2,
+    styles: Annotated[
+        list[Style] | None, typer.Option("--style", help="Repeat to pick styles (default: all).")
+    ] = None,
+    iters: int = 10,
+    transport: Annotated[
+        Transport,
+        typer.Option(
+            help="How allgather and ring move K/V; auto uses copy engines on a single node."
+        ),
+    ] = Transport.AUTO,
+    cuda_graph: Annotated[
+        bool, typer.Option(help="Replay each step from a CUDA graph (removes launch overhead).")
+    ] = False,
+    validate: Annotated[
+        bool, typer.Option(help="Check outputs and gradients against single-device attention.")
+    ] = False,
+    results_json: Annotated[
+        Path | None, typer.Option(help="Append one JSON line per style.")
+    ] = None,
+    trace_dir: Annotated[
+        Path | None, typer.Option(help="Write merged Perfetto traces (needs transformer-nuggets).")
+    ] = None,
+) -> None:
+    run(
+        Config(
+            seq_len=seq_len,
+            heads=heads,
+            kv_heads=kv_heads,
+            head_dim=head_dim,
+            backend=backend,
+            mask=mask,
+            window=window,
+            num_docs=num_docs,
+            head_groups=head_groups,
+            styles=styles or list(Style),
+            iters=iters,
+            transport=transport,
+            cuda_graph=cuda_graph,
+            validate=validate,
+            results_json=results_json,
+            trace_dir=trace_dir,
+        )
+    )
+
+
 if __name__ == "__main__":
-    main()
+    app()

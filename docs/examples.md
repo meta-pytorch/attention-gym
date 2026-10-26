@@ -105,10 +105,10 @@ torchrun --standalone --nproc_per_node=4 examples/flex_attention/ring_attention.
 - `ulysses` / `ulysses-overlap`: all-to-all from sequence to head sharding and back, optionally pipelined over head groups.
 - `ring`: rotate `k/v` with a prefetched point-to-point shift and merge each step by log-sum-exp; a hand-written backward overlaps the `k/v` and `dk/dv` rotations with compute.
 
-Ring shards move over NCCL or, when every rank is on one node, as copy-engine pushes into symmetric memory (`--ring-transport auto|nccl|copy-engine`; `auto` picks copy engines on a single node). The other styles use `torch.distributed._functional_collectives`, whose async tensors make the overlap explicit; the all-gather and Ulysses backwards come from their autograd formulas. `--cuda-graph` replays each step from a CUDA graph to remove host launch overhead. `--validate` checks outputs and gradients against single-device attention, and `--trace-dir` writes per-rank Perfetto traces through `transformer_nuggets`.
+`--transport auto|nccl|copy-engine` picks how the all-gather and ring styles move `k/v`: NCCL, or copy-engine pushes into symmetric memory from [`attn_gym.distributed`](utilities.md#distributed), which need every rank in one NVLink domain (`auto` picks copy engines on a single node). The copy-engine all-gather writes each shard straight into the layout attention reads. The NCCL path and Ulysses use `torch.distributed._functional_collectives`, whose async tensors make the overlap explicit; their backwards come from the collectives' autograd formulas. Pick styles with repeated `--style`. `--cuda-graph` replays each step from a CUDA graph to remove host launch overhead. `--validate` checks outputs and gradients against single-device attention, and `--trace-dir` writes per-rank Perfetto traces through `transformer_nuggets`.
 
 ```bash
-torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py --seq-len 16384 --validate
+torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py --seq-len 16384 --validate --cuda-graph
 torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py --seq-len 131072 --backend FLASH --trace-dir traces/
 ```
 

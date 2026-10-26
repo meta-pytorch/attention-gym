@@ -12,6 +12,8 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
   [`docs/linear.md`](docs/linear.md).
 - **Sparse attention** (`attn_gym/sparse/`) — `lightning_indexer` Top-K selection and
   `gather_attn`; see [`docs/sparse.md`](docs/sparse.md).
+- **Distributed** (`attn_gym/distributed/`) — copy-engine all-gather and point-to-point channels over
+  symmetric memory, used by the context-parallel attention example.
 - **Utilities** (`attn_gym/utils.py`) — helpers for visualizing and debugging
   `score_mod`/`mask_mod` functions.
 
