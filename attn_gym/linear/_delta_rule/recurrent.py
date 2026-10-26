@@ -52,6 +52,16 @@ def _prune_recurrent_configs(configs, _named_args, V, **_):
     return [config for config in configs if config.kwargs["BV"] <= max_block_v]
 
 
+@triton.jit
+def _load_key_tile(base, o_k_tile, K: tl.constexpr, BK: tl.constexpr):
+    """Load a key-indexed tile in FP32, masking only padded key channels."""
+    if K == BK:
+        tile = tl.load(base + o_k_tile)
+    else:
+        tile = tl.load(base + o_k_tile, mask=o_k_tile < K, other=0.0)
+    return tile.to(tl.float32)
+
+
 @triton.jit(do_not_specialize=["N"])
 def _recurrent_delta_rule_fwd_kernel(
     q,
@@ -132,33 +142,32 @@ def _recurrent_delta_rule_fwd_kernel(
     else:
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 
-    for t in range(bos, eos):
+    # Key-indexed operands are loaded as [BK, BV] tiles that repeat each key channel across
+    # the value columns, so they land in the state tile's layout directly. Loading [BK]
+    # vectors and broadcasting them costs a layout conversion per operand per token.
+    o_k_tile = tl.broadcast_to(o_k[:, None], (BK, BV))
+    # A 32-bit trip count and base pointers offset by the scalar row before adding the key
+    # tile offsets keep 64-bit address math out of the per-element tile registers.
+    for i_t in range((eos - bos).to(tl.int32)):
+        t = bos + i_t
         row = t * H + i_h
         row_k = t * HK + i_hk
-        b_q = tl.load(q + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
-        b_q *= scale
-        b_k = tl.load(k + ptr_offset((row_k, o_k), (K, 1)), mask=m_k, other=0.0).to(tl.float32)
+        b_q = _load_key_tile(q + row_k * K, o_k_tile, K, BK) * scale
+        b_k = _load_key_tile(k + row_k * K, o_k_tile, K, BK)
         if SCALAR_GATE:
             b_g = tl.load(gate + row).to(tl.float32)
         else:
-            b_g = tl.load(gate + ptr_offset((row, o_k), (K, 1)), mask=m_k, other=0.0).to(
-                tl.float32
-            )
+            b_g = _load_key_tile(gate + row * K, o_k_tile, K, BK)
         b_beta = tl.load(beta + row).to(tl.float32)
-        b_v = tl.load(v + ptr_offset((row, o_v), (V, 1)), mask=m_v, other=0.0).to(tl.float32)
+        b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
 
         # exp(g) computed as exp2(g * log2(e)); the FMA folds into the exp2 argument.
-        if SCALAR_GATE:
-            b_state *= tl.exp2(b_g * LOG2_E)
-        else:
-            b_state *= tl.exp2(b_g * LOG2_E)[:, None]
+        b_state *= tl.exp2(b_g * LOG2_E)
 
-        b_delta = (b_v - tl.sum(b_k[:, None] * b_state, 0)) * b_beta
-        b_state += b_k[:, None] * b_delta[None, :]
-        b_o = tl.sum(b_q[:, None] * b_state, 0)
-        tl.store(
-            output + ptr_offset((row, o_v), (V, 1)), b_o.to(output.dtype.element_ty), mask=m_v
-        )
+        b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
+        b_state += b_k * b_delta[None, :]
+        b_o = tl.sum(b_q * b_state, 0)
+        tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
 
     if STORE_FINAL_STATE:
         tl.store(ht + p_state, b_state, mask=m_kv)
@@ -167,7 +176,7 @@ def _recurrent_delta_rule_fwd_kernel(
 recurrent_delta_rule_fwd_kernel = triton.autotune(
     configs=[
         triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
-        for block_v in (32, 16, 8, 4)
+        for block_v in (32, 16, 8, 4, 2)
         for num_warps in (1, 2, 4)
     ],
     key=[
@@ -274,22 +283,25 @@ def launch_recurrent_delta_rule_fwd(
     kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
     launch_options = {}
     if not use_autotune:
-        # Offline B200 sweeps set the one-token tiles and GB200 sweeps the multi-token ones.
-        # Multi-token scans favor one warp: with more warps, every token
-        # converts the 1D q/k/v vectors into the state tile's layout through shared memory and
-        # CTA barriers, while a single warp keeps those exchanges in registers. The value tile
-        # then grows with the sequence-head count to keep the grid full. For K >= 128, packed
-        # lengths may be skewed and the longest sequence's programs then bound latency, so
-        # varlen keeps the narrowest tile. Public entry points cap K at 256, where a one-warp
-        # BV=16 tile still fits in registers.
+        # Offline B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
+        # Multi-token scans favor one warp: with more warps, the per-token reductions and
+        # broadcasts cross warps through shared memory and CTA barriers, while a single warp
+        # keeps them in registers. Each program carries its tile through the whole sequence,
+        # so a grid that spills into a second wave doubles latency: tiny grids split V finely
+        # to spread the serial scan over more SMs, and at K=128 BV=16 keeps up to 256
+        # sequence-heads in one wave once registers are capped at 128 (16 one-warp programs per
+        # SM). For K >= 128, packed lengths may be skewed and the longest sequence's programs
+        # then bound latency, so varlen keeps a narrow tile.
         average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
         sequence_heads = num_sequences * heads
         if average_tokens > 1 and key_dim >= 128:
             num_warps = 1
-            if cu_seqlens is not None or sequence_heads <= 64:
+            if sequence_heads <= 16:
+                block_v_limit = 2
+            elif cu_seqlens is not None or sequence_heads <= 64:
                 block_v_limit = 4
             else:
-                block_v_limit = 8 if sequence_heads <= 1024 else 16
+                block_v_limit = 16
         elif average_tokens > 1:
             # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
             if sequence_heads >= 2048:
@@ -297,18 +309,24 @@ def launch_recurrent_delta_rule_fwd(
             else:
                 block_v_limit, num_warps = (4 if sequence_heads <= 256 else 8), 1
         elif value_dim >= 128:
-            block_v_limit, num_warps = 16, 4
+            block_v_limit = 4 if key_dim > 128 or sequence_heads > 512 else 8
+            num_warps = 1
         elif sequence_heads <= 8:
             block_v_limit, num_warps = 8, 4
         elif sequence_heads < 1024:
             block_v_limit, num_warps = 16, 2
         else:
             block_v_limit, num_warps = 32, 2
+        # Each thread holds BK * BV / (32 * num_warps) state elements; above 64 the tile no longer
+        # fits the 128-register cap, so K=256 halves the K=128 limit.
+        block_v_limit = min(block_v_limit, 2048 * num_warps // triton.next_power_of_2(key_dim))
         launch_options = {
             "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
             "num_warps": num_warps,
             "num_stages": 3,
         }
+        if num_warps == 1:
+            launch_options["maxnreg"] = 128
     kernel[grid](
         q,
         k,
