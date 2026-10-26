@@ -301,7 +301,8 @@ def launch_recurrent_delta_rule_fwd(
             elif cu_seqlens is not None or sequence_heads <= 64:
                 block_v_limit = 4
             else:
-                block_v_limit = 16
+                # A one-warp BV * K tile fits the 128-register cap below up to 2048 elements.
+                block_v_limit = 16 if key_dim <= 128 else 8
         elif average_tokens > 1:
             # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
             if sequence_heads >= 2048:
@@ -317,9 +318,6 @@ def launch_recurrent_delta_rule_fwd(
             block_v_limit, num_warps = 16, 2
         else:
             block_v_limit, num_warps = 32, 2
-        # Each thread holds BK * BV / (32 * num_warps) state elements; above 64 the tile no longer
-        # fits the 128-register cap, so K=256 halves the K=128 limit.
-        block_v_limit = min(block_v_limit, 2048 * num_warps // triton.next_power_of_2(key_dim))
         launch_options = {
             "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
             "num_warps": num_warps,
