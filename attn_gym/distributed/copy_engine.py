@@ -8,8 +8,8 @@
 
 PyTorch symmetric memory maps each rank's buffer into its peers' address spaces, so a plain
 ``Tensor.copy_`` from a local tensor into a peer's buffer is a copy-engine transfer over NVLink:
-it uses no SMs, so it does not compete with attention kernels, and it is not limited by NCCL's
-per-peer channel count. On GB300 a contiguous push reaches ~820 GB/s, versus ~330 GB/s for a
+the payload moves without occupying SMs (only small signal kernels launch), and it is not limited by
+NCCL's per-peer channel count. It still shares memory and NVLink bandwidth with other work. On GB300 a contiguous push reaches ~820 GB/s, versus ~330 GB/s for a
 default NCCL send/recv and ~430 GB/s for an NCCL all-gather.
 
 Every rank in the group must share one NVLink domain: one node, or a multi-node NVLink system
@@ -106,9 +106,11 @@ class CopyEngineAllGather:
 
     ``start(parts)`` issues the pushes; ``wait(parts)`` returns the gathered buffer. When any part
     requires grad, ``wait`` is differentiable: its backward reduce-scatters the gradient over NCCL.
-    The buffer is reused by the next ``start``, which first tells peers it is free; that signal is
-    queued behind everything already on the current stream (including the backward that reads
-    the buffer), so one gather may be outstanding at a time.
+    Every ``start`` first tells peers this rank's buffer is free, then waits for each peer's free
+    signal before writing into it. The signal is queued behind everything already on the current
+    stream (including any backward that reads the previous gather), so one gather may be
+    outstanding at a time, and every call issues the same signals, so a captured ``start`` replays
+    correctly whether or not the gather ran eagerly first.
     """
 
     def __init__(
@@ -137,9 +139,6 @@ class CopyEngineAllGather:
         gathered_part[dim] *= self.world_size
         self.buffer = self.flat.view(num_parts, *gathered_part)
         self.stream = torch.cuda.Stream(device)
-        self.started = False
-        for peer in self.peers():
-            self.handle.put_signal(peer, _channel(0, FREE))
 
     def peers(self) -> list[int]:
         return [(self.rank + i) % self.world_size for i in range(1, self.world_size)]
@@ -148,10 +147,9 @@ class CopyEngineAllGather:
         lo, hi = self.rank * self.row_len, (self.rank + 1) * self.row_len
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream), torch.no_grad():
-            if self.started:
-                # Everything that read the previous gather is queued before this point.
-                for peer in self.peers():
-                    self.handle.put_signal(peer, _channel(0, FREE))
+            # Everything that read the previous gather is queued before this point.
+            for peer in self.peers():
+                self.handle.put_signal(peer, _channel(0, FREE))
             for peer in [self.rank, *self.peers()]:
                 if peer != self.rank:
                     self.handle.wait_signal(peer, _channel(0, FREE))
@@ -162,7 +160,6 @@ class CopyEngineAllGather:
                     self.handle.put_signal(peer, _channel(0, READY))
         for part in parts:
             part.record_stream(self.stream)
-        self.started = True
 
     def wait(self, parts: Sequence[torch.Tensor]) -> torch.Tensor:
         if torch.is_grad_enabled() and any(part.requires_grad for part in parts):
@@ -195,11 +192,10 @@ class _GatherWait(torch.autograd.Function):
         return None, *ctx.gather.reduce_scatter(grad)
 
 
-def single_node(group: dist.ProcessGroup | None = None) -> bool:
-    """True when every rank of ``group`` runs on this node (torchrun's ``LOCAL_WORLD_SIZE``).
+def single_node() -> bool:
+    """True when every rank of the world group runs on this node (torchrun's ``LOCAL_WORLD_SIZE``).
 
     Multi-node NVLink domains (NVL72) also support copy-engine transfers, but there is no cheap
     portable query for them, so callers opt in explicitly there.
     """
-    group = group or dist.group.WORLD
-    return int(os.environ.get("LOCAL_WORLD_SIZE", "-1")) == dist.get_world_size(group)
+    return int(os.environ.get("LOCAL_WORLD_SIZE", "-1")) == dist.get_world_size()

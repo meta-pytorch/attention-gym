@@ -21,7 +21,8 @@ Helper functions for visualization, benchmarking, and profiling.
 ## Distributed
 
 Copy-engine transfers into symmetric memory, for groups inside one NVLink domain (one node or
-an NVL72 rack). They use no SMs, so they overlap compute without slowing it.
+an NVL72 rack). Payload copies do not occupy SMs, so they overlap attention kernels well; they
+still share memory and NVLink bandwidth.
 
 ::: attn_gym.distributed.CopyEngineAllGather
 

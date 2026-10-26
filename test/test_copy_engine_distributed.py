@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 
 import pytest
 import torch
@@ -72,21 +73,29 @@ def _all_gather_worker(rank: int, port: int) -> None:
             for x, r in zip(parts, ref_parts, strict=True):
                 torch.testing.assert_close(x.grad, r.grad)
 
-        # A captured gather must move the values present at replay time.
+        # Forward-only reuse with a slow reader: rank 0 keeps reading the buffer long after its
+        # peer has started the next gather, so a push must wait for rank 0's free signal.
+        # References first: no NCCL collective may resynchronize the ranks inside the loop.
+        inputs = [_parts(seed, device) for seed in range(3, 6)]
+        refs = [_reference_gather(parts) for parts in inputs]
+        snapshots = []
+        for parts in inputs:
+            gather.start(parts)
+            out = gather.wait(parts)
+            if rank == 0:
+                torch.cuda._sleep(50_000_000)
+            snapshots.append(out.clone())
+        for snapshot, ref in zip(snapshots, refs, strict=True):
+            torch.testing.assert_close(snapshot, ref, rtol=0, atol=0)
+
+        # A gather captured before any eager call must replay repeatedly with current values.
+        fresh = CopyEngineAllGather(dist.group.WORLD, 2, PART_SHAPE, 2, torch.float32, device)
         static = _parts(10, device)
-        gather.start(static)
-        gather.wait(static)
         graph = torch.cuda.CUDAGraph()
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side):
-            gather.start(static)
-            gather.wait(static)
-        torch.cuda.current_stream().wait_stream(side)
         with torch.cuda.graph(graph):
-            gather.start(static)
-            captured_out = gather.wait(static)
-        for seed in (11, 12):
+            fresh.start(static)
+            captured_out = fresh.wait(static)
+        for seed in (11, 12, 13):
             for dst, src in zip(static, _parts(seed, device), strict=True):
                 dst.copy_(src)
             graph.replay()
@@ -126,4 +135,13 @@ def _channel_worker(rank: int, port: int) -> None:
     "worker", [_all_gather_worker, _channel_worker], ids=["all-gather", "channel"]
 )
 def test_copy_engine_matches_nccl(worker) -> None:
-    mp.spawn(worker, args=(_free_port(),), nprocs=WORLD, join=True)
+    # Symmetric-memory waits have no timeout, so bound the run: a protocol bug would otherwise hang.
+    context = mp.spawn(worker, args=(_free_port(),), nprocs=WORLD, join=False)
+    deadline = time.monotonic() + 300
+    try:
+        while not context.join(timeout=max(0.0, deadline - time.monotonic())):
+            assert time.monotonic() < deadline, "spawned ranks did not finish within 300 s"
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
