@@ -142,12 +142,10 @@ def _recurrent_delta_rule_fwd_kernel(
     else:
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 
-    # Key-indexed operands are loaded as [BK, BV] tiles that repeat each key channel across
-    # the value columns, so they land in the state tile's layout directly. Loading [BK]
-    # vectors and broadcasting them costs a layout conversion per operand per token.
+    # Load key-indexed operands as [BK, BV] tiles in the state's layout; broadcasting [BK]
+    # vectors costs a layout conversion per operand per token.
     o_k_tile = tl.broadcast_to(o_k[:, None], (BK, BV))
-    # A 32-bit trip count and base pointers offset by the scalar row before adding the key
-    # tile offsets keep 64-bit address math out of the per-element tile registers.
+    # A 32-bit trip count and scalar row offsets keep 64-bit math out of per-element addresses.
     for i_t in range((eos - bos).to(tl.int32)):
         t = bos + i_t
         row = t * H + i_h
@@ -283,15 +281,11 @@ def launch_recurrent_delta_rule_fwd(
     kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
     launch_options = {}
     if not use_autotune:
-        # Offline B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
-        # Multi-token scans favor one warp: with more warps, the per-token reductions and
-        # broadcasts cross warps through shared memory and CTA barriers, while a single warp
-        # keeps them in registers. Each program carries its tile through the whole sequence,
-        # so a grid that spills into a second wave doubles latency: tiny grids split V finely
-        # to spread the serial scan over more SMs, and at K=128 BV=16 keeps up to 256
-        # sequence-heads in one wave once registers are capped at 128 (16 one-warp programs per
-        # SM). For K >= 128, packed lengths may be skewed and the longest sequence's programs
-        # then bound latency, so varlen keeps a narrow tile.
+        # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
+        # Multi-token scans use one warp so per-token reductions stay in registers. Each program
+        # carries its tile through the whole sequence, so the grid should fit one wave: tiny
+        # grids split V finely, and BV=16 under the 128-register cap fits 256 sequence-heads at
+        # K=128. Skewed varlen lengths are bound by the longest sequence, so varlen keeps BV=4.
         average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
         sequence_heads = num_sequences * heads
         if average_tokens > 1 and key_dim >= 128:
@@ -301,7 +295,7 @@ def launch_recurrent_delta_rule_fwd(
             elif cu_seqlens is not None or sequence_heads <= 64:
                 block_v_limit = 4
             else:
-                # A one-warp BV * K tile fits the 128-register cap below up to 2048 elements.
+                # BV * K <= 2048 fits the 128-register cap.
                 block_v_limit = 16 if key_dim <= 128 else 8
         elif average_tokens > 1:
             # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
