@@ -28,7 +28,9 @@ still share memory and NVLink bandwidth.
 
 ::: attn_gym.distributed.CopyEngineChannel
 
-::: attn_gym.distributed.single_node
+::: attn_gym.distributed.same_nvlink_domain
+
+::: attn_gym.distributed.nvlink_domain
 
 ## Misc
 

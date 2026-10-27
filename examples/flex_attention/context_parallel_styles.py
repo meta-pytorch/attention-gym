@@ -21,7 +21,7 @@ chunks, rank ``r`` owns chunks ``r`` and ``2P - 1 - r``.
 
 ``--transport`` picks how the all-gather and ring styles move K/V: NCCL, or copy-engine pushes into
 symmetric memory (``attn_gym.distributed``), which need every rank in one NVLink domain and
-default on when all ranks share a node. The copy-engine all-gather writes each shard straight into
+default on when every rank is in one NVLink domain (one node, or an NVL72 rack). The copy-engine all-gather writes each shard straight into
 the layout attention reads. The NCCL path and Ulysses use
 ``torch.distributed._functional_collectives``: in eager mode they return asynchronous tensors that
 wait on first use, which is what lets the overlap variants issue communication before compute.
@@ -59,7 +59,7 @@ from attn_gym.distributed import (
     DEFAULT_TIMEOUT_MS,
     CopyEngineAllGather,
     CopyEngineChannel,
-    single_node,
+    same_nvlink_domain,
 )
 from attn_gym.testing.profiling import (
     graph_annotations_available,
@@ -719,9 +719,13 @@ def run(cfg: Config) -> None:
 
     q, k, v, grad_out = make_inputs(cfg, layout, device, full=False)
     q, k, v = (x.requires_grad_(True) for x in (q, k, v))
+    # Copy engines only reach peers in this GPU's NVLink domain; across domains, use NCCL.
+    one_domain = same_nvlink_domain()
     transport = cfg.transport
     if transport is Transport.AUTO:
-        transport = Transport.COPY_ENGINE if single_node() else Transport.NCCL
+        transport = Transport.COPY_ENGINE if one_domain else Transport.NCCL
+    elif transport is Transport.COPY_ENGINE and not one_domain:
+        raise RuntimeError("--transport copy-engine needs every rank in one NVLink domain.")
     # Persistent communication buffers, built once and shared by every style that needs them.
     kv_part = (1, cfg.kv_heads, layout.shard_len, cfg.head_dim)
     ring = gather = None
@@ -888,7 +892,7 @@ def main(
     transport: Annotated[
         Transport,
         typer.Option(
-            help="How allgather and ring move K/V; auto uses copy engines on a single node."
+            help="How allgather and ring move K/V; auto uses copy engines within one NVLink domain."
         ),
     ] = Transport.AUTO,
     cuda_graph: Annotated[
