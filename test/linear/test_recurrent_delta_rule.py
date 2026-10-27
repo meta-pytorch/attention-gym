@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
-from attn_gym.linear import recurrent_gdn
+from attn_gym.linear import recurrent_gdn, recurrent_kda
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
 from attn_gym.testing.kda import assert_matches_low_precision_reference
 
@@ -171,3 +171,56 @@ def test_scalar_and_vector_gate_specializations_agree():
 
     torch.testing.assert_close(scalar_output, vector_output, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(scalar_state, vector_state, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize("gate_kind", [GateKind.SCALAR, GateKind.VECTOR])
+@pytest.mark.parametrize(
+    "batch,tokens,key_dim",
+    [
+        (1, 5, 128),  # BV=2 one-warp tiles
+        (2, 5, 128),  # BV=4
+        (5, 5, 128),  # BV=16 under the register cap
+        (5, 5, 192),  # padded keys at the K > 128 cap (BV=8)
+        (5, 1, 256),  # one-token one-warp tile (BV=4)
+    ],
+)
+def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim):
+    """Each fixed one-warp tile for K >= 128 matches the eager recurrence."""
+    torch.manual_seed(0)
+    heads, value_dim = 16, 128
+    query = F.normalize(torch.randn(batch, tokens, heads, key_dim, device="cuda"), dim=-1)
+    key = F.normalize(torch.randn_like(query), dim=-1)
+    value = torch.randn(batch, tokens, heads, value_dim, device="cuda")
+    gate_shape = (batch, tokens, heads) + ((key_dim,) if gate_kind is GateKind.VECTOR else ())
+    gate = F.logsigmoid(torch.randn(gate_shape, device="cuda"))
+    beta = torch.sigmoid(torch.randn(batch, tokens, heads, device="cuda"))
+    state = torch.randn(batch, heads, value_dim, key_dim, device="cuda")
+    scale = key_dim**-0.5
+    with torch.no_grad():
+        output, final_state = launch_recurrent_delta_rule_fwd(
+            query,
+            key,
+            value,
+            gate,
+            beta,
+            state,
+            None,
+            scale=scale,
+            gate_kind=gate_kind,
+            store_final_state=True,
+        )
+        reference = recurrent_kda if gate_kind is GateKind.VECTOR else recurrent_gdn
+        expected = reference(
+            query,
+            key,
+            value,
+            gate,
+            beta,
+            state,
+            scale=scale,
+            output_final_state=True,
+            impl="reference",
+        )
+
+    torch.testing.assert_close(output, expected[0], rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(final_state, expected[1], rtol=1e-5, atol=1e-5)
