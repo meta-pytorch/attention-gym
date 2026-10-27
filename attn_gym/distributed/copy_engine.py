@@ -29,6 +29,7 @@ a whole step, so keep the timeout well above the slowest step (NCCL's watchdog d
 10 minutes). The timeout is a kernel argument, so CUDA graphs keep the value they captured.
 """
 
+import ctypes
 import math
 import os
 import socket
@@ -217,9 +218,10 @@ class _GatherWait(torch.autograd.Function):
 def nvlink_domain() -> str:
     """Identify the NVLink domain of the current GPU.
 
-    On a multi-node NVLink system (GB200/GB300 NVL72) this is the fabric cluster UUID and clique
-    reported by NVML; GPUs outside that fabric (or when ``pynvml`` is unavailable) are identified
-    by their host, since GPUs on one host share NVLink.
+    On GPUs attached to an NVLink fabric (GB200/GB300 NVL72 racks) this is the fabric cluster
+    UUID and clique reported by NVML (needs ``nvidia-ml-py``). Otherwise it falls back to the host
+    name, which assumes the GPUs of one host are NVLink peers (true on HGX/DGX-style systems, not
+    on PCIe-only boxes).
     """
     try:
         import pynvml
@@ -229,8 +231,10 @@ def nvlink_domain() -> str:
         pynvml.nvmlInit()
         uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
         handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
-        info = pynvml.c_nvmlGpuFabricInfo_t()
-        pynvml.nvmlDeviceGetGpuFabricInfo(handle, info)
+        # The versioned query: the legacy struct mis-sizes the cluster UUID in nvidia-ml-py.
+        info = pynvml.c_nvmlGpuFabricInfo_v2_t()
+        info.version = pynvml.nvmlGpuFabricInfo_v2
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
     except (pynvml.NVMLError, AttributeError):  # older driver or pynvml without fabric queries
         return f"host:{socket.gethostname()}"
     if info.state == pynvml.NVML_GPU_FABRIC_STATE_COMPLETED and info.status == 0:

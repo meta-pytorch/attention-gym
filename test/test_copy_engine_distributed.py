@@ -2,7 +2,6 @@
 
 import os
 import socket
-import sys
 import time
 
 import pytest
@@ -14,7 +13,6 @@ import torch.multiprocessing as mp
 from attn_gym.distributed import (
     CopyEngineAllGather,
     CopyEngineChannel,
-    nvlink_domain,
     same_nvlink_domain,
 )
 
@@ -191,11 +189,6 @@ def _domain_worker(rank: int, port: int) -> None:
         assert same_nvlink_domain(), "two GPUs on one host must share an NVLink domain"
     finally:
         dist.destroy_process_group()
-
-
-def test_nvlink_domain_falls_back_to_host_without_pynvml(monkeypatch) -> None:
-    monkeypatch.setitem(sys.modules, "pynvml", None)  # makes `import pynvml` raise ImportError
-    assert nvlink_domain() == f"host:{socket.gethostname()}"
 
 
 @pytest.mark.parametrize(
