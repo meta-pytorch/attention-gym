@@ -20,6 +20,13 @@ Ranks synchronize through the symmetric-memory signal pad, one flag per (peer, c
 ``READY`` (sender -> receiver: the data has landed) and ``FREE`` (receiver -> sender: the buffer
 may be overwritten). All signals are queued on CUDA streams, so both classes can be captured in a
 CUDA graph and replayed.
+
+Every signal wait gives up after ``timeout_ms`` (default ``DEFAULT_TIMEOUT_MS``, overridable with
+``ATTN_GYM_SYMM_TIMEOUT_MS``; 0 waits forever). A timed-out wait prints which rank and channel it
+was waiting on and traps, so ranks that fall out of lockstep fail loudly instead of hanging. The
+clock starts when the GPU reaches the wait, which can legitimately last as long as a peer lags by
+a whole step, so keep the timeout well above the slowest step (NCCL's watchdog default is also
+10 minutes). The timeout is a kernel argument, so CUDA graphs keep the value they captured.
 """
 
 import math
@@ -31,6 +38,16 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 READY, FREE = 0, 1
+DEFAULT_TIMEOUT_MS = int(os.environ.get("ATTN_GYM_SYMM_TIMEOUT_MS", str(10 * 60 * 1000)))
+
+
+def _check_timeout(timeout_ms: int) -> int:
+    if timeout_ms < 0:
+        raise ValueError(
+            f"timeout_ms must be >= 0 (0 waits forever), got {timeout_ms}; "
+            "check ATTN_GYM_SYMM_TIMEOUT_MS if it came from the default"
+        )
+    return timeout_ms
 
 
 def _channel(slot: int, signal: int) -> int:
@@ -59,36 +76,38 @@ class CopyEngineChannel:
         part_shape: Sequence[int],
         dtype: torch.dtype,
         device: torch.device,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
     ):
         self.src, self.dst = src, dst
+        self.timeout_ms = _check_timeout(timeout_ms)
         shape = (2, num_parts, *part_shape)
         self.slots = symm_mem.empty(shape, dtype=dtype, device=device)
         self.handle = symm_mem.rendezvous(self.slots, group.group_name)
         self.peer_slots = self.handle.get_buffer(dst, shape, dtype)
         self.stream = torch.cuda.Stream(device)
         for slot in range(2):
-            self.handle.put_signal(src, _channel(slot, FREE))
+            self.handle.put_signal(src, _channel(slot, FREE), self.timeout_ms)
 
     def send(self, parts: Sequence[torch.Tensor], step: int) -> None:
         slot = (step + 1) % 2
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream), torch.no_grad():
-            self.handle.wait_signal(self.dst, _channel(slot, FREE))
+            self.handle.wait_signal(self.dst, _channel(slot, FREE), self.timeout_ms)
             for peer_part, part in zip(self.peer_slots[slot], parts, strict=True):
                 peer_part.copy_(part)
-            self.handle.put_signal(self.dst, _channel(slot, READY))
+            self.handle.put_signal(self.dst, _channel(slot, READY), self.timeout_ms)
         for part in parts:
             part.record_stream(self.stream)
 
     def recv(self, step: int) -> torch.Tensor:
         slot = step % 2
-        self.handle.wait_signal(self.src, _channel(slot, READY))
+        self.handle.wait_signal(self.src, _channel(slot, READY), self.timeout_ms)
         return self.slots[slot]
 
     def release(self, step: int) -> None:
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
-            self.handle.put_signal(self.src, _channel(step % 2, FREE))
+            self.handle.put_signal(self.src, _channel(step % 2, FREE), self.timeout_ms)
 
     def join(self) -> None:
         torch.cuda.current_stream().wait_stream(self.stream)
@@ -121,8 +140,10 @@ class CopyEngineAllGather:
         dim: int,
         dtype: torch.dtype,
         device: torch.device,
+        timeout_ms: int = DEFAULT_TIMEOUT_MS,
     ):
         self.group = group
+        self.timeout_ms = _check_timeout(timeout_ms)
         self.rank, self.world_size = group.rank(), group.size()
         self.part_shape = tuple(part_shape)
         self.dim = dim
@@ -149,15 +170,15 @@ class CopyEngineAllGather:
         with torch.cuda.stream(self.stream), torch.no_grad():
             # Everything that read the previous gather is queued before this point.
             for peer in self.peers():
-                self.handle.put_signal(peer, _channel(0, FREE))
+                self.handle.put_signal(peer, _channel(0, FREE), self.timeout_ms)
             for peer in [self.rank, *self.peers()]:
                 if peer != self.rank:
-                    self.handle.wait_signal(peer, _channel(0, FREE))
+                    self.handle.wait_signal(peer, _channel(0, FREE), self.timeout_ms)
                 for dst, part in zip(self.peer_flat[peer], parts, strict=True):
                     for row, src in zip(dst, part.reshape(self.rows, self.row_len), strict=True):
                         row[lo:hi].copy_(src)
                 if peer != self.rank:
-                    self.handle.put_signal(peer, _channel(0, READY))
+                    self.handle.put_signal(peer, _channel(0, READY), self.timeout_ms)
         for part in parts:
             part.record_stream(self.stream)
 
@@ -169,7 +190,7 @@ class CopyEngineAllGather:
     def _wait(self) -> torch.Tensor:
         torch.cuda.current_stream().wait_stream(self.stream)
         for peer in self.peers():
-            self.handle.wait_signal(peer, _channel(0, READY))
+            self.handle.wait_signal(peer, _channel(0, READY), self.timeout_ms)
         return self.buffer
 
     def reduce_scatter(self, grad: torch.Tensor) -> list[torch.Tensor]:

@@ -131,11 +131,59 @@ def _channel_worker(rank: int, port: int) -> None:
         dist.destroy_process_group()
 
 
+def _desync_worker(rank: int, port: int, log_dir: str) -> None:
+    """Rank 1 gathers while rank 0 never does: rank 1 must trap after the timeout, not hang."""
+    device = _init(rank, port)
+    gather = CopyEngineAllGather(
+        dist.group.WORLD, 2, PART_SHAPE, 2, torch.float32, device, timeout_ms=1000
+    )
+    dist.barrier()
+    done = os.path.join(log_dir, "rank1.done")
+    if rank == 0:
+        # Stay alive (and out of the gather) until rank 1 has timed out or the test gives up.
+        deadline = time.monotonic() + 120
+        while not os.path.exists(done) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        os._exit(0)
+    # The kernel reports through device printf, which writes to this process's fd 1.
+    log = os.open(os.path.join(log_dir, "rank1.log"), os.O_WRONLY | os.O_CREAT)
+    os.dup2(log, 1)
+    parts = _parts(0, device)
+    start = time.monotonic()
+    try:
+        gather.start(parts)
+        gather.wait(parts)
+        torch.cuda.synchronize()
+    except RuntimeError:
+        elapsed = time.monotonic() - start
+        code = 0 if 1 <= elapsed < 60 else 2
+    else:
+        code = 3  # the wait returned although rank 0 never signalled
+    open(done, "w").close()
+    os._exit(code)
+
+
+def test_desynced_ranks_trap_instead_of_hanging(tmp_path) -> None:
+    context = mp.spawn(
+        _desync_worker, args=(_free_port(), str(tmp_path)), nprocs=WORLD, join=False
+    )
+    deadline = time.monotonic() + 120
+    try:
+        while not context.join(timeout=max(0.0, deadline - time.monotonic())):
+            assert time.monotonic() < deadline, "the timed-out wait did not trap within 120 s"
+    finally:
+        for process in context.processes:
+            if process.is_alive():
+                process.kill()
+    message = (tmp_path / "rank1.log").read_text()
+    assert "SymmetricMemory::wait_signal: rank 1 failed to receive signal from rank 0" in message
+
+
 @pytest.mark.parametrize(
     "worker", [_all_gather_worker, _channel_worker], ids=["all-gather", "channel"]
 )
 def test_copy_engine_matches_nccl(worker) -> None:
-    # Symmetric-memory waits have no timeout, so bound the run: a protocol bug would otherwise hang.
+    # Bound setup and the whole run as well, independently of the per-wait signal timeouts.
     context = mp.spawn(worker, args=(_free_port(),), nprocs=WORLD, join=False)
     deadline = time.monotonic() + 300
     try:
