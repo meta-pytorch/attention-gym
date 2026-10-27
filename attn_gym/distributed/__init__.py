@@ -6,6 +6,11 @@
 
 """Communication building blocks for context-parallel attention."""
 
-from attn_gym.distributed.copy_engine import CopyEngineAllGather, CopyEngineChannel, single_node
+from attn_gym.distributed.copy_engine import (
+    DEFAULT_TIMEOUT_MS,
+    CopyEngineAllGather,
+    CopyEngineChannel,
+    single_node,
+)
 
-__all__ = ["CopyEngineAllGather", "CopyEngineChannel", "single_node"]
+__all__ = ["DEFAULT_TIMEOUT_MS", "CopyEngineAllGather", "CopyEngineChannel", "single_node"]

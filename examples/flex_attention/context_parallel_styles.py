@@ -55,7 +55,12 @@ from torch.nn.attention.flex_attention import (
     flex_attention,
 )
 
-from attn_gym.distributed import CopyEngineAllGather, CopyEngineChannel, single_node
+from attn_gym.distributed import (
+    DEFAULT_TIMEOUT_MS,
+    CopyEngineAllGather,
+    CopyEngineChannel,
+    single_node,
+)
 from attn_gym.testing.profiling import (
     graph_annotations_available,
     kernel_stage,
@@ -308,7 +313,7 @@ class RingChannels:
 
 
 def make_ring_channels(
-    transport: "Transport", layout: CPLayout, group, part_shape, device
+    transport: "Transport", layout: CPLayout, group, part_shape, device, timeout_ms: int
 ) -> RingChannels:
     """K/V and dK/dV hops to the next rank; each carries two parts (K and V, or dK and dV)."""
     if transport is Transport.NCCL:
@@ -317,7 +322,9 @@ def make_ring_channels(
     next_rank = (layout.rank + 1) % layout.world_size
     return RingChannels(
         *(
-            CopyEngineChannel(group, prev_rank, next_rank, 2, part_shape, torch.bfloat16, device)
+            CopyEngineChannel(
+                group, prev_rank, next_rank, 2, part_shape, torch.bfloat16, device, timeout_ms
+            )
             for _ in range(2)
         )
     )
@@ -535,6 +542,7 @@ class Config:
     validate: bool
     results_json: Path | None
     trace_dir: Path | None
+    symm_timeout_ms: int
 
 
 def init_distributed(seq_len: int) -> tuple[torch.device, CPLayout, bool]:
@@ -718,11 +726,13 @@ def run(cfg: Config) -> None:
     kv_part = (1, cfg.kv_heads, layout.shard_len, cfg.head_dim)
     ring = gather = None
     if "ring" in styles:
-        ring = make_ring_channels(transport, layout, dist.group.WORLD, kv_part, device)
+        ring = make_ring_channels(
+            transport, layout, dist.group.WORLD, kv_part, device, cfg.symm_timeout_ms
+        )
     copy_engine = transport is Transport.COPY_ENGINE
     if copy_engine and {"allgather", "allgather-overlap"} & set(styles):
         gather = CopyEngineAllGather(
-            dist.group.WORLD, 2, kv_part, dim=2, dtype=torch.bfloat16, device=device
+            dist.group.WORLD, 2, kv_part, 2, torch.bfloat16, device, cfg.symm_timeout_ms
         )
     gib = 2 * math.prod(kv_part) * 2 / 2**30  # one K/V shard pair, bf16
     persistent_gib = {
@@ -893,6 +903,13 @@ def main(
     trace_dir: Annotated[
         Path | None, typer.Option(help="Write merged Perfetto traces (needs transformer-nuggets).")
     ] = None,
+    symm_timeout_ms: Annotated[
+        int,
+        typer.Option(
+            min=0,
+            help="Copy-engine signal timeout; a stuck rank traps with a message (0 waits forever).",
+        ),
+    ] = DEFAULT_TIMEOUT_MS,
 ) -> None:
     run(
         Config(
@@ -912,6 +929,7 @@ def main(
             validate=validate,
             results_json=results_json,
             trace_dir=trace_dir,
+            symm_timeout_ms=symm_timeout_ms,
         )
     )
 
