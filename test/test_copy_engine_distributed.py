@@ -10,7 +10,11 @@ import torch.distributed as dist
 import torch.distributed._functional_collectives as funcol
 import torch.multiprocessing as mp
 
-from attn_gym.distributed import CopyEngineAllGather, CopyEngineChannel
+from attn_gym.distributed import (
+    CopyEngineAllGather,
+    CopyEngineChannel,
+    same_nvlink_domain,
+)
 
 pytestmark = [
     pytest.mark.skipif(
@@ -179,8 +183,18 @@ def test_desynced_ranks_trap_instead_of_hanging(tmp_path) -> None:
     assert "SymmetricMemory::wait_signal: rank 1 failed to receive signal from rank 0" in message
 
 
+def _domain_worker(rank: int, port: int) -> None:
+    _init(rank, port)
+    try:
+        assert same_nvlink_domain(), "two GPUs on one host must share an NVLink domain"
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.parametrize(
-    "worker", [_all_gather_worker, _channel_worker], ids=["all-gather", "channel"]
+    "worker",
+    [_all_gather_worker, _channel_worker, _domain_worker],
+    ids=["all-gather", "channel", "nvlink-domain"],
 )
 def test_copy_engine_matches_nccl(worker) -> None:
     # Bound setup and the whole run as well, independently of the per-wait signal timeouts.

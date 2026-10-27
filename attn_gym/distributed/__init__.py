@@ -10,7 +10,14 @@ from attn_gym.distributed.copy_engine import (
     DEFAULT_TIMEOUT_MS,
     CopyEngineAllGather,
     CopyEngineChannel,
-    single_node,
+    nvlink_domain,
+    same_nvlink_domain,
 )
 
-__all__ = ["DEFAULT_TIMEOUT_MS", "CopyEngineAllGather", "CopyEngineChannel", "single_node"]
+__all__ = [
+    "DEFAULT_TIMEOUT_MS",
+    "CopyEngineAllGather",
+    "CopyEngineChannel",
+    "nvlink_domain",
+    "same_nvlink_domain",
+]

@@ -29,8 +29,10 @@ a whole step, so keep the timeout well above the slowest step (NCCL's watchdog d
 10 minutes). The timeout is a kernel argument, so CUDA graphs keep the value they captured.
 """
 
+import ctypes
 import math
 import os
+import socket
 from collections.abc import Sequence
 
 import torch
@@ -213,10 +215,39 @@ class _GatherWait(torch.autograd.Function):
         return None, *ctx.gather.reduce_scatter(grad)
 
 
-def single_node() -> bool:
-    """True when every rank of the world group runs on this node (torchrun's ``LOCAL_WORLD_SIZE``).
+def nvlink_domain() -> str:
+    """Identify the NVLink domain of the current GPU.
 
-    Multi-node NVLink domains (NVL72) also support copy-engine transfers, but there is no cheap
-    portable query for them, so callers opt in explicitly there.
+    On GPUs attached to an NVLink fabric (GB200/GB300 NVL72 racks) this is the fabric cluster
+    UUID and clique reported by NVML (needs ``nvidia-ml-py``). Otherwise it falls back to the host
+    name, which assumes the GPUs of one host are NVLink peers (true on HGX/DGX-style systems, not
+    on PCIe-only boxes).
     """
-    return int(os.environ.get("LOCAL_WORLD_SIZE", "-1")) == dist.get_world_size()
+    try:
+        import pynvml
+    except ImportError:
+        return f"host:{socket.gethostname()}"
+    try:
+        pynvml.nvmlInit()
+        uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
+        # The versioned query: the legacy struct mis-sizes the cluster UUID in nvidia-ml-py.
+        info = pynvml.c_nvmlGpuFabricInfo_v2_t()
+        info.version = pynvml.nvmlGpuFabricInfo_v2
+        pynvml.nvmlDeviceGetGpuFabricInfoV(handle, ctypes.byref(info))
+    except (pynvml.NVMLError, AttributeError):  # older driver or pynvml without fabric queries
+        return f"host:{socket.gethostname()}"
+    if info.state == pynvml.NVML_GPU_FABRIC_STATE_COMPLETED and info.status == 0:
+        return f"fabric:{bytes(info.clusterUuid).hex()}:{info.cliqueId}"
+    return f"host:{socket.gethostname()}"
+
+
+def same_nvlink_domain(group: dist.ProcessGroup | None = None) -> bool:
+    """True when every rank of ``group`` shares one NVLink domain, so copy-engine transfers work.
+
+    Collective: every rank of ``group`` must call it.
+    """
+    group = group or dist.group.WORLD
+    domains = [None] * dist.get_world_size(group)
+    dist.all_gather_object(domains, nvlink_domain(), group=group)
+    return len(set(domains)) == 1
