@@ -7,9 +7,9 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 - **Masks** (`attn_gym/masks/`) — `mask_mod` functions and `BlockMask` builders; see
   [`docs/masks.md`](docs/masks.md) for the full list.
 - **Score mods** (`attn_gym/mods/`) — `score_mod` functions; see [`docs/mods.md`](docs/mods.md).
-- **Linear attention** (`attn_gym/linear/`) — KDA and GDN chunked/recurrent operators and short
-  convolution, with reference, Triton, CuTeDSL, and vendored cuDNN backends; see
-  [`docs/linear.md`](docs/linear.md).
+- **Linear attention** (`attn_gym/linear/`) — KDA, GDN, and Mamba2 (SSD) chunked/recurrent
+  operators and short convolution, with reference, Triton, CuTeDSL, and vendored cuDNN backends
+  (reference and Triton for Mamba2); see [`docs/linear.md`](docs/linear.md).
 - **Sparse attention** (`attn_gym/sparse/`) — `lightning_indexer` Top-K selection and
   `gather_attn`; see [`docs/sparse.md`](docs/sparse.md).
 - **Distributed** (`attn_gym/distributed/`) — copy-engine all-gather and point-to-point channels over

@@ -4,8 +4,9 @@ Attention Gym provides functional linear-attention operators with eager referenc
 
 This page is the API and implementation reference. Start with the operation you need:
 
-- **Train or prefill:** [Gated Delta Rule](#gated-delta-rule) or
-  [Kimi Delta Attention](#kimi-delta-attention), using the `chunk_*` operations.
+- **Train or prefill:** [Gated Delta Rule](#gated-delta-rule),
+  [Kimi Delta Attention](#kimi-delta-attention), or the [Mamba2 SSD scan](#mamba2-ssd), using
+  the `chunk_*` operations.
 - **Carry state between calls or decode:** the `recurrent_*` operations and the paged/decode
   variants in those sections.
 - **Split a packed stream across ranks:** [Context Parallelism](#context-parallelism).
@@ -129,6 +130,70 @@ elementwise kernels run per decode step.
 ::: attn_gym.linear.recurrent_gdn
 
 ::: attn_gym.linear.recurrent_gdn_decode
+
+## Mamba2 SSD
+
+`chunk_mamba2` and `recurrent_mamba2` implement the Mamba2 state-space-dual scan with
+`mamba_ssm`'s layouts: `x` and `z` are `[batch, T, H, P]`, `dt` is `[batch, T, H]`, `A` is `[H]`,
+`B` and `C` are `[batch, T, G, N]` with `H % G == 0`, and the state is `[N_seq, H, P, N]`. For
+each head the step size `dt = clamp(softplus(dt + dt_bias), *dt_limit)` (each stage optional)
+decays the state by `exp(dt * A)` before writing `dt * outer(x, B)`, and `C` reads it:
+
+```text
+state = exp(dt * A) * state + dt * outer(x, B)
+y     = (state @ C + D * x) * silu(z)
+```
+
+This is the gated delta rule without its delta correction (`q = C`, `k = B`, `v = dt * x`,
+`gate = dt * A`, `scale = 1`).
+
+### Supported capabilities
+
+- Dense `[batch, T, ...]` inputs and packed batch-one inputs with `cu_seqlens`, including empty
+  sequences. The fused paths keep packed offsets on the device.
+- Grouped `B`/`C` (`H % G == 0`), scalar or per-channel `D`, the optional `silu(z)` gate, and
+  the `dt_bias`/softplus/`dt_limit` step-size transform.
+- `chunk_mamba2` for training and prefill. The default `impl="fused"` runs a single-pass Triton
+  forward and a chunk-parallel Triton backward with gradients for every input, including
+  `dt_bias`, `D`, `z`, and the initial state, on CUDA with FP16/BF16 activations and a
+  power-of-two `N` in [16, 256]. It supports strict `torch.compile`.
+- `paged_chunk_mamba2` advances selected `[num_slots, H, P, N]` cache rows in place for
+  inference prefill, without caller-side gather/scatter copies, under the same `N` constraint.
+- `recurrent_mamba2(impl="fused")` is an inference-only Triton token scan with returned or paged
+  state (`state_indices` and `has_initial_state`), and `recurrent_mamba2_decode` advances a paged
+  cache by one token per sequence, like `mamba_ssm`'s `selective_state_update`. Both accept FP16,
+  BF16, or FP32 inputs and any `N <= 256`; decode inputs may be strided views of one projection
+  buffer.
+- Paged pools store FP32 or BF16 state; recurrence math stays FP32. Non-positive slot indices
+  produce zero output and leave the pool untouched.
+- `impl="reference"` runs eager PyTorch with autograd on CPU or CUDA, in FP64 when given FP64
+  inputs.
+
+```python
+from attn_gym.linear import chunk_mamba2, paged_chunk_mamba2, recurrent_mamba2_decode
+
+y, final_state = chunk_mamba2(
+    x, dt, A, B, C, D, z, dt_bias=dt_bias, dt_softplus=True, output_final_state=True
+)
+
+with torch.no_grad():
+    y = paged_chunk_mamba2(
+        x, dt, A, B, C, state_cache, state_indices, D, z,
+        cu_seqlens=cu_seqlens, dt_bias=dt_bias, dt_softplus=True,
+    )
+    y_step = recurrent_mamba2_decode(
+        x_step, dt_step, A, B_step, C_step, state_cache, state_indices, D, z_step,
+        dt_bias=dt_bias, dt_softplus=True,
+    )
+```
+
+::: attn_gym.linear.chunk_mamba2
+
+::: attn_gym.linear.paged_chunk_mamba2
+
+::: attn_gym.linear.recurrent_mamba2
+
+::: attn_gym.linear.recurrent_mamba2_decode
 
 ## Gate Transforms
 
