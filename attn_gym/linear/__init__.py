@@ -22,6 +22,12 @@ from attn_gym.linear.kda import (
     recurrent_kda,
     recurrent_kda_decode,
 )
+from attn_gym.linear.mamba2 import (
+    chunk_mamba2,
+    paged_chunk_mamba2,
+    recurrent_mamba2,
+    recurrent_mamba2_decode,
+)
 from attn_gym.linear.short_conv import ops as _short_conv_ops
 from attn_gym.linear.types import GateTransform, Impl
 
@@ -51,6 +57,13 @@ GDN_OPS = [
     "recurrent_gdn_decode",
 ]
 
+MAMBA2_OPS = [
+    "chunk_mamba2",
+    "paged_chunk_mamba2",
+    "recurrent_mamba2",
+    "recurrent_mamba2_decode",
+]
+
 # Model-agnostic building blocks.
 GENERIC_OPS = [
     "GateTransform",
@@ -68,7 +81,7 @@ GENERIC_OPS = [
     "register_activation",
 ]
 
-__all__ = GDN_OPS + GENERIC_OPS + KDA_OPS  # noqa: PLE0605 -- built from the op groups above
+__all__ = GDN_OPS + GENERIC_OPS + KDA_OPS + MAMBA2_OPS  # noqa: PLE0605 -- built from the op groups above
 
 _SHORT_CONV_EXPORTS = {
     "causal_conv1d",
