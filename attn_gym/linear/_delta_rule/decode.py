@@ -241,13 +241,16 @@ def launch_recurrent_delta_rule_decode(
     major = get_device_properties(packed_qkv.device).major
     measured_gdn_shape = packed_qkv.dtype is torch.bfloat16 and key_dim == value_dim == 128
     tuned_major = None
+    # GB200: the Blackwell table wins across gates and head counts up to 1024 sequence-heads.
+    # Above that, KDA keeps BV=16.
     if measured_gdn_shape and (
         major == 9
         or (
             major == 10
-            and gate_kind is GateKind.SCALAR
-            and heads in (2, 4, 8, 16)
-            and batch <= 256
+            and (
+                batch * heads <= 1024
+                or (gate_kind is GateKind.SCALAR and heads in (2, 4, 8, 16) and batch <= 256)
+            )
         )
     ):
         tuned_major = major

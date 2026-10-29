@@ -53,13 +53,43 @@ def _prune_recurrent_configs(configs, _named_args, V, **_):
 
 
 @triton.jit
-def _load_key_tile(base, o_k_tile, K: tl.constexpr, BK: tl.constexpr):
-    """Load a key-indexed tile in FP32, masking only padded key channels."""
+def _load_key_tile(base, o_k_tile, K: tl.constexpr, BK: tl.constexpr, valid):
+    """Load an FP32 key tile, masking padding and invalid tokens."""
     if K == BK:
-        tile = tl.load(base + o_k_tile)
+        tile = tl.load(base + o_k_tile, mask=valid, other=0.0)
     else:
-        tile = tl.load(base + o_k_tile, mask=o_k_tile < K, other=0.0)
+        tile = tl.load(base + o_k_tile, mask=(o_k_tile < K) & valid, other=0.0)
     return tile.to(tl.float32)
+
+
+@triton.jit
+def _load_token(
+    q,
+    k,
+    v,
+    gate,
+    beta,
+    row,
+    row_k,
+    o_k_tile,
+    o_v,
+    m_v,
+    valid,
+    K: tl.constexpr,
+    BK: tl.constexpr,
+    V: tl.constexpr,
+    SCALAR_GATE: tl.constexpr,
+):
+    """Load a token's inputs; `valid=False` returns zeros without reading memory."""
+    b_q = _load_key_tile(q + row_k * K, o_k_tile, K, BK, valid)
+    b_k = _load_key_tile(k + row_k * K, o_k_tile, K, BK, valid)
+    if SCALAR_GATE:
+        b_g = tl.load(gate + row, mask=valid, other=0.0).to(tl.float32)
+    else:
+        b_g = _load_key_tile(gate + row * K, o_k_tile, K, BK, valid)
+    b_beta = tl.load(beta + row, mask=valid, other=0.0).to(tl.float32)
+    b_v = tl.load(v + row * V + o_v, mask=m_v & valid, other=0.0).to(tl.float32)
+    return b_q, b_k, b_g, b_beta, b_v
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -91,6 +121,7 @@ def _recurrent_delta_rule_fwd_kernel(
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
+    PREFETCH: tl.constexpr,
 ):
     """Scan one sequence/head/value tile while retaining the FP32 state in registers.
 
@@ -146,25 +177,44 @@ def _recurrent_delta_rule_fwd_kernel(
     # vectors costs a layout conversion per operand per token.
     o_k_tile = tl.broadcast_to(o_k[:, None], (BK, BV))
     # A 32-bit trip count and scalar row offsets keep 64-bit math out of per-element addresses.
-    for i_t in range((eos - bos).to(tl.int32)):
+    num_tokens = (eos - bos).to(tl.int32)
+    if PREFETCH:
+        b_next = _load_token(
+            q, k, v, gate, beta, bos * H + i_h, bos * HK + i_hk, o_k_tile, o_v, m_v,
+            num_tokens > 0, K, BK, V, SCALAR_GATE,
+        )  # fmt: skip
+    for i_t in range(num_tokens):
         t = bos + i_t
         row = t * H + i_h
         row_k = t * HK + i_hk
-        b_q = _load_key_tile(q + row_k * K, o_k_tile, K, BK) * scale
-        b_k = _load_key_tile(k + row_k * K, o_k_tile, K, BK)
-        if SCALAR_GATE:
-            b_g = tl.load(gate + row).to(tl.float32)
+        if PREFETCH:
+            # Load the next token before computing this one.
+            b_q, b_k, b_g, b_beta, b_v = b_next
+            b_next = _load_token(
+                q, k, v, gate, beta, row + H, row_k + HK, o_k_tile, o_v, m_v,
+                i_t + 1 < num_tokens, K, BK, V, SCALAR_GATE,
+            )  # fmt: skip
         else:
-            b_g = _load_key_tile(gate + row * K, o_k_tile, K, BK)
-        b_beta = tl.load(beta + row).to(tl.float32)
-        b_v = tl.load(v + row * V + o_v, mask=m_v, other=0.0).to(tl.float32)
+            b_q, b_k, b_g, b_beta, b_v = _load_token(
+                q, k, v, gate, beta, row, row_k, o_k_tile, o_v, m_v, True, K, BK, V,
+                SCALAR_GATE,
+            )  # fmt: skip
+        b_q *= scale
 
         # exp(g) computed as exp2(g * log2(e)); the FMA folds into the exp2 argument.
         b_state *= tl.exp2(b_g * LOG2_E)
 
-        b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
-        b_state += b_k * b_delta[None, :]
-        b_o = tl.sum(b_q * b_state, 0)
+        if PREFETCH:
+            # q @ (S + k delta) = q @ S + (q . k) delta lets both reductions read decayed S
+            # without waiting for the state update.
+            b_o = tl.sum(b_q * b_state, 0)
+            b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
+            b_o += tl.sum(b_q * b_k, 0) * b_delta
+            b_state += b_k * b_delta[None, :]
+        else:
+            b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
+            b_state += b_k * b_delta[None, :]
+            b_o = tl.sum(b_q * b_state, 0)
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
 
     if STORE_FINAL_STATE:
@@ -188,6 +238,7 @@ recurrent_delta_rule_fwd_kernel = triton.autotune(
         "STORE_FINAL_STATE",
         "IS_VARLEN",
         "SCALAR_GATE",
+        "PREFETCH",
     ],
     prune_configs_by={"early_config_prune": _prune_recurrent_configs},
     **autotune_cache_kwargs,
@@ -277,6 +328,11 @@ def launch_recurrent_delta_rule_fwd(
     # One flat launch dimension avoids the 65,535 grid-Y limit for large batches.
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
 
+    sequence_heads = num_sequences * heads
+    average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
+    # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
+    # Prefetch was slower for K > 128.
+    prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
     use_autotune = autotune and state_indices is None
     kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
     launch_options = {}
@@ -286,8 +342,6 @@ def launch_recurrent_delta_rule_fwd(
         # carries its tile through the whole sequence, so the grid should fit one wave: tiny
         # grids split V finely, and BV=16 under the 128-register cap fits 256 sequence-heads at
         # K=128. Skewed varlen lengths are bound by the longest sequence, so varlen keeps BV=4.
-        average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
-        sequence_heads = num_sequences * heads
         if average_tokens > 1 and key_dim >= 128:
             num_warps = 1
             if sequence_heads <= 16:
@@ -346,6 +400,7 @@ def launch_recurrent_delta_rule_fwd(
         USE_STATE_INDICES=state_indices is not None,
         USE_HAS_INITIAL_STATE=has_initial_state is not None,
         SCALAR_GATE=gate_kind is GateKind.SCALAR,
+        PREFETCH=prefetch,
         **launch_options,
     )
     return output, final_state
