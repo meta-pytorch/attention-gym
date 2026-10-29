@@ -157,9 +157,9 @@ This is the gated delta rule without its delta correction (`q = C`, `k = B`, `v 
   CUDA with FP16/BF16 activations and a power-of-two `N` in [16, 256]: a state scan that splits
   long sequences into parallel segments when few `(sequence, head)` pairs run, a chunk-parallel
   output kernel, and a chunk-parallel backward with gradients for every input, including
-  `dt_bias`, `D`, `z`, and the initial state. Training keeps the pre-gate output (one extra
-  `[batch, T, H, P]` activation) so the gate backward is elementwise. It supports strict
-  `torch.compile`.
+  `dt_bias`, `D`, `z`, and the initial state. With a gate, training keeps the FP32 pre-gate
+  output (one extra `[batch, T, H, P]` FP32 activation) so the gate backward is elementwise. It
+  supports strict `torch.compile`.
 - `paged_chunk_mamba2` advances selected `[num_slots, H, P, N]` cache rows in place for
   inference prefill, without caller-side gather/scatter copies, under the same `N` constraint.
 - `recurrent_mamba2(impl="fused")` is an inference-only Triton token scan with returned or paged
@@ -171,6 +171,40 @@ This is the gated delta rule without its delta correction (`q = C`, `k = B`, `v 
   produce zero output and leave the pool untouched.
 - `impl="reference"` runs eager PyTorch with autograd on CPU or CUDA, in FP64 when given FP64
   inputs.
+
+!!! note "Mamba2 precision"
+
+    Like GDN and KDA (see "What the fused paths keep in FP32"), the fused Mamba2 paths carry the
+    state from `initial_state` to `final_state`, and its cotangent back, in FP32 with FP32 log2
+    decays, including across scan segments. Chunk-entry states and the per-chunk
+    state-cotangent tape are staged in the activation dtype as tensor-core operands, so FP16
+    shares GDN's range limit: states beyond about 65504 or cotangents below `2^-14` lose
+    precision or range when a chunk reads them. The pre-gate output `state @ C + D * x` stays
+    FP32, so the gated output is rounded once and `dz` reads it unrounded. `dD` is reduced from
+    the FP32 gated cotangent `dy * silu(z)`, but the scan kernels read that cotangent in the
+    activation dtype, including `dx`'s skip term (as `mamba_ssm` does): in FP16, values beyond
+    about 65504 make `dx`, `dB`, `dC`, and the decay gradients non-finite. The softplus keeps
+    small step sizes (`log1p`), and the `dt_limit` clamp passes no gradient at its bounds, like
+    `Tensor.clamp`.
+
+    With nonnegative step sizes, the chunked forward and the state and state-cotangent scans
+    split decays applied to FP32 values (carries, entry-state reads, writes) into factors of at
+    least `2^-126`, so a decay that underflows FP32 on its own still leaves any representable
+    product whose undecayed factors fit FP32 (for writes, `x * dt`). Other decays are formed on
+    their own, and a contribution through a factor below `2^-126` flushes to zero: the pairwise
+    in-chunk weights (BF16/FP16 tensor-core operands), the chunk backward's in-chunk gradient
+    terms (splitting them costs 2-3% of forward+backward on B300), and a token-by-token or
+    decode step with `dt * |A|` above about 87. The chunk backward also contracts the entry
+    state and the writes with the state cotangent before decaying them, so a product beyond FP32
+    range overflows even when the decayed term would fit.
+
+    Within each 64-token chunk the decays are differences of a running FP32 sum of
+    `dt * A`. A later step whose `|dt * A|` is below about half an FP32 ulp of that running sum
+    is lost: for example one `dt * A = -1e8` hides the following `-1` steps in its chunk. Keep
+    the in-chunk sum of `|dt * A|` small relative to the smallest decay step that matters; a
+    finite upper `dt_limit` bounds it by `64 * dt_max * |A|`, while a lower limit alone does not.
+    The token-by-token recurrence has no such limit. A BF16 paged pool is rounded once per call,
+    so decoding into it rounds the state every token; use an FP32 pool for long contexts.
 
 ```python
 from attn_gym.linear import chunk_mamba2, paged_chunk_mamba2, recurrent_mamba2_decode

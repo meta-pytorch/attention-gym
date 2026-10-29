@@ -13,8 +13,10 @@ cumulative log decay ``g`` (last index ``L``), ``E_ij = exp(g_i - g_j) [i >= j]`
 The backward runs four kernels:
 
 1. ``mamba2_gate_bwd_kernel`` reads the forward's stored pre-gate output ``Yc + D X`` and forms
-   ``dz = dy * (Yc + D X) * silu'(z)`` and the core cotangent ``dY = dy * silu(z)`` elementwise,
-   so the scan kernels below never see the gate.
+   ``dz = dy * (Yc + D X) * silu'(z)`` and the core cotangent ``dY = dy * silu(z)``
+   elementwise, so the scan kernels below never see the gate. It reduces ``dD`` from the FP32
+   ``dY`` and stores ``dY`` in the input dtype, the dtype in which the ``dx``, ``dB``, and
+   ``dC`` products (and ``dx``'s skip term, as in ``mamba_ssm``) consume it.
 2. :func:`mamba2_chunk_states` reruns the forward scan to store each chunk's ``S_in``.
 3. ``mamba2_state_bwd_kernel`` scans chunks in reverse per ``(sequence, head, P tile)``,
    storing each chunk's ``dS_out`` in the input dtype and carrying
@@ -32,14 +34,28 @@ The backward runs four kernels:
     dC  = dG B + exp(g) * (dYc S_in)       dB = dG^T C + c * (X dS_out)
     Q   = dG * (C B^T)                     (cotangent of g_i - g_j inside E)
     dv  = colsum(K * (C B^T)) + exp(g_L - g) * rowdot(X, B dS_out^T)
-    dg  = rowsum(Q) - colsum(Q) + rowdot(Yc_inter, dYc) - c * rowdot(X, B dS_out^T)
-          + [i == L] (sum(c * rowdot(X, B dS_out^T)) + exp(g_L) <S_in, dS_out>)
-    da  = reverse_cumsum(dg),  dv += A da,  dA = sum(v da)
+    w   = c * rowdot(X, B dS_out^T)        (write weights c_j = v_j exp(g_L - g_j))
+    dg  = rowdot(Yc_inter, dYc) + [i == L] exp(g_L) <S_in, dS_out>
+    da  = reverse_cumsum(dg) + sum_{i >= k > j} Q_ij + sum_{j < k} w_j
+    dv += A da,  dA = sum(v da)
+
+``da`` is the cotangent of the in-chunk log-decay increments ``a_k = v_k A``. The pairwise
+``Q`` term and the write term sum only the contributions that cross each increment; the
+algebraically equal ``rowsum(Q) - colsum(Q)`` and ``-w + [i == L] sum(w)`` forms cancel large
+terms in FP32 and lose small ones.
 
 Matmul operands are rounded to the input dtype as in the forward; every accumulation and
 reduction is FP32. ``dA``, ``dD``, and ``ddt_bias`` are per-chunk partial sums reduced afterwards
 with ``torch.sum``, and heads split across programs write separate ``dB``/``dC`` partials, so the
 result is deterministic.
+
+The ``dS`` scan decays through :func:`scale_by_exp2`, as does the ``<S_in, dS_out>`` term after
+its contraction. ``mamba2_chunk_bwd_kernel`` forms its other in-chunk decay factors
+(``exp(g)``, ``c_j``, ``E``) on their own, so a gradient contribution through a factor below
+``2^-126`` flushes to zero, and it contracts ``S_in`` and the writes with ``dS_out`` before
+decaying them, so a product beyond FP32 range overflows. Splitting the factors as the carries do
+costs about 9% of this kernel on B300, whose tuned configuration already spills registers;
+decaying the writes before their contraction costs more.
 """
 
 from __future__ import annotations
@@ -52,37 +68,50 @@ from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import LOG2_E
 from attn_gym.linear.mamba2.triton.chunk_fwd import (
     CHUNK_SIZE,
-    GATE_BLOCK,
     chunk_slot_base,
+    decay_by_exp2,
     has_dt_limit,
     heads_per_program,
     locate_chunk,
     mamba2_chunk_states,
     num_chunk_slots,
     prune_p_tiles,
+    scale_by_exp2,
     segment_plan,
     segment_ptrs,
     transform_dt,
 )
 
+GATE_ROWS = 32
 
-# ``numel`` stays specialized: its divisibility by 16 lets the masked accesses vectorize.
-@triton.jit(do_not_specialize=["num_sequences"])
+
+@triton.jit(do_not_specialize=["tokens", "num_sequences"])
 def mamba2_gate_bwd_kernel(
     dy,
     z,
     pre_gate,
+    x,
     d_core,
     dz,
+    dD_partial,
     cu_seqlens,
-    numel,
+    tokens,
     num_sequences,
-    TOKEN_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
+    H: tl.constexpr,
+    P: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    HAS_D: tl.constexpr,
+    D_PER_CHANNEL: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < numel
+    """One ``[BLOCK_T tokens, P]`` tile of one head; ``dD`` partials are per token block."""
+    token_block, head = tl.program_id(0), tl.program_id(1)
+    rows = token_block * BLOCK_T + tl.arange(0, BLOCK_T)
+    offs_p = tl.arange(0, BLOCK_P)
+    mask_p = offs_p < P
+    mask = (rows < tokens)[:, None] & mask_p[None, :]
+    offs = rows.to(tl.int64)[:, None] * (H * P) + head * P + offs_p[None, :]
     d_out = tl.load(dy + offs, mask=mask, other=0.0).to(tl.float32)
     gate = tl.load(z + offs, mask=mask, other=0.0).to(tl.float32)
     output = tl.load(pre_gate + offs, mask=mask, other=0.0).to(tl.float32)
@@ -91,11 +120,21 @@ def mamba2_gate_bwd_kernel(
     d_out *= gate * sigmoid
     if IS_VARLEN:
         # Tokens past the terminal offset hold unwritten forward output and get zero gradient.
-        valid = offs < tl.load(cu_seqlens + num_sequences).to(tl.int64) * TOKEN_SIZE
-        d_gate = tl.where(valid, d_gate, 0.0)
-        d_out = tl.where(valid, d_out, 0.0)
+        valid = rows < tl.load(cu_seqlens + num_sequences)
+        d_gate = tl.where(valid[:, None], d_gate, 0.0)
+        d_out = tl.where(valid[:, None], d_out, 0.0)
     tl.store(dz + offs, d_gate.to(dz.dtype.element_ty), mask=mask)
     tl.store(d_core + offs, d_out.to(d_core.dtype.element_ty), mask=mask)
+    if HAS_D:
+        # Masked like d_out: capacity past the terminal offset may hold any x, even NaN.
+        if IS_VARLEN:
+            mask &= valid[:, None]
+        skip = d_out * tl.load(x + offs, mask=mask, other=0.0).to(tl.float32)
+        partial = token_block.to(tl.int64) * H + head
+        if D_PER_CHANNEL:
+            tl.store(dD_partial + partial * P + offs_p, tl.sum(skip, axis=0), mask=mask_p)
+        else:
+            tl.store(dD_partial + partial, tl.sum(tl.sum(skip, axis=1), axis=0))
 
 
 @triton.jit
@@ -107,14 +146,17 @@ def transform_dt_grad(
     DT_MAX: tl.constexpr,
     HAS_DT_LIMIT: tl.constexpr,
 ):
-    """Derivative of :func:`transform_dt` with respect to ``dt_raw``."""
+    """Derivative of :func:`transform_dt` with respect to ``dt_raw``.
+
+    Like ``Tensor.clamp``, the clamp passes no gradient at its bounds.
+    """
     u = dt_raw + bias
     grad = tl.full(u.shape, 1.0, tl.float32)
     if DT_SOFTPLUS:
-        grad = tl.where(u <= 20.0, tl.sigmoid(u), 1.0)
-        u = tl.where(u <= 20.0, tl.log(1.0 + tl.exp(u)), u)
+        grad = tl.where(u > 20.0, 1.0, tl.sigmoid(u))
     if HAS_DT_LIMIT:
-        grad = tl.where((u >= DT_MIN) & (u <= DT_MAX), grad, 0.0)
+        u = transform_dt(dt_raw, bias, DT_SOFTPLUS, DT_MIN, DT_MAX, False)
+        grad = tl.where((u > DT_MIN) & (u < DT_MAX), grad, 0.0)
     return grad
 
 
@@ -189,7 +231,7 @@ def mamba2_state_bwd_kernel(
                 sequence, head, last_segment - step, offs_p, offs_n, H, P, N
             )
             local = tl.load(segment_states + ptrs, mask=mask_p[:, None], other=0.0)
-            d_state = d_state * tl.math.exp2(tl.load(segment_decays + index)) + local
+            d_state = scale_by_exp2(d_state, tl.load(segment_decays + index)) + local
     chunk_state_ptrs = head * P * N + offs_p[:, None] * N + offs_n[None, :]
     total_decay = 0.0
 
@@ -220,8 +262,9 @@ def mamba2_state_bwd_kernel(
         d_out = tl.load(dy + xp, mask=mask_xp, other=0.0).to(tl.float32)
         bc = token0 * (G * N) + group * N + (offs_t[:, None] * (G * N) + offs_n[None, :])
         c_chunk = tl.load(C + bc, mask=mask_t[:, None], other=0.0)
-        scaled_d_out = (d_out * tl.math.exp2(g)[:, None]).to(c_chunk.dtype)
-        d_state = d_state * tl.math.exp2(g_last) + tl.dot(tl.trans(scaled_d_out), c_chunk)
+        steep = g_last < -126.0
+        scaled_d_out = decay_by_exp2(d_out, g[:, None], steep).to(c_chunk.dtype)
+        d_state = scale_by_exp2(d_state, g_last) + tl.dot(tl.trans(scaled_d_out), c_chunk)
 
     if SUMMARY:
         index, ptrs = segment_ptrs(sequence, head, segment, offs_p, offs_n, H, P, N)
@@ -268,6 +311,7 @@ def mamba2_chunk_bwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     D_PER_CHANNEL: tl.constexpr,
     HAS_D: tl.constexpr,
+    REDUCE_D_GRAD: tl.constexpr,
     IS_VARLEN: tl.constexpr,
 ):
     slot, group_split = tl.program_id(0), tl.program_id(1)
@@ -334,14 +378,16 @@ def mamba2_chunk_bwd_kernel(
                 if D_PER_CHANNEL:
                     skip = tl.load(D + head * P + offs_p, mask=mask_p, other=0.0)
                     skip = skip.to(tl.float32)[None, :]
-                    tl.store(
-                        dD_partial + (slot64 * H + head) * P + offs_p,
-                        tl.sum(d_out * x_float, axis=0),
-                        mask=mask_p,
-                    )
+                    if REDUCE_D_GRAD:
+                        tl.store(
+                            dD_partial + (slot64 * H + head) * P + offs_p,
+                            tl.sum(d_out * x_float, axis=0),
+                            mask=mask_p,
+                        )
                 else:
                     skip = tl.load(D + head).to(tl.float32)
-                    d_skip += tl.sum(tl.sum(d_out * x_float, axis=1), axis=0)
+                    if REDUCE_D_GRAD:
+                        d_skip += tl.sum(tl.sum(d_out * x_float, axis=1), axis=0)
             inter_dot += tl.sum(inter * d_out, axis=1)
             b_d_state = tl.dot(b_chunk, tl.trans(d_state))
             write_dot += tl.sum(x_float * b_d_state, axis=1)
@@ -364,13 +410,20 @@ def mamba2_chunk_bwd_kernel(
         d_c += tl.dot(d_scores_lp, b_chunk)
         d_b += tl.dot(tl.trans(d_scores_lp), c_chunk)
 
-        d_segment = d_scores * scores
+        # The cotangent of ``g_i - g_j`` reaches the increments ``a_k`` with ``j < k <= i``.
+        # Summing exactly those pairs keeps the diagonal (whose decay has no derivative) and the
+        # cancelling row and column sums of ``g``'s cotangent out of the FP32 reductions.
+        strict = offs_t[:, None] > offs_t[None, :]
+        crossing = tl.cumsum(tl.where(strict, d_scores * scores, 0.0), axis=0, reverse=True)
+        d_a = tl.sum(tl.where(strict, crossing, 0.0), axis=1)
+        # The write ``w_j`` decays by ``exp(g_L - g_j)``, which depends on the increments
+        # after ``j``: increment ``k`` collects the writes before it.
         write_term = write_dot * write_scale
+        d_a += tl.sum(tl.where(strict, write_term[None, :], 0.0), axis=1)
         d_v = tl.sum(d_masked * scores, axis=0) + write_dot * tail_decay
-        d_g = tl.sum(d_segment, axis=1) - tl.sum(d_segment, axis=0) + inter_dot - write_term
-        last_term = tl.sum(write_term, axis=0) + tl.math.exp2(g_last) * tl.sum(state_dot, axis=0)
-        d_g += tl.where(is_last, last_term, 0.0)
-        d_a = tl.cumsum(d_g, axis=0, reverse=True)
+        state_term = scale_by_exp2(tl.sum(state_dot, axis=0), g_last)
+        d_g = inter_dot + tl.where(is_last, state_term, 0.0)
+        d_a += tl.cumsum(d_g, axis=0, reverse=True)
         d_v += d_a * decay_rate
         d_dt = d_v * transform_dt_grad(dt_raw, bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT)
         d_dt = tl.where(mask_t, d_dt, 0.0)
@@ -380,7 +433,7 @@ def mamba2_chunk_bwd_kernel(
         tl.store(dA_partial + partial, tl.sum(d_a * dt_chunk, axis=0))
         if HAS_DT_BIAS:
             tl.store(ddt_bias_partial + partial, tl.sum(d_dt, axis=0))
-        if HAS_D and not D_PER_CHANNEL:
+        if REDUCE_D_GRAD and not D_PER_CHANNEL:
             tl.store(dD_partial + partial, d_skip)
 
     tokens = T if IS_VARLEN else num_sequences * T
@@ -429,6 +482,7 @@ _mamba2_chunk_bwd = TritonTuner(
         a["HEADS_PER_PROGRAM"],
         a["IS_VARLEN"],
         a["HAS_D"],
+        a["REDUCE_D_GRAD"],
         triton.next_power_of_2(a["dA_partial"].shape[0]),
     ),
     prune=prune_p_tiles,
@@ -468,26 +522,40 @@ def mamba2_chunk_bwd(
         None if tensor is None else tensor.contiguous()
         for tensor in (D, z, initial_state, dt_bias, d_final_state)
     )
-    dz = None
+    dz = dD = None
     if z is not None:
-        # The gate backward leaves a gate-free core cotangent for the scan kernels.
+        # The gate backward leaves a gate-free core cotangent for the scan kernels and reduces
+        # dD from its FP32 value.
         if pre_gate is None or pre_gate.shape != x.shape:
             raise ValueError("mamba2_chunk_bwd requires the pre-gate output with z")
         d_core, dz = torch.empty_like(d_output), torch.empty_like(z)
-        mamba2_gate_bwd_kernel[(triton.cdiv(z.numel(), GATE_BLOCK),)](
+        token_blocks = triton.cdiv(batch * tokens, GATE_ROWS)
+        gate_dD = (
+            None
+            if D is None
+            else x.new_empty(token_blocks, heads, *D.shape[1:], dtype=torch.float32)
+        )
+        mamba2_gate_bwd_kernel[(token_blocks, heads)](
             d_output,
             z,
             pre_gate.contiguous(),
+            x,
             d_core,
             dz,
+            gate_dD,
             cu_seqlens,
-            z.numel(),
+            batch * tokens,
             num_states,
-            TOKEN_SIZE=heads * head_dim,
-            BLOCK=GATE_BLOCK,
+            H=heads,
+            P=head_dim,
+            BLOCK_T=GATE_ROWS,
+            BLOCK_P=triton.next_power_of_2(head_dim),
+            HAS_D=D is not None,
+            D_PER_CHANNEL=D is not None and D.ndim == 2,
             IS_VARLEN=is_varlen,
         )
         d_output = d_core
+        dD = None if gate_dD is None else gate_dD.sum(0)
     num_slots = num_chunk_slots(x, cu_seqlens)
     transform = {
         "DT_SOFTPLUS": dt_softplus,
@@ -562,7 +630,8 @@ def mamba2_chunk_bwd(
     dB_partial = new_buffer(splits, *B.shape, dtype=torch.float32, device=x.device)
     dC_partial = new_buffer(splits, *B.shape, dtype=torch.float32, device=x.device)
     dA_partial = x.new_zeros(num_slots, heads, dtype=torch.float32)
-    dD_partial = None if D is None else x.new_zeros(num_slots, *D.shape, dtype=torch.float32)
+    reduce_d_grad = D is not None and dD is None
+    dD_partial = x.new_zeros(num_slots, *D.shape, dtype=torch.float32) if reduce_d_grad else None
     ddt_bias_partial = None if dt_bias is None else torch.zeros_like(dA_partial)
     _mamba2_chunk_bwd[(num_slots, groups * splits)](
         x=x,
@@ -588,10 +657,13 @@ def mamba2_chunk_bwd(
         HEADS_PER_PROGRAM=group_heads,
         D_PER_CHANNEL=D is not None and D.ndim == 2,
         HAS_D=D is not None,
+        REDUCE_D_GRAD=reduce_d_grad,
         IS_VARLEN=is_varlen,
         **shapes,
         **transform,
     )
+    if reduce_d_grad:
+        dD = dD_partial.sum(0)
 
     empty = x.new_empty(0)
     return (
@@ -600,7 +672,7 @@ def mamba2_chunk_bwd(
         dA_partial.sum(0).to(A.dtype),
         dB_partial.sum(0).to(B.dtype),
         dC_partial.sum(0).to(C.dtype),
-        empty if D is None else dD_partial.sum(0).to(D.dtype),
+        empty if D is None else dD.to(D.dtype),
         empty if dz is None else dz,
         empty if dt_bias is None else ddt_bias_partial.sum(0).to(dt_bias.dtype),
         empty if initial_state is None else d_initial_state.to(initial_state.dtype),

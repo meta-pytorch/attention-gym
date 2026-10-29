@@ -249,6 +249,31 @@ def test_fused_packed_gradients():
         assert not gradient[:, sum(lengths) :].any()
 
 
+@pytest.mark.parametrize("per_channel_D", [False, True])
+def test_fused_packed_capacity_values_do_not_reach_gradients(per_channel_D):
+    """Capacity past the terminal offset may hold anything, even NaN."""
+    lengths = [100, 0, 64, 300]
+    active = sum(lengths)
+    inputs = make_inputs(1, active + 37, 4, 2, 64, 64, dtype=torch.bfloat16)
+    if per_channel_D:
+        inputs["D"] = torch.randn(4, 64, device="cuda")
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    d_output = torch.randn_like(inputs["x"])
+    d_output[:, active:] = 0
+
+    def gradients(capacity_value):
+        leaves = {name: tensor.detach().clone() for name, tensor in inputs.items()}
+        for name in ("x", "B", "C", "z"):
+            leaves[name][:, active:] = capacity_value
+        leaves = {name: tensor.requires_grad_() for name, tensor in leaves.items()}
+        output, _ = chunk_mamba2(**leaves, dt_softplus=True, cu_seqlens=cu_seqlens, impl="fused")
+        return dict(zip(leaves, torch.autograd.grad(output, list(leaves.values()), d_output)))
+
+    finite, poisoned = gradients(0.0), gradients(float("nan"))
+    for name in inputs:
+        torch.testing.assert_close(poisoned[name], finite[name], rtol=0, atol=0)
+
+
 SEGMENT_LENGTH = 256
 
 
