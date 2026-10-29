@@ -237,7 +237,7 @@ def test_fused_packed_capacity_values_do_not_reach_gradients(per_channel_D):
 
     def gradients(capacity_value):
         leaves = {name: tensor.detach().clone() for name, tensor in inputs.items()}
-        for name in ("x", "B", "C", "z"):
+        for name in ("x", "dt", "B", "C", "z"):
             leaves[name][:, active:] = capacity_value
         leaves = {name: tensor.requires_grad_() for name, tensor in leaves.items()}
         output, _ = chunk_mamba2(**leaves, dt_softplus=True, cu_seqlens=cu_seqlens, impl="fused")
@@ -403,3 +403,39 @@ def test_fused_compiles_once_across_lengths(fresh_compile_cache):
             if step == 0:
                 traced = counter.frame_count
         assert counter.frame_count == traced
+
+
+MAMBA2_TRAINING_KERNELS = (
+    "mamba2_dt_fwd_kernel",
+    "mamba2_chunk_fwd_kernel",
+    "mamba2_chunk_out_kernel",
+    "mamba2_gate_fwd_kernel",
+    "mamba2_gate_bwd_kernel",
+    "mamba2_state_bwd_kernel",
+    "mamba2_chunk_bwd_kernel",
+    "mamba2_dt_bwd_kernel",
+)
+
+
+def test_fused_training_reuses_kernels_across_packed_shapes(
+    mamba2_first_candidate, triton_compiles
+):
+    """Token and sequence counts in every integer class launch the kernels compiled for the
+    first shape; segmented scans add one variant of each scan."""
+    # One head per group keeps one head per chunk program on any GPU. With 16 heads the
+    # elementwise kernels' element counts stay multiples of 16, which they specialize on; other
+    # head counts add at most one more class.
+    for tokens, num_sequences in ((1, 1), (16, 1), (48, 2), (37, 3), (200, 16), (1000, 33)):
+        packed_training_step(tokens, num_sequences, groups=16)
+    assert triton_compiles == dict.fromkeys(MAMBA2_TRAINING_KERNELS, 1)
+    # Long sequences with few programs split each scan into segments: each scan kernel gains a
+    # segmented main variant and a summary variant, whatever the segment count.
+    for tokens, num_sequences in ((2048, 1), (3000, 2), (3500, 3)):
+        packed_training_step(tokens, num_sequences, groups=16)
+    scans = {"mamba2_chunk_fwd_kernel": 3, "mamba2_state_bwd_kernel": 3}
+    assert triton_compiles == dict.fromkeys(MAMBA2_TRAINING_KERNELS, 1) | scans
+    # An initial state changes what the main scans read and write, not their summaries.
+    for tokens, num_sequences in ((2048, 1), (3000, 2)):
+        packed_training_step(tokens, num_sequences, groups=16, initial_state=True)
+    scans = {"mamba2_chunk_fwd_kernel": 4, "mamba2_state_bwd_kernel": 4}
+    assert triton_compiles == dict.fromkeys(MAMBA2_TRAINING_KERNELS, 1) | scans
