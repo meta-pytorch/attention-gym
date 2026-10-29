@@ -263,7 +263,7 @@ def test_fused_packed_capacity_values_do_not_reach_gradients(per_channel_D):
 
     def gradients(capacity_value):
         leaves = {name: tensor.detach().clone() for name, tensor in inputs.items()}
-        for name in ("x", "B", "C", "z"):
+        for name in ("x", "dt", "B", "C", "z"):
             leaves[name][:, active:] = capacity_value
         leaves = {name: tensor.requires_grad_() for name, tensor in leaves.items()}
         output, _ = chunk_mamba2(**leaves, dt_softplus=True, cu_seqlens=cu_seqlens, impl="fused")
