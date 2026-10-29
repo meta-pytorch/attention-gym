@@ -205,9 +205,10 @@ def chunk_mamba2(
             They start at zero, never decrease, and may end before ``T``; output beyond the
             terminal offset is unspecified.
         output_final_state: Return the final state with the output.
-        impl: ``"fused"`` (default) uses the single-pass Triton forward and a chunk-parallel
-            Triton backward on CUDA with FP16/BF16 activations and a power-of-two ``N`` in
-            [16, 256]; packed offsets stay on the device. ``"reference"`` uses eager PyTorch.
+        impl: ``"fused"`` (default) uses Triton kernels on CUDA with FP16/BF16 activations and
+            a power-of-two ``N`` in [16, 256]: a state scan that splits long sequences into
+            parallel segments, chunk-parallel output, and a chunk-parallel backward; packed
+            offsets stay on the device. ``"reference"`` uses eager PyTorch.
 
     Returns:
         The output in ``x.dtype`` and either the final state or ``None``.
