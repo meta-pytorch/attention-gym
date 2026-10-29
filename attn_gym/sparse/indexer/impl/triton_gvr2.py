@@ -13,7 +13,9 @@ from torch import Tensor
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets, score_strides
 
+from ..validation import validate_precision
 from .cute import score_workspace_pairs
+from .triton import _validate_mxfp8, launch_mxfp8_scores
 
 
 @triton.jit
@@ -173,20 +175,27 @@ def launch(
     compress_ratio: int,
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Return exact finite-score Top-K sets; score order is unspecified.
 
     FP16/BF16: Hopper+, H/D<=256, D divisible by 8, T<=2**20.
+    MXFP8: SM100/SM103, H32/64, D128, BF16/FP32 weights and logical E8M0 scales.
     All operands accept arbitrary nonnegative strides.
     """
     if cu_seqlens is not None or cu_seqlens_k is not None:
+        if q.dtype == torch.float8_e4m3fn:
+            raise ValueError("MXFP8 indexing does not support packed cu_seqlens.")
         raise ValueError("Triton GVR2 does not support packed cu_seqlens")
     if torch.version.hip or not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] < 9:
         raise ValueError("The Triton GVR2 indexer requires Hopper or newer NVIDIA GPUs.")
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("Triton GVR2 requires FP16/BF16 inputs.")
-    if k.dtype != q.dtype or weights.dtype != q.dtype:
-        raise TypeError("q, k, and weights must have one dtype")
+    validate_precision(q, k, weights, q_scale, k_scale)
+    scaled_fp8 = q.dtype == torch.float8_e4m3fn
+    if scaled_fp8:
+        _validate_mxfp8(q)
+    elif q.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError("Triton GVR2 requires FP16/BF16 or scaled MXFP8 inputs.")
     batch, tokens, heads, dim = q.shape
     candidates = k.shape[1]
     if heads > 256 or dim > 256 or dim % 8 or tokens > 2**20:
@@ -200,33 +209,39 @@ def launch(
         return output.fill_(-1)
     pairs = score_workspace_pairs(batch, tokens, candidates)
     scores = torch.empty((pairs, 2, candidates), device=q.device, dtype=torch.float32)
-    wide = requires_int64_offsets(q, k, weights, scores, output)
+    wide = requires_int64_offsets(q, k, weights, q_scale, k_scale, scores, output)
     total_pairs = batch * triton.cdiv(tokens, 2)
     with torch.cuda.device(q.device):
         for start in range(0, total_pairs, pairs):
             slab = scores[: min(pairs, total_pairs - start)]
-            _score_kernel[(slab.shape[0] * 2, triton.cdiv(candidates, 128))](
-                q,
-                k,
-                weights,
-                slab,
-                start,
-                tokens,
-                candidates,
-                heads,
-                dim,
-                score_strides(q),
-                score_strides(k),
-                score_strides(weights),
-                causal,
-                compress_ratio,
-                max(16, triton.next_power_of_2(heads)),
-                max(16, triton.next_power_of_2(dim)),
-                128,
-                wide,
-                num_warps=4,
-                num_stages=1,
-            )
+            if scaled_fp8:
+                assert q_scale is not None and k_scale is not None
+                launch_mxfp8_scores(
+                    q, k, weights, q_scale, k_scale, slab, start, causal, compress_ratio, wide
+                )
+            else:
+                _score_kernel[(slab.shape[0] * 2, triton.cdiv(candidates, 128))](
+                    q,
+                    k,
+                    weights,
+                    slab,
+                    start,
+                    tokens,
+                    candidates,
+                    heads,
+                    dim,
+                    score_strides(q),
+                    score_strides(k),
+                    score_strides(weights),
+                    causal,
+                    compress_ratio,
+                    max(16, triton.next_power_of_2(heads)),
+                    max(16, triton.next_power_of_2(dim)),
+                    128,
+                    wide,
+                    num_warps=4,
+                    num_stages=1,
+                )
             _gvr2_topk_kernel[(slab.shape[0] * 2,)](
                 slab,
                 output,

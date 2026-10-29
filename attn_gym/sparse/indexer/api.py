@@ -7,6 +7,7 @@ from attn_gym._cu_seqlens import validate_cu_seqlens_pair
 from attn_gym.types import Impl, resolve_impl
 
 from .ops import _indexer_op
+from .validation import validate_precision
 
 
 def _validate_inputs(
@@ -18,6 +19,8 @@ def _validate_inputs(
     compress_ratio: int,
     cu_seqlens: Tensor | None,
     cu_seqlens_k: Tensor | None,
+    q_scale: Tensor | None,
+    k_scale: Tensor | None,
 ) -> None:
     """Validate metadata without synchronizing or inspecting tensor values."""
     # --- type checks ---
@@ -63,15 +66,8 @@ def _validate_inputs(
             f"weights must have shape {[batch, queries, heads]}, got {list(weights.shape)}."
         )
 
-    # --- dtype ---
-    if not q.is_floating_point():
-        raise TypeError(f"q must have a floating-point dtype, got {q.dtype}.")
-    if k.dtype != q.dtype:
-        raise ValueError(f"k must have the same dtype as q, but got {k.dtype} and {q.dtype}.")
-    if weights.dtype != q.dtype:
-        raise ValueError(
-            f"weights must have the same dtype as q, but got {weights.dtype} and {q.dtype}."
-        )
+    # --- dtype and optional FP8 scales ---
+    validate_precision(q, k, weights, q_scale, k_scale)
 
     # --- device ---
     if k.device != q.device:
@@ -85,6 +81,8 @@ def _validate_inputs(
     if topk < 0:
         raise ValueError(f"topk must be non-negative, got {topk}.")
 
+    if q.dtype == torch.float8_e4m3fn and (cu_seqlens is not None or cu_seqlens_k is not None):
+        raise ValueError("MXFP8 indexing does not support packed cu_seqlens.")
     validate_cu_seqlens_pair(cu_seqlens, cu_seqlens_k, batch=batch, device=q.device)
 
     # Packed pools contain the sum of independently floored document lengths.
@@ -104,10 +102,12 @@ def lightning_indexer(
     *,
     causal: bool = False,
     compress_ratio: int = 1,
-    cu_seqlens: Tensor | None = None,
-    cu_seqlens_k: Tensor | None = None,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
     kernel_options: dict[str, str] | None = None,
+    cu_seqlens: Tensor | None = None,
+    cu_seqlens_k: Tensor | None = None,
 ) -> Tensor:
     """Return the Top-K candidate indices for every (batch, query) row.
 
@@ -126,7 +126,8 @@ def lightning_indexer(
             offsets, ``S = T // compress_ratio``. With offsets, candidates from each
             document are concatenated in document order; S may include inactive capacity.
 
-        weights: Per-head weights, [B, T, H]. May be negative.
+        weights: Per-head weights, [B, T, H]. May be negative. MXFP8 Q/K accept
+            BF16 or FP32 weights; other inputs require matching dtypes.
 
         topk: Non-negative output width. Rows with fewer valid candidates are
             padded with -1, including when S is zero or topk exceeds S.
@@ -156,6 +157,14 @@ def lightning_indexer(
             that document's candidate pool, suitable for gather_attn with these offsets.
             Without packed offsets, indices are positions in the batch element's pool.
 
+        q_scale: E8M0 (``torch.float8_e8m0fnu``) [B, T, H, D // 32] scales for E4M3FN
+            Q; each multiplies one contiguous 32-element group of D inside the dot
+            product (FP32 accumulation). Required together with k_scale for MXFP8,
+            otherwise None. Values are not checked on device; non-finite scales or
+            scores are outside the contract. This function does not quantize.
+
+        k_scale: E8M0 [B, S, D // 32] scales for K; same semantics as q_scale.
+
         impl: Impl.REFERENCE (or ``"reference"``) uses eager PyTorch on CPU or CUDA;
             Impl.FUSED (default, or ``"fused"``) uses optimized CUDA kernels.
 
@@ -181,16 +190,19 @@ def lightning_indexer(
         documents before top-k, not by filtering its result.
 
     Fused backends support ``torch.compile(fullgraph=True)`` and CUDA Graph replay.
-    Both require FP16/BF16 inputs and T <= 2**20. CuTe requires
+    Both support FP16/BF16 with T <= 2**20, and MXFP8 (E4M3FN Q/K with E8M0 scales)
+    for H in {32, 64}, D=128 on SM100/SM103. MXFP8 rejects packed cu_seqlens;
+    deterministic mode changes only selection, not scoring. CuTe requires
     SM100/SM103, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
     bases and non-singleton outer strides. Other Q/K strides may vary independently;
     weights may have arbitrary strides and need only element alignment.
     Triton requires SM90 or newer, H <= 256 and D <= 256 divisible by 8. Its streaming
     FP16/BF16 path requires Q/K unit last strides and 16-byte-aligned bases and outer strides;
     weights may be strided, and its register-resident selection cost grows with topk.
-    Triton GVR2 accepts arbitrary nonnegative input strides and uses its own tiled scorer,
-    so its scores may round differently from the streaming path.
-    CuTe and Triton GVR2 reuse a per-call FP32 score workspace capped at 32 MiB and 1024 query
+    Triton GVR2 and MXFP8 accept arbitrary nonnegative input strides; both backends accept
+    arbitrary nonnegative scale strides. Triton GVR2 uses its own tiled scorer, so its
+    FP16/BF16 scores may round differently from the streaming path.
+    CuTe and Triton MXFP8/GVR2 reuse a per-call FP32 score workspace capped at 32 MiB and 1024 query
     rows. For nonzero topk, candidate capacity S must be at most 2**22 so one query
     pair fits that budget. Large inputs use slabs rather than an unbounded quadratic
     score allocation.
@@ -202,11 +214,13 @@ def lightning_indexer(
     Selection with NaN/Inf scores is unspecified and may differ across backends.
     Indices are nondifferentiable even when inputs require gradients. Training
     attention over the selected positions does not propagate gradients through
-    selection into q, k, or weights.
+    selection into q, k, weights, or scales.
     """
 
     selected_impl = resolve_impl(impl)
-    _validate_inputs(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
+    _validate_inputs(
+        q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k, q_scale, k_scale
+    )
     match selected_impl:
         case Impl.REFERENCE:
             if kernel_options:
@@ -214,7 +228,16 @@ def lightning_indexer(
             from .impl import reference
 
             return reference.launch(
-                q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k
+                q,
+                k,
+                weights,
+                topk,
+                causal,
+                compress_ratio,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_k,
+                q_scale=q_scale,
+                k_scale=k_scale,
             )
         case Impl.FUSED:
             options = {} if kernel_options is None else kernel_options
@@ -237,7 +260,9 @@ def lightning_indexer(
                 causal,
                 compress_ratio,
                 options.get("backend", "auto"),
-                cu_seqlens,
-                cu_seqlens_k,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_k=cu_seqlens_k,
+                q_scale=q_scale,
+                k_scale=k_scale,
                 selector=selector,
             )

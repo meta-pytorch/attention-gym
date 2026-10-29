@@ -15,6 +15,8 @@ def launch(
     compress_ratio: int,
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Multi-head weighted ReLU Top-K, reference implementation.
 
@@ -33,6 +35,8 @@ def launch(
             for nonpacked calls.
         cu_seqlens: Packed query offsets, [N + 1]; supplied together with cu_seqlens_k.
         cu_seqlens_k: Packed candidate offsets, [N + 1].
+        q_scale: optional E8M0 per-32-element dequantization scales, [B, T, H, D/32].
+        k_scale: optional E8M0 per-32-element dequantization scales, [B, S, D/32].
 
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
@@ -51,6 +55,9 @@ def launch(
     q = q.to(accum_dtype)
     k = k.to(accum_dtype)
     weights = weights.to(accum_dtype)
+    if q_scale is not None:  # The API requires both scales or neither.
+        q = (q.unflatten(-1, (head_dim // 32, 32)) * q_scale.float().unsqueeze(-1)).flatten(-2)
+        k = (k.unflatten(-1, (head_dim // 32, 32)) * k_scale.float().unsqueeze(-1)).flatten(-2)
 
     # Query chunks bound the [B, chunk, H, S] per-head intermediates; scores stay [B, T, S].
     scores = q.new_empty(batch, queries, candidates)
