@@ -3,12 +3,12 @@
 ``mamba2_chunk_fwd_kernel`` is the scan: one program owns one ``(sequence, head, P tile)`` and
 keeps its FP32 ``[BP, N]`` state in registers while it walks the sequence in ``BT`` token chunks.
 It stores every chunk's entry state, rounded to the input dtype exactly as the output MMA reads
-it, into its chunk slot (see :func:`chunk_slot_base`), and the final state.
-``mamba2_chunk_out_kernel`` then computes every chunk's pre-gate output ``Yc + D X`` in
-parallel from those entry states: the masked ``C B^T`` intra-chunk product (shared by a group's
-heads), the entry-state read, and the ``D`` skip. ``mamba2_gate_fwd_kernel`` applies the
-``silu(z)`` gate elementwise; in the accumulator layout the gate's loads cost more than this
-extra pass. The pre-gate output stays FP32, so the gated output is rounded once, as when the
+it, into its chunk slot (see :func:`chunk_slot_base`), and the final state. The training path
+transforms ``dt`` once (``mamba2_dt_fwd_kernel``) and runs every kernel on the FP32 step sizes.
+``mamba2_chunk_out_kernel`` then computes every chunk's pre-gate output ``Yc + D X`` in parallel
+from those entry states: the masked ``C B^T`` intra-chunk product (shared by a group's heads),
+the entry-state read, and the ``D`` skip. ``mamba2_gate_fwd_kernel`` applies the ``silu(z)``
+gate elementwise; in the accumulator layout the gate's loads cost more than this extra pass. The pre-gate output stays FP32, so the gated output is rounded once, as when the
 gate reads the accumulator, and FP16 pre-gate values beyond the FP16 range cannot overflow a
 finite gated output. Training keeps it so the backward can form ``dz`` and ``dy * silu(z)``
 elementwise. The backward reruns the scan to recover the entry states.
@@ -320,7 +320,6 @@ def mamba2_chunk_out_kernel(
     x,
     dt,
     A,
-    dt_bias,
     B,
     C,
     D,
@@ -336,11 +335,6 @@ def mamba2_chunk_out_kernel(
     BT: tl.constexpr,
     BP: tl.constexpr,
     HEADS_PER_PROGRAM: tl.constexpr,
-    DT_SOFTPLUS: tl.constexpr,
-    DT_MIN: tl.constexpr,
-    DT_MAX: tl.constexpr,
-    HAS_DT_LIMIT: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
     D_PER_CHANNEL: tl.constexpr,
     HAS_D: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -369,12 +363,8 @@ def mamba2_chunk_out_kernel(
     for head_index in range(HEADS_PER_PROGRAM):
         head = group * (H // G) + split * HEADS_PER_PROGRAM + head_index
         decay_rate = tl.load(A + head).to(tl.float32) * LOG2_E
-        bias = tl.load(dt_bias + head).to(tl.float32) if HAS_DT_BIAS else 0.0
         dt_chunk = tl.load(dt + token0 * H + head + offs_t * H, mask=mask_t, other=0.0)
-        dt_chunk = transform_dt(
-            dt_chunk.to(tl.float32), bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT
-        )
-        dt_chunk = tl.where(mask_t, dt_chunk, 0.0)
+        dt_chunk = dt_chunk.to(tl.float32)
         g = tl.cumsum(dt_chunk * decay_rate, axis=0)
         decay = tl.math.exp2(tl.where(causal, g[:, None] - g[None, :], float("-inf")))
         weights = (scores * decay * dt_chunk[None, :]).to(c_chunk.dtype)
@@ -402,6 +392,63 @@ def mamba2_chunk_out_kernel(
 
 
 GATE_BLOCK = 2048
+DT_BLOCK = 1024
+
+
+@triton.jit
+def mamba2_dt_fwd_kernel(
+    dt,
+    dt_bias,
+    out,
+    numel,
+    H: tl.constexpr,
+    BLOCK: tl.constexpr,
+    DT_SOFTPLUS: tl.constexpr,
+    DT_MIN: tl.constexpr,
+    DT_MAX: tl.constexpr,
+    HAS_DT_LIMIT: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+):
+    """FP32 :func:`transform_dt` of every ``[..., H]`` step size."""
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    raw = tl.load(dt + offs, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(dt_bias + offs % H, mask=mask, other=0.0).to(tl.float32) if HAS_DT_BIAS else 0.0
+    tl.store(
+        out + offs, transform_dt(raw, bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT), mask=mask
+    )
+
+
+def has_dt_limit(dt_min: float, dt_max: float) -> bool:
+    return (dt_min, dt_max) != (0.0, math.inf)
+
+
+def has_dt_transform(dt_bias, dt_softplus, dt_min, dt_max) -> bool:
+    return dt_bias is not None or dt_softplus or has_dt_limit(dt_min, dt_max)
+
+
+def transformed_dt(dt, dt_bias, dt_softplus, dt_min, dt_max) -> torch.Tensor:
+    """FP32 ``clamp(softplus(dt + dt_bias), dt_min, dt_max)``, or ``dt`` itself with no transform.
+
+    The training-path kernels read these step sizes instead of transforming per chunk.
+    """
+    if not has_dt_transform(dt_bias, dt_softplus, dt_min, dt_max):
+        return dt
+    out = torch.empty(dt.shape, dtype=torch.float32, device=dt.device)
+    mamba2_dt_fwd_kernel[(triton.cdiv(dt.numel(), DT_BLOCK),)](
+        dt,
+        dt_bias,
+        out,
+        dt.numel(),
+        H=dt.shape[-1],
+        BLOCK=DT_BLOCK,
+        DT_SOFTPLUS=dt_softplus,
+        DT_MIN=float(dt_min),
+        DT_MAX=float(dt_max),
+        HAS_DT_LIMIT=has_dt_limit(dt_min, dt_max),
+        HAS_DT_BIAS=dt_bias is not None,
+    )
+    return out
 
 
 # ``numel`` stays specialized: its divisibility by 16 lets the masked accesses vectorize.
@@ -521,10 +568,6 @@ def num_chunk_slots(x: torch.Tensor, cu_seqlens: torch.Tensor | None) -> int:
     if cu_seqlens is None:
         return batch * triton.cdiv(tokens, CHUNK_SIZE)
     return tokens // CHUNK_SIZE + cu_seqlens.shape[0] - 1
-
-
-def has_dt_limit(dt_min: float, dt_max: float) -> bool:
-    return (dt_min, dt_max) != (0.0, math.inf)
 
 
 def launch_chunk_fwd(
@@ -669,18 +712,9 @@ def mamba2_chunk_fwd(
         else None
     )
     pre_gate = None if z is None else x.new_empty(x.shape, dtype=torch.float32)
+    dt = transformed_dt(dt, dt_bias, dt_softplus, dt_min, dt_max)
     chunk_states = mamba2_chunk_states(
-        x,
-        dt,
-        A,
-        B,
-        initial_state,
-        dt_bias,
-        cu_seqlens,
-        dt_softplus,
-        dt_min,
-        dt_max,
-        final_state=final_state,
+        x, dt, A, B, initial_state, cu_seqlens, final_state=final_state
     )
     groups = B.shape[2]
     num_slots = chunk_states.shape[0]
@@ -691,7 +725,6 @@ def mamba2_chunk_fwd(
         x=x,
         dt=dt,
         A=A,
-        dt_bias=dt_bias,
         B=B,
         C=C,
         D=D,
@@ -706,11 +739,6 @@ def mamba2_chunk_fwd(
         N=state_dim,
         BT=CHUNK_SIZE,
         HEADS_PER_PROGRAM=group_heads,
-        DT_SOFTPLUS=dt_softplus,
-        DT_MIN=float(dt_min),
-        DT_MAX=float(dt_max),
-        HAS_DT_LIMIT=has_dt_limit(dt_min, dt_max),
-        HAS_DT_BIAS=dt_bias is not None,
         D_PER_CHANNEL=D is not None and D.ndim == 2,
         HAS_D=D is not None,
         IS_VARLEN=cu_seqlens is not None,
@@ -771,17 +799,14 @@ def mamba2_chunk_states(
     A: torch.Tensor,
     B: torch.Tensor,
     initial_state: torch.Tensor | None,
-    dt_bias: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
-    dt_softplus: bool,
-    dt_min: float,
-    dt_max: float,
     final_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute every chunk's entry state, ``[num_chunk_slots, H, P, N]`` in ``x.dtype``.
 
-    Slots of packed capacity that no chunk owns stay uninitialized. ``final_state``, if given,
-    receives each sequence's FP32 final state.
+    ``dt`` holds the transformed step sizes (see :func:`transformed_dt`). Slots of packed
+    capacity that no chunk owns stay uninitialized. ``final_state``, if given, receives each
+    sequence's FP32 final state.
     """
     heads, head_dim = x.shape[2:]
     chunk_states = x.new_empty(num_chunk_slots(x, cu_seqlens), heads, head_dim, B.shape[-1])
@@ -794,11 +819,11 @@ def mamba2_chunk_states(
         None,
         None,
         initial_state,
-        dt_bias,
+        None,
         cu_seqlens,
-        dt_softplus,
-        dt_min,
-        dt_max,
+        False,
+        0.0,
+        math.inf,
         final_state=final_state,
         chunk_states=chunk_states,
     )
@@ -807,10 +832,12 @@ def mamba2_chunk_states(
 
 __all__ = [
     "CHUNK_SIZE",
+    "DT_BLOCK",
     "GATE_BLOCK",
     "chunk_slot_base",
     "decay_by_exp2",
     "has_dt_limit",
+    "has_dt_transform",
     "heads_per_program",
     "locate_chunk",
     "mamba2_chunk_fwd",
@@ -822,4 +849,5 @@ __all__ = [
     "segment_plan",
     "segment_ptrs",
     "transform_dt",
+    "transformed_dt",
 ]

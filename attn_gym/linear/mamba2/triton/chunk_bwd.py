@@ -10,7 +10,9 @@ cumulative log decay ``g`` (last index ``L``), ``E_ij = exp(g_i - g_j) [i >= j]`
     S_out = exp(g_L) S_in + (c * X)^T B,      c_j = v_j exp(g_L - g_j)
     y     = (Yc + D X) * silu(z)
 
-The backward runs four kernels:
+The backward transforms ``dt`` once (``mamba2_dt_fwd_kernel``), runs four kernels on the FP32
+transformed step sizes ``v``, and maps ``dv`` back through the transform
+(``mamba2_dt_bwd_kernel``):
 
 1. ``mamba2_gate_bwd_kernel`` reads the forward's stored pre-gate output ``Yc + D X`` and forms
    ``dz = dy * (Yc + D X) * silu'(z)`` and the core cotangent ``dY = dy * silu(z)``
@@ -45,9 +47,9 @@ algebraically equal ``rowsum(Q) - colsum(Q)`` and ``-w + [i == L] sum(w)`` forms
 terms in FP32 and lose small ones.
 
 Matmul operands are rounded to the input dtype as in the forward; every accumulation and
-reduction is FP32. ``dA``, ``dD``, and ``ddt_bias`` are per-chunk partial sums reduced afterwards
-with ``torch.sum``, and heads split across programs write separate ``dB``/``dC`` partials, so the
-result is deterministic.
+reduction is FP32. ``ddt_bias`` is the sum of ``mamba2_dt_bwd_kernel``'s output, ``dA`` and
+``dD`` are per-chunk partial sums reduced afterwards with ``torch.sum``, and heads split across
+programs write separate ``dB``/``dC`` partials, so the result is deterministic.
 
 The ``dS`` scan decays through :func:`scale_by_exp2`, as does the ``<S_in, dS_out>`` term after
 its contraction. ``mamba2_chunk_bwd_kernel`` forms its other in-chunk decay factors
@@ -68,9 +70,11 @@ from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import LOG2_E
 from attn_gym.linear.mamba2.triton.chunk_fwd import (
     CHUNK_SIZE,
+    DT_BLOCK,
     chunk_slot_base,
     decay_by_exp2,
     has_dt_limit,
+    has_dt_transform,
     heads_per_program,
     locate_chunk,
     mamba2_chunk_states,
@@ -80,6 +84,7 @@ from attn_gym.linear.mamba2.triton.chunk_fwd import (
     segment_plan,
     segment_ptrs,
     transform_dt,
+    transformed_dt,
 )
 
 GATE_ROWS = 32
@@ -160,11 +165,39 @@ def transform_dt_grad(
     return grad
 
 
+@triton.jit
+def mamba2_dt_bwd_kernel(
+    ddt,
+    dt,
+    dt_bias,
+    cu_seqlens,
+    numel,
+    num_sequences,
+    H: tl.constexpr,
+    BLOCK: tl.constexpr,
+    DT_SOFTPLUS: tl.constexpr,
+    DT_MIN: tl.constexpr,
+    DT_MAX: tl.constexpr,
+    HAS_DT_LIMIT: tl.constexpr,
+    HAS_DT_BIAS: tl.constexpr,
+    IS_VARLEN: tl.constexpr,
+):
+    """Map ``dv`` (cotangent of the transformed step size) to ``d dt_raw`` in place."""
+    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < numel
+    if IS_VARLEN:
+        # Capacity past the terminal offset may hold any dt, even NaN; its gradient stays zero.
+        mask &= offs < tl.load(cu_seqlens + num_sequences).to(tl.int64) * H
+    raw = tl.load(dt + offs, mask=mask, other=0.0).to(tl.float32)
+    bias = tl.load(dt_bias + offs % H, mask=mask, other=0.0).to(tl.float32) if HAS_DT_BIAS else 0.0
+    grad = transform_dt_grad(raw, bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT)
+    tl.store(ddt + offs, tl.load(ddt + offs, mask=mask, other=0.0) * grad, mask=mask)
+
+
 @triton.jit(do_not_specialize=["T", "segment_length"])
 def mamba2_state_bwd_kernel(
     dt,
     A,
-    dt_bias,
     C,
     dy,
     d_final_state,
@@ -181,11 +214,6 @@ def mamba2_state_bwd_kernel(
     N: tl.constexpr,
     BT: tl.constexpr,
     BP: tl.constexpr,
-    DT_SOFTPLUS: tl.constexpr,
-    DT_MIN: tl.constexpr,
-    DT_MAX: tl.constexpr,
-    HAS_DT_LIMIT: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
     HAS_FINAL_STATE_GRAD: tl.constexpr,
     STORE_INITIAL_STATE_GRAD: tl.constexpr,
     IS_VARLEN: tl.constexpr,
@@ -216,7 +244,6 @@ def mamba2_state_bwd_kernel(
     mask_p = offs_p < P
 
     decay_rate = tl.load(A + head).to(tl.float32) * LOG2_E
-    bias = tl.load(dt_bias + head).to(tl.float32) if HAS_DT_BIAS else 0.0
 
     state_ptrs = (sequence.to(tl.int64) * H + head) * P * N + offs_p[:, None] * N + offs_n[None, :]
     if HAS_FINAL_STATE_GRAD and not SUMMARY:
@@ -249,10 +276,7 @@ def mamba2_state_bwd_kernel(
         token0 = bos + chunk_start
         mask_t = chunk_start + offs_t < length
         dt_chunk = tl.load(dt + token0 * H + head + offs_t * H, mask=mask_t, other=0.0)
-        dt_chunk = transform_dt(
-            dt_chunk.to(tl.float32), bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT
-        )
-        dt_chunk = tl.where(mask_t, dt_chunk, 0.0)
+        dt_chunk = dt_chunk.to(tl.float32)
         g = tl.cumsum(dt_chunk * decay_rate, axis=0)
         g_last = tl.sum(tl.where(offs_t == BT - 1, g, 0.0), axis=0)
         total_decay += g_last
@@ -280,7 +304,6 @@ def mamba2_chunk_bwd_kernel(
     x,
     dt,
     A,
-    dt_bias,
     B,
     C,
     D,
@@ -293,7 +316,6 @@ def mamba2_chunk_bwd_kernel(
     dC_partial,
     dA_partial,
     dD_partial,
-    ddt_bias_partial,
     cu_seqlens,
     T,
     num_sequences,
@@ -304,11 +326,6 @@ def mamba2_chunk_bwd_kernel(
     BT: tl.constexpr,
     BP: tl.constexpr,
     HEADS_PER_PROGRAM: tl.constexpr,
-    DT_SOFTPLUS: tl.constexpr,
-    DT_MIN: tl.constexpr,
-    DT_MAX: tl.constexpr,
-    HAS_DT_LIMIT: tl.constexpr,
-    HAS_DT_BIAS: tl.constexpr,
     D_PER_CHANNEL: tl.constexpr,
     HAS_D: tl.constexpr,
     REDUCE_D_GRAD: tl.constexpr,
@@ -341,11 +358,8 @@ def mamba2_chunk_bwd_kernel(
     for head_index in range(HEADS_PER_PROGRAM):
         head = group * (H // G) + split * HEADS_PER_PROGRAM + head_index
         decay_rate = tl.load(A + head).to(tl.float32)
-        bias = tl.load(dt_bias + head).to(tl.float32) if HAS_DT_BIAS else 0.0
-        dt_raw = tl.load(dt + token0 * H + head + offs_t * H, mask=mask_t, other=0.0)
-        dt_raw = dt_raw.to(tl.float32)
-        dt_chunk = transform_dt(dt_raw, bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT)
-        dt_chunk = tl.where(mask_t, dt_chunk, 0.0)
+        dt_chunk = tl.load(dt + token0 * H + head + offs_t * H, mask=mask_t, other=0.0)
+        dt_chunk = dt_chunk.to(tl.float32)
         g = tl.cumsum(dt_chunk * (decay_rate * LOG2_E), axis=0)
         g_last = tl.sum(tl.where(is_last, g, 0.0), axis=0)
         decay = tl.math.exp2(tl.where(causal, g[:, None] - g[None, :], float("-inf")))
@@ -425,14 +439,10 @@ def mamba2_chunk_bwd_kernel(
         d_g = inter_dot + tl.where(is_last, state_term, 0.0)
         d_a += tl.cumsum(d_g, axis=0, reverse=True)
         d_v += d_a * decay_rate
-        d_dt = d_v * transform_dt_grad(dt_raw, bias, DT_SOFTPLUS, DT_MIN, DT_MAX, HAS_DT_LIMIT)
-        d_dt = tl.where(mask_t, d_dt, 0.0)
-        tl.store(ddt + token0 * H + head + offs_t * H, d_dt, mask=mask_t)
+        tl.store(ddt + token0 * H + head + offs_t * H, tl.where(mask_t, d_v, 0.0), mask=mask_t)
 
         partial = slot64 * H + head
         tl.store(dA_partial + partial, tl.sum(d_a * dt_chunk, axis=0))
-        if HAS_DT_BIAS:
-            tl.store(ddt_bias_partial + partial, tl.sum(d_dt, axis=0))
         if REDUCE_D_GRAD and not D_PER_CHANNEL:
             tl.store(dD_partial + partial, d_skip)
 
@@ -566,9 +576,8 @@ def mamba2_chunk_bwd(
     }
     shapes = {"H": heads, "G": groups, "P": head_dim, "N": state_dim, "BT": CHUNK_SIZE}
 
-    chunk_states = mamba2_chunk_states(
-        x, dt, A, B, initial_state, dt_bias, cu_seqlens, dt_softplus, dt_min, dt_max
-    )
+    step = transformed_dt(dt, dt_bias, dt_softplus, dt_min, dt_max)
+    chunk_states = mamba2_chunk_states(x, step, A, B, initial_state, cu_seqlens)
     chunk_state_grads = torch.empty_like(chunk_states)
     d_initial_state = (
         x.new_empty(num_states, heads, head_dim, state_dim, dtype=torch.float32)
@@ -582,9 +591,8 @@ def mamba2_chunk_bwd(
         segment_states = x.new_empty(summaries, head_dim, state_dim, dtype=torch.float32)
         segment_decays = x.new_empty(summaries, dtype=torch.float32)
     state_bwd_args = dict(
-        dt=dt,
+        dt=step,
         A=A,
-        dt_bias=dt_bias,
         C=C,
         dy=d_output,
         segment_states=segment_states,
@@ -595,7 +603,6 @@ def mamba2_chunk_bwd(
         IS_VARLEN=is_varlen,
         SEGMENTED=num_segments > 1,
         **shapes,
-        **transform,
     )
 
     def state_grid(meta):
@@ -632,12 +639,10 @@ def mamba2_chunk_bwd(
     dA_partial = x.new_zeros(num_slots, heads, dtype=torch.float32)
     reduce_d_grad = D is not None and dD is None
     dD_partial = x.new_zeros(num_slots, *D.shape, dtype=torch.float32) if reduce_d_grad else None
-    ddt_bias_partial = None if dt_bias is None else torch.zeros_like(dA_partial)
     _mamba2_chunk_bwd[(num_slots, groups * splits)](
         x=x,
-        dt=dt,
+        dt=step,
         A=A,
-        dt_bias=dt_bias,
         B=B,
         C=C,
         D=D,
@@ -650,7 +655,6 @@ def mamba2_chunk_bwd(
         dC_partial=dC_partial,
         dA_partial=dA_partial,
         dD_partial=dD_partial,
-        ddt_bias_partial=ddt_bias_partial,
         cu_seqlens=cu_seqlens,
         T=tokens,
         num_sequences=num_states,
@@ -660,10 +664,22 @@ def mamba2_chunk_bwd(
         REDUCE_D_GRAD=reduce_d_grad,
         IS_VARLEN=is_varlen,
         **shapes,
-        **transform,
     )
     if reduce_d_grad:
         dD = dD_partial.sum(0)
+    if has_dt_transform(dt_bias, dt_softplus, dt_min, dt_max):
+        mamba2_dt_bwd_kernel[(triton.cdiv(dt.numel(), DT_BLOCK),)](
+            ddt,
+            dt,
+            dt_bias,
+            cu_seqlens,
+            dt.numel(),
+            num_states,
+            H=heads,
+            BLOCK=DT_BLOCK,
+            IS_VARLEN=is_varlen,
+            **transform,
+        )
 
     empty = x.new_empty(0)
     return (
@@ -674,7 +690,7 @@ def mamba2_chunk_bwd(
         dC_partial.sum(0).to(C.dtype),
         empty if D is None else dD.to(D.dtype),
         empty if dz is None else dz,
-        empty if dt_bias is None else ddt_bias_partial.sum(0).to(dt_bias.dtype),
+        empty if dt_bias is None else ddt.sum((0, 1)).to(dt_bias.dtype),
         empty if initial_state is None else d_initial_state.to(initial_state.dtype),
     )
 
