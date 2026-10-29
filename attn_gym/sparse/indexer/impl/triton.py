@@ -21,7 +21,7 @@ from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_
 _TILE_SMEM_BUDGET = 192 * 1024
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "S", "WB"])
 def _index_kernel(
     Q,
     K,
@@ -30,12 +30,12 @@ def _index_kernel(
     CuQ,
     CuK,
     num_documents,
-    T: tl.constexpr,
-    S: tl.constexpr,
+    T,
+    S,
     H: tl.constexpr,
     D: tl.constexpr,
     TOPK: tl.constexpr,
-    WB: tl.constexpr,
+    WB,
     WT: tl.constexpr,
     WH: tl.constexpr,
     CAUSAL: tl.constexpr,
@@ -53,6 +53,7 @@ def _index_kernel(
     if WIDE:
         batch = batch.to(tl.int64)
         query = query.to(tl.int64)
+        T = T.to(tl.int64)
     rank = tl.arange(0, KEEP)
     begin = 0
     end = (query + 1) // RATIO if CAUSAL else S

@@ -145,6 +145,25 @@ def test_triton_dynamic_fullgraph(topk):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+def test_triton_reuses_kernel_across_lengths(monkeypatch):
+    """New row lengths launch the kernel compiled for an earlier one instead of compiling again."""
+    import triton
+
+    compiled = []
+
+    def count(**kwargs):
+        if kwargs["fn"].name == "_index_kernel":
+            compiled.append(kwargs["key"])
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_post_compile_hook", count)
+    for tokens in (1023, 1031, 1097):
+        inputs = make_indexer_test_inputs(tokens, 3, 48, torch.bfloat16)
+        lightning_indexer(
+            *inputs, 37, causal=True, impl="fused", kernel_options={"backend": "triton"}
+        )
+    assert len(compiled) <= 1
+
+
 def test_triton_wide_offsets(monkeypatch):
     """Exercise the wide specialization even when all actual offsets fit int32."""
     from attn_gym.sparse.indexer.impl import triton as implementation
