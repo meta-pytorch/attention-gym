@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 import triton
 import triton.language as tl
+from torch import Tensor
 from triton.language.extra import libdevice
 
 # Kernels fold natural-log inputs into the faster exp2 with ``exp(x) == exp2(x * LOG2_E)``.
@@ -103,6 +104,14 @@ def storage_cosize(shape: Sequence[int], strides: Sequence[int]) -> int:
         if size > 0:
             cosize += (size - 1) * stride
     return 0 if is_empty else cosize
+
+
+def score_strides(tensor: Tensor) -> tuple[int, ...]:
+    """Discard unreachable wide singleton strides before Triton casts constexpr literals."""
+    return tuple(
+        0 if size == 1 and stride > 2**31 - 1 else stride
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True)
+    )
 
 
 def requires_int64_offsets(*tensors: torch.Tensor | None) -> bool:

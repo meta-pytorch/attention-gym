@@ -45,7 +45,12 @@ def test_radix_selection(radix_impl, dtype, causal, heads, tokens, topk):
     """Both precisions and masks preserve indices and FP64 selection-regret bounds."""
     q, k, weights = make_indexer_test_inputs(tokens, heads, 128, dtype)
     actual = lightning_indexer(
-        q, k, weights, topk, causal=causal, kernel_options={"backend": "cute"}
+        q,
+        k,
+        weights,
+        topk,
+        causal=causal,
+        kernel_options={"backend": "cute", "selector": "default"},
     )
     assert_indexer_selection(actual, q, k, weights, topk, causal)
 
@@ -56,7 +61,9 @@ def test_radix_selection(radix_impl, dtype, causal, heads, tokens, topk):
 def test_radix_generic_scores(radix_impl, dtype, causal, heads, head_dim):
     """Tiled score generation covers head/reduction tails without shape-sized SMEM."""
     inputs = make_indexer_test_inputs(65, heads, head_dim, dtype)
-    actual = lightning_indexer(*inputs, 16, causal=causal, kernel_options={"backend": "cute"})
+    actual = lightning_indexer(
+        *inputs, 16, causal=causal, kernel_options={"backend": "cute", "selector": "default"}
+    )
     assert_indexer_selection(actual, *inputs, 16, causal)
 
 
@@ -66,7 +73,9 @@ def test_radix_reuses_slab_across_batches(radix_impl, monkeypatch, causal, heads
     """Odd batch tails and a partial final slab never alias other score rows."""
     monkeypatch.setattr(radix_impl, "_MAX_SCORE_PAIRS", 4)
     inputs = make_indexer_test_inputs(17, heads, dim, torch.bfloat16, batch=3)
-    actual = lightning_indexer(*inputs, 7, causal=causal, kernel_options={"backend": "cute"})
+    actual = lightning_indexer(
+        *inputs, 7, causal=causal, kernel_options={"backend": "cute", "selector": "default"}
+    )
     assert_indexer_selection(actual, *inputs, 7, causal)
 
 
@@ -76,14 +85,16 @@ def test_radix_launches_only_active_pairs(radix_impl, monkeypatch, batch, tokens
     monkeypatch.setattr(radix_impl, "_MAX_SCORE_PAIRS", capacity)
     score_kernel, topk_kernel = Mock(), Mock()
     monkeypatch.setattr(radix_impl, "_compile_scores", lambda *args: score_kernel)
-    monkeypatch.setattr(radix_impl, "_compile_topk", lambda *args: topk_kernel)
+    monkeypatch.setattr(radix_impl, "_compile_topk", lambda *args, **kwargs: topk_kernel)
     q, k, weights = make_indexer_test_inputs(tokens, 32, 128, torch.bfloat16, batch=batch)
     inputs = (
         q.transpose(1, 2).contiguous().transpose(1, 2),
         k.transpose(0, 1).contiguous().transpose(0, 1),
         weights.transpose(1, 2).contiguous().transpose(1, 2),
     )
-    lightning_indexer(*inputs, 7, causal=True, kernel_options={"backend": "cute"})
+    lightning_indexer(
+        *inputs, 7, causal=True, kernel_options={"backend": "cute", "selector": "default"}
+    )
     total_pairs = batch * ((tokens + 1) // 2)
     expected = [min(capacity, total_pairs - start) for start in range(0, total_pairs, capacity)]
     assert [call.args[3].shape[0] for call in score_kernel.call_args_list] == expected
@@ -139,9 +150,13 @@ def test_radix_input_alignment(radix_impl, operand, heads, dim, dtype):
     assert inputs[operand].is_contiguous() and inputs[operand].data_ptr() % 16 == 2
     if operand < 2:
         with pytest.raises(ValueError, match="16-byte aligned"):
-            lightning_indexer(*inputs, 16, causal=True, kernel_options={"backend": "cute"})
+            lightning_indexer(
+                *inputs, 16, causal=True, kernel_options={"backend": "cute", "selector": "default"}
+            )
     else:
-        actual = lightning_indexer(*inputs, 16, causal=True, kernel_options={"backend": "cute"})
+        actual = lightning_indexer(
+            *inputs, 16, causal=True, kernel_options={"backend": "cute", "selector": "default"}
+        )
         assert_indexer_selection(actual, *inputs, 16, True)
 
 
@@ -175,7 +190,7 @@ def test_radix_strided_inputs(radix_impl, monkeypatch, layout, heads, dim, dtype
             weights = weights[:, :1, :1].expand_as(weights)
     assert not q.is_contiguous() and not k.is_contiguous() and not weights.is_contiguous()
     actual = lightning_indexer(
-        q, k, weights, 37, causal=causal, kernel_options={"backend": "cute"}
+        q, k, weights, 37, causal=causal, kernel_options={"backend": "cute", "selector": "default"}
     )
     assert_indexer_selection(actual, q, k, weights, 37, causal)
 
@@ -193,7 +208,7 @@ def test_radix_rejects_non_tma_layout(radix_impl, operand, layout):
             (*tensor.shape[:-1], tensor.shape[-1] + 1), device="cuda", dtype=tensor.dtype
         )[..., :-1].copy_(tensor)
     with pytest.raises(ValueError, match="unit last strides and 16-byte aligned"):
-        lightning_indexer(*inputs, 16, kernel_options={"backend": "cute"})
+        lightning_indexer(*inputs, 16, kernel_options={"backend": "cute", "selector": "default"})
 
 
 def _lowest_index_topk(rows: torch.Tensor, topk: int) -> torch.Tensor:
@@ -398,7 +413,9 @@ def test_radix_active_int64_offset(radix_impl):
     k[:, 0, -1], k[:, 1, -1] = -1, 1
     weights[:, :, -1] = 1
     assert q.numel() > 2**31 and requires_int64_abi(q, k, weights)
-    actual = lightning_indexer(q, k, weights, 1, kernel_options={"backend": "cute"})
+    actual = lightning_indexer(
+        q, k, weights, 1, kernel_options={"backend": "cute", "selector": "default"}
+    )
     expected = (signal > 0).to(torch.int32).reshape(batch, tokens, 1)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
