@@ -249,6 +249,39 @@ def test_fused_packed_gradients():
         assert not gradient[:, sum(lengths) :].any()
 
 
+SEGMENT_LENGTH = 256
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_fused_segmented_scans_match_reference(packed, monkeypatch):
+    """Force 256-token scan segments, whose summaries feed later segments in both directions."""
+
+    def plan(num_programs, tokens, device):
+        return math.ceil(tokens / SEGMENT_LENGTH), SEGMENT_LENGTH
+
+    for module in ("chunk_fwd", "chunk_bwd"):
+        monkeypatch.setattr(f"attn_gym.linear.mamba2.triton.{module}.segment_plan", plan)
+    # Packed lengths cover a partial last segment, an exact multiple, a tiny, and an empty one.
+    lengths = [700, 0, 2 * SEGMENT_LENGTH, 1, 300] if packed else None
+    batch, tokens = (1, sum(lengths) + 7) if packed else (2, 900)
+    states = len(lengths) if packed else batch
+    inputs = make_inputs(batch, tokens, 4, 2, 64, 64, dtype=torch.bfloat16)
+    inputs["initial_state"] = random_state(states, 4, 64, 64)
+    kwargs = {"dt_softplus": True, "output_final_state": True}
+    if packed:
+        kwargs["cu_seqlens"] = cumulative_sequence_offsets(lengths)
+    active = sum(lengths) if packed else tokens
+    expected, expected_state = reference(inputs, **kwargs)
+    # Inference gates in place; training keeps the pre-gate output and gates into y.
+    for grad in (False, True):
+        leaves = {name: tensor.detach().requires_grad_(grad) for name, tensor in inputs.items()}
+        with torch.set_grad_enabled(grad):
+            output, state = chunk_mamba2(**leaves, impl="fused", **kwargs)
+        assert_close_to_reference(output[:, :active], expected[:, :active], 1e-2)
+        assert_close_to_reference(state, expected_state, 1e-2)
+    assert_gradients_match_reference(inputs, **kwargs)
+
+
 @pytest.mark.parametrize("packed", [False, True])
 def test_fused_operator_registration(packed):
     inputs = make_inputs(1, 100, 4, 2, 80, 32, dtype=torch.bfloat16)
@@ -268,11 +301,15 @@ def test_fused_operator_registration(packed):
     transform = (True, 0.0, math.inf)
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     for op in (chunk_fwd_op, chunk_fwd_with_state_op):
-        torch.library.opcheck(op, (*args, *transform), test_utils=test_utils)
+        for store_pre_gate in (False, True):
+            torch.library.opcheck(op, (*args, *transform, store_pre_gate), test_utils=test_utils)
+    pre_gate = chunk_fwd_op(*args, *transform, True)[1]
     d_output = torch.randn_like(inputs["x"])
     d_final_state = torch.randn_like(initial_state)
     torch.library.opcheck(
-        chunk_bwd_op, (*args, d_output, d_final_state, *transform), test_utils=test_utils
+        chunk_bwd_op,
+        (*args, pre_gate, d_output, d_final_state, *transform),
+        test_utils=test_utils,
     )
 
 
