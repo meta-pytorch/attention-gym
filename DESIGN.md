@@ -223,6 +223,28 @@ may start as one module and become a package if its implementation becomes too l
 a large Triton backend may evolve from `impl/triton.py` into
 `impl/triton/{forward,backward}.py` without changing the public API.
 
+The linear variants have grown into this shape in practice:
+
+```text
+attn_gym/linear/
+  types.py                 # Impl, KernelOptions, and other public types shared by variants
+  _delta_rule/             # Private semantics shared by GDN and KDA: paged state, decode, the
+                           # recurrent scan, gate transforms, packed references, and the vendored
+                           # cuDNN kernels (cudnn_fe/, maintained per its MAINTENANCE.md)
+  <variant>/
+    api.py                 # Public functions, kernel_options resolution, local dispatch
+    validation.py          # Backend-independent input checks
+    ops.py                 # Torch-only operator schemas, fakes, and autograd wrappers
+    impl/                  # Backend adapters (fused.py, cudnn.py) and, for GDN, the reference
+    fwd/, bwd/             # Kernel packages per DSL (triton/, cute/)
+    stages.py              # Optional staged primitives for context parallelism
+    context_parallel.py
+```
+
+The [`adding-linear-attention-variants`](.agents/skills/adding-linear-attention-variants/SKILL.md)
+skill turns this layout, the API shape below, and the precision contract into a parity checklist
+for a new variant.
+
 ### Module responsibilities
 
 Each operation has one public API layer and a private implementation layer:
@@ -455,6 +477,11 @@ Selection is deterministic and explicit. An unsupported implementation fails cle
 falling back or changing execution form. The initial implementation should use straightforward
 local dispatch rather than a general capability solver.
 
+Within `Impl.FUSED`, `kernel_options={"backend": "fused" | "cudnn", ...}`
+(`attn_gym.linear.types.KernelOptions`) selects among optimized backends and their scheduling
+options. A backend that does not support a requested option raises rather than ignoring it, and the
+option reaches every path it affects (forward, backward, recomputation, staged execution).
+
 ### Variable-length inputs
 
 Variable-length support is part of the intended base contract rather than an optional follow-up.
@@ -473,6 +500,24 @@ unless required.
 Chunked and recurrent operations return ``(output, final_state)``. The state is ``None`` unless
 ``output_final_state=True``. This matches the KDA operations and keeps state-carrying execution
 explicit without introducing a variant-specific result wrapper.
+
+Persistent state is value-major, `[N, H, V, K]`. Inference operations that serve a cache
+(`paged_chunk_*`, `recurrent_*` with `state_indices`, `recurrent_*_decode`) instead read and write
+rows of a caller-owned pool `[num_slots, ...]` in place: `state_indices` selects one slot per
+sequence, a non-positive index produces zero output and leaves the pool untouched, and
+`has_initial_state` marks freshly assigned slots that start from zero. These operations are
+inference-only.
+
+### Precision contract
+
+Inputs of one role (for example Q/K/V) share a dtype. FP16 and BF16 inputs run the recurrence in
+FP32 with FP32 state and return the activation dtype; FP64 inputs keep FP64 in the reference.
+Optimized paths carry the recurrent state and its cotangent between chunks in FP32 with FP32 decay,
+but stage some tensors in the activation dtype because they are tensor-core operands: chunk-entry
+states, state-cotangent tapes, and other MMA inputs. Each variant documents exactly which tensors
+are staged, what that costs in FP16 range, and any input domain where its chunked decomposition
+loses precision. Documented limits are pinned by strict expected-failure tests rather than left
+implicit, and a narrowing that is not part of the contract is a bug.
 
 ### Layers versus functional operators
 
@@ -582,6 +627,19 @@ Every new operation should include the applicable parts of this matrix.
 - Initial and final state behavior.
 - Batch-invariance tests for any advertised guarantee.
 
+### Numerical contract
+
+- An FP64 token-by-token recurrence on the same rounded inputs as the primary oracle; the chunked
+  reference checks the decomposition, not the numbers.
+- A pointwise check paired with an aggregate relative-RMS bound in source-dtype epsilon, with
+  limits set from measured healthy errors (helpers in `attn_gym/testing/`).
+- Cancelling reductions, such as decay and bias gradients, bounded relative to the summed
+  magnitudes of their terms.
+- The output, final state, and every gradient, on model-range inputs and on extreme inputs
+  compared by value.
+- A regression for each numerical fix that fails before it, and strict expected failures for
+  documented limits.
+
 ### Integration
 
 - Public API execution through `torch.compile`, including full-graph capture where supported.
@@ -621,7 +679,8 @@ A PR adding a new attention operation should include:
 1. A short description of the mathematical operation and a paper/model reference.
 2. A public functional API under `attn_gym.linear` or `attn_gym.sparse`.
 3. An eager/reference implementation or a documented reason one is impractical.
-4. Tests covering forward behavior and training gradients when applicable.
+4. Tests covering forward behavior and training gradients when applicable, and the precision
+   contract above for optimized implementations.
 5. A supported-capabilities section in the operation's documentation.
 6. At least one runnable example or model integration.
 7. Backend dependency and hardware requirements.

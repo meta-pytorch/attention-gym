@@ -126,6 +126,9 @@ before changing the covered subsystem:
   registration, fake implementations, autograd, `opcheck`, and `torch.compile` validation.
 - [`cutedsl-tunable-kernel-template`](.agents/skills/cutedsl-tunable-kernel-template/SKILL.md) —
   typed config generation, cached TVM-FFI compilation, parallel compile, and sequential tuning.
+- [`adding-linear-attention-variants`](.agents/skills/adding-linear-attention-variants/SKILL.md) —
+  GDN/KDA parity checklist, landing order, numerical contract, and kernel pitfalls for a new
+  `attn_gym.linear` variant or execution path.
 
 ## Agent Scratch Space
 
