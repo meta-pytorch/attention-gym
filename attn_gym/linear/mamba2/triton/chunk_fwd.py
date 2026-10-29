@@ -8,12 +8,12 @@ it, into its chunk slot (see :func:`chunk_slot_base`), and the final state.
 parallel from those entry states: the masked ``C B^T`` intra-chunk product (shared by a group's
 heads), the entry-state read, and the ``D`` skip. ``mamba2_gate_fwd_kernel`` applies the
 ``silu(z)`` gate elementwise; in the accumulator layout the gate's loads cost more than this
-extra pass. Training keeps the pre-gate output so the backward can form ``dz`` and
-``dy * silu(z)`` elementwise. The backward reruns the scan to recover the entry states.
+extra pass. The pre-gate output stays FP32, so the gated output is rounded once, as when the
+gate reads the accumulator, and FP16 pre-gate values beyond the FP16 range cannot overflow a
+finite gated output. Training keeps it so the backward can form ``dz`` and ``dy * silu(z)``
+elementwise. The backward reruns the scan to recover the entry states.
 
-The entry states are a transient ``[num_chunk_slots, H, P, N]`` tensor in the input dtype. The
-pre-gate output and the backward's gate-free cotangent ``dy * silu(z)`` are stored in the input
-dtype, so a gated output is rounded twice (pre-gate, then gated).
+The entry states are a transient ``[num_chunk_slots, H, P, N]`` tensor in the input dtype.
 
 Paged prefill keeps the single-pass form (``STORE_OUTPUT``), which computes each chunk's output
 inside the walk and so never materializes entry states.
@@ -32,6 +32,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra import libdevice
 
 from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import LOG2_E
@@ -58,7 +59,8 @@ def transform_dt(
     """``clamp(softplus(dt_raw + bias), DT_MIN, DT_MAX)`` with each stage optional."""
     dt = dt_raw + bias
     if DT_SOFTPLUS:
-        dt = tl.where(dt <= 20.0, tl.log(1.0 + tl.exp(dt)), dt)
+        # ``log1p`` keeps small step sizes that ``log(1 + exp(dt))`` rounds to zero below -16.
+        dt = tl.where(dt > 20.0, dt, libdevice.log1p(libdevice.exp(dt)))
     if HAS_DT_LIMIT:
         dt = tl.minimum(tl.maximum(dt, DT_MIN), DT_MAX)
     return dt
@@ -75,6 +77,37 @@ def chunk_slot_base(cu_seqlens, sequence, bos, T, BT: tl.constexpr, IS_VARLEN: t
     if IS_VARLEN:
         return bos // BT + sequence
     return sequence.to(tl.int64) * tl.cdiv(T, BT)
+
+
+@triton.jit
+def scale_by_exp2(value, log2_scale):
+    """``value * 2**log2_scale`` for a decay (``log2_scale <= 0``) without early underflow.
+
+    A decay can underflow FP32 on its own while the decayed value stays representable. For
+    nonpositive scales, up to two split-off factors of at least ``2**-126`` reach every nonzero
+    FP32 product of a finite value; a scale at or above ``-126`` computes exactly what one
+    ``exp2`` and multiply would. Growth factors (positive scales) get no such protection.
+    """
+    first = tl.maximum(log2_scale, -126.0)
+    rest = log2_scale - first
+    second = tl.maximum(rest, -126.0)
+    return value * tl.math.exp2(first) * tl.math.exp2(second) * tl.math.exp2(rest - second)
+
+
+@triton.jit
+def decay_by_exp2(value, log2_scale, steep):
+    """:func:`scale_by_exp2`, splitting the decay only when the program-uniform ``steep`` is set.
+
+    Set ``steep`` when some scale may fall below ``-126``; at or above it one ``exp2`` and
+    multiply give the same result, so ordinary chunks skip the split factors' multiplies. With
+    nonnegative step sizes a chunk's cumulative log2 decay is monotone, so ``g_last < -126``
+    finds every steep chunk; a negative step can hide one, which then decays as one ``exp2``.
+    """
+    if steep:
+        result = scale_by_exp2(value, log2_scale)
+    else:
+        result = value * tl.math.exp2(log2_scale)
+    return result
 
 
 @triton.jit
@@ -186,7 +219,7 @@ def mamba2_chunk_fwd_kernel(
         for previous in range(segment):
             index, ptrs = segment_ptrs(sequence, head, previous, offs_p, offs_n, H, P, N)
             local = tl.load(segment_states + ptrs, mask=mask_p[:, None], other=0.0)
-            state = state * tl.math.exp2(tl.load(segment_decays + index)) + local
+            state = scale_by_exp2(state, tl.load(segment_decays + index)) + local
     total_decay = 0.0
     if STORE_CHUNK_STATES:
         slot_base = chunk_slot_base(cu_seqlens, sequence, bos, T, BT, IS_VARLEN)
@@ -209,6 +242,7 @@ def mamba2_chunk_fwd_kernel(
         g = tl.cumsum(dt_chunk * decay_rate, axis=0)
         g_last = tl.sum(tl.where(offs_t == BT - 1, g, 0.0), axis=0)
         total_decay += g_last
+        steep = g_last < -126.0
 
         if STORE_CHUNK_STATES:
             chunk_slot = slot_base + chunk_start // BT
@@ -224,7 +258,7 @@ def mamba2_chunk_fwd_kernel(
             weights = (scores * decay * dt_chunk[None, :]).to(x_chunk.dtype)
             output = tl.dot(weights, x_chunk)
             entry = tl.dot(c_chunk, tl.trans(state).to(c_chunk.dtype))
-            output += tl.math.exp2(g)[:, None] * entry
+            output += decay_by_exp2(entry, g[:, None], steep)
             if HAS_D:
                 output += x_chunk.to(tl.float32) * skip
             if HAS_Z:
@@ -232,9 +266,16 @@ def mamba2_chunk_fwd_kernel(
                 output *= gate * tl.sigmoid(gate)
             tl.store(y + xp, output.to(y.dtype.element_ty), mask=mask_xp)
 
-        write_scale = dt_chunk * tl.math.exp2(g_last - g)
-        scaled_x = (x_chunk.to(tl.float32) * write_scale[:, None]).to(x_chunk.dtype)
-        state = state * tl.math.exp2(g_last) + tl.dot(tl.trans(scaled_x), b_chunk)
+        if steep:
+            # Decay the write itself: ``dt * exp2(g_L - g)`` alone can underflow (``x * dt``
+            # must fit FP32).
+            scaled_x = x_chunk.to(tl.float32) * dt_chunk[:, None]
+            scaled_x = scale_by_exp2(scaled_x, (g_last - g)[:, None])
+        else:
+            write_scale = dt_chunk * tl.math.exp2(g_last - g)
+            scaled_x = x_chunk.to(tl.float32) * write_scale[:, None]
+        scaled_x = scaled_x.to(x_chunk.dtype)
+        state = scale_by_exp2(state, g_last) + tl.dot(tl.trans(scaled_x), b_chunk)
 
     if SUMMARY:
         index, ptrs = segment_ptrs(sequence, head, segment, offs_p, offs_n, H, P, N)
@@ -337,7 +378,7 @@ def mamba2_chunk_out_kernel(
         g = tl.cumsum(dt_chunk * decay_rate, axis=0)
         decay = tl.math.exp2(tl.where(causal, g[:, None] - g[None, :], float("-inf")))
         weights = (scores * decay * dt_chunk[None, :]).to(c_chunk.dtype)
-        exp_g = tl.math.exp2(g)
+        steep = tl.min(g, axis=0) < -126.0
         state_base = (slot64 * H + head) * (P * N)
         for p_start in range(0, P, BP):
             offs_p = p_start + tl.arange(0, BP)
@@ -348,7 +389,7 @@ def mamba2_chunk_out_kernel(
             state_ptrs = state_base + offs_p[:, None] * N + offs_n[None, :]
             state = tl.load(chunk_states + state_ptrs, mask=mask_p[:, None], other=0.0)
             output = tl.dot(weights, x_chunk)
-            output += exp_g[:, None] * tl.dot(c_chunk, tl.trans(state))
+            output += decay_by_exp2(tl.dot(c_chunk, tl.trans(state)), g[:, None], steep)
             if HAS_D:
                 # A second load lets the residual take the accumulator layout directly.
                 residual = tl.load(x + xp, mask=mask_xp, other=0.0).to(tl.float32)
@@ -610,8 +651,8 @@ def mamba2_chunk_fwd(
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
     """Return the output, the FP32 final state if requested, and the pre-gate output if stored.
 
-    The pre-gate output ``Yc + D X`` is the gate-backward residual; it is stored only with a
-    gate ``z`` and ``store_pre_gate``.
+    The FP32 pre-gate output ``Yc + D X`` is the gate-backward residual; it is returned only
+    with a gate ``z`` and ``store_pre_gate``.
     """
     batch, _, heads, head_dim = x.shape
     state_dim = B.shape[-1]
@@ -627,7 +668,7 @@ def mamba2_chunk_fwd(
         if output_final_state
         else None
     )
-    pre_gate = x.new_empty(x.shape) if store_pre_gate and z is not None else None
+    pre_gate = None if z is None else x.new_empty(x.shape, dtype=torch.float32)
     chunk_states = mamba2_chunk_states(
         x,
         dt,
@@ -645,8 +686,7 @@ def mamba2_chunk_fwd(
     num_slots = chunk_states.shape[0]
     group_heads = heads_per_program(x, groups, num_slots)
     splits = heads // groups // group_heads
-    # With a gate the output kernel writes the pre-gate output, gated in place afterwards
-    # unless training keeps it.
+    # With a gate the output kernel writes the FP32 pre-gate output for the gate kernel.
     _mamba2_chunk_out[(num_slots, groups * splits)](
         x=x,
         dt=dt,
@@ -679,7 +719,7 @@ def mamba2_chunk_fwd(
         mamba2_gate_fwd_kernel[(triton.cdiv(y.numel(), GATE_BLOCK),)](
             y if pre_gate is None else pre_gate, z, y, y.numel(), BLOCK=GATE_BLOCK
         )
-    return y, final_state, pre_gate
+    return y, final_state, pre_gate if store_pre_gate else None
 
 
 def mamba2_paged_chunk_fwd(
@@ -769,6 +809,7 @@ __all__ = [
     "CHUNK_SIZE",
     "GATE_BLOCK",
     "chunk_slot_base",
+    "decay_by_exp2",
     "has_dt_limit",
     "heads_per_program",
     "locate_chunk",
@@ -777,6 +818,7 @@ __all__ = [
     "mamba2_paged_chunk_fwd",
     "num_chunk_slots",
     "prune_p_tiles",
+    "scale_by_exp2",
     "segment_plan",
     "segment_ptrs",
     "transform_dt",

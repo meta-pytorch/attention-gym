@@ -209,7 +209,9 @@ def _chunk_fwd_fake(
 
 
 def _pre_gate_fake(x: torch.Tensor, z: torch.Tensor | None, store: bool) -> torch.Tensor:
-    return x.new_empty(x.shape) if store and z is not None else x.new_empty(0)
+    if store and z is not None:
+        return x.new_empty(x.shape, dtype=torch.float32)
+    return x.new_empty(0)
 
 
 @torch.library.register_fake("attn_gym::mamba2_chunk_fwd_with_state")
