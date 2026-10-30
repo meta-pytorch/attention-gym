@@ -54,6 +54,20 @@ def test_packed_kv_permutation_and_inverse(tokens, candidates, q_offsets, k_offs
         torch.testing.assert_close(result, reference, atol=0, rtol=0)
 
 
+def test_packed_kv_reuses_kernel_across_lengths(triton_compiles):
+    """New token, candidate and document counts reuse the single- or multi-document kernel."""
+    # Triton specializes integers equal to 1 and multiples of 16; cover both and neither.
+    for tokens, documents in ((1, 1), (1024, 16), (1031, 3), (1040, 1)):
+        cu_q = torch.linspace(0, tokens, documents + 1, device="cuda").to(torch.int32)
+        cu_k = cu_q // 3
+        local = torch.randn(1, 1, tokens, 24, device="cuda", requires_grad=True)
+        sparse = torch.randn(1, 1, tokens // 3, 24, device="cuda", requires_grad=True)
+        packed, _, _ = pack_kv(local, sparse, cu_q, cu_k)
+        packed.sum().backward()
+    # Packing and unpacking each build one binary for one document and one for several.
+    assert triton_compiles["_pack_kv_kernel"] == 4
+
+
 def test_packed_kv_replay_changes_document_boundaries():
     torch.manual_seed(22)
     local = torch.randn(1, 1, 7, 16, device="cuda", requires_grad=True)

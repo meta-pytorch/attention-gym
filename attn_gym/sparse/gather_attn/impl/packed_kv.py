@@ -13,7 +13,11 @@ from torch import Tensor
 from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
 
 
-@triton.jit
+# num_documents keeps its == 1 specialization, which folds the document search away.
+@triton.jit(
+    do_not_specialize=["local_tokens", "sparse_tokens"],
+    do_not_specialize_on_alignment=["num_documents"],
+)
 def _pack_kv_kernel(
     Local,
     Sparse,
