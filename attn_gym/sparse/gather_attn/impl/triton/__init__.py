@@ -125,9 +125,10 @@ def gather_attn(
 
     Args:
         query: (batch, heads, seq_len, head_dim) — queries.
-        local_kv: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values;
-            one head is broadcast to every query head and gets a single-head gradient.
-        sparse_kv: (batch, 1 or heads, sparse_seq_len, head_dim) — candidate KV pool.
+        local_kv: (batch, kv_heads, seq_len, head_dim) — local sliding-window keys, also the
+            values when local_v is None.
+        sparse_kv: (batch, kv_heads, sparse_seq_len, head_dim) — candidate key pool, also the
+            values when sparse_v is None.
         kv_indices: (batch, seq_len, topk) — global sparse_kv positions in dense mode,
             document-local positions with packed offsets.
         attention_sink: (heads,) — learned per-head sink weight.
@@ -135,8 +136,9 @@ def gather_attn(
         cu_seqlens_k: (num_documents + 1,) or None — cumulative packed candidate lengths.
         sliding_window_size: size of the causal sliding window.
         scale: Multiplier for query-key logits; does not scale sink logits.
-        local_v: must be None; separate values run on the reference backend.
-        sparse_v: must be None.
+        local_v: values shaped like local_kv, or None. Supplied together with sparse_v.
+        sparse_v: values shaped like sparse_kv, or None. Separate values and
+            1 < kv_heads < heads run forward only on the grouped schedule.
 
     Returns:
         Tuple of (output, lse) where output has same shape as query and lse has
@@ -151,9 +153,17 @@ def gather_attn(
     kv_indices = kv_indices.contiguous()
     attention_sink = attention_sink.contiguous()
 
+    grouped = sparse_v is not None or sparse_kv.shape[1] not in (1, query.shape[1])
     requires_grad = torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (query, local_kv, sparse_kv, attention_sink)
+        tensor is not None and tensor.requires_grad
+        for tensor in (query, local_kv, sparse_kv, local_v, sparse_v, attention_sink)
     )
+    if requires_grad and grouped:
+        # TODO: implement the grouped-schedule backward (separate dK/dV, per-group reduction).
+        raise ValueError(
+            "Triton gather_attn backward does not support separate values or grouped KV heads "
+            "yet; run the forward without gradients or use impl='reference'"
+        )
     if requires_grad:
         return _GatherAttnFunction.apply(
             query,
@@ -180,5 +190,7 @@ def gather_attn(
         share_kv,
         scale,
         False,
+        sparse_v,
+        local_v,
     )
     return output, lse

@@ -10,6 +10,7 @@ from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_in
 
 from .primitives import (
     TileConfig,
+    can_use_grouped_kv_schedule,
     can_use_shared_kv_schedule,
     causal_window_mask,
     load_bhsd,
@@ -178,6 +179,8 @@ def _gather_attn_fwd_shared(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
+    sparse_v_ptr,
+    local_v_ptr,
     kv_indices_ptr,
     cu_seqlens_ptr,
     cu_seqlens_k_ptr,
@@ -187,11 +190,15 @@ def _gather_attn_fwd_shared(
     QUERY_STRIDES,
     SPARSE_KV_STRIDES,
     LOCAL_KV_STRIDES,
+    SPARSE_V_STRIDES,
+    LOCAL_V_STRIDES,
     KV_INDICES_STRIDES,
     num_documents,
     LSE_STRIDES,
     B: tl.constexpr,
     H: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    V_IS_K: tl.constexpr,
     S,
     D: tl.constexpr,
     SPARSE_SEQ_LEN,
@@ -205,12 +212,20 @@ def _gather_attn_fwd_shared(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Process one sequence position across heads to reuse shared KV tiles."""
+    """Process one sequence position across the query heads that share one KV head.
+
+    With KV_HEADS == 1 every query head reads KV head 0. Otherwise the head-block grid axis
+    enumerates (KV head, block of its H // KV_HEADS query heads), so each gathered K/V row is
+    loaded once per group. V_IS_K reuses each key tile as its value tile.
+    """
     S = tl.cast(S, tl.int64 if WIDE else tl.int32)
     SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
     QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
     SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
     LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
+    if not V_IS_K:
+        SPARSE_V_STRIDES = offset_strides(SPARSE_V_STRIDES, WIDE)
+        LOCAL_V_STRIDES = offset_strides(LOCAL_V_STRIDES, WIDE)
     KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
     LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
 
@@ -220,9 +235,18 @@ def _gather_attn_fwd_shared(
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
 
-    offsets_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    if KV_HEADS == 1:
+        kv_head = 0
+        offsets_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+        head_mask = offsets_h < H
+    else:
+        group = H // KV_HEADS
+        blocks_per_group = (group + BLOCK_H - 1) // BLOCK_H
+        kv_head = head_block // blocks_per_group
+        group_offsets = (head_block % blocks_per_group) * BLOCK_H + tl.arange(0, BLOCK_H)
+        offsets_h = kv_head * group + group_offsets
+        head_mask = group_offsets < group
     offsets_d = tl.arange(0, BLOCK_D)
-    head_mask = offsets_h < H
     dimension_mask = offsets_d < D
 
     query = tl.load(
@@ -263,19 +287,32 @@ def _gather_attn_fwd_shared(
                 & (selected_idx < candidate_end - candidate_start)
             )
             selected_idx = tl.where(selected_valid, selected_idx, 0) + candidate_start
+            selected_mask = selected_valid[:, None] & dimension_mask[None, :]
             sparse_values = tl.load(
                 sparse_kv_ptr
                 + ptr_offset(
-                    (batch, 0, selected_idx[:, None], offsets_d[None, :]),
+                    (batch, kv_head, selected_idx[:, None], offsets_d[None, :]),
                     SPARSE_KV_STRIDES,
                 ),
-                mask=selected_valid[:, None] & dimension_mask[None, :],
+                mask=selected_mask,
                 other=0.0,
             )
+            if V_IS_K:
+                sparse_v = sparse_values
+            else:
+                sparse_v = tl.load(
+                    sparse_v_ptr
+                    + ptr_offset(
+                        (batch, kv_head, selected_idx[:, None], offsets_d[None, :]),
+                        SPARSE_V_STRIDES,
+                    ),
+                    mask=selected_mask,
+                    other=0.0,
+                )
             logits = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
             logits = tl.where(head_mask[:, None] & selected_valid[None, :], logits, -float("inf"))
             accumulator, running_max, running_sum = online_softmax_update(
-                accumulator, running_max, running_sum, logits, sparse_values
+                accumulator, running_max, running_sum, logits, sparse_v
             )
 
     offsets_n_base = tl.arange(0, BLOCK_N)
@@ -283,22 +320,35 @@ def _gather_attn_fwd_shared(
     for local_start in tl.range(0, WINDOW, BLOCK_N, num_stages=2):
         offsets_n = first_local_position + local_start + offsets_n_base
         local_valid = (offsets_n >= 0) & (offsets_n <= sequence) & (offsets_n < S)
+        local_mask = local_valid[:, None] & dimension_mask[None, :]
         local_values = tl.load(
             local_kv_ptr
             + ptr_offset(
-                (batch, 0, offsets_n[:, None], offsets_d[None, :]),
+                (batch, kv_head, offsets_n[:, None], offsets_d[None, :]),
                 LOCAL_KV_STRIDES,
             ),
-            mask=local_valid[:, None] & dimension_mask[None, :],
+            mask=local_mask,
             other=0.0,
         )
+        if V_IS_K:
+            local_v = local_values
+        else:
+            local_v = tl.load(
+                local_v_ptr
+                + ptr_offset(
+                    (batch, kv_head, offsets_n[:, None], offsets_d[None, :]),
+                    LOCAL_V_STRIDES,
+                ),
+                mask=local_mask,
+                other=0.0,
+            )
         if HAS_CU_SEQLENS:
             local_valid &= offsets_n >= query_start
 
         logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
         logits = tl.where(head_mask[:, None] & local_valid[None, :], logits, -float("inf"))
         accumulator, running_max, running_sum = online_softmax_update(
-            accumulator, running_max, running_sum, logits, local_values
+            accumulator, running_max, running_sum, logits, local_v
         )
 
     tl.store(
@@ -461,7 +511,9 @@ _FWD_SHARED = TritonTuner(
         for block_n in (64, 128, 256)
         for num_warps in (4, 8)
     ],
-    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    key=tuning_key(
+        "query_ptr", "B", "H", "KV_HEADS", "V_IS_K", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"
+    ),
     prune=prune_shared_forward_configs,
 )
 _FWD_TMA = TritonTuner(
@@ -486,6 +538,41 @@ GENERIC_FORWARD_TILES = (
 )
 
 
+def forward_schedule(
+    query: torch.Tensor,
+    sparse_kv: torch.Tensor,
+    local_kv: torch.Tensor,
+    sparse_v: torch.Tensor | None,
+    local_v: torch.Tensor | None,
+    *,
+    kv_heads: int,
+    sliding_window_size: int,
+) -> str:
+    """Name the forward kernel for these inputs: grouped, shared, tma, or generic.
+
+    Separate values and 1 < kv_heads < heads run only on the grouped schedule; inputs it
+    cannot run raise rather than fall back to a schedule that would ignore them. Every other
+    input keeps the shared/TMA/generic choice it had before grouped support existed.
+    """
+    if sparse_v is not None or kv_heads not in (1, query.shape[1]):
+        kv_tensors = [sparse_kv, local_kv]
+        if sparse_v is not None:
+            kv_tensors += [sparse_v, local_v]
+        if not can_use_grouped_kv_schedule(
+            query, kv_tensors, kv_heads=kv_heads, sliding_window_size=sliding_window_size
+        ):
+            raise ValueError(
+                "Triton gather_attn supports separate values and grouped KV heads only on "
+                "SM100 or newer with bfloat16 inputs, head_dim <= 256 divisible by 16, unit "
+                "inner strides, at most 128 query heads per KV head, and "
+                "sliding_window_size <= 2048; use impl='reference'"
+            )
+        return "grouped"
+    if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size):
+        return "shared"
+    return "tma" if can_use_tma(query) and can_use_tma(local_kv) else "generic"
+
+
 def _launch_forward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -496,8 +583,15 @@ def _launch_forward(
     cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     scale: float,
+    *,
+    kv_heads: int,
+    sparse_v: torch.Tensor | None,
+    local_v: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch forward with query, indices, and sink made contiguous by the opaque op."""
+    """Launch forward with query, indices, and sink made contiguous by the opaque op.
+
+    ``kv_heads`` is the KV head count before the op broadcasts a single shared head.
+    """
     batch, heads, seq_len, head_dim = query.shape
     topk = kv_indices.shape[-1]
     sparse_seq_len = sparse_kv.shape[2]
@@ -507,11 +601,76 @@ def _launch_forward(
     has_cu_seqlens = cu_seqlens is not None
     num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
     wide = requires_int64_offsets(
-        query, sparse_kv, local_kv, kv_indices, output, lse, cu_seqlens, cu_seqlens_k
+        query,
+        sparse_kv,
+        local_kv,
+        sparse_v,
+        local_v,
+        kv_indices,
+        output,
+        lse,
+        cu_seqlens,
+        cu_seqlens_k,
+    )
+    schedule = forward_schedule(
+        query,
+        sparse_kv,
+        local_kv,
+        sparse_v,
+        local_v,
+        kv_heads=kv_heads,
+        sliding_window_size=sliding_window_size,
     )
 
+    if schedule == "grouped":
+        group = heads // kv_heads
+        # tl.dot needs at least 16 rows; partial head tiles are masked. The D cap matches the
+        # shared schedule's head tile for wide heads.
+        block_h = max(16, min(32 if head_dim > 128 else 128, triton.next_power_of_2(group)))
+        block_k = max(16, min(64, triton.next_power_of_2(topk)))
+        v_is_k = sparse_v is None
+        sparse_v = sparse_kv if v_is_k else sparse_v
+        local_v = local_kv if v_is_k else local_v
+        _FWD_SHARED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
+            query,
+            sparse_kv,
+            local_kv,
+            sparse_v,
+            local_v,
+            kv_indices,
+            cu_seqlens,
+            cu_seqlens_k,
+            attention_sink,
+            output,
+            lse,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            LOCAL_KV_STRIDES=local_kv.stride(),
+            SPARSE_V_STRIDES=sparse_v.stride(),
+            LOCAL_V_STRIDES=local_v.stride(),
+            KV_INDICES_STRIDES=kv_indices.stride(),
+            num_documents=num_documents,
+            LSE_STRIDES=lse.stride(),
+            B=batch,
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            TOPK=topk,
+            WINDOW=sliding_window_size,
+            SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            WIDE=wide,
+            BLOCK_H=block_h,
+            BLOCK_K=block_k,
+            BLOCK_D=block_d,
+        )
+        return output, lse
+
     # This head-major schedule is tuned for shared KV on Blackwell.
-    if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size):
+    if schedule == "shared":
         # A smaller head tile keeps D=512 accumulators within Blackwell's resources.
         block_h = (
             triton.next_power_of_2(heads)
@@ -523,6 +682,8 @@ def _launch_forward(
             query,
             sparse_kv,
             local_kv,
+            sparse_kv,
+            local_kv,
             kv_indices,
             cu_seqlens,
             cu_seqlens_k,
@@ -532,11 +693,15 @@ def _launch_forward(
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             LOCAL_KV_STRIDES=local_kv.stride(),
+            SPARSE_V_STRIDES=sparse_kv.stride(),
+            LOCAL_V_STRIDES=local_kv.stride(),
             KV_INDICES_STRIDES=kv_indices.stride(),
             num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
             B=batch,
             H=heads,
+            KV_HEADS=1,
+            V_IS_K=True,
             S=seq_len,
             D=head_dim,
             SPARSE_SEQ_LEN=sparse_seq_len,
@@ -561,7 +726,7 @@ def _launch_forward(
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
     grid = (triton.cdiv(seq_len, block_m), batch * heads)
-    if can_use_tma(query) and can_use_tma(local_kv):
+    if schedule == "tma":
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
         local_desc = TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])

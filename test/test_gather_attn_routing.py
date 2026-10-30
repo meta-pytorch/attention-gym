@@ -223,3 +223,26 @@ def test_probe_old_fa4_head_limit(monkeypatch):
     monkeypatch.setitem(sys.modules, "flash_attn.cute.pack_gqa", None)
     assert cute._fa4_available(False)
     assert not cute._fa4_available(False, padded_heads=True)
+
+
+@pytest.mark.parametrize("case", ["separate_values", "grouped_heads"])
+def test_grouped_inputs_route_to_triton(
+    cuda_inputs, fa4_available, triton_backend, monkeypatch, case
+):
+    """Inputs CuTe would otherwise take skip it once values are separate or heads grouped."""
+    cute_launch = Mock()
+    monkeypatch.setattr(cute, "gather_attn", cute_launch)
+    if case == "separate_values":
+        cuda_inputs["local_v"] = torch.empty_like(cuda_inputs["local_kv"])
+        cuda_inputs["sparse_v"] = torch.empty_like(cuda_inputs["sparse_kv"])
+    else:
+        cuda_inputs["local_kv"] = cuda_inputs["local_kv"].expand(-1, 2, -1, -1)
+        cuda_inputs["sparse_kv"] = cuda_inputs["sparse_kv"].expand(-1, 2, -1, -1)
+    query = cuda_inputs["query"]
+    triton_backend.gather_attn.return_value = (query, None)
+    assert gather_attn(**cuda_inputs) is query
+    cute_launch.assert_not_called()
+    fa4_available.assert_not_called()
+    call = triton_backend.gather_attn.call_args
+    assert call.kwargs["sparse_v"] is cuda_inputs.get("sparse_v")
+    assert call.kwargs["local_v"] is cuda_inputs.get("local_v")
