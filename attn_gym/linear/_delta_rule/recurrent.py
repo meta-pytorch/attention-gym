@@ -39,6 +39,11 @@ from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 configure_triton_allocator()
 
 
+# Autotune winners at a fixed sequence count were stable from 64 tokens per sequence upward
+# (GB200, H=16, K=V=128) and differed only among shorter scans.
+_TOKENS_BUCKET_LIMIT = 64
+
+
 class GateKind(Enum):
     """Gate layout consumed by the scan."""
 
@@ -92,7 +97,7 @@ def _load_token(
     return b_q, b_k, b_g, b_beta, b_v
 
 
-@triton.jit(do_not_specialize=["N"])
+@triton.jit(do_not_specialize=["T", "N", "tokens_bucket"])
 def _recurrent_delta_rule_fwd_kernel(
     q,
     k,
@@ -108,6 +113,7 @@ def _recurrent_delta_rule_fwd_kernel(
     scale,
     T,
     N,
+    tokens_bucket,
     state_batch_stride: tl.constexpr,
     H: tl.constexpr,
     HK: tl.constexpr,
@@ -227,8 +233,11 @@ recurrent_delta_rule_fwd_kernel = triton.autotune(
         for block_v in (32, 16, 8, 4, 2)
         for num_warps in (1, 2, 4)
     ],
+    # The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
+    # ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; ``tokens_bucket`` collapses the exact
+    # token count to that information so new lengths do not re-benchmark.
     key=[
-        "T",
+        "tokens_bucket",
         "N",
         "H",
         "HK",
@@ -330,6 +339,7 @@ def launch_recurrent_delta_rule_fwd(
 
     sequence_heads = num_sequences * heads
     average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
+    tokens_bucket = min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT)
     # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
     # Prefetch was slower for K > 128.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
@@ -388,6 +398,7 @@ def launch_recurrent_delta_rule_fwd(
         scale=scale,
         T=tokens,
         N=num_sequences,
+        tokens_bucket=tokens_bucket,
         state_batch_stride=state_batch_stride,
         H=heads,
         HK=key_heads,

@@ -224,3 +224,30 @@ def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim)
 
     torch.testing.assert_close(output, expected[0], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(final_state, expected[1], rtol=1e-5, atol=1e-5)
+
+
+def test_recurrent_reuses_kernel_across_token_counts(triton_compiles):
+    """Aligned and unaligned token counts launch the scan compiled for the first one."""
+    # Single-token scans select a different prefetch policy, so they are not part of this set.
+    for tokens in (37, 16, 48):
+        inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
+        recurrent_gdn(*inputs[:5], autotune=False)
+    torch.cuda.synchronize()
+    assert triton_compiles["_recurrent_delta_rule_fwd_kernel"] == 1
+
+
+def test_recurrent_reuses_tuning_across_token_counts(monkeypatch):
+    """Scans of 64 or more tokens at one sequence count share one autotuning result, which a
+    single-token scan does not reuse."""
+    from attn_gym.linear._delta_rule import recurrent as recurrent_module
+
+    tuner = recurrent_module.recurrent_delta_rule_fwd_kernel
+    monkeypatch.setattr(tuner, "cache", {})
+    for tokens in (64, 91, 160):
+        inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
+        recurrent_gdn(*inputs[:5], autotune=True)
+    torch.cuda.synchronize()
+    assert len(tuner.cache) == 1
+    inputs = _make_inputs(tokens=1, dtype=torch.bfloat16, initial_state=False)
+    recurrent_gdn(*inputs[:5], autotune=True)
+    assert len(tuner.cache) == 2
