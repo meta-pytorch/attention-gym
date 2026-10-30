@@ -5,7 +5,8 @@ Delegates to FlashAttention-4's absorbed MLA path (``qv``): FA4 sums
 latent rows as values, which is the 576-wide latent dot product split into its rope and
 latent parts. FA4 owns compilation caching, split-KV, and the paged gather.
 
-This backend is eager-only.
+The kernel runs behind the ``attn_gym::paged_mla_decode_fwd`` operator, so the call
+compiles with ``torch.compile(fullgraph=True)``.
 
 Constraints
 -----------
@@ -41,7 +42,15 @@ def _constraint_violation(q_latent: torch.Tensor, q_rope: torch.Tensor) -> Excep
     return None
 
 
-def paged_mla_decode(
+torch.library.define(
+    "attn_gym::paged_mla_decode_fwd",
+    "(Tensor q_latent, Tensor q_rope, Tensor latent_cache, Tensor rope_cache, "
+    "Tensor block_table, Tensor cu_seqlens_q, Tensor seqused_k, int max_seqlen_q, "
+    "float scale) -> (Tensor, Tensor)",
+)
+
+
+def _paged_mla_decode_fwd_cuda(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
     latent_cache: torch.Tensor,
@@ -49,19 +58,13 @@ def paged_mla_decode(
     block_table: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     seqused_k: torch.Tensor,
-    *,
     max_seqlen_q: int,
     scale: float,
-    return_lse: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run FA4's absorbed MLA forward over the paged latent cache."""
-    if (error := _constraint_violation(q_latent, q_rope)) is not None:
-        raise error
-    from flash_attn.cute.interface import flash_attn_varlen_func
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from flash_attn.cute.interface import _flash_attn_fwd
 
-    # TODO: call FA4's inner forward instead of the public wrapper so kernel configs can be
-    # specified and autotuned, then register a custom op so this works under torch.compile.
-    return flash_attn_varlen_func(
+    # TODO: expose FA4's MLA kernel choice (1CTA/2CTA, split count) per call and autotune it.
+    out, lse = _flash_attn_fwd(
         q_rope,
         rope_cache.unsqueeze(2),
         latent_cache.unsqueeze(2),
@@ -74,5 +77,57 @@ def paged_mla_decode(
         causal=True,
         pack_gqa=True,
         num_splits=0,
-        return_lse=return_lse,
+        return_lse=True,
+    )[:2]
+    return out, lse
+
+
+torch.library.impl("attn_gym::paged_mla_decode_fwd", "CUDA", _paged_mla_decode_fwd_cuda)
+
+
+@torch.library.register_fake("attn_gym::paged_mla_decode_fwd")
+def _paged_mla_decode_fwd_fake(
+    q_latent: torch.Tensor,
+    q_rope: torch.Tensor,
+    latent_cache: torch.Tensor,
+    rope_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    max_seqlen_q: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return q_latent.new_empty(q_latent.shape), q_latent.new_empty(
+        q_latent.shape[:2], dtype=torch.float32
+    )
+
+
+_paged_mla_decode_fwd = torch.ops.attn_gym.paged_mla_decode_fwd.default
+
+
+def paged_mla_decode(
+    q_latent: torch.Tensor,
+    q_rope: torch.Tensor,
+    latent_cache: torch.Tensor,
+    rope_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    *,
+    max_seqlen_q: int,
+    scale: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run FA4's absorbed MLA forward over the paged latent cache; LSE is ``[tokens, heads]``."""
+    if (error := _constraint_violation(q_latent, q_rope)) is not None:
+        raise error
+    return _paged_mla_decode_fwd(
+        q_latent,
+        q_rope,
+        latent_cache,
+        rope_cache,
+        block_table,
+        cu_seqlens_q,
+        seqused_k,
+        max_seqlen_q,
+        scale,
     )

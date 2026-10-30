@@ -208,8 +208,9 @@ def paged_mla_decode(
         scale: Positive multiplier for the logits. There is no default: the right value
             is the model's ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`` (times any
             rope scaling correction), not ``1 / sqrt(latent_dim + rope_dim)``.
-        impl: ``Impl.FUSED`` (default) runs FlashAttention-4's absorbed MLA kernel
-            (eager-only); ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
+        impl: ``Impl.FUSED`` (default) runs FlashAttention-4's absorbed MLA kernel through a
+            registered operator that works under ``torch.compile``; ``Impl.REFERENCE`` runs
+            eager PyTorch on CPU or CUDA.
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return ``(output, PagedMLADecodeAux)`` with the requested outputs.
 
@@ -259,7 +260,6 @@ def paged_mla_decode(
                 seqused_k,
                 max_seqlen_q=max_seqlen_q,
                 scale=scale,
-                return_lse=return_lse,
             )
 
     if return_aux is None:

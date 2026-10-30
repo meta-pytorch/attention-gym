@@ -197,3 +197,64 @@ def test_fused_matches_reference(num_heads, block_size):
     assert_matches_low_precision_reference(out, high_out, low_out, "out")
     assert_rms_matches_low_precision_reference(out, high_out, low_out, "out")
     torch.testing.assert_close(lse, high_aux.lse, atol=1e-4, rtol=0)
+
+
+OPCHECK_UTILITIES = (
+    "test_schema",
+    "test_autograd_registration",
+    "test_faketensor",
+    "test_aot_dispatch_dynamic",
+)
+
+
+def _decode_inputs(num_heads=16, block_size=64):
+    query_lengths, key_lengths = [1, 3, 1, 2], [40, 300, 1, 129]
+    inputs = _make_inputs(
+        query_lengths,
+        key_lengths,
+        num_heads=num_heads,
+        latent_dim=512,
+        rope_dim=64,
+        block_size=block_size,
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    return inputs, max(query_lengths)
+
+
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="FA4 absorbed MLA requires SM100 or SM103")
+@pytest.mark.parametrize("layout", ["cache_views", "compact", "head_major"])
+def test_fused_operator_registration(layout):
+    """The registered operator's schema, fake, and dynamic AOT dispatch match the kernel."""
+    pytest.importorskip("flash_attn.cute")
+    inputs, max_seqlen_q = _decode_inputs()
+    if layout != "cache_views":
+        for name in ("q_latent", "q_rope", "latent_cache", "rope_cache"):
+            compact = inputs[name].contiguous()
+            inputs[name] = (
+                compact.transpose(0, 1).contiguous().transpose(0, 1)
+                if layout == "head_major"
+                else compact
+            )
+    torch.library.opcheck(
+        torch.ops.attn_gym.paged_mla_decode_fwd.default,
+        (*inputs.values(), max_seqlen_q, 1 / math.sqrt(192)),
+        test_utils=OPCHECK_UTILITIES,
+    )
+
+
+@pytest.mark.skipif(not CUTE_CAPABLE, reason="FA4 absorbed MLA requires SM100 or SM103")
+def test_fused_compiles_fullgraph():
+    pytest.importorskip("flash_attn.cute")
+    inputs, max_seqlen_q = _decode_inputs()
+    call = {
+        "max_seqlen_q": max_seqlen_q,
+        "scale": 1 / math.sqrt(192),
+        "return_aux": AuxRequest(lse=True),
+    }
+    torch._dynamo.reset()
+    compiled = torch.compile(paged_mla_decode, fullgraph=True)
+    out, aux = compiled(**inputs, **call)
+    expected_out, expected_aux = paged_mla_decode(**inputs, **call)
+    assert torch.equal(out, expected_out)
+    assert torch.equal(aux.lse, expected_aux.lse)
