@@ -337,6 +337,27 @@ def test_native_summary_launches_no_driver_plans(monkeypatch) -> None:
     assert len(tables) == 5
 
 
+def test_native_summary_selection_reuses_triton_glue_across_counts(triton_compiles) -> None:
+    """New sequence and bound-row counts within one power-of-two bucket reuse the compiled
+    selector and gather instead of compiling again; the maps stay exact."""
+    # 12 and 16 sequences share the 16-wide bucket but differ in the %16 class Triton would
+    # otherwise specialize on; the bound-row counts 9 and 16 do the same for the selector.
+    cases = []
+    for sequences in (12, 16):
+        inputs, cu = _packed_inputs([3 + (i % 5) for i in range(sequences)])
+        cases.append((inputs, cu, build_cudnn_state_summaries(*inputs[1:], cu)))
+    triton_compiles.clear()
+    for inputs, cu, full in cases:
+        sequences = cu.shape[0] - 1
+        for rows in (9, 16):
+            indices = [i % sequences for i in range(rows)]
+            bounds = _bounds([[cu[i].item(), cu[i + 1].item()] for i in indices])
+            selected = build_cudnn_state_summaries(*inputs[1:], cu, bounds=bounds)
+            _assert_bitwise_equal(selected, full[indices])
+    assert triton_compiles["_select_summary_work"] == 1, triton_compiles
+    assert triton_compiles["_gather_summary_rows"] == 1, triton_compiles
+
+
 def test_native_summary_all_empty_or_unmatched_bounds() -> None:
     """Rows never touching a launch still follow the identity/NaN contract, also under replay."""
     inputs, cu = _packed_inputs(LENGTHS)
