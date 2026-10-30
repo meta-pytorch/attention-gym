@@ -190,7 +190,6 @@ def _gather_attn_fwd_shared(
     KV_INDICES_STRIDES,
     num_documents,
     LSE_STRIDES,
-    B: tl.constexpr,
     H: tl.constexpr,
     S,
     D: tl.constexpr,
@@ -461,7 +460,7 @@ _FWD_SHARED = TritonTuner(
         for block_n in (64, 128, 256)
         for num_warps in (4, 8)
     ],
-    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    key=tuning_key("query_ptr", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
     prune=prune_shared_forward_configs,
 )
 _FWD_TMA = TritonTuner(
@@ -535,7 +534,6 @@ def _launch_forward(
             KV_INDICES_STRIDES=kv_indices.stride(),
             num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
-            B=batch,
             H=heads,
             S=seq_len,
             D=head_dim,

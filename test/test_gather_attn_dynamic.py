@@ -1,5 +1,7 @@
 """Dynamic graph and kernel-reuse contracts for Triton gather attention."""
 
+from collections import Counter
+
 import pytest
 import torch
 
@@ -236,3 +238,46 @@ def test_sequence_lengths_reuse_triton_kernels(heads, dim, dtype, share_kv, dete
                 assert keys == first_keys, "Sequence length changed the Triton compilation keys"
     finally:
         torch.use_deterministic_algorithms(previous)
+
+
+def test_batch_sizes_reuse_shared_schedule(
+    monkeypatch, tmp_path, triton_compiles, gather_attn_single_config
+):
+    """New batch sizes launch the shared-KV kernels and tuned configs of an earlier one."""
+    _cuda()
+    if torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("The shared-KV schedule requires Blackwell")
+    import importlib
+
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    # Start without in-process or on-disk winners so every tuning decision is observed.
+    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    tuned = Counter()
+    tune = tune_module.tune
+
+    def count_tuning(configs, compile_fn, *args, **kwargs):
+        tuned[compile_fn().__name__] += 1
+        return tune(configs, compile_fn, *args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", count_tuning)
+    heads, tokens, dim = 16, 32, 32
+    for batch in (1, 2, 3):
+        q = torch.randn(batch, heads, tokens, dim, device="cuda", dtype=torch.bfloat16)
+        local = torch.randn(batch, 1, tokens, dim, device="cuda", dtype=torch.bfloat16)
+        sparse = torch.randn(batch, 1, 16, dim, device="cuda", dtype=torch.bfloat16)
+        sink = torch.zeros(heads, device="cuda")
+        indices = torch.tensor([0, 1, -1], device="cuda", dtype=torch.int32)
+        tensors = tuple(t.requires_grad_() for t in (q, local, sparse, sink))
+        out = gather_attn(
+            *tensors[:3],
+            indices.repeat(batch, tokens, 1),
+            tensors[3],
+            sliding_window_size=7,
+            kernel_options={"backend": "triton"},
+        )
+        torch.autograd.grad(out.sum(), tensors)
+    assert "_gather_attn_fwd_shared" in tuned
+    assert {name: count for name, count in tuned.items() if count > 1} == {}
+    assert {name: count for name, count in triton_compiles.items() if count > 1} == {}
