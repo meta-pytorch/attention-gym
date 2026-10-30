@@ -275,6 +275,12 @@ call `tune(...)` directly, restore all inputs and outputs after it returns, then
 through the ordinary explicit-config path. A benchmark callback that restores only between samples is
 insufficient because it cannot prepare state for the final launch.
 
+Winners are memoized by `tuning_key`, so a key that holds an exact varlen size (token count, chunk
+capacity, document count) re-benchmarks every candidate on nearly every training step. Key on a
+bucket of the quantity that changes the candidate set or the winner, such as
+`min(pow2_ceil(capacity), 2 * sm_count)` or work waves per SM, and check that the bucket winner
+stays within noise of exact-size tuning across the bucket.
+
 A fully warm run must not start the compiler process. It still benchmarks requested candidates unless a separate baked selector chooses one without tuning.
 
 ## `torch.compile` Boundary

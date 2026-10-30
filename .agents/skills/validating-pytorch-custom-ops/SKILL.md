@@ -490,6 +490,28 @@ for sequence_length in (127, 193):
 Use `TORCH_LOGS="recompiles"` to verify dimensions advertised as dynamic are reused rather than
 silently specialized.
 
+Dynamo reuse does not cover the kernels behind the operator boundary. A Triton constexpr, a
+default-specialized int, an exact-size autotune key, or a CuTeDSL `jit_cache` argument can still
+compile or re-benchmark for each new length. Follow the AGENTS.md "Kernel Specialization for
+Dynamic Shapes" rules and assert kernel-level reuse across the specialization classes:
+
+```python
+def test_new_lengths_reuse_compiled_kernel(monkeypatch):
+    compiled = []
+
+    def count(**kwargs):
+        if kwargs["fn"].name == "_my_kernel":
+            compiled.append(kwargs["key"])
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_post_compile_hook", count)
+    for tokens in (1, 1023, 1024, 1097):  # == 1, other, multiple of 16
+        operation(*make_inputs(tokens))
+    assert len(compiled) <= 1
+```
+
+For CuTeDSL compile functions assert `compile_fn.cache_info().currsize`; for tunables assert that
+the winner cache gains no entry for a new size inside the same tuning bucket.
+
 ### CUDA Graphs
 
 When CUDA Graph support is claimed:

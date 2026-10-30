@@ -51,10 +51,12 @@ def ptr_offset(indices, strides):
     Only the tuple arity must be static; stride values may be runtime scalars
     (e.g. a strided token dimension), and compile-time values still fold.
 
-    Repo convention is to pass stride tuples as ``tl.constexpr``: one JIT per distinct stride
-    set (i.e. per new sequence length for a contiguous tensor) in exchange for folded address
-    math. Runtime strides measured 8-20% slower on the instruction-bound softplus gate kernel
-    (GB200, 128M elements); prefer them only when a kernel is launch-bound and sees many shapes.
+    Pass strides fixed by the model (head and feature strides) as ``tl.constexpr`` so the
+    address math folds. A stride that scales with sequence length, such as a contiguous tensor's
+    batch stride, compiles one JIT per new length: pass it at runtime with ``do_not_specialize``,
+    or zero it when that axis has size one. Runtime inner strides measured 8-20% slower on the
+    instruction-bound softplus gate kernel (GB200, 128M elements), so measure before making a hot
+    inner stride dynamic.
     """
     tl.static_assert(len(indices) == len(strides), "indices and strides must have equal length")
     offset = 0
