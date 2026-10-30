@@ -7,18 +7,7 @@ import torch
 from torch import Tensor
 
 from attn_gym._cu_seqlens import validate_cu_seqlens_pair
-from attn_gym.types import Impl, resolve_impl
-
-
-@dataclass(frozen=True, slots=True)
-class AuxRequest:
-    """Specifies which auxiliary outputs to return from gather_attn.
-
-    Attributes:
-        lse: If True, include the log-sum-exp tensor in the returned auxiliary data.
-    """
-
-    lse: bool = False
+from attn_gym.types import AuxRequest, Impl, resolve_impl
 
 
 @dataclass(frozen=True, slots=True)
