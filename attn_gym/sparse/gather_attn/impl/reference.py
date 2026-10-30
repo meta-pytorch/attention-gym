@@ -56,8 +56,14 @@ def gather_attn(
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
+    local_v: Tensor | None = None,
+    sparse_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Gather actual slots, masking before dots so invalid NaNs cannot propagate."""
+    """Gather actual slots, masking before dots so invalid NaNs cannot propagate.
+
+    Query head h reads KV head h // (heads // kv_heads). ``local_v``/``sparse_v`` supply
+    separate values for the same slots; without them the keys are also the values.
+    """
     batch, heads, tokens, dim = query.shape
     positions = torch.arange(tokens, device=query.device)
     window = min(sliding_window_size, tokens)
@@ -118,6 +124,7 @@ def gather_attn(
         .reshape(batch, kv_heads, heads // kv_heads, tokens, indices.shape[-1])
         .permute(0, 1, 3, 2, 4)
     )
-    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), slots)
+    values = slots if sparse_v is None else gather_slots(local_v, sparse_v)
+    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), values)
     output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, dim)
     return output.to(query.dtype), lse
