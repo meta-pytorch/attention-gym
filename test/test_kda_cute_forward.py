@@ -1770,6 +1770,63 @@ def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
     )
 
 
+@pytest.mark.parametrize(
+    "mode,shapes",
+    [
+        # (batch, tokens per request, request count): one of each integer specialization
+        # class (1, a multiple of 16, other) after the warm-up shape.
+        pytest.param("decode", [(3, 1, 3), (1, 1, 1), (16, 1, 16), (5, 1, 5)], id="decode"),
+        # Packed prefill: new total lengths, including a multiple of 16, and a different
+        # request count within the same power-of-two search bucket.
+        pytest.param(
+            "prefill", [(1, 37, 3), (1, 80, 3), (1, 17, 4), (1, 3, 3)], id="packed-prefill"
+        ),
+        # Dense prefill: the batch stride of the input grows with the token count.
+        pytest.param("prefill", [(2, 40, 2), (2, 72, 2), (2, 17, 2)], id="dense-prefill"),
+    ],
+)
+def test_paged_chunk_kda_replay_shapes_reuse_compiled_kernels(
+    mode: str, shapes: list[tuple[int, int, int]], triton_compiles
+):
+    """New batch sizes and prefill lengths reuse the compiled replay-cache kernels."""
+    from triton.runtime.jit import KernelInterface
+
+    from attn_gym.linear.kda.fwd.triton import paged_replay
+
+    replay_kernels = {
+        name for name, value in vars(paged_replay).items() if isinstance(value, KernelInterface)
+    }
+    num_slots = 1 + max(requests for _, _, requests in shapes)
+    state_cache = torch.zeros(num_slots, 2, 128, 128, device="cuda")
+    replay_state = ReplayState(
+        torch.zeros(num_slots, 64, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(num_slots, 64, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(num_slots, 64, 2, 128, device="cuda", dtype=torch.bfloat16),
+        torch.zeros(num_slots, 64, 2, 128, device="cuda"),
+        torch.zeros(num_slots, 64, 2, device="cuda"),
+        torch.zeros(num_slots, device="cuda", dtype=torch.int32),
+    )
+    for index, (batch, tokens, requests) in enumerate(shapes):
+        torch.manual_seed(index)
+        inputs = tuple(tensor.detach() for tensor in _inputs(batch=batch, tokens=tokens, heads=2))
+        cu_seqlens = None
+        if mode == "prefill" and batch == 1:
+            cu_seqlens = torch.linspace(0, tokens, requests + 1, device="cuda").round().int()
+        if index == 1:
+            triton_compiles.clear()
+        paged_chunk_kda(
+            *inputs,
+            state_cache,
+            torch.arange(1, requests + 1, device="cuda", dtype=torch.int32),
+            cu_seqlens=cu_seqlens,
+            autotune=False,
+            kernel_options={"schedule": "static"},
+            replay_state=replay_state,
+        )
+    assert replay_kernels
+    assert {name: triton_compiles[name] for name in replay_kernels & triton_compiles.keys()} == {}
+
+
 def test_paged_chunk_kda_replay_custom_op_registration():
     """Validate mutation schemas and fake metadata for replay cache operations."""
     q, k, v, gate, beta = (tensor.detach() for tensor in _inputs(batch=2, tokens=1, heads=2))
