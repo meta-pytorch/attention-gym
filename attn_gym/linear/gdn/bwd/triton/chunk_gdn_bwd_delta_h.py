@@ -135,8 +135,9 @@ def chunk_gdn_bwd_dv_local_kernel(
         triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
         triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=2),
     ],
+    # The value tile only flips with grid fill (``num_sequences * H`` programs against the SM
+    # count), not with the token count (measured), so ``T`` stays out of the key.
     key=[
-        "T",
         "num_sequences",
         "H",
         "HK",

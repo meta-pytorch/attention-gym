@@ -62,7 +62,7 @@ def _load_last_gate(gate, valid_tokens, stride, BT: tl.constexpr):
         triton.Config({"BV": 64}, num_warps=4, num_stages=2),
         triton.Config({"BV": 64}, num_warps=8, num_stages=2),
     ],
-    key=["T", "H", "HK", "K", "V", "IS_VARLEN"],
+    key=["H", "HK", "K", "V", "IS_VARLEN"],
     prune_configs_by={
         "early_config_prune": lambda configs, _named_args, V, **_: [
             config for config in configs if config.kwargs["BV"] <= V
