@@ -4,7 +4,14 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Active-slot cache movement for streaming paged chunk KDA."""
+"""Active-slot cache movement for streaming paged chunk KDA.
+
+Request counts, batch sizes, and token counts reach the kernels as runtime arguments so
+serving traffic does not recompile them. Element-count bounds keep Triton's default
+integer specialization: the ``% 16`` divisibility hint keeps the bound mask aligned so
+loads and stores stay vectorized (dropping it measured 1.3-1.5x slower), and the counts
+carry a factor of the 64-token window or of the head dimension, so they stay in one class.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +21,8 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 
+# Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as
+# compile-time constants even in runtime argument slots; cast such sizes with ``int()``.
 _CHUNK_SIZE = tl.constexpr(64)
 
 
@@ -64,6 +73,11 @@ def _tensors_overlap(left: torch.Tensor, right: torch.Tensor) -> bool:
     return torch._C._overlaps(left, right) and not _packed_rows_are_disjoint(left, right)
 
 
+def _token_strides(tensor: torch.Tensor) -> tuple[int, ...]:
+    """Return ``(batch, token, head, dim)`` strides, treating a 3-D tensor as ``dim == 1``."""
+    return tensor.stride() if tensor.ndim == 4 else (*tensor.stride(), 0)
+
+
 def _validate_replay_aliases(
     replay_tensors: tuple[tuple[str, torch.Tensor], ...],
     read_only_tensors: tuple[tuple[str, torch.Tensor | None], ...],
@@ -89,7 +103,7 @@ def _validate_replay_aliases(
         "pack_cu_seqlens",
     )
 )
-@triton.jit
+@triton.jit(do_not_specialize=["num_sequences", "search_capacity"])
 def _plan_prefill_kernel(
     replay_count,
     state_indices,
@@ -100,6 +114,7 @@ def _plan_prefill_kernel(
     pack_cu_seqlens,
     count_stride_s: tl.constexpr,
     num_sequences,
+    search_capacity,
     use_has_initial_state: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -137,10 +152,12 @@ def _plan_prefill_kernel(
         tl.cumsum(complete_length, axis=0),
         mask=in_bounds,
     )
+    # Entries past the last request repeat the total so the pack search can probe the whole
+    # power-of-two capacity without bounds checks.
     tl.store(
         pack_cu_seqlens + sequence_offset + 1,
         tl.cumsum(logical_length, axis=0),
-        mask=in_bounds,
+        mask=sequence < search_capacity,
     )
 
 
@@ -158,7 +175,7 @@ def _plan_prefill_kernel(
         "output_route",
     )
 )
-@triton.jit
+@triton.jit(do_not_specialize=["source_batch_stride"])
 def _pack_prefill_kernel(
     source,
     replay_cache,
@@ -170,17 +187,16 @@ def _pack_prefill_kernel(
     prefix,
     tail,
     output_route,
-    source_strides: tl.constexpr,
+    source_batch_stride,
+    source_inner_strides: tl.constexpr,
     replay_strides: tl.constexpr,
     prefix_strides: tl.constexpr,
     tail_strides: tl.constexpr,
-    num_sequences: tl.constexpr,
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     is_packed: tl.constexpr,
     write_output_routes: tl.constexpr,
     SEARCH_STEPS: tl.constexpr,
-    num_elements: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -191,23 +207,22 @@ def _pack_prefill_kernel(
     feature = offset % feature_size
     packed_token = offset // feature_size
 
-    # Find the request owning each token in the compact logical work space. Repeated
-    # boundaries naturally skip inactive and empty requests (upper-bound search).
+    # Find the request owning each token in the compact logical work space: the number of
+    # boundaries at or before the token. The search halves a power-of-two candidate range
+    # ``[low, low + 2 ** SEARCH_STEPS)`` whose boundaries the plan kernel padded past the
+    # last request with the total, so every probe is in bounds and repeated boundaries skip
+    # inactive, empty, and padding requests alike. Starting from a compile-time range lets
+    # the compiler fold the first probes to fixed addresses.
+    total_tokens = tl.load(pack_cu_seqlens + (1 << SEARCH_STEPS))
     low = tl.zeros_like(packed_token)
-    high = low + num_sequences
-    for _ in tl.static_range(SEARCH_STEPS):
-        middle = (low + high) // 2
-        searching = low < high
-        boundary = tl.load(
-            pack_cu_seqlens + middle + 1,
-            mask=searching & (middle < num_sequences),
-            other=0,
-        )
-        goes_right = searching & (boundary <= packed_token)
-        low = tl.where(goes_right, middle + 1, low)
-        high = tl.where(searching & ~goes_right, middle, high)
+    for step in tl.static_range(SEARCH_STEPS):
+        probe = low + (1 << (SEARCH_STEPS - 1 - step))
+        boundary = tl.load(pack_cu_seqlens + probe)
+        low = tl.where(boundary <= packed_token, probe, low)
     sequence = low
-    in_bounds = (offset < num_elements) & (sequence < num_sequences)
+    # Tokens at or past the total belong to no request and land on the last candidate, so
+    # this is the only bound the launch needs.
+    in_bounds = packed_token < total_tokens
     pack_start = tl.load(
         pack_cu_seqlens + sequence,
         mask=in_bounds,
@@ -245,7 +260,12 @@ def _pack_prefill_kernel(
                     head,
                     dim,
                 ),
-                source_strides,
+                (
+                    source_batch_stride,
+                    source_inner_strides[0],
+                    source_inner_strides[1],
+                    source_inner_strides[2],
+                ),
             ),
             mask=active & ~from_replay,
             other=0.0,
@@ -299,7 +319,7 @@ def _scatter_output_kernel(
     output_route,
     output,
     feature_size: tl.constexpr,
-    num_elements: tl.constexpr,
+    num_elements,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -342,7 +362,7 @@ def _commit_tail_kernel(
     num_heads: tl.constexpr,
     head_dim: tl.constexpr,
     write_count: tl.constexpr,
-    num_elements: tl.constexpr,
+    num_elements,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -381,14 +401,14 @@ def _commit_tail_kernel(
 @triton.heuristics(
     _int64_offset_heuristic("replay_count", "state_indices", "has_initial_state", "active_counts")
 )
-@triton.jit
+@triton.jit(do_not_specialize=["num_active"])
 def _gather_counts_kernel(
     replay_count,
     state_indices,
     has_initial_state,
     active_counts,
     count_stride_s: tl.constexpr,
-    num_active: tl.constexpr,
+    num_active,
     use_has_initial_state: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -430,7 +450,7 @@ def _update_and_gather_kernel(
     head_dim: tl.constexpr,
     num_tokens: tl.constexpr,
     feature_size: tl.constexpr,
-    num_elements: tl.constexpr,
+    num_elements,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -475,7 +495,7 @@ def _gather_state_kernel(
     state_stride_s: tl.constexpr,
     active_stride_b: tl.constexpr,
     state_size: tl.constexpr,
-    num_elements: tl.constexpr,
+    num_elements,
     use_has_initial_state: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -524,7 +544,7 @@ def _commit_state_kernel(
     count_stride_s: tl.constexpr,
     state_size: tl.constexpr,
     chunk_size: tl.constexpr,
-    num_elements: tl.constexpr,
+    num_elements,
     use_has_initial_state: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -633,11 +653,9 @@ def prepare_paged_chunk_replay(
             state_indices,
             active_counts,
             active_cache,
-            cache_strides=(cache.stride() if current.ndim == 4 else (*cache.stride(), 0)),
-            current_strides=(current.stride() if current.ndim == 4 else (*current.stride(), 0)),
-            active_strides=(
-                active_cache.stride() if current.ndim == 4 else (*active_cache.stride(), 0)
-            ),
+            cache_strides=_token_strides(cache),
+            current_strides=_token_strides(current),
+            active_strides=_token_strides(active_cache),
             head_dim=current.shape[-1] if current.ndim == 4 else 1,
             num_tokens=cache.shape[1],
             feature_size=feature_size,
@@ -733,19 +751,17 @@ def prepare_paged_chunk_prefill(
         ),
     )
     num_sequences = state_indices.shape[0]
-    prefix_capacity = (
-        triton.cdiv(
-            q.shape[0] * q.shape[1] + (_CHUNK_SIZE - 1) * num_sequences,
-            _CHUNK_SIZE,
-        )
-        * _CHUNK_SIZE
-    )
+    chunk_size = int(_CHUNK_SIZE)
     # Keep all work on grid X: CUDA grid Y is limited to 65,535. This aggregate
     # capacity also avoids repeating the total packed-token bound for every request.
-    max_pack_tokens = q.shape[0] * q.shape[1] + (_CHUNK_SIZE - 1) * num_sequences
+    max_pack_tokens = q.shape[0] * q.shape[1] + (chunk_size - 1) * num_sequences
+    prefix_capacity = triton.cdiv(max_pack_tokens, chunk_size) * chunk_size
+    # The pack kernels search the requests over a power-of-two capacity, so they compile
+    # once per doubling of the request count instead of once per count.
+    search_capacity = triton.next_power_of_2(max(1, num_sequences))
     tail_counts = replay_count.new_empty((num_sequences,))
     prefix_cu_seqlens = replay_count.new_empty((num_sequences + 1,))
-    pack_cu_seqlens = replay_count.new_empty((num_sequences + 1,))
+    pack_cu_seqlens = replay_count.new_empty((search_capacity + 1,))
     output_capacity = q.shape[0] * q.shape[1]
     output_route = q.new_zeros((output_capacity,), dtype=torch.int64)
     prefix_caches = tuple(
@@ -753,10 +769,11 @@ def prepare_paged_chunk_prefill(
         for cache in (replay_q, replay_k, replay_v, replay_gate, replay_beta)
     )
     tail_caches = tuple(
-        cache.new_zeros((num_sequences, _CHUNK_SIZE, *cache.shape[2:]))
+        cache.new_zeros((num_sequences, chunk_size, *cache.shape[2:]))
         for cache in (replay_q, replay_k, replay_v, replay_gate, replay_beta)
     )
-    plan_block = triton.next_power_of_2(num_sequences)
+    # One single-CTA variant serves every request count up to the floor.
+    plan_block = max(128, search_capacity)
     _plan_prefill_kernel[(1,)](
         replay_count,
         state_indices,
@@ -767,6 +784,7 @@ def prepare_paged_chunk_prefill(
         pack_cu_seqlens,
         count_stride_s=replay_count.stride(0),
         num_sequences=num_sequences,
+        search_capacity=search_capacity,
         use_has_initial_state=has_initial_state is not None,
         BLOCK=plan_block,
         num_warps=min(8, max(1, plan_block // 32)),
@@ -774,7 +792,6 @@ def prepare_paged_chunk_prefill(
 
     is_packed = q.shape[0] == 1
     pack_block = 256
-    search_steps = num_sequences.bit_length()
     for index, (source, replay_cache, prefix, tail) in enumerate(
         zip(
             (q, k, v, gate, beta),
@@ -787,6 +804,9 @@ def prepare_paged_chunk_prefill(
         num_heads = source.shape[2]
         head_dim = source.shape[3] if source.ndim == 4 else 1
         num_elements = max_pack_tokens * num_heads * head_dim
+        # The batch strides depend on the token count, so they stay out of the compiled
+        # kernel: the source one is a runtime scalar and the prefix one is never used.
+        source_strides = _token_strides(source)
         _pack_prefill_kernel[(triton.cdiv(num_elements, pack_block),)](
             source,
             replay_cache,
@@ -798,19 +818,16 @@ def prepare_paged_chunk_prefill(
             prefix,
             tail,
             output_route,
-            source_strides=(source.stride() if source.ndim == 4 else (*source.stride(), 0)),
-            replay_strides=(
-                replay_cache.stride() if source.ndim == 4 else (*replay_cache.stride(), 0)
-            ),
-            prefix_strides=(prefix.stride() if source.ndim == 4 else (*prefix.stride(), 0)),
-            tail_strides=(tail.stride() if source.ndim == 4 else (*tail.stride(), 0)),
-            num_sequences=num_sequences,
+            source_batch_stride=0 if is_packed else source_strides[0],
+            source_inner_strides=source_strides[1:],
+            replay_strides=_token_strides(replay_cache),
+            prefix_strides=(0, *_token_strides(prefix)[1:]),
+            tail_strides=_token_strides(tail),
             num_heads=num_heads,
             head_dim=head_dim,
             is_packed=is_packed,
             write_output_routes=index == 0,
-            SEARCH_STEPS=search_steps,
-            num_elements=num_elements,
+            SEARCH_STEPS=search_capacity.bit_length() - 1,
             BLOCK=pack_block,
         )
     return (
@@ -891,17 +908,15 @@ def commit_paged_chunk_prefill(
     ):
         num_heads = tail.shape[2]
         head_dim = tail.shape[3] if tail.ndim == 4 else 1
-        num_elements = num_sequences * _CHUNK_SIZE * num_heads * head_dim
+        num_elements = num_sequences * int(_CHUNK_SIZE) * num_heads * head_dim
         _commit_tail_kernel[(triton.cdiv(num_elements, block),)](
             tail,
             tail_counts,
             state_indices,
             replay_cache,
             replay_count,
-            tail_strides=(tail.stride() if tail.ndim == 4 else (*tail.stride(), 0)),
-            replay_strides=(
-                replay_cache.stride() if tail.ndim == 4 else (*replay_cache.stride(), 0)
-            ),
+            tail_strides=_token_strides(tail),
+            replay_strides=_token_strides(replay_cache),
             count_stride_s=replay_count.stride(0),
             num_heads=num_heads,
             head_dim=head_dim,
