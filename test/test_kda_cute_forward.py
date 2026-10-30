@@ -5,6 +5,7 @@ from __future__ import annotations
 import functools
 import gc
 import importlib
+import itertools
 import math
 
 import pytest
@@ -892,6 +893,29 @@ def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
     assert actual is result
     assert captured["bv"] == 32
     assert captured["metadata"] is metadata
+
+
+def test_diag_neumann_inverse_reuses_kernel_across_sequence_counts(triton_compiles):
+    """Sequence counts in every integer class share one compiled diagonal-inverse kernel."""
+    engine = importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine")
+    torch.manual_seed(11)
+    heads = 2
+    for lengths in ((65, 70, 57), (192,), (12,) * 16):
+        tokens = sum(lengths)
+        cu_seqlens = torch.tensor([0, *itertools.accumulate(lengths)], device="cuda").int()
+        metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
+        blocks = torch.randn(1, tokens, heads, 16, device="cuda").tril(-1) / 8
+        packed = engine._kda_diag_neumann_inverse(blocks.clone(), metadata, 64)
+        # Each sequence must see the same result as a single-sequence launch.
+        for begin, end in itertools.pairwise(cu_seqlens.tolist()):
+            local_metadata = prepare_ragged_chunk_metadata(
+                torch.tensor([0, end - begin], device="cuda", dtype=torch.int32), end - begin, 64
+            )
+            local = engine._kda_diag_neumann_inverse(
+                blocks[:, begin:end].clone(), local_metadata, 64
+            )
+            torch.testing.assert_close(packed[:, begin:end], local, rtol=0, atol=0)
+    assert triton_compiles["_diag_neumann_inverse_kernel"] == 1
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
