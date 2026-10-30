@@ -144,47 +144,45 @@ def test_runtime_kv_addresses_beyond_int32(gather_attn_single_config):
         torch.testing.assert_close(value, reference)
 
 
-def _kernel_keys():
-    """Observe the explicit no-sequence-recompile contract, not launch counts."""
-    from triton.runtime.autotuner import Autotuner, Heuristics
-    from triton.runtime.jit import JITFunction
-
-    from attn_gym.sparse.gather_attn.impl.triton import backward, forward, shared_backward
-
-    device = torch.cuda.current_device()
-    result = {}
-    for module in (forward, backward, shared_backward):
-        for name, value in vars(module).items():
-            while isinstance(value, (Autotuner, Heuristics)):
-                value = value.fn
-            if isinstance(value, JITFunction):
-                cache = value.device_caches.get(device)
-                if cache is not None and cache[0]:
-                    result[(module.__name__, name)] = frozenset(cache[0])
-    return result
-
-
 @pytest.mark.parametrize(
-    "heads,dim,dtype,share_kv,deterministic",
+    "heads,dim,inner_stride,dtype,share_kv,deterministic",
     [
-        (2, 17, torch.float32, False, False),
-        (2, 32, torch.float32, False, False),
-        (16, 32, torch.bfloat16, True, False),
-        (16, 32, torch.bfloat16, True, True),
+        (2, 16, 2, torch.float32, False, False),
+        (2, 32, 1, torch.float32, False, False),
+        (16, 32, 1, torch.bfloat16, True, False),
+        (16, 32, 1, torch.bfloat16, True, True),
     ],
     ids=["generic", "tma", "shared-atomic", "shared-deterministic"],
 )
-def test_sequence_lengths_reuse_triton_kernels(heads, dim, dtype, share_kv, deterministic):
-    """Changing T/S within one alignment class must reuse compiled kernels."""
+def test_sequence_lengths_reuse_triton_kernels(
+    heads,
+    dim,
+    inner_stride,
+    dtype,
+    share_kv,
+    deterministic,
+    triton_compiles,
+    gather_attn_single_config,
+):
+    """New document and sparse-KV counts, and T within a T % 16 class, reuse compiled kernels."""
     _cuda()
     from test_gather_attn_triton import assert_matches_low_precision_eager
+
+    def attention_compiles() -> Counter[str]:
+        return Counter(
+            {
+                name: count
+                for name, count in triton_compiles.items()
+                if name.startswith(("_index_query_map_keys", "_gather_attn"))
+            }
+        )
 
     previous = torch.are_deterministic_algorithms_enabled()
     torch.use_deterministic_algorithms(deterministic)
     try:
-        first_keys = None
-        # Runtime tuples retain Triton's normal alignment specialization, not exact lengths.
-        for tokens, candidates in ((32, 16), (48, 32)):
+        # Tokens, candidates and documents span Triton's multiple-of-16 and other classes; the
+        # single-document pack comes last to isolate the kept ``== 1`` class.
+        for tokens, candidates, documents in ((32, 16, 2), (40, 20, 16), (48, 36, 3), (32, 16, 1)):
             q, local, sparse, indices, sink, cu_q, cu_k = _inputs(
                 tokens,
                 candidates,
@@ -192,12 +190,17 @@ def test_sequence_lengths_reuse_triton_kernels(heads, dim, dtype, share_kv, dete
                 dim=dim,
                 dtype=dtype,
                 share_kv=share_kv,
-                inner_stride=2 if dim == 17 else 1,
+                inner_stride=inner_stride,
             )
-            if tokens == 48:
-                # Document-count changes also stay runtime data; add a leading empty document.
-                cu_q = torch.cat((cu_q[:1], cu_q))
-                cu_k = torch.cat((cu_k[:1], cu_k))
+            # Unselected slots keep the index row stride a multiple of 16 as T changes.
+            indices = torch.nn.functional.pad(indices, (0, 13), value=-1)
+            if documents == 1:
+                multi_document = attention_compiles()
+                cu_q, cu_k = cu_q[[0, -1]], cu_k[[0, -1]]
+            else:
+                # Leading empty documents change the document count without changing attention.
+                cu_q = torch.cat((cu_q.new_zeros(documents - 2), cu_q))
+                cu_k = torch.cat((cu_k.new_zeros(documents - 2), cu_k))
             tensors = tuple(t.requires_grad_() for t in (q, local, sparse, sink))
             actual = _forward_and_grads(
                 tensors, indices, cu_q, cu_k, kernel_options={"backend": "triton"}
@@ -230,14 +233,19 @@ def test_sequence_lengths_reuse_triton_kernels(heads, dim, dtype, share_kv, dete
                     quantized_intermediates=2 if i == 4 else 0,
                     intermediate_dtype=dtype,
                 )
-            keys = _kernel_keys()
-            assert keys, "No Triton consumer kernels were compiled"
-            if first_keys is None:
-                first_keys = keys
-            else:
-                assert keys == first_keys, "Sequence length changed the Triton compilation keys"
     finally:
         torch.use_deterministic_algorithms(previous)
+    # Lse row strides are tuple elements, which Triton always specializes, so attention kernels
+    # keep one binary per T % 16 class; the reverse-map kernel takes no T-sized strides.
+    attention = {
+        name: count for name, count in multi_document.items() if name.startswith("_gather_attn")
+    }
+    assert multi_document["_index_query_map_keys"] == 1
+    assert attention and set(attention.values()) == {2}, multi_document
+    # One document adds at most its ``== 1`` binary per kernel, which the key kernel keeps.
+    single_document = attention_compiles() - multi_document
+    assert single_document["_index_query_map_keys"] == 1
+    assert set(single_document.values()) == {1}, single_document
 
 
 def test_batch_sizes_reuse_shared_schedule(

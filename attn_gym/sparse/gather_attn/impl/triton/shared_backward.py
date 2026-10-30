@@ -19,7 +19,8 @@ from .primitives import (
 )
 
 
-@triton.jit
+# Counts drop only the multiple-of-16 hint; == 1 folds the single-document search.
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
 def _gather_attn_bwd_dq_shared(
     query_ptr,
     sparse_kv_ptr,
@@ -203,7 +204,7 @@ def _gather_attn_bwd_dq_shared(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
 def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_ptr,
     sparse_kv_ptr,
@@ -335,7 +336,7 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["SPARSE_SEQ_LEN"])
 def _gather_attn_bwd_dsparse_kv_shared(
     query_ptr,
     sparse_kv_ptr,

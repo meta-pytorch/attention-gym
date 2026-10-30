@@ -27,7 +27,8 @@ from .shared_backward import (
 )
 
 
-@triton.jit
+# Counts drop only the multiple-of-16 hint; == 1 folds the single-document search.
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
 def _gather_attn_bwd_dq(
     query_ptr,
     sparse_kv_ptr,
@@ -188,7 +189,7 @@ def _gather_attn_bwd_dq(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_documents"])
 def _gather_attn_bwd_dlocal_kv(
     query_ptr,
     local_kv_ptr,
@@ -307,7 +308,7 @@ def _gather_attn_bwd_dlocal_kv(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_documents"])
 def _gather_attn_bwd_dlocal_kv_tma(
     query_desc,
     local_desc,
@@ -406,7 +407,7 @@ def _gather_attn_bwd_dlocal_kv_tma(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["SPARSE_SEQ_LEN"])
 def _gather_attn_bwd_dsparse_kv(
     query_ptr,
     sparse_kv_ptr,
@@ -561,7 +562,8 @@ _BWD_DSPARSE_KV = TritonTuner(
 )
 
 
-@triton.jit
+# No stride tuple here scales with S, so unlike the attention kernels S is runtime too.
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "S"])
 def _index_query_map_keys(
     kv_indices_ptr,
     sort_keys_ptr,
@@ -578,13 +580,14 @@ def _index_query_map_keys(
 ):
     """Form packed global sort keys without changing attention's document-local indices."""
     strides = offset_strides((stride_b, stride_s, stride_k), WIDE)
-    row = tl.program_id(0)
+    query_position = tl.program_id(0)
     tile = tl.program_id(1)
+    batch = tl.program_id(2)
     if WIDE:
-        row = row.to(tl.int64)
+        query_position = query_position.to(tl.int64)
         tile = tile.to(tl.int64)
-    batch = row // S
-    query_position = row % S
+        batch = batch.to(tl.int64)
+    row = batch * S + query_position
     slots = tile * BLOCK_K + tl.arange(0, BLOCK_K)
     _, _, candidate_start, candidate_end = load_document_bounds(
         cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, WIDE
@@ -617,7 +620,7 @@ def _build_index_query_map(
     if cu_seqlens is not None:
         # This workspace belongs only to the reverse map, not the attention inputs or tape.
         sort_keys = kv_indices.new_empty((batch, seq_len * topk))
-        _index_query_map_keys[(batch * seq_len, triton.cdiv(topk, 256))](
+        _index_query_map_keys[(seq_len, triton.cdiv(topk, 256), batch)](
             kv_indices,
             sort_keys,
             cu_seqlens,
