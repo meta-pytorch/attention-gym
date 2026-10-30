@@ -22,7 +22,8 @@ from .primitives import (
 )
 
 
-@triton.jit
+# Counts drop only the multiple-of-16 hint; == 1 folds the single-document search.
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
 def _gather_attn_fwd(
     query_ptr,
     sparse_kv_ptr,
@@ -173,7 +174,7 @@ def _gather_attn_fwd(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
 def _gather_attn_fwd_shared(
     query_ptr,
     sparse_kv_ptr,
@@ -316,7 +317,7 @@ def _gather_attn_fwd_shared(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
 def _gather_attn_fwd_tma(
     query_desc,
     sparse_kv_ptr,
