@@ -1262,6 +1262,33 @@ def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, trit
     assert all(1 <= compiled[name] <= config_counts[name] for name in compiled), compiled
 
 
+def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch):
+    """New token counts reuse the autotuning result of an earlier packed shape."""
+    from triton.runtime.autotuner import Autotuner
+
+    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_delta_h as delta_h_module
+    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_wy as wy_module
+
+    force_portable_backward(monkeypatch)
+    tuners = []
+    for kernel in (
+        delta_h_module.chunk_gdn_bwd_delta_h_kernel,
+        wy_module.chunk_gdn_bwd_dqkwg_kernel,
+    ):
+        while not isinstance(kernel, Autotuner):
+            kernel = kernel.fn
+        tuners.append(kernel)
+        monkeypatch.setattr(kernel, "cache", {})
+    # The same sequence count with new token counts, aligned and unaligned to 16.
+    for lengths in ((37, 43, 65), (64, 64, 64), (100, 20, 57)):
+        *inputs, cu_seqlens = make_gdn_test_inputs(
+            lengths, key_heads=1, value_heads=2, key_dim=64, requires_grad=True
+        )
+        run_with_gradients(tuple(inputs), "fused", cu_seqlens)
+    torch.cuda.synchronize()
+    assert [len(tuner.cache) for tuner in tuners] == [1, 1]
+
+
 def test_packed_cuda_graph_replays_boundaries():
     """Reread packed boundaries and chunk offsets on CUDA Graph replay."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128)
