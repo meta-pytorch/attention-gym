@@ -44,13 +44,13 @@ def _index_kernel(
     BD: tl.constexpr,
     BN: tl.constexpr,
     KEEP: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     PACKED: tl.constexpr,
 ):
     """Stream TMA key tiles through tensor cores and a register-resident Top-K."""
     batch = tl.program_id(1)
     query = tl.program_id(0)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         batch = batch.to(tl.int64)
         query = query.to(tl.int64)
         T = T.to(tl.int64)
@@ -58,8 +58,8 @@ def _index_kernel(
     begin = 0
     end = (query + 1) // RATIO if CAUSAL else S
     if PACKED:
-        document = _document_ids(CuQ, query, num_documents, WIDE)
-        offset = document.to(tl.int64) if WIDE else document
+        document = _document_ids(CuQ, query, num_documents, USE_INT64_OFFSETS)
+        offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
         begin = tl.load(CuK + offset)
         end = tl.load(CuK + tl.minimum(offset + 1, num_documents))
         if CAUSAL:
@@ -72,7 +72,7 @@ def _index_kernel(
         return
 
     heads = tl.arange(0, BH)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         heads = heads.to(tl.int64)
     weights = tl.load(W + ptr_offset((batch, query, heads), (WB, WT, WH)), heads < H, 0).to(
         tl.float32
@@ -191,15 +191,15 @@ def _candidate_bounds_kernel(
     tokens,
     CAUSAL: tl.constexpr,
     RATIO: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     block = tl.program_id(0)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         block = block.to(tl.int64)
     query = block * BLOCK + tl.arange(0, BLOCK)
-    document = _document_ids(CuQ, query, num_documents, WIDE)
-    offset = document.to(tl.int64) if WIDE else document
+    document = _document_ids(CuQ, query, num_documents, USE_INT64_OFFSETS)
+    offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
     start = tl.load(CuK + offset)
     end = tl.load(CuK + tl.minimum(offset + 1, num_documents))
     if CAUSAL:

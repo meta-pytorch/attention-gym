@@ -33,25 +33,25 @@ def _pack_kv_kernel(
     stride_packed_d,
     D: tl.constexpr,
     PACK: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     row = tl.program_id(0)
     channel = tl.arange(0, BLOCK_D)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         row = row.to(tl.int64)
         channel = channel.to(tl.int64)
 
     if row < local_tokens + sparse_tokens:
         if row < local_tokens:
-            document = _document_ids(CuQ, row, num_documents, WIDE)
-            offset = document.to(tl.int64) if WIDE else document
+            document = _document_ids(CuQ, row, num_documents, USE_INT64_OFFSETS)
+            offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
             packed_row = row + tl.load(CuK + offset)
             unpacked_ptr = Local + ptr_offset((row, channel), (stride_local_t, stride_local_d))
         else:
             sparse_row = row - local_tokens
-            document = _document_ids(CuK, sparse_row, num_documents, WIDE)
-            offset = document.to(tl.int64) if WIDE else document
+            document = _document_ids(CuK, sparse_row, num_documents, USE_INT64_OFFSETS)
+            offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
             local_end = tl.load(CuQ + tl.minimum(offset + 1, num_documents))
             # Inactive sparse capacity follows all local capacity in the tail document.
             packed_row = sparse_row + tl.where(document < num_documents, local_end, local_tokens)

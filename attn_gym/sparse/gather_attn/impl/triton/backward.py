@@ -56,24 +56,24 @@ def _gather_attn_bwd_dq(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     NUM_LOCAL_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Accumulate query and sink gradients over both attention branches."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
     query_block = tl.program_id(0)
     batch_head = tl.program_id(1)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         query_block = query_block.to(tl.int64)
         batch_head = batch_head.to(tl.int64)
     head = batch_head % H
@@ -103,7 +103,7 @@ def _gather_attn_bwd_dq(
     candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
         query_start, _, candidate_start, candidate_end = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, USE_INT64_OFFSETS
         )
 
     for selected_slot in tl.range(0, TOPK):
@@ -210,22 +210,22 @@ def _gather_attn_bwd_dlocal_kv(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     NUM_QUERY_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Backward for dKV (local sliding window)."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
-    GRAD_LOCAL_KV_STRIDES = offset_strides(GRAD_LOCAL_KV_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    GRAD_LOCAL_KV_STRIDES = offset_strides(GRAD_LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
     key_block = tl.program_id(0)
     batch_head = tl.program_id(1)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         key_block = key_block.to(tl.int64)
         batch_head = batch_head.to(tl.int64)
     head = batch_head % H
@@ -248,7 +248,7 @@ def _gather_attn_bwd_dlocal_kv(
 
     if HAS_CU_SEQLENS:
         _, key_end, _, _ = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_n, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_n, num_documents, S, USE_INT64_OFFSETS
         )
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
@@ -326,15 +326,15 @@ def _gather_attn_bwd_dlocal_kv_tma(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     NUM_QUERY_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """TMA backward for local-KV gradients."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
     key_block = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -350,7 +350,7 @@ def _gather_attn_bwd_dlocal_kv_tma(
 
     if HAS_CU_SEQLENS:
         _, key_end, _, _ = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_n, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_n, num_documents, S, USE_INT64_OFFSETS
         )
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
@@ -429,18 +429,18 @@ def _gather_attn_bwd_dsparse_kv(
     SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Compute sparse-KV gradients from an inverted index of selecting queries."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    SELECTED_QUERIES_STRIDES = offset_strides(SELECTED_QUERIES_STRIDES, WIDE)
-    BLOCK_OFFSETS_STRIDES = offset_strides(BLOCK_OFFSETS_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
-    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    SELECTED_QUERIES_STRIDES = offset_strides(SELECTED_QUERIES_STRIDES, USE_INT64_OFFSETS)
+    BLOCK_OFFSETS_STRIDES = offset_strides(BLOCK_OFFSETS_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
+    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
 
     sparse_index = tl.program_id(0)
     batch_head = tl.program_id(1)
@@ -575,22 +575,22 @@ def _index_query_map_keys(
     stride_k,
     S,
     TOPK: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_K: tl.constexpr,
 ):
     """Form packed global sort keys without changing attention's document-local indices."""
-    strides = offset_strides((stride_b, stride_s, stride_k), WIDE)
+    strides = offset_strides((stride_b, stride_s, stride_k), USE_INT64_OFFSETS)
     query_position = tl.program_id(0)
     tile = tl.program_id(1)
     batch = tl.program_id(2)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         query_position = query_position.to(tl.int64)
         tile = tile.to(tl.int64)
         batch = batch.to(tl.int64)
     row = batch * S + query_position
     slots = tile * BLOCK_K + tl.arange(0, BLOCK_K)
     _, _, candidate_start, candidate_end = load_document_bounds(
-        cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, WIDE
+        cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, USE_INT64_OFFSETS
     )
     indices = tl.load(
         kv_indices_ptr + ptr_offset((batch, query_position, slots), strides),
@@ -629,7 +629,9 @@ def _build_index_query_map(
             *kv_indices.stride(),
             S=seq_len,
             TOPK=topk,
-            WIDE=requires_int64_offsets(kv_indices, sort_keys, cu_seqlens, cu_seqlens_k),
+            USE_INT64_OFFSETS=requires_int64_offsets(
+                kv_indices, sort_keys, cu_seqlens, cu_seqlens_k
+            ),
             BLOCK_K=256,
             num_warps=4,
         )
@@ -701,7 +703,7 @@ def _launch_backward(
 
     has_cu_seqlens = cu_seqlens is not None
     num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
-    wide = requires_int64_offsets(
+    use_int64_offsets = requires_int64_offsets(
         query,
         sparse_kv,
         local_kv,
@@ -761,7 +763,7 @@ def _launch_backward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             BLOCK_D=block_d,
@@ -806,7 +808,7 @@ def _launch_backward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             NUM_LOCAL_TILES=num_local_key_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
@@ -841,7 +843,7 @@ def _launch_backward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             NUM_QUERY_TILES=num_local_query_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
@@ -868,7 +870,7 @@ def _launch_backward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             NUM_QUERY_TILES=num_local_query_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
@@ -924,7 +926,7 @@ def _launch_backward(
             TOPK=topk,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             BLOCK_D=block_d,
         )
         grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
@@ -973,7 +975,7 @@ def _launch_backward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             SCALE=scale,
-            WIDE=wide or requires_int64_offsets(grad_sparse_kv_partials),
+            USE_INT64_OFFSETS=use_int64_offsets or requires_int64_offsets(grad_sparse_kv_partials),
             BLOCK_D=block_d,
         )
         grad_sparse_kv = (

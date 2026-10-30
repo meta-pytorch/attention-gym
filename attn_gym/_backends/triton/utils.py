@@ -64,7 +64,7 @@ def ptr_offset(indices, strides):
 
 
 @triton.jit
-def _document_ids(CuQ, query, num_documents, WIDE: tl.constexpr):
+def _document_ids(CuQ, query, num_documents, USE_INT64_OFFSETS: tl.constexpr):
     low = tl.full(query.shape, 0, tl.int32)
     high = tl.full(query.shape, num_documents, tl.int32)
     remaining = num_documents
@@ -72,7 +72,7 @@ def _document_ids(CuQ, query, num_documents, WIDE: tl.constexpr):
     # Right-sided search skips empty documents and returns N for inactive capacity.
     while remaining > 0:
         middle = low + (high - low) // 2
-        offset = middle.to(tl.int64) if WIDE else middle
+        offset = middle.to(tl.int64) if USE_INT64_OFFSETS else middle
         boundary = tl.load(CuQ + offset + 1, middle < num_documents, 0)
         right = query >= boundary
         active = low < high

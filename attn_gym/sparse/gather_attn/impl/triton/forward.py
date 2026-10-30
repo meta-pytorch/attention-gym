@@ -48,23 +48,23 @@ def _gather_attn_fwd(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     NUM_LOCAL_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Apply online softmax over selected sparse entries and the local window."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
     query_block = tl.program_id(0)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         query_block = query_block.to(tl.int64)
     batch_head = tl.program_id(1)
     head = batch_head % H
@@ -89,7 +89,7 @@ def _gather_attn_fwd(
     candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
         query_start, _, candidate_start, candidate_end = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, USE_INT64_OFFSETS
         )
 
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
@@ -199,23 +199,23 @@ def _gather_attn_fwd_shared(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Process one sequence position across heads to reuse shared KV tiles."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
     sequence = tl.program_id(0)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         sequence = sequence.to(tl.int64)
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
@@ -243,7 +243,7 @@ def _gather_attn_fwd_shared(
     candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
         query_start, _, candidate_start, candidate_end = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, USE_INT64_OFFSETS
         )
 
     if TOPK:
@@ -340,21 +340,21 @@ def _gather_attn_fwd_tma(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     NUM_LOCAL_TILES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """TMA forward using host-created descriptors for dense tiles."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
     query_block = tl.program_id(0)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         query_block = query_block.to(tl.int64)
     batch_head = tl.program_id(1)
     head = batch_head % H
@@ -374,7 +374,7 @@ def _gather_attn_fwd_tma(
     candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
         query_start, _, candidate_start, candidate_end = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, offsets_m, num_documents, S, USE_INT64_OFFSETS
         )
 
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
@@ -506,7 +506,7 @@ def _launch_forward(
     lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
     has_cu_seqlens = cu_seqlens is not None
     num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
-    wide = requires_int64_offsets(
+    use_int64_offsets = requires_int64_offsets(
         query, sparse_kv, local_kv, kv_indices, output, lse, cu_seqlens, cu_seqlens_k
     )
 
@@ -543,7 +543,7 @@ def _launch_forward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             BLOCK_D=block_d,
@@ -586,7 +586,7 @@ def _launch_forward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             NUM_LOCAL_TILES=num_local_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
@@ -617,7 +617,7 @@ def _launch_forward(
             WINDOW=sliding_window_size,
             SCALE=scale,
             HAS_CU_SEQLENS=has_cu_seqlens,
-            WIDE=wide,
+            USE_INT64_OFFSETS=use_int64_offsets,
             NUM_LOCAL_TILES=num_local_tiles,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
