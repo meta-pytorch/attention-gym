@@ -34,6 +34,31 @@ def can_use_shared_kv_schedule(
     )
 
 
+def can_use_grouped_kv_schedule(
+    query: torch.Tensor,
+    kv_tensors: Sequence[torch.Tensor],
+    *,
+    kv_heads: int,
+    sliding_window_size: int,
+) -> bool:
+    """Check the grouped Blackwell forward schedule for separate values or grouped KV heads.
+
+    ``kv_tensors`` holds every key and value pool the kernel gathers from. Head dimensions
+    above 256 are excluded because separate K and V tiles then exceed shared memory.
+    """
+    _, heads, _, head_dim = query.shape
+    return (
+        torch.cuda.get_device_capability(query.device)[0] >= 10
+        and query.dtype == torch.bfloat16
+        and query.stride(-1) == 1
+        and all(tensor.stride(-1) == 1 for tensor in kv_tensors)
+        and heads // kv_heads <= 128
+        and head_dim % 16 == 0
+        and head_dim <= 256
+        and sliding_window_size <= 2048
+    )
+
+
 class TileConfig(NamedTuple):
     """Launch parameters of a fixed-config (not autotuned) kernel."""
 

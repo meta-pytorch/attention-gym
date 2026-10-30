@@ -310,8 +310,9 @@ def gather_attn(
             Supply local_v and sparse_v together.
 
         sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to reuse
-            sparse_kv as the values. Separate values and 1 < kv_heads < num_heads are
-            currently supported only by Impl.REFERENCE.
+            sparse_kv as the values. Separate values and 1 < kv_heads < num_heads run on
+            Impl.REFERENCE, or forward only on the Triton backend (SM100 or newer, bfloat16,
+            head_dim <= 256). The CuTe backend requires shared values and one KV head.
 
         cu_seqlens: Packed offsets shaped [N + 1] for batch-one inputs, as contiguous
             int32 on query.device. They partition both queries and local_kv; the local
@@ -385,20 +386,24 @@ def gather_attn(
     if selected_impl is Impl.REFERENCE:
         from .impl import reference as implementation
     else:
-        # TODO: support separate values and grouped KV heads in the Triton backend.
-        if sparse_v is not None or kv_heads not in (1, query.shape[1]):
+        grouped = sparse_v is not None or kv_heads not in (1, query.shape[1])
+        if grouped and backend == "cute":
             raise ValueError(
-                "fused gather_attn requires keys that are also the values (local_v and "
-                "sparse_v omitted) and 1 or num_heads KV heads; use impl='reference'"
+                "the CuTe gather_attn backend requires keys that are also the values and "
+                "one KV head; use kernel_options={'backend': 'triton'} or impl='reference'"
             )
         if query.device.type != "cuda":
             raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
         if backend is None:
-            backend = _select_backend(
-                query,
-                attention_sink,
-                share_kv,
-                num_keys=sliding_window_size + kv_indices.shape[-1],
+            backend = (
+                "triton"
+                if grouped
+                else _select_backend(
+                    query,
+                    attention_sink,
+                    share_kv,
+                    num_keys=sliding_window_size + kv_indices.shape[-1],
+                )
             )
         if backend == "cute":
             from .impl import cute as implementation
@@ -424,6 +429,7 @@ def gather_attn(
             scale=scale,
         )
     else:
+        values = {} if backend == "cute" else {"local_v": local_v, "sparse_v": sparse_v}
         output, lse = implementation.gather_attn(
             query,
             local_kv,
@@ -435,6 +441,7 @@ def gather_attn(
             sliding_window_size,
             share_kv,
             scale=scale,
+            **values,
         )
 
     if return_aux is None:

@@ -12,6 +12,7 @@ import pytest
 import torch
 
 from attn_gym.sparse.gather_attn import Impl, gather_attn
+from attn_gym.testing.gather_attn import assert_matches_low_precision_eager
 
 IMPLEMENTATIONS = [(Impl.REFERENCE, None)]
 if torch.cuda.is_available():
@@ -90,27 +91,6 @@ def shared_kv_blackwell_inputs(request):
 
 def _device_for_impl(impl):
     return torch.device("cuda") if impl is Impl.FUSED else torch.device("cpu")
-
-
-def assert_matches_low_precision_eager(
-    actual,
-    low_precision_expected,
-    high_precision_expected,
-    reduction_sizes,
-):
-    """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
-    assert torch.isfinite(actual).all()
-    actual_difference = (actual.double() - high_precision_expected).abs()
-    eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
-    accumulation_eps = (
-        sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
-    )
-    output_rounding_eps = torch.finfo(actual.dtype).eps
-    rounding_eps = accumulation_eps + output_rounding_eps
-    mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
-    max_atol = rounding_eps * high_precision_expected.abs().max().item()
-    assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
-    assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
 
 
 # ---------------------------------------------------------------------------
