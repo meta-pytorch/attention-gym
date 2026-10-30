@@ -145,23 +145,25 @@ def test_triton_dynamic_fullgraph(topk):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_triton_reuses_kernel_across_lengths(monkeypatch):
-    """New row lengths launch the kernel compiled for an earlier one instead of compiling again."""
-    import triton
-
-    compiled = []
-
-    def count(**kwargs):
-        if kwargs["fn"].name == "_index_kernel":
-            compiled.append(kwargs["key"])
-
-    monkeypatch.setattr(triton.knobs.runtime, "jit_post_compile_hook", count)
-    for tokens in (1023, 1031, 1097):
-        inputs = make_indexer_test_inputs(tokens, 3, 48, torch.bfloat16)
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+def test_triton_reuses_kernel_across_lengths(packed, triton_compiles):
+    """New row lengths and document counts launch the kernel compiled for an earlier one."""
+    # Triton specializes integers equal to 1 and multiples of 16; cover both and neither.
+    for tokens, documents in ((1, 1), (1024, 16), (1031, 3), (1040, 1)):
+        inputs = make_indexer_test_inputs(tokens, 3, 48, torch.bfloat16, batch=1 if packed else 2)
+        offsets = None
+        if packed:
+            offsets = torch.linspace(0, tokens, documents + 1, device="cuda").to(torch.int32)
         lightning_indexer(
-            *inputs, 37, causal=True, impl="fused", kernel_options={"backend": "triton"}
+            *inputs,
+            37,
+            causal=True,
+            cu_seqlens=offsets,
+            cu_seqlens_k=offsets,
+            impl="fused",
+            kernel_options={"backend": "triton"},
         )
-    assert len(compiled) <= 1
+    assert triton_compiles["_index_kernel"] == 1
 
 
 def test_triton_wide_offsets(monkeypatch):
