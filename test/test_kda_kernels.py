@@ -584,7 +584,7 @@ def test_l2norm_bwd(dtype, T, D, strided):
         HEADS=1,
         D=D,
         BD=BD,
-        NB=triton.cdiv(T, 16),
+        ROW_BUCKET=triton.next_power_of_2(T),
         NUM_SEQUENCES=0,
         IS_VARLEN=False,
     )

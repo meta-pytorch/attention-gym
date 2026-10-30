@@ -22,7 +22,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 @pytest.fixture(autouse=True)
 def fixed_l2norm_schedule(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
-    """Separate backend reuse from the unchanged, exact-NB autotuning policy."""
+    """Separate backend reuse from the row-bucket autotuning policy."""
     torch.manual_seed(123)
     if request.node.get_closest_marker("full_autotune") is not None:
         return
@@ -177,9 +177,8 @@ def test_pointwise_reuses_backend_cache(kind, layout):
         )
 
 
-@pytest.mark.full_autotune
-def test_l2norm_retunes_without_recompiling(monkeypatch):
-    """A new NB retunes the same two binaries, not a new binary per row count."""
+def stub_l2norm_tuning(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Tune over two configs with one untimed trial each; return the trial log."""
     configs = [
         config
         for config in l2norm_bwd_kernel.configs
@@ -196,9 +195,16 @@ def test_l2norm_retunes_without_recompiling(monkeypatch):
         return [1.0] * len(quantiles)
 
     monkeypatch.setattr(l2norm_bwd_kernel, "do_bench", one_trial)
+    return trials
+
+
+@pytest.mark.full_autotune
+def test_l2norm_retunes_without_recompiling(monkeypatch):
+    """A new row bucket retunes the same two binaries, not a new binary per row count."""
+    trials = stub_l2norm_tuning(monkeypatch)
     l2norm_bwd_kernel.fn.device_caches.clear()
     counts = []
-    for tokens in (65, 97):
+    for tokens in (65, 193):
         inputs = make_inputs("l2norm", 2, tokens, torch.bfloat16, "compact")
         output = run_operation("l2norm", inputs)
         torch.autograd.grad(output, inputs, torch.randn_like(output))
@@ -206,6 +212,18 @@ def test_l2norm_retunes_without_recompiling(monkeypatch):
     assert len(trials) == 4
     assert len(l2norm_bwd_kernel.cache) == 2
     assert counts == [2, 2], counts
+
+
+@pytest.mark.full_autotune
+def test_l2norm_reuses_tuning_within_row_bucket(monkeypatch):
+    """Row counts within one power of two reuse the first autotuning result."""
+    trials = stub_l2norm_tuning(monkeypatch)
+    for tokens in (65, 97, 127):
+        inputs = make_inputs("l2norm", 2, tokens, torch.bfloat16, "compact")
+        output = run_operation("l2norm", inputs)
+        torch.autograd.grad(output, inputs, torch.randn_like(output))
+    assert len(trials) == 2
+    assert len(l2norm_bwd_kernel.cache) == 1
 
 
 @pytest.mark.parametrize("layout", ["compact", "qkv", "transposed"])
