@@ -1,5 +1,7 @@
 """Shared operands and an independent per-query oracle for gather attention."""
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -109,3 +111,48 @@ def gather_attn_oracle(
         outputs.append(torch.stack(batch_outputs, dim=1))
         lses.append(torch.stack(batch_lses, dim=1))
     return torch.stack(outputs), torch.stack(lses)
+
+
+def assert_matches_low_precision_eager(
+    actual,
+    low_precision_expected,
+    high_precision_expected,
+    reduction_sizes,
+    quantized_intermediates=0,
+):
+    """Bound kernel error by low-precision eager error against an FP64 measuring stick.
+
+    ``quantized_intermediates`` counts extra roundings to ``actual.dtype`` on the kernel's path
+    that eager does not share, such as a gradient computed from the saved low-precision output.
+    """
+    assert actual.shape == high_precision_expected.shape
+    assert torch.isfinite(actual).all()
+    if actual.numel() == 0:
+        return
+    actual_difference = (actual.double() - high_precision_expected).abs()
+    eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
+    accumulation_eps = (
+        sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
+    )
+    output_rounding_eps = torch.finfo(actual.dtype).eps
+    rounding_eps = accumulation_eps + (1 + quantized_intermediates) * output_rounding_eps
+    mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
+    max_atol = rounding_eps * high_precision_expected.abs().max().item()
+    assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
+    assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
+
+
+def assert_sink_gradient_fp32(
+    sink: torch.Tensor,
+    lse: torch.Tensor,
+    output: torch.Tensor,
+    grad_output: torch.Tensor,
+    grad_sink: torch.Tensor,
+) -> None:
+    """Check FP32 sink arithmetic independently of the saved output's quantization error."""
+    delta = (output.double() * grad_output.double()).sum(-1)
+    sink_partials = -torch.exp(sink.double()[None, :, None] - lse.double()) * delta
+    # Bound FP32 reduction error by the sum of magnitudes, not the cancellation-prone result.
+    allowance = 32 * torch.finfo(torch.float32).eps * sink_partials.abs().sum((0, 2))
+    assert torch.isfinite(grad_sink).all()
+    assert ((grad_sink.double() - sink_partials.sum((0, 2))).abs() <= allowance).all()

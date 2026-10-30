@@ -51,9 +51,9 @@ def _packed_gather_attn(
     cu_seqlens_k: Tensor,
     sliding_window_size: int,
     *,
+    scale: float,
     local_v: Tensor | None,
     sparse_v: Tensor | None,
-    scale: float,
 ) -> tuple[Tensor, Tensor]:
     """Gather actual slots so masked KV (including NaNs) cannot contaminate other documents."""
     batch, heads, tokens, dim = query.shape
@@ -113,9 +113,9 @@ def gather_attn(
     cu_seqlens_k: Tensor | None,
     sliding_window_size: int,
     *,
+    scale: float,
     local_v: Tensor | None,
     sparse_v: Tensor | None,
-    scale: float,
 ) -> tuple[Tensor, Tensor]:
     """
     Performs gather attention as follows:
@@ -183,9 +183,9 @@ def gather_attn(
             cu_seqlens,
             cu_seqlens_k,
             sliding_window_size,
+            scale=scale,
             local_v=local_v,
             sparse_v=sparse_v,
-            scale=scale,
         )
 
     group = h // local_kv.shape[1]

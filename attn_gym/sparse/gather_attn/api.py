@@ -8,6 +8,8 @@ from torch import Tensor
 
 from attn_gym.types import Impl, resolve_impl
 
+from .impl.routing import require_grouped_schedule, uses_grouped_schedule
+
 
 @dataclass(frozen=True, slots=True)
 class AuxRequest:
@@ -294,8 +296,16 @@ def gather_attn(
             Supply local_v and sparse_v together.
 
         sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to reuse
-            sparse_kv as the values. Separate values and 1 < kv_heads < num_heads are
-            currently supported only by Impl.REFERENCE.
+            sparse_kv as the values. Separate values and 1 < kv_heads < num_heads run on
+            Impl.REFERENCE, or on the Triton backend with SM100 or SM103, bfloat16 inputs,
+            head_dim <= 256 and divisible by 16, unit inner strides, and
+            sliding_window_size <= 2048; other inputs raise. The
+            CuTe backend requires shared values and one KV head. Passing the key tensor
+            objects themselves as both values (local_v is local_kv and sparse_v is
+            sparse_kv) runs them as shared values; other aliases, such as views, count as
+            separate values. With kv_heads == num_heads,
+            separate values run one query head per grouped-schedule tile, slower than the
+            shared-value MHA kernels.
 
         cu_seqlens: Packed offsets shaped [N + 1] for batch-one inputs, as contiguous
             int32 on query.device. They partition both queries and local_kv; the local
@@ -322,8 +332,9 @@ def gather_attn(
             Compiled calls, deterministic mode, and empty attention sets use Triton
             automatically. Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with Impl.REFERENCE.
-            Triton shared-KV backward uses nondeterministic atomic accumulation unless
-            torch.use_deterministic_algorithms is enabled.
+            The Triton backward accumulates with nondeterministic atomics for shared-KV inputs
+            and, for sparse selections over small heads, the grouped schedule's sparse dK/dV,
+            unless torch.use_deterministic_algorithms is enabled.
 
         scale: Positive multiplier for query-key logits. Defaults to 1 / sqrt(head_dim).
             Attention sink logits are not scaled.
@@ -360,6 +371,9 @@ def gather_attn(
         sparse_v,
     )
     kv_heads = sparse_kv.shape[1]
+    if sparse_v is sparse_kv and local_v is local_kv:
+        # Values that are the keys themselves keep the shared-value kernels.
+        local_v = sparse_v = None
     if scale is not None and not scale > 0:
         raise ValueError("scale must be greater than 0.")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
@@ -368,20 +382,29 @@ def gather_attn(
     if selected_impl is Impl.REFERENCE:
         from .impl import reference as implementation
     else:
-        # TODO: support separate values and grouped KV heads in the Triton backend.
-        if sparse_v is not None or kv_heads not in (1, query.shape[1]):
-            raise ValueError(
-                "fused gather_attn requires keys that are also the values (local_v and "
-                "sparse_v omitted) and 1 or num_heads KV heads; use impl='reference'"
-            )
         if query.device.type != "cuda":
             raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
+        grouped = uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None)
+        if grouped and backend == "cute":
+            raise ValueError(
+                "the CuTe gather_attn backend requires keys that are also the values and "
+                "one KV head; use kernel_options={'backend': 'triton'} or impl='reference'"
+            )
+        if grouped:
+            values = () if sparse_v is None else (sparse_v, local_v)
+            require_grouped_schedule(
+                query, (sparse_kv, local_kv, *values), sliding_window_size=sliding_window_size
+            )
         if backend is None:
-            backend = _select_backend(
-                query,
-                attention_sink,
-                kv_heads == 1,
-                num_keys=sliding_window_size + kv_indices.shape[-1],
+            backend = (
+                "triton"
+                if grouped
+                else _select_backend(
+                    query,
+                    attention_sink,
+                    kv_heads == 1,
+                    num_keys=sliding_window_size + kv_indices.shape[-1],
+                )
             )
         if backend == "cute":
             from .impl import cute as implementation

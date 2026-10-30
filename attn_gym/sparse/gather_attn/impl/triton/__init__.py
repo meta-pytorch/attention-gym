@@ -21,6 +21,8 @@ class _GatherAttnFunction(torch.autograd.Function):
         sliding_window_size: int,
         share_kv: bool,
         scale: float,
+        sparse_v: torch.Tensor | None,
+        local_v: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         output, lse, selected_queries, block_offsets = _gather_attn_fwd_op(
             query,
@@ -34,6 +36,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             share_kv,
             scale,
             True,
+            sparse_v,
+            local_v,
         )
         # Save the function inputs, including offsets, for backward and version checks.
         ctx.save_for_backward(
@@ -48,6 +52,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             lse,
             cu_seqlens,
             cu_seqlens_k,
+            sparse_v,
+            local_v,
         )
         ctx.sliding_window_size = sliding_window_size
         ctx.share_kv = share_kv
@@ -70,8 +76,17 @@ class _GatherAttnFunction(torch.autograd.Function):
             lse,
             cu_seqlens,
             cu_seqlens_k,
+            sparse_v,
+            local_v,
         ) = ctx.saved_tensors
-        grad_query, grad_sparse_kv, grad_local_kv, grad_sink = _gather_attn_bwd_op(
+        (
+            grad_query,
+            grad_sparse_kv,
+            grad_local_kv,
+            grad_sink,
+            grad_sparse_v,
+            grad_local_v,
+        ) = _gather_attn_bwd_op(
             query,
             sparse_kv,
             local_kv,
@@ -87,6 +102,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             ctx.sliding_window_size,
             ctx.share_kv,
             ctx.scale,
+            sparse_v,
+            local_v,
         )
         return (
             grad_query,
@@ -99,6 +116,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None if sparse_v is None else grad_sparse_v,
+            None if local_v is None else grad_local_v,
         )
 
 
@@ -125,9 +144,10 @@ def gather_attn(
 
     Args:
         query: (batch, heads, seq_len, head_dim) — queries.
-        local_kv: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values;
-            one head is broadcast to every query head and gets a single-head gradient.
-        sparse_kv: (batch, 1 or heads, sparse_seq_len, head_dim) — candidate KV pool.
+        local_kv: (batch, kv_heads, seq_len, head_dim) — local sliding-window keys, also the
+            values when local_v is None.
+        sparse_kv: (batch, kv_heads, sparse_seq_len, head_dim) — candidate key pool, also the
+            values when sparse_v is None.
         kv_indices: (batch, seq_len, topk) — global sparse_kv positions in dense mode,
             document-local positions with packed offsets.
         attention_sink: (heads,) — learned per-head sink weight.
@@ -135,8 +155,9 @@ def gather_attn(
         cu_seqlens_k: (num_documents + 1,) or None — cumulative packed candidate lengths.
         sliding_window_size: size of the causal sliding window.
         scale: Multiplier for query-key logits; does not scale sink logits.
-        local_v: must be None; separate values run on the reference backend.
-        sparse_v: must be None.
+        local_v: values shaped like local_kv, or None. Supplied together with sparse_v.
+        sparse_v: values shaped like sparse_kv, or None. Separate values and
+            1 < kv_heads < heads run on the grouped schedule.
 
     Returns:
         Tuple of (output, lse) where output has same shape as query and lse has
@@ -152,9 +173,38 @@ def gather_attn(
     attention_sink = attention_sink.contiguous()
 
     requires_grad = torch.is_grad_enabled() and any(
-        tensor.requires_grad for tensor in (query, local_kv, sparse_kv, attention_sink)
+        tensor is not None and tensor.requires_grad
+        for tensor in (query, local_kv, sparse_kv, local_v, sparse_v, attention_sink)
     )
     if requires_grad:
+        # Dynamo rejects one tensor passed as several autograd.Function inputs, as QSA passes
+        # one pool for local and sparse keys and values and one offsets tensor for both
+        # sequence partitions. Repeats become views; autograd sums their gradients back.
+        tensors = []
+        for tensor in (
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            attention_sink,
+            cu_seqlens,
+            cu_seqlens_k,
+            sparse_v,
+            local_v,
+        ):
+            repeated = tensor is not None and any(tensor is earlier for earlier in tensors)
+            tensors.append(tensor.view_as(tensor) if repeated else tensor)
+        (
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            attention_sink,
+            cu_seqlens,
+            cu_seqlens_k,
+            sparse_v,
+            local_v,
+        ) = tensors
         return _GatherAttnFunction.apply(
             query,
             sparse_kv,
@@ -166,6 +216,8 @@ def gather_attn(
             sliding_window_size,
             share_kv,
             scale,
+            sparse_v,
+            local_v,
         )
 
     output, lse, _, _ = _gather_attn_fwd_op(
@@ -180,5 +232,7 @@ def gather_attn(
         share_kv,
         scale,
         False,
+        sparse_v,
+        local_v,
     )
     return output, lse

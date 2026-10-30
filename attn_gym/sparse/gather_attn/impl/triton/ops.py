@@ -3,6 +3,7 @@
 import torch
 from torch import Tensor
 
+from ..routing import uses_grouped_schedule
 from .backward import _build_index_query_map, _launch_backward
 from .forward import _launch_forward
 
@@ -10,7 +11,8 @@ torch.library.define(
     "attn_gym::_gather_attn_fwd",
     "(Tensor query, Tensor sparse_kv, Tensor local_kv, Tensor kv_indices, "
     "Tensor attention_sink, Tensor? cu_seqlens, Tensor? cu_seqlens_k, "
-    "int sliding_window_size, bool share_kv, float scale, bool needs_backward) "
+    "int sliding_window_size, bool share_kv, float scale, bool needs_backward, "
+    "Tensor? sparse_v=None, Tensor? local_v=None) "
     "-> (Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
@@ -18,8 +20,9 @@ torch.library.define(
     "(Tensor query, Tensor sparse_kv, Tensor local_kv, Tensor kv_indices, "
     "Tensor selected_queries, Tensor block_offsets, Tensor attention_sink, "
     "Tensor? cu_seqlens, Tensor? cu_seqlens_k, Tensor output, Tensor lse, "
-    "Tensor grad_output, int sliding_window_size, bool share_kv, float scale) "
-    "-> (Tensor, Tensor, Tensor, Tensor)",
+    "Tensor grad_output, int sliding_window_size, bool share_kv, float scale, "
+    "Tensor? sparse_v=None, Tensor? local_v=None) "
+    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 
 
@@ -35,14 +38,20 @@ def _gather_attn_fwd_cuda(
     share_kv: bool,
     scale: float,
     needs_backward: bool,
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     with torch.cuda.device(query.device):
         query = query.contiguous()
         kv_indices = kv_indices.contiguous()
         attention_sink = attention_sink.contiguous()
+        kv_heads = sparse_kv.shape[1]
         if share_kv:
             sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
             local_kv = local_kv.expand(-1, query.shape[1], -1, -1)
+            if sparse_v is not None:
+                sparse_v = sparse_v.expand(-1, query.shape[1], -1, -1)
+                local_v = local_v.expand(-1, query.shape[1], -1, -1)
         output, lse = _launch_forward(
             query,
             sparse_kv,
@@ -53,8 +62,14 @@ def _gather_attn_fwd_cuda(
             cu_seqlens_k,
             sliding_window_size,
             scale,
+            kv_heads=kv_heads,
+            sparse_v=sparse_v,
+            local_v=local_v,
         )
-        if needs_backward:
+        # The grouped backward builds its own key-major map, so it needs no query map.
+        if needs_backward and not uses_grouped_schedule(
+            query.shape[1], kv_heads, sparse_v is not None
+        ):
             # Backward may enable deterministic mode after this forward has run.
             selected_queries, block_offsets = _build_index_query_map(
                 kv_indices, sparse_kv.shape[2], cu_seqlens, cu_seqlens_k
@@ -81,14 +96,20 @@ def _gather_attn_bwd_cuda(
     sliding_window_size: int,
     share_kv: bool,
     scale: float,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
+) -> tuple[Tensor, ...]:
     with torch.cuda.device(query.device):
         query = query.contiguous()
         kv_indices = kv_indices.contiguous()
         attention_sink = attention_sink.contiguous()
+        kv_heads = sparse_kv.shape[1]
         if share_kv:
             sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
             local_kv = local_kv.expand(-1, query.shape[1], -1, -1)
+            if sparse_v is not None:
+                sparse_v = sparse_v.expand(-1, query.shape[1], -1, -1)
+                local_v = local_v.expand(-1, query.shape[1], -1, -1)
         # The launcher reduces shared-KV gradients back to the original single head.
         # Deterministic mode is consulted here at execution time, not during tracing.
         return _launch_backward(
@@ -107,6 +128,9 @@ def _gather_attn_bwd_cuda(
             sliding_window_size,
             share_kv,
             scale,
+            kv_heads=kv_heads,
+            sparse_v=sparse_v,
+            local_v=local_v,
         )
 
 
@@ -127,10 +151,15 @@ def _gather_attn_fwd_fake(
     share_kv: bool,
     scale: float,
     needs_backward: bool,
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     batch, heads, seq_len, _ = query.shape
-    selected_size = seq_len * kv_indices.shape[2] if needs_backward else 0
-    offsets_size = sparse_kv.shape[2] + 1 if needs_backward else 0
+    needs_map = needs_backward and not uses_grouped_schedule(
+        heads, sparse_kv.shape[1], sparse_v is not None
+    )
+    selected_size = seq_len * kv_indices.shape[2] if needs_map else 0
+    offsets_size = sparse_kv.shape[2] + 1 if needs_map else 0
     return (
         query.new_empty(query.shape),
         query.new_empty((batch, heads, seq_len), dtype=torch.float32),
@@ -156,12 +185,16 @@ def _gather_attn_bwd_fake(
     sliding_window_size: int,
     share_kv: bool,
     scale: float,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
+) -> tuple[Tensor, ...]:
     return (
         query.new_empty(query.shape),
         sparse_kv.new_empty(sparse_kv.shape),
         local_kv.new_empty(local_kv.shape),
         attention_sink.new_empty(attention_sink.shape),
+        query.new_empty(0) if sparse_v is None else sparse_v.new_empty(sparse_v.shape),
+        query.new_empty(0) if local_v is None else local_v.new_empty(local_v.shape),
     )
 
 

@@ -5,10 +5,7 @@ from typing import NamedTuple
 
 import pytest
 import torch
-from test_gather_attn_triton import (
-    assert_matches_low_precision_eager,
-    assert_sink_gradient_fp32,
-)
+from test_gather_attn_triton import assert_matches_low_precision_eager
 
 from attn_gym.sparse.gather_attn import (
     AuxRequest,
@@ -16,6 +13,7 @@ from attn_gym.sparse.gather_attn import (
     Impl,
     gather_attn,
 )
+from attn_gym.testing.gather_attn import assert_sink_gradient_fp32
 
 pytestmark = pytest.mark.usefixtures("gather_attn_single_config")
 

@@ -98,7 +98,10 @@ testpaths = ["test"]
 norecursedirs = ["agent_space"]
 # `-n` honors `xdist_group` marks, so tests that pin specific GPUs never run concurrently.
 addopts = "--dist loadgroup"
-markers = ["full_autotune: exercise every production Triton autotuning candidate"]
+markers = [
+    "full_autotune: exercise every production Triton autotuning candidate",
+    "tuner_config(index): pin every gather_attn Triton tuner to that valid candidate",
+]
 
 # ---------- RUFF ------------
 [tool.ruff]

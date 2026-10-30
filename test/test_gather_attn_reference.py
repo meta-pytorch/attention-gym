@@ -139,7 +139,9 @@ def test_qsa_block_selection_matches_oracle():
             visible = local + 1
             complete = visible // block_size
             chosen = torch.randperm(complete, generator=generator)[:budget_blocks].tolist()
-            selected = [block * block_size + offset for block in chosen for offset in range(4)]
+            selected = [
+                block * block_size + offset for block in chosen for offset in range(block_size)
+            ]
             selected += list(range(complete * block_size, visible))
             kv_indices[0, position, : len(selected)] = torch.tensor(selected)
             position += 1

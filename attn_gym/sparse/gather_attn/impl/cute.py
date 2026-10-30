@@ -9,8 +9,8 @@ FA4 exposes a compile-friendly public wrapper upstream.
 
 Constraints
 -----------
-- head_dim = 512, 1 <= nheads <= 128, share_kv = True (fewer than 128 heads are
-  zero-padded to FA4's 64/128-head tiles in-kernel via TMA out-of-bounds)
+- head_dim = 512, 1 <= nheads <= 128 (fewer than 128 heads are zero-padded to FA4's
+  64/128-head tiles in-kernel via TMA out-of-bounds), one KV head that is also the values
 - dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
 - Requires FA4 4.0.0b32+ for sparse MLA attention sinks and, with fewer than 128
   heads, sparse-MLA head padding
@@ -41,7 +41,7 @@ def _constraint_violation(query: torch.Tensor, share_kv: bool) -> Exception | No
     if query.dtype != torch.bfloat16:
         return TypeError("CuTe backend requires bfloat16.")
     if not share_kv:
-        return ValueError("CuTe backend requires share_kv=True.")
+        return ValueError("CuTe backend requires one KV head that is also the values.")
     if d != 512:
         return ValueError(f"CuTe backend requires head_dim=512, got {d}.")
     if not 0 < h <= 128:
