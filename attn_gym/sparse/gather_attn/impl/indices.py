@@ -29,13 +29,13 @@ def _build_gather_indices_kernel(
     WINDOW: tl.constexpr,
     OUT_K: tl.constexpr,
     PACKED: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     query = tl.program_id(0)
     tile = tl.program_id(1)
     batch = tl.program_id(2)
-    if WIDE:
+    if USE_INT64_OFFSETS:
         query = query.to(tl.int64)
         tile = tile.to(tl.int64)
         batch = batch.to(tl.int64)
@@ -45,8 +45,8 @@ def _build_gather_indices_kernel(
     sparse_start = 0
     sparse_end = num_candidates
     if PACKED:
-        document = _document_ids(CuQ, query, num_documents, WIDE)
-        offset = document.to(tl.int64) if WIDE else document
+        document = _document_ids(CuQ, query, num_documents, USE_INT64_OFFSETS)
+        offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
         start = tl.load(CuQ + offset)
         query_end = tl.load(CuQ + offset + 1, document < num_documents, T)
         sparse_start = tl.load(CuK + offset)

@@ -49,21 +49,21 @@ def _gather_attn_bwd_dq_shared(
     WINDOW: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Compute query gradients across heads while reusing shared KV tiles."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, WIDE)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
-    GRAD_SINK_PARTIALS_STRIDES = offset_strides(GRAD_SINK_PARTIALS_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
+    GRAD_SINK_PARTIALS_STRIDES = offset_strides(GRAD_SINK_PARTIALS_STRIDES, USE_INT64_OFFSETS)
 
     sequence = tl.program_id(0)
     batch = tl.program_id(1)
@@ -105,7 +105,7 @@ def _gather_attn_bwd_dq_shared(
     candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
         query_start, _, candidate_start, candidate_end = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, USE_INT64_OFFSETS
         )
 
     if TOPK:
@@ -228,19 +228,19 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
     HAS_CU_SEQLENS: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Atomically scatter one query's sparse-KV gradient tile into shared dKV."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
-    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
+    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
 
     query_position = tl.program_id(0)
     batch = tl.program_id(1)
@@ -265,7 +265,7 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     candidate_end = SPARSE_SEQ_LEN
     if HAS_CU_SEQLENS:
         _, _, candidate_start, candidate_end = load_document_bounds(
-            cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, WIDE
+            cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, USE_INT64_OFFSETS
         )
     selected_valid = (
         selected_mask
@@ -358,19 +358,19 @@ def _gather_attn_bwd_dsparse_kv_shared(
     SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     SCALE: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
     """Accumulate a head tile into one partial shared sparse-KV gradient."""
-    S = tl.cast(S, tl.int64 if WIDE else tl.int32)
-    QUERY_STRIDES = offset_strides(QUERY_STRIDES, WIDE)
-    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, WIDE)
-    SELECTED_QUERIES_STRIDES = offset_strides(SELECTED_QUERIES_STRIDES, WIDE)
-    BLOCK_OFFSETS_STRIDES = offset_strides(BLOCK_OFFSETS_STRIDES, WIDE)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, WIDE)
-    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, WIDE)
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    SELECTED_QUERIES_STRIDES = offset_strides(SELECTED_QUERIES_STRIDES, USE_INT64_OFFSETS)
+    BLOCK_OFFSETS_STRIDES = offset_strides(BLOCK_OFFSETS_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
+    GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
 
     sparse_index = tl.program_id(0)
     batch = tl.program_id(1)
