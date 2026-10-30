@@ -104,6 +104,21 @@ def test_candidate_bounds_reuse_kernel_across_lengths(triton_compiles):
     assert triton_compiles["_candidate_bounds_kernel"] == 2
 
 
+def test_fa4_index_builder_reuses_kernel_across_lengths(triton_compiles):
+    """New token, document and candidate counts reuse the single- or multi-document kernel."""
+    device = _cuda()
+    from attn_gym.sparse.gather_attn.impl.indices import build_gather_indices
+
+    # Triton specializes integers equal to 1 and multiples of 16; cover both and neither.
+    for tokens, documents in ((1, 1), (1024, 16), (1031, 3), (1040, 1)):
+        cu_q = torch.linspace(0, tokens, documents + 1, device=device).to(torch.int32)
+        indices = _indices(2, tokens, 16, torch.int32, device=device)
+        build_gather_indices(indices, None, None, 13, tokens // 3)
+        build_gather_indices(indices[:1], cu_q, cu_q // 3, 13, tokens // 3)
+    # One dense binary, then packed binaries for one and for several documents.
+    assert triton_compiles["_build_gather_indices_kernel"] == 3
+
+
 def test_fa4_index_builder_fullgraph_dynamic():
     from attn_gym.sparse.gather_attn.impl.indices import build_gather_indices
 
