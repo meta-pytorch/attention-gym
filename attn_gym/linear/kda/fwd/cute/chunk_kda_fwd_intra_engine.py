@@ -49,7 +49,7 @@ from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_sequences"])
 def _diag_neumann_inverse_kernel(
     akkd,
     cu_seqlens,
