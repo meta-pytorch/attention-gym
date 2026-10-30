@@ -117,6 +117,22 @@ def _run_without_initial_state(
     )
 
 
+def test_ragged_delta_h_sequence_extent_bound_reuses_compiled_kernel():
+    """Packs on both sides of the sequence-extent selector share one compiled kernel."""
+    compile_fn = delta_h_module._compile_delta_h_bwd_packed
+    compile_fn.cache_clear()
+    sequences, heads = 32, 8
+    # Short documents (T <= 64 * N) enable the bound; longer ones disable it.
+    for call, length in enumerate((8, 66)):
+        lengths = [length] * sequences
+        tokens = sum(lengths)
+        assert should_bound_sequence_extent(tokens, sequences, heads, 64, False) is (call == 0)
+        metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+        _run_without_initial_state(_inputs(tokens, sequences, heads=heads), metadata)
+        info = compile_fn.cache_info()
+        assert (info.currsize, info.hits + info.misses) == (1, call + 1)
+
+
 def test_ragged_delta_h_without_initial_state_handles_zero_sequence_extent():
     physical_tokens = 128
     num_sequences = 32
