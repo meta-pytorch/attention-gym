@@ -218,7 +218,7 @@ def _l2norm_bwd_cuda(
         HEADS=heads,
         D=head_dim,
         BD=block_dim,
-        NB=triton.cdiv(rows, 16),
+        ROW_BUCKET=triton.next_power_of_2(rows),
         NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         IS_VARLEN=cu_seqlens is not None,
     )

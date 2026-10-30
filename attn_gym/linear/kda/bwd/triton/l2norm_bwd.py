@@ -32,12 +32,19 @@ _BT_LIST = [8, 16, 32, 64, 128]
 @triton.autotune(
     # The first config is the pinned autotune=False schedule: BT=8 with two warps.
     configs=[triton.Config({"BT": bt}, num_warps=w) for w in [2, 1, 4, 8, 16] for bt in _BT_LIST],
-    # NB selects a tuned schedule, not a different binary for each row count.
-    key=["D", "NB"],
+    # ROW_BUCKET selects a tuned schedule per power-of-two row count, not a binary per shape.
+    key=["D", "ROW_BUCKET"],
     **autotune_cache_kwargs,
 )
 @triton.jit(
-    do_not_specialize=["N_ROWS", "TOKENS", "NB", "NUM_SEQUENCES", "X_STRIDES", "DY_STRIDES"]
+    do_not_specialize=[
+        "N_ROWS",
+        "TOKENS",
+        "ROW_BUCKET",
+        "NUM_SEQUENCES",
+        "X_STRIDES",
+        "DY_STRIDES",
+    ]
 )
 def l2norm_bwd_kernel(
     x,
@@ -54,7 +61,7 @@ def l2norm_bwd_kernel(
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
-    NB,
+    ROW_BUCKET,
     NUM_SEQUENCES,
     IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
