@@ -125,3 +125,91 @@ def test_invalid_window(inputs, compile_call, window):
     error = ValueError if window == -1 else TypeError
     with pytest.raises(error, match="sliding_window_size must"):
         call(**inputs, sliding_window_size=window, impl=Impl.REFERENCE)
+
+
+def _values(inputs) -> dict[str, torch.Tensor]:
+    """Separate values with the same shapes as the fixture's keys."""
+    return {"local_v": inputs["local_kv"].clone(), "sparse_v": inputs["sparse_kv"].clone()}
+
+
+def _grouped(inputs, *, heads: int = 4) -> dict[str, torch.Tensor]:
+    """Widen the fixture's query to `heads` heads over its two-head KV pools."""
+    generator = torch.Generator().manual_seed(7)
+    return {
+        **inputs,
+        "query": torch.randn(1, heads, 4, 3, generator=generator),
+        "local_kv": torch.randn(1, 2, 4, 3, generator=generator),
+        "sparse_kv": torch.randn(1, 2, 2, 3, generator=generator),
+        "attention_sink": torch.randn(heads, generator=generator),
+    }
+
+
+@pytest.mark.parametrize("name", ["local_v", "sparse_v"])
+def test_values_must_be_supplied_together(inputs, name):
+    with pytest.raises(ValueError, match="local_v and sparse_v must be supplied together"):
+        gather_attn(**inputs, **{name: _values(inputs)[name]}, impl=Impl.REFERENCE)
+
+
+@pytest.mark.parametrize("name", ["local_v", "sparse_v"])
+def test_non_tensor_values(inputs, name):
+    values = {**_values(inputs), name: []}
+    with pytest.raises(TypeError, match=rf"{name} must be a torch.Tensor"):
+        gather_attn(**inputs, **values, impl=Impl.REFERENCE)
+
+
+@pytest.mark.parametrize("name", ["local_v", "sparse_v"])
+@pytest.mark.parametrize(
+    "corrupt,match",
+    [
+        (lambda values: values[..., :-1], "must have the same shape as"),
+        (lambda values: values.double(), "must have the same dtype as query"),
+    ],
+)
+def test_values_must_match_their_keys(inputs, name, corrupt, match):
+    values = _values(inputs)
+    values[name] = corrupt(values[name])
+    with pytest.raises(ValueError, match=rf"{name} {match}"):
+        gather_attn(**inputs, **values, impl=Impl.REFERENCE)
+
+
+def test_kv_heads_must_divide_query_heads(inputs):
+    with pytest.raises(ValueError, match="KV head count that divides the 3 query heads, got 2"):
+        gather_attn(**_grouped(inputs, heads=3), impl=Impl.REFERENCE)
+
+
+def test_local_kv_heads_must_match_sparse_kv(inputs):
+    inputs["sparse_kv"] = inputs["sparse_kv"].expand(-1, 2, -1, -1)
+    with pytest.raises(ValueError, match=r"local_kv must have shape \[batch, 2, "):
+        gather_attn(**inputs, impl=Impl.REFERENCE)
+
+
+@pytest.mark.parametrize("case", ["separate_values", "grouped_heads"])
+def test_fused_rejects_separate_values_and_grouped_heads(inputs, case):
+    """Fused kernels do not implement these yet; they must not silently compute MQA/MHA."""
+    call = {**inputs, **_values(inputs)} if case == "separate_values" else _grouped(inputs)
+    with pytest.raises(ValueError, match="fused gather_attn requires keys that are also"):
+        gather_attn(**call, impl=Impl.FUSED)
+
+
+@pytest.mark.usefixtures("fresh_compile_cache")
+def test_public_reference_fullgraph_grouped_separate_values(inputs):
+    """Validation of separate values and grouped KV heads traces under fullgraph compile."""
+    call = {
+        **_grouped(inputs),
+        "local_v": torch.randn(1, 2, 4, 3),
+        "sparse_v": torch.randn(1, 2, 2, 3),
+    }
+    differentiable = tuple(tensor for tensor in call.values() if tensor.is_floating_point())
+    for tensor in differentiable:
+        tensor.requires_grad_()
+    compiled = torch.compile(gather_attn, backend="eager", fullgraph=True)
+    expected, expected_aux = gather_attn(
+        **call, impl=Impl.REFERENCE, return_aux=AuxRequest(lse=True)
+    )
+    actual, actual_aux = compiled(**call, impl=Impl.REFERENCE, return_aux=AuxRequest(lse=True))
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(actual_aux.lse, expected_aux.lse)
+    expected_gradients = torch.autograd.grad(expected.square().sum(), differentiable)
+    actual_gradients = torch.autograd.grad(actual.square().sum(), differentiable)
+    for actual_gradient, expected_gradient in zip(actual_gradients, expected_gradients):
+        torch.testing.assert_close(actual_gradient, expected_gradient)

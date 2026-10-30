@@ -111,9 +111,10 @@ def gather_attn(
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
-    share_kv: bool,
     *,
     scale: float,
+    local_v: torch.Tensor | None,
+    sparse_v: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Triton implementation of gather attention.
 
@@ -124,7 +125,8 @@ def gather_attn(
 
     Args:
         query: (batch, heads, seq_len, head_dim) — queries.
-        local_kv: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values.
+        local_kv: (batch, 1 or heads, seq_len, head_dim) — local sliding-window key-values;
+            one head is broadcast to every query head and gets a single-head gradient.
         sparse_kv: (batch, 1 or heads, sparse_seq_len, head_dim) — candidate KV pool.
         kv_indices: (batch, seq_len, topk) — global sparse_kv positions in dense mode,
             document-local positions with packed offsets.
@@ -132,8 +134,9 @@ def gather_attn(
         cu_seqlens: (num_documents + 1,) or None — cumulative packed query lengths.
         cu_seqlens_k: (num_documents + 1,) or None — cumulative packed candidate lengths.
         sliding_window_size: size of the causal sliding window.
-        share_kv: if True, broadcast single-head KV and return single-head gradients.
         scale: Multiplier for query-key logits; does not scale sink logits.
+        local_v: must be None; separate values run on the reference backend.
+        sparse_v: must be None.
 
     Returns:
         Tuple of (output, lse) where output has same shape as query and lse has
@@ -141,6 +144,7 @@ def gather_attn(
     """
     if query.device.type != "cuda":
         raise ValueError("The Triton gather attention backend requires CUDA tensors.")
+    share_kv = sparse_kv.shape[1] == 1
 
     # Keep traceable normalization outside the opaque boundary so backward reuses each copy.
     query = query.contiguous()

@@ -39,9 +39,10 @@ def _validate_inputs(
     kv_indices: Tensor,
     attention_sink: Tensor | None,
     sliding_window_size: int,
-    share_kv: bool,
     cu_seqlens: Tensor | None,
     cu_seqlens_k: Tensor | None,
+    local_v: Tensor | None,
+    sparse_v: Tensor | None,
 ) -> None:
     """Validate tensor metadata without reading values or skipping compiled callers."""
     if type(sliding_window_size) is not int:
@@ -58,28 +59,29 @@ def _validate_inputs(
 
     if attention_sink is not None:
         tensors["attention_sink"] = attention_sink
+    if (local_v is None) != (sparse_v is None):
+        raise ValueError("local_v and sparse_v must be supplied together")
+    if local_v is not None:
+        tensors["local_v"] = local_v
+        tensors["sparse_v"] = sparse_v
 
     for name, tensor in tensors.items():
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}.")
 
-    if local_kv.dtype != query.dtype:
-        raise ValueError(
-            f"local_kv must have the same dtype as query, but got {local_kv.dtype} and {query.dtype}."
-        )
-    if sparse_kv.dtype != query.dtype:
-        raise ValueError(
-            f"sparse_kv must have the same dtype as query, but got {sparse_kv.dtype} and {query.dtype}."
-        )
-
-    if local_kv.device != query.device:
-        raise ValueError(
-            f"local_kv must be on the same device as query, but got {local_kv.device} and {query.device}."
-        )
-    if sparse_kv.device != query.device:
-        raise ValueError(
-            f"sparse_kv must be on the same device as query, but got {sparse_kv.device} and {query.device}."
-        )
+    kv_tensors = {"local_kv": local_kv, "sparse_kv": sparse_kv}
+    if local_v is not None:
+        kv_tensors.update(local_v=local_v, sparse_v=sparse_v)
+    for name, tensor in kv_tensors.items():
+        if tensor.dtype != query.dtype:
+            raise ValueError(
+                f"{name} must have the same dtype as query, but got {tensor.dtype} and {query.dtype}."
+            )
+        if tensor.device != query.device:
+            raise ValueError(
+                f"{name} must be on the same device as query, "
+                f"but got {tensor.device} and {query.device}."
+            )
 
     if query.ndim != 4:
         raise ValueError("query must have shape [batch, heads, sequence_length, head_dim].")
@@ -92,30 +94,37 @@ def _validate_inputs(
     if sliding_window_size < 0:
         raise ValueError("sliding_window_size must be non-negative.")
 
-    expected_kv_heads = 1 if share_kv else heads
-    if (
-        sparse_kv.ndim != 4
-        or sparse_kv.shape[0] != batch
-        or sparse_kv.shape[1] != expected_kv_heads
-        or sparse_kv.shape[3] != head_dim
-    ):
-        expected_h = "1" if share_kv else "heads"
+    if sparse_kv.ndim != 4 or sparse_kv.shape[0] != batch or sparse_kv.shape[3] != head_dim:
         raise ValueError(
-            f"sparse_kv must have shape [batch, {expected_h}, sparse_sequence_length, head_dim], "
+            "sparse_kv must have shape [batch, kv_heads, sparse_sequence_length, head_dim], "
             f"got {list(sparse_kv.shape)}."
+        )
+    kv_heads = sparse_kv.shape[1]
+    if kv_heads <= 0 or heads % kv_heads != 0:
+        raise ValueError(
+            f"sparse_kv must have a KV head count that divides the {heads} query heads, "
+            f"got {kv_heads}."
         )
     if (
         local_kv.ndim != 4
         or local_kv.shape[0] != batch
-        or local_kv.shape[1] != expected_kv_heads
+        or local_kv.shape[1] != kv_heads
         or local_kv.shape[2] != sequence_length
         or local_kv.shape[3] != head_dim
     ):
-        expected_h = "1" if share_kv else "heads"
         raise ValueError(
-            f"local_kv must have shape [batch, {expected_h}, sequence_length, head_dim], "
+            f"local_kv must have shape [batch, {kv_heads}, sequence_length, head_dim], "
             f"got {list(local_kv.shape)}."
         )
+    for name, values, keys, keys_name in (
+        ("local_v", local_v, local_kv, "local_kv"),
+        ("sparse_v", sparse_v, sparse_kv, "sparse_kv"),
+    ):
+        if values is not None and values.shape != keys.shape:
+            raise ValueError(
+                f"{name} must have the same shape as {keys_name}, "
+                f"got {list(values.shape)} and {list(keys.shape)}."
+            )
 
     if (
         kv_indices.ndim != 3
@@ -200,6 +209,8 @@ def gather_attn(
     kv_indices: Tensor,
     attention_sink: Tensor | None = ...,
     *,
+    local_v: Tensor | None = ...,
+    sparse_v: Tensor | None = ...,
     sliding_window_size: int = ...,
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
@@ -218,6 +229,8 @@ def gather_attn(
     kv_indices: Tensor,
     attention_sink: Tensor | None = ...,
     *,
+    local_v: Tensor | None = ...,
+    sparse_v: Tensor | None = ...,
     sliding_window_size: int = ...,
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
@@ -235,6 +248,8 @@ def gather_attn(
     kv_indices: Tensor,
     attention_sink: Tensor | None = None,
     *,
+    local_v: Tensor | None = None,
+    sparse_v: Tensor | None = None,
     sliding_window_size: int = 512,
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
@@ -248,17 +263,19 @@ def gather_attn(
         Each query attends to the previous sliding_window_size elements in the local_kv tensor
         as well as the positions in sparse_kv pointed to by kv_indices.
         Only one softmax is applied, covering both the sliding window and selected sparse positions.
+        Query head h reads KV head h // (num_heads // kv_heads), so kv_heads = 1 is MQA,
+        kv_heads = num_heads is MHA, and other divisors of num_heads are GQA.
 
     Args:
         query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
-        local_kv: Key and Value for the sliding window branch,
-            represented as a shared tensor, (batch_size, 1, sequence_length, head_dim)
-            Or represented as (batch_size, num_heads, sequence_length, head_dim)
+        local_kv: Keys for the sliding window branch, shaped
+            (batch_size, kv_heads, sequence_length, head_dim), where kv_heads divides
+            num_heads. They are also the values unless local_v is given.
 
-        sparse_kv: KV candidate pool for the indexing branch, shape of (batch, 1, X, head_dim)
-            Or shaped as (batch_size, num_heads, X, head_dim)
-            where X is any integer
+        sparse_kv: Key candidate pool for the indexing branch, shaped
+            (batch_size, kv_heads, X, head_dim), where X is any integer. Also the values
+            unless sparse_v is given.
 
         kv_indices: Integer selections shaped (batch, sequence_length, num_topk_blocks),
             shared across heads. Without packed offsets these index the batch's sparse_kv
@@ -271,6 +288,14 @@ def gather_attn(
         attention_sink: tensor in shape of (num_heads, ), learnable per-head weight that occupies
             the denominator of softmax. It may use the query dtype or torch.float32.
             If None, no attention sink will be applied
+
+        local_v: Values for the sliding window branch, shaped like local_kv, or None to
+            reuse local_kv as the values (shared K = V, as in DeepSeek's MLA latent).
+            Supply local_v and sparse_v together.
+
+        sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to reuse
+            sparse_kv as the values. Separate values and 1 < kv_heads < num_heads are
+            currently supported only by Impl.REFERENCE.
 
         cu_seqlens: Packed offsets shaped [N + 1] for batch-one inputs, as contiguous
             int32 on query.device. They partition both queries and local_kv; the local
@@ -322,7 +347,6 @@ def gather_attn(
     if kernel_options not in (None, {}, {"backend": "cute"}, {"backend": "triton"}):
         raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
 
-    share_kv = isinstance(sparse_kv, Tensor) and sparse_kv.ndim == 4 and sparse_kv.shape[1] == 1
     _validate_inputs(
         query,
         local_kv,
@@ -330,10 +354,12 @@ def gather_attn(
         kv_indices,
         attention_sink,
         sliding_window_size,
-        share_kv,
         cu_seqlens,
         cu_seqlens_k,
+        local_v,
+        sparse_v,
     )
+    kv_heads = sparse_kv.shape[1]
     if scale is not None and not scale > 0:
         raise ValueError("scale must be greater than 0.")
     scale = query.shape[-1] ** -0.5 if scale is None else scale
@@ -342,13 +368,19 @@ def gather_attn(
     if selected_impl is Impl.REFERENCE:
         from .impl import reference as implementation
     else:
+        # TODO: support separate values and grouped KV heads in the Triton backend.
+        if sparse_v is not None or kv_heads not in (1, query.shape[1]):
+            raise ValueError(
+                "fused gather_attn requires keys that are also the values (local_v and "
+                "sparse_v omitted) and 1 or num_heads KV heads; use impl='reference'"
+            )
         if query.device.type != "cuda":
             raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
         if backend is None:
             backend = _select_backend(
                 query,
                 attention_sink,
-                share_kv,
+                kv_heads == 1,
                 num_keys=sliding_window_size + kv_indices.shape[-1],
             )
         if backend == "cute":
@@ -369,8 +401,9 @@ def gather_attn(
         cu_seqlens,
         cu_seqlens_k,
         sliding_window_size,
-        share_kv,
         scale=scale,
+        local_v=local_v,
+        sparse_v=sparse_v,
     )
 
     if return_aux is None:

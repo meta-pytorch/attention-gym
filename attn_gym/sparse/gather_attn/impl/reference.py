@@ -51,6 +51,8 @@ def _packed_gather_attn(
     cu_seqlens_k: Tensor,
     sliding_window_size: int,
     *,
+    local_v: Tensor | None,
+    sparse_v: Tensor | None,
     scale: float,
 ) -> tuple[Tensor, Tensor]:
     """Gather actual slots so masked KV (including NaNs) cannot contaminate other documents."""
@@ -70,19 +72,21 @@ def _packed_gather_attn(
     sparse_indices = torch.where(sparse_valid, sparse_indices, 0)
     indices = torch.cat((local_indices, sparse_indices), dim=-1).long()
     valid = torch.cat((local_valid, sparse_valid), dim=-1)[:, None, :, :, None]
-    kv = torch.cat((local_kv, sparse_kv), dim=2)
-    kv_heads = kv.shape[1]
-    # Index the original pool rather than an expanded [B, H, T, pool, D] view:
-    # gather's backward would otherwise allocate a gradient for that entire view.
-    slots = kv[
-        torch.arange(batch, device=query.device)[:, None, None, None],
-        torch.arange(kv_heads, device=query.device)[None, :, None, None],
-        indices[:, None],
-    ]
-    # Multiplication by a zero probability does not neutralize NaN values or gradients.
-    slots = torch.where(valid, slots, 0)
+    kv_heads = local_kv.shape[1]
     accumulation_dtype = torch.promote_types(query.dtype, torch.float32)
-    slots_acc = slots.to(accumulation_dtype)
+    batch_index = torch.arange(batch, device=query.device)[:, None, None, None]
+    head_index = torch.arange(kv_heads, device=query.device)[None, :, None, None]
+
+    def gather_slots(local_pool: Tensor, sparse_pool: Tensor) -> Tensor:
+        pool = torch.cat((local_pool, sparse_pool), dim=2)
+        # Index the original pool rather than an expanded [B, H, T, pool, D] view:
+        # gather's backward would otherwise allocate a gradient for that entire view.
+        slots = pool[batch_index, head_index, indices[:, None]]
+        # Multiplication by a zero probability does not neutralize NaN values or gradients.
+        return torch.where(valid, slots, 0).to(accumulation_dtype)
+
+    slots_acc = gather_slots(local_kv, sparse_kv)
+    value_slots_acc = slots_acc if sparse_v is None else gather_slots(local_v, sparse_v)
     # Share the gathered slots across query heads, including for the two matmuls.
     grouped_query = query.reshape(batch, kv_heads, heads // kv_heads, tokens, dim)
     grouped_query = grouped_query.permute(0, 1, 3, 2, 4).to(accumulation_dtype)
@@ -94,7 +98,7 @@ def _packed_gather_attn(
     grouped_probabilities = probabilities.reshape(
         batch, kv_heads, heads // kv_heads, tokens, indices.shape[-1]
     ).permute(0, 1, 3, 2, 4)
-    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), slots_acc)
+    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), value_slots_acc)
     output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, dim)
     return output.to(query.dtype), lse
 
@@ -108,33 +112,34 @@ def gather_attn(
     cu_seqlens: Tensor | None,
     cu_seqlens_k: Tensor | None,
     sliding_window_size: int,
-    share_kv: bool,
     *,
+    local_v: Tensor | None,
+    sparse_v: Tensor | None,
     scale: float,
 ) -> tuple[Tensor, Tensor]:
     """
     Performs gather attention as follows:
-        if share_kv:
-            expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
+        Query head h reads KV head h // (num_heads // kv_heads).
         For each token, Q_i, in query:
             document = searchsorted(cu_seqlens[1:], i, right=True)
             first_token_of_document = cu_seqlens[document]
             farthest_past_token_index = max(i - sliding_window, first_token_of_document)
-            KV = cat([local_kv[farthest_past_token_index: i + 1], sparse_kv[indices]])
-            P = (Q @ KV.T) * scale
+            K = cat([local_kv[farthest_past_token_index: i + 1], sparse_kv[indices]])
+            V = the same slots of local_v / sparse_v, or K when they are None
+            P = (Q @ K.T) * scale
             P = softmax(cat([P, sink]))[:P.sequence_length]
             return P @ V
 
     Args:
         query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
 
-        local_kv: Key and Value for the sliding window branch,
-            represented as (batch_size, 1, sequence_length, head_dim) if share_kv is True.
-            Otherwise represented as (batch_size, num_heads, sequence_length, head_dim).
+        local_kv: Keys for the sliding window branch, shaped
+            (batch_size, kv_heads, sequence_length, head_dim); kv_heads divides num_heads.
+            They are also the values when local_v is None.
 
-        sparse_kv: KV candidate pool for the indexing branch, shape of (batch, 1, X, head_dim)
-            if share_kv is True.
-            Otherwise represented as (batch_size, num_heads, X, head_dim), where X may be zero.
+        sparse_kv: Key candidate pool for the indexing branch, shaped
+            (batch_size, kv_heads, X, head_dim), where X may be zero. Also the values when
+            sparse_v is None.
 
         kv_indices: Which entries to select from sparse_kv.
             Shape of (batch, sequence_length, num_topk_blocks), integer tensor
@@ -152,7 +157,12 @@ def gather_attn(
 
         sliding_window_size: Integer, size of sliding window
 
-        share_kv: bool, true iff all query heads attend to the same KV head
+        local_v: Values for the sliding window branch, shaped like local_kv, or None to use
+            local_kv as the values. Supplied together with sparse_v.
+
+        sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to use
+            sparse_kv as the values.
+
         scale: Multiplier for query-key logits; does not scale sink logits.
     Returns:
         Tuple of (output, lse) where output has shape (batch_size, num_heads, sequence_length,
@@ -173,11 +183,18 @@ def gather_attn(
             cu_seqlens,
             cu_seqlens_k,
             sliding_window_size,
+            local_v=local_v,
+            sparse_v=sparse_v,
             scale=scale,
         )
-    if share_kv:
-        local_kv = local_kv.expand(-1, h, -1, -1)
-        sparse_kv = sparse_kv.expand(-1, h, -1, -1)
+
+    group = h // local_kv.shape[1]
+
+    def repeat_kv_heads(tensor: Tensor) -> Tensor:
+        """Give each query head its KV head; a single KV head stays a broadcast view."""
+        return tensor[:, :, None].expand(-1, -1, group, -1, -1).flatten(1, 2)
+
+    local_kv, sparse_kv = repeat_kv_heads(local_kv), repeat_kv_heads(sparse_kv)
     counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=accumulation_dtype)
     if sparse_seq_len > 0:
         # We have s queries that each potentially attend to sparse_seq_len elements.
@@ -205,6 +222,11 @@ def gather_attn(
     attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
     query_acc = query.to(accumulation_dtype)
     attention_kv_acc = attention_kv.to(accumulation_dtype)
+    if sparse_v is None:
+        attention_v_acc = attention_kv_acc
+    else:
+        attention_v = torch.cat([repeat_kv_heads(sparse_v), repeat_kv_heads(local_v)], dim=-2)
+        attention_v_acc = attention_v.to(accumulation_dtype)
 
     # Match the optimized backends' mixed-precision boundaries: accumulate QK and
     # softmax in FP32 for low-precision inputs, then quantize P for the PV dot.
@@ -216,7 +238,7 @@ def gather_attn(
     probs, lse = _softmax_with_sink(logits, attention_sink)
     probs = probs.to(dtype)
 
-    # The low-precision P and KV operands accumulate in FP32 before the output
+    # The low-precision P and V operands accumulate in FP32 before the output
     # is stored in the input dtype, as in a tensor-core dot.
-    output = torch.matmul(probs.to(accumulation_dtype), attention_kv_acc).to(dtype)
+    output = torch.matmul(probs.to(accumulation_dtype), attention_v_acc).to(dtype)
     return output, lse

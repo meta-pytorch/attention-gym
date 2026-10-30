@@ -113,19 +113,23 @@ def gather_attn(
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
-    share_kv: bool = True,
     *,
     scale: float,
+    local_v: torch.Tensor | None,
+    sparse_v: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """CuTe DSL (SM100/SM103) forward+backward for gather attention.
 
     Eager-only — torch.compile is not supported for this backend.
     Optional per-head attention sinks are forwarded to FA4, which owns their gradients.
+    FA4's sparse MLA path reads one KV head that is also the value, so separate values
+    (local_v/sparse_v) or more KV heads are rejected.
 
     Returns:
         Tuple of (output, lse) where output has shape (batch, heads, seq, head_dim)
         and lse has shape (batch, heads, seq).
     """
+    share_kv = sparse_kv.shape[1] == 1 and sparse_v is None
     if (error := _constraint_violation(query, share_kv)) is not None:
         raise error
     from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
