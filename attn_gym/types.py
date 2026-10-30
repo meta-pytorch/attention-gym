@@ -4,8 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Implementation selection shared by attention operations."""
+"""Types shared by attention operations."""
 
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -23,3 +24,14 @@ def resolve_impl(impl: Impl | str) -> Impl:
     except ValueError:
         valid = ", ".join(repr(member.value) for member in Impl)
         raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
+
+
+@dataclass(frozen=True, slots=True)
+class AuxRequest:
+    """Specifies which auxiliary outputs an attention operation returns.
+
+    Attributes:
+        lse: If True, include the log-sum-exp tensor in the returned auxiliary data.
+    """
+
+    lse: bool = False

@@ -1,5 +1,6 @@
 import attn_gym.linear
 import attn_gym.masks
+import attn_gym.mla
 import attn_gym.mods
 import attn_gym.sparse
 from attn_gym.utils import (
@@ -17,6 +18,7 @@ __all__ = [
     "get_flash_block_size",
     "linear",
     "masks",
+    "mla",
     "mods",
     "sparse",
     "visualize_attention_scores",
