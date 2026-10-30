@@ -1232,6 +1232,36 @@ def test_backward_cuda_graph_replay(head_dim: int, portable: bool, monkeypatch):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, triton_compiles):
+    """New token and sequence counts launch the Triton backward compiled for an earlier shape."""
+    from triton.runtime.jit import JITFunction
+
+    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_wy as wy_module
+
+    force_portable_backward(monkeypatch)
+    # Autotuning may compile every candidate config once; nothing else may compile.
+    config_counts: dict[str, int] = {}
+    for kernel in (
+        wy_module.chunk_gdn_bwd_dqkwg_kernel,
+        wy_module.chunk_gdn_bwd_wy_kernel,
+        wy_module.chunk_gdn_bwd_gate_cumsum_kernel,
+    ):
+        configs = 1
+        while not isinstance(kernel, JITFunction):
+            configs = len(kernel.configs)
+            kernel = kernel.fn
+        config_counts[kernel.fn.__name__] = configs
+    # Sequence and token counts cover Triton's integer classes: one, a multiple of 16, other.
+    for lengths in ((70, 58), (64,), (1,), (37, 43, 65), (9,) * 16, (16,) * 16):
+        *inputs, cu_seqlens = make_gdn_test_inputs(
+            lengths, key_heads=1, value_heads=2, key_dim=64, requires_grad=True
+        )
+        run_with_gradients(tuple(inputs), "fused", cu_seqlens)
+    torch.cuda.synchronize()
+    compiled = {name: triton_compiles[name] for name in config_counts}
+    assert all(1 <= compiled[name] <= config_counts[name] for name in compiled), compiled
+
+
 def test_packed_cuda_graph_replays_boundaries():
     """Reread packed boundaries and chunk offsets on CUDA Graph replay."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128)

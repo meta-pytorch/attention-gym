@@ -70,7 +70,7 @@ def _load_last_gate(gate, valid_tokens, stride, BT: tl.constexpr):
     },
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_dqkwg_kernel(
     q,
     k,
@@ -222,7 +222,7 @@ def chunk_gdn_bwd_dqkwg_kernel(
     },
     **autotune_cache_kwargs,
 )
-@triton.jit
+@triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gdn_bwd_wy_kernel(
     k,
     v,
@@ -365,7 +365,7 @@ def chunk_gdn_bwd_wy_kernel(
     tl.store(d_gate + scalar_offsets, b_dgate, mask=token_mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_gate_cumsum_kernel(
     d_gate_direct,
     d_gate_wy,
