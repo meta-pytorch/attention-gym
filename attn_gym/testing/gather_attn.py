@@ -1,5 +1,7 @@
 """Shared operands and an independent per-query oracle for gather attention."""
 
+import math
+
 import torch
 from torch import Tensor
 
@@ -43,6 +45,37 @@ def make_gather_attn_test_inputs(
         inputs["local_v"] = randn(batch, kv_heads, tokens, head_dim)
         inputs["sparse_v"] = randn(batch, kv_heads, sparse_tokens, head_dim)
     return inputs
+
+
+def make_qsa_block_indices(
+    document_lengths: list[int],
+    *,
+    block_size: int,
+    budget_blocks: int,
+    generator: torch.Generator,
+    device: str | torch.device = "cuda",
+) -> Tensor:
+    """Build document-local token indices the way QSA selects them.
+
+    Each query keeps up to ``budget_blocks`` of its complete ``block_size``-token blocks,
+    expanded to token indices, plus the partial tail block ending at the query; -1 pads
+    the rest. Use with a raw-token sparse pool and ``sliding_window_size=0``.
+    """
+    width = budget_blocks * block_size + block_size - 1
+    indices = torch.full((1, sum(document_lengths), width), -1, dtype=torch.int64)
+    position = 0
+    for length in document_lengths:
+        for local in range(length):
+            visible = local + 1
+            complete = visible // block_size
+            chosen = torch.randperm(complete, generator=generator)[:budget_blocks].tolist()
+            selected = [
+                block * block_size + offset for block in chosen for offset in range(block_size)
+            ]
+            selected += list(range(complete * block_size, visible))
+            indices[0, position, : len(selected)] = torch.tensor(selected)
+            position += 1
+    return indices.to(device)
 
 
 def gather_attn_oracle(
@@ -109,3 +142,24 @@ def gather_attn_oracle(
         outputs.append(torch.stack(batch_outputs, dim=1))
         lses.append(torch.stack(batch_lses, dim=1))
     return torch.stack(outputs), torch.stack(lses)
+
+
+def assert_matches_low_precision_eager(
+    actual,
+    low_precision_expected,
+    high_precision_expected,
+    reduction_sizes,
+):
+    """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
+    assert torch.isfinite(actual).all()
+    actual_difference = (actual.double() - high_precision_expected).abs()
+    eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
+    accumulation_eps = (
+        sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
+    )
+    output_rounding_eps = torch.finfo(actual.dtype).eps
+    rounding_eps = accumulation_eps + output_rounding_eps
+    mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
+    max_atol = rounding_eps * high_precision_expected.abs().max().item()
+    assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
+    assert actual_difference.max().item() <= eager_difference.max().item() + max_atol

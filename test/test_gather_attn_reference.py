@@ -3,7 +3,11 @@ import torch
 
 from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
 from attn_gym.testing import cumulative_sequence_offsets
-from attn_gym.testing.gather_attn import gather_attn_oracle, make_gather_attn_test_inputs
+from attn_gym.testing.gather_attn import (
+    gather_attn_oracle,
+    make_gather_attn_test_inputs,
+    make_qsa_block_indices,
+)
 
 
 @pytest.mark.parametrize("share_kv", [False, True])
@@ -130,19 +134,13 @@ def test_qsa_block_selection_matches_oracle():
     generator = torch.Generator().manual_seed(0)
     keys = torch.randn(1, kv_heads, tokens, head_dim, dtype=torch.float64, generator=generator)
     values = torch.randn(1, kv_heads, tokens, head_dim, dtype=torch.float64, generator=generator)
-    # Each query reads up to budget_blocks complete blocks plus its partial tail block.
-    width = budget_blocks * block_size + block_size - 1
-    kv_indices = torch.full((1, tokens, width), -1, dtype=torch.int64)
-    position = 0
-    for length in document_lengths:
-        for local in range(length):
-            visible = local + 1
-            complete = visible // block_size
-            chosen = torch.randperm(complete, generator=generator)[:budget_blocks].tolist()
-            selected = [block * block_size + offset for block in chosen for offset in range(4)]
-            selected += list(range(complete * block_size, visible))
-            kv_indices[0, position, : len(selected)] = torch.tensor(selected)
-            position += 1
+    kv_indices = make_qsa_block_indices(
+        document_lengths,
+        block_size=block_size,
+        budget_blocks=budget_blocks,
+        generator=generator,
+        device="cpu",
+    )
     offsets = cumulative_sequence_offsets(document_lengths, device="cpu")
     inputs = {
         "query": torch.randn(1, heads, tokens, head_dim, dtype=torch.float64, generator=generator),

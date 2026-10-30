@@ -10,7 +10,8 @@ torch.library.define(
     "attn_gym::_gather_attn_fwd",
     "(Tensor query, Tensor sparse_kv, Tensor local_kv, Tensor kv_indices, "
     "Tensor attention_sink, Tensor? cu_seqlens, Tensor? cu_seqlens_k, "
-    "int sliding_window_size, bool share_kv, float scale, bool needs_backward) "
+    "int sliding_window_size, bool share_kv, float scale, bool needs_backward, "
+    "Tensor? sparse_v=None, Tensor? local_v=None) "
     "-> (Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
@@ -35,14 +36,20 @@ def _gather_attn_fwd_cuda(
     share_kv: bool,
     scale: float,
     needs_backward: bool,
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     with torch.cuda.device(query.device):
         query = query.contiguous()
         kv_indices = kv_indices.contiguous()
         attention_sink = attention_sink.contiguous()
+        kv_heads = sparse_kv.shape[1]
         if share_kv:
             sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
             local_kv = local_kv.expand(-1, query.shape[1], -1, -1)
+            if sparse_v is not None:
+                sparse_v = sparse_v.expand(-1, query.shape[1], -1, -1)
+                local_v = local_v.expand(-1, query.shape[1], -1, -1)
         output, lse = _launch_forward(
             query,
             sparse_kv,
@@ -53,6 +60,9 @@ def _gather_attn_fwd_cuda(
             cu_seqlens_k,
             sliding_window_size,
             scale,
+            kv_heads=kv_heads,
+            sparse_v=sparse_v,
+            local_v=local_v,
         )
         if needs_backward:
             # Backward may enable deterministic mode after this forward has run.
@@ -127,6 +137,8 @@ def _gather_attn_fwd_fake(
     share_kv: bool,
     scale: float,
     needs_backward: bool,
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     batch, heads, seq_len, _ = query.shape
     selected_size = seq_len * kv_indices.shape[2] if needs_backward else 0
