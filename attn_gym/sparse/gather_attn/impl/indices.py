@@ -8,7 +8,12 @@ from torch import Tensor
 from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
 
 
-@triton.jit
+# num_documents keeps its == 1 specialization, which folds the document search away. The
+# batch stride keeps its alignment hint, which vectorizes the index loads; that hint is stable
+# only when top-k is a multiple of 16, otherwise the stride changes class with T.
+@triton.jit(
+    do_not_specialize=["num_candidates", "T"], do_not_specialize_on_alignment=["num_documents"]
+)
 def _build_gather_indices_kernel(
     Indices,
     GatherIndices,
@@ -16,7 +21,7 @@ def _build_gather_indices_kernel(
     CuK,
     num_documents,
     num_candidates,
-    T: tl.constexpr,
+    T,
     K: tl.constexpr,
     stride_b,
     stride_t,
@@ -24,23 +29,24 @@ def _build_gather_indices_kernel(
     WINDOW: tl.constexpr,
     OUT_K: tl.constexpr,
     PACKED: tl.constexpr,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    row = tl.program_id(0)
+    query = tl.program_id(0)
     tile = tl.program_id(1)
-    if WIDE:
-        row = row.to(tl.int64)
+    batch = tl.program_id(2)
+    if USE_INT64_OFFSETS:
+        query = query.to(tl.int64)
         tile = tile.to(tl.int64)
-    batch = row // T
-    query = row % T
+        batch = batch.to(tl.int64)
+    row = batch * T + query
     start = 0
     query_end = T
     sparse_start = 0
     sparse_end = num_candidates
     if PACKED:
-        document = _document_ids(CuQ, query, num_documents, WIDE)
-        offset = document.to(tl.int64) if WIDE else document
+        document = _document_ids(CuQ, query, num_documents, USE_INT64_OFFSETS)
+        offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
         start = tl.load(CuQ + offset)
         query_end = tl.load(CuQ + offset + 1, document < num_documents, T)
         sparse_start = tl.load(CuK + offset)
@@ -80,7 +86,7 @@ def build_gather_indices(
     if batch * tokens == 0:
         return indices
     with torch.cuda.device(kv_indices.device):
-        _build_gather_indices_kernel[(batch * tokens, triton.cdiv(slots, 256))](
+        _build_gather_indices_kernel[(tokens, triton.cdiv(slots, 256), batch)](
             kv_indices,
             indices,
             cu_seqlens,

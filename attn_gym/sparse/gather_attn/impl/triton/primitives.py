@@ -107,11 +107,11 @@ def prune_wide_backward_configs(configs, args):
 
 
 @triton.jit
-def offset_strides(strides, WIDE: tl.constexpr):
+def offset_strides(strides, USE_INT64_OFFSETS: tl.constexpr):
     """Select address width before multiplying runtime strides and indices."""
     result = ()
     for axis in tl.static_range(len(strides)):
-        result += (tl.cast(strides[axis], tl.int64 if WIDE else tl.int32),)
+        result += (tl.cast(strides[axis], tl.int64 if USE_INT64_OFFSETS else tl.int32),)
     return result
 
 
@@ -144,11 +144,11 @@ def load_document_bounds(
     positions,
     num_documents,
     sequence_length,
-    WIDE: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     """Find query and candidate bounds; inactive queries have no sparse candidates."""
-    document = _document_ids(cu_seqlens_ptr, positions, num_documents, WIDE)
-    offset = document.to(tl.int64) if WIDE else document
+    document = _document_ids(cu_seqlens_ptr, positions, num_documents, USE_INT64_OFFSETS)
+    offset = document.to(tl.int64) if USE_INT64_OFFSETS else document
     # The right-sided search skips empty documents and returns N for tail/padded positions.
     start = tl.load(cu_seqlens_ptr + offset)
     end = tl.load(
