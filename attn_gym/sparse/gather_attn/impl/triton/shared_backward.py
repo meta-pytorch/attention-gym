@@ -40,7 +40,6 @@ def _gather_attn_bwd_dq_shared(
     num_documents,
     LSE_STRIDES,
     GRAD_SINK_PARTIALS_STRIDES,
-    B: tl.constexpr,
     H: tl.constexpr,
     S,
     D: tl.constexpr,
@@ -221,7 +220,6 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     num_documents,
     LSE_STRIDES,
     GRAD_SPARSE_KV_STRIDES,
-    B: tl.constexpr,
     H: tl.constexpr,
     S,
     D: tl.constexpr,
@@ -489,7 +487,7 @@ BWD_DQ_SHARED = TritonTuner(
         for block_n in (16, 64, 128)
         for num_warps in (4, 8)
     ],
-    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    key=tuning_key("query_ptr", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
     prune=prune_shared_dq_configs,
 )
 # Atomic configs accumulate into the same FP32 output, so it is cleared between trials.
@@ -506,7 +504,7 @@ BWD_DSPARSE_KV_SHARED_ATOMIC = TritonTuner(
             (32, 64, 8),
         )
     ],
-    key=tuning_key("query_ptr", "B", "H", "D", "TOPK", "HAS_CU_SEQLENS"),
+    key=tuning_key("query_ptr", "H", "D", "TOPK", "HAS_CU_SEQLENS"),
     prune=prune_wide_backward_configs,
     reset=_zero_grad_sparse_kv,
 )
