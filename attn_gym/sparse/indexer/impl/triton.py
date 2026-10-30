@@ -21,7 +21,7 @@ from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_
 _TILE_SMEM_BUDGET = 192 * 1024
 
 
-@triton.jit(do_not_specialize=["T", "S", "WB"])
+@triton.jit(do_not_specialize=["T", "S", "WB", "num_documents"])
 def _index_kernel(
     Q,
     K,
@@ -180,7 +180,9 @@ def launch(
     return output
 
 
-@triton.jit
+# A single document folds the document search away (1.4 -> 1.2 us on GB200), so num_documents
+# keeps its == 1 specialization but not the multiple-of-16 one.
+@triton.jit(do_not_specialize=["tokens"], do_not_specialize_on_alignment=["num_documents"])
 def _candidate_bounds_kernel(
     CuQ,
     CuK,

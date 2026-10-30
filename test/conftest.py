@@ -1,6 +1,8 @@
 """Shared pytest fixtures."""
 
 import os
+import sys
+from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -67,6 +69,37 @@ def fresh_compile_cache() -> Iterator[None]:
         yield
     finally:
         torch.compiler.reset()
+
+
+@pytest.fixture
+def triton_compiles(monkeypatch: pytest.MonkeyPatch) -> Counter[str]:
+    """Count Triton binaries built for each kernel name while the test runs.
+
+    The hook fires on every in-process kernel-cache miss, including binaries loaded from Triton's
+    disk cache, so a count reflects specializations rather than cold compiles. Those in-process
+    caches outlive a test, so the fixture first empties them for every loaded ``attn_gym`` kernel;
+    otherwise a specialization an earlier test built in the same worker would go uncounted.
+    """
+    import triton
+    from triton.runtime.autotuner import Autotuner, Heuristics
+    from triton.runtime.jit import JITFunction
+
+    for name, module in list(sys.modules.items()):
+        if module is None or name.partition(".")[0] != "attn_gym":
+            continue
+        for kernel in list(vars(module).values()):
+            while isinstance(kernel, Autotuner | Heuristics):
+                kernel = kernel.fn
+            if isinstance(kernel, JITFunction):
+                kernel.device_caches.clear()
+
+    compiles: Counter[str] = Counter()
+
+    def count(**kwargs) -> None:
+        compiles[kwargs["fn"].name] += 1
+
+    monkeypatch.setattr(triton.knobs.runtime, "jit_post_compile_hook", count)
+    return compiles
 
 
 @pytest.fixture

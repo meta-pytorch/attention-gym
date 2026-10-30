@@ -92,6 +92,18 @@ def test_candidate_bounds_match_document_intervals(causal, ratio):
         torch.testing.assert_close(actual.cpu(), expected)
 
 
+def test_candidate_bounds_reuse_kernel_across_lengths(triton_compiles):
+    """New token and document counts reuse the single- or multi-document kernel."""
+    device = _cuda()
+    from attn_gym.sparse.indexer.impl.triton import prepare_candidate_bounds
+
+    # Triton specializes integers equal to 1 and multiples of 16; cover both and neither.
+    for tokens, documents in ((1, 1), (1024, 16), (1031, 3), (1040, 1)):
+        cu_q = torch.linspace(0, tokens, documents + 1, device=device).to(torch.int32)
+        prepare_candidate_bounds(cu_q, cu_q // 3, tokens, True, 3)
+    assert triton_compiles["_candidate_bounds_kernel"] == 2
+
+
 def test_fa4_index_builder_fullgraph_dynamic():
     from attn_gym.sparse.gather_attn.impl.indices import build_gather_indices
 
