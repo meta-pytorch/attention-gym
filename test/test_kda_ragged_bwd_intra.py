@@ -220,6 +220,18 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
         torch.testing.assert_close(packed, sequence_local, rtol=0, atol=0)
 
 
+def test_ragged_bwd_intra_clamps_grid_wider_than_capacity():
+    """An explicit grid past the chunk capacity runs exactly like the capacity-wide grid."""
+    lengths = [65, 63]
+    inputs = _inputs(sum(lengths))
+    metadata = _metadata(lengths)
+    wide = chunk_kda_bwd_intra(
+        *inputs, metadata, config=ChunkKdaBwdIntraConfig(4 * metadata.capacity)
+    )
+    for actual, expected in zip(wide, _run(inputs, lengths), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("metadata", [None, "ragged"], ids=["dense", "ragged"])
 def test_bwd_intra_accepts_zero_tokens(metadata):
     inputs = _inputs(0)

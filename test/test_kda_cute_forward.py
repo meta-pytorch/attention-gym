@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import functools
 import gc
 import importlib
@@ -41,6 +42,7 @@ from attn_gym.linear.kda.ops import (
     chunk_replay_state_gather_op,
 )
 from attn_gym.testing import strided_state_pool
+from attn_gym.testing.kda import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
@@ -856,6 +858,38 @@ def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
     for result in gradients[1:]:
         for candidate, expected in zip(result, gradients[0], strict=True):
             torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
+
+
+def test_backward_tuning_reuses_winner_across_packed_document_counts(monkeypatch):
+    """Packs with a fixed token count but new document counts must not re-benchmark."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    benchmarked = collections.Counter()
+
+    def count_benchmark(fn) -> float:
+        benchmarked[type(fn.args[1])] += 1
+        return 1.0
+
+    monkeypatch.setattr(tune_module, "benchmark_gpu", count_benchmark)
+    monkeypatch.setattr(tune_module, "cache_enabled", lambda: False)
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    tokens = 16384
+    inputs = _inputs(tokens=tokens)
+    d_output = torch.randn_like(inputs[0])
+    tuned_configs = (ChunkKdaBwdIntraConfig, ChunkKdaBwdWyDqkgConfig)
+
+    counts = []
+    # Capacities 256-292 share the saturated intra bucket (256) and two wy/dQKG waves on 148-152
+    # SMs, so every pack reuses the first pack's winners.
+    for documents in (1, 2, 16, 37):
+        lengths = [100] * (documents - 1) + [tokens - 100 * (documents - 1)]
+        cu_seqlens = cumulative_sequence_offsets(lengths)
+        output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens, autotune=True)
+        torch.autograd.grad(output, inputs, d_output)
+        counts.append({config: benchmarked[config] for config in tuned_configs})
+
+    assert all(counts[0][config] > 0 for config in tuned_configs)
+    assert counts == [counts[0]] * len(counts)
 
 
 def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):

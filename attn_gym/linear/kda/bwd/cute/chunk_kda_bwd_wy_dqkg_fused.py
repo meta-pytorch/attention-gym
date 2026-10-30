@@ -50,6 +50,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
+from attn_gym.utils import cdiv
 
 # The retained tcgen05 descriptor and TMEM vector bridges are adapted from cuLA.
 # Copyright (c) 2025 ANTGROUP. All rights reserved.
@@ -3529,10 +3530,16 @@ class ChunkKdaBwdWyDqkgTunable:
 
     @staticmethod
     def tuning_key(args: Args, *, target: CompileTarget) -> tuple[int]:
-        """Key winners by the static persistent-grid work envelope."""
+        """Key winners by the power-of-two bucket of persistent-grid work waves.
+
+        The tile count (chunk capacity times heads) changes with the document count at a
+        fixed token count; the wave count it implies is what separates the 1- and 2-wave
+        schedules, so nearby capacities share a winner instead of re-benchmarking.
+        """
         if target.sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
-        return (args.h.shape[1] * args.v.shape[2],)
+        waves = cdiv(args.h.shape[1] * args.v.shape[2], target.sm_count)
+        return (1 << (waves - 1).bit_length(),)
 
     @staticmethod
     def configs(
