@@ -1983,7 +1983,10 @@ class ChunkKdaBwdIntraHmmaGrid:
 
 
 class ChunkKdaBwdIntraConfig(NamedTuple):
-    """Persistent-grid choice for intra-chunk backward."""
+    """Persistent-grid choice for intra-chunk backward.
+
+    ``grid_chunks`` is the chunk-axis grid width; launches clamp it to the chunk capacity.
+    """
 
     grid_chunks: int
 
@@ -2119,37 +2122,56 @@ class ChunkKdaBwdIntraTunable:
         return ChunkKdaBwdIntraConfig(grid_chunks)
 
     @staticmethod
-    def tuning_key(args: Args, *, target: CompileTarget) -> tuple[int]:
-        """Keep capacity-specific tuning winners."""
+    def capacity_bucket(capacity: int, sm_count: int) -> int:
+        """Round capacity up to the power of two that determines the tuning candidates.
+
+        Candidates stop depending on capacity at twice the largest power-of-two grid that
+        fits the target, so every larger capacity shares one bucket.
+        """
+        return min(triton.next_power_of_2(capacity), 2 * (1 << (sm_count.bit_length() - 1)))
+
+    @classmethod
+    def tuning_key(cls, args: Args, *, target: CompileTarget) -> tuple[int]:
+        """Share winners across capacities with the same candidate grids.
+
+        Packed capacity changes with the document count at a fixed token count, so an
+        exact key would re-benchmark nearly every training step for a launch-only choice.
+        """
         if target.sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
-        return (args.capacity,)
+        return (cls.capacity_bucket(args.capacity, target.sm_count),)
 
     @classmethod
     def configs(cls, args: Args) -> tuple[ChunkKdaBwdIntraConfig, ...]:
-        """Generate persistent-grid candidates from routing capacity and target size."""
+        """Generate persistent-grid candidates from the capacity bucket and target size.
+
+        Candidates may exceed a capacity in their bucket; launches clamp them to it, so only
+        the first candidate of each clamped grid is benchmarked.
+        """
         sm_count = get_compile_target().sm_count
         if sm_count is None:
             raise RuntimeError("KDA tuning requires a CUDA target with an SM count")
-        grid_limit = min(args.capacity, 1 << (sm_count.bit_length() - 1))
+        bucket = cls.capacity_bucket(args.capacity, sm_count)
+        grid_limit = min(bucket, 1 << (sm_count.bit_length() - 1))
         values = (
-            cls.default_config(args, target=get_compile_target()).grid_chunks,
+            max(1, grid_limit // 2),
             max(1, grid_limit // 4),
             grid_limit,
-            min(args.capacity, sm_count),
-            min(args.capacity, grid_limit * 2),
+            min(bucket, sm_count),
+            min(bucket, grid_limit * 2),
         )
-        return tuple(ChunkKdaBwdIntraConfig(value) for value in dict.fromkeys(values))
+        launched: dict[int, int] = {}
+        for value in values:
+            launched.setdefault(min(value, args.capacity), value)
+        return tuple(ChunkKdaBwdIntraConfig(value) for value in launched.values())
 
     @staticmethod
     def compile_call(
         config: ChunkKdaBwdIntraConfig,
         args: Args,
     ) -> tuple[int, bool, type[cutlass.Numeric], bool, bool]:
-        if not 1 <= config.grid_chunks <= args.capacity:
-            raise ValueError(
-                f"grid_chunks must be in [1, {args.capacity}], got {config.grid_chunks}"
-            )
+        if config.grid_chunks < 1:
+            raise ValueError(f"grid_chunks must be positive, got {config.grid_chunks}")
         io_type = cute_dtype(args.q.dtype).cute_type
         return (
             args.q.shape[2],
@@ -2195,7 +2217,8 @@ class ChunkKdaBwdIntraTunable:
             _column_token_head(args.dg2),
             args.cu_seqlens,
             args.chunk_offsets,
-            config.grid_chunks,
+            # Chunks past the capacity have no work, so a larger grid only adds idle CTAs.
+            min(config.grid_chunks, args.capacity),
         )
         db2 = torch.empty_like(args.db)
         elements = args.db.numel()
