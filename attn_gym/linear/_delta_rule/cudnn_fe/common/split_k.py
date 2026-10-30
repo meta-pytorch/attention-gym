@@ -7,7 +7,8 @@
 # gate head stride; hosts validate launch contracts (16-byte aligned channel-gate rows), compile
 # through jit_cache and keep the absent-scheduler ABI on replay; upstream-only knobs (GDP
 # expand_num, safe_gate with A_log/dt_bias/gate_lower_bound, log2_threshold overrides) are
-# resolved away; the channel-scan accumulator is a cute.make_rmem_tensor.
+# resolved away; the channel-scan accumulator is a cute.make_rmem_tensor; uncut launch facts pin
+# the scan's rows-per-warp bucket so it does not key the uncut hosts' compiles.
 
 """Split-K sequence partitioning for the chunked linear-attention kernels:
 GDN (scalar ``gate (T, HO)``, b_t=64) and KDA (per-key-channel
@@ -1835,7 +1836,9 @@ def _split_table_facts(
     n_heads_out = gate_shape[1]
     need_rows = chunk_scratch_rows(gate_shape[0], batch_size, b_t)
     grid_y = n_heads_out if gate_channels > 0 else -(-n_heads_out // WARP_SIZE)
-    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms)
+    # The scan unrolls over scan_rows, so it is a constexpr of the hosts; the uncut hosts trace
+    # no scan, and pinning it there keeps their compile keys free of the token count.
+    scan_rows = scan_rows_per_warp(need_rows, grid_y, num_sms) if split else SCAN_ROWS_PER_WARP_MAX
     n_scan_blocks = -(-need_rows // (SCAN_WARPS * scan_rows))
     n_scan_ctas = min(
         n_scan_blocks,

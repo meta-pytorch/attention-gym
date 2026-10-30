@@ -126,6 +126,71 @@ def test_v130_changing_shapes_reuses_only_static_configuration():
     assert sizes[2] == sizes[1]
 
 
+def test_v130_token_count_across_scan_buckets_reuses_uncut_compiles(monkeypatch):
+    """The uncut (``split=False``) hosts never launch the split-table scan, so the scan's
+    per-warp row bucket, which grows with the token count, must not key their compiles."""
+    from attn_gym.linear import chunk_kda
+    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.cudnn_fe import plan
+    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
+        chunk_scratch_rows,
+        scan_rows_per_warp,
+    )
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
+        kda_warmup_backward_f16,
+        kda_warmup_forward_f16,
+    )
+
+    # A small SM count makes tiny totals cross the scan thresholds (the split scan shrinks its
+    # rows per warp until the grid covers the SMs); the plan stays uncut at every size.
+    num_sm, heads, lengths_by_total = 4, 2, ([33, 31], [65, 63], [129, 127])
+    monkeypatch.setattr(plan, "_num_sm", lambda device: num_sm)
+    buckets = {
+        scan_rows_per_warp(
+            chunk_scratch_rows(sum(lengths), len(lengths), driver.B_T), heads, num_sm
+        )
+        for lengths in lengths_by_total
+    }
+    assert buckets == {1, 2, 4}, buckets
+    compile_fns = (
+        kda_warmup_forward_f16._compile_warmup_forward,
+        kda_warmup_backward_f16._compile_warmup_backward,
+    )
+
+    before = [fn.cache_info() for fn in compile_fns]
+    for lengths in lengths_by_total:
+        offsets = cumulative_sequence_offsets(lengths)
+        inputs = make_kda_test_inputs(
+            sum(lengths),
+            heads=heads,
+            seed=832,
+            gate_scale=0.69,
+            normalize_qk=True,
+            dtype=torch.float16,
+            requires_grad=True,
+        )
+        assert not driver.ForwardPlan.build(sum(lengths), len(lengths), heads, 128, "cuda").chain
+        actual, _ = chunk_kda(*inputs, cu_seqlens=offsets, kernel_options={"backend": "cudnn"})
+        high, _ = kda_reference(
+            *(t.double() for t in inputs), cu_seqlens=offsets, output_final_state=False
+        )
+        low, _ = kda_reference(
+            *(t.float() for t in inputs), cu_seqlens=offsets, output_final_state=False
+        )
+        assert_matches_low_precision_reference(
+            actual, high, low, f"forward at {sum(lengths)} tokens", source_dtype=torch.float16
+        )
+        grads = torch.autograd.grad(actual, inputs, torch.randn_like(actual))
+        assert all(torch.isfinite(g).all() for g in grads)
+    after = [fn.cache_info() for fn in compile_fns]
+    launches = [
+        a.hits + a.misses - (b.hits + b.misses) for a, b in zip(after, before, strict=True)
+    ]
+    assert launches == [len(lengths_by_total)] * len(compile_fns)
+    # One specialization per host serves all three token buckets.
+    assert [a.currsize - b.currsize for a, b in zip(after, before, strict=True)] == [1, 1]
+
+
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
 @pytest.mark.parametrize("with_state", (False, True), ids=("no-state", "state"))
 @pytest.mark.parametrize("scheme", ["uncut", "dv", "prep", "chain"])
