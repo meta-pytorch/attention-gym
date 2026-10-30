@@ -134,11 +134,16 @@ def _representative_config(kernel, *, num_warps, num_stages=None, **kwargs):
 def use_one_autotune_config_for_correctness_tests():
     """Avoid benchmarking configs whose outputs these tests never inspect."""
     selections = (_representative_config(l2norm_bwd_kernel, BT=16, num_warps=4),)
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", True)
-        for autotuner, config in selections:
-            monkeypatch.setattr(autotuner, "configs", [config])
-        yield
+    # cuBLAS settings are not plain attributes, so monkeypatch cannot restore them.
+    matmul_precision = torch.backends.cuda.matmul.fp32_precision
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    try:
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            for autotuner, config in selections:
+                monkeypatch.setattr(autotuner, "configs", [config])
+            yield
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = matmul_precision
 
 
 # Golden / plus-minus comparison helper
