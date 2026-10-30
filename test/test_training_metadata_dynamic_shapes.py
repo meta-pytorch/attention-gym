@@ -49,17 +49,21 @@ def _expected_offsets(lengths: list[int]) -> torch.Tensor:
 def test_metadata_reuses_backend_cache_across_independent_t_and_n():
     cache = _cache(_prepare_ragged_chunk_offsets_kernel)
     cache.clear()
-    # N=3 and N=4 share the necessary next-power-of-two vector class. T also
-    # crosses a divisibility boundary, independently of N and device contents.
-    for tokens, lengths in ((128, [65, 0, 31]), (257, [1, 64, 0]), (257, [0, 65, 1, 0])):
+    # Up to 128 sequences share one vector class. T also crosses a divisibility boundary,
+    # independently of N and device contents.
+    for tokens, lengths in (
+        (128, [65, 0, 31]),
+        (257, [1, 64, 0]),
+        (257, [0, 65, 1, 0] + [1] * 60),
+    ):
         metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
         torch.testing.assert_close(metadata.chunk_offsets, _expected_offsets(lengths))
         assert len(cache) == 1, "exact T/N created another metadata backend specialization"
 
-    lengths = [0, 65, 1, 0, 1]
+    lengths = [0, 65, 1, 0, 1] + [1] * 124
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), 257, 64)
     torch.testing.assert_close(metadata.chunk_offsets, _expected_offsets(lengths))
-    assert len(cache) == 2, "a different vector class must remain separately compiled"
+    assert len(cache) == 2, "a wider vector class must remain separately compiled"
 
 
 def _inputs(tokens: int, sequences: int, scalar_gate: bool, dtype: torch.dtype):

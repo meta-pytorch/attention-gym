@@ -375,7 +375,10 @@ def _prepare_ragged_chunk_offsets(
     """Build packed chunk offsets for the torch-only registration wrapper."""
     num_sequences = cu_seqlens.shape[0] - 1
     chunk_offsets = torch.empty_like(cu_seqlens)
-    block = triton.next_power_of_2(num_sequences)
+    # One single-CTA binary serves every batch of up to 128 sequences. The wider arange costs
+    # at most ~0.4 us per launch (GB200), negligible next to the chunk kernels, while each
+    # power-of-two block is a separate compile.
+    block = max(128, triton.next_power_of_2(num_sequences))
     _prepare_ragged_chunk_offsets_kernel[(1,)](
         cu_seqlens,
         chunk_offsets,

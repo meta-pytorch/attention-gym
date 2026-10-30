@@ -244,6 +244,15 @@ def test_ragged_chunk_scheduler_accepts_zero_capacity():
     assert actual.shape == (0, 5)
 
 
+def test_ragged_chunk_scheduler_reuses_kernel_across_small_batches(triton_compiles):
+    """Batches of up to 128 sequences share one compiled offsets kernel."""
+    for num_sequences in (1, 2, 3, 5, 17, 100, 128):
+        cu_seqlens = torch.arange(num_sequences + 1, device="cuda", dtype=torch.int32) * 70
+        metadata = prepare_ragged_chunk_metadata(cu_seqlens, 70 * num_sequences, 64)
+        torch.testing.assert_close(metadata.chunk_offsets, cu_seqlens // 35)
+    assert triton_compiles["_prepare_ragged_chunk_offsets_kernel"] == 1
+
+
 def test_ragged_chunk_scheduler_accepts_more_than_4096_sequences():
     num_sequences = 4097
     cu_seqlens = torch.arange(num_sequences + 1, device="cuda", dtype=torch.int32)
