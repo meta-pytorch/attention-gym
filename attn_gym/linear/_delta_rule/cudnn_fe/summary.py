@@ -41,27 +41,32 @@ from .plan import int32, workspace
 _GATE_SCALE_LOG2 = kda_summary_f16.DEFAULT_GATE_LOWER_BOUND * kda_summary_f16.LOG2_E
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["rows"])
 def _select_summary_work(
-    cu, bounds, work, count, HEADS: tl.constexpr, ROWS: tl.constexpr, FIELDS: tl.constexpr
+    cu,
+    bounds,
+    work,
+    count,
+    rows,
+    HEADS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    FIELDS: tl.constexpr,
 ):
     """Write one uncut native work item per sequence/head, zero-width unless a bound selects it.
 
-    ``ROWS == 0`` selects every sequence. Row layout follows ``common/split_k.py``:
+    ``rows == 0`` selects every sequence; ``ROW_BLOCK`` is a power of two covering ``rows``, the
+    only shape the kernel specializes on. Row layout follows ``common/split_k.py``:
     ``[seq, head, write_start, write_end, compute_start, compute_end, token_start, token_stop,
     final_dst, dstate_dst]``.
     """
     seq = tl.program_id(0)
     head = tl.program_id(1)
     start, stop = tl.load(cu + seq), tl.load(cu + seq + 1)
-    if ROWS == 0:
-        selected = True
-    else:
-        rows = tl.arange(0, triton.next_power_of_2(ROWS))
-        lo = tl.load(bounds + 2 * rows, rows < ROWS, other=-1)
-        hi = tl.load(bounds + 2 * rows + 1, rows < ROWS, other=-1)
-        selected = tl.sum(((lo == start) & (hi == stop) & (lo < hi)).to(tl.int32), 0) > 0
-    stop = tl.where(selected, stop, start)
+    bound = tl.arange(0, ROW_BLOCK)
+    lo = tl.load(bounds + 2 * bound, bound < rows, other=-1)
+    hi = tl.load(bounds + 2 * bound + 1, bound < rows, other=-1)
+    matched = tl.sum(((lo == start) & (hi == stop) & (lo < hi)).to(tl.int32), 0) > 0
+    stop = tl.where((rows == 0) | matched, stop, start)
     chunks = tl.cdiv(stop - start, 16)
     fields = tl.arange(0, 16)
     row = tl.where((fields == 0) | (fields >= 8), seq, tl.where(fields == 1, head, 0))
@@ -72,29 +77,31 @@ def _select_summary_work(
         tl.store(count, tl.num_programs(0) * HEADS)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["sequences"])
 def _gather_summary_rows(
     maps,
     cu,
     bounds,
     output,
+    sequences,
     HEADS: tl.constexpr,
-    SEQUENCES: tl.constexpr,
+    SEQ_BLOCK: tl.constexpr,
     V: tl.constexpr,
     K: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Map each subsequence bound to its summary, or synthesize the empty identity.
 
-    A nonempty row that is not a subsequence (NOTE [Summary ranges are subsequences] in
+    ``SEQ_BLOCK`` is a power of two covering ``sequences``, the only shape the kernel specializes
+    on. A nonempty row that is not a subsequence (NOTE [Summary ranges are subsequences] in
     ``attn_gym.linear.kda.stages``) is filled with NaN so the mistake surfaces at the first
     compose instead of silently using another subsequence's map.
     """
     row, head, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     start, stop = tl.load(bounds + row * 2), tl.load(bounds + row * 2 + 1)
-    seqs = tl.arange(0, triton.next_power_of_2(SEQUENCES))
-    lo = tl.load(cu + seqs, seqs < SEQUENCES, other=-1)
-    hi = tl.load(cu + seqs + 1, seqs < SEQUENCES, other=-1)
+    seqs = tl.arange(0, SEQ_BLOCK)
+    lo = tl.load(cu + seqs, seqs < sequences, other=-1)
+    hi = tl.load(cu + seqs + 1, seqs < sequences, other=-1)
     matches = (lo == start) & (hi == stop)
     seq = tl.max(tl.where(matches, seqs, 0), 0)
     offsets = block * BLOCK + tl.arange(0, BLOCK)
@@ -119,7 +126,16 @@ def _summary_rows(
     if bounds.shape[0]:
         block = 1024
         _gather_summary_rows[(bounds.shape[0], heads, cdiv(rows * k, block))](
-            maps, cu_seqlens, bounds, selected, heads, sequences, rows - k, k, block
+            maps,
+            cu_seqlens,
+            bounds,
+            selected,
+            sequences,
+            heads,
+            triton.next_power_of_2(sequences),
+            rows - k,
+            k,
+            block,
         )
     return selected
 
@@ -148,13 +164,15 @@ class _Launch:
             sequences * heads, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
         )
         work_count = int32(1, device)
+        rows = 0 if bounds is None else bounds.shape[0]
         _select_summary_work[(sequences, heads)](
             cu_seqlens,
             work_count if bounds is None else bounds,
             work_items,
             work_count,
+            rows,
             heads,
-            0 if bounds is None else bounds.shape[0],
+            max(1, triton.next_power_of_2(rows)),
             WORK_ITEM_FIELDS,
         )
         return cls(
