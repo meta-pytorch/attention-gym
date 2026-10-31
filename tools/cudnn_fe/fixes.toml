@@ -146,6 +146,17 @@ guarding_tests = [
 upstream_status = "ag-specific"
 
 [[fix]]
+id = "B18"
+title = "Uncut hosts no longer key their compiles on the split scan's token-count bucket"
+kind = "bugfix"
+ag_subject = "cuDNN-FE uncut hosts: stop keying compiles on the split scan's row bucket"
+guarding_tests = [
+  "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_token_count_across_scan_buckets_reuses_uncut_compiles",
+  "test/gdn/cudnn/test_gdn_cudnn_training.py::test_gdn_cudnn_token_count_across_scan_buckets_reuses_uncut_compiles",
+]
+upstream_status = "ag-specific"
+
+[[fix]]
 id = "B16"
 title = "Copy 4-byte-aligned gate/beta to 16-byte bases"
 kind = "bugfix"

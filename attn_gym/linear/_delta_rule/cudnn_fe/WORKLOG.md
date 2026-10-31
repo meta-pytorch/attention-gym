@@ -228,6 +228,19 @@ vendor the new tag.
   shape. **Tests:** GT::test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default,
   KV::test_v130_changing_shapes_reuses_only_static_configuration (asserts `cache_info()`).
 
+### B18 — Uncut compiles keyed on the split scan's row bucket
+- **Found by:** specialization audit of dynamic (varlen) workloads. `_split_table_facts` derived
+  `scan_rows` (the split scan's rows per warp, 1/2/4 by total tokens vs. SM count) for every
+  launch, and the four warmup hosts put it in their `@jit_cache` key even with `split=False`,
+  where no scan is traced. Each token bucket cost a redundant 3–11 s cold compile per host and
+  direction; the cached cubins were byte-identical across buckets.
+- **Fix:** `_split_table_facts` pins `scan_rows` to `SCAN_ROWS_PER_WARP_MAX` when `split` is
+  false (`common/split_k.py`). The split hosts keep the bucket: their scans unroll over it.
+- **Evidence:** fails without = YES: the guard tests see three specializations per host instead
+  of one. **Tests:** KV::test_v130_token_count_across_scan_buckets_reuses_uncut_compiles,
+  GT::test_gdn_cudnn_token_count_across_scan_buckets_reuses_uncut_compiles (assert
+  `cache_info().currsize` across the three buckets under a monkeypatched SM count).
+
 ### B16 — 4-byte-aligned gate/beta views rejected
 - **Found by:** PR #604 review: legal 4-byte-offset views failed TVM-FFI's 16-byte base ABI.
 - **Fix:** `aligned()` copies such gate/beta into a 16-byte base (`plan.py`).

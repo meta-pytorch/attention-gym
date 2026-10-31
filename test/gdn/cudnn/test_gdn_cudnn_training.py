@@ -834,6 +834,58 @@ def test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default(split: bo
             torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
 
 
+def test_gdn_cudnn_token_count_across_scan_buckets_reuses_uncut_compiles(monkeypatch) -> None:
+    """The uncut (``split=False``) hosts never launch the split-table scan, so the scan's
+    per-warp row bucket, which grows with the token count, must not key their compiles."""
+    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+    from attn_gym.linear._delta_rule.cudnn_fe import plan
+    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
+        chunk_scratch_rows,
+        scan_rows_per_warp,
+    )
+    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
+        gdn_warmup_backward_f16,
+        gdn_warmup_forward_f16,
+    )
+
+    # A small SM count makes tiny totals cross the scan thresholds (the split scan shrinks its
+    # rows per warp until the grid covers the SMs); the scalar-gate scan grid has one head row.
+    num_sm, lengths_by_total = 2, ([65, 63], [257, 191], [513, 447])
+    monkeypatch.setattr(plan, "_num_sm", lambda device: num_sm)
+    buckets = {
+        scan_rows_per_warp(chunk_scratch_rows(sum(lengths), len(lengths), fe_gdn.B_T), 1, num_sm)
+        for lengths in lengths_by_total
+    }
+    assert buckets == {1, 2, 4}, buckets
+    compile_fns = (
+        gdn_warmup_forward_f16._compile_warmup_forward,
+        gdn_warmup_backward_f16._compile_warmup_backward,
+    )
+
+    before = [fn.cache_info() for fn in compile_fns]
+    for lengths in lengths_by_total:
+        q, k, value, gate, beta, _, cu_seqlens = make_gdn_test_inputs(
+            lengths, key_heads=2, value_heads=2, seed=715
+        )
+        inputs = tuple(t.requires_grad_() for t in (q, k, value, gate, beta))
+        d_output = torch.randn_like(value)
+        results = []
+        for kernel_options in (None, _CUDNN_KERNEL_OPTIONS):
+            output, _ = public_chunk_gdn(
+                *inputs, cu_seqlens=cu_seqlens, kernel_options=kernel_options
+            )
+            results.append((output, *torch.autograd.grad(output, inputs, d_output)))
+        for actual, expected in zip(results[1], results[0], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+    after = [fn.cache_info() for fn in compile_fns]
+    launches = [
+        a.hits + a.misses - (b.hits + b.misses) for a, b in zip(after, before, strict=True)
+    ]
+    assert launches == [len(lengths_by_total)] * len(compile_fns)
+    # One specialization per host serves all three token buckets.
+    assert [a.currsize - b.currsize for a, b in zip(after, before, strict=True)] == [1, 1]
+
+
 def test_gdn_cudnn_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
     """A long stream on few tiles runs as an exact piece chain in both directions; it must agree
     with the uncut plan on output, final state, and every gradient, including the state ones."""

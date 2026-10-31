@@ -34,7 +34,8 @@ Changes made for Attention Gym:
 - Compilation: frozen config dataclasses and module-level `jit_cache` compile functions over fake
   TVM-FFI tensor signatures (`common/tvm_ffi.py`) that reproduce the upstream placeholder ABI, with
   int64-extent variants for oversized tensors, so no live placeholder tensors are allocated and
-  compiled kernels persist across processes.
+  compiled kernels persist across processes; uncut launches pin the split scan's rows-per-warp
+  bucket so the token count does not key their compiles.
 - Bug fixes: mbarriers initialized by one thread (GDN prefill, summary, and backward); the KDA
   delta residual stays FP32 through subtraction and beta scaling in every kernel that forms it;
   the GDN bprop computes dBeta without dividing by beta, from the beta-free inverse factor it
