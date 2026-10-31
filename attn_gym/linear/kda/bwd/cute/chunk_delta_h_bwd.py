@@ -196,7 +196,6 @@ class BlackwellDeltaHBwd:
         head_bv: int = 16,
         varlen: bool = False,
         use_int64_offsets: bool = False,
-        bound_sequence_extent: bool = False,
         dynamic_state_layout: bool = False,
         fastmath: bool = False,
         scalar_gate: bool = False,
@@ -209,12 +208,10 @@ class BlackwellDeltaHBwd:
         self.num_heads = num_heads
         self.varlen = varlen
         self.use_int64_offsets = use_int64_offsets
-        self.bound_sequence_extent = bound_sequence_extent
         self.dynamic_state_layout = dynamic_state_layout
         self.fastmath = fastmath
         # Scalar gate: gk is one decay per (token, head) instead of one per key dimension.
         self.scalar_gate = scalar_gate
-        assert not bound_sequence_extent or varlen, "sequence extent applies only to varlen inputs"
 
         # Tile dimensions
         self.BT = 64
@@ -266,7 +263,7 @@ class BlackwellDeltaHBwd:
         return (
             f"kda_bwd_dhu_dv_fused_vl{int(self.varlen)}_h{self.num_heads}"
             f"_k{self.head_k}_v{self.head_v}_bt{self.BT}_bv{self.BV}_{cute_dtype(self.io_type).name}"
-            f"_i64{int(self.use_int64_offsets)}_se{int(self.bound_sequence_extent)}"
+            f"_i64{int(self.use_int64_offsets)}"
             f"_ds{int(self.dynamic_state_layout)}_fm{int(self.fastmath)}"
         )
 
@@ -477,6 +474,7 @@ class BlackwellDeltaHBwd:
         use_gk: Int32,
         use_dht: Int32,
         use_dh0: Int32,
+        bound_sequence_extent: Int32,
         stream,
     ):
         if cutlass.const_expr(self.varlen):
@@ -895,6 +893,7 @@ class BlackwellDeltaHBwd:
             use_gk,
             use_dht,
             use_dh0,
+            bound_sequence_extent,
         ).launch(
             grid=self._launch_grid(),
             block=[self.CTA_THREADS, 1, 1],
@@ -1674,6 +1673,7 @@ class BlackwellDeltaHBwd:
         use_gk: Int32,
         use_dht: Int32,
         use_dh0: Int32,
+        bound_sequence_extent: Int32,
     ):
         mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
         atom_k, desc_k = tma.k
@@ -1936,11 +1936,14 @@ class BlackwellDeltaHBwd:
         gdx = cute.arch.grid_dim()[0]
         value_tiles = self.head_v // self.BV
         sequence_extent = B
-        if cutlass.const_expr(self.bound_sequence_extent):
-            tid, _, _ = cute.arch.thread_idx()
-            if tid % self.WARP_SZ == 0:
-                sequence_extent = load_ragged_sequence_extent(cu_seqlens)
-            sequence_extent = Int32(cute.arch.shuffle_sync(sequence_extent, 0))
+        if cutlass.const_expr(self.varlen):  # noqa: SIM102
+            # A uniform runtime branch: the host enables it only for short-document packs,
+            # where trimming graph-overcaptured sequences outweighs the extra metadata read.
+            if bound_sequence_extent != 0:
+                tid, _, _ = cute.arch.thread_idx()
+                if tid % self.WARP_SZ == 0:
+                    sequence_extent = load_ragged_sequence_extent(cu_seqlens)
+                sequence_extent = Int32(cute.arch.shuffle_sync(sequence_extent, 0))
         work_tiles = value_tiles * self.num_heads * sequence_extent
         n_iters = (work_tiles - bx + gdx - 1) // gdx
 
@@ -2343,6 +2346,7 @@ def _compile_delta_h_bwd(
         Int32(0),
         Int32(0),
         Int32(0),
+        Int32(0),
     )
 
 
@@ -2352,7 +2356,6 @@ def _compile_delta_h_bwd_packed(
     bv: int,
     io_type: type[cutlass.Numeric],
     use_int64_offsets: bool,
-    bound_sequence_extent: bool,
     dynamic_state_layout: bool,
     fastmath: bool = False,
     scalar_gate: bool = False,
@@ -2369,7 +2372,6 @@ def _compile_delta_h_bwd_packed(
         io_type=io_type,
         varlen=True,
         use_int64_offsets=use_int64_offsets,
-        bound_sequence_extent=bound_sequence_extent,
         dynamic_state_layout=dynamic_state_layout,
         fastmath=fastmath,
         scalar_gate=scalar_gate,
@@ -2415,6 +2417,7 @@ def _compile_delta_h_bwd_packed(
         metadata,
         (Int32(1), Int32(1), Int32(heads), Int32(key_dim), Int32(value_dim)),
         Float32(1.0),
+        Int32(0),
         Int32(0),
         Int32(0),
         Int32(0),
@@ -2531,13 +2534,6 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         bv,
         io_type,
         use_int64_offsets,
-        should_bound_sequence_extent(
-            tokens,
-            sequences,
-            heads,
-            chunk_size,
-            h0 is not None,
-        ),
         requires_dynamic_state_layout(final_state_kernel, initial_state_gradient_kernel),
         fastmath,
         scalar_gate,
@@ -2551,6 +2547,7 @@ def _blackwell_delta_h_bwd_dhu_dv_fused_packed(
         Int32(gk is not None),
         Int32(dht is not None),
         Int32(h0 is not None),
+        Int32(should_bound_sequence_extent(tokens, sequences, heads, chunk_size, h0 is not None)),
     )
     return chunk_state, d_initial_state, d_value
 
@@ -2665,6 +2662,7 @@ def blackwell_delta_h_bwd_dhu_dv_fused(
         Int32(gk is not None),
         Int32(dht is not None),
         Int32(h0 is not None),
+        Int32(0),
     )
 
     return dh_out, dh0_out, dv2
