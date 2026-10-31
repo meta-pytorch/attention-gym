@@ -75,6 +75,32 @@ Line length: 99 chars. Python target: 3.10+. Formatter/linter: ruff.
 Do not use `ghstack` in this repository. For commit stacks, use `stack-pr` or GitHub's
 native stacked-PR support through `gh stack`.
 
+## Kernel Specialization for Dynamic Shapes
+
+Training and serving here are varlen: total tokens, document count, batch, and chunk capacity
+change nearly every step, and each new compile or autotune sweep stalls that step (measured from 0.1 s
+to over 10 s per occurrence). Keep kernels as dynamic as possible without giving up measured steady-state
+performance:
+
+- Pass sizes that only feed bounds, masks, grids, offsets, or loop trip counts (`T`, `S`, batch,
+  document count, capacity, strides that scale with them) as runtime values. In Triton also list
+  them in `do_not_specialize`: a plain int still compiles separate variants for `== 1` and for
+  multiples of 16. In CuTeDSL keep them `cute.sym_int` in fake signatures and out of `jit_cache`
+  arguments.
+- Specialize what changes generated code and measurably pays: head/feature dims, tiles, dtypes,
+  mode flags, int32 versus int64 offsets, and strides fixed by the model. Element-count bounds on
+  vectorized masked loads may keep Triton's default divisibility hint (dropping it measured
+  1.26-1.52x slower on paged replay).
+- Never key a compile or tuning cache on a value the kernel does not read, or on a flag whose code
+  is behind another disabled `const_expr` branch.
+- Tuning keys bucket what moves the winner (for example a power of two of grid fill or work
+  waves), not exact `T` or `N`. Clamp or bucket size-derived constexprs such as
+  `next_power_of_2(N)` arange widths so the variant count stays small.
+- Prove reuse with a test that varies shapes across the specialization classes (`1`, multiples
+  of 16, other values, bucket edges) and asserts compile or tuning counts
+  (`triton.knobs.runtime.jit_post_compile_hook`, `compile_fn.cache_info()`, the tunable winner
+  cache). A/B warm performance before keeping or removing a specialization.
+
 ## Adding CuTeDSL Kernels
 
 Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache`
