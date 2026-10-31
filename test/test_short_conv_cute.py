@@ -3407,7 +3407,7 @@ def test_short_conv_training_graph_replays_boundaries(route: str, tokens: int):
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("with_state", [False, True])
 def test_short_conv_training_forward_reuses_tail_classes(packed, with_state):
-    """Full physical tiles are one bounded class, not an exact-T specialization."""
+    """Dense full physical tiles are one bounded class; packed launches never key on T."""
     compile_fn = cute_backend._compile_forward
     compile_fn.cache_clear()
     for call, (batch, tokens) in enumerate([(2, 17), (3, 33), (3, 16), (2, 48), (2, 32)]):
@@ -3439,4 +3439,5 @@ def test_short_conv_training_forward_reuses_tail_classes(packed, with_state):
             actual, (x, weight) if initial is None else (x, weight, initial), incoming
         )
         _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
-        _assert_specializations(compile_fn, calls=call + 1, specializations=1 if call < 2 else 2)
+        specializations = 2 if call >= 2 and not packed else 1
+        _assert_specializations(compile_fn, calls=call + 1, specializations=specializations)

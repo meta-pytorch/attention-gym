@@ -2934,6 +2934,14 @@ def _input_alignment(x: torch.Tensor, config: ShortConvConfig, *, tma: bool = Fa
     return x.element_size()
 
 
+def _full_time_tiles(tokens: int, config: ShortConvConfig, *, packed: bool) -> bool:
+    """Whether a dense forward can skip tail bounds because every time tile is full.
+
+    Packed tiles always bound by the runtime endpoint, so packed launches never key on T.
+    """
+    return not packed and tokens % config.times_per_block == 0
+
+
 def _launch_forward(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2962,7 +2970,7 @@ def _launch_forward(
         initial_state is not None,
         resolved_activation,
         _needs_int64(x, weight, output, initial_state),
-        tokens % config.times_per_block == 0,
+        _full_time_tiles(tokens, config, packed=cu_seqlens is not None),
     )
     compiled(
         x,
@@ -3253,7 +3261,7 @@ def tune_causal_conv1d(
             kernel_initial_state is not None,
             resolved_activation,
             use_int64_offsets,
-            tokens % config.times_per_block == 0,
+            _full_time_tiles(tokens, config, packed=packed),
         ),
         parallel_compile=parallel_compile,
     )
