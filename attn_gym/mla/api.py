@@ -208,8 +208,9 @@ def paged_mla_decode(
         scale: Positive multiplier for the logits. There is no default: the right value
             is the model's ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`` (times any
             rope scaling correction), not ``1 / sqrt(latent_dim + rope_dim)``.
-        impl: ``Impl.FUSED`` (default) runs FlashAttention-4's absorbed MLA kernel
-            (eager-only); ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
+        impl: ``Impl.FUSED`` (default) runs FlashAttention's absorbed MLA kernel:
+            FlashAttention-4 on SM100/SM103 (eager-only), FlashAttention-3 on SM90.
+            ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return ``(output, PagedMLADecodeAux)`` with the requested outputs.
 
@@ -247,9 +248,21 @@ def paged_mla_decode(
                 scale=scale,
             )
         else:
-            from .impl import cute
+            from .impl import cute, fa3
 
-            out, lse = cute.paged_mla_decode(
+            if not q_latent.is_cuda:
+                raise ValueError("The fused paged_mla_decode requires CUDA tensors.")
+            capability = torch.cuda.get_device_capability(q_latent.device)
+            if capability in cute.SUPPORTED_CAPABILITIES:
+                backend = cute
+            elif capability in fa3.SUPPORTED_CAPABILITIES:
+                backend = fa3
+            else:
+                raise ValueError(
+                    "The fused paged_mla_decode requires SM90 (FlashAttention-3) or "
+                    f"SM100/SM103 (FlashAttention-4), got SM{capability[0]}{capability[1]}."
+                )
+            out, lse = backend.paged_mla_decode(
                 q_latent,
                 q_rope,
                 latent_cache,

@@ -6,16 +6,15 @@ import pytest
 import torch
 
 from attn_gym.mla import AuxRequest, Impl, paged_mla_decode
-from attn_gym.mla.impl.cute import SUPPORTED_CAPABILITIES
+from attn_gym.mla.impl import cute, fa3
 from attn_gym.testing import cumulative_sequence_offsets
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     assert_rms_matches_low_precision_reference,
 )
 
-CUTE_CAPABLE = (
-    torch.cuda.is_available() and torch.cuda.get_device_capability() in SUPPORTED_CAPABILITIES
-)
+CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
+FUSED_CAPABLE = CAPABILITY in cute.SUPPORTED_CAPABILITIES + fa3.SUPPORTED_CAPABILITIES
 
 
 def _make_inputs(
@@ -141,6 +140,8 @@ def test_rejects_mismatched_metadata():
         )
     with pytest.raises(ValueError, match="scale"):
         paged_mla_decode(**inputs, max_seqlen_q=1, scale=0.0, impl="reference")
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
+        paged_mla_decode(**inputs, max_seqlen_q=1, scale=1.0)
 
 
 def test_output_is_forward_only():
@@ -163,12 +164,16 @@ def test_output_is_forward_only():
         )
 
 
-@pytest.mark.skipif(not CUTE_CAPABLE, reason="FA4 absorbed MLA requires SM100 or SM103")
+@pytest.mark.skipif(
+    not FUSED_CAPABLE, reason="Fused absorbed MLA requires SM90 (FA3) or SM100/SM103 (FA4)"
+)
 @pytest.mark.parametrize("block_size", [16, 64])
 @pytest.mark.parametrize("num_heads", [1, 16, 128])
 def test_fused_matches_reference(num_heads, block_size):
     """Decode rows, multi-token rows, and one-key rows over shuffled 576-wide cache views."""
-    pytest.importorskip("flash_attn.cute")
+    pytest.importorskip(
+        "flash_attn.cute" if CAPABILITY in cute.SUPPORTED_CAPABILITIES else "flash_attn_interface"
+    )
     query_lengths = [1, 1, 3, 1, 2, 1]
     key_lengths = [17, 1000, 333, 4096, 64, 1]
     inputs = _make_inputs(
