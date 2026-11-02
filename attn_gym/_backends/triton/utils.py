@@ -65,6 +65,34 @@ def ptr_offset(indices, strides):
     return offset
 
 
+@triton.constexpr_function
+def _tree_levels(width: int) -> int:
+    return width.bit_length() - 1
+
+
+@triton.jit
+def fixed_tree_sum(x):
+    """Sum FP32 values along the last axis in an order fixed by that axis's length alone.
+
+    ``tl.sum``'s association order follows the thread layout, which changes with the tile shape
+    and ``num_warps``. Each level here adds adjacent pairs; ``a + b == b + a`` makes every pair
+    sum exact regardless of which thread holds which lane, so every launch config yields the same
+    bits per slice.
+
+    The last axis must have power-of-two length; callers zero-pad masked lanes. Leading axes are
+    independent, and the result drops the last axis. Keep each level a ``tl.sum`` over a pair
+    rather than ``tl.split`` plus ``+``: the latter let the compiler fuse a caller's ``x * x`` into
+    the first add as an FMA under only some layouts, changing FP32 bits across launch configs.
+    """
+    tl.static_assert(len(x.shape) > 0)
+    tl.static_assert(x.dtype == tl.float32)
+    width: tl.constexpr = x.shape[-1]
+    tl.static_assert(width > 0 and (width & (width - 1)) == 0)
+    for _ in tl.static_range(_tree_levels(width)):
+        x = tl.sum(tl.reshape(x, x.shape[:-1] + [x.shape[-1] // 2, 2]), axis=-1)
+    return tl.sum(x, axis=-1)
+
+
 @triton.jit
 def _document_ids(CuQ, query, num_documents, USE_INT64_OFFSETS: tl.constexpr):
     low = tl.full(query.shape, 0, tl.int32)
