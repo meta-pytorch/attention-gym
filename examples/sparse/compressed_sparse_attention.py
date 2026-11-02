@@ -4,11 +4,19 @@ Implementation of compressed sparse attention from here: https://arxiv.org/html/
 """
 
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
 
-from attn_gym.sparse.gather_attn import Impl, gather_attn
+from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
+
+
+class CSAOutput(NamedTuple):
+    output: torch.Tensor
+    """(B, H, S, D) attention output."""
+    indexer_loss: torch.Tensor | None
+    """Scalar indexer distillation loss, or None unless requested."""
 
 
 def pad_to_block_size(x: torch.Tensor, m: int, value: float) -> torch.Tensor:
@@ -213,6 +221,22 @@ def _gather_attn_with_causal_blocks(
     return attn_result, selected_is_valid
 
 
+def gather_selected_blocks(blocks: torch.Tensor, topk_blocks: torch.Tensor) -> torch.Tensor:
+    """Gather each query's selected compressed blocks.
+
+    Args:
+        blocks: (B, H, num_blocks, D) compressed blocks.
+        topk_blocks: (B, S, K) block indices per query.
+    Returns:
+        (B, H, S, K, D) selected blocks.
+    """
+    batch, heads, _, dim = blocks.shape
+    _, sequence_length, k = topk_blocks.shape
+    index = topk_blocks.reshape(batch, 1, sequence_length * k, 1)
+    selected = blocks.gather(2, index.expand(batch, heads, sequence_length * k, dim))
+    return selected.reshape(batch, heads, sequence_length, k, dim)
+
+
 def CSA(
     Q,
     Q_I,
@@ -239,7 +263,9 @@ def CSA(
     sliding_window_size,
     rope_dims: int,
     share_kv: bool,
-):
+    *,
+    compute_indexer_loss: bool = False,
+) -> CSAOutput:
     """
     Naming of args uses convention from DeepSeek V4 paper
 
@@ -279,6 +305,10 @@ def CSA(
     sliding_window_size: size of sliding window for SWA
     rope_dims: number of dimensions to apply rope to
     share_kv: True if all query heads attend to one kv head
+    compute_indexer_loss: also return the auxiliary loss that trains the indexer to match
+        main attention (see `indexer_loss`). Its gradient reaches only the indexer inputs
+        (Q_I, W_I, K_I*, Z_I*, B_I*, compressed_indices_norm_weight); the main-attention
+        side of the loss is detached.
     """
 
     device = Q.device
@@ -353,7 +383,7 @@ def CSA(
         dim=-1,
     ).indices
 
-    attention_output, _selected_is_valid = _gather_attn_with_causal_blocks(
+    attention_output, aux, selected_is_valid = _gather_attn_with_causal_blocks(
         Q,
         KV,
         compressed_kv,
@@ -361,15 +391,29 @@ def CSA(
         indexer_mask,
         attention_sink,
         sliding_window_size,
+        return_aux=AuxRequest(lse=True),
     )
 
-    return torch.cat(
+    aux_loss = None
+    if compute_indexer_loss:
+        # Top-k selection is discrete; the loss trains the indexer through the scores of
+        # the blocks it selected.
+        aux_loss = indexer_loss(
+            Q,
+            gather_selected_blocks(compressed_kv, topk_blocks),
+            aux.lse,
+            scores.gather(dim=-1, index=topk_blocks),
+            selected_is_valid,
+        )
+
+    output = torch.cat(
         [
             attention_output[..., :-rope_dims],
             apply_rope(attention_output[..., -rope_dims:], inverse=True),
         ],
         dim=-1,
     )
+    return CSAOutput(output, aux_loss)
 
 
 def indexer_loss(
@@ -379,7 +423,13 @@ def indexer_loss(
     selected_indexer_logits: torch.Tensor,
     selected_is_valid: torch.Tensor,
 ) -> torch.Tensor:
-    """Computes the auxilary indexer loss Deepseek used in their paper. Takes the KL divergence between the attention
+    """Computes the auxiliary indexer loss from DeepSeek-V3.2, as used by V4's CSA.
+
+    The teacher is main attention's probability on each selected compressed block, summed over
+    heads and L1-normalized over the selected blocks. Normalizing by the full attention LSE
+    (window + selected blocks + sink) weights each head by the mass it puts on compressed
+    blocks. The student is the softmax of the indexer's logits over the same blocks, and the
+    loss is KL(teacher || student).
 
     Args:
         main_query: (B, H, S, D) — main attention queries (detached).
@@ -441,88 +491,79 @@ def indexer_loss(
     return valid_kl.sum() / row_has_valid.sum().clamp_min(1)
 
 
-def main() -> None:
+def main(num_steps: int = 100) -> None:
+    """Run CSA, then train only the indexer to match main attention's block choices."""
     torch.manual_seed(0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.float64
 
     batch_size = 1
-    num_heads = 2
-    num_index_heads = 1
-    sequence_length = 5
-    head_dim = 4
-    index_head_dim = 4
-
-    compression_rate = 2
-    num_topk_blocks = 1
-    sliding_window_size = 2
-    rope_dims = 4
-    share_kv = True
-    num_blocks = (sequence_length + compression_rate - 1) // compression_rate
+    num_heads = 4
+    num_index_heads = 2
+    sequence_length = 64
+    head_dim = 16
+    index_head_dim = 16
+    compression_rate = 4
+    num_topk_blocks = 4
+    sliding_window_size = 8
+    rope_dims = 8
+    num_blocks = math.ceil(sequence_length / compression_rate)
 
     def randn(*shape):
         return torch.randn(*shape, device=device, dtype=dtype)
 
-    Q = randn(batch_size, num_heads, sequence_length, head_dim)
-    Q_I = randn(batch_size, num_index_heads, sequence_length, index_head_dim)
+    # Main-attention inputs; with share_kv=True, KV-side tensors have one head.
+    main_inputs = {
+        "Q": randn(batch_size, num_heads, sequence_length, head_dim),
+        "KV": randn(batch_size, 1, sequence_length, head_dim),
+        "C_a": randn(batch_size, 1, sequence_length, head_dim),
+        "C_b": randn(batch_size, 1, sequence_length, head_dim),
+        "Z_a": randn(batch_size, 1, sequence_length, 1),
+        "Z_b": randn(batch_size, 1, sequence_length, 1),
+        "B_a": randn(1, num_heads, num_blocks, 1, 1),
+        "B_b": randn(1, num_heads, num_blocks, 1, 1),
+        "KV_norm_weight": torch.ones(head_dim, device=device, dtype=dtype),
+        "compressed_kv_norm_weight": torch.ones(head_dim, device=device, dtype=dtype),
+        "attention_sink": torch.zeros(num_heads, device=device, dtype=dtype),
+    }
+    # Indexer inputs stand in for the indexer's projections and are what the loss trains.
+    indexer_inputs = {
+        "Q_I": randn(batch_size, num_index_heads, sequence_length, index_head_dim),
+        "W_I": randn(batch_size, sequence_length, num_index_heads),
+        "K_Ia": randn(batch_size, 1, sequence_length, index_head_dim),
+        "K_Ib": randn(batch_size, 1, sequence_length, index_head_dim),
+        "Z_Ia": randn(batch_size, 1, sequence_length, 1),
+        "Z_Ib": randn(batch_size, 1, sequence_length, 1),
+        "B_Ia": randn(1, num_index_heads, num_blocks, 1, 1),
+        "B_Ib": randn(1, num_index_heads, num_blocks, 1, 1),
+        "compressed_indices_norm_weight": torch.ones(index_head_dim, device=device, dtype=dtype),
+    }
+    for tensor in indexer_inputs.values():
+        tensor.requires_grad_()
 
-    # Shared KV inputs start with one head and are expanded by CSA.
-    KV = randn(batch_size, 1, sequence_length, head_dim)
-    C_a = randn(batch_size, 1, sequence_length, head_dim)
-    C_b = randn(batch_size, 1, sequence_length, head_dim)
-    Z_a = randn(batch_size, 1, sequence_length, 1)
-    Z_b = randn(batch_size, 1, sequence_length, 1)
-    B_a = randn(1, num_heads, num_blocks, 1, 1)
-    B_b = randn(1, num_heads, num_blocks, 1, 1)
+    def run_csa() -> CSAOutput:
+        return CSA(
+            **main_inputs,
+            **indexer_inputs,
+            compression_rate=compression_rate,
+            num_topk_blocks=num_topk_blocks,
+            sliding_window_size=sliding_window_size,
+            rope_dims=rope_dims,
+            share_kv=True,
+            compute_indexer_loss=True,
+        )
 
-    W_I = randn(batch_size, sequence_length, num_index_heads)
-    K_Ia = randn(batch_size, 1, sequence_length, index_head_dim)
-    K_Ib = randn(batch_size, 1, sequence_length, index_head_dim)
-    Z_Ia = randn(batch_size, 1, sequence_length, 1)
-    Z_Ib = randn(batch_size, 1, sequence_length, 1)
-    B_Ia = randn(1, num_index_heads, num_blocks, 1, 1)
-    B_Ib = randn(1, num_index_heads, num_blocks, 1, 1)
-
-    KV_norm_weight = torch.ones(head_dim, device=device, dtype=dtype)
-    compressed_indices_norm_weight = torch.ones(
-        index_head_dim,
-        device=device,
-        dtype=dtype,
-    )
-    compressed_kv_norm_weight = torch.ones(head_dim, device=device, dtype=dtype)
-    attention_sink = torch.zeros(num_heads, device=device, dtype=dtype)
-
-    output = CSA(
-        Q=Q,
-        Q_I=Q_I,
-        KV=KV,
-        C_a=C_a,
-        C_b=C_b,
-        Z_a=Z_a,
-        Z_b=Z_b,
-        B_a=B_a,
-        B_b=B_b,
-        W_I=W_I,
-        K_Ia=K_Ia,
-        K_Ib=K_Ib,
-        Z_Ia=Z_Ia,
-        Z_Ib=Z_Ib,
-        B_Ia=B_Ia,
-        B_Ib=B_Ib,
-        KV_norm_weight=KV_norm_weight,
-        compressed_indices_norm_weight=compressed_indices_norm_weight,
-        compressed_kv_norm_weight=compressed_kv_norm_weight,
-        attention_sink=attention_sink,
-        compression_rate=compression_rate,
-        num_topk_blocks=num_topk_blocks,
-        sliding_window_size=sliding_window_size,
-        rope_dims=rope_dims,
-        share_kv=share_kv,
-    )
-
-    print("Output shape:", output.shape)
-    print(output)
+    optimizer = torch.optim.Adam(indexer_inputs.values(), lr=1e-2)
+    for step in range(num_steps):
+        output, loss = run_csa()
+        if step == 0:
+            print("Output shape:", tuple(output.shape))
+        if step % 20 == 0 or step == num_steps - 1:
+            print(f"step {step:3d}  indexer KL {loss.item():.4f}")
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
 
 if __name__ == "__main__":
