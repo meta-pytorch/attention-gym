@@ -5,6 +5,7 @@ from examples/sparse/compressed_sparse_attention.py. The standalone reference CS
 defined inline here for comparison.
 """
 
+import inspect
 import math
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -379,7 +380,7 @@ def test_gather_attn_matches_csa_reference_fp64(share_kv, num_topk_blocks):
 
     with torch.inference_mode():
         expected = reference_CSA(*inputs)
-        actual = csa_example.CSA(*inputs)
+        actual = csa_example.CSA(*inputs).output
 
     assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
@@ -396,11 +397,46 @@ def test_gather_attn_matches_csa_reference_cuda_fp64():
 
     with torch.inference_mode():
         expected = reference_CSA(*inputs)
-        actual = csa_example.CSA(*inputs)
+        actual = csa_example.CSA(*inputs).output
 
     assert actual.device.type == expected.device.type == "cuda"
     assert actual.dtype == expected.dtype == torch.float64
     torch.testing.assert_close(actual, expected, atol=ATOL, rtol=RTOL)
+
+
+@pytest.mark.parametrize("share_kv", [False, True])
+def test_csa_indexer_loss_trains_only_indexer(share_kv):
+    inputs = _make_inputs(share_kv, 2, dtype=torch.float64, device=torch.device("cpu"))
+    names = inspect.signature(csa_example.CSA).parameters
+    tensors = {
+        name: value.requires_grad_()
+        for name, value in zip(names, inputs)
+        if isinstance(value, torch.Tensor)
+    }
+    indexer_names = {
+        "Q_I",
+        "W_I",
+        "K_Ia",
+        "K_Ib",
+        "Z_Ia",
+        "Z_Ib",
+        "B_Ia",
+        "B_Ib",
+        "compressed_indices_norm_weight",
+    }
+
+    output, loss = csa_example.CSA(*inputs, compute_indexer_loss=True)
+    grads = torch.autograd.grad(loss, list(tensors.values()), allow_unused=True)
+
+    assert loss.shape == () and loss.item() > 0
+    for name, grad in zip(tensors, grads):
+        if name in indexer_names:
+            assert grad is not None and torch.isfinite(grad).all(), name
+            assert torch.count_nonzero(grad) > 0, name
+        else:
+            assert grad is None or torch.count_nonzero(grad) == 0, name
+    with torch.no_grad():
+        torch.testing.assert_close(output, csa_example.CSA(*inputs).output)
 
 
 # ---------------------------------------------------------------------------
