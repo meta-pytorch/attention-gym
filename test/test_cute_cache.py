@@ -469,6 +469,132 @@ def test_run_tunable_custom_benchmark_bypasses_cached_winner(isolated_cache, mon
     assert benchmarked == [config.timing for config in candidates]
 
 
+def test_run_tunable_kernel_benchmark_replaces_default_and_reuses_winner(
+    isolated_cache, monkeypatch
+):
+    """A kernel's joint timing policy replaces the default one without disabling winner reuse."""
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    candidates = (CompileConfig("slow", 3.0), CompileConfig("fast", 1.0))
+    benchmarked = []
+
+    class ReversedTimingKernel:
+        @staticmethod
+        def benchmark_all(launches) -> list[float]:
+            timings = [float(launch()) for launch in launches]
+            benchmarked.extend(timings)
+            return [-timing for timing in timings]
+
+        @staticmethod
+        def default_config(*, target):
+            return candidates[1]
+
+        @staticmethod
+        def tuning_key(*, target):
+            return ()
+
+        @staticmethod
+        def configs():
+            return candidates
+
+        @staticmethod
+        @cute_cache.jit_cache
+        def compile(config: CompileConfig) -> FakeCompiled:
+            return FakeCompiled(config.variant)
+
+        @staticmethod
+        def compile_call(config: CompileConfig):
+            return (config,)
+
+        @staticmethod
+        def launch(compiled: FakeCompiled, config: CompileConfig) -> float:
+            assert compiled() == config.variant
+            return config.timing
+
+    monkeypatch.setattr(
+        tune_module,
+        "benchmark_gpu",
+        lambda fn: pytest.fail("the kernel's benchmark replaces the default policy"),
+    )
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    options = {
+        "autotune": True,
+        "parallel_compile": False,
+        "target": cute_target.CompileTarget("test"),
+    }
+    for _ in range(2):
+        _, selected = run_tunable(ReversedTimingKernel, **options)
+        assert selected == candidates[0]
+    # The winner also loads from disk.
+    tune_module._WINNERS.clear()
+    tune_module._WINNERS_FAST.clear()
+    assert run_tunable(ReversedTimingKernel, **options)[1] == candidates[0]
+    assert benchmarked == [config.timing for config in candidates]
+
+    # An explicit per-launch policy replaces the kernel's joint one.
+    _, selected = run_tunable(ReversedTimingKernel, **options, benchmark=lambda fn: float(fn()))
+    assert selected == candidates[1]
+    assert benchmarked == [config.timing for config in candidates]
+
+
+def test_tune_benchmark_all_times_usable_candidates_together(isolated_cache):
+    """A joint timing policy sees every usable launch at once; skipped candidates never win."""
+    configs = (
+        CompileConfig("slow", 3.0),
+        CompileConfig("broken", 0.5),
+        CompileConfig("fast", 1.0),
+    )
+
+    @cute_cache.jit_cache
+    def compile_kernel(config: CompileConfig) -> FakeCompiled:
+        return FakeCompiled(config.variant)
+
+    def launch(compiled: FakeCompiled, config: CompileConfig) -> float:
+        if config.variant == "broken":
+            raise RuntimeError("unsupported candidate")
+        return config.timing
+
+    jointly_timed = []
+
+    def benchmark_all(launches) -> list[float]:
+        jointly_timed.append([launch() for launch in launches])
+        return jointly_timed[-1]
+
+    assert (
+        tune(
+            configs,
+            compile_kernel,
+            launch,
+            benchmark_all=benchmark_all,
+            parallel_compile=False,
+            skip_errors=(RuntimeError,),
+        )
+        is configs[2]
+    )
+    assert jointly_timed == [[3.0, 1.0]]
+    with pytest.raises(ValueError, match="either benchmark= or benchmark_all="):
+        tune(configs, compile_kernel, launch, benchmark=float, benchmark_all=benchmark_all)
+    with pytest.raises(ValueError, match="returned 1 timings for 2 launches"):
+        tune(
+            configs,
+            compile_kernel,
+            launch,
+            benchmark_all=lambda launches: [1.0],
+            parallel_compile=False,
+            skip_errors=(RuntimeError,),
+        )
+    with pytest.raises(RuntimeError, match="unsupported candidate"):
+        tune(
+            configs[1:2],
+            compile_kernel,
+            launch,
+            benchmark_all=benchmark_all,
+            parallel_compile=False,
+            skip_errors=(RuntimeError,),
+        )
+    assert len(jointly_timed) == 1
+
+
 def test_run_tunable_keys_winners_by_runtime_workload(isolated_cache, monkeypatch):
     """Separate winner decisions without recompiling shape-polymorphic binaries."""
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")

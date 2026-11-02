@@ -8,6 +8,9 @@ from torch import Tensor
 
 from attn_gym.types import AuxRequest, Impl, resolve_impl
 
+from . import ops  # noqa: F401  # registers the attn_gym::paged_mla_decode ops
+from .impl import reference
+
 
 @dataclass(frozen=True, slots=True)
 class PagedMLADecodeAux:
@@ -30,10 +33,15 @@ def _validate_inputs(
     cu_seqlens_q: Tensor,
     seqused_k: Tensor,
     max_seqlen_q: int,
+    max_seqlen_k: int | None,
 ) -> None:
     """Validate tensor metadata without reading values."""
     if type(max_seqlen_q) is not int or max_seqlen_q < 1:
         raise ValueError(f"max_seqlen_q must be a positive Python int, got {max_seqlen_q!r}.")
+    if max_seqlen_k is not None and (type(max_seqlen_k) is not int or max_seqlen_k < 1):
+        raise ValueError(
+            f"max_seqlen_k must be None or a positive Python int, got {max_seqlen_k!r}."
+        )
     if q_latent.ndim != 3 or q_rope.ndim != 3 or q_latent.shape[:2] != q_rope.shape[:2]:
         raise ValueError(
             "q_latent and q_rope must have shapes [tokens, heads, latent_dim] and "
@@ -137,8 +145,10 @@ def paged_mla_decode(
     seqused_k: Tensor,
     *,
     max_seqlen_q: int,
+    max_seqlen_k: int | None = None,
     scale: float,
     impl: Impl | str = Impl.FUSED,
+    autotune: bool = False,
     return_aux: None = ...,
 ) -> Tensor: ...
 
@@ -154,8 +164,10 @@ def paged_mla_decode(
     seqused_k: Tensor,
     *,
     max_seqlen_q: int,
+    max_seqlen_k: int | None = None,
     scale: float,
     impl: Impl | str = Impl.FUSED,
+    autotune: bool = False,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, PagedMLADecodeAux]: ...
 
@@ -170,8 +182,10 @@ def paged_mla_decode(
     seqused_k: Tensor,
     *,
     max_seqlen_q: int,
+    max_seqlen_k: int | None = None,
     scale: float,
     impl: Impl | str = Impl.FUSED,
+    autotune: bool = False,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, PagedMLADecodeAux]:
     """Attend packed queries to a paged, compressed MLA cache without expanding it.
@@ -205,12 +219,22 @@ def paged_mla_decode(
         seqused_k: Contiguous int32 ``[num_sequences]`` cached key count per sequence,
             including the keys of the current queries.
         max_seqlen_q: Host-side upper bound on any sequence's query count.
+        max_seqlen_k: Optional host-side upper bound on ``seqused_k``. Only ``autotune``
+            reads it, to give short and long contexts separate winners; without it, every
+            context uses the ``block_table`` capacity. A wrong value costs speed, not
+            correctness.
         scale: Positive multiplier for the logits. There is no default: the right value
             is the model's ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`` (times any
             rope scaling correction), not ``1 / sqrt(latent_dim + rope_dim)``.
         impl: ``Impl.FUSED`` (default) runs FlashAttention's absorbed MLA kernel:
-            FlashAttention-4 on SM100/SM103 (eager-only), FlashAttention-3 on SM90.
-            ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
+            FlashAttention-4 on SM100/SM103, FlashAttention-3 on SM90. Both support
+            ``torch.compile``. ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
+        autotune: If True, benchmark FlashAttention-4's MLA kernels and split counts on the
+            first call of each workload bucket and launch the fastest; winners are cached in
+            memory and on disk. Buckets are the head count, block size, and power-of-two
+            buckets of ``max_seqlen_q``, the sequence count, and ``max_seqlen_k``. Run each
+            bucket once before CUDA graph capture; an untuned bucket raises ``RuntimeError``
+            there. Ignored on SM90, with ``Impl.REFERENCE``, and for empty inputs.
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return ``(output, PagedMLADecodeAux)`` with the requested outputs.
 
@@ -228,6 +252,7 @@ def paged_mla_decode(
         cu_seqlens_q,
         seqused_k,
         max_seqlen_q,
+        max_seqlen_k,
     )
     if not scale > 0:
         raise ValueError(f"scale must be greater than 0, got {scale}.")
@@ -235,8 +260,6 @@ def paged_mla_decode(
     return_lse = return_aux is not None and return_aux.lse
     with torch.no_grad():
         if selected_impl is Impl.REFERENCE:
-            from .impl import reference
-
             out, lse = reference.paged_mla_decode(
                 q_latent,
                 q_rope,
@@ -248,21 +271,9 @@ def paged_mla_decode(
                 scale=scale,
             )
         else:
-            from .impl import cute, fa3
-
             if not q_latent.is_cuda:
                 raise ValueError("The fused paged_mla_decode requires CUDA tensors.")
-            capability = torch.cuda.get_device_capability(q_latent.device)
-            if capability in cute.SUPPORTED_CAPABILITIES:
-                backend = cute
-            elif capability in fa3.SUPPORTED_CAPABILITIES:
-                backend = fa3
-            else:
-                raise ValueError(
-                    "The fused paged_mla_decode requires SM90 (FlashAttention-3) or "
-                    f"SM100/SM103 (FlashAttention-4), got SM{capability[0]}{capability[1]}."
-                )
-            out, lse = backend.paged_mla_decode(
+            args = (
                 q_latent,
                 q_rope,
                 latent_cache,
@@ -270,10 +281,15 @@ def paged_mla_decode(
                 block_table,
                 cu_seqlens_q,
                 seqused_k,
-                max_seqlen_q=max_seqlen_q,
-                scale=scale,
-                return_lse=return_lse,
+                max_seqlen_q,
+                max_seqlen_k,
+                scale,
+                autotune,
             )
+            if return_lse:
+                out, lse = torch.ops.attn_gym.paged_mla_decode_with_lse.default(*args)
+            else:
+                out, lse = torch.ops.attn_gym.paged_mla_decode.default(*args), None
 
     if return_aux is None:
         return out

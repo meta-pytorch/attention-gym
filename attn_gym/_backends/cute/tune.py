@@ -13,7 +13,10 @@ import threading
 from collections.abc import Callable, Iterable
 from typing import Any, Protocol, TypeVar
 
-from .cache import cache_enabled
+import torch
+
+from ._key import _canonicalize
+from .cache import cache_enabled, get_cache_path
 from .compile import (
     DEFAULT_COMPILE_TIMEOUT_SECONDS,
     _materialize_calls,
@@ -106,6 +109,7 @@ def tune(
     launch: Callable[[CompiledT, ConfigT], Any],
     *,
     benchmark: Callable[[Callable[[], Any]], float] | None = None,
+    benchmark_all: Callable[[list[Callable[[], Any]]], Iterable[float]] | None = None,
     compile_call: Callable[[ConfigT], tuple[Any, ...]] | None = None,
     parallel_compile: bool = True,
     workers: int | None = None,
@@ -129,9 +133,13 @@ def tune(
     process, loads every requested artifact, and benchmarks again.
     Candidates are benchmarked in iteration order. ``benchmark`` may replace
     the default timing policy; it receives a zero-arg callable for one candidate
-    launch. Destructive or stateful kernels must restore state in that callback,
-    or use :func:`run_tunable` with a ``benchmark_reset`` hook. Compile functions
-    without ``precompile`` (Triton kernels compile on first launch) run sequentially.
+    launch, and stateful kernels must restore state in that callback.
+    ``benchmark_all`` instead receives every usable candidate's launch at once, in order, and
+    returns one timing each (``math.inf`` for a candidate it eliminated), so it can interleave
+    candidates. tune() first launches each candidate once to warm it up and apply
+    ``skip_errors``, so stateful kernels must restore state in ``launch`` or use
+    :func:`run_tunable`'s ``benchmark_reset``. Compile functions without
+    ``precompile`` (Triton kernels compile on first launch) run sequentially.
 
     Use ``compile_call`` when the compile function needs additional static
     arguments::
@@ -143,15 +151,23 @@ def tune(
             compile_call=lambda config: (head_dim, config),
         )
 
-    A candidate whose benchmark raises one of ``skip_errors`` (for example Triton's
-    ``OutOfResources``, raised when a lazily compiled kernel is loaded) is skipped; if every
-    candidate raises, the last error propagates.
+    A candidate whose benchmark (with ``benchmark_all``, its warm-up launch) raises one of
+    ``skip_errors`` (for example Triton's ``OutOfResources``, raised when a lazily compiled
+    kernel is loaded) is skipped; if every candidate raises, the last error propagates.
+    tune() raises inside CUDA graph capture: run each workload once before capturing.
     """
     candidates = list(configs)
     if not candidates:
         raise ValueError("tune() requires at least one config")
+    if benchmark is not None and benchmark_all is not None:
+        raise ValueError("pass either benchmark= or benchmark_all=, not both")
     if workers is not None and workers < 1:
         raise ValueError(f"workers must be positive, got {workers}")
+    if torch.cuda.is_initialized() and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "tune() cannot benchmark during CUDA graph capture; run this workload once "
+            "before capturing so its winner is cached"
+        )
     can_precompile = callable(getattr(compile_fn, "precompile", None))
     if not can_precompile and not callable(getattr(compile_fn, "cache_namespace", None)):
         raise TypeError("tune() requires a compile function decorated with jit_cache")
@@ -173,18 +189,39 @@ def tune(
             set_compile_target(target)
         compiled_candidates = [compile_fn(*args) for args in calls]
 
-    measure = benchmark_gpu if benchmark is None else benchmark
-    timings = []
+    launches = [
+        functools.partial(launch, compiled, config)
+        for compiled, config in zip(compiled_candidates, candidates)
+    ]
+    timings = [math.inf] * len(candidates)
     error = None
-    for compiled, config in zip(compiled_candidates, candidates):
-        try:
-            timing = float(measure(functools.partial(launch, compiled, config)))
-        except skip_errors as candidate_error:
-            error = candidate_error
-            timing = math.inf
+    if benchmark_all is None:
+        measure = benchmark_gpu if benchmark is None else benchmark
+        for index, candidate_launch in enumerate(launches):
+            try:
+                timings[index] = float(measure(candidate_launch))
+            except skip_errors as candidate_error:
+                error = candidate_error
+    else:
+        usable = []
+        for index, candidate_launch in enumerate(launches):
+            try:
+                candidate_launch()
+            except skip_errors as candidate_error:
+                error = candidate_error
+            else:
+                usable.append(index)
+        if usable:
+            measured = list(benchmark_all([launches[index] for index in usable]))
+            if len(measured) != len(usable):
+                raise ValueError(
+                    f"benchmark_all returned {len(measured)} timings for {len(usable)} launches"
+                )
+            for index, timing in zip(usable, measured):
+                timings[index] = float(timing)
+    for config, timing in zip(candidates, timings):
         if math.isnan(timing):
             raise ValueError(f"benchmark returned NaN for config {config!r}")
-        timings.append(timing)
     if error is not None and all(timing == math.inf for timing in timings):
         raise error
     return candidates[min(range(len(candidates)), key=timings.__getitem__)]
@@ -197,9 +234,6 @@ def _winner_key(
     tuning_key: tuple[Any, ...],
 ) -> str:
     """Identify one tuning decision independently from codegen specialization."""
-    from ._key import _canonicalize
-    from .target import get_compile_target
-
     name = getattr(kernel, "__qualname__", type(kernel).__qualname__)
     payload = (
         # Source and target namespace: editing the kernel or moving to another
@@ -220,8 +254,6 @@ def _winner_key(
 
 
 def _winner_path(key: str):
-    from .cache import get_cache_path
-
     return get_cache_path() / "winners" / f"{key}.pickle"
 
 
@@ -297,7 +329,10 @@ def run_tunable(
     decision is benchmarked, restore runs before every candidate launch and before the
     final winner launch, so the caller observes exactly one launch. Kernels may list
     ``benchmark_errors``, exception types that mark a candidate unusable while tuning
-    (see ``tune``'s ``skip_errors``). An explicit
+    (see ``tune``'s ``skip_errors``). Kernels may define ``benchmark_all(launches)``, passed
+    to ``tune`` as its joint timing policy (for example, replaying CUDA graphs round-robin so
+    every candidate sees the same clocks). Unlike ``benchmark=`` it keeps winner reuse, so
+    ``compile.cache_namespace()`` must change when the policy does. An explicit
     ``target`` is installed process-wide before candidate generation and remains active
     after this function returns.
     """
@@ -361,6 +396,9 @@ def run_tunable(
                     compile_fn,
                     launch,
                     benchmark=benchmark,
+                    benchmark_all=None
+                    if benchmark is not None
+                    else getattr(kernel, "benchmark_all", None),
                     compile_call=lambda candidate: kernel.compile_call(candidate, *runtime_args),
                     parallel_compile=parallel_compile,
                     workers=workers,
