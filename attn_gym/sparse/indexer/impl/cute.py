@@ -1,4 +1,4 @@
-"""Bounded-workspace indexer for SM100/SM103 scoring followed by radix Top-K.
+"""Bounded-workspace indexer for SM100/SM103 scoring followed by exact Top-K.
 
 A slab contains at most 1024 query rows and 32 MiB of FP32 scores, independent
 of batch size and sequence length. Consecutive launches reuse that per-call
@@ -9,6 +9,7 @@ The registered operator calls this launcher; there is no backend fallback.
 
 import math
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -28,6 +29,9 @@ from attn_gym._backends.cute.target import (
 from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int64_abi
 from attn_gym.utils import cdiv
 
+if TYPE_CHECKING:
+    from cutlass.cute.runtime import _FakeTensor
+
 _HEAD_DIM_GRANULARITY = 16
 _MAX_SEQUENCE = 1 << 20
 # Limit both the row count (linear storage as T grows) and absolute scratch bytes.
@@ -40,6 +44,48 @@ def score_workspace_pairs(batch: int, tokens: int, candidates: int) -> int:
     return min(
         _MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * candidates)
     )
+
+
+def _fake_score_operands(
+    io_dtype: type,
+    weight_dtype: type,
+    heads: int,
+    head_dim: int,
+    use_int64_offsets: bool,
+    contiguous_weight_heads: bool,
+) -> tuple["_FakeTensor", "_FakeTensor", "_FakeTensor", "_FakeTensor"]:
+    """Share symbolic B/T/S and stride contracts across the two scoring ABIs."""
+    import cutlass
+    from cutlass import cute
+
+    sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
+    q = make_fake_strided_tensor(
+        io_dtype,
+        (batch, tokens, heads, head_dim),
+        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
+        use_int64_strides=use_int64_offsets,
+    )
+    k = make_fake_strided_tensor(
+        io_dtype,
+        (batch, candidates, head_dim),
+        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
+        use_int64_strides=use_int64_offsets,
+    )
+    weights = make_fake_strided_tensor(
+        weight_dtype,
+        (batch, tokens, heads),
+        contiguous_dim=-1 if contiguous_weight_heads else None,
+        use_int64_strides=use_int64_offsets,
+    )
+    scores = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (pairs, 2, candidates),
+        stride_order=(2, 1, 0),
+        assumed_align=TMA_ALIGNMENT_BYTES,
+        use_32bit_stride=not use_int64_offsets,
+    )
+    return q, k, weights, scores
 
 
 @jit_cache
@@ -58,7 +104,6 @@ def _compile_scores(
     ``has_candidate_bounds`` scores only each query's packed ``candidate_bounds`` interval.
     """
     import cutlass
-    from cutlass import cute
 
     from .cute_score import IndexerScoreKernel
     from .cute_score_generic import IndexerGenericScoreKernel
@@ -74,40 +119,16 @@ def _compile_scores(
         contiguous_weight_heads=contiguous_weight_heads,
     )
     io_dtype = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
-    sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
-    batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
-    q = make_fake_strided_tensor(
-        io_dtype,
-        (batch, tokens, heads, head_dim),
-        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
-        use_int64_strides=use_int64_offsets,
-    )
-    k = make_fake_strided_tensor(
-        io_dtype,
-        (batch, candidates, head_dim),
-        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
-        use_int64_strides=use_int64_offsets,
-    )
-    weights = make_fake_strided_tensor(
-        io_dtype,
-        (batch, tokens, heads),
-        contiguous_dim=-1 if contiguous_weight_heads else None,
-        use_int64_strides=use_int64_offsets,
-    )
-    scores = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (pairs, 2, candidates),
-        stride_order=(2, 1, 0),
-        assumed_align=TMA_ALIGNMENT_BYTES,
-        use_32bit_stride=not use_int64_offsets,
+    q, k, weights, scores = _fake_score_operands(
+        io_dtype, io_dtype, heads, head_dim, use_int64_offsets, contiguous_weight_heads
     )
     args = (q, k, weights, scores, integer(0), cutlass.Float32(1.0))
     if has_candidate_bounds:
         return compile_tvm_ffi(
             operation.with_candidate_bounds,
             *args,
-            _fake_candidate_bounds(tokens, use_int64_offsets),
+            _fake_candidate_bounds(q.shape[1], use_int64_offsets),
             name=f"{operation.get_name()}_packed",
         )
     return compile_tvm_ffi(operation, *args)
@@ -135,8 +156,9 @@ def _compile_topk(
     use_int64_offsets: bool,
     deterministic: bool,
     has_candidate_bounds: bool = False,
+    selector: str = "default",
 ) -> Callable[..., None]:
-    """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
+    """Compile indices-only selection with symbolic B, T, S and slab capacity."""
     import cutlass
     from cutlass import cute
 
@@ -159,13 +181,21 @@ def _compile_topk(
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
     )
-    operation = IndexerTopKKernel(
-        topk,
-        causal,
-        use_int64_offsets,
-        compress_ratio=compress_ratio,
-        deterministic=deterministic,
-    )
+    assert selector in ("default", "gvr2"), selector
+    if selector == "gvr2":
+        from .cute_topk_gvr2 import IndexerGVR2TopKKernel
+
+        operation = IndexerGVR2TopKKernel(
+            topk, causal, use_int64_offsets, compress_ratio=compress_ratio
+        )
+    else:
+        operation = IndexerTopKKernel(
+            topk,
+            causal,
+            use_int64_offsets,
+            compress_ratio=compress_ratio,
+            deterministic=deterministic,
+        )
     if has_candidate_bounds:
         return compile_tvm_ffi(
             operation.with_candidate_bounds,
@@ -207,6 +237,25 @@ def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
         raise RuntimeError("this tcgen05 kernel requires an SM100 or SM103 GPU")
 
 
+def resolve_selector(selector: str, topk: int, *, deterministic: bool, packed: bool) -> str:
+    """Use GVR2 below its native K limit, except for deterministic or packed calls.
+
+    GVR2 cannot provide CuTe's deterministic ordering or packed candidate bounds.
+    See the ``auto`` threshold sweep in docs/indexer_performance.md.
+    """
+    if selector not in ("auto", "default", "gvr2"):
+        raise ValueError(f"unknown indexer selector {selector!r}")
+    if selector == "gvr2" and (deterministic or packed):
+        raise ValueError("CuTe GVR2 does not support deterministic mode or packed cu_seqlens")
+    if selector == "auto":
+        if deterministic or packed:
+            return "default"
+        from .cute_topk_gvr2 import NATIVE_TOPK_LIMIT
+
+        return "gvr2" if topk < NATIVE_TOPK_LIMIT else "default"
+    return selector
+
+
 def launch(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -216,6 +265,7 @@ def launch(
     compress_ratio: int = 1,
     deterministic: bool = False,
     candidate_bounds: torch.Tensor | None = None,
+    selector: str = "default",
 ) -> torch.Tensor:
     """Compute weighted-ReLU Top-K with bounded per-call score storage.
 
@@ -228,6 +278,9 @@ def launch(
     """
     import cutlass
 
+    selector = resolve_selector(
+        selector, topk, deterministic=deterministic, packed=candidate_bounds is not None
+    )
     _validate(q, k)
     batch, tokens, heads, head_dim = q.shape
     candidates = k.shape[1]
@@ -259,10 +312,10 @@ def launch(
         topk_args = (topk, causal, compress_ratio, use_int64_offsets, deterministic)
         if candidate_bounds is None:
             score_kernel = _compile_scores(*score_args)
-            topk_kernel = _compile_topk(*topk_args)
+            topk_kernel = _compile_topk(*topk_args, selector=selector)
         else:
             score_kernel = _compile_scores(*score_args, has_candidate_bounds=True)
-            topk_kernel = _compile_topk(*topk_args, has_candidate_bounds=True)
+            topk_kernel = _compile_topk(*topk_args, has_candidate_bounds=True, selector=selector)
     finally:
         set_compile_target(previous)
 
@@ -278,4 +331,4 @@ def launch(
     return output
 
 
-__all__ = ["launch"]
+__all__ = ["launch", "resolve_selector"]

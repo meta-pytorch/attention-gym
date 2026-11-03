@@ -10,7 +10,7 @@ from torch import Tensor
 torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
-    "str backend, Tensor? cu_seqlens=None, Tensor? cu_seqlens_k=None) -> Tensor",
+    'str backend, Tensor? cu_seqlens=None, Tensor? cu_seqlens_k=None, str selector="default") -> Tensor',
 )
 
 
@@ -24,6 +24,7 @@ def _indexer_cuda(
     backend: str,
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
+    selector: str = "default",
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries.
 
@@ -33,13 +34,15 @@ def _indexer_cuda(
     if backend == "auto":
         capability = torch.cuda.get_device_capability(q.device)
         backend = "cute" if capability in ((10, 0), (10, 3)) else "triton"
-    match backend:
-        case "cute":
+    match backend, selector:
+        case "cute", _:
             from .impl.cute import launch
-        case "triton":
+        case "triton", "gvr2":
+            from .impl.triton_gvr2 import launch
+        case "triton", "auto" | "default":  # Triton auto keeps the streaming selector.
             from .impl.triton import launch
         case _:
-            raise ValueError(f"unknown indexer backend {backend!r}")
+            raise ValueError(f"unknown indexer backend {backend!r} or selector {selector!r}")
     if backend == "triton":
         return launch(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
     candidate_bounds = None
@@ -50,7 +53,17 @@ def _indexer_cuda(
             cu_seqlens, cu_seqlens_k, q.shape[1], causal, compress_ratio
         )
     deterministic = torch.are_deterministic_algorithms_enabled()
-    return launch(q, k, weights, topk, causal, compress_ratio, deterministic, candidate_bounds)
+    return launch(
+        q,
+        k,
+        weights,
+        topk,
+        causal,
+        compress_ratio,
+        deterministic,
+        candidate_bounds,
+        selector=selector,
+    )
 
 
 torch.library.impl("attn_gym::_indexer", "CUDA", _indexer_cuda)
@@ -67,6 +80,7 @@ def _indexer_fake(
     backend: str,
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
+    selector: str = "default",
 ) -> Tensor:
     """Describe the common contiguous, nondifferentiable index output."""
     return q.new_empty((q.shape[0], q.shape[1], topk), dtype=torch.int32)

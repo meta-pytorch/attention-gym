@@ -52,10 +52,12 @@ def launch(
     k = k.to(accum_dtype)
     weights = weights.to(accum_dtype)
 
-    # dots: [B, T, H, S]
-    dots = torch.einsum("bthd,bsd->bths", q, k)
-    # score: [B, T, S]
-    scores = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
+    # Query chunks bound the [B, chunk, H, S] per-head intermediates; scores stay [B, T, S].
+    scores = q.new_empty(batch, queries, candidates)
+    for start in range(0, queries, 128):
+        rows = slice(start, start + 128)
+        dots = torch.einsum("bthd,bsd->bths", q[:, rows], k)
+        scores[:, rows] = (torch.relu(dots) * weights[:, rows].unsqueeze(-1)).sum(dim=2) * scale
 
     starts = torch.zeros((queries, 1), dtype=torch.int32, device=q.device)
     if cu_seqlens is not None:
@@ -76,7 +78,6 @@ def launch(
     key_positions = torch.arange(candidates, device=q.device)[None, :]
     valid = (key_positions >= starts) & (key_positions < ends)
     scores.masked_fill_(~valid, float("-inf"))
-
     indices = scores.topk(min(topk, candidates), dim=-1).indices.to(torch.int32)
     selected_valid = (indices >= starts) & (indices < ends)
     indices = torch.where(selected_valid, indices - starts, -1)

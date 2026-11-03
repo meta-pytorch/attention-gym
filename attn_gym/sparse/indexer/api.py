@@ -163,6 +163,12 @@ def lightning_indexer(
             ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100/SM103 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
+            ``"selector"`` chooses the exact Top-K algorithm: ``"auto"`` (the value when
+            omitted) lets CuTe use GVR2 when ``topk < 2048`` and radix otherwise,
+            and keeps Triton's streaming Top-K; ``"default"`` forces CuTe radix /
+            Triton streaming; ``"gvr2"`` forces GVR2 on either backend. CuTe auto
+            uses radix for deterministic or packed calls; explicit GVR2 rejects
+            deterministic CuTe calls and packed offsets on either backend.
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are unspecified, and
@@ -179,10 +185,12 @@ def lightning_indexer(
     SM100/SM103, even H, D divisible by 16, and Q/K with unit last strides and 16-byte-aligned
     bases and non-singleton outer strides. Other Q/K strides may vary independently;
     weights may have arbitrary strides and need only element alignment.
-    Triton requires SM90 or newer, H <= 256, D <= 256 divisible by 8, and Q/K with
-    unit last strides and 16-byte-aligned bases and outer strides; weights may be strided.
-    Its register-resident selection makes per-tile cost grow with topk.
-    CuTe reuses a per-call FP32 score workspace capped at 32 MiB and 1024 query
+    Triton requires SM90 or newer, H <= 256 and D <= 256 divisible by 8. Its streaming
+    FP16/BF16 path requires Q/K unit last strides and 16-byte-aligned bases and outer strides;
+    weights may be strided, and its register-resident selection cost grows with topk.
+    Triton GVR2 accepts arbitrary nonnegative input strides and uses its own tiled scorer,
+    so its scores may round differently from the streaming path.
+    CuTe and Triton GVR2 reuse a per-call FP32 score workspace capped at 32 MiB and 1024 query
     rows. For nonzero topk, candidate capacity S must be at most 2**22 so one query
     pair fits that budget. Large inputs use slabs rather than an unbounded quadratic
     score allocation.
@@ -209,16 +217,27 @@ def lightning_indexer(
                 q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k
             )
         case Impl.FUSED:
-            if kernel_options not in (
-                None,
-                {},
-                {"backend": "cute"},
-                {"backend": "triton"},
+            options = {} if kernel_options is None else kernel_options
+            if (
+                not isinstance(options, dict)
+                or options.keys() - {"backend", "selector"}
+                or ("backend" in options and options["backend"] not in ("cute", "triton"))
             ):
+                raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
+            selector = options.get("selector", "auto")
+            if selector not in ("auto", "default", "gvr2"):
                 raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
             if not q.is_cuda:
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
-            backend = (kernel_options or {}).get("backend", "auto")
             return _indexer_op(
-                q, k, weights, topk, causal, compress_ratio, backend, cu_seqlens, cu_seqlens_k
+                q,
+                k,
+                weights,
+                topk,
+                causal,
+                compress_ratio,
+                options.get("backend", "auto"),
+                cu_seqlens,
+                cu_seqlens_k,
+                selector=selector,
             )
