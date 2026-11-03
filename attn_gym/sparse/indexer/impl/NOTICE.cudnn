@@ -4,6 +4,10 @@ cute_score_generic.py, cute_topk.py and cute_topk_gvr2.py adapt cuDNN Frontend s
 workspace layout, scheduling and outputs; they do not depend on the cuDNN
 Frontend package. The applicable license is in LICENSE.Apache-2.0.
 
+cute_score_mxfp8.py adapts the same score pipeline and the scale-copy partition
+from CUTLASS's dense_blockscaled_gemm_persistent.py example. The applicable
+BSD-3-Clause terms for that partition are reproduced in cute_score_mxfp8.py.
+
 cute_topk_gvr2.py adapts the streaming main-family algorithm and float4 load
 helper from FlashInfer's topk_varlen/kernels/gvr2_topk_decode.py at commit
 c11c1090172f578bad37b8bca2b40e4161d72144 (derived from TensorRT-LLM PR #17821,
