@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import PinnedConfigKernel, ptr_offset
+from attn_gym._backends.triton.utils import PinnedConfigKernel, fixed_tree_sum, ptr_offset
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
@@ -60,7 +60,9 @@ def l2norm_fwd_kernel(
             X_STRIDES,
         )
     b_x = tl.load(x + x_offsets, mask=mask, other=0.0).to(tl.float32)
-    b_rstd = 1 / tl.sqrt(tl.sum(b_x * b_x, 1) + eps)
+    # The launch config follows token count, head count, and cu_seqlens shape, so a fixed
+    # reduction order keeps a token's bits identical between decode and prefill.
+    b_rstd = 1 / tl.sqrt(fixed_tree_sum(b_x * b_x) + eps)
     b_y = b_x * b_rstd[:, None]
 
     tl.store(
@@ -287,7 +289,9 @@ def l2norm(
 
     ``autotune`` benchmarks backward tile configurations when true. False launches one
     fixed configuration, so the input gradient is reproducible across processes and
-    autotune cache states. The forward always uses a fixed launch policy.
+    autotune cache states. The forward never autotunes, and it reduces each row in a fixed
+    order, so a row's output bits do not depend on the token count, head count, or
+    ``cu_seqlens`` shape that select its launch config.
     """
     if not x.is_cuda:
         raise ValueError("l2norm requires a CUDA tensor")

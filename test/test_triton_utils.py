@@ -12,6 +12,7 @@ import torch
 triton = pytest.importorskip("triton")
 tl = pytest.importorskip("triton.language")
 triton_utils = pytest.importorskip("attn_gym._backends.triton.utils")
+fixed_tree_sum = triton_utils.fixed_tree_sum
 ptr_offset = triton_utils.ptr_offset
 requires_int64_offsets = triton_utils.requires_int64_offsets
 storage_cosize = triton_utils.storage_cosize
@@ -104,3 +105,43 @@ def test_ptr_offset_accepts_runtime_strides():
     for stride in (3, 12288):
         _store_runtime_stride_offset[(1,)](output, 7, stride)
         assert output.item() == 7 * stride
+
+
+@triton.jit
+def _store_fixed_tree_sum(x, output, M: tl.constexpr, N: tl.constexpr, W: tl.constexpr):
+    o_m = tl.arange(0, M)[:, None, None]
+    o_n = tl.arange(0, N)[None, :, None]
+    o_w = tl.arange(0, W)[None, None, :]
+    block = tl.load(x + (o_m * N + o_n) * W + o_w)
+    tl.store(
+        output + tl.arange(0, M)[:, None] * N + tl.arange(0, N)[None, :], fixed_tree_sum(block)
+    )
+
+
+def _adjacent_pair_sum(x: torch.Tensor) -> torch.Tensor:
+    while x.shape[-1] > 1:
+        x = x.unflatten(-1, (-1, 2)).sum(-1)
+    return x.squeeze(-1)
+
+
+@pytest.mark.parametrize("width", [1, 2, 64, 128, 512])
+def test_fixed_tree_sum_matches_adjacent_pairs_under_every_layout(width):
+    """Sum adjacent pairs to the same bits for every tile shape and warp count."""
+    torch.manual_seed(0)
+    # Spread magnitudes so a different association order would change the rounded sum.
+    x = torch.randn(16, 16, width, device="cuda") * torch.logspace(-8, 8, width, device="cuda")
+    expected = _adjacent_pair_sum(x)
+    for m, n in ((16, 16), (4, 16), (1, 16), (1, 1)):
+        for num_warps in (1, 4, 8):
+            output = torch.empty(16, 16, device="cuda")
+            for i in range(0, 16, m):
+                for j in range(0, 16, n):
+                    _store_fixed_tree_sum[(1,)](
+                        x[i : i + m, j : j + n].contiguous(),
+                        output[i : i + m, j : j + n],
+                        M=m,
+                        N=n,
+                        W=width,
+                        num_warps=num_warps,
+                    )
+            assert torch.equal(output, expected), (m, n, num_warps)

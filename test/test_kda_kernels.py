@@ -18,6 +18,7 @@ from attn_gym._backends.triton.utils import can_use_tma
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
+from attn_gym.linear.kda.fwd.triton import l2norm_fwd as l2norm_fwd_module
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
     chunk_gla_fwd_kernel_o,
@@ -220,6 +221,34 @@ def test_l2norm_launch_config(
     expected: tuple[int, int],
 ):
     assert _l2norm_launch_config(rows, tuned_major) == expected
+
+
+@pytest.mark.parametrize("D", [100, 128])
+@pytest.mark.parametrize("dtype", DTYPES, ids=_case_id)
+def test_l2norm_fwd_batch_invariant_launch_configs(monkeypatch, dtype, D):
+    """Normalize each row to the same bits under every selectable launch config.
+
+    Decode metadata selects smaller tiles than prefill, so a layout-ordered reduction would
+    normalize the same token differently in a decode batch and in a prefill.
+    """
+    torch.manual_seed(4)
+    x = torch.randn(1, 512, 4, D, device=DEV, dtype=dtype)
+    configs = sorted(
+        {
+            _l2norm_launch_config(rows, tuned_major)
+            for tuned_major in (None, 9, 10)
+            for rows in range(1, 4097)
+        }
+    )
+    assert len(configs) > 1
+    outputs = []
+    for config in configs:
+        monkeypatch.setattr(
+            l2norm_fwd_module, "_l2norm_launch_config", lambda rows, major, c=config: c
+        )
+        outputs.append(l2norm(x))
+    for config, output in zip(configs[1:], outputs[1:]):
+        assert torch.equal(output, outputs[0]), config
 
 
 @pytest.mark.parametrize("dtype,T,D,strided", _L2NORM_CASES, ids=_case_id)
