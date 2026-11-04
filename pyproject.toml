@@ -46,7 +46,7 @@ tests = [
     "typer",
     "jsonargparse[signatures]",
     "perfetto",  # warpdrive tracing/profiler tests read and write Perfetto traces
-    "flash-attn-4[cu13]>=4.0.0b38; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "flash-attn-4[cu13]>=4.0.0b39; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 dev = [
