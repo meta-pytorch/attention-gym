@@ -156,13 +156,14 @@ def _tile_map_pairs(
 class GatherSelections(NamedTuple):
     """Per-query gather selection counts, their packed offsets, and their total.
 
-    ``total`` is a pinned host copy that is valid once ``ready`` completes.
+    ``total`` is a pinned host copy that is valid once ``ready`` completes; both are None
+    during CUDA graph capture, where nothing may be read back.
     """
 
     counts: torch.Tensor
     offsets: torch.Tensor
-    total: torch.Tensor
-    ready: torch.cuda.Event
+    total: torch.Tensor | None
+    ready: torch.cuda.Event | None
 
 
 def count_gather_selections(
@@ -172,24 +173,21 @@ def count_gather_selections(
 ) -> GatherSelections:
     """Count the selections the key-major map must cover: all but the dense tiles' queries.
 
-    The largest batch row's total starts copying to the host at once, so
-    ``build_tile_query_map`` can read it after the kernels queued in between, without
+    Outside graph capture the largest batch row's total starts copying to the host at once,
+    so ``build_tile_query_map`` can read it after the kernels queued in between, without
     stalling the GPU.
     """
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "The grouped gather_attn backward sizes its key-major dK/dV map from a host read, "
-            "which CUDA graph capture forbids; capture is not supported yet"
-        )
     counts = selected_counts
     if tile_spans is not None:
         dense = (tile_spans[..., 1] >= 0).repeat_interleave(dense_tile_queries, dim=1)
         counts = torch.where(dense[:, : counts.shape[1]], 0, counts)
     ends = counts.cumsum(dim=1)
-    total = torch.empty(1, dtype=ends.dtype, pin_memory=True)
-    total.copy_(ends[:, -1].max().reshape(1), non_blocking=True)
-    ready = torch.cuda.Event()
-    ready.record()
+    total = ready = None
+    if not torch.cuda.is_current_stream_capturing():
+        total = torch.empty(1, dtype=ends.dtype, pin_memory=True)
+        total.copy_(ends[:, -1].max().reshape(1), non_blocking=True)
+        ready = torch.cuda.Event()
+        ready.record()
     return GatherSelections(counts, ends - counts, total, ready)
 
 
@@ -198,7 +196,7 @@ def build_tile_query_map(
     selections: GatherSelections,
     sparse_seq_len: int,
     tile: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Invert query-major selections into key-tile-major (query, key mask) pairs.
 
     ``selected_rows`` holds each query's compacted global pool rows (see
@@ -209,8 +207,9 @@ def build_tile_query_map(
     mask selects key ``t * tile + j``, and a key selected ``n`` times by one query appears in
     ``n`` pairs.
 
-    The selections are packed before the sort, which covers only real selections; None
-    means there are none.
+    The selections are packed before the sort. With a host total the sort covers only real
+    selections; during capture it covers ``seq_len * topk`` slots. Either way ``entries`` is
+    padded with unused slots to a nonzero multiple of 16.
     """
     # Pair masks hold one int32 bit per key of a tile, and the sort keys pack the key's
     # position in its tile into log2(tile) bits.
@@ -218,10 +217,17 @@ def build_tile_query_map(
     batch, seq_len, topk = selected_rows.shape
     device = selected_rows.device
     counts, offsets, total, ready = selections
-    ready.synchronize()
-    entries = int(total)
-    if entries == 0:
-        return None
+    # Index widths follow the capacity, not the count, so eager and captured runs agree.
+    capacity = triton.cdiv(seq_len * topk, 16) * 16
+    entries = capacity
+    if ready is not None:
+        ready.synchronize()
+        # Even without gather selections, keep one unused slot so the dK/dV kernel runs (and
+        # tunes) in eager exactly as it does under capture, where the total is unknown.
+        entries = max(1, int(total))
+    # Triton specializes integer arguments that are 1 or divisible by 16, so a multiple of 16
+    # in both paths keeps eager and captured runs on the same compiled kernels.
+    entries = triton.cdiv(entries, 16) * 16
     num_tiles = triton.cdiv(sparse_seq_len, tile)
     query_bits = max(1, (seq_len - 1).bit_length())
     # int32 encoded keys halve the sort when they fit.
@@ -256,7 +262,7 @@ def build_tile_query_map(
     starts = uninitialized_empty((batch, entries), device=device, dtype=torch.int32)
     _tile_map_starts[grid](sorted_keys, starts, entries, TILE=tile, SENTINEL=sentinel, BLOCK=1024)
     # One flat scan: a batched last-dim cumsum takes a much slower row-wise kernel.
-    pair_ends_dtype = torch.int32 if batch * entries < 2**31 else torch.int64
+    pair_ends_dtype = torch.int32 if batch * capacity < 2**31 else torch.int64
     pair_ends = torch.cumsum(
         starts.view(-1),
         dim=0,
@@ -290,7 +296,7 @@ def build_tile_query_map(
     return (
         pair_queries,
         pair_masks,
-        tile_offsets.to(torch.int32 if entries < 2**31 else torch.int64),
+        tile_offsets.to(torch.int32 if capacity < 2**31 else torch.int64),
     )
 
 

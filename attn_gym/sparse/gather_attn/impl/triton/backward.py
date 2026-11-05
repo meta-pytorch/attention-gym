@@ -1401,8 +1401,8 @@ def _launch_grouped_backward(
             selected_counts, spans, cu_seqlens, tile_queries, document_bounds=True
         )
         num_dense_tiles = tile_spans.shape[1]
-    # Start the gather count's host copy now; the map reads it after the dQ and dense dK/dV
-    # kernels below are queued.
+    # Outside capture, start the gather count's host copy now; the map reads it after the dQ
+    # and dense dK/dV kernels below are queued.
     gather_selections = (
         count_gather_selections(selected_counts, tile_spans, tile_queries) if key_major else None
     )
@@ -1696,78 +1696,61 @@ def _launch_grouped_backward(
         grad_sparse_v = grad_sparse_kv if v_is_k else rounded(grad_sparse_v_fp32)
     else:
         # Each program owns its key tile's gradient rows, so this is deterministic.
-        tile_map = build_tile_query_map(selected_rows, gather_selections, sparse_seq_len, tile)
-        if tile_map is None:
-            # Dense tiles cover every selection, or there are none.
-            if grad_dense_kv is None:
-                grad_sparse_kv = full_buffer(
-                    sparse_shape, 0, dtype=sparse_kv.dtype, device=sparse_kv.device
-                )
-                grad_sparse_v = (
-                    grad_sparse_kv
-                    if v_is_k
-                    else full_buffer(
-                        sparse_shape, 0, dtype=sparse_kv.dtype, device=sparse_kv.device
-                    )
-                )
-            else:
-                grad_sparse_kv = rounded(grad_dense_kv)
-                grad_sparse_v = grad_sparse_kv if v_is_k else rounded(grad_dense_v)
-        else:
-            pair_queries, pair_masks, tile_offsets = tile_map
-            grad_sparse_kv = uninitialized_empty(
-                sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device
-            )
-            grad_sparse_v = (
-                grad_sparse_kv
-                if v_is_k
-                else uninitialized_empty(
-                    sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device
-                )
-            )
-            # TMA gathers need 16-byte-aligned bases, which a contiguous view at an odd
-            # storage offset lacks; a copy gets a fresh, aligned allocation.
-            query_rows, grad_output_rows = (
-                (tensor if can_use_tma(tensor) else tensor.clone()).view(-1, head_dim)
-                for tensor in (query, grad_output)
-            )
-            BWD_DSPARSE_KV_GROUPED[(triton.cdiv(sparse_seq_len, tile), kv_heads, batch)](
-                TensorDescriptor.from_tensor(query_rows, [1, block_d]),
-                sparse_kv,
-                sparse_values,
-                TensorDescriptor.from_tensor(grad_output_rows, [1, block_d]),
-                lse,
-                delta,
-                pair_queries,
-                pair_masks,
-                tile_offsets,
-                grad_sparse_kv,
-                grad_sparse_v,
-                SPARSE_KV_STRIDES=sparse_kv.stride(),
-                SPARSE_V_STRIDES=sparse_values.stride(),
-                LSE_STRIDES=lse.stride(),
-                PAIR_STRIDES=pair_queries.stride(),
-                TILE_OFFSETS_STRIDES=tile_offsets.stride(),
-                GRAD_SPARSE_KV_STRIDES=grad_sparse_kv.stride(),
-                GRAD_SPARSE_V_STRIDES=grad_sparse_v.stride(),
-                H=heads,
-                KV_HEADS=kv_heads,
-                V_IS_K=v_is_k,
-                S=seq_len,
-                D=head_dim,
-                SPARSE_SEQ_LEN=sparse_seq_len,
-                SCALE=scale,
-                # Rows enumerate (pair, group head), up to seq_len * topk * group of them.
-                USE_INT64_OFFSETS=use_int64_offsets
-                or requires_int64_offsets(grad_sparse_kv, grad_sparse_v, pair_queries)
-                or seq_len * topk * group >= 2**31,
-                TILE=tile,
-                BLOCK_D=block_d,
-                grad_dense_kv_ptr=grad_dense_kv,
-                grad_dense_v_ptr=grad_dense_v,
-                GRAD_DENSE_STRIDES=None if grad_dense_kv is None else grad_dense_kv.stride(),
-                ADD_DENSE=grad_dense_kv is not None,
-            )
+        pair_queries, pair_masks, tile_offsets = build_tile_query_map(
+            selected_rows, gather_selections, sparse_seq_len, tile
+        )
+        grad_sparse_kv = uninitialized_empty(
+            sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device
+        )
+        grad_sparse_v = (
+            grad_sparse_kv
+            if v_is_k
+            else uninitialized_empty(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
+        )
+        # TMA gathers need 16-byte-aligned bases, which a contiguous view at an odd
+        # storage offset lacks; a copy gets a fresh, aligned allocation.
+        query_rows, grad_output_rows = (
+            (tensor if can_use_tma(tensor) else tensor.clone()).view(-1, head_dim)
+            for tensor in (query, grad_output)
+        )
+        BWD_DSPARSE_KV_GROUPED[(triton.cdiv(sparse_seq_len, tile), kv_heads, batch)](
+            TensorDescriptor.from_tensor(query_rows, [1, block_d]),
+            sparse_kv,
+            sparse_values,
+            TensorDescriptor.from_tensor(grad_output_rows, [1, block_d]),
+            lse,
+            delta,
+            pair_queries,
+            pair_masks,
+            tile_offsets,
+            grad_sparse_kv,
+            grad_sparse_v,
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_values.stride(),
+            LSE_STRIDES=lse.stride(),
+            PAIR_STRIDES=pair_queries.stride(),
+            TILE_OFFSETS_STRIDES=tile_offsets.stride(),
+            GRAD_SPARSE_KV_STRIDES=grad_sparse_kv.stride(),
+            GRAD_SPARSE_V_STRIDES=grad_sparse_v.stride(),
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            SCALE=scale,
+            # Rows enumerate (pair, group head) and pair offsets span the batch, bounded by the
+            # map's capacity (seq_len * topk padded to 16) in eager and captured runs alike.
+            USE_INT64_OFFSETS=use_int64_offsets
+            or requires_int64_offsets(grad_sparse_kv, grad_sparse_v)
+            or triton.cdiv(seq_len * topk, 16) * 16 * max(group, batch) >= 2**31,
+            TILE=tile,
+            BLOCK_D=block_d,
+            grad_dense_kv_ptr=grad_dense_kv,
+            grad_dense_v_ptr=grad_dense_v,
+            GRAD_DENSE_STRIDES=None if grad_dense_kv is None else grad_dense_kv.stride(),
+            ADD_DENSE=grad_dense_kv is not None,
+        )
 
     return (
         grad_query,
