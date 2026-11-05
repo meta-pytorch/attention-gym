@@ -6,9 +6,9 @@ workspace allocation, and backward orchestration.
 
 Constraints
 -----------
-- latent width = 512 with independent RoPE width 0 or 64, 1 <= nheads <= 128,
-  share_kv = True (fewer than
-  128 heads are zero-padded to FA4's 64/128-head tiles in-kernel via TMA out-of-bounds)
+- latent width = 512 with independent RoPE width 0 or 64, 1 <= nheads <= 128, one KV
+  head that is also the values (fewer than 128 heads are zero-padded to FA4's 64/128-head
+  tiles in-kernel via TMA out-of-bounds)
 - dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
 - Requires FA4 4.0.0b32+ for sparse MLA attention sinks and, with fewer than 128
   heads, sparse-MLA head padding; 4.0.0b33+ to recompute probabilities in backward
@@ -48,7 +48,7 @@ def _constraint_violation(
     if query.dtype != torch.bfloat16:
         return TypeError("CuTe backend requires bfloat16.")
     if not share_kv:
-        return ValueError("CuTe backend requires share_kv=True.")
+        return ValueError("CuTe backend requires one KV head that is also the values.")
     if d != VALUE_DIM or (0 if query_rope is None else query_rope.shape[-1]) not in ROPE_DIMS:
         return ValueError("CuTe backend requires latent width 512 and RoPE width 0 or 64.")
     if not 0 < h <= 128:

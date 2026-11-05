@@ -4,6 +4,7 @@ import torch
 from torch import Tensor
 
 from .ops import _gather_attn_bwd_op, _gather_attn_fwd_op
+from .routing import uses_grouped_schedule
 
 
 class _GatherAttnFunction(torch.autograd.Function):
@@ -118,8 +119,14 @@ def gather_attn(
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
+    local_v: Tensor | None = None,
+    sparse_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """Flatten independent operands into one common opaque operator contract."""
+    """Flatten independent operands into one common opaque operator contract.
+
+    ``local_v``/``sparse_v`` are separate values; with them, or with 1 < kv_heads < heads,
+    the inputs run on the Triton grouped schedule.
+    """
     if backend == "triton" and (sliding_window_size or kv_indices.shape[-1]):
         query = query.contiguous()
     kv_indices = kv_indices.contiguous()
@@ -128,9 +135,17 @@ def gather_attn(
     tensors = (query, sparse_kv, local_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k)
     ropes = (query_rope, sparse_rope, local_rope)
     options = (sliding_window_size, share_kv, scale, backend, bwd_recompute_p)
+    values = (sparse_v, local_v)
     requires_grad = torch.is_grad_enabled() and any(
-        tensor is not None and tensor.requires_grad for tensor in (*tensors, *ropes)
+        tensor is not None and tensor.requires_grad for tensor in (*tensors, *ropes, *values)
     )
+    if requires_grad and uses_grouped_schedule(
+        query.shape[1], sparse_kv.shape[1], sparse_v is not None
+    ):
+        raise NotImplementedError(
+            "The Triton grouped schedule (separate values or grouped KV heads) runs without "
+            "gradients for now; use impl='reference' or torch.no_grad()"
+        )
     if requires_grad:
         # Distinct views avoid duplicate HOP inputs while preserving leaf accumulation.
         inputs = tuple(None if tensor is None else tensor.view_as(tensor) for tensor in tensors)
@@ -145,5 +160,6 @@ def gather_attn(
         backend,
         bwd_recompute_p,
         *ropes,
+        *values,
     )
     return output, lse
