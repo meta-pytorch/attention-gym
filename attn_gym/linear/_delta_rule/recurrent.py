@@ -32,6 +32,7 @@ from attn_gym._backends.triton.utils import (
     LOG2_E,
     autotune_cache_kwargs,
     configure_triton_allocator,
+    fixed_tree_sum,
     ptr_offset,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
@@ -55,6 +56,12 @@ def _prune_recurrent_configs(configs, _named_args, V, **_):
     """Drop value tiles wider than the padded value dimension."""
     max_block_v = max(8, triton.next_power_of_2(V))
     return [config for config in configs if config.kwargs["BV"] <= max_block_v]
+
+
+@triton.jit
+def _sum_over_k(x):
+    """Sum a ``[BK, BV]`` tile over K in an order fixed by ``BK`` alone (``fixed_tree_sum``)."""
+    return fixed_tree_sum(tl.trans(x))
 
 
 @triton.jit
@@ -207,20 +214,14 @@ def _recurrent_delta_rule_fwd_kernel(
             )  # fmt: skip
         b_q *= scale
 
-        # exp(g) computed as exp2(g * log2(e)); the FMA folds into the exp2 argument.
+        # exp(g) computed as exp2(g * log2(e)).
         b_state *= tl.exp2(b_g * LOG2_E)
 
-        if PREFETCH:
-            # q @ (S + k delta) = q @ S + (q . k) delta lets both reductions read decayed S
-            # without waiting for the state update.
-            b_o = tl.sum(b_q * b_state, 0)
-            b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
-            b_o += tl.sum(b_q * b_k, 0) * b_delta
-            b_state += b_k * b_delta[None, :]
-        else:
-            b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
-            b_state += b_k * b_delta[None, :]
-            b_o = tl.sum(b_q * b_state, 0)
+        # Every launch config uses this one formula, fixed-order sums and no FMA fusion (see the
+        # launch), so a sequence's bits do not depend on the batch shape that picks the config.
+        b_delta = (b_v - _sum_over_k(b_k * b_state)) * b_beta
+        b_state += b_k * b_delta[None, :]
+        b_o = _sum_over_k(b_q * b_state)
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
 
     if STORE_FINAL_STATE:
@@ -340,7 +341,7 @@ def launch_recurrent_delta_rule_fwd(
     sequence_heads = num_sequences * heads
     average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
     tokens_bucket = min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT)
-    # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
+    # Up to 16 sequence-heads, prefetch hides load latency (GB300: 0.77-0.95x at K=64 and K=128).
     # Prefetch was slower for K > 128.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
     use_autotune = autotune and state_indices is None
@@ -412,6 +413,9 @@ def launch_recurrent_delta_rule_fwd(
         USE_HAS_INITIAL_STATE=has_initial_state is not None,
         SCALAR_GATE=gate_kind is GateKind.SCALAR,
         PREFETCH=prefetch,
+        # Whether a multiply fuses into the next add as an FMA follows the thread layout, so it
+        # changes with the launch config. Plain multiplies and adds keep a sequence's bits fixed.
+        enable_fp_fusion=False,
         **launch_options,
     )
     return output, final_state

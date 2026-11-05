@@ -19,6 +19,10 @@ scan in :mod:`attn_gym.linear._delta_rule.recurrent`, with the cache storing the
     state += outer(k, delta)
     out    = scale * l2norm(q) @ state
 
+It matches the scan's math, not its bits: this kernel picks its launch config from the batch size
+and sums with ``tl.sum``, FMA fusion on.
+TODO: make its bits independent of the launch config, as the scan's are.
+
 Gate transforms (`USE_LOWER_BOUND` selects the first):
 
     bounded:  lower_bound * sigmoid(exp(A_log) * (raw_gate + dt_bias))

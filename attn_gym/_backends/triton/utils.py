@@ -83,6 +83,9 @@ def fixed_tree_sum(x):
     independent, and the result drops the last axis. Keep each level a ``tl.sum`` over a pair
     rather than ``tl.split`` plus ``+``: the latter let the compiler fuse a caller's ``x * x`` into
     the first add as an FMA under only some layouts, changing FP32 bits across launch configs.
+    The pair ``tl.sum`` does not rule that out for every tile layout: on a transposed tile (the
+    recurrent scan's sums over K) products still fused under some layouts, so that kernel also
+    launches with ``enable_fp_fusion=False``.
     """
     tl.static_assert(len(x.shape) > 0)
     tl.static_assert(x.dtype == tl.float32)

@@ -417,7 +417,9 @@ def recurrent_kda(
             False entries ignore stale contents in the selected slot and start from zero.
         autotune: Benchmark candidate value-tile sizes for non-paged execution
             when true; winners are cached and reused. Paged execution and false
-            use a deterministic sequence-length heuristic.
+            use a deterministic sequence-length heuristic. Either way, a sequence's
+            output and state bits do not depend on the launch config, so they do not
+            depend on the other sequences in the batch.
         impl: ``"fused"`` uses the inference-only optimized scan; ``"reference"``
             uses differentiable eager PyTorch in FP32, with no automatic
             fallback.
