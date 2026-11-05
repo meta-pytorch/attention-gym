@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
+from attn_gym.testing.gather_attn import assert_sink_gradient_fp32
 
 ATOL_FWD = 1e-2
 RTOL_FWD = 1e-2
@@ -67,22 +68,6 @@ def assert_matches_low_precision_eager(
     ) * high_precision_expected.abs().max().item()
     assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
     assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
-
-
-def assert_sink_gradient_fp32(
-    sink: torch.Tensor,
-    lse: torch.Tensor,
-    output: torch.Tensor,
-    grad_output: torch.Tensor,
-    grad_sink: torch.Tensor,
-) -> None:
-    """Check FP32 sink arithmetic independently of the saved output's quantization error."""
-    delta = (output.double() * grad_output.double()).sum(-1)
-    sink_partials = -torch.exp(sink.double()[None, :, None] - lse.double()) * delta
-    # Bound FP32 reduction error by the sum of magnitudes, not the cancellation-prone result.
-    allowance = 32 * torch.finfo(torch.float32).eps * sink_partials.abs().sum((0, 2))
-    assert torch.isfinite(grad_sink).all()
-    assert ((grad_sink.double() - sink_partials.sum((0, 2))).abs() <= allowance).all()
 
 
 def _make_inputs(

@@ -212,7 +212,12 @@ def nan_filled_empty(monkeypatch):
         monkeypatch.setattr(owner, name, nan_filled(getattr(owner, name)))
     if not torch.cuda.is_available():
         return
-    from attn_gym.sparse.gather_attn.impl.triton import forward, primitives
+    from attn_gym.sparse.gather_attn.impl.triton import (
+        backward,
+        forward,
+        key_major_backward,
+        primitives,
+    )
 
     def poisoned(allocate):
         """Integers too: gather attention's index buffers bypass ``torch.empty``."""
@@ -226,7 +231,7 @@ def nan_filled_empty(monkeypatch):
         return allocate_poisoned
 
     # The grouped gather schedule allocates buffers it fully writes without torch.empty.
-    for module in (forward, primitives):
+    for module in (backward, forward, key_major_backward, primitives):
         monkeypatch.setattr(
             module, "uninitialized_empty", poisoned(primitives.uninitialized_empty)
         )

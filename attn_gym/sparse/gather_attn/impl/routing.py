@@ -8,8 +8,8 @@ import torch
 def uses_grouped_schedule(heads: int, kv_heads: int, separate_values: bool) -> bool:
     """Whether inputs need the Triton grouped schedule: separate values or 1 < kv_heads < heads.
 
-    Backend choice and the forward schedule route on this one predicate so they cannot
-    disagree.
+    Backend choice, the forward schedule, the forward's query map, and the backward launcher
+    all route on this one predicate so they cannot disagree.
     """
     return separate_values or kv_heads not in (1, heads)
 
