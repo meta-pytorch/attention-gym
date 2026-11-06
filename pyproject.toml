@@ -39,7 +39,8 @@ cudnn = [
 ]
 
 tests = [
-    "pytest",
+    # xdist 3.8 loses loadgroup isolation with pytest 9.2.
+    "pytest<9.2",
     "pytest-xdist",
     "typer",
     "jsonargparse[signatures]",
@@ -48,7 +49,7 @@ tests = [
 
 dev = [
     "prek",
-    "pytest",
+    "pytest<9.2",
     "pytest-xdist",  # pytest addopts pass --dist, so xdist must be present even for -n 0
     "ruff",
     "typer",
