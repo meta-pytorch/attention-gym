@@ -95,7 +95,7 @@ with this skill.
 - After changing a fake's dtype or layout without a schema change, use a fresh
   `TORCHINDUCTOR_CACHE_DIR`; a stale FX graph raises "expected dtype ... but got ...".
 - Warm tuning caches skip tuning and its reset hooks; test tuned paths with the
-  `isolated_winners` fixture pattern from `test/test_triton_tunable.py`.
+  `isolated_winners` fixture in `test/conftest.py`.
 
 ## Completion
 
