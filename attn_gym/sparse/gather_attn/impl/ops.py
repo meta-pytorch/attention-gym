@@ -14,7 +14,8 @@ torch.library.define(
     "Tensor? attention_sink, Tensor? cu_seqlens, Tensor? cu_seqlens_k, "
     "int sliding_window_size, bool share_kv, float scale, bool needs_backward, "
     "str backend, bool bwd_recompute_p=True, Tensor? query_rope=None, "
-    "Tensor? sparse_rope=None, Tensor? local_rope=None) -> (Tensor, Tensor, Tensor?[])",
+    "Tensor? sparse_rope=None, Tensor? local_rope=None, Tensor? sparse_v=None, "
+    "Tensor? local_v=None) -> (Tensor, Tensor, Tensor?[])",
 )
 torch.library.define(
     "attn_gym::_gather_attn_bwd",
@@ -58,6 +59,8 @@ def _gather_attn_fwd_cuda(
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, list[Tensor | None]]:
     with torch.cuda.device(query.device):
         if backend not in ("cute", "triton"):
@@ -103,11 +106,16 @@ def _gather_attn_fwd_cuda(
             query = query.contiguous()
             kv_indices = kv_indices.contiguous()
             sink = _triton_sink(query, attention_sink)
+            kv_heads = sparse_kv.shape[1]
             if share_kv:
                 sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
                 local_kv = (
                     None if local_kv is None else local_kv.expand(-1, query.shape[1], -1, -1)
                 )
+                sparse_v = (
+                    None if sparse_v is None else sparse_v.expand(-1, query.shape[1], -1, -1)
+                )
+                local_v = None if local_v is None else local_v.expand(-1, query.shape[1], -1, -1)
                 sparse_rope = (
                     None if sparse_rope is None else sparse_rope.expand(-1, query.shape[1], -1, -1)
                 )
@@ -124,6 +132,9 @@ def _gather_attn_fwd_cuda(
                 cu_seqlens_k,
                 sliding_window_size,
                 scale,
+                kv_heads=kv_heads,
+                sparse_v=sparse_v,
+                local_v=local_v,
                 query_rope=query_rope,
                 sparse_rope=sparse_rope,
                 local_rope=local_rope,
@@ -259,6 +270,8 @@ def _gather_attn_fwd_fake(
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
 ) -> tuple[Tensor, Tensor, list[Tensor | None]]:
     if backend not in ("cute", "triton"):
         raise ValueError(f"gather-attention operators require a concrete backend, got {backend!r}")

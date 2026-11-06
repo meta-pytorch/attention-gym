@@ -8,6 +8,9 @@ from pathlib import Path
 
 import pytest
 
+# Show measured values when shared test helpers' assertions fail.
+pytest.register_assert_rewrite("attn_gym.testing")
+
 # Both caches are read at import or CUDA-init time, so set them before any test module loads;
 # subprocess tests inherit them. Explicit user settings win.
 # Cached CuTeDSL objects are finalized by the driver on load and memoized in its ComputeCache.
@@ -147,13 +150,19 @@ def gather_attn_single_config(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[None]:
-    """Use one valid Triton schedule unless a test explicitly covers autotuning."""
+    """Use one valid Triton schedule unless a test explicitly covers autotuning.
+
+    The schedule is each tuner's first candidate, or, for a test marked
+    ``tuner_config(index)``, the candidate at that index (modulo the tuner's valid candidates).
+    """
     if (
         not torch.cuda.is_available()
         or request.node.get_closest_marker("full_autotune") is not None
     ):
         yield
         return
+    marker = request.node.get_closest_marker("tuner_config")
+    index = marker.args[0] if marker else 0
 
     import importlib
 
@@ -169,10 +178,12 @@ def gather_attn_single_config(
     for tuner in tuners:
         original_pruner = tuner._prune
 
-        def first_valid_config(configs, args, _pruner=original_pruner):
-            return (_pruner(configs, args) if _pruner else configs)[:1]
+        def pinned_config(configs, args, _pruner=original_pruner):
+            valid = _pruner(configs, args) if _pruner else configs
+            # An empty list still reaches the tuner's own "no configs" error.
+            return valid[index % len(valid) :][:1] if valid else valid
 
-        monkeypatch.setattr(tuner, "_prune", first_valid_config)
+        monkeypatch.setattr(tuner, "_prune", pinned_config)
     # The single-candidate winner would otherwise stay in the in-process memo, which is not
     # keyed by the candidate set, and skip tuning for later callers.
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")
@@ -186,7 +197,8 @@ def nan_filled_empty(monkeypatch):
     """Fill every fresh floating-point tensor with NaN, the worst case ``torch.empty`` allows.
 
     The caching allocator mostly recycles blocks, so a test cannot rely on real garbage: filling
-    at the allocation entry points the kernels use makes every unwritten element a NaN.
+    at the allocation entry points the kernels use makes every unwritten element a NaN. The
+    grouped gather schedule's ``uninitialized_empty`` buffers also get integer poison.
     """
 
     def nan_filled(allocate):
@@ -198,3 +210,23 @@ def nan_filled_empty(monkeypatch):
 
     for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
         monkeypatch.setattr(owner, name, nan_filled(getattr(owner, name)))
+    if not torch.cuda.is_available():
+        return
+    from attn_gym.sparse.gather_attn.impl.triton import forward, primitives
+
+    def poisoned(allocate):
+        """Integers too: gather attention's index buffers bypass ``torch.empty``."""
+
+        def allocate_poisoned(*args, **kwargs):
+            tensor = allocate(*args, **kwargs)
+            if tensor.is_floating_point():
+                return tensor.fill_(torch.nan)
+            return tensor.fill_(torch.iinfo(tensor.dtype).max)
+
+        return allocate_poisoned
+
+    # The grouped gather schedule allocates buffers it fully writes without torch.empty.
+    for module in (forward, primitives):
+        monkeypatch.setattr(
+            module, "uninitialized_empty", poisoned(primitives.uninitialized_empty)
+        )
