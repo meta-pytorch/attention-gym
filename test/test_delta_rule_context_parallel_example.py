@@ -126,20 +126,9 @@ def _assert_matches_reference(
         )
 
 
-def _rank_main(
-    rank: int, rendezvous: str, dtype: torch.dtype, capture: bool, variant: str
-) -> None:
+def _run_case(rank: int, variant: str, dtype: torch.dtype, capture: bool) -> None:
     """Keep one model across layouts; captured runs update only caller-owned tensor buffers."""
     device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        "nccl",
-        init_method=rendezvous,
-        rank=rank,
-        world_size=2,
-        device_id=device,
-        timeout=timedelta(seconds=180),
-    )
     graph = None
     try:
         # Keep parameter autograd nodes on the same stream for warmup, capture, and replay.
@@ -252,28 +241,67 @@ def _rank_main(
     finally:
         if graph is not None:
             graph.reset()
+
+
+def _rank_main(
+    rank: int, rendezvous: str, variant: str, cases: tuple[tuple[str, torch.dtype, bool], ...]
+) -> None:
+    """Run every case of one variant on a single process group to pay NCCL startup once."""
+    device = torch.device("cuda", rank)
+    torch.cuda.set_device(device)
+    dist.init_process_group(
+        "nccl",
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        device_id=device,
+        timeout=timedelta(seconds=180),
+    )
+    try:
+        for case, dtype, capture in cases:
+            try:
+                _run_case(rank, variant, dtype, capture)
+            except Exception as error:
+                raise RuntimeError(f"{case} failed on rank {rank}") from error
+            # Wait for device work and both ranks before continuing to the next case.
+            torch.cuda.synchronize(device)
+            dist.barrier()
+    finally:
         dist.destroy_process_group()
 
 
+# Each variant's (case id, dtype, capture) cases share one pair of ranks and process group.
 @pytest.mark.parametrize(
-    ("variant", "dtype", "capture"),
+    ("variant", "cases"),
     [
-        pytest.param("kda", torch.bfloat16, False, id="kda-bf16-eager"),
-        pytest.param("kda", torch.bfloat16, True, id="kda-bf16-cuda-graph"),
-        pytest.param("kda", torch.float16, False, id="kda-fp16-eager"),
-        pytest.param("kda", torch.float16, True, id="kda-fp16-cuda-graph"),
+        pytest.param(
+            "kda",
+            (
+                ("kda-bf16-eager", torch.bfloat16, False),
+                ("kda-bf16-cuda-graph", torch.bfloat16, True),
+                ("kda-fp16-eager", torch.float16, False),
+                ("kda-fp16-cuda-graph", torch.float16, True),
+            ),
+            id="kda",
+        ),
         # context_parallel_gdn is covered at kernel level; here GDN only adds gate plumbing.
-        pytest.param("gdn", torch.bfloat16, True, id="gdn-bf16-cuda-graph"),
-        pytest.param("gdn", torch.float16, False, id="gdn-fp16-eager"),
+        pytest.param(
+            "gdn",
+            (
+                ("gdn-bf16-cuda-graph", torch.bfloat16, True),
+                ("gdn-fp16-eager", torch.float16, False),
+            ),
+            id="gdn",
+        ),
     ],
 )
 def test_same_module_uses_each_batch_routing(
-    tmp_path: Path, variant: str, dtype: torch.dtype, capture: bool
+    tmp_path: Path, variant: str, cases: tuple[tuple[str, torch.dtype, bool], ...]
 ) -> None:
     """One model must follow two incompatible layouts, including in-place graph metadata replay."""
     mp.spawn(
         _rank_main,
-        args=((tmp_path / "nccl-init").as_uri(), dtype, capture, variant),
+        args=((tmp_path / "nccl-init").as_uri(), variant, cases),
         nprocs=2,
         join=True,
     )
