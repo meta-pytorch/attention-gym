@@ -207,6 +207,7 @@ def relative_rms_error(actual: torch.Tensor, reference: torch.Tensor) -> float:
     )
 
 
+@torch.no_grad()
 def assert_relative_rms_within(
     actual: torch.Tensor,
     expected: torch.Tensor,
@@ -219,10 +220,15 @@ def assert_relative_rms_within(
 
     A zero reference has a zero budget and therefore requires an exactly zero result.
     """
-    assert torch.isfinite(actual).all(), f"{name}: kernel output contains non-finite values"
     expected = expected.double()
-    error = (actual.double() - expected).square().mean().sqrt().item()
-    scale = expected.square().mean().sqrt().item()
+    finite, error, scale = torch.stack(
+        (
+            torch.isfinite(actual).all(),
+            (actual.double() - expected).square().mean().sqrt(),
+            expected.square().mean().sqrt(),
+        )
+    ).tolist()
+    assert finite, f"{name}: kernel output contains non-finite values"
     if scale == 0:
         assert error == 0, f"{name}: expected exact zero, got RMS error {error:.3e}"
         return
