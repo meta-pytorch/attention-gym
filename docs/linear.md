@@ -153,10 +153,13 @@ This is the gated delta rule without its delta correction (`q = C`, `k = B`, `v 
   sequences. The fused paths keep packed offsets on the device.
 - Grouped `B`/`C` (`H % G == 0`), scalar or per-channel `D`, the optional `silu(z)` gate, and
   the `dt_bias`/softplus/`dt_limit` step-size transform.
-- `chunk_mamba2` for training and prefill. The default `impl="fused"` runs a single-pass Triton
-  forward and a chunk-parallel Triton backward with gradients for every input, including
-  `dt_bias`, `D`, `z`, and the initial state, on CUDA with FP16/BF16 activations and a
-  power-of-two `N` in [16, 256]. It supports strict `torch.compile`.
+- `chunk_mamba2` for training and prefill. The default `impl="fused"` runs Triton kernels on
+  CUDA with FP16/BF16 activations and a power-of-two `N` in [16, 256]: a state scan that splits
+  long sequences into parallel segments when few `(sequence, head)` pairs run, a chunk-parallel
+  output kernel, and a chunk-parallel backward with gradients for every input, including
+  `dt_bias`, `D`, `z`, and the initial state. Training keeps the pre-gate output (one extra
+  `[batch, T, H, P]` activation) so the gate backward is elementwise. It supports strict
+  `torch.compile`.
 - `paged_chunk_mamba2` advances selected `[num_slots, H, P, N]` cache rows in place for
   inference prefill, without caller-side gather/scatter copies, under the same `N` constraint.
 - `recurrent_mamba2(impl="fused")` is an inference-only Triton token scan with returned or paged
