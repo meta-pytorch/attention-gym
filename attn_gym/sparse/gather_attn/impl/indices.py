@@ -29,6 +29,7 @@ def _build_gather_indices_kernel(
     WINDOW: tl.constexpr,
     OUT_K: tl.constexpr,
     PACKED: tl.constexpr,
+    HAS_LOCAL: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -60,7 +61,7 @@ def _build_gather_indices_kernel(
         -1,
     )
     sparse_valid = (index >= 0) & (index < sparse_end - sparse_start)
-    sparse_position = tl.where(sparse_valid, index, 0) + query_end - start
+    sparse_position = tl.where(sparse_valid, index, 0) + (query_end - start if HAS_LOCAL else 0)
     sparse_position = tl.where(sparse_valid, sparse_position, -1)
     combined = tl.where(
         slot < WINDOW, tl.where(local_valid, local_position - start, -1), sparse_position
@@ -74,6 +75,8 @@ def build_gather_indices(
     cu_seqlens_k: Tensor | None,
     sliding_window_size: int,
     sparse_kv_len: int,
+    *,
+    has_local: bool = True,
 ) -> Tensor:
     """Build FA4's padded indices relative to each document's [local KV; sparse KV] pool.
 
@@ -99,6 +102,7 @@ def build_gather_indices(
             sliding_window_size,
             slots,
             cu_seqlens is not None,
+            has_local,
             requires_int64_offsets(kv_indices, indices, cu_seqlens, cu_seqlens_k),
             256,
             num_warps=4,

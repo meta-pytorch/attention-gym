@@ -8,8 +8,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from attn_gym.sparse.gather_attn import Impl, gather_attn
-from attn_gym.sparse.gather_attn import impl as implementations
+from attn_gym.sparse.gather_attn import Impl, RopePair, api, gather_attn
 from attn_gym.sparse.gather_attn.api import _select_backend
 from attn_gym.sparse.gather_attn.impl import cute
 
@@ -20,14 +19,6 @@ def clear_fa4_probe():
     probe.cache_clear()
     yield
     probe.cache_clear()
-
-
-@pytest.fixture
-def triton_backend(monkeypatch):
-    backend = SimpleNamespace(gather_attn=Mock())
-    monkeypatch.setitem(sys.modules, "attn_gym.sparse.gather_attn.impl.triton", backend)
-    monkeypatch.setattr(implementations, "triton", backend, raising=False)
-    return backend
 
 
 @pytest.fixture
@@ -50,15 +41,13 @@ def fa4_available(monkeypatch, request):
     return available
 
 
+@pytest.mark.parametrize("rope_dim", [0, 64], ids=["bare", "paired"])
 @pytest.mark.parametrize("heads", [1, 24, 64, 96, 127, 128])
-def test_default_prefers_cute(cuda_inputs, fa4_available, monkeypatch, heads):
-    cuda_inputs["query"] = cuda_inputs["query"][:, :heads]
-    cuda_inputs["attention_sink"] = cuda_inputs["attention_sink"][:heads]
-    query = cuda_inputs["query"]
-    launch = Mock(return_value=(query, None))
-    monkeypatch.setattr(cute, "gather_attn", launch)
-    assert gather_attn(**cuda_inputs) is query
-    launch.assert_called_once()
+def test_default_prefers_cute(cuda_inputs, fa4_available, heads, rope_dim):
+    query = cuda_inputs["query"][:, :heads]
+    sink = cuda_inputs["attention_sink"][:heads]
+    rope = query[..., :rope_dim] if rope_dim else None
+    assert _select_backend(query, sink, True, num_keys=6, query_rope=rope) == "cute"
     fa4_available.assert_called_once_with(True, padded_heads=heads != 128)
 
 
@@ -84,73 +73,99 @@ def test_unsupported_metadata_uses_triton(
     fa4_available.assert_not_called()
 
 
-@pytest.mark.parametrize("constraint", ["compiling", "deterministic", "missing_fa4", "empty_keys"])
-def test_auto_fallback_calls_triton(
-    cuda_inputs, fa4_available, triton_backend, monkeypatch, constraint
+@pytest.mark.parametrize("rope_dim", [0, 64], ids=["bare", "paired"])
+@pytest.mark.parametrize("constraint", ["deterministic", "missing_fa4", "empty_keys"])
+def test_auto_fallback_selects_triton(
+    cuda_inputs, fa4_available, monkeypatch, constraint, rope_dim
 ):
-    if constraint == "compiling":
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    elif constraint == "deterministic":
+    if constraint == "deterministic":
         monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
     elif constraint == "missing_fa4":
         fa4_available.return_value = False
-    else:
-        cuda_inputs["kv_indices"] = cuda_inputs["kv_indices"][..., :0]
-        cuda_inputs["sliding_window_size"] = 0
+    num_keys = 0 if constraint == "empty_keys" else 6
     query = cuda_inputs["query"]
-    launch = Mock(return_value=(query, None))
-    triton_backend.gather_attn = launch
-    assert gather_attn(**cuda_inputs) is query
-    launch.assert_called_once()
+    rope = query[..., :rope_dim] if rope_dim else None
+    assert (
+        _select_backend(
+            query, cuda_inputs["attention_sink"], True, num_keys=num_keys, query_rope=rope
+        )
+        == "triton"
+    )
     if constraint != "missing_fa4":
         fa4_available.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "impl,kernel_options", [(Impl.FUSED, {"backend": "triton"}), (Impl.REFERENCE, None)]
-)
-def test_explicit_implementation_is_honored(
-    cuda_inputs, fa4_available, triton_backend, monkeypatch, impl, kernel_options
-):
+@pytest.mark.parametrize("rope_dim", [0, 64], ids=["bare", "paired"])
+@pytest.mark.parametrize("backend", [None, "triton", "cute"])
+def test_fused_fake_outputs_have_no_cpu_bookkeeping(cuda_inputs, fa4_available, backend, rope_dim):
+    """Common output metadata is CUDA-only, so Inductor can capture the opaque boundary."""
+    options = None if backend is None else {"backend": backend}
+    inputs = cuda_inputs.copy()
+    if rope_dim:
+        for name in ("query", "local_kv", "sparse_kv"):
+            tensor = inputs[name]
+            inputs[name] = RopePair(tensor, torch.empty_like(tensor[..., :rope_dim]))
+    kwargs = {"scale": 0.0625} if rope_dim else {}
+    result = gather_attn(**inputs, **kwargs, kernel_options=options)
+    assert result.shape == cuda_inputs["query"].shape
+    assert result.device == cuda_inputs["query"].device
+
+
+@pytest.mark.parametrize("backend", [None, "cute", "triton"])
+def test_backend_request_is_forwarded(cuda_inputs, monkeypatch, backend):
+    query = cuda_inputs["query"]
+    launch = Mock(return_value=(query, None))
+    select = Mock(return_value="cute")
+    monkeypatch.setattr(api, "_select_backend", select)
+    monkeypatch.setattr(api, "fused_gather_attn", launch)
+    options = None if backend is None else {"backend": backend}
+    assert gather_attn(**cuda_inputs, kernel_options=options) is query
+    assert launch.call_args.kwargs["backend"] == (backend or "cute")
+    assert select.call_count == (1 if backend is None else 0)
+
+
+@pytest.mark.parametrize("fallback", ["missing-fa4", "deterministic"])
+@pytest.mark.parametrize("recompute", [True, False])
+def test_auto_fallback_reserves_only_triton_tape(monkeypatch, fallback, recompute):
+    """A fallback must not retain the GB-sized FA4 tape it will never consume."""
+    monkeypatch.setattr(cute, "_environment_supported", lambda *args: False)
+    if fallback == "deterministic":
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    saved = []
+
+    def save(tensor):
+        saved.append(tensor)
+        return tensor
+
+    with FakeTensorMode(), torch.autograd.graph.saved_tensors_hooks(save, lambda x: x):
+        q = torch.empty(1, 128, 8192, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        kv = torch.empty(1, 1, 8192, 512, device="cuda", dtype=torch.bfloat16)
+        indices = torch.empty(1, 8192, 32, device="cuda", dtype=torch.int32)
+        gather_attn(
+            q,
+            kv,
+            kv,
+            indices,
+            sliding_window_size=512,
+            kernel_options={"bwd_recompute_p": recompute},
+        )
+    maps = [t for t in saved if t.dtype == torch.int32 and t.ndim == 2]
+    assert len(maps) == 2
+    assert all(t.device.type == "cuda" for t in saved)
+    assert sum(t.numel() * t.element_size() for t in maps) == (8192 * 32 + 8192 + 1) * 4
+    # Q, local KV, sparse KV, output only: no additional BF16 FA4 KV/residual/P buffers.
+    assert sum(t.dtype == torch.bfloat16 for t in saved) == 4
+
+
+def test_reference_implementation_is_honored(cuda_inputs, fa4_available, monkeypatch):
     from attn_gym.sparse.gather_attn.impl import reference
 
-    module = reference if impl is Impl.REFERENCE else triton_backend
     query = cuda_inputs["query"]
     launch = Mock(return_value=(query, None))
-    monkeypatch.setattr(module, "gather_attn", launch)
-    assert gather_attn(**cuda_inputs, impl=impl, kernel_options=kernel_options) is query
+    monkeypatch.setattr(reference, "gather_attn", launch)
+    assert gather_attn(**cuda_inputs, impl=Impl.REFERENCE) is query
     launch.assert_called_once()
     fa4_available.assert_not_called()
-
-
-@pytest.mark.parametrize("constraint", ["compiling", "deterministic"])
-def test_explicit_cute_bypasses_auto_policy(cuda_inputs, fa4_available, monkeypatch, constraint):
-    if constraint == "compiling":
-        monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
-    else:
-        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
-    query = cuda_inputs["query"]
-    launch = Mock(return_value=(query, None))
-    monkeypatch.setattr(cute, "gather_attn", launch)
-    assert gather_attn(**cuda_inputs, kernel_options={"backend": "cute"}) is query
-    launch.assert_called_once()
-    fa4_available.assert_not_called()
-
-
-def test_selected_backend_failure_is_not_retried(
-    cuda_inputs, fa4_available, triton_backend, monkeypatch
-):
-    fallback = triton_backend.gather_attn
-    monkeypatch.setattr(cute, "gather_attn", Mock(side_effect=RuntimeError("kernel failed")))
-    with pytest.raises(RuntimeError, match="kernel failed"):
-        gather_attn(**cuda_inputs)
-    fallback.assert_not_called()
-
-
-def test_explicit_cute_does_not_fall_back(cuda_inputs, monkeypatch):
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
-    with pytest.raises(ValueError, match="requires SM100"):
-        gather_attn(**cuda_inputs, kernel_options={"backend": "cute"})
 
 
 def test_invalid_inputs_are_not_hidden(cuda_inputs, fa4_available):
@@ -221,5 +236,33 @@ def test_probe_old_fa4_head_limit(monkeypatch):
         sys.modules, "flash_attn.cute.interface", SimpleNamespace(flash_attn_func=Mock())
     )
     monkeypatch.setitem(sys.modules, "flash_attn.cute.pack_gqa", None)
+    monkeypatch.setitem(sys.modules, "flash_attn.cute.config", None)
     assert cute._fa4_available(False)
     assert not cute._fa4_available(False, padded_heads=True)
+
+
+def test_reference_does_not_require_kernel_dependencies():
+    """Importing the shared schemas must not import Triton or FA4 for CPU users."""
+    import subprocess
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+import torch
+sys.modules['triton'] = None
+sys.modules['flash_attn'] = None
+from attn_gym.sparse import gather_attn
+q = torch.ones(1, 1, 1, 2)
+indices = torch.zeros(1, 1, 1, dtype=torch.int32)
+actual = gather_attn(q, q, q, indices, sliding_window_size=0, impl='reference')
+torch.testing.assert_close(actual, q)
+""",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )

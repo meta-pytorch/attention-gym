@@ -5,7 +5,6 @@ Validates forward and backward precision against an FP64 eager baseline.
 CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
 Fewer than 128 heads require FA4's sparse-MLA head-padding support.
 
-Note: torch.compile is NOT supported for the CuTe backend (eager-only).
 """
 
 import inspect
