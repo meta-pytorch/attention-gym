@@ -8,6 +8,8 @@ no worst-case scratch reservation or CPU bookkeeping output is needed.
 import torch
 from torch import Tensor
 
+from .routing import uses_grouped_schedule
+
 torch.library.define(
     "attn_gym::_gather_attn_fwd",
     "(Tensor query, Tensor sparse_kv, Tensor? local_kv, Tensor kv_indices, "
@@ -24,8 +26,9 @@ torch.library.define(
     "Tensor? cu_seqlens, Tensor? cu_seqlens_k, Tensor output, Tensor lse, "
     "Tensor grad_output, int sliding_window_size, bool share_kv, float scale, "
     "str backend, bool bwd_recompute_p=True, Tensor? query_rope=None, "
-    "Tensor? sparse_rope=None, Tensor? local_rope=None) "
-    "-> (Tensor, Tensor, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)",
+    "Tensor? sparse_rope=None, Tensor? local_rope=None, Tensor? sparse_v=None, "
+    "Tensor? local_v=None) "
+    "-> (Tensor, Tensor, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)",
 )
 
 
@@ -141,12 +144,15 @@ def _gather_attn_fwd_cuda(
             )
             if needs_backward:
                 # Only full-width backward uses the reverse map, including when determinism
-                # is enabled after forward.
+                # is enabled after forward. The grouped backward builds its own key-major map.
+                needs_map = (query_rope is None or query_rope.shape[-1] == 0) and not (
+                    uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None)
+                )
                 state = (
                     _build_index_query_map(
                         kv_indices, sparse_kv.shape[2], cu_seqlens, cu_seqlens_k
                     )
-                    if query_rope is None or query_rope.shape[-1] == 0
+                    if needs_map
                     else (None, None)
                 )
         return output, lse, list(state) if needs_backward else []
@@ -172,9 +178,9 @@ def _gather_attn_bwd_cuda(
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
-) -> tuple[
-    Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None, Tensor | None
-]:
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
+) -> tuple[Tensor | None, ...]:
     with torch.cuda.device(query.device):
         if sliding_window_size == 0 and kv_indices.shape[-1] == 0:
             return tuple(
@@ -187,13 +193,15 @@ def _gather_attn_bwd_cuda(
                     sparse_rope,
                     local_rope,
                     attention_sink,
+                    sparse_v,
+                    local_v,
                 )
             )
         # Autograd passes the forward's concrete choice, even if determinism changes.
         if backend == "cute":
             from . import cute
 
-            return cute._launch_backward(
+            grads = cute._launch_backward(
                 query,
                 local_kv,
                 sparse_kv,
@@ -210,22 +218,27 @@ def _gather_attn_bwd_cuda(
                 sparse_rope=sparse_rope,
                 local_rope=local_rope,
             )
+            # CuTe runs only shared values, so there are no value gradients.
+            return (*grads, None, None)
         from .triton.backward import _launch_backward
 
         selected_queries, block_offsets = state
         query = query.contiguous()
         kv_indices = kv_indices.contiguous()
         sink = _triton_sink(query, attention_sink)
+        kv_heads = sparse_kv.shape[1]
         if share_kv:
             sparse_kv = sparse_kv.expand(-1, query.shape[1], -1, -1)
             local_kv = None if local_kv is None else local_kv.expand(-1, query.shape[1], -1, -1)
+            sparse_v = None if sparse_v is None else sparse_v.expand(-1, query.shape[1], -1, -1)
+            local_v = None if local_v is None else local_v.expand(-1, query.shape[1], -1, -1)
             sparse_rope = (
                 None if sparse_rope is None else sparse_rope.expand(-1, query.shape[1], -1, -1)
             )
             local_rope = (
                 None if local_rope is None else local_rope.expand(-1, query.shape[1], -1, -1)
             )
-        dq, dsparse, dlocal, dqr, dsr, dlr, dsink = _launch_backward(
+        dq, dsparse, dlocal, dqr, dsr, dlr, dsink, dsparse_v, dlocal_v = _launch_backward(
             query,
             sparse_kv,
             local_kv,
@@ -241,11 +254,24 @@ def _gather_attn_bwd_cuda(
             sliding_window_size,
             share_kv,
             scale,
+            kv_heads=kv_heads,
+            sparse_v=sparse_v,
+            local_v=local_v,
             query_rope=query_rope,
             sparse_rope=sparse_rope,
             local_rope=local_rope,
         )
-        return dq, dsparse, dlocal, dqr, dsr, dlr, dsink if attention_sink is not None else None
+        return (
+            dq,
+            dsparse,
+            dlocal,
+            dqr,
+            dsr,
+            dlr,
+            dsink if attention_sink is not None else None,
+            dsparse_v,
+            dlocal_v,
+        )
 
 
 torch.library.impl("attn_gym::_gather_attn_fwd", "CUDA", _gather_attn_fwd_cuda)
@@ -280,7 +306,11 @@ def _gather_attn_fwd_fake(
     output = _output_buffer(query, backend)
     state = []
     if needs_backward and (sliding_window_size != 0 or kv_indices.shape[-1] != 0):
-        if backend == "triton":
+        if backend == "triton" and uses_grouped_schedule(
+            heads, sparse_kv.shape[1], sparse_v is not None
+        ):
+            state = [None, None]
+        elif backend == "triton":
             state = (
                 [
                     kv_indices.new_empty((batch, tokens * kv_indices.shape[2]), dtype=torch.int32),
@@ -361,9 +391,9 @@ def _gather_attn_bwd_fake(
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
-) -> tuple[
-    Tensor, Tensor, Tensor | None, Tensor | None, Tensor | None, Tensor | None, Tensor | None
-]:
+    sparse_v: Tensor | None = None,
+    local_v: Tensor | None = None,
+) -> tuple[Tensor | None, ...]:
     return (
         query.new_empty(query.shape),
         sparse_kv.new_empty(sparse_kv.shape),
@@ -372,6 +402,8 @@ def _gather_attn_bwd_fake(
         None if sparse_rope is None else sparse_rope.new_empty(sparse_rope.shape),
         None if local_rope is None else local_rope.new_empty(local_rope.shape),
         None if attention_sink is None else attention_sink.new_empty(attention_sink.shape),
+        None if sparse_v is None else sparse_v.new_empty(sparse_v.shape),
+        None if local_v is None else local_v.new_empty(local_v.shape),
     )
 
 

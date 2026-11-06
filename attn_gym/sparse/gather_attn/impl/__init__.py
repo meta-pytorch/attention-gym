@@ -4,7 +4,6 @@ import torch
 from torch import Tensor
 
 from .ops import _gather_attn_bwd_op, _gather_attn_fwd_op
-from .routing import uses_grouped_schedule
 
 
 class _GatherAttnFunction(torch.autograd.Function):
@@ -26,6 +25,8 @@ class _GatherAttnFunction(torch.autograd.Function):
         query_rope: Tensor | None,
         sparse_rope: Tensor | None,
         local_rope: Tensor | None,
+        sparse_v: Tensor | None,
+        local_v: Tensor | None,
     ) -> tuple[Tensor, Tensor]:
         output, lse, state = _gather_attn_fwd_op(
             query,
@@ -44,6 +45,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             query_rope,
             sparse_rope,
             local_rope,
+            sparse_v,
+            local_v,
         )
         ctx.save_for_backward(
             query,
@@ -58,6 +61,8 @@ class _GatherAttnFunction(torch.autograd.Function):
             query_rope,
             sparse_rope,
             local_rope,
+            sparse_v,
+            local_v,
             *state,
         )
         ctx.options = (sliding_window_size, share_kv, scale, backend, bwd_recompute_p)
@@ -80,9 +85,11 @@ class _GatherAttnFunction(torch.autograd.Function):
             query_rope,
             sparse_rope,
             local_rope,
+            sparse_v,
+            local_v,
             *state,
         ) = ctx.saved_tensors
-        dq, ds, dl, dqr, dsr, dlr, dsink = _gather_attn_bwd_op(
+        dq, ds, dl, dqr, dsr, dlr, dsink, dsv, dlv = _gather_attn_bwd_op(
             query,
             sparse_kv,
             local_kv,
@@ -98,8 +105,13 @@ class _GatherAttnFunction(torch.autograd.Function):
             query_rope,
             sparse_rope,
             local_rope,
+            sparse_v,
+            local_v,
         )
-        return dq, ds, dl, None, dsink, None, None, None, None, None, None, None, dqr, dsr, dlr
+        return (
+            *(dq, ds, dl, None, dsink, None, None, None, None, None, None, None),
+            *(dqr, dsr, dlr, dsv, dlv),
+        )
 
 
 def gather_attn(
@@ -139,18 +151,14 @@ def gather_attn(
     requires_grad = torch.is_grad_enabled() and any(
         tensor is not None and tensor.requires_grad for tensor in (*tensors, *ropes, *values)
     )
-    if requires_grad and uses_grouped_schedule(
-        query.shape[1], sparse_kv.shape[1], sparse_v is not None
-    ):
-        raise NotImplementedError(
-            "The Triton grouped schedule (separate values or grouped KV heads) runs without "
-            "gradients for now; use impl='reference' or torch.no_grad()"
-        )
     if requires_grad:
         # Distinct views avoid duplicate HOP inputs while preserving leaf accumulation.
         inputs = tuple(None if tensor is None else tensor.view_as(tensor) for tensor in tensors)
         rope_inputs = tuple(None if tensor is None else tensor.view_as(tensor) for tensor in ropes)
-        return _GatherAttnFunction.apply(*inputs, *options, *rope_inputs)
+        value_inputs = tuple(
+            None if tensor is None else tensor.view_as(tensor) for tensor in values
+        )
+        return _GatherAttnFunction.apply(*inputs, *options, *rope_inputs, *value_inputs)
     output, lse, _ = _gather_attn_fwd_op(
         *tensors,
         sliding_window_size,

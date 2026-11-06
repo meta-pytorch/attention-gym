@@ -371,9 +371,10 @@ def gather_attn(
             but nonempty paired RoPE has no strict deterministic backward there.
             Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with
-            Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward
-            supports deterministic accumulation when deterministic algorithms are
-            enabled; otherwise it may use nondeterministic atomics.
+            Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward, and
+            the grouped schedule's sparse dK/dV for sparse selections over small heads,
+            accumulate with nondeterministic atomics unless deterministic algorithms
+            are enabled.
 
         scale: Positive multiplier for query-key logits. Bare tensors default to
             1 / sqrt(latent_dim). Paired inputs, including zero-width RoPE pairs,
@@ -390,13 +391,14 @@ def gather_attn(
             reuse sparse_kv as the values. Separate values and 1 < kv_heads < num_heads
             run on Impl.REFERENCE, or on the Triton backend with SM100 or SM103,
             bfloat16 inputs, head_dim <= 256 and divisible by 16, unit inner strides,
-            and sliding_window_size <= 2048; other inputs raise. The Triton backend runs
-            them without gradients for now. The CuTe backend requires shared values and
-            one KV head. Passing the key tensor objects themselves as both values
-            (local_v is local_kv and sparse_v is sparse_kv) runs them as shared values;
-            other aliases, such as views, count as separate values. With
-            kv_heads == num_heads, separate values run one query head per
-            grouped-schedule tile, slower than the shared-value MHA kernels.
+            and sliding_window_size <= 2048; other inputs raise. The CuTe backend
+            requires shared values and one KV head. Passing the key tensor objects
+            themselves as both values (local_v is local_kv and sparse_v is sparse_kv)
+            runs them as shared values; other aliases, such as views, count as separate
+            values. With kv_heads == num_heads, separate values run one query head per
+            grouped-schedule tile, slower than the shared-value MHA kernels. Their
+            Triton backward cannot be captured in a CUDA graph yet, except on the
+            atomic path the default mode picks for small heads.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return (output, GatherAttnAux) containing the requested
