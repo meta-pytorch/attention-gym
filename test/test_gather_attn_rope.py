@@ -76,6 +76,30 @@ def test_plain_tuple_and_named_tuple_are_equivalent():
         torch.testing.assert_close(x, y, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("backend", ["triton", "cute"])
+def test_components_can_be_views_of_shared_storage(backend):
+    skip_unsupported(backend)
+    torch.manual_seed(912)
+    q = torch.randn(1, 64, 33, 576, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    kv = torch.randn(1, 1, 33, 576, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    indices = torch.arange(16, device="cuda", dtype=torch.int32)[None, None].expand(1, 33, -1)
+
+    def parts(x):
+        return RopePair(x[..., :512], x[..., 512:])
+
+    qr, kr = q.detach().double().requires_grad_(), kv.detach().double().requires_grad_()
+    opts = {"sliding_window_size": 0, "scale": 0.0625}
+    qparts, kvparts = parts(q), parts(kv)
+    out = gather_attn(qparts, None, kvparts, indices, **opts, kernel_options={"backend": backend})
+    ref_q, ref_kv = parts(qr), parts(kr)
+    expected = gather_attn(ref_q, None, ref_kv, indices, **opts, impl="reference")
+    go = torch.randn_like(out)
+    gs = torch.autograd.grad(out, (q, kv, *qparts, *kvparts), go)
+    rs = torch.autograd.grad(expected, (qr, kr, *ref_q, *ref_kv), go.double())
+    for i, (got, ref) in enumerate(zip(gs, rs, strict=True)):
+        assert_numerics(got, ref, f"shared-storage gradient {i}")
+
+
 def test_value_dim_is_not_a_public_argument():
     x = torch.randn(1, 1, 3, 8)
     idx = torch.zeros(1, 3, 1, dtype=torch.int32)
@@ -445,6 +469,65 @@ def test_triton_paired_reuses_shape_specializations(triton_compiles):
     plain = counts(0)
     assert plain
     assert counts(64) == plain
+
+
+def test_fa4_sparse_only_inactive_capacity_replay():
+    from dataclasses import replace
+
+    skip_unsupported("cute")
+    inputs = make_inputs(heads=64, seq_len=35, topk=16, local=False, with_docs=True)
+    cu = torch.tensor([0, 0, 7, 21, 21], device="cuda", dtype=torch.int32)
+    cuk = torch.tensor([0, 0, 3, 9, 9], device="cuda", dtype=torch.int32)
+    inputs = replace(inputs, cu_seqlens=cu, cu_seqlens_k=cuk)
+    with torch.no_grad():
+        for tensor in inputs.sparse_kv:
+            tensor[:, :, 9:].fill_(float("nan"))
+    go = torch.randn(1, 64, 21, 512, device="cuda", dtype=torch.bfloat16)
+
+    def step():
+        out = gather_attn(
+            **inputs.kwargs(),
+            sliding_window_size=0,
+            scale=0.0625,
+            kernel_options={"backend": "cute"},
+        )
+        return out, *torch.autograd.grad(out[:, :, :21], inputs.differentiable(), go)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = step()
+    for q_bounds, k_bounds in (
+        ([0, 0, 7, 21, 21], [0, 0, 3, 9, 9]),
+        ([0, 0, 5, 13, 21], [0, 0, 1, 6, 9]),
+    ):
+        cu.copy_(torch.tensor(q_bounds, device="cuda", dtype=torch.int32))
+        cuk.copy_(torch.tensor(k_bounds, device="cuda", dtype=torch.int32))
+        graph.replay()
+        torch.cuda.synchronize()
+        ref = as_fp64(inputs)
+        ref = replace(
+            ref,
+            query=RopePair(*(t[:, :, :21].detach().requires_grad_() for t in ref.query)),
+            sparse_kv=RopePair(*(t[:, :, :9].detach().requires_grad_() for t in ref.sparse_kv)),
+            kv_indices=inputs.kv_indices[:, :21],
+        )
+        expected = gather_attn(
+            **ref.kwargs(), sliding_window_size=0, scale=0.0625, impl="reference"
+        )
+        grads = torch.autograd.grad(expected, ref.differentiable(), go.double())
+        assert_numerics(captured[0][:, :, :21], expected, "active output")
+        for i, (got, want) in enumerate(zip(captured[1:], grads, strict=True)):
+            if i < 2:
+                got = got[:, :, :21]
+            elif i < 4:
+                got = got[:, :, :9]
+            assert_numerics(got, want, f"active gradient {i}")
 
 
 @pytest.mark.parametrize("recompute", [True, False])
