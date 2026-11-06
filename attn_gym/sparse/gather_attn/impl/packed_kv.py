@@ -127,63 +127,52 @@ def _launch_pack_kv(
         )
 
 
-class _PackKV(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx, local: Tensor, sparse: Tensor, cu_seqlens: Tensor, cu_seqlens_k: Tensor
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        local_tokens, head_dim = local.shape[2:]
-        sparse_tokens = sparse.shape[2]
-        if local_tokens + sparse_tokens > torch.iinfo(torch.int32).max:
-            raise ValueError("Combined KV capacity must fit in int32 FA4 offsets.")
-        packed = local.new_empty((local_tokens + sparse_tokens, 1, head_dim))
-        extended_cu_seqlens = cu_seqlens.new_empty((cu_seqlens.numel() + 1,))
-        combined_cu_seqlens = torch.empty_like(extended_cu_seqlens)
-        _launch_pack_kv(
-            local,
-            sparse,
-            packed,
-            cu_seqlens,
-            cu_seqlens_k,
-            extended_cu_seqlens,
-            combined_cu_seqlens,
-            pack=True,
-        )
-        ctx.save_for_backward(cu_seqlens, cu_seqlens_k)
-        ctx.local_shape = local.shape
-        ctx.sparse_shape = sparse.shape
-        ctx.mark_non_differentiable(extended_cu_seqlens, combined_cu_seqlens)
-        ctx.set_materialize_grads(False)
-        return packed, extended_cu_seqlens, combined_cu_seqlens
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(
-        ctx, grad_packed: Tensor, _grad_extended: None, _grad_combined: None
-    ) -> tuple[Tensor, Tensor, None, None]:
-        cu_seqlens, cu_seqlens_k = ctx.saved_tensors
-        grad_local = grad_packed.new_empty(ctx.local_shape)
-        grad_sparse = grad_packed.new_empty(ctx.sparse_shape)
-        _launch_pack_kv(
-            grad_local,
-            grad_sparse,
-            grad_packed,
-            cu_seqlens,
-            cu_seqlens_k,
-            None,
-            None,
-            pack=False,
-        )
-        return grad_local, grad_sparse, None, None
-
-
-def pack_kv(
+def launch_pack_kv(
     local: Tensor, sparse: Tensor, cu_seqlens: Tensor, cu_seqlens_k: Tensor
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Pack validated [1, 1, T/S, D] KV and append an always-present tail document.
 
     Returns [T + S, 1, D] KV, extended query offsets, and combined KV offsets.
-    Offset tensors are contiguous int32 with matching document counts; their final
+    Input offset tensors are contiguous int32 with matching document counts; their final
     endpoints may precede capacity. No CUDA endpoint is read on the host.
     """
-    return _PackKV.apply(local, sparse, cu_seqlens, cu_seqlens_k)
+    local_tokens, head_dim = local.shape[2:]
+    sparse_tokens = sparse.shape[2]
+    if local_tokens + sparse_tokens > torch.iinfo(torch.int32).max:
+        raise ValueError("Combined KV capacity must fit in int32 FA4 offsets.")
+    packed = local.new_empty((local_tokens + sparse_tokens, 1, head_dim))
+    extended_cu_seqlens = cu_seqlens.new_empty((cu_seqlens.numel() + 1,))
+    combined_cu_seqlens = torch.empty_like(extended_cu_seqlens)
+    _launch_pack_kv(
+        local,
+        sparse,
+        packed,
+        cu_seqlens,
+        cu_seqlens_k,
+        extended_cu_seqlens,
+        combined_cu_seqlens,
+        pack=True,
+    )
+    return packed, extended_cu_seqlens, combined_cu_seqlens
+
+
+def launch_unpack_kv(
+    grad_packed: Tensor,
+    local_shape: tuple[int, ...],
+    sparse_shape: tuple[int, ...],
+    cu_seqlens: Tensor,
+    cu_seqlens_k: Tensor,
+) -> tuple[Tensor, Tensor]:
+    grad_local = grad_packed.new_empty(local_shape)
+    grad_sparse = grad_packed.new_empty(sparse_shape)
+    _launch_pack_kv(
+        grad_local,
+        grad_sparse,
+        grad_packed,
+        cu_seqlens,
+        cu_seqlens_k,
+        None,
+        None,
+        pack=False,
+    )
+    return grad_local, grad_sparse
