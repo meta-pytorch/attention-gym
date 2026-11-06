@@ -396,9 +396,7 @@ def gather_attn(
             themselves as both values (local_v is local_kv and sparse_v is sparse_kv)
             runs them as shared values; other aliases, such as views, count as separate
             values. With kv_heads == num_heads, separate values run one query head per
-            grouped-schedule tile, slower than the shared-value MHA kernels. Their
-            Triton backward cannot be captured in a CUDA graph yet, except on the
-            atomic path the default mode picks for small heads.
+            grouped-schedule tile, slower than the shared-value MHA kernels.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return (output, GatherAttnAux) containing the requested
