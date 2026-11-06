@@ -241,6 +241,18 @@ def test_probe_old_fa4_head_limit(monkeypatch):
     assert not cute._fa4_available(False, padded_heads=True)
 
 
+@pytest.mark.parametrize("module", ["flash_attn.cute.pack_gqa", "flash_attn.cute.config"])
+def test_probe_finds_head_padding_in_either_fa4_module(monkeypatch, module):
+    """FA4 moved sparse_mla_qhead_tile from pack_gqa to config; both releases pad heads."""
+    monkeypatch.setitem(
+        sys.modules, "flash_attn.cute.interface", SimpleNamespace(flash_attn_func=Mock())
+    )
+    for name in ("flash_attn.cute.pack_gqa", "flash_attn.cute.config"):
+        monkeypatch.setitem(sys.modules, name, SimpleNamespace())
+    monkeypatch.setitem(sys.modules, module, SimpleNamespace(sparse_mla_qhead_tile=Mock()))
+    assert cute._fa4_available(False, padded_heads=True)
+
+
 def test_reference_does_not_require_kernel_dependencies():
     """Importing the shared schemas must not import Triton or FA4 for CPU users."""
     import subprocess
