@@ -37,6 +37,10 @@ Notes:
 - A `.venv` symlink into another worktree is not isolation: its editable `.pth` still
   points at that worktree, so pytest imports the other checkout's `attn_gym`. Replace it
   with a real per-worktree env.
+- Copying or hard-linking an env (`cp -r`, `cp -al`) is not isolation either: console
+  scripts such as `pytest` keep the source env's interpreter in their shebang, so they run
+  the other env's Python and packages. Build every env, including side-by-side envs for
+  other CuTeDSL versions, with `uv venv`, and prefer `<env>/bin/python -m pytest`.
 - Do not use `uv sync`/`uv.lock`: nightly torch churns daily and CI uses the
   imperative `uv pip` flow above, not a lockfile.
 - Drop `[linear]` if CuTeDSL/TVM-FFI kernels are not needed (CPU-only work).
