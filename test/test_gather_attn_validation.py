@@ -36,7 +36,8 @@ def inputs() -> dict[str, torch.Tensor]:
 def test_non_tensor_input(inputs, name):
     """Malformed inputs report their own name rather than incidental attribute errors."""
     inputs[name] = []
-    with pytest.raises(TypeError, match=rf"{name} must be a torch.Tensor"):
+    requirement = "Tensor or a" if name in ("query", "local_kv", "sparse_kv") else "torch.Tensor"
+    with pytest.raises(TypeError, match=rf"{name} must be a {requirement}"):
         gather_attn(**inputs, impl=Impl.REFERENCE)
 
 

@@ -186,7 +186,16 @@ def check_training(
     )
 
     assert aux.lse is not None and not aux.lse.requires_grad
-    assert_sink_gradient_fp32(sink, aux.lse, actual, grad_output, actual_grads[3])
+    from attn_gym.sparse.gather_attn.api import _select_backend
+
+    backend = (kernel_options or {}).get("backend") or _select_backend(
+        query, sink, shared, num_keys=topk + window
+    )
+    # FA4 uses its own dPsum precision (including the saved output residual); only Triton
+    # promises the FP32 arithmetic on rounded output checked by this helper. Both backends
+    # passed the FP64/eager sink-gradient bound above.
+    if backend == "triton":
+        assert_sink_gradient_fp32(sink, aux.lse, actual, grad_output, actual_grads[3])
     if topk == 0:
         assert actual_grads[2].count_nonzero() == 0
     if window == 0:
@@ -249,13 +258,13 @@ def test_cute_eligible_auto_fullgraph_training():
     ):
         pytest.skip("SM100 or SM103 required")
     if not _fa4_available(with_sink=False):
-        pytest.skip("FA4 required to exercise compile-driven fallback")
+        pytest.skip("FA4 required to exercise compiled CuTe dispatch")
     torch.manual_seed(0)
     inputs = make_inputs(128, True, torch.bfloat16, seq_len=17, topk=2, with_docs=False)
     assert _select_backend(inputs.query, None, True, num_keys=21) == "cute"
     # Omit the sink: both the metadata and installed FA4 permit CuTe outside compilation.
     args = inputs[:4]
-    expected = gather_attn(*args, sliding_window_size=19, kernel_options={"backend": "triton"})
+    expected = gather_attn(*args, sliding_window_size=19, kernel_options={"backend": "cute"})
     compiled = torch.compile(gather_attn, fullgraph=True, dynamic=False)
     actual = compiled(*args, sliding_window_size=19)
     assert torch.isfinite(expected).all() and torch.isfinite(actual).all()
@@ -268,7 +277,7 @@ def test_cute_eligible_auto_fullgraph_training():
     actual_grads = torch.autograd.grad(actual, inputs[:3], grad_output)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)
     torch.testing.assert_close(actual_grads[0], expected_grads[0], atol=0, rtol=0)
-    # Match the existing compiled/eager shared-KV reduction and atomic-accumulation budgets.
+    # Match the existing compiled/eager gradient budgets.
     torch.testing.assert_close(actual_grads[1], expected_grads[1], atol=0.01, rtol=0.01)
     torch.testing.assert_close(actual_grads[2], expected_grads[2], atol=0.06, rtol=0.03)
 

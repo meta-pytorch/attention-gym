@@ -5,7 +5,7 @@ Validates forward and backward precision against an FP64 eager baseline.
 CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
 Fewer than 128 heads require FA4's sparse-MLA head-padding support.
 
-Note: torch.compile is NOT supported for the CuTe backend (eager-only).
+Compiled training and CUDA graph replay are covered in test_gather_attn_cute_compile.py.
 """
 
 import inspect
@@ -39,6 +39,7 @@ def skip_unsupported_cute_sink(sink_dtype: torch.dtype | None) -> None:
         pytest.skip("installed FA4 sparse-MLA kernel does not support attention sinks yet")
 
 
+@torch.no_grad()
 def assert_matches_low_precision_eager(
     actual,
     low_precision_expected,
@@ -47,20 +48,31 @@ def assert_matches_low_precision_eager(
     computation_dtype=None,
 ):
     """Bound kernel error by low-precision eager error against an FP64 measuring stick."""
-    assert torch.isfinite(actual).all()
     actual_difference = (actual.double() - high_precision_expected).abs()
     eager_difference = (low_precision_expected.double() - high_precision_expected).abs()
+    finite, actual_mean, eager_mean, actual_max, eager_max, expected_mean, expected_max = (
+        torch.stack(
+            (
+                torch.isfinite(actual).all(),
+                actual_difference.mean(),
+                eager_difference.mean(),
+                actual_difference.max(),
+                eager_difference.max(),
+                high_precision_expected.abs().mean(),
+                high_precision_expected.abs().max(),
+            )
+        ).tolist()
+    )
+    assert finite
     accumulation_eps = (
         sum(math.sqrt(size) for size in reduction_sizes) * torch.finfo(torch.float32).eps
     )
     output_rounding_eps = torch.finfo(computation_dtype or actual.dtype).eps
     rounding_eps = accumulation_eps + output_rounding_eps
-    mean_atol = rounding_eps * high_precision_expected.abs().mean().item()
-    max_atol = (accumulation_eps + len(reduction_sizes) * output_rounding_eps) * (
-        high_precision_expected.abs().max().item()
-    )
-    assert actual_difference.mean().item() <= eager_difference.mean().item() + mean_atol
-    assert actual_difference.max().item() <= eager_difference.max().item() + max_atol
+    mean_atol = rounding_eps * expected_mean
+    max_atol = (accumulation_eps + len(reduction_sizes) * output_rounding_eps) * expected_max
+    assert actual_mean <= eager_mean + mean_atol
+    assert actual_max <= eager_max + max_atol
     # The pointwise budgets above catch outliers; two source-dtype eps bound aggregate drift.
     assert_relative_rms_within(
         actual,
@@ -141,70 +153,36 @@ def check_cute_precision(
         else None
     )
 
-    # --- Derive FP64 inputs from the same quantized values ---
-    query_64 = query_lp.double().requires_grad_(True)
-    local_kv_64 = local_kv_lp.double().requires_grad_(True)
-    sparse_kv_64 = sparse_kv_lp.double().requires_grad_(True)
-
-    # --- Lower-precision copies for eager and cute ---
-    query_lp_ref = query_lp.clone().requires_grad_(True)
-    local_kv_lp_ref = local_kv_lp.clone().requires_grad_(True)
-    sparse_kv_lp_ref = sparse_kv_lp.clone().requires_grad_(True)
-
-    query_lp_cute = query_lp.clone().requires_grad_(True)
-    local_kv_lp_cute = local_kv_lp.clone().requires_grad_(True)
-    sparse_kv_lp_cute = sparse_kv_lp.clone().requires_grad_(True)
-
-    sink_64 = sink.double().requires_grad_(True) if sink is not None else None
-    sink_ref = sink.detach().requires_grad_(True) if sink is not None else None
-    sink_cute = sink.detach().requires_grad_(True) if sink is not None else None
-
-    # --- Forward ---
-    out_64 = gather_attn(
-        query_64,
-        local_kv_64,
-        sparse_kv_64,
-        kv_indices,
-        sink_64,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_k=cu_seqlens_k,
-        sliding_window_size=sliding_window_size,
-        impl=Impl.REFERENCE,
-        scale=scale,
-    )
-    out_lp_ref = gather_attn(
-        query_lp_ref,
-        local_kv_lp_ref,
-        sparse_kv_lp_ref,
-        kv_indices,
-        sink_ref,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_k=cu_seqlens_k,
-        sliding_window_size=sliding_window_size,
-        impl=Impl.REFERENCE,
-        scale=scale,
-    )
-    out_lp_cute = gather_attn(
-        query_lp_cute,
-        local_kv_lp_cute,
-        sparse_kv_lp_cute,
-        kv_indices,
-        sink_cute,
-        cu_seqlens=cu_seqlens,
-        cu_seqlens_k=cu_seqlens_k,
-        sliding_window_size=sliding_window_size,
-        kernel_options=kernel_options,
-        scale=scale,
-    )
-
-    # --- Backward ---
     grad_gen = torch.Generator(device=device).manual_seed(1234)
-    grad_lp = torch.randn(out_lp_ref.shape, dtype=dtype, device=device, generator=grad_gen)
-    grad_64 = grad_lp.double()
+    grad_lp = torch.randn(query_lp.shape, dtype=dtype, device=device, generator=grad_gen)
 
-    out_64.backward(grad_64)
-    out_lp_ref.backward(grad_lp)
-    out_lp_cute.backward(grad_lp)
+    def run(*, fp64=False, **options):
+        def leaf(tensor):
+            return (tensor.double() if fp64 else tensor.detach()).requires_grad_()
+
+        query, local_kv, sparse_kv = map(leaf, (query_lp, local_kv_lp, sparse_kv_lp))
+        attention_sink = None if sink is None else leaf(sink)
+        operands = (query, local_kv, sparse_kv)
+        if attention_sink is not None:
+            operands += (attention_sink,)
+        out = gather_attn(
+            query,
+            local_kv,
+            sparse_kv,
+            kv_indices,
+            attention_sink,
+            cu_seqlens=cu_seqlens,
+            cu_seqlens_k=cu_seqlens_k,
+            sliding_window_size=sliding_window_size,
+            scale=scale,
+            **options,
+        )
+        grads = torch.autograd.grad(out, operands, grad_lp.to(out.dtype))
+        return out.detach(), *grads
+
+    high = run(fp64=True, impl=Impl.REFERENCE)
+    low = run(impl=Impl.REFERENCE)
+    actual = run(kernel_options=kernel_options)
 
     # --- Reduction sizes ---
     effective_topk = min(num_topk, sparse_seq_len) if num_topk > 0 else 0
@@ -216,45 +194,29 @@ def check_cute_precision(
     )
     dsparse_kv_reduction_sizes = fwd_reduction_sizes + (effective_topk,) + (batch,)
 
-    # --- Forward check ---
-    assert_matches_low_precision_eager(
-        out_lp_cute,
-        out_lp_ref,
-        out_64,
-        reduction_sizes=fwd_reduction_sizes,
+    names = ("output", "query", "local_kv", "sparse_kv")
+    reductions = (
+        fwd_reduction_sizes,
+        dq_reduction_sizes,
+        dkv_reduction_sizes,
+        dsparse_kv_reduction_sizes,
     )
-
-    # --- Backward checks ---
-    assert_matches_low_precision_eager(
-        query_lp_cute.grad,
-        query_lp_ref.grad,
-        query_64.grad,
-        reduction_sizes=dq_reduction_sizes,
-    )
-    assert_matches_low_precision_eager(
-        local_kv_lp_cute.grad,
-        local_kv_lp_ref.grad,
-        local_kv_64.grad,
-        reduction_sizes=dkv_reduction_sizes,
-    )
-    if effective_topk > 0:
-        assert_matches_low_precision_eager(
-            sparse_kv_lp_cute.grad,
-            sparse_kv_lp_ref.grad,
-            sparse_kv_64.grad,
-            reduction_sizes=dsparse_kv_reduction_sizes,
-        )
-
     if sink is not None:
-        assert sink_cute.grad.dtype == sink_dtype
+        assert actual[-1].dtype == sink_dtype
+        names += ("sink",)
+        reductions += (fwd_reduction_sizes + (head_dim, batch * seq_len),)
+    for name, got, low_ref, high_ref, reduction in zip(
+        names, actual, low, high, reductions, strict=True
+    ):
+        if name == "sparse_kv" and effective_topk == 0:
+            continue
         assert_matches_low_precision_eager(
-            sink_cute.grad,
-            sink_ref.grad,
-            sink_64.grad,
-            reduction_sizes=fwd_reduction_sizes + (head_dim, batch * seq_len),
-            # FA4 computes dsink from the BF16 output and upstream gradient,
-            # even when the sink parameter and its gradient are stored in FP32.
-            computation_dtype=dtype,
+            got,
+            low_ref,
+            high_ref,
+            reduction_sizes=reduction,
+            # Sink arithmetic uses BF16 output/dout even for an FP32 sink parameter.
+            computation_dtype=dtype if name == "sink" else None,
         )
 
 

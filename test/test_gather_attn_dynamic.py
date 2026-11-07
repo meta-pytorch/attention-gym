@@ -54,7 +54,7 @@ def _forward_and_grads(tensors, indices, cu_q, cu_k, **kwargs):
 def test_triton_operator_contracts(share_kv, gather_attn_single_config):
     """Both opaque operators preserve fake metadata, aliasing and compiled dispatch."""
     _cuda()
-    from attn_gym.sparse.gather_attn.impl.triton.ops import (
+    from attn_gym.sparse.gather_attn.impl.ops import (
         _gather_attn_bwd_op,
         _gather_attn_fwd_op,
     )
@@ -63,8 +63,11 @@ def test_triton_operator_contracts(share_kv, gather_attn_single_config):
     indices = indices.repeat_interleave(2, dim=-1)[..., ::2]
     args = (q, sparse, local, indices, sink, cu_q, cu_k, 7, share_kv, 0.25)
     for needs_backward in (False, True):
-        torch.library.opcheck(_gather_attn_fwd_op, (*args, needs_backward))
-    out, lse, queries, offsets = _gather_attn_fwd_op(*args, True)
+        torch.library.opcheck(
+            _gather_attn_fwd_op,
+            (*args, needs_backward, "triton"),
+        )
+    out, lse, tape = _gather_attn_fwd_op(*args, True, "triton")
     torch.library.opcheck(
         _gather_attn_bwd_op,
         (
@@ -72,8 +75,7 @@ def test_triton_operator_contracts(share_kv, gather_attn_single_config):
             sparse,
             local,
             indices,
-            queries,
-            offsets,
+            tape,
             sink,
             cu_q,
             cu_k,
@@ -83,6 +85,7 @@ def test_triton_operator_contracts(share_kv, gather_attn_single_config):
             7,
             share_kv,
             0.25,
+            "triton",
         ),
     )
 

@@ -2,6 +2,6 @@
 
 from attn_gym.types import Impl
 
-from .api import AuxRequest, GatherAttnAux, gather_attn
+from .api import AuxRequest, GatherAttnAux, RopePair, gather_attn
 
-__all__ = ["AuxRequest", "GatherAttnAux", "Impl", "gather_attn"]
+__all__ = ["AuxRequest", "GatherAttnAux", "Impl", "RopePair", "gather_attn"]

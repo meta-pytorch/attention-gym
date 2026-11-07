@@ -16,6 +16,7 @@ from .primitives import (
     load_document_bounds,
     offset_strides,
     online_softmax_update,
+    optional_strides,
     select_tiles,
     store_bhsd,
     tuning_key,
@@ -54,12 +55,16 @@ def _gather_attn_fwd(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Apply online softmax over selected sparse entries and the local window."""
+    """Apply online softmax over selected sparse entries and the local window.
+
+    Local KV is None when WINDOW is 0.
+    """
     S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
     SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    if WINDOW:
+        LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
     KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
     LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
 
@@ -179,6 +184,9 @@ def _gather_attn_fwd_shared(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
+    query_rope_ptr,
+    sparse_rope_ptr,
+    local_rope_ptr,
     kv_indices_ptr,
     cu_seqlens_ptr,
     cu_seqlens_k_ptr,
@@ -188,12 +196,16 @@ def _gather_attn_fwd_shared(
     QUERY_STRIDES,
     SPARSE_KV_STRIDES,
     LOCAL_KV_STRIDES,
+    QUERY_ROPE_STRIDES,
+    SPARSE_ROPE_STRIDES,
+    LOCAL_ROPE_STRIDES,
     KV_INDICES_STRIDES,
     num_documents,
     LSE_STRIDES,
     H: tl.constexpr,
     S,
     D: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
     SPARSE_SEQ_LEN,
     TOPK: tl.constexpr,
     WINDOW: tl.constexpr,
@@ -205,14 +217,25 @@ def _gather_attn_fwd_shared(
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
 ):
-    """Process one sequence position across heads to reuse shared KV tiles."""
+    """Process one sequence position across heads to reuse shared KV tiles.
+
+    D is the latent width, used as both key and value. With ROPE_DIM, separate key-only
+    query and KV tensors add a second logit dot; they never reach the output. Local tensors
+    are None when WINDOW is 0.
+    """
     S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
     SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
-    LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
     KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
     LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
+    if WINDOW:
+        LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    if ROPE_DIM:
+        QUERY_ROPE_STRIDES = offset_strides(QUERY_ROPE_STRIDES, USE_INT64_OFFSETS)
+        SPARSE_ROPE_STRIDES = offset_strides(SPARSE_ROPE_STRIDES, USE_INT64_OFFSETS)
+        if WINDOW:
+            LOCAL_ROPE_STRIDES = offset_strides(LOCAL_ROPE_STRIDES, USE_INT64_OFFSETS)
 
     sequence = tl.program_id(0)
     if USE_INT64_OFFSETS:
@@ -234,6 +257,17 @@ def _gather_attn_fwd_shared(
         mask=head_mask[:, None] & dimension_mask[None, :],
         other=0.0,
     )
+    if ROPE_DIM:
+        offsets_rope = tl.arange(0, ROPE_DIM)
+        query_rope = tl.load(
+            query_rope_ptr
+            + ptr_offset(
+                (batch, offsets_h[:, None], sequence, offsets_rope[None, :]),
+                QUERY_ROPE_STRIDES,
+            ),
+            mask=head_mask[:, None],
+            other=0.0,
+        )
     sink = tl.load(attention_sink_ptr + offsets_h, mask=head_mask, other=0.0).to(tl.float32)
     running_max = sink
     running_sum = tl.full((BLOCK_H,), 1.0, tl.float32)
@@ -272,34 +306,62 @@ def _gather_attn_fwd_shared(
                 mask=selected_valid[:, None] & dimension_mask[None, :],
                 other=0.0,
             )
-            logits = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
+            logits = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3")
+            if ROPE_DIM:
+                sparse_rope = tl.load(
+                    sparse_rope_ptr
+                    + ptr_offset(
+                        (batch, 0, selected_idx[:, None], offsets_rope[None, :]),
+                        SPARSE_ROPE_STRIDES,
+                    ),
+                    mask=selected_valid[:, None],
+                    other=0.0,
+                )
+                logits = tl.dot(
+                    query_rope, tl.trans(sparse_rope), acc=logits, input_precision="tf32x3"
+                )
+            logits *= SCALE
             logits = tl.where(head_mask[:, None] & selected_valid[None, :], logits, -float("inf"))
             accumulator, running_max, running_sum = online_softmax_update(
                 accumulator, running_max, running_sum, logits, sparse_values
             )
 
-    offsets_n_base = tl.arange(0, BLOCK_N)
-    first_local_position = sequence - WINDOW + 1
-    for local_start in tl.range(0, WINDOW, BLOCK_N, num_stages=2):
-        offsets_n = first_local_position + local_start + offsets_n_base
-        local_valid = (offsets_n >= 0) & (offsets_n <= sequence) & (offsets_n < S)
-        local_values = tl.load(
-            local_kv_ptr
-            + ptr_offset(
-                (batch, 0, offsets_n[:, None], offsets_d[None, :]),
-                LOCAL_KV_STRIDES,
-            ),
-            mask=local_valid[:, None] & dimension_mask[None, :],
-            other=0.0,
-        )
-        if HAS_CU_SEQLENS:
-            local_valid &= offsets_n >= query_start
-
-        logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
-        logits = tl.where(head_mask[:, None] & local_valid[None, :], logits, -float("inf"))
-        accumulator, running_max, running_sum = online_softmax_update(
-            accumulator, running_max, running_sum, logits, local_values
-        )
+    if WINDOW:
+        offsets_n_base = tl.arange(0, BLOCK_N)
+        first_local_position = sequence - WINDOW + 1
+        for local_start in tl.range(0, WINDOW, BLOCK_N, num_stages=2):
+            offsets_n = first_local_position + local_start + offsets_n_base
+            local_valid = (offsets_n >= 0) & (offsets_n <= sequence) & (offsets_n < S)
+            if HAS_CU_SEQLENS:
+                local_valid &= offsets_n >= query_start
+            local_values = tl.load(
+                local_kv_ptr
+                + ptr_offset(
+                    (batch, 0, offsets_n[:, None], offsets_d[None, :]),
+                    LOCAL_KV_STRIDES,
+                ),
+                mask=local_valid[:, None] & dimension_mask[None, :],
+                other=0.0,
+            )
+            logits = tl.dot(query, tl.trans(local_values), input_precision="tf32x3")
+            if ROPE_DIM:
+                local_rope = tl.load(
+                    local_rope_ptr
+                    + ptr_offset(
+                        (batch, 0, offsets_n[:, None], offsets_rope[None, :]),
+                        LOCAL_ROPE_STRIDES,
+                    ),
+                    mask=local_valid[:, None],
+                    other=0.0,
+                )
+                logits = tl.dot(
+                    query_rope, tl.trans(local_rope), acc=logits, input_precision="tf32x3"
+                )
+            logits *= SCALE
+            logits = tl.where(head_mask[:, None] & local_valid[None, :], logits, -float("inf"))
+            accumulator, running_max, running_sum = online_softmax_update(
+                accumulator, running_max, running_sum, logits, local_values
+            )
 
     tl.store(
         output_ptr
@@ -461,7 +523,7 @@ _FWD_SHARED = TritonTuner(
         for block_n in (64, 128, 256)
         for num_warps in (4, 8)
     ],
-    key=tuning_key("query_ptr", "H", "D", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    key=tuning_key("query_ptr", "H", "D", "ROPE_DIM", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
     prune=prune_shared_forward_configs,
 )
 _FWD_TMA = TritonTuner(
@@ -479,6 +541,12 @@ _FWD_TMA = TritonTuner(
 
 # Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256). On Blackwell,
 # FP32 D=256 skips the middle tile: it fits shared memory but needs 576 tensor-memory columns.
+ROPE_REQUIREMENTS = (
+    "Triton gather_attn supports key-only RoPE tensors only on the Blackwell shared-KV "
+    "schedule: BF16, shared KV, 16-128 heads, latent width <= 128 or 512, RoPE width 16, 32, "
+    "64, or 128, with sparse RoPE (and local RoPE under a window) broadcast across heads."
+)
+
 GENERIC_FORWARD_TILES = (
     TileConfig(64, 128, 8, 3, shared_rows=256, tmem_cols=512),
     TileConfig(64, 64, 8, 3, shared_rows=192, tmem_cols=576),
@@ -489,15 +557,24 @@ GENERIC_FORWARD_TILES = (
 def _launch_forward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
-    local_kv: torch.Tensor,
+    local_kv: torch.Tensor | None,
     kv_indices: torch.Tensor,
     attention_sink: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     cu_seqlens_k: torch.Tensor | None,
     sliding_window_size: int,
     scale: float,
+    *,
+    query_rope: torch.Tensor | None = None,
+    sparse_rope: torch.Tensor | None = None,
+    local_rope: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Launch forward with query, indices, and sink made contiguous by the opaque op."""
+    """Launch forward with query, indices, and sink made contiguous by the opaque op.
+
+    The latent KV is both key and value, so the output is as wide as ``query``. Key-only
+    RoPE tensors run only on the shared-KV schedule; local tensors may be None without a
+    window.
+    """
     batch, heads, seq_len, head_dim = query.shape
     topk = kv_indices.shape[-1]
     sparse_seq_len = sparse_kv.shape[2]
@@ -506,12 +583,32 @@ def _launch_forward(
     lse = torch.empty(batch, heads, seq_len, device=query.device, dtype=torch.float32)
     has_cu_seqlens = cu_seqlens is not None
     num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
+    if not sliding_window_size:
+        # Kernels never read local tensors without a window, so they are passed as None.
+        local_kv = local_rope = None
+    if query_rope is not None and query_rope.shape[-1] == 0:
+        # Zero-width RoPE adds nothing to the scores.
+        query_rope = sparse_rope = local_rope = None
+    if query_rope is not None:
+        query_rope = query_rope.contiguous()
     use_int64_offsets = requires_int64_offsets(
-        query, sparse_kv, local_kv, kv_indices, output, lse, cu_seqlens, cu_seqlens_k
+        query,
+        sparse_kv,
+        local_kv,
+        query_rope,
+        sparse_rope,
+        local_rope,
+        kv_indices,
+        output,
+        lse,
+        cu_seqlens,
+        cu_seqlens_k,
     )
 
     # This head-major schedule is tuned for shared KV on Blackwell.
-    if can_use_shared_kv_schedule(query, sparse_kv, local_kv, sliding_window_size):
+    if can_use_shared_kv_schedule(
+        query, sparse_kv, local_kv, sliding_window_size, query_rope, sparse_rope, local_rope
+    ):
         # A smaller head tile keeps D=512 accumulators within Blackwell's resources.
         block_h = (
             triton.next_power_of_2(heads)
@@ -523,6 +620,9 @@ def _launch_forward(
             query,
             sparse_kv,
             local_kv,
+            query_rope,
+            sparse_rope,
+            local_rope,
             kv_indices,
             cu_seqlens,
             cu_seqlens_k,
@@ -531,13 +631,17 @@ def _launch_forward(
             lse,
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
-            LOCAL_KV_STRIDES=local_kv.stride(),
+            LOCAL_KV_STRIDES=optional_strides(local_kv),
+            QUERY_ROPE_STRIDES=optional_strides(query_rope),
+            SPARSE_ROPE_STRIDES=optional_strides(sparse_rope),
+            LOCAL_ROPE_STRIDES=optional_strides(local_rope),
             KV_INDICES_STRIDES=kv_indices.stride(),
             num_documents=num_documents,
             LSE_STRIDES=lse.stride(),
             H=heads,
             S=seq_len,
             D=head_dim,
+            ROPE_DIM=0 if query_rope is None else query_rope.shape[-1],
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             WINDOW=sliding_window_size,
@@ -549,6 +653,8 @@ def _launch_forward(
             BLOCK_D=block_d,
         )
         return output, lse
+    if query_rope is not None:
+        raise ValueError(ROPE_REQUIREMENTS)
 
     # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
     block_m, block_n, num_warps, num_stages, *_ = (
@@ -560,9 +666,13 @@ def _launch_forward(
         triton.cdiv(sliding_window_size + block_m - 1, block_n) if sliding_window_size else 0
     )
     grid = (triton.cdiv(seq_len, block_m), batch * heads)
-    if can_use_tma(query) and can_use_tma(local_kv):
+    if can_use_tma(query) and (local_kv is None or can_use_tma(local_kv)):
         query_desc = TensorDescriptor.from_tensor(query, [1, 1, block_m, block_d])
-        local_desc = TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
+        local_desc = (
+            None
+            if local_kv is None
+            else TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
+        )
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
         _FWD_TMA[grid](
             query_desc,
@@ -605,7 +715,7 @@ def _launch_forward(
             lse,
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
-            LOCAL_KV_STRIDES=local_kv.stride(),
+            LOCAL_KV_STRIDES=optional_strides(local_kv),
             KV_INDICES_STRIDES=kv_indices.stride(),
             num_documents=num_documents,
             LSE_STRIDES=lse.stride(),

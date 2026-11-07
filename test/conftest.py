@@ -21,8 +21,26 @@ os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
 import torch
 
 
+def _configure_worker_parallelism(config: pytest.Config) -> None:
+    if sys.platform != "linux" or not hasattr(config, "workerinput"):
+        return
+    workers = config.workerinput["workercount"]
+    if workers <= 1:
+        return
+    cpu_budget = max(1, len(os.sched_getaffinity(0)) // workers)
+    # Limit compiler parallelism per xdist worker unless explicitly overridden.
+    os.environ.setdefault("TORCHINDUCTOR_COMPILE_THREADS", str(min(4, cpu_budget)))
+    if "OMP_NUM_THREADS" in os.environ or "MKL_NUM_THREADS" in os.environ:
+        return
+    threads = min(torch.get_num_threads(), cpu_budget)
+    # Propagate the budget to spawned ranks too, and handle plugins that imported torch early.
+    os.environ["OMP_NUM_THREADS"] = os.environ["MKL_NUM_THREADS"] = str(threads)
+    torch.set_num_threads(threads)
+
+
 def pytest_configure(config: pytest.Config) -> None:
-    """Refuse to test one checkout's sources through another worktree's editable install."""
+    """Configure worker budgets and reject imports from another checkout."""
+    _configure_worker_parallelism(config)
     import attn_gym
 
     package_root = Path(attn_gym.__file__).resolve().parent.parent

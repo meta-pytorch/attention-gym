@@ -41,67 +41,9 @@ def _softmax_with_sink(logits: Tensor, attention_sink: Tensor) -> tuple[Tensor, 
     return probabilities, lse
 
 
-def _packed_gather_attn(
-    query: Tensor,
-    local_kv: Tensor,
-    sparse_kv: Tensor,
-    kv_indices: Tensor,
-    attention_sink: Tensor,
-    cu_seqlens: Tensor,
-    cu_seqlens_k: Tensor,
-    sliding_window_size: int,
-    *,
-    scale: float,
-) -> tuple[Tensor, Tensor]:
-    """Gather actual slots so masked KV (including NaNs) cannot contaminate other documents."""
-    batch, heads, tokens, dim = query.shape
-    positions = torch.arange(tokens, device=query.device)
-    window = min(sliding_window_size, tokens)
-    local_indices = positions[:, None] - window + 1 + torch.arange(window, device=query.device)
-    local_valid = (local_indices >= 0).unsqueeze(0)
-    documents = torch.searchsorted(cu_seqlens[1:], positions, right=True)
-    starts = cu_seqlens[documents]
-    local_valid = local_valid & (local_indices >= starts[:, None])
-    local_indices = local_indices.clamp_min(0).expand(batch, -1, -1)
-    sparse_starts = cu_seqlens_k[documents][None, :, None]
-    sparse_ends = cu_seqlens_k[(documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1)][None, :, None]
-    sparse_valid = (kv_indices >= 0) & (kv_indices < sparse_ends - sparse_starts)
-    sparse_indices = torch.where(sparse_valid, kv_indices, 0) + sparse_starts + tokens
-    sparse_indices = torch.where(sparse_valid, sparse_indices, 0)
-    indices = torch.cat((local_indices, sparse_indices), dim=-1).long()
-    valid = torch.cat((local_valid, sparse_valid), dim=-1)[:, None, :, :, None]
-    kv = torch.cat((local_kv, sparse_kv), dim=2)
-    kv_heads = kv.shape[1]
-    # Index the original pool rather than an expanded [B, H, T, pool, D] view:
-    # gather's backward would otherwise allocate a gradient for that entire view.
-    slots = kv[
-        torch.arange(batch, device=query.device)[:, None, None, None],
-        torch.arange(kv_heads, device=query.device)[None, :, None, None],
-        indices[:, None],
-    ]
-    # Multiplication by a zero probability does not neutralize NaN values or gradients.
-    slots = torch.where(valid, slots, 0)
-    accumulation_dtype = torch.promote_types(query.dtype, torch.float32)
-    slots_acc = slots.to(accumulation_dtype)
-    # Share the gathered slots across query heads, including for the two matmuls.
-    grouped_query = query.reshape(batch, kv_heads, heads // kv_heads, tokens, dim)
-    grouped_query = grouped_query.permute(0, 1, 3, 2, 4).to(accumulation_dtype)
-    logits = torch.matmul(grouped_query, slots_acc.transpose(-2, -1)) * scale
-    logits = logits.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, indices.shape[-1])
-    logits = logits.masked_fill(~valid.squeeze(-1), float("-inf"))
-    probabilities, lse = _softmax_with_sink(logits, attention_sink)
-    probabilities = probabilities.to(query.dtype)
-    grouped_probabilities = probabilities.reshape(
-        batch, kv_heads, heads // kv_heads, tokens, indices.shape[-1]
-    ).permute(0, 1, 3, 2, 4)
-    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), slots_acc)
-    output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, dim)
-    return output.to(query.dtype), lse
-
-
 def gather_attn(
     query: Tensor,
-    local_kv: Tensor,
+    local_kv: Tensor | None,
     sparse_kv: Tensor,
     kv_indices: Tensor,
     attention_sink: Tensor,
@@ -111,112 +53,71 @@ def gather_attn(
     share_kv: bool,
     *,
     scale: float,
+    query_rope: Tensor | None = None,
+    sparse_rope: Tensor | None = None,
+    local_rope: Tensor | None = None,
 ) -> tuple[Tensor, Tensor]:
-    """
-    Performs gather attention as follows:
-        if share_kv:
-            expand local and sparse kv from (batch, 1, sequence_length, head_dim) to (batch, num_heads, sequence_length, head_dim)
-        For each token, Q_i, in query:
-            document = searchsorted(cu_seqlens[1:], i, right=True)
-            first_token_of_document = cu_seqlens[document]
-            farthest_past_token_index = max(i - sliding_window, first_token_of_document)
-            KV = cat([local_kv[farthest_past_token_index: i + 1], sparse_kv[indices]])
-            P = (Q @ KV.T) * scale
-            P = softmax(cat([P, sink]))[:P.sequence_length]
-            return P @ V
+    """Gather actual slots, masking before dots so invalid NaNs cannot propagate."""
+    batch, heads, tokens, dim = query.shape
+    positions = torch.arange(tokens, device=query.device)
+    window = min(sliding_window_size, tokens)
+    local_indices = positions[:, None] - window + 1 + torch.arange(window, device=query.device)
+    local_valid = (local_indices >= 0).unsqueeze(0).expand(batch, -1, -1)
+    local_indices = local_indices.expand(batch, -1, -1)
+    offset = 0 if local_kv is None else tokens
+    if cu_seqlens is None:
+        sparse_valid = (kv_indices >= 0) & (kv_indices < sparse_kv.shape[2])
+        sparse_indices = torch.where(sparse_valid, kv_indices, 0) + offset
+    else:
+        documents = torch.searchsorted(cu_seqlens[1:], positions, right=True)
+        starts = cu_seqlens[documents]
+        local_valid = local_valid & (local_indices >= starts[None, :, None])
+        sparse_starts = cu_seqlens_k[documents][None, :, None]
+        sparse_ends = cu_seqlens_k[(documents + 1).clamp(max=cu_seqlens_k.shape[0] - 1)][
+            None, :, None
+        ]
+        sparse_valid = (kv_indices >= 0) & (kv_indices < sparse_ends - sparse_starts)
+        sparse_indices = torch.where(sparse_valid, kv_indices, 0) + sparse_starts + offset
+    sparse_indices = torch.where(sparse_valid, sparse_indices, 0)
+    indices = torch.cat((local_indices, sparse_indices), dim=-1).long()
+    valid = torch.cat((local_valid, sparse_valid), dim=-1)[:, None, :, :, None]
+    kv_heads = sparse_kv.shape[1]
+    accumulation_dtype = torch.promote_types(query.dtype, torch.float32)
 
-    Args:
-        query: query, shaped like (batch_size, num_heads, sequence_length, head_dim)
+    def gather_slots(local: Tensor | None, sparse: Tensor) -> Tensor:
+        kv = sparse if local is None else torch.cat((local, sparse), dim=2)
+        # A sentinel row keeps even a zero-capacity pool indexable without reading invalid KV.
+        kv = torch.cat((kv, kv.new_zeros((batch, kv_heads, 1, kv.shape[-1]))), dim=2)
+        safe_indices = torch.where(valid[:, 0, :, :, 0], indices, kv.shape[2] - 1)
+        slots = kv[
+            torch.arange(batch, device=query.device)[:, None, None, None],
+            torch.arange(kv_heads, device=query.device)[None, :, None, None],
+            safe_indices[:, None],
+        ]
+        return torch.where(valid, slots, 0).to(accumulation_dtype)
 
-        local_kv: Key and Value for the sliding window branch,
-            represented as (batch_size, 1, sequence_length, head_dim) if share_kv is True.
-            Otherwise represented as (batch_size, num_heads, sequence_length, head_dim).
-
-        sparse_kv: KV candidate pool for the indexing branch, shape of (batch, 1, X, head_dim)
-            if share_kv is True.
-            Otherwise represented as (batch_size, num_heads, X, head_dim), where X may be zero.
-
-        kv_indices: Which entries to select from sparse_kv.
-            Shape of (batch, sequence_length, num_topk_blocks), integer tensor
-            If less than num_topk_blocks should be indexed, pad the tensor with -1
-            Duplicate indices will be upweighted based on the number of times they were duplicated
-
-
-        attention_sink: tensor in shape of (num_heads, ), learnable per head weight that occupies denominator of softmax
-
-        cu_seqlens: Packed query offsets, or None for ordinary batched inputs.
-            They bound the local window.
-
-        cu_seqlens_k: Packed sparse-pool offsets. Selected indices are document-local
-            when offsets are present, and global otherwise.
-
-        sliding_window_size: Integer, size of sliding window
-
-        share_kv: bool, true iff all query heads attend to the same KV head
-        scale: Multiplier for query-key logits; does not scale sink logits.
-    Returns:
-        Tuple of (output, lse) where output has shape (batch_size, num_heads, sequence_length,
-        head_dim) and lse has shape (batch_size, num_heads, sequence_length).
-    """
-    device = query.device
-    dtype = query.dtype
-    accumulation_dtype = torch.promote_types(dtype, torch.float32)
-    b, h, s, _head_dim = query.shape
-    sparse_seq_len = sparse_kv.shape[2]
-    if cu_seqlens is not None:
-        return _packed_gather_attn(
-            query,
-            local_kv,
-            sparse_kv,
-            kv_indices,
-            attention_sink,
-            cu_seqlens,
-            cu_seqlens_k,
-            sliding_window_size,
-            scale=scale,
+    def grouped_q(tensor: Tensor) -> Tensor:
+        return (
+            tensor.reshape(batch, kv_heads, heads // kv_heads, tokens, tensor.shape[-1])
+            .permute(0, 1, 3, 2, 4)
+            .to(accumulation_dtype)
         )
-    if share_kv:
-        local_kv = local_kv.expand(-1, h, -1, -1)
-        sparse_kv = sparse_kv.expand(-1, h, -1, -1)
-    counts = torch.zeros(b, s, sparse_seq_len, device=device, dtype=accumulation_dtype)
-    if sparse_seq_len > 0:
-        # We have s queries that each potentially attend to sparse_seq_len elements.
-        # Indices of -1 are sentinel values meaning "no selection for this slot".
-        # Repeated indices get extra weight (equivalent to multiple copies in the attention set).
-        # This is specifically for edge case handling,
-        # since most uses of this will have indices pass through torch.topk
-        valid_mask = (kv_indices >= 0) & (kv_indices < sparse_seq_len)
-        safe_indices = torch.where(valid_mask, kv_indices, 0).long()
-        # Count how many times each position is selected per query (ignoring sentinels)
-        counts.scatter_add_(
-            dim=-1,
-            index=safe_indices,
-            src=valid_mask.to(accumulation_dtype),
-        )
-    # Convert counts to additive log-mask: 0 selections → -inf, k selections → log(k).
-    topk_mask = torch.where(counts > 0, torch.log(counts), float("-inf"))
 
-    SWA_mask = make_sliding_window_mask(
-        s, sliding_window_size, device, accumulation_dtype
-    ).unsqueeze(0)
-    SWA_mask = SWA_mask.expand(b, -1, -1)
-
-    attention_kv = torch.cat([sparse_kv, local_kv], dim=-2)
-    attention_mask = torch.cat([topk_mask, SWA_mask], dim=-1).unsqueeze(1)
-    query_acc = query.to(accumulation_dtype)
-    attention_kv_acc = attention_kv.to(accumulation_dtype)
-
-    # Match the optimized backends' mixed-precision boundaries: accumulate QK and
-    # softmax in FP32 for low-precision inputs, then quantize P for the PV dot.
+    slots = gather_slots(local_kv, sparse_kv)
+    logits = torch.matmul(grouped_q(query), slots.transpose(-2, -1))
+    if query_rope is not None:
+        rope_slots = gather_slots(local_rope, sparse_rope)
+        logits = logits + torch.matmul(grouped_q(query_rope), rope_slots.transpose(-2, -1))
     logits = (
-        torch.matmul(query_acc, torch.permute(attention_kv_acc, (0, 1, 3, 2))) * scale
-        + attention_mask
+        (logits * scale).permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, indices.shape[-1])
     )
-
-    probs, lse = _softmax_with_sink(logits, attention_sink)
-    probs = probs.to(dtype)
-
-    # The low-precision P and KV operands accumulate in FP32 before the output
-    # is stored in the input dtype, as in a tensor-core dot.
-    output = torch.matmul(probs.to(accumulation_dtype), attention_kv_acc).to(dtype)
-    return output, lse
+    logits = logits.masked_fill(~valid.squeeze(-1), float("-inf"))
+    probabilities, lse = _softmax_with_sink(logits, attention_sink)
+    grouped_probabilities = (
+        probabilities.to(query.dtype)
+        .reshape(batch, kv_heads, heads // kv_heads, tokens, indices.shape[-1])
+        .permute(0, 1, 3, 2, 4)
+    )
+    output = torch.matmul(grouped_probabilities.to(accumulation_dtype), slots)
+    output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, dim)
+    return output.to(query.dtype), lse

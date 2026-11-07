@@ -1,5 +1,7 @@
 """Packed gather attention uses document-local indices and matches independent documents."""
 
+from functools import wraps
+
 import pytest
 import torch
 
@@ -439,22 +441,21 @@ def test_packed_cute_native_varlen_replays_offsets_and_gradients(monkeypatch):
     _device("cute")
     from flash_attn.cute import interface
 
-    native = interface.flash_attn_varlen_func
+    native = interface._flash_attn_fwd
     called = False
 
+    @wraps(native)
     def check_native(*args, **kwargs):
         nonlocal called
         called = True
-        assert kwargs["q"].ndim == 3
+        assert kwargs["qv"].ndim == 3
         assert kwargs["gather_kv_indices"].ndim == 2
-        assert kwargs["k"] is kwargs["v"]
+        assert kwargs["cu_seqlens_q"] is not None
+        assert kwargs["cu_seqlens_k"] is not None
+        assert kwargs["q"] is None and kwargs["k"] is None
         return native(*args, **kwargs)
 
-    def reject_flat(*args, **kwargs):
-        raise AssertionError("Packed attention must not flatten away document boundaries")
-
-    monkeypatch.setattr(interface, "flash_attn_varlen_func", check_native)
-    monkeypatch.setattr(interface, "flash_attn_func", reject_flat)
+    monkeypatch.setattr(interface, "_flash_attn_fwd", check_native)
     tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512, capacity=3)
     q, local, sparse, sink = tensors
     grad = torch.randn_like(q) * 0.2
@@ -501,17 +502,19 @@ def test_packed_cute_query_batch_view_has_zero_copy_backward(monkeypatch):
     _device("cute")
     from flash_attn.cute import interface
 
-    native = interface.flash_attn_varlen_func
-    native_queries = []
+    native = interface._flash_attn_bwd_sparse_mla
+    native_gradients = []
 
-    def capture_query(*args, **kwargs):
-        native_queries.append(kwargs["q"])
-        return native(*args, **kwargs)
+    @wraps(native)
+    def capture_gradient(*args, **kwargs):
+        result = native(*args, **kwargs)
+        native_gradients.append(result[3])  # dQv in FA4's sequence-major layout.
+        return result
 
-    monkeypatch.setattr(interface, "flash_attn_varlen_func", capture_query)
+    monkeypatch.setattr(interface, "_flash_attn_bwd_sparse_mla", capture_gradient)
     tensors, indices, cu_q, cu_k = _inputs("cuda", torch.bfloat16, head_dim=512)
     query, local, sparse, sink = tensors
-    gather_attn(
+    output = gather_attn(
         query,
         local,
         sparse,
@@ -522,9 +525,7 @@ def test_packed_cute_query_batch_view_has_zero_copy_backward(monkeypatch):
         cu_seqlens_k=cu_k,
         kernel_options={"backend": "cute"},
     )
-    incoming = torch.randn_like(native_queries[0])
-    (grad_query,) = torch.autograd.grad(native_queries[0], query, incoming)
-    torch.testing.assert_close(grad_query, incoming.transpose(0, 1).unsqueeze(0))
-    grad_storage = grad_query.untyped_storage().data_ptr()
-    incoming_storage = incoming.untyped_storage().data_ptr()
-    assert grad_storage == incoming_storage
+    (grad_query,) = torch.autograd.grad(output, query, torch.randn_like(output))
+    native_gradient = native_gradients[0]
+    torch.testing.assert_close(grad_query, native_gradient.transpose(0, 1).unsqueeze(0))
+    assert grad_query.untyped_storage().data_ptr() == native_gradient.untyped_storage().data_ptr()

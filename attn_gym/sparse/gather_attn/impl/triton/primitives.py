@@ -14,22 +14,42 @@ from attn_gym._backends.triton.utils import _document_ids, ptr_offset
 def can_use_shared_kv_schedule(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
-    local_kv: torch.Tensor,
+    local_kv: torch.Tensor | None,
     sliding_window_size: int,
+    query_rope: torch.Tensor | None = None,
+    sparse_rope: torch.Tensor | None = None,
+    local_rope: torch.Tensor | None = None,
 ) -> bool:
-    """Check the shared Blackwell forward/backward schedule's layout and shape limits."""
+    """Check the shared Blackwell forward/backward schedule's layout and shape limits.
+
+    The latent KV is both key and value. Optional key-only RoPE tensors add a second logit
+    dot; with RoPE, ``sparse_rope`` (and ``local_rope`` under a window) must be given.
+    """
     _, heads, _, head_dim = query.shape
+    rope_tensors = (sparse_rope, local_rope) if sliding_window_size else (sparse_rope,)
+    rope_ok = query_rope is None or (
+        query_rope.shape[-1] in (16, 32, 64, 128)
+        and query_rope.dtype == torch.bfloat16
+        and all(
+            rope is not None
+            and rope.dtype == torch.bfloat16
+            and rope.shape[-1] == query_rope.shape[-1]
+            and rope.stride(1) == 0
+            for rope in rope_tensors
+        )
+    )
     return (
         torch.cuda.get_device_capability(query.device)[0] >= 10
         and query.dtype == torch.bfloat16
         and sparse_kv.stride(1) == 0
-        and local_kv.stride(1) == 0
         and query.stride(-1) == 1
         and sparse_kv.stride(-1) == 1
-        and local_kv.stride(-1) == 1
+        # Without a window the kernels never read local KV, so it may be absent.
+        and (sliding_window_size == 0 or (local_kv.stride(1) == 0 and local_kv.stride(-1) == 1))
         and 16 <= heads <= 128
         and head_dim % 16 == 0
         and (head_dim <= 128 or head_dim == 512)
+        and rope_ok
         and sliding_window_size <= 2048
     )
 
@@ -77,6 +97,11 @@ def select_tiles(
         ),
         candidates[-1],
     )
+
+
+def optional_strides(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
+    """Strides of an optional kernel operand; None compiles out its constexpr-guarded uses."""
+    return None if tensor is None else tensor.stride()
 
 
 def tuning_key(tensor: str, *names: str):
