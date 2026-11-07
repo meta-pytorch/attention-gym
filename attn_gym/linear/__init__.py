@@ -23,7 +23,7 @@ from attn_gym.linear.kda import (
     recurrent_kda_decode,
 )
 from attn_gym.linear.short_conv import ops as _short_conv_ops
-from attn_gym.linear.types import GateTransform, Impl
+from attn_gym.linear.types import GateTransform, Impl, RecurrentKernelOptions
 
 # Note: Lazy Imports
 # Backend-backed names load on first use, keeping reference imports torch-only.
@@ -56,6 +56,7 @@ GENERIC_OPS = [
     "GateTransform",
     "Impl",
     "KernelOptions",
+    "RecurrentKernelOptions",
     "ReplayState",
     "active_token_mask",
     "causal_conv1d",

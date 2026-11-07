@@ -32,6 +32,7 @@ from attn_gym._backends.triton.utils import (
     LOG2_E,
     autotune_cache_kwargs,
     configure_triton_allocator,
+    fixed_tree_sum,
     ptr_offset,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
@@ -55,6 +56,12 @@ def _prune_recurrent_configs(configs, _named_args, V, **_):
     """Drop value tiles wider than the padded value dimension."""
     max_block_v = max(8, triton.next_power_of_2(V))
     return [config for config in configs if config.kwargs["BV"] <= max_block_v]
+
+
+@triton.jit
+def _fixed_order_sum_over_k(x):
+    """Sum a ``[BK, BV]`` tile over K in an order fixed by ``BK`` alone (``fixed_tree_sum``)."""
+    return fixed_tree_sum(tl.trans(x))
 
 
 @triton.jit
@@ -128,6 +135,7 @@ def _recurrent_delta_rule_fwd_kernel(
     USE_HAS_INITIAL_STATE: tl.constexpr,
     SCALAR_GATE: tl.constexpr,
     PREFETCH: tl.constexpr,
+    BATCH_INVARIANT: tl.constexpr,
 ):
     """Scan one sequence/head/value tile while retaining the FP32 state in registers.
 
@@ -210,7 +218,13 @@ def _recurrent_delta_rule_fwd_kernel(
         # exp(g) computed as exp2(g * log2(e)); the FMA folds into the exp2 argument.
         b_state *= tl.exp2(b_g * LOG2_E)
 
-        if PREFETCH:
+        if BATCH_INVARIANT:
+            # Every launch config uses this one formula, fixed-order sums and no FMA fusion (see
+            # the launch), so a sequence's bits do not depend on the batch shape that picks it.
+            b_delta = (b_v - _fixed_order_sum_over_k(b_k * b_state)) * b_beta
+            b_state += b_k * b_delta[None, :]
+            b_o = _fixed_order_sum_over_k(b_q * b_state)
+        elif PREFETCH:
             # q @ (S + k delta) = q @ S + (q . k) delta lets both reductions read decayed S
             # without waiting for the state update.
             b_o = tl.sum(b_q * b_state, 0)
@@ -248,6 +262,7 @@ recurrent_delta_rule_fwd_kernel = triton.autotune(
         "IS_VARLEN",
         "SCALAR_GATE",
         "PREFETCH",
+        "BATCH_INVARIANT",
     ],
     prune_configs_by={"early_config_prune": _prune_recurrent_configs},
     **autotune_cache_kwargs,
@@ -269,6 +284,7 @@ def launch_recurrent_delta_rule_fwd(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = False,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
 
@@ -301,6 +317,9 @@ def launch_recurrent_delta_rule_fwd(
             this mask every selected slot is treated as real history.
         autotune: Benchmark tile configurations when true; paged launches always use fixed
             heuristics because rerunning candidates would advance the pool repeatedly.
+        batch_invariant: Use one formula, fixed-order sums over K and no FMA fusion, so a
+            sequence's output and state bits do not depend on the launch config that the batch
+            shape picks. Composes with ``autotune`` and prefetching.
 
     Returns:
         The output in ``q.dtype`` plus the final state (``None`` unless requested). In paged
@@ -383,6 +402,10 @@ def launch_recurrent_delta_rule_fwd(
         }
         if num_warps == 1:
             launch_options["maxnreg"] = 128
+    if batch_invariant:
+        # Whether a multiply fuses into the next add as an FMA follows the thread layout, so it
+        # changes with the launch config. Plain multiplies and adds keep a sequence's bits fixed.
+        launch_options["enable_fp_fusion"] = False
     kernel[grid](
         q,
         k,
@@ -412,6 +435,7 @@ def launch_recurrent_delta_rule_fwd(
         USE_HAS_INITIAL_STATE=has_initial_state is not None,
         SCALAR_GATE=gate_kind is GateKind.SCALAR,
         PREFETCH=prefetch,
+        BATCH_INVARIANT=batch_invariant,
         **launch_options,
     )
     return output, final_state

@@ -55,14 +55,15 @@ torch.library.define(
 )
 _RECURRENT_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state, "
-    "Tensor? cu_seqlens, float scale, bool autotune)"
+    "Tensor? cu_seqlens, float scale, bool autotune, bool batch_invariant)"
 )
 torch.library.define("attn_gym::gdn_recurrent_fwd", _RECURRENT_ARGS + " -> (Tensor, Tensor)")
 torch.library.define("attn_gym::gdn_recurrent_fwd_no_state", _RECURRENT_ARGS + " -> Tensor")
 torch.library.define(
     "attn_gym::gdn_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
-    "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale) -> Tensor",
+    "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale, "
+    "bool batch_invariant) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_recurrent_decode",
@@ -287,8 +288,9 @@ def _recurrent_fwd_fake(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del k, gate, beta, initial_state, scale, autotune
+    del k, gate, beta, initial_state, scale, autotune, batch_invariant
     num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     # The state carries one [V, K] slab per value head; grouped callers have v.shape[2] > HK.
     final_state = q.new_empty(
@@ -308,8 +310,9 @@ def _recurrent_fwd_no_state_fake(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> torch.Tensor:
-    del k, gate, beta, initial_state, cu_seqlens, scale, autotune
+    del k, gate, beta, initial_state, cu_seqlens, scale, autotune, batch_invariant
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -325,8 +328,10 @@ def _recurrent_fwd_paged_fake(
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     scale: float,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
+    del batch_invariant
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -586,6 +591,7 @@ def recurrent_forward(
     state_indices: torch.Tensor | None,
     has_initial_state: torch.Tensor | None,
     autotune: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize inputs and invoke the fused recurrent GDN operator."""
     if q.shape[-1] > 256:
@@ -615,10 +621,11 @@ def recurrent_forward(
             has_initial_state,
             cu_seqlens,
             scale,
+            batch_invariant,
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()
-    args = (q, k, v, gate, beta, initial_state, cu_seqlens, scale, autotune)
+    args = (q, k, v, gate, beta, initial_state, cu_seqlens, scale, autotune, batch_invariant)
     if output_final_state:
         return recurrent_fwd_op(*args)
     return recurrent_fwd_no_state_op(*args), None

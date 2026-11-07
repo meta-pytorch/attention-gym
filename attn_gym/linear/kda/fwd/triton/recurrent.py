@@ -32,6 +32,7 @@ def _launch_kda_recurrent_fwd(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch the vector-gate specialization used by recurrent KDA."""
     return launch_recurrent_delta_rule_fwd(
@@ -48,6 +49,7 @@ def _launch_kda_recurrent_fwd(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         autotune=autotune,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -61,6 +63,7 @@ def _kda_recurrent_fwd_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output, final_state = _launch_kda_recurrent_fwd(
         q,
@@ -73,6 +76,7 @@ def _kda_recurrent_fwd_cuda(
         scale=scale,
         store_final_state=True,
         autotune=autotune,
+        batch_invariant=batch_invariant,
     )
     assert final_state is not None
     return output, final_state
@@ -88,6 +92,7 @@ def _kda_recurrent_fwd_no_state_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
         q,
@@ -100,6 +105,7 @@ def _kda_recurrent_fwd_no_state_cuda(
         scale=scale,
         store_final_state=False,
         autotune=autotune,
+        batch_invariant=batch_invariant,
     )[0]
 
 
@@ -114,6 +120,7 @@ def _kda_recurrent_fwd_paged_cuda(
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     scale: float,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     return _launch_kda_recurrent_fwd(
         q,
@@ -128,6 +135,7 @@ def _kda_recurrent_fwd_paged_cuda(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         autotune=False,
+        batch_invariant=batch_invariant,
     )[0]
 
 
