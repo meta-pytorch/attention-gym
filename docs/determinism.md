@@ -122,8 +122,23 @@ given a fixed configuration. The guarantees, strongest first:
   stages alike — the first time a shape is seen and reuses the cached winner
   afterwards; `autotune=False` pins every stage to its fixed heuristic
   configuration instead, so kernel selection is repeatable across machines and
-  cache states. `recurrent_kda` and `causal_conv1d` have single fixed
-  schedules and need no flag.
+  cache states. `recurrent_kda(..., autotune=False)` pins its heuristic
+  configuration the same way. `causal_conv1d` has a single fixed schedule and
+  needs no flag.
+- **`recurrent_kda` and `recurrent_gdn` with `kernel_options={"batch_invariant": True}`:
+  bitwise across batches.** On one GPU model and software stack, a sequence gets
+  the same output and final-state bits alone, among empty slots, or decoded one
+  token per call with an FP32 state pool (a BF16 pool rounds the state between
+  calls). The scan picks its launch
+  configuration from the batch shape, so `autotune=False` alone does not give
+  this. The option makes the configuration irrelevant: one formula for every
+  configuration, sums over K in a fixed order, and no FMA fusion. `l2norm` makes
+  the same split: its forward always reduces in a fixed order, and its `autotune`
+  flag only pins the backward configuration. Autotuning and prefetching still
+  run. The option costs up to ~20% GPU time on long prefills and ~9% on decode
+  (GB300). The fused decode ops (`recurrent_kda_decode`, `recurrent_gdn_decode`)
+  do not support it. For batch-invariant decode, apply `gate_transform`, the beta
+  sigmoid and `l2norm` yourself, then call the scan with one token per sequence.
 - **CUDA-graph replay: bitwise** by construction, and the intended serving mode
   for decode.
 - **Across lowerings: never bitwise.** Dense versus packed, chunked versus

@@ -19,9 +19,11 @@ scan in :mod:`attn_gym.linear._delta_rule.recurrent`, with the cache storing the
     state += outer(k, delta)
     out    = scale * l2norm(q) @ state
 
-It matches the scan's math, not its bits: this kernel picks its launch config from the batch size
-and sums with ``tl.sum``, FMA fusion on.
-TODO: make its bits independent of the launch config, as the scan's are.
+It has no ``batch_invariant`` mode: it picks its launch config from the batch size and sums with
+``tl.sum``, FMA fusion on, so a sequence's bits can change with the batch. For batch-invariant
+decode, apply ``gate_transform``, the beta sigmoid and ``l2norm`` outside, then run the scan with
+one token per sequence, an FP32 state pool and ``kernel_options={"batch_invariant": True}``.
+TODO: add the scan's ``batch_invariant`` mode here.
 
 Gate transforms (`USE_LOWER_BOUND` selects the first):
 

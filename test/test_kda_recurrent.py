@@ -263,7 +263,7 @@ def test_recurrent_grouped_heads_registration():
     state = torch.randn(1, v.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
         recurrent_fwd_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True, False),
     )
 
 
@@ -616,11 +616,11 @@ def test_recurrent_custom_op_registration(packed: bool, state_dtype: torch.dtype
     state = torch.randn(num_sequences, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     torch.library.opcheck(
         recurrent_fwd_op,
-        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True, False),
     )
     torch.library.opcheck(
         recurrent_fwd_no_state_op,
-        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, cu_seqlens, q.shape[-1] ** -0.5, True, False),
     )
     _, state_pool = strided_state_pool(
         num_sequences + 1, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype
@@ -628,7 +628,7 @@ def test_recurrent_custom_op_registration(packed: bool, state_dtype: torch.dtype
     slots = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens, q.shape[-1] ** -0.5),
+        (q, k, v, gate, beta, state_pool, slots, None, cu_seqlens, q.shape[-1] ** -0.5, False),
     )
 
 
@@ -642,15 +642,15 @@ def test_recurrent_custom_op_registration_mixed_dtype():
 
     torch.library.opcheck(
         recurrent_fwd_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True, False),
     )
     torch.library.opcheck(
         recurrent_fwd_no_state_op,
-        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True),
+        (q, k, v, gate, beta, state, None, q.shape[-1] ** -0.5, True, False),
     )
     torch.library.opcheck(
         recurrent_fwd_paged_op,
-        (q, k, v, gate, beta, state_pool, slots, None, None, q.shape[-1] ** -0.5),
+        (q, k, v, gate, beta, state_pool, slots, None, None, q.shape[-1] ** -0.5, False),
     )
 
 
@@ -724,13 +724,13 @@ def test_recurrent_cuda_graph_replay():
     cu_seqlens = cumulative_sequence_offsets([11, 16, 5])
     initial_state = torch.randn(3, q.shape[2], v.shape[-1], q.shape[3], device="cuda")
     scale = 0.25
-    recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True)
+    recurrent_fwd_op(q, k, v, gate, beta, initial_state, cu_seqlens, scale, True, False)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output, captured_state = recurrent_fwd_op(
-            q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
+            q, k, v, gate, beta, initial_state, cu_seqlens, scale, True, False
         )
 
     active_tokens = 23
@@ -743,7 +743,7 @@ def test_recurrent_cuda_graph_replay():
     torch.cuda.synchronize()
 
     expected_output, expected_state = recurrent_fwd_op(
-        q, k, v, gate, beta, initial_state, cu_seqlens, scale, True
+        q, k, v, gate, beta, initial_state, cu_seqlens, scale, True, False
     )
     torch.testing.assert_close(
         captured_output[:, :active_tokens],
@@ -761,13 +761,13 @@ def test_recurrent_paged_cuda_graph_replay(state_dtype: torch.dtype):
     storage, pool = strided_state_pool(7, q.shape[2], q.shape[3], v.shape[-1], dtype=state_dtype)
     slots = torch.tensor([5, 1, 3], device="cuda", dtype=torch.int32)
     scale = 0.25
-    recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale)
+    recurrent_fwd_paged_op(q, k, v, gate, beta, pool, slots, None, None, scale, False)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         captured_output = recurrent_fwd_paged_op(
-            q, k, v, gate, beta, pool, slots, None, None, scale
+            q, k, v, gate, beta, pool, slots, None, None, scale, False
         )
 
     with torch.no_grad():

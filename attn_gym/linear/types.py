@@ -60,6 +60,20 @@ class KernelOptions(SplitOptions, total=False):
     inputs."""
 
 
+class RecurrentKernelOptions(TypedDict, total=False):
+    """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
+
+    batch_invariant: bool
+    """Give a sequence the same output and final-state bits in any batch: alone, among empty
+    slots, or decoded one token per call with an FP32 state pool (a BF16 pool rounds the state
+    between calls). Holds on one GPU model and software stack. Without it, the launch config
+    follows the batch shape and changes the bits, and ``autotune=False`` does not prevent that.
+    The scan uses one formula, sums in a fixed order and turns off FMA fusion, so the config no
+    longer matters. Autotuning and prefetching still run. Costs up to ~20% GPU time on long
+    prefills and ~9% on decode (GB300). The fused decode ops (``recurrent_gdn_decode``,
+    ``recurrent_kda_decode``) do not support it. Defaults to ``False``."""
+
+
 class GateTransform(str, Enum):
     """Pointwise transform from a raw gate projection to a natural-log decay.
 
@@ -87,6 +101,7 @@ __all__ = [
     "GateTransform",
     "Impl",
     "KernelOptions",
+    "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
     "resolve_gate_transform",

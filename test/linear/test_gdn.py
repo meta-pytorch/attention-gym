@@ -348,6 +348,17 @@ def test_chunk_kernel_options_are_strict():
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "cudnn"})
 
 
+def test_recurrent_kernel_options_are_strict():
+    """Accept only a bool ``batch_invariant``, and only for the fused scan."""
+    inputs = make_inputs(sequence=2)
+    with pytest.raises(ValueError, match="unsupported recurrent_gdn kernel options: backend"):
+        recurrent_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "fused"})
+    with pytest.raises(TypeError, match="must be a bool"):
+        recurrent_gdn(*inputs[:-1], impl="fused", kernel_options={"batch_invariant": 1})
+    with pytest.raises(ValueError, match="not supported with impl='reference'"):
+        recurrent_gdn(*inputs[:-1], impl="reference", kernel_options={"batch_invariant": True})
+
+
 @pytest.mark.parametrize("function", [chunk_gdn, recurrent_gdn])
 def test_invalid_initial_state_shape_fails_clearly(function):
     inputs = make_inputs(sequence=2)

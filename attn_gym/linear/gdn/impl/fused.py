@@ -18,6 +18,7 @@ def _launch_recurrent(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
     *,
     output_final_state: bool,
     state_indices: torch.Tensor | None = None,
@@ -38,6 +39,7 @@ def _launch_recurrent(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         autotune=autotune,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -51,6 +53,7 @@ def _gdn_recurrent_fwd_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output, final_state = _launch_recurrent(
         q,
@@ -62,6 +65,7 @@ def _gdn_recurrent_fwd_cuda(
         cu_seqlens,
         scale,
         autotune,
+        batch_invariant,
         output_final_state=True,
     )
     assert final_state is not None
@@ -78,6 +82,7 @@ def _gdn_recurrent_fwd_no_state_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     return _launch_recurrent(
         q,
@@ -89,6 +94,7 @@ def _gdn_recurrent_fwd_no_state_cuda(
         cu_seqlens,
         scale,
         autotune,
+        batch_invariant,
         output_final_state=False,
     )[0]
 
@@ -104,6 +110,7 @@ def _gdn_recurrent_fwd_paged_cuda(
     has_initial_state: torch.Tensor | None,
     cu_seqlens: torch.Tensor | None,
     scale: float,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     """Advance selected cache slots with the shared scalar-gate scan."""
     return _launch_recurrent(
@@ -116,6 +123,7 @@ def _gdn_recurrent_fwd_paged_cuda(
         cu_seqlens,
         scale,
         False,
+        batch_invariant,
         output_final_state=True,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
