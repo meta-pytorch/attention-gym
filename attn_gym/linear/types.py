@@ -49,6 +49,16 @@ class SplitOptions(BackendOptions, total=False):
     """Split the forward recurrence."""
 
 
+class GDNKernelOptions(SplitOptions, total=False):
+    """Chunk GDN backend controls."""
+
+    save_chunk_states: bool
+    """Keep the forward's chunk states for the backward instead of recomputing them. Gradients
+    are bitwise identical; the cost is about ``(T / 64 + N) * H * K * V + T * H * V`` more
+    ``q.dtype`` elements held until the backward (384 MiB at T=16384, N=1, H=32, K=V=128).
+    Fused backend only."""
+
+
 class KernelOptions(SplitOptions, total=False):
     """KDA backend controls and experimental scheduling options."""
 
@@ -84,6 +94,7 @@ def resolve_gate_transform(kind: GateTransform | str) -> GateTransform:
 
 __all__ = [
     "BackendOptions",
+    "GDNKernelOptions",
     "GateTransform",
     "Impl",
     "KernelOptions",

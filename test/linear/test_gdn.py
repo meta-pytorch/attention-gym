@@ -337,6 +337,10 @@ def test_chunk_kernel_options_are_strict():
             resolve_kernel_options({"backend": "cudnn", name: 1})
         with pytest.raises(ValueError, match="requires.*cudnn"):
             resolve_kernel_options({name: True})
+    with pytest.raises(TypeError, match="must be a bool"):
+        resolve_kernel_options({"save_chunk_states": 1})
+    with pytest.raises(ValueError, match="save_chunk_states requires.*fused"):
+        resolve_kernel_options({"backend": "cudnn", "save_chunk_states": True})
     inputs = make_inputs(sequence=2)
     with pytest.raises(ValueError, match="unsupported chunk_gdn kernel options: unknown"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"unknown": True})

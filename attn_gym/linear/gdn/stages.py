@@ -102,7 +102,7 @@ class ChunkGDNPrepared:
         else:
             initial_state = normalize_compact_tensor(initial_state.float())
             reject_int64_offsets(initial_state)
-        output, final_state = _finish_chunk_gdn_fwd(
+        output, final_state, _h, _v_new = _finish_chunk_gdn_fwd(
             saved.q,
             saved.k,
             self.factors,

@@ -19,8 +19,8 @@ from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_for
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
+from attn_gym.linear.types import GDNKernelOptions as KernelOptions
 from attn_gym.linear.types import Impl, resolve_impl
-from attn_gym.linear.types import SplitOptions as KernelOptions
 
 
 def chunk_gdn(
@@ -67,7 +67,9 @@ def chunk_gdn(
             default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
-            for calls without ``initial_state`` or ``output_final_state``.
+            for calls without ``initial_state`` or ``output_final_state``. On the repo-local
+            path, ``save_chunk_states`` trades memory for a faster backward (see
+            :class:`attn_gym.linear.types.GDNKernelOptions`).
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -103,6 +105,7 @@ def chunk_gdn(
             cu_seqlens=cu_seqlens,
             scale=scale,
             output_final_state=output_final_state,
+            save_chunk_states=options.save_chunk_states,
         )
 
     return reference_delta_rule(
