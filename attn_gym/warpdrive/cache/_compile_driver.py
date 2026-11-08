@@ -1,8 +1,7 @@
-"""Fresh-process driver for CuTeDSL compilation.
+"""Compiler process that ``precompile_many`` starts in a fresh interpreter.
 
-The driver is a fresh interpreter. It installs import paths and target metadata,
-decodes a trusted compile-call payload, then forks workers that receive only
-integer indices into state inherited from the driver.
+It installs the caller's import paths and compile target, loads the pickled compile calls,
+then forks workers. A worker receives only an index into the calls it inherited.
 """
 
 from __future__ import annotations
@@ -45,32 +44,35 @@ def main(request_path: Path, calls_path: Path) -> int:
     except ImportError:
         pass
 
-    from attn_gym._backends.cute.target import CompileTarget, set_compile_target
-
     target_fields = request["target"]
     capability = target_fields.get("capability")
     if capability is not None:
         target_fields["capability"] = tuple(capability)
-    target = CompileTarget(**target_fields)
-    set_compile_target(target)
-
-    if target.configured_arch is not None:
-        os.environ["CUTE_DSL_ARCH"] = target.configured_arch
-    elif target.capability is not None:
-        major, minor = target.capability
+    # CuTeDSL reads CUTE_DSL_ARCH when cutlass is first imported, and importing attn_gym
+    # imports cutlass: set it before the imports below.
+    if target_fields.get("configured_arch") is not None:
+        os.environ["CUTE_DSL_ARCH"] = target_fields["configured_arch"]
+    elif capability is not None:
+        major, minor = capability
         suffix = "a" if major >= 9 else ""
         os.environ["CUTE_DSL_ARCH"] = f"sm_{major}{minor}{suffix}"
+
+    from attn_gym.warpdrive.cache.jit import set_cache_path
+    from attn_gym.warpdrive.cache.target import CompileTarget, set_compile_target
+
+    set_compile_target(CompileTarget(**target_fields))
+    set_cache_path(request["cache_path"])
 
     _compile_fn = _resolve(request["module"], request["qualname"])
     if not callable(getattr(_compile_fn, "precompile", None)):
         raise TypeError("compile function is not decorated with jit_cache")
 
-    # The parent creates this payload inside the same private TemporaryDirectory.
-    # It is never accepted from a persistent cache or an external caller.
+    # Safe to unpickle: the parent wrote this file in its private TemporaryDirectory. It never
+    # comes from a persistent cache or an outside caller.
     _compile_calls = pickle.loads(calls_path.read_bytes())
 
-    # Amortize imports and source hashing across workers. Target metadata is
-    # already available, so this setup does not need CUDA device discovery.
+    # Import and hash sources once, before forking, so workers inherit the result. The target
+    # is already set, so this does no CUDA device discovery.
     prepare_cache = getattr(_compile_fn, "prepare_cache", None)
     if callable(prepare_cache):
         prepare_cache()

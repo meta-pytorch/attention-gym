@@ -1,0 +1,15 @@
+/* schedule_html: CTA x slot grid, timeline and work-space map. */
+.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
+.controls .figlabel { margin: 0; }
+.seg { display: inline-flex; }
+.seg button { border-radius: 0; margin-left: -1px; }
+.seg button:first-child { border-radius: 3px 0 0 3px; margin-left: 0; }
+.seg button:last-child { border-radius: 0 3px 3px 0; }
+.readout { font: 11.5px var(--mono); color: var(--ink); }
+.legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
+  vertical-align: -1px; margin-right: 5px; }
+.view { margin-bottom: 14px; }
+.view canvas { display: block; }
+.view .figure { overflow: hidden; }
+.pair { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
+.pair > .view { flex: 1 1 420px; min-width: 0; }

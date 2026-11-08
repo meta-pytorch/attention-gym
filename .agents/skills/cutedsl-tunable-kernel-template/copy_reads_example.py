@@ -3,7 +3,7 @@
 Run this from an environment containing Attention Gym and CuTeDSL. Reuse the
 same cache directory to compare cold and warm behavior::
 
-    ATTN_GYM_CUTE_CACHE_DIR=/tmp/cute-playground \
+    WARPDRIVE_CACHE_DIR=/tmp/cute-playground \
         python .agents/skills/cutedsl-tunable-kernel-template/copy_reads_example.py
 """
 

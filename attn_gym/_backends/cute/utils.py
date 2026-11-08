@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import operator
-import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from functools import cache, lru_cache
@@ -11,7 +10,12 @@ from typing import Any, NamedTuple
 
 import torch
 
-_VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
+from attn_gym.warpdrive.cache.tvm_ffi import (
+    compile_tvm_ffi,
+    make_fake_compact_tensor,
+    make_fake_strided_tensor,
+)
+
 TMA_ALIGNMENT_BYTES = 16
 _CUTE_DTYPES = {
     torch.float16: ("Float16", "fp16"),
@@ -39,19 +43,6 @@ def cute_dtype(dtype: torch.dtype | type) -> CuteDType:
         raise TypeError(f"no CuTeDSL storage type for {dtype}")
     type_name, name = _CUTE_DTYPES[dtype]
     return CuteDType(getattr(cutlass, type_name), name)
-
-
-def _contains_torch_tensor(value: Any) -> bool:
-    if isinstance(value, torch.Tensor):
-        return True
-    if isinstance(value, (tuple, list)):
-        return any(_contains_torch_tensor(item) for item in value)
-    if isinstance(value, dict):
-        return any(
-            _contains_torch_tensor(key) or _contains_torch_tensor(item)
-            for key, item in value.items()
-        )
-    return False
 
 
 @lru_cache(maxsize=8)
@@ -114,52 +105,6 @@ def tensor_supports_contiguous_dim(
             index == dim or stride * element_size % alignment_bytes == 0
             for index, stride in enumerate(tensor.stride())
         )
-    )
-
-
-def make_fake_strided_tensor(
-    dtype: Any,
-    shape: tuple[Any, ...],
-    *,
-    contiguous_dim: int | None = -1,
-    stride_divisibility: int = 1,
-    assumed_align: int | None = None,
-    use_int64_strides: bool = True,
-) -> Any:
-    """Create a fake tensor with dynamic strides and an optional contiguous mode.
-
-    ``contiguous_dim=None`` leaves every stride dynamic, for ordinary scalar loads.
-    ``stride_divisibility`` is measured in elements. When ``assumed_align`` is omitted,
-    it is derived from that divisibility and the element width, matching the weakest
-    alignment promised by the dynamic stride layout.
-    """
-    if not shape:
-        raise ValueError("make_fake_strided_tensor requires at least one dimension")
-    if contiguous_dim is not None and not -len(shape) <= contiguous_dim < len(shape):
-        raise ValueError(f"contiguous_dim is out of range for rank {len(shape)}")
-    if not 1 <= stride_divisibility:
-        raise ValueError("stride_divisibility must be positive")
-    if assumed_align is not None and assumed_align < 1:
-        raise ValueError("assumed_align must be positive")
-    if contiguous_dim is not None:
-        contiguous_dim %= len(shape)
-    from cutlass import cute
-
-    sym_int = cute.sym_int64 if use_int64_strides else cute.sym_int
-    strides = tuple(
-        1 if index == contiguous_dim else sym_int(divisibility=stride_divisibility)
-        for index in range(len(shape))
-    )
-    if assumed_align is None:
-        alignment_bits = stride_divisibility * dtype.width
-        if alignment_bits % 8:
-            raise ValueError("sub-byte fake tensors require an explicit assumed_align")
-        assumed_align = max(1, alignment_bits // 8)
-    return cute.runtime.make_fake_tensor(
-        dtype,
-        shape,
-        stride=strides,
-        assumed_align=assumed_align,
     )
 
 
@@ -228,60 +173,12 @@ def normalize_compact_tensor(
     return tensor.clone(memory_format=torch.contiguous_format)
 
 
-def compile_tvm_ffi(
-    entrypoint: Any,
-    *compile_args: Any,
-    name: str | None = None,
-    opt_level: int | None = None,
-) -> Any:
-    """Compile a fake-tensor signature with the canonical TVM-FFI stream ABI.
-
-    ``compile_args`` describe the callable's runtime signature and must omit the
-    stream. Tensor arguments should be fake CuTe tensors, never runtime Torch
-    tensors. This helper appends a fake environment stream, enables TVM-FFI with
-    a typed compile option, and gives the outer artifact a stable name.
-
-    Class-based entrypoints should expose ``get_name()``. Free-function
-    entrypoints may instead provide ``name=`` explicitly. ``opt_level`` sets the
-    CuTeDSL optimization level (the compiler default when ``None``); it changes
-    generated code, so callers that need a specific level must pass it.
-    """
-    if name is None:
-        get_name = getattr(entrypoint, "get_name", None)
-        if not callable(get_name):
-            raise TypeError("compile_tvm_ffi() requires entrypoint.get_name() or name=")
-        name = get_name()
-    if not isinstance(name, str) or _VALID_NAME.fullmatch(name) is None:
-        raise ValueError(
-            "CuTeDSL compile names must start with a lowercase letter and contain "
-            f"only lowercase letters, digits, and underscores; got {name!r}"
-        )
-    if any(_contains_torch_tensor(arg) for arg in compile_args):
-        raise TypeError("compile_tvm_ffi() accepts fake CuTe tensors, not runtime Torch tensors")
-
-    from cutlass import cute
-
-    # Requires CuTeDSL >= 4.5.0 for `set_name_prefix` (`_name_prefix=` was removed in 4.6.2).
-    # Class-based entrypoints hold the jit wrapper on their `__call__`.
-    jit_wrapper = entrypoint if hasattr(entrypoint, "set_name_prefix") else entrypoint.__call__
-    jit_wrapper.set_name_prefix(name)
-    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    if opt_level is None:
-        compile_fn = cute.compile[cute.EnableTVMFFI]
-    else:
-        compile_fn = cute.compile[cute.EnableTVMFFI, cute.OptLevel(opt_level)]
-    return compile_fn(
-        entrypoint,
-        *compile_args,
-        stream,
-    )
-
-
 __all__ = [
     "TMA_ALIGNMENT_BYTES",
     "compile_tvm_ffi",
     "get_device_properties",
     "initialized_cuda_device",
+    "make_fake_compact_tensor",
     "make_fake_strided_tensor",
     "normalize_compact_tensor",
     "normalize_tma_rows",

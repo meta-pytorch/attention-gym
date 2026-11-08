@@ -268,7 +268,7 @@ id = "R2"
 title = "compile_tvm_ffi takes opt_level; hosts keep O2"
 kind = "perf"
 ag_subject = "Let compile_tvm_ffi set the CuTeDSL optimization level"
-guarding_tests = ["test/test_cute_cache.py::test_compile_tvm_ffi_adds_fake_stream_and_typed_option"]
+guarding_tests = ["test/warpdrive/test_cache.py::test_compile_tvm_ffi_adds_fake_stream_and_typed_option"]
 upstream_status = "ag-specific"
 
 # --------------------------------------------------------------------------- restyle / infra
@@ -317,7 +317,7 @@ ag_subjects_extra = [
 ]
 guarding_tests = [
   "test/kda/cudnn/test_kda_cudnn_v130.py::test_v130_changing_shapes_reuses_only_static_configuration",
-  "test/test_cute_cache.py::test_runtime_cache_includes_compile_target",
+  "test/warpdrive/test_cache.py::test_runtime_cache_includes_compile_target",
 ]
 gate = "sass (byte-identical per family)"
 upstream_status = "ag-specific"

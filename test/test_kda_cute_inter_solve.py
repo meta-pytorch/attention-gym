@@ -82,7 +82,7 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
         chunk_kda_fwd_inter_solve_cute,
     )
 
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path / "cache"))
     _compile_k3b.cache_clear()
     _compile_k4b.cache_clear()
 

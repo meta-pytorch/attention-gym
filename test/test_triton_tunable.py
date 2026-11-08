@@ -24,7 +24,7 @@ def _snapshot_out(_grid, args):
 
 @pytest.fixture
 def isolated_winners(tmp_path, monkeypatch):
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     monkeypatch.setattr(tune_module, "_WINNERS", {})
     monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})

@@ -1,0 +1,591 @@
+# Examples
+
+[Back to warpdrive](index.md)
+
+Start with GEMM for the basic handoff; use the other examples for the feature you need.
+These are teaching kernels with the input limits below, not drop-in replacements for every
+PyTorch or FA4 feature.
+
+| Learn | Source | Guide |
+|---|---|---|
+| Three roles, two rings, one CTA per tile; `WorkStream(schedule=OneShot())` | [gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py) | [GEMM](#gemm) |
+| Four schedules, double-buffered accumulators, TMA stores, pairs, multicast clusters, `tile_n` | [persistent_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/persistent_gemm.py) | [GEMM](#gemm), [tile boundaries](#tile-boundaries) |
+| Device offsets, stateful `WorkMap`, one descriptor per operand, ragged stores | [grouped_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/grouped_gemm.py) | [Grouped GEMM](#grouped-gemm) |
+| Two softmax instances, correction, slots, fan-out/join, turnstiles, S/P alias, split-P, persistence and pairs | [fa4_fwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_fwd.py) | [Forward](#attention-forward) |
+| Overlapping handles, `Warps` arrivals, TMEM/SMEM aliases, a 2-CTA pair with a DSMEM exchange and relay warp | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
+| Device-built work table: host capacity, device length | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
+| Split-KV items, per-sequence counts, round-robin softmax, named mailboxes, SMEM P | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
+| Whole-model persistent decode: host instruction table, static schedule, cooperative launch, epoch-tagged words between CTAs | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
+| Managed producer, raw `external="consumer"` with overridden count, native wait on a `NamedBarrier.id` | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
+
+Each kernel has a `bench_*.py` script beside it. Run benchmarks under a GPU reservation with
+`--output` to save versions, source hashes and every replay sample; compare only columns of
+one run. Headline numbers below are GB300 measurements from November 2026 (CuTeDSL 4.8.0,
+PyTorch 2.15 nightly cu132, FA4 `00807a02`); rerun them before relying on a difference under 5%.
+
+## GEMM
+
+```python
+import torch
+from attn_gym.warpdrive.examples.gemm import gemm
+
+a = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
+b = torch.randn_like(a)
+d = gemm(a, b)  # A @ B.T
+```
+
+To use a persistent two-CTA kernel:
+
+```python
+from attn_gym.warpdrive import ClusterLaunchControl, CtaPair
+from attn_gym.warpdrive.examples.persistent_gemm import persistent_gemm
+
+d = persistent_gemm(a, b, schedule=ClusterLaunchControl(), cluster=CtaPair())
+```
+
+```text
+load A/B -- ab ring --> MMA -- acc ring --> epilogue writes A @ B.T
+```
+
+Both wrappers require:
+
+- BF16 `a: (M, K)`, `b: (N, K)` on one CUDA device; contiguous and 16-byte aligned.
+- K and N multiples of 8.
+- Optional `out`: BF16 `(M, N)`, same device, contiguous, 16-byte aligned, disjoint from
+  both inputs. Empty outputs return early; K=0 writes zeros.
+
+`PersistentGemm` defaults to two accumulator stages: the next mainloop can use one while
+the epilogue drains the other. All stage choices must fit SMEM and TMEM.
+
+For two pairs sharing A along N, pass `cluster=Cluster(2, 2, pair=True)`; see
+[clusters](clusters.md#larger-clusters). At `tile_n=224`, this matches the cuBLAS 256x224 2x2
+configuration observed for 3000x5000x4096.
+
+**Choosing `tile_n`.** It defaults to 224 for `CtaPair()` and 256 otherwise. The winning width
+is mostly wave quantization: how the tile count divides into resident CTAs (152 CTAs, 76 pairs
+or 36 2x2 clusters on a GB300) and how full the last wave is, against the better per-FLOP
+efficiency of a 256-wide tile at many waves. No width wins everywhere and there is no
+shape-based selector; set `tile_n` for the shapes you run. Two traps: on a 2x2 cluster, 224
+makes a 448-wide cluster tile that gives N=4096 a fifth wave; 128 wins only tiny tile counts.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  .venv/bin/python -m attn_gym.warpdrive.examples.bench_persistent_gemm \
+  --variants mm single pair pair_n256 pair_clc --output agent_space/persistent_gemm.json
+```
+
+Variants are `mm` (`torch.mm`), `single`/`pair` with optional `_late` (`early_release=False`),
+`_clc`/`_atomic` schedules, `_acc1` (`acc_stages=1`) and `_n<tile_n>`. The pair at 224 measured
+72.4 us against `torch.mm`'s 75.2 us at 4096^3; short-K shapes trail `torch.mm` by 10-25%
+from wave quantization and store bandwidth.
+
+### Tile boundaries
+
+Two accumulator buffers let MMA and epilogue overlap. `Umma` publishes asynchronously;
+the epilogue can return TMEM as soon as its final read completes:
+
+```text
+early_release=True:   last tcgen05.ld -> wait::ld -> release TMEM -> SMEM/TMA store
+ early_release=False: last tcgen05.ld -> wait::ld -> SMEM/TMA store -> release TMEM
+```
+
+`early_release=True` is the default. It changes **when TMEM is reusable**, not when the
+output store finishes. It matters where the epilogue is long relative to the mainloop
+(short-K pairs, 0-3%); the second accumulator stage matters more (1-22%, most at
+4096x4096x512 on a pair, where the epilogue is as long as the 8-k-tile mainloop).
+
+Work-ring scope is a tile-boundary cost too: cluster-scope thread arrivals emit a
+`MEMBAR.ALL.GPU` per receiving thread. Work payloads become ready from completed bytes and
+their releases publish nothing, so the layer derives `remote_scope="cta"` for them
+([scheduling](scheduling.md)); avoid forcing cluster scope on a ring whose release publishes
+no data.
+
+## Grouped GEMM
+
+```python
+from attn_gym.warpdrive.examples.grouped_gemm import grouped_gemm
+
+a = torch.randn(4096, 7168, device="cuda", dtype=torch.bfloat16)  # the experts' rows, concatenated
+b = torch.randn(8, 2048, 7168, device="cuda", dtype=torch.bfloat16)  # one (N, K) weight per expert
+offsets = torch.tensor([700, 700, 1500, 2100, 2100, 3000, 4000, 4096], device="cuda", dtype=torch.int32)
+out = grouped_gemm(a, b, offsets)  # out[s_g:e_g] = a[s_g:e_g] @ b[g].T
+```
+
+`offsets` contains **end rows**, not sizes (`torch._grouped_mm` calls it `offs`):
+
+```text
+offsets = [700, 700, 1500, ...]
+group 0: rows [0, 700)      group 1: empty      group 2: rows [700, 1500)
+```
+
+Contract:
+
+- `a: (total_M, K)`, `b: (G, N, K)`, BF16; GEMM's device, contiguity, alignment and
+  K/N-multiple-of-8 limits apply.
+- `offsets: (G,)`, contiguous int32 on the same device; nonnegative, nondecreasing,
+  at most `total_M`, and unchanged during execution. Values are read only on-device.
+- `total_M + (G + 1) * 256` must fit int32. `out` must not overlap `a`, `b` or `offsets`.
+- Empty/arbitrary-size groups are allowed; rows past `offsets[-1]` stay untouched. Invalid
+  offset values are clamped to the previous end and A's end: wrong rows, but in bounds.
+
+One compiled kernel handles dynamic `G`, `total_M`, `N`, `K` and routing. Options are
+`schedule` (default `StaticPersistent()`), `cluster` (`SingleCta()` or `CtaPair()`),
+`max_ctas`, `tile_n`, `ab_stages`, `acc_stages`, `c_stages`, `epi_tile_n` and `roles`.
+
+**How work is found:** the host reserves an upper bound of
+`ceil(total_M / tile_m) + G` m-tiles, since each ragged group adds at most one. `GroupedTiles`
+numbers real tiles back to back, dropping only indices after the last tile. Its
+[decode state](scheduling.md#decode-state) carries the prefix-sum walk between items,
+testing eight groups per round trip instead of restarting. Exact numbering is what lets the
+static schedule tie atomic/CLC without a scheduler warp: a binary search over a padded tile
+space scattered dropped slots through static units' strided sequences and unbalanced them.
+
+**How stores stop at a group boundary:** A/out each use one descriptor plus
+`cute.domain_offset`; B is `(N, K, G)`, with group as a TMA coordinate. The output's ragged
+view has shape `(2^30, N, 2^31 - 1)`: its row mode ends at TMA's clipping boundary, and its
+third coordinate selects the group's end row. A partial group tile is clipped like a tensor edge.
+
+**Choosing a cluster.** Small skewed groups waste rows in 128-row tiles (up to 1.5x the real
+rows at 64-128 groups); a pair's 256-row tiles waste about twice that, so `CtaPair()` pays only
+with few groups and large N.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  .venv/bin/python -m attn_gym.warpdrive.examples.bench_grouped_gemm \
+  --output agent_space/grouped_gemm.json
+```
+
+The bench uses skewed routing with 1/8 of the experts idle and compares `torch._grouped_mm`,
+a `torch.mm` loop, Inductor's Triton template and FlexGEMM's QUACK backend (`--help` lists
+variants). One-CTA static measured 0.83-1.06x `torch._grouped_mm`'s time on its six shapes.
+
+## Attention forward
+
+```python
+from attn_gym.warpdrive.examples.fa4_fwd import fa4_fwd
+
+out, lse = fa4_fwd(q, k, v)
+```
+
+This teaching kernel computes **unmasked attention** using `flash_attn.cute` and `quack`
+helpers. It does not implement the full FA4 API.
+
+| Input/output | Contract |
+|---|---|
+| Q/K/V | BF16 `(batch, seqlen, heads, head_dim)`, contiguous, 16-byte aligned, one CUDA device |
+| Dimensions | Head dimension 64 or 128; matching batch/head counts; K and V shapes match |
+| Sequence lengths | Positive key length divisible by `tile_n` (128 or 64); ragged Q allowed |
+| O / LSE | O has Q's shape; LSE is fp32 `(batch, heads, seqlen_q)`, natural-log units |
+| Not supported | Varlen or GQA |
+
+The tiling needs `2 * (tile_n + head_dim) <= 512` TMEM columns. Wrapper checks are not a
+complete validator of rank, head dimension or device requirements; enforce the full contract
+in another wrapper.
+
+Choose [schedule and mapping](scheduling.md) with `schedule=`/`mapping=` (`Raster` or FA4
+mappings), and [role placement/register budgets](roles.md#choose-placement-in-the-constructor)
+with `roles={...}`. `tile_n=64` halves the K/V tile; `rescale_threshold` controls FA4's
+lazy rescale; head dimension follows the tensors. See [configuration](configuration.md)
+for all knobs and fixed choices.
+
+For short sequences prefer `StaticPersistent()` (FA4's default) over `ClusterLaunchControl()`:
+at 8x16x1024, CLC launches 512 CTAs where static launches 152, and static measured about 2-4%
+faster; on long sequences the two tie.
+
+K/V share channel-bound SMEM. The constructor-only `overlap_o_q=True` also reuses Q's bytes
+for epilogue SMEM; `fa4_fwd` does not expose it. This requires a non-persistent schedule
+(`OneShot()` among built-ins). Persistence would need an epilogue-to-load ordering edge:
+**sharing an address does not create a handoff**.
+
+### Hardware row max on SM103
+
+```python
+from attn_gym.warpdrive import ClusterLaunchControl, CtaPair
+
+out, lse = fa4_fwd(
+    q,
+    k,
+    v,
+    cluster=CtaPair(),
+    schedule=ClusterLaunchControl(),
+    split_p=True,
+    use_ldred_rowmax=True,
+)
+```
+
+`use_ldred_rowmax=True` combines score loading and maximum reduction with `tcgen05.ld.red`:
+
+```text
+128 scores -> four 32-column hardware maxima -> existing software row-max updater
+```
+
+- SM103 only; an SM100 target raises `ValueError`. Default is false, retaining the software path.
+- Rescale threshold, exponentials, BF16 P conversion and row sums are unchanged, including
+  fast-exp2's flush-to-zero rescale behavior.
+- Tests compare O/LSE bitwise: ragged Q, nonuniform scales, repeated launches, persistent
+  wraps, and subnormal rescale amplified by large finite V. SASS and wrapper kernel-name
+  checks verify that the hardware path runs.
+- It cuts instructions, not traffic: SASS replaces 264 `FMNMX` with 10 plus
+  `LDTM.STAT.x32.MAX.F32` (12% fewer warp instructions at 4x16x4096), worth 0.9-2.0%.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 60s \
+  .venv/bin/python -m attn_gym.warpdrive.examples.bench_fa4_fwd \
+  --shape 0 --output agent_space/fa4_fwd.json
+```
+
+Shapes 0-2 are `(batch, heads, length)` `(4,16,4096)`, `(2,16,8192)` and `(8,16,1024)`, head
+dimension 128, non-causal; variants are CLC split-P with software and hardware max, static
+with hardware max, and FA4's default. With hardware max the port is within 0.4% of FA4 on the
+long shapes; static matches FA4 on the short one. `--profile` warms every variant and
+profiles one forward each between CUDA profiler start/stop (`ncu --profile-from-start off`).
+
+## Attention backward
+
+```python
+from attn_gym.warpdrive import CtaPair
+from attn_gym.warpdrive.examples.fa4_bwd import fa4_bwd
+
+dq, dk, dv = fa4_bwd(q, k, v, out, dout, lse, causal=False)  # FA4's 1-CTA kernel
+dq, dk, dv = fa4_bwd(q, k, v, out, dout, lse, causal=False, cluster=CtaPair())  # FA4's default
+```
+
+This ports both head-dimension-128 main kernels of FA4's `flash_bwd_sm100.py`: its 1-CTA
+kernel (`FlashAttentionBackward`, which FA4 selects with `disable_2cta`) and its default
+pipelined 2-CTA kernel (`FlashAttentionBackward2Cta`, `cluster=CtaPair()`).
+
+```text
+FA4 preprocess -> warpdrive main kernel -> FA4 dQ postprocess
+  dPsum = rowsum(dO * O)
+  LSE_log2 = LSE * log2(e)
+  zero fp32 dQ accumulator
+```
+
+Contract:
+
+- BF16 `(batch, seqlen, heads, 128)` inputs, contiguous, 16-byte aligned, one CUDA device;
+  matching batch/head counts, no GQA. Forward LSE: fp32 `(batch, heads, seqlen_q)`.
+- Arbitrary sequence lengths: TMA zero-fills partial loads, keys past `seqlen_k` are masked,
+  and dK/dV stores are clipped. `causal=True` is bottom-right aligned.
+- No varlen, paging, block sparsity, score mods, softcap or deterministic mode.
+
+**1-CTA.** Each `OneShot()` item is a 128-key tile. `Raster()` over `(n_blocks, heads, batch)`
+matches FA4's `SingleTileScheduler` order. Four roles use 14 warps: reduce 0–3, two compute
+warpgroups 4–11 sharing each tile, MMA 12, load 13. Eleven channels (seven with `Warps`
+sides) pipeline five MMAs per tile through overlapping handles, three TMEM aliases and two
+SMEM epilogue overlaps.
+
+**2-CTA.** A pair owns a 256-key item and the leader issues `CtaGroup.TWO` MMAs; a fifth role,
+the relay warp 14, joins them. S^T, dP^T, dV and dK keep their rows in their CTA, so the compute
+warps and epilogue are the 1-CTA code (shared helpers). The other operands split differently
+across the pair: Qt, dOt and Kt are separate TMA loads, and dQ = dS K needs each CTA's dS for
+the other's query rows:
+
+```text
+compute (CTA r): dS^T for its 128 keys x 128 queries
+   own query half  -> own sdS, key block r
+   peer's half     -> sdSx --cp.async.bulk.shared::cluster--> peer's sdS, key block r
+                                     completes on peer's xchg barrier (armed by thread 0)
+relay (CTA r):   wait xchg ----------------------------------------\
+compute (both):  sdS written and S_{t+1} read --------------------- ds full (leader, 18 arrivals)
+                                                                    -> leader issues dQ_t
+```
+
+Thirteen channels (those with an MMA side pair-scoped), one raw barrier, and TMEM S / dV / dP /
+dK with P over S, dS over dP and this CTA's 64 dQ columns over S's tail. Both
+[class docstrings](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) map channels, TMEM and MMA order.
+
+Design points worth reusing:
+
+- **Read the next epoch before owning it.** S_{t+1} needs Q_{t+1} while dK_t still holds Q_t:
+  the port uses `q.peek()` and `preview.view("Q", read=True, by="umma")`, and the next
+  `q.wait()` owns that epoch ([previews](channels.md#previews)). The 2-CTA kernel previews dO
+  the same way.
+- **Defer a commit past the loop's back edge** with `commit(signal=False)` and a raw arrival
+  after S_{t+1}'s load (FA4's "dS_t is published once S_{t+1} is read"); a rotated loop that
+  closes the handle in its own iteration carries P_t in registers and was 1.5-2.4% slower causal.
+- **Arrive once per warp.** `Warps` sides replace per-thread arrivals; the other examples keep
+  `Threads`, where `Warps` measured -0.8% to +2.3%.
+- **Two Q stages are required:** with one, S_{t+1} waits for a load that needs Q_t's release.
+- **Write the peer's dS straight to SMEM** once the ds acquire guards it, and acquire ds only
+  after both dS stages are in TMEM; holding dS in registers or acquiring early cost 1-5%.
+- dQ reduce and dK/dV epilogues order SMEM staging with declared `NamedBarrier`s and
+  `bulk_commit_group`/`bulk_wait_group`, as in the persistent GEMM epilogue.
+- The pair's dS exchange is raw: compute thread 0 arms the peer's `xchg` mbarrier
+  (`mbarrier.arrive.expect_tx` on the peer) and issues `cp.async.bulk.shared::cluster`; the relay
+  waits with a hand-kept phase. The ds channel orders sdS/sdSx and barrier reuse.
+- The alias report marks P~S, dS~dP, dQ~dP and dQ~dS `unverified` (unknown epoch
+  correspondence, not hazards), and every alias in the pair (pairs are not modeled).
+
+### Correctness
+
+dK and dV are bit for bit FA4's results from the same kernel configuration (1-CTA against
+`disable_2cta`, the pair against FA4's default), non-causal and causal, including ragged
+lengths. dQ differs only by the order in which CTAs' TMA reduce-adds land in the fp32
+accumulator (max |diff| up to 9.8e-4 against values of order 1; FA4 is not bitwise
+reproducible there either). All three match an fp32 autograd reference within FA4's own error.
+dK/dV are deterministic across launches; dQ is not, as in FA4.
+
+```bash
+gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=10s 1500s \
+  .venv/bin/python -m attn_gym.warpdrive.examples.bench_fa4_bwd \
+  --output agent_space/bwd.json  # add --causal for the causal rows
+```
+
+The bench graph-replays one whole backward call (preprocess, main kernel, postprocess) per
+variant and times the main kernel with CUPTI. The 2-CTA port measured 1.4-3.1% faster than
+FA4's 2-CTA main kernel on every shape, both modes; the 1-CTA port is within 0.7% of FA4's.
+
+## Single-token decode
+
+```python
+from attn_gym.warpdrive.examples.fa4_decode_swapab import fa4_decode
+
+out, lse = fa4_decode(q, k, v, num_splits=8, seqused_k=lengths, splits_per_seq=counts)
+```
+
+This ports FA4's `flash_fwd_decode_sm100.py`. Swapping the MMA operands puts 128 KV tokens
+along M and one KV head's query heads along N:
+
+```text
+S^T = K Q^T -> softmax -> P^T -> O^T = V^T P^T
+```
+
+| Input | Contract |
+|---|---|
+| Q | BF16, contiguous `(batch, 1, heads, d)` |
+| K / V | BF16, contiguous `(batch, kv_len, kv_heads, d or d_v)` |
+| Heads | Query heads divisible by KV heads, at most 32 per KV head |
+| Dimensions | `d` divisible by K step (default 64); `d_v` divisible by 128. Defaults 128/128; 256 works for either |
+| `seqused_k` | int32 per-sequence lengths; rows past the length must be finite—FA4's bounded V descriptor is not ported |
+| `splits_per_seq` | int32 per-sequence counts, at most `num_splits`; caps splits as FA4's prepare kernel does |
+| Not supported | Paging, varlen Q, masks, score mods |
+
+`decode_partials` returns fp32 O `(splits, batch, 1, heads, d_v)` and LSE
+`(splits, batch, heads, 1)` in FA4's combine layout. Splits past a sequence's count are
+unwritten; kept splits with no KV blocks write O=0, LSE=-inf. `fa4_decode` uses FA4's combine
+kernel and returns BF16 O `(batch, 1, heads, d_v)` and fp32 LSE `(batch, heads, 1)`.
+
+The roles keep FA4's placement: QK and PV MMA warps, K/V-load plus split-LSE warp,
+Q-load/O-store warp, two alternating softmax warpgroups, and correction warpgroup.
+
+- `SplitKV` supplies `(split, kv_head, batch)` items. Per-sequence counts are read after
+  `PdlWait()`; indices past the count are dropped.
+- `Sharing.ROUND_ROBIN` on S, P and row-max/row-sum mailboxes gives softmax[i] blocks
+  i, i+2, … with one warpgroup's counts. **OneShot only:** after an odd block count, another
+  item would start on softmax[1]'s epochs.
+- Thread mailboxes use NamedBarrier-backed channels and a turnstile for the shared row-max
+  exchange. Three one-shot `NamedBarrier` flags finish split statistics; one-shot flags
+  instead of ring channels free named-barrier IDs (12 to 9 of 13 here).
+- P occupies a 4-stage SMEM ring as PV's B operand, with no TMEM alias.
+
+`SwapABDecode` configures `tile_n` (default 256), `tile_k` (64), S/P depths (4/4), head
+dimensions and role registers; wrappers forward these keywords. See
+[configuration](configuration.md) for valid ranges.
+
+Default K/V storage is **split rings**, 7/5 stages for 8-head tiles. `shared_kv=True` selects
+[FA4's shared ring](#shared-kv-ring), with two MMA cursors and two-block K lookahead. Other
+port differences: the first PV overwrites its O slot instead of zero-filling TMEM first;
+empty splits use the normal tail with zero sums.
+
+Tests match FA4 partials and combined outputs bitwise, using FA4's actual split counts and
+the table captured at its combine call.
+
+Tips for short decodes, where setup and tail dominate:
+
+- **Precompute divisors on the host.** `SplitKV.bind()` builds `FastDivmodDivisor` values once,
+  so roles avoid general integer division (-1.6% to -3.3% on small cases).
+- **Order the tail by dependency.** Correction runs the row-sum/1/L stats round trip before
+  waiting for the final O slots.
+
+```bash
+gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
+  .venv/bin/python -m attn_gym.warpdrive.examples.bench_fa4_decode \
+  --output agent_space/decode.json  # add --shared-kv for the shared ring
+```
+
+The bench runs FA4's prepare/decode/combine against the port's decode/combine on seven dense
+and ragged shapes, timing the decode kernel with CUPTI, and asserts bitwise partials. Long
+splits tie FA4; short and ragged ones measured within about 7%. For NCU source attribution add
+`--profile --shapes 0` under
+`CUTE_DSL_LINEINFO=1 ncu --profile-from-start off --cache-control none --import-source yes`,
+filtering kernels to `attn_kernel|warpdrive_fa4_decode`.
+
+### Decode racecheck
+
+compute-sanitizer racecheck reports RAW hazards between correction's lane-0 stores to
+`sRowSums` and `split_stats`'s vectorized read. They are **false positives**: all correction
+threads arrive on the one-shot `sum_done` named barrier after the stores and the load warp
+syncs before reading, which publishes ordinary SMEM writes
+([one-shot done flag](channels.md#one-shot-done-flag)); FA4's own decode reports the same
+handoff. `test/warpdrive/test_warpdrive_decode.py::test_decode_stats_handoff` isolates the
+handoff for a sanitizer run. New access pairs need a fresh audit.
+
+### Shared KV ring
+
+```python
+out, lse = fa4_decode(q, k, v, num_splits, seqused_k=lengths, splits_per_seq=counts, shared_kv=True)
+```
+
+`shared_kv=True` chooses `SharedKVDecode`: one ring of `sum(kv_stages)` stages containing
+**either K or V^T** (their buffers overlap), not two readers joining on every stage.
+
+```text
+one TMA producer -> mixed K / V^T epochs
+                   QK owns K epochs; skips V
+                   PV owns V epochs; skips K
+```
+
+The declaration uses `consumer_sharing=Sharing.EXCLUSIVE` with QK/PV consumer roles.
+FA4's QKIssued/PVIssued `NamedBarrier`s bound cursor skew; follow the
+[rendezvous recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued).
+
+Both MMA warps probe the next stage after releasing, using try tokens; here they help, unlike
+on split rings. The loader probes after each commit within a block's K or V group; its token
+cannot cross those dynamic regions, unlike FA4's loader token.
+
+Why it helps: with split rings, V-stage reuse waits on the previous PV, so the loader stalls
+before the next K; in the shared ring V reuses K stages that QK already released. Split rings
+stay the default because the effect depends on the shape, and "ragged" alone does not predict
+it: shared measured 3.8% faster on 8x65536 ragged (8/1 heads) and 2.7% on 1x32768 (32/1), but
+5.9% slower on 2x131072 ragged and 1.5% slower on 8x32768 dense. Measure with `--shared-kv`.
+
+## Qwen3-0.6B decode megakernel
+
+```python
+from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
+from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+    load_qwen3_weights,
+    make_decode_state,
+)
+
+weights = load_qwen3_weights()  # Qwen/Qwen3-0.6B from the HF hub, or a local checkpoint path
+caches, token, pos = make_decode_state(weights, ctx_len=1024, max_len=1088)  # random prompt
+runner = QwenMegakernel(weights, max_len=1088)  # one compile serves every max_len
+logits = runner(weights, token, pos, *caches)  # decode_step_ref's contract: writes K/V at pos
+```
+
+One persistent launch runs a whole batch-one decode step. The host lowers the step into a
+table of 20.3k instructions and assigns them to CTAs ahead of time:
+
+```text
+for layer in 28 layers:
+    QKV     128 items   32 rows of [Wq; Wk; Wv] x RMSNorm(h)            -> qkv
+    ATTN    8 x 16      kv head x KV split: q/k norm, RoPE, flash decode  -> attention partials
+    OPROJ   32 x 4      32 rows x 512-column slice of Wo (split K)        -> o partials
+    GATEUP  192         16 gate + 16 up rows x RMSNorm(h + o)             -> SiLU(g) * u
+    DOWN    32 x 4      32 rows x 768-column slice of Wd (split K)        -> down partials;
+                        the last split also sums them into the residual
+LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logits
+```
+
+| Input | Contract |
+|---|---|
+| Model | Qwen3-0.6B shapes, bf16 weights, batch 1, one token per launch |
+| Caches | Contiguous bf16 `(28, 8, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
+| GPU | SM100 family; one CTA per SM, cooperative launch |
+| Not supported | Batch > 1, prefill, paging, other model shapes |
+
+- **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
+  assigns rows to CTAs with a row-latency model and `assign_static` lays the table out
+  `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
+  `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
+  resident (the reason for `cooperative=True`) the earliest unfinished row can always run.
+- **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
+  and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
+  prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
+  on CUDA cores; weights and KV carry an L2 evict-first hint.
+- **Dependencies between CTAs** are raw code: every activation is a 64-bit word
+  `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
+  (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL
+  protocol). The last CTA to finish advances the epoch. Split-K partials are summed by their consumers, except
+  down's: its last split (last because its GATEUP rows run in a second wave) fetches the other
+  partials and publishes the finished residual, so QKV and the LM head read one word per
+  element instead of five.
+- **Numerics** follow HF's bf16 rounding boundaries with fp32 accumulation; every per-step
+  intermediate has its own buffer, so a launch has no write-after-read hazards.
+
+**What limits it** is latency between dependent phases, not bandwidth: a step has about 140
+dependent phases, a flag handoff between SMs costs about 0.5 us one way, and fetching
+already-published words costs an L2 round trip (about 0.47 us) plus bytes. Compute almost
+never waits for weights. Optimize the number and length of dependent phases, not cache hints.
+
+`QwenDecodeMegakernel(splits=19)` (passed through `QwenMegakernel(..., splits=19)`) gives one
+attention item per GB300 SM; it is faster from about ctx 6208 and slower below. The split count
+is static, so pick it for the contexts the runner decodes.
+
+Checkpoint tests skip unless Qwen3-0.6B is already in the local HF cache; they never download it
+(`hf download Qwen/Qwen3-0.6B` fetches it):
+
+```bash
+gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 600s \
+  .venv/bin/python -m pytest test/warpdrive/test_warpdrive_qwen_megakernel.py \
+  test/warpdrive/test_warpdrive_qwen_megakernel_ref.py
+gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 2400s \
+  .venv/bin/python -m attn_gym.warpdrive.examples.bench_qwen_megakernel \
+  --output agent_space/qwen_megakernel.json
+```
+
+The bench compares eager and `torch.compile` CUDA graphs and a logical-bytes read roofline at
+ctx 1024/4096/8192 (`--contexts`). At ctx 1024 the megakernel measured 453 us per step
+against 1365 us for `torch.compile` + graph, at 47% of the read roofline.
+
+`QwenMegakernel(..., trace="globaltimer")` compiles the layer's
+[globaltimer ranges](tracing.md#globaltimer): every CTA records its compute and load work items
+(payload: the table row) and the compute role's `trace_region`s, also with the row as payload:
+`poll` (waiting for the row's inputs; it ends when they are ready), `stream` (a GEMV tile's
+weight stages), `attn.blocks` (an attention row's KV blocks) and `reduce.poll` (the last down
+split fetching the other partials). `qwen_megakernel_trace` decodes one launch:
+
+```python
+from attn_gym.warpdrive.examples import qwen_megakernel_trace as mkt
+
+runner = QwenMegakernel(weights, max_len=1088, trace="globaltimer")
+runner(weights, token, pos, *caches)  # compile and warm up
+with mkt.trace_session(runner, trace_path="step.pftrace") as session:
+    runner.launch(*caches)
+mkt.phase_spans(session.ranges, runner.table)  # {"QKV": 1.9, "ATTN": 3.8, ...} us per layer
+mkt.input_waits(session.ranges, runner.table)  # median row start -> inputs ready, us
+```
+
+The trace has one process per SM and one track per role; work items are named after their
+instruction (`QKV`, `load QKV`, ...) with `layer`, `a` and `b` in their args, and an arrow runs
+from each input group's last-finishing producer row to the row waiting for it, across SMs
+(`write_step_trace`). `bench_qwen_megakernel --trace-dir DIR` writes one trace per context and
+reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
+[Tracing](tracing.md#iket)), and `waits=True` adds the layer's wait ranges with either backend.
+Disabled, both emit no instructions.
+
+Pitfalls:
+
+- **Co-residency.** A static schedule over spinning CTAs needs every CTA resident;
+  `launch_args()`'s SM-count cap is only a capacity estimate. Launch with `cooperative=True`
+  (CUDA-graph capture keeps the attribute). When another job shares the GPU, steps can slow
+  down several times or stall; `schedule="atomic"` does not need co-residency.
+- **Materialize tensors before `run_roles`.** Argument tensors materialized lazily inside a
+  role, dicts of tensors in params and Python loops in the kernel prologue fail with "operand
+  does not dominate this use" at an unrelated line. Keep params flat.
+- **SMEM over-subscription fails only at launch** (`cudaErrorInvalidValue`, e.g. `stages=13`);
+  `describe()` cannot report bytes before compiling.
+- **Register budgets don't help a 9-warp CTA.** Three warps share one SM sub-partition, so
+  ptxas caps every thread at 168 registers whatever `RoleConfig` asks for; pushing the compute
+  role past 168 spills in hot loops. Check `cuobjdump --dump-resource-usage` before timing.
+- **Unroll GEMV k-loops fully;** the rolled loop kept a stack frame (about 2.6% per step).
+- A one-entry buffer dict makes `h.data` the bare tensor (use `h.view("W")`), and a rank-1
+  SMEM layout needs a tuple shape (`cute.make_layout((3072,))`).
+- Bit-level helpers (fp32/int32 bitcasts, i64 packing, vector relaxed loads) need private MLIR
+  imports such as `cutlass._mlir_helpers.arith.bitcast`. Each strong load is one L2 request per
+  lane, so use vector loads when polling.
+
+Known layer limits: there is no channel kind between CTAs (the tagged words are raw code),
+`Tma(tx_bytes)` fixes a ring's bytes per stage, and `plan_from_warpdrive` models only the
+CTA-local ring, so it cannot see this kernel's cross-CTA critical path.
+
+## Known limits
+
+Non-bulk `cp.async` producer mechanisms are not supported (`cp.async.bulk` loads can use
+`Tma`; see [TMA checks](tracing.md#tma-checks)). Both decode variants are OneShot-only. The
+alias diagnostic has limited ordering coverage; see [storage](storage.md#read-the-result).
+
+For the normal and quick-fuzz commands, see [Tests](index.md#tests). Long campaigns and
+what the harness covers are in the [fuzz harness guide](https://github.com/meta-pytorch/attention-gym/blob/main/test/warpdrive_fuzz/README.md).
