@@ -59,12 +59,6 @@ def _prune_recurrent_configs(configs, _named_args, V, **_):
 
 
 @triton.jit
-def _fixed_order_sum_over_k(x):
-    """Sum a ``[BK, BV]`` tile over K in an order fixed by ``BK`` alone (``fixed_tree_sum``)."""
-    return fixed_tree_sum(tl.trans(x))
-
-
-@triton.jit
 def _load_key_tile(base, o_k_tile, K: tl.constexpr, BK: tl.constexpr, valid):
     """Load an FP32 key tile, masking padding and invalid tokens."""
     if K == BK:
@@ -219,11 +213,10 @@ def _recurrent_delta_rule_fwd_kernel(
         b_state *= tl.exp2(b_g * LOG2_E)
 
         if BATCH_INVARIANT:
-            # Every launch config uses this one formula, fixed-order sums and no FMA fusion (see
-            # the launch), so a sequence's bits do not depend on the batch shape that picks it.
-            b_delta = (b_v - _fixed_order_sum_over_k(b_k * b_state)) * b_beta
+            # Transpose so fixed_tree_sum reduces K rather than V.
+            b_delta = (b_v - fixed_tree_sum(tl.trans(b_k * b_state))) * b_beta
             b_state += b_k * b_delta[None, :]
-            b_o = _fixed_order_sum_over_k(b_q * b_state)
+            b_o = fixed_tree_sum(tl.trans(b_q * b_state))
         elif PREFETCH:
             # q @ (S + k delta) = q @ S + (q . k) delta lets both reductions read decayed S
             # without waiting for the state update.
@@ -403,8 +396,7 @@ def launch_recurrent_delta_rule_fwd(
         if num_warps == 1:
             launch_options["maxnreg"] = 128
     if batch_invariant:
-        # Whether a multiply fuses into the next add as an FMA follows the thread layout, so it
-        # changes with the launch config. Plain multiplies and adds keep a sequence's bits fixed.
+        # Disable FMA fusion to avoid layout-dependent rounding.
         launch_options["enable_fp_fusion"] = False
     kernel[grid](
         q,

@@ -64,14 +64,12 @@ class RecurrentKernelOptions(TypedDict, total=False):
     """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
 
     batch_invariant: bool
-    """Give a sequence the same output and final-state bits in any batch: alone, among empty
-    slots, or decoded one token per call with an FP32 state pool (a BF16 pool rounds the state
-    between calls). Holds on one GPU model and software stack. Without it, the launch config
-    follows the batch shape and changes the bits, and ``autotune=False`` does not prevent that.
-    The scan uses one formula, sums in a fixed order and turns off FMA fusion, so the config no
-    longer matters. Autotuning and prefetching still run. Costs up to ~20% GPU time on long
-    prefills and ~9% on decode (GB300). The fused decode ops (``recurrent_gdn_decode``,
-    ``recurrent_kda_decode``) do not support it. Defaults to ``False``."""
+    """Keep output and final-state bits identical across batches on the same GPU model and
+    software stack. Defaults to ``False`` for speed; ``autotune=False`` alone is not enough.
+    Token-by-token equivalence requires FP32 state; BF16 state rounds between calls.
+    Autotuning and prefetching remain available. The fused ``recurrent_gdn_decode`` and
+    ``recurrent_kda_decode`` ops do not support this option.
+    See ``docs/determinism.md`` for the full contract and performance costs."""
 
 
 class GateTransform(str, Enum):

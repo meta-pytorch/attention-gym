@@ -519,10 +519,9 @@ correctness checks and debugging. For a given sequence, its output should not de
 A slow eager or recurrent implementation may provide this guarantee. Optimized chunked
 implementations may advertise a weaker numerical contract if the distinction is explicit.
 
-The first public flag is `kernel_options={"batch_invariant": True}` on `recurrent_gdn` and
-`recurrent_kda` (contract and scope in `docs/determinism.md`). Batch invariance should not be
-inferred solely from choosing the recurrent operation: without the flag, its bits follow the batch
-shape.
+For `recurrent_gdn` and `recurrent_kda`, opt in with
+`kernel_options={"batch_invariant": True}`. Without it, output bits can change with batch shape.
+See `docs/determinism.md` for the full contract and limitations.
 
 ## Backend and dependency policy
 
