@@ -89,3 +89,60 @@ or indexer-training loss.
 Selection with NaN/Inf scores is unspecified and may differ across backends.
 
 ::: attn_gym.sparse.indexer.lightning_indexer
+
+## Paged sparse decode
+
+`paged_sparse_decode` is the serving-side counterpart: decode queries attend to indexer-selected
+entries of a paged KV cache plus an optional causal window, in one softmax with an optional
+attention sink. Indices stay **logical** (positions within each request, `-1` padded); the
+kernel translates them through the block table itself, so no expanded token list or physical
+slot list is built per step.
+
+```python
+from attn_gym.sparse import PagedKV, paged_sparse_decode
+
+kv = PagedKV(key_cache, value_cache, block_table)
+# key_cache/value_cache: [num_pages, page_size, kv_heads, head_dim]; block_table: int32
+out = paged_sparse_decode(
+    query,              # [tokens, heads, head_dim]
+    kv,
+    indices,            # int32 [tokens, topk] logical block ids
+    cu_seqlens_q,       # int32 [num_sequences + 1]
+    seqused_k,          # int32 [num_sequences], keys including the current queries
+    max_seqlen_q=1,
+    topk_length=topk_length,  # optional int32 [tokens]: valid prefix of each row
+    index_block_size=4,
+)
+```
+
+Each index selects `index_block_size` consecutive entries. The window holds the last
+`window_size` positions of `window_kv` (a separate cache) or, by default, of `kv` itself. With
+a shared source the window start rounds down to a block boundary and selections inside the
+window are skipped, so each key is attended once and the incomplete block holding the query
+(which an indexer over complete blocks cannot select) is always included.
+
+| Model | Mapping |
+|---|---|
+| Qwen QSA | compressed-block ids, `index_block_size=4`, `window_size=0`, separate K/V, GQA |
+| DeepSeek V3.2 DSA | token ids, `index_block_size=1`, values as `key_cache[..., :512]` |
+| DeepSeek V4 / V4.1 | compressed-entry ids into `kv`, raw cache as `window_kv`, `window_size=128`, `attention_sink` |
+
+### Implementations
+
+- `impl="reference"` builds each row's key set explicitly on CPU or CUDA; it is the
+  correctness oracle and supports every shape.
+- `impl="fused"` (default) runs a Triton split-K kernel and an LSE merge on CUDA, under
+  `torch.compile(fullgraph=True, dynamic=True)` and CUDA graph capture. Batch, sequence count,
+  and split count are runtime values, so changing batches do not recompile. The split count
+  comes from a wave-occupancy model of the GPU's SMs. It needs fp16/bf16 inputs, power-of-two
+  head dims of at least 16, and at most 16K elements of `group x head_dim` per KV head (for
+  example 16 x 256 or 32 x 512). Quantized caches (FP8/FP4 DeepSeek formats) are not supported
+  yet; DeepSeek V3.2's 576-wide latent needs the reference path.
+
+On B200 with Qwen3.8-Flash-Next QSA shapes (24/2 heads per rank at TP1, 6/1 at TP4, head dim
+256, 512 blocks of 4, page 64), the fused kernel matches vLLM's native QSA kernel at batch 1
+and is 5-25% faster from batch 4 to 128 (up to 1.5x with 2048-block budgets), before counting
+the separate index-expansion kernel vLLM runs first. See
+`benchmarks/sparse/paged_sparse_decode_benchmark.py --vllm-root <checkout>`.
+
+::: attn_gym.sparse.paged_decode.paged_sparse_decode
