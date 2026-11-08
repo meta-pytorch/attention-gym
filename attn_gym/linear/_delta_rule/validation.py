@@ -106,6 +106,22 @@ def resolve_backend_options(
     return backend, *splits
 
 
+def resolve_recurrent_kernel_options(
+    kernel_options: Mapping[str, object] | None, *, op_name: str
+) -> bool:
+    """Validate recurrent-scan ``kernel_options``; return ``batch_invariant`` (default False)."""
+    if kernel_options is None:
+        return False
+    unknown = kernel_options.keys() - {"batch_invariant"}
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported {op_name} kernel options: {names}")
+    batch_invariant = kernel_options.get("batch_invariant", False)
+    if not isinstance(batch_invariant, bool):
+        raise TypeError("kernel_options['batch_invariant'] must be a bool")
+    return batch_invariant
+
+
 def resolve_scale(scale: float | None, key_dim: int) -> float:
     """Resolve a query-scale override to a validated float, defaulting to ``1/sqrt(K)``."""
     if scale is None:
@@ -227,6 +243,7 @@ __all__ = [
     "require_inference_only",
     "resolve_backend_options",
     "resolve_decode_out",
+    "resolve_recurrent_kernel_options",
     "resolve_scale",
     "validate_decode_inputs",
     "validate_delta_rule_inputs",

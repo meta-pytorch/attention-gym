@@ -60,6 +60,18 @@ class KernelOptions(SplitOptions, total=False):
     inputs."""
 
 
+class RecurrentKernelOptions(TypedDict, total=False):
+    """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
+
+    batch_invariant: bool
+    """Keep output and final-state bits identical across batches on the same GPU model and
+    software stack. Defaults to ``False`` for speed; ``autotune=False`` alone is not enough.
+    Token-by-token equivalence requires FP32 state; BF16 state rounds between calls.
+    Autotuning and prefetching remain available. The fused ``recurrent_gdn_decode`` and
+    ``recurrent_kda_decode`` ops do not support this option.
+    See ``docs/determinism.md`` for the full contract and performance costs."""
+
+
 class GateTransform(str, Enum):
     """Pointwise transform from a raw gate projection to a natural-log decay.
 
@@ -87,6 +99,7 @@ __all__ = [
     "GateTransform",
     "Impl",
     "KernelOptions",
+    "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
     "resolve_gate_transform",

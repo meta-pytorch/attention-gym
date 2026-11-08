@@ -295,6 +295,7 @@ def test_fused_recurrent_paged_registration(state_dtype: torch.dtype):
             has_initial_state,
             None,
             q.shape[-1] ** -0.5,
+            False,
         ),
     )
 
@@ -313,6 +314,7 @@ def test_fused_recurrent_grouped_heads_registration():
             state,
             None,
             q.shape[-1] ** -0.5,
+            False,
             False,
         ),
     )
@@ -333,6 +335,7 @@ def test_fused_recurrent_registration(output_final_state: bool):
             state,
             None,
             q.shape[-1] ** -0.5,
+            False,
             False,
         ),
     )

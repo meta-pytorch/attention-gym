@@ -7,6 +7,7 @@ import torch
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
+    resolve_recurrent_kernel_options,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
@@ -19,7 +20,7 @@ from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_for
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
 from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
-from attn_gym.linear.types import Impl, resolve_impl
+from attn_gym.linear.types import Impl, RecurrentKernelOptions, resolve_impl
 from attn_gym.linear.types import SplitOptions as KernelOptions
 
 
@@ -209,6 +210,7 @@ def recurrent_gdn(
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: RecurrentKernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent gated delta rule attention for decoding and inference prefill.
 
@@ -241,15 +243,24 @@ def recurrent_gdn(
         has_initial_state: Optional contiguous boolean mask indicating whether each selected slot
             should be loaded. False entries mark freshly assigned slots whose contents are
             garbage: they start from zero and overwrite the slot, even for empty sequences.
-        autotune: Benchmark candidate value-tile sizes for non-paged execution when true; paged
-            execution always uses deterministic heuristics because it mutates the state cache.
+        autotune: Benchmark candidate value-tile sizes for non-paged execution when true. When
+            false, and always for paged execution (which mutates the state cache), a heuristic
+            picks the config, so results are reproducible across processes and autotune cache
+            states. That config still follows the batch shape; see ``kernel_options`` for batch
+            invariance.
         impl: ``"fused"`` uses the inference-only Triton scan; ``"reference"`` uses eager
             PyTorch with autograd support.
+        kernel_options: Fused-scan options, see
+            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``{"batch_invariant": True}``
+            makes a sequence's bits independent of the rest of the batch.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
+    batch_invariant = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_gdn")
+    if selected_impl is Impl.REFERENCE and kernel_options:
+        raise ValueError("kernel_options are not supported with impl='reference'")
     validate_gdn_inputs(
         q,
         k,
@@ -285,6 +296,7 @@ def recurrent_gdn(
             state_indices=state_indices,
             has_initial_state=has_initial_state,
             autotune=autotune,
+            batch_invariant=batch_invariant,
         )
 
     return reference_delta_rule(

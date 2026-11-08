@@ -6,6 +6,8 @@
 
 """Correctness tests for the shared recurrent delta-rule scan."""
 
+import itertools
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,6 +15,7 @@ import torch.nn.functional as F
 pytest.importorskip("triton")
 
 from attn_gym.linear import recurrent_gdn, recurrent_kda
+from attn_gym.linear._delta_rule import recurrent as recurrent_module
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
 from attn_gym.testing.kda import assert_matches_low_precision_reference
 
@@ -58,6 +61,7 @@ def _launch_scalar_gdn(
     *,
     scale: float,
     store_final_state: bool,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch the scalar-gate specialization with public GDN inputs."""
     output, final_state = launch_recurrent_delta_rule_fwd(
@@ -71,10 +75,12 @@ def _launch_scalar_gdn(
         scale=scale,
         gate_kind=GateKind.SCALAR,
         store_final_state=store_final_state,
+        batch_invariant=batch_invariant,
     )
     return output, final_state
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
 @pytest.mark.parametrize(
     "dtype,tokens,use_initial_state,return_final_state,scale,key_dim,value_dim",
     [
@@ -85,7 +91,14 @@ def _launch_scalar_gdn(
     ],
 )
 def test_scalar_gate_matches_recurrent_gdn(
-    dtype, tokens, use_initial_state, return_final_state, scale, key_dim, value_dim
+    dtype,
+    tokens,
+    use_initial_state,
+    return_final_state,
+    scale,
+    key_dim,
+    value_dim,
+    batch_invariant,
 ):
     query, key, value, gate, beta, state = _make_inputs(
         tokens=tokens,
@@ -116,6 +129,7 @@ def test_scalar_gate_matches_recurrent_gdn(
             state,
             scale=kernel_scale,
             store_final_state=return_final_state,
+            batch_invariant=batch_invariant,
         )
 
     assert output.dtype == dtype
@@ -153,8 +167,9 @@ def test_scalar_and_vector_gate_specializations_agree():
     scale = query.shape[-1] ** -0.5
     with torch.no_grad():
         scalar_output, scalar_state = _launch_scalar_gdn(
-            query, key, value, gate, beta, state, scale=scale, store_final_state=True
-        )
+            query, key, value, gate, beta, state, scale=scale, store_final_state=True,
+            batch_invariant=False,
+        )  # fmt: skip
         vector_gate = gate.unsqueeze(-1).expand(*gate.shape, query.shape[-1])
         vector_output, vector_state = launch_recurrent_delta_rule_fwd(
             query,
@@ -167,12 +182,14 @@ def test_scalar_and_vector_gate_specializations_agree():
             scale=scale,
             gate_kind=GateKind.VECTOR,
             store_final_state=True,
+            batch_invariant=False,
         )
 
     torch.testing.assert_close(scalar_output, vector_output, rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(scalar_state, vector_state, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
 @pytest.mark.parametrize("gate_kind", [GateKind.SCALAR, GateKind.VECTOR])
 @pytest.mark.parametrize(
     "batch,tokens,key_dim",
@@ -184,8 +201,9 @@ def test_scalar_and_vector_gate_specializations_agree():
         (5, 1, 256),  # one-token one-warp tile (BV=4)
     ],
 )
-def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim):
-    """Each fixed one-warp tile for K >= 128 matches the eager recurrence."""
+def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim, batch_invariant):
+    """Each fixed one-warp tile for K >= 128 matches the eager recurrence, in both arithmetic
+    modes."""
     torch.manual_seed(0)
     heads, value_dim = 16, 128
     query = F.normalize(torch.randn(batch, tokens, heads, key_dim, device="cuda"), dim=-1)
@@ -208,6 +226,7 @@ def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim)
             scale=scale,
             gate_kind=gate_kind,
             store_final_state=True,
+            batch_invariant=batch_invariant,
         )
         reference = recurrent_kda if gate_kind is GateKind.VECTOR else recurrent_gdn
         expected = reference(
@@ -251,3 +270,107 @@ def test_recurrent_reuses_tuning_across_token_counts(monkeypatch):
     inputs = _make_inputs(tokens=1, dtype=torch.bfloat16, initial_state=False)
     recurrent_gdn(*inputs[:5], autotune=True)
     assert len(tuner.cache) == 2
+
+
+def _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fresh):
+    """Run ``scan`` with ``batch_invariant`` over packed sequences of ``lens`` tokens, reading and
+    writing ``pool[slots]``."""
+    cu_seqlens = torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], device="cuda")
+    output, _ = scan(
+        q, k, v, gate, beta, pool,
+        cu_seqlens=cu_seqlens.to(torch.int32),
+        state_indices=slots,
+        has_initial_state=~fresh,
+        autotune=False,
+        kernel_options={"batch_invariant": True},
+    )  # fmt: skip
+    return output
+
+
+@pytest.mark.parametrize("gate_kind", [GateKind.SCALAR, GateKind.VECTOR])
+def test_batch_invariant_bits_do_not_depend_on_batch_shape(gate_kind):
+    """With ``batch_invariant``, a sequence gets the same output and state bits alone, in a padded
+    batch, and decoded.
+
+    The launcher picks BV, num_warps and PREFETCH from the batch shape. Batch-invariant
+    serving needs the bits to stay fixed anyway: a trainer scores one packed sequence while the
+    server prefills it among empty slots and then decodes it one token per step.
+    """
+    torch.manual_seed(0)
+    tokens, heads, dim, padding = 150, 16, 128, 64
+    scan = recurrent_gdn if gate_kind is GateKind.SCALAR else recurrent_kda
+    q = F.normalize(torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1).bfloat16()
+    v = torch.randn(1, tokens, heads, dim, device="cuda").bfloat16()
+    gate_shape = (1, tokens, heads) if gate_kind is GateKind.SCALAR else (1, tokens, heads, dim)
+    gate = F.logsigmoid(torch.randn(gate_shape, device="cuda"))
+    beta = torch.rand(1, tokens, heads, device="cuda").bfloat16()
+
+    def run(lens, slots):
+        pool = torch.zeros(len(lens) + 1, heads, dim, dim, device="cuda")
+        slots = torch.tensor(slots, dtype=torch.int32, device="cuda")
+        fresh = torch.ones(len(lens), dtype=torch.bool, device="cuda")
+        output = _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fresh)
+        return output, pool[1]
+
+    alone_output, alone_state = run([tokens], [1])
+    padded_output, padded_state = run([tokens] + [0] * padding, [1] + [0] * padding)
+    assert torch.equal(padded_output, alone_output)
+    assert torch.equal(padded_state, alone_state)
+
+    # Decode: each step passes this sequence's next token plus `padding` empty rows.
+    pool = torch.zeros(2, heads, dim, dim, device="cuda")
+    slots = torch.tensor([1] + [0] * padding, dtype=torch.int32, device="cuda")
+    for step in range(tokens):
+        fresh = torch.zeros(padding + 1, dtype=torch.bool, device="cuda")
+        fresh[0] = step == 0
+        token = slice(step, step + 1)
+        output = _batch_invariant_paged_scan(
+            scan, q[:, token], k[:, token], v[:, token], gate[:, token], beta[:, token],
+            [1] + [0] * padding, pool, slots, fresh,
+        )  # fmt: skip
+        assert torch.equal(output, alone_output[:, token]), step
+    assert torch.equal(pool[1], alone_state)
+
+    # Unpaged with autotuning: whichever config the autotuner picks gives the same bits.
+    output, _ = scan(q, k, v, gate, beta, kernel_options={"batch_invariant": True})
+    assert torch.equal(output, alone_output)
+
+
+@pytest.mark.parametrize("gate_kind", [GateKind.SCALAR, GateKind.VECTOR])
+def test_batch_invariant_bits_do_not_depend_on_launch_config(monkeypatch, gate_kind):
+    """With ``batch_invariant``, every (BV, num_warps, PREFETCH) the launcher can pick gives the
+    same output and state bits."""
+    kernel = recurrent_module._recurrent_delta_rule_fwd_kernel
+    forced = {}
+
+    class ForcedConfig:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: kernel[grid](*args, **{**kwargs, **forced})
+
+    monkeypatch.setattr(recurrent_module, "_recurrent_delta_rule_fwd_kernel", ForcedConfig())
+    torch.manual_seed(0)
+    tokens, heads, dim = 64, 4, 128
+    q = F.normalize(torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1).bfloat16()
+    k = F.normalize(torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1).bfloat16()
+    v = torch.randn(1, tokens, heads, dim, device="cuda").bfloat16()
+    gate_shape = (1, tokens, heads) if gate_kind is GateKind.SCALAR else (1, tokens, heads, dim)
+    gate = F.logsigmoid(torch.randn(gate_shape, device="cuda"))
+    beta = torch.rand(1, tokens, heads, device="cuda").bfloat16()
+    scan = recurrent_gdn if gate_kind is GateKind.SCALAR else recurrent_kda
+
+    configs = list(itertools.product((2, 4, 8, 16, 32), (1, 2, 4), (False, True)))
+    results = []
+    for block_v, num_warps, prefetch in configs:
+        forced.update(BV=block_v, num_warps=num_warps, PREFETCH=prefetch)
+        results.append(
+            scan(
+                q, k, v, gate, beta,
+                output_final_state=True,
+                autotune=False,
+                kernel_options={"batch_invariant": True},
+            )
+        )  # fmt: skip
+    for config, (output, state) in zip(configs[1:], results[1:]):
+        assert torch.equal(output, results[0][0]), config
+        assert torch.equal(state, results[0][1]), config

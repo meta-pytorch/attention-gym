@@ -23,6 +23,7 @@ import torch
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
+    resolve_recurrent_kernel_options,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
@@ -36,7 +37,13 @@ from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
-from attn_gym.linear.types import Impl, KernelOptions, ReplayState, resolve_impl
+from attn_gym.linear.types import (
+    Impl,
+    KernelOptions,
+    RecurrentKernelOptions,
+    ReplayState,
+    resolve_impl,
+)
 
 _CHUNK_SIZE = 64
 _DECODE_GATE_TRANSFORMS = {
@@ -373,6 +380,7 @@ def recurrent_kda(
     has_initial_state: torch.Tensor | None = None,
     autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: RecurrentKernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent KDA for decoding and inference prefill.
 
@@ -417,10 +425,15 @@ def recurrent_kda(
             False entries ignore stale contents in the selected slot and start from zero.
         autotune: Benchmark candidate value-tile sizes for non-paged execution
             when true; winners are cached and reused. Paged execution and false
-            use a deterministic sequence-length heuristic.
+            launch a heuristic config, so results are reproducible across processes
+            and autotune cache states. That config still follows the batch shape;
+            see ``kernel_options`` for batch invariance.
         impl: ``"fused"`` uses the inference-only optimized scan; ``"reference"``
             uses differentiable eager PyTorch in FP32, with no automatic
             fallback.
+        kernel_options: Fused-scan options, see
+            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``{"batch_invariant": True}``
+            makes a sequence's bits independent of the rest of the batch.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -431,6 +444,9 @@ def recurrent_kda(
     separate launches, and speculative-decoding rollback is unsupported.
     """
     selected_impl = resolve_impl(impl)
+    batch_invariant = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_kda")
+    if selected_impl is Impl.REFERENCE and kernel_options:
+        raise ValueError("kernel_options are not supported with impl='reference'")
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(
@@ -470,6 +486,7 @@ def recurrent_kda(
             state_indices=state_indices,
             has_initial_state=has_initial_state,
             autotune=autotune,
+            batch_invariant=batch_invariant,
         )
     return reference_delta_rule(
         naive_recurrent_kda,

@@ -36,7 +36,10 @@ optional cuDNN CuTeDSL backend; it accepts the same approximate `split_forward` 
 `split_backward` forgetting-horizon options as cuDNN KDA (see
 [Kimi Delta Attention](#kimi-delta-attention)), with the same no-state restriction. They help only
 when few sequences leave the GPU idle and every head forgets quickly; heads that never forget stay
-uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan.
+uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan. Pass
+`kernel_options={"batch_invariant": True}` to `recurrent_gdn` or `recurrent_kda` to make a
+sequence's bits independent of the rest of the batch
+(see [Determinism](determinism.md#kda-determinism)).
 
 ```python
 from attn_gym.linear import chunk_gdn

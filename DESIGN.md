@@ -519,11 +519,9 @@ correctness checks and debugging. For a given sequence, its output should not de
 A slow eager or recurrent implementation may provide this guarantee. Optimized chunked
 implementations may advertise a weaker numerical contract if the distinction is explicit.
 
-The exact first contract remains open: bitwise equality versus tolerance-based equality, whether it
-covers gradients and final recurrent state, and which dtypes and hardware are guaranteed. We should
-settle those details using the first operation rather than prematurely adding a public
-`batch_invariant` flag. Batch invariance should not be inferred solely from choosing the recurrent
-operation.
+For `recurrent_gdn` and `recurrent_kda`, opt in with
+`kernel_options={"batch_invariant": True}`. Without it, output bits can change with batch shape.
+See `docs/determinism.md` for the full contract and limitations.
 
 ## Backend and dependency policy
 
