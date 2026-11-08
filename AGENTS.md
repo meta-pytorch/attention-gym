@@ -125,6 +125,20 @@ Imports are found statically, so keep the code a kernel traces reachable by impo
   passed as a compile argument is keyed by its module and name only, so if its module is not
   imported by the compile module, list that module in `extra_sources`.
 - Do not add `extra_sources` for modules the compile module already imports; they are hashed.
+- An argument object can name its own key with `__cute_cache_key__()` (classes passed as values
+  key by module and name instead). To key a class defined outside the compile module's imports,
+  include `module_source_digest(cls.__module__)` in that hook rather than listing the module in
+  `extra_sources`; warpdrive kernels do this.
+- Host-only code that tracing never runs (report renderers, trace decoders) stays out of the key
+  when imported at call time by relative name, `importlib.import_module(".mod", __package__)`:
+  the scan does not follow relative string names. Never import code that tracing runs this way.
+
+A kernel loaded from disk was never traced. An argument that defines `__cute_trace_record__()`
+(a picklable record of what tracing left on it) and `__cute_restore_trace__(record)` gets the
+record of its build back on every memory or disk hit (`by_static_key` hits excepted); the
+record is pickled beside the object file as `<key>.trace`. `jit_cache(uncached=predicate)`
+compiles the calls the predicate selects without either cache, for when the trace itself is
+the point (warpdrive's `trace_protocol`).
 
 When testing specialization reuse, assert on `compile_fn.cache_info()` (distinct keys in
 `currsize`, launches in `hits + misses`) instead of disabling the disk cache with

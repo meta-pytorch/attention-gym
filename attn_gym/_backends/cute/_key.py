@@ -46,6 +46,10 @@ def _imported_names(source: Path, package: str) -> Iterator[str]:
     ``TYPE_CHECKING`` ones included) and string literals shaped like module names, which covers
     ``importlib.import_module("pkg.module")``. ``from pkg import name`` yields ``pkg``, where
     ``name`` may be defined, and ``pkg.name``, in case it is a submodule.
+
+    Relative names in strings (``importlib.import_module(".mod", __package__)``) are not
+    followed: that is how host-only code that tracing never runs stays out of the key (see
+    "Adding CuTeDSL Kernels" in AGENTS.md).
     """
     for node in ast.walk(ast.parse(source.read_bytes(), filename=str(source))):
         match node:
@@ -98,6 +102,35 @@ def module_closure(source: Path) -> tuple[Path, ...]:
     return tuple(sorted(seen))
 
 
+def _hash_module_closure(hasher: Any, module_name: str) -> bool:
+    """Hash an imported module's ``module_closure``; False when it has no Python source."""
+    module_file = getattr(sys.modules.get(module_name), "__file__", None)
+    if module_file is None or not module_file.endswith(".py"):
+        return False
+    for path in module_closure(Path(module_file)):
+        # Package labels are package-relative so checkouts and installs share entries; only
+        # the caller itself can live outside the package.
+        if path.is_relative_to(_PACKAGE_ROOT):
+            _hash_file(hasher, path.relative_to(_PACKAGE_ROOT).as_posix(), path)
+        else:
+            _hash_file(hasher, module_name, path)
+    return True
+
+
+@functools.cache
+def module_source_digest(module_name: str) -> str | None:
+    """Hash the source of an imported module and its ``module_closure``, or return None for a
+    module without Python source (builtins, extensions).
+
+    A class passed as a compile argument is keyed by its module and name only. Its
+    ``__cute_cache_key__`` can include this digest so that editing a class defined outside the
+    compile function's imports (a test's kernel subclass, say) changes the key, where
+    ``extra_sources`` would have to name that module in advance.
+    """
+    hasher = hashlib.sha256()
+    return hasher.hexdigest() if _hash_module_closure(hasher, module_name) else None
+
+
 @functools.cache
 def source_fingerprint(
     fn: Callable[..., Any],
@@ -121,15 +154,7 @@ def source_fingerprint(
     )
     hasher.update(pickle.dumps(stamps, protocol=pickle.HIGHEST_PROTOCOL))
 
-    module_file = getattr(sys.modules.get(fn.__module__), "__file__", None)
-    if module_file is not None and module_file.endswith(".py"):
-        for path in module_closure(Path(module_file)):
-            # Package labels are package-relative so checkouts and installs share entries; only
-            # the caller itself can live outside the package.
-            if path.is_relative_to(_PACKAGE_ROOT):
-                _hash_file(hasher, path.relative_to(_PACKAGE_ROOT).as_posix(), path)
-            else:
-                _hash_file(hasher, fn.__module__, path)
+    _hash_module_closure(hasher, fn.__module__)
 
     for extra_source in extra_sources:
         path = Path(extra_source).expanduser().resolve()
@@ -252,7 +277,8 @@ def _pickle_sort_key(item: Any) -> bytes:
 
 
 def _canonicalize(item: Any) -> Any:
-    custom_key = getattr(item, "__attention_gym_cache_key__", None)
+    # A class passed as a value keys by name below, even if its instances define the hook.
+    custom_key = None if isinstance(item, type) else getattr(item, "__cute_cache_key__", None)
     if custom_key is not None:
         value = custom_key() if callable(custom_key) else custom_key
         return (
@@ -304,9 +330,16 @@ def _canonicalize(item: Any) -> Any:
     except (pickle.PickleError, TypeError) as error:
         raise TypeError(
             f"CuTeDSL cache argument of type {type(item).__qualname__} has no stable key; "
-            "pass static pickleable values or define __attention_gym_cache_key__"
+            "pass static pickleable values or define __cute_cache_key__"
         ) from error
     return item
+
+
+def canonical_key(item: Any) -> Any:
+    """Return the content-addressed, picklable encoding the cache keys ``item`` by. Freezing
+    it early (warpdrive freezes a kernel's constructor call) keeps later in-place changes to
+    ``item`` out of the key."""
+    return _canonicalize(item)
 
 
 def make_runtime_key(

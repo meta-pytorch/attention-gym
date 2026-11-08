@@ -163,6 +163,25 @@ def make_fake_strided_tensor(
     )
 
 
+def make_fake_compact_tensor(
+    dtype: Any,
+    shape: tuple[Any, ...],
+    stride_order: tuple[int, ...] | None = None,
+    assumed_align: int = 16,
+) -> Any:
+    """Create a fake compact tensor for a TVM-FFI compile signature.
+
+    ``stride_order`` defaults to row-major (the last mode is contiguous).
+    """
+    from cutlass import cute
+
+    if stride_order is None:
+        stride_order = tuple(reversed(range(len(shape))))
+    return cute.runtime.make_fake_compact_tensor(
+        dtype, shape, stride_order=stride_order, assumed_align=assumed_align
+    )
+
+
 def validate_tma_tensor(
     name: str, tensor: torch.Tensor, *, alignment: int = TMA_ALIGNMENT_BYTES
 ) -> None:
@@ -282,6 +301,7 @@ __all__ = [
     "compile_tvm_ffi",
     "get_device_properties",
     "initialized_cuda_device",
+    "make_fake_compact_tensor",
     "make_fake_strided_tensor",
     "normalize_compact_tensor",
     "normalize_tma_rows",

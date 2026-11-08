@@ -3,7 +3,10 @@
 ``jit_cache`` decorates a module-level function that calls ``cute.compile``.
 Its static arguments and ``CompileTarget`` determine the cache key. Cold
 entries are compiled under a per-key process lock and atomically exported;
-warm entries are loaded from the shared object file.
+warm entries are loaded from the shared object file. Arguments that define
+``__cute_trace_record__`` and ``__cute_restore_trace__`` get the host-side
+results of the trace that built the kernel back on every cached call; the
+record is pickled beside the object file, which is loaded as trusted code anyway.
 
 ``ATTN_GYM_CUTE_CACHE_DIR`` is the only Attention Gym environment override.
 Other behavior is expressed through ``jit_cache`` and tuning options. The
@@ -26,15 +29,17 @@ import time
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ParamSpec, TypeVar
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 import torch
-from typing_extensions import Self
 
 from ._key import make_key as _make_key
 from ._key import make_runtime_key as _make_runtime_key
 from ._key import source_fingerprint as _source_fingerprint
 from .target import CompileTarget, get_compile_target
+
+if TYPE_CHECKING:
+    from typing_extensions import Self
 
 try:
     import fcntl
@@ -71,6 +76,10 @@ class _CacheEntry:
     key: str
     object_path: Path
     lock_path: Path
+
+    @property
+    def trace_path(self) -> Path:
+        return self.object_path.with_suffix(".trace")
 
 
 class CacheLockError(RuntimeError):
@@ -190,6 +199,63 @@ def _load_compiled(path: Path) -> Any:
     return module[EXPORT_FUNCTION_NAME]
 
 
+def _trace_holders(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[Any]:
+    """Arguments that keep trace-time results, positional first, then keywords by name. A class
+    passed as a value is not one, even if its instances are (its hooks are unbound)."""
+    values = (*args, *(kwargs[name] for name in sorted(kwargs)))
+    return [
+        value
+        for value in values
+        if not isinstance(value, type) and callable(getattr(value, "__cute_trace_record__", None))
+    ]
+
+
+def _trace_records(holders: list[Any]) -> tuple[Any, ...] | None:
+    """Capture what tracing left on ``holders``; None when no argument keeps any."""
+    return tuple(holder.__cute_trace_record__() for holder in holders) if holders else None
+
+
+def _restore_traces(holders: list[Any], records: tuple[Any, ...] | None) -> None:
+    """Give a cached call's arguments the results of the trace that built the kernel."""
+    for holder, record in zip(holders, records or ()):
+        holder.__cute_restore_trace__(record)
+
+
+def _publish_records(records: tuple[Any, ...], destination: Path) -> None:
+    """Atomically publish the trace records of an entry (before its object file)."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.stem}.", suffix=".tmp.trace", dir=destination.parent
+    )
+    try:
+        with os.fdopen(fd, "wb") as artifact:
+            pickle.dump(records, artifact, protocol=pickle.HIGHEST_PROTOCOL)
+            artifact.flush()
+            os.fsync(artifact.fileno())
+        os.replace(temporary_name, destination)
+    finally:
+        Path(temporary_name).unlink(missing_ok=True)
+
+
+def _load_records(path: Path) -> tuple[Any, ...] | None:
+    """Load an entry's trace records; None (recompile) for a missing, truncated, or stale
+    record, such as one naming a class that has moved."""
+    try:
+        records = pickle.loads(path.read_bytes())
+    except (
+        OSError,
+        EOFError,
+        ImportError,
+        AttributeError,
+        IndexError,
+        TypeError,
+        ValueError,
+        pickle.UnpicklingError,
+    ):
+        return None
+    return records if isinstance(records, tuple) else None
+
+
 def _publish_compiled(compiled: Any, destination: Path) -> None:
     """Export a compiled callable and atomically publish its object file."""
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -261,6 +327,7 @@ def jit_cache(
     lock_timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     extra_sources: Iterable[str | os.PathLike[str]] = (),
     cache_key: Callable[P, Hashable] | None = None,
+    uncached: Callable[P, bool] | None = None,
 ) -> Callable[P, T]:
     """Cache a ``cute.compile`` function in memory and optionally on disk.
 
@@ -272,7 +339,13 @@ def jit_cache(
     invalidated by edits to the function's module and every ``attn_gym`` module it
     transitively imports (``_key.module_closure``), not by unrelated modules.
     ``extra_sources`` adds inputs that import analysis cannot see, such as files
-    read at trace time or code outside ``attn_gym``.
+    read at trace time or code outside ``attn_gym``. An argument with
+    ``__cute_trace_record__()`` (a picklable record of what tracing left on it)
+    and ``__cute_restore_trace__(record)`` has the record of the build restored
+    on every call served from memory or disk. Calls for which
+    ``uncached`` returns true compile without reading or filling either cache and
+    count as misses: use it when the caller needs the compile's trace-time side
+    effects, such as a recorded protocol trace.
     """
     if fn is None:
         return functools.partial(
@@ -281,12 +354,14 @@ def jit_cache(
             lock_timeout=lock_timeout,
             extra_sources=extra_sources,
             cache_key=cache_key,
+            uncached=uncached,
         )
     if lock_timeout <= 0:
         raise ValueError(f"lock_timeout must be positive, got {lock_timeout}")
     source_paths = tuple(os.fspath(Path(path).expanduser().resolve()) for path in extra_sources)
-    memory_cache: dict[str, T] = {}
-    runtime_cache: dict[Any, T] = {}
+    # Values are (compiled, trace records of the build, or None).
+    memory_cache: dict[str, tuple[T, Any]] = {}
+    runtime_cache: dict[Any, tuple[T, Any]] = {}
     static_cache: dict[Any, T] = {}
     key_locks: dict[str, threading.Lock] = {}
     state_lock = threading.RLock()
@@ -310,20 +385,29 @@ def jit_cache(
 
     def remember(
         key: str,
-        compiled: T,
+        built: tuple[T, Any],
         *,
         runtime_key: Any,
         hit: bool,
+        holders: list[Any],
     ) -> T:
         nonlocal hits, misses
         with state_lock:
-            memory_cache[key] = compiled
-            runtime_cache[runtime_key] = compiled
+            memory_cache[key] = built
+            runtime_cache[runtime_key] = built
             if hit:
                 hits += 1
             else:
                 misses += 1
-        return compiled
+        if hit:
+            _restore_traces(holders, built[1])
+        return built[0]
+
+    def compile_traced(
+        args: tuple[Any, ...], kwargs: dict[str, Any], holders: list[Any]
+    ) -> tuple[T, Any]:
+        compiled = _compile(fn, args, kwargs)
+        return compiled, _trace_records(holders)
 
     def compile_and_publish(
         entry: _CacheEntry,
@@ -331,10 +415,12 @@ def jit_cache(
         kwargs: dict[str, Any],
         *,
         strict: bool,
-    ) -> T:
-        compiled = _compile(fn, args, kwargs)
+    ) -> tuple[T, Any]:
+        built = compile_traced(args, kwargs, _trace_holders(args, kwargs))
         try:
-            _publish_compiled(compiled, entry.object_path)
+            if built[1] is not None:
+                _publish_records(built[1], entry.trace_path)
+            _publish_compiled(built[0], entry.object_path)
         except Exception:
             if strict:
                 raise
@@ -343,13 +429,21 @@ def jit_cache(
                 entry.object_path,
                 exc_info=True,
             )
-        return compiled
+        return built
 
-    def load_from_disk(entry: _CacheEntry) -> T | None:
+    def entry_complete(entry: _CacheEntry, holders: list[Any]) -> bool:
         if not _artifact_exists(entry.object_path):
+            return False
+        return not holders or _artifact_exists(entry.trace_path)
+
+    def load_from_disk(entry: _CacheEntry, holders: list[Any]) -> tuple[T, Any] | None:
+        if not entry_complete(entry, holders):
+            return None
+        records = _load_records(entry.trace_path) if holders else None
+        if holders and (records is None or len(records) != len(holders)):
             return None
         try:
-            return _load_compiled(entry.object_path)
+            return _load_compiled(entry.object_path), records
         except (AttributeError, KeyError, OSError, RuntimeError, ValueError):
             return None
 
@@ -370,8 +464,13 @@ def jit_cache(
 
     @functools.wraps(fn)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> T:
-        nonlocal hits
+        nonlocal hits, misses
         reset_after_fork()
+        if uncached is not None and uncached(*args, **kwargs):
+            compiled = _compile(fn, args, kwargs)
+            with state_lock:
+                misses += 1
+            return compiled
         target = get_compile_target()
         key_args, key_kwargs = key_arguments(args, kwargs)
         runtime_key = _fast_key((key_args, tuple(key_kwargs.items())))
@@ -379,70 +478,57 @@ def jit_cache(
             runtime_key = _make_runtime_key(key_args, key_kwargs, target)
         else:
             runtime_key = (_target_key(target), runtime_key)
+        holders = _trace_holders(args, kwargs)
         with state_lock:
-            if runtime_key in runtime_cache:
+            built = runtime_cache.get(runtime_key)
+            if built is not None:
                 hits += 1
-                return runtime_cache[runtime_key]
+        if built is not None:
+            _restore_traces(holders, built[1])
+            return built[0]
 
         entry = _cache_entry(fn, key_args, key_kwargs, source_paths, target)
+        cached = {"runtime_key": runtime_key, "holders": holders}
         with state_lock:
             if entry.key in memory_cache:
-                return remember(
-                    entry.key,
-                    memory_cache[entry.key],
-                    runtime_key=runtime_key,
-                    hit=True,
-                )
+                return remember(entry.key, memory_cache[entry.key], hit=True, **cached)
             key_lock = key_locks.setdefault(entry.key, threading.Lock())
 
         with key_lock:
             reset_after_fork()
             with state_lock:
                 if entry.key in memory_cache:
-                    return remember(
-                        entry.key,
-                        memory_cache[entry.key],
-                        runtime_key=runtime_key,
-                        hit=True,
-                    )
+                    return remember(entry.key, memory_cache[entry.key], hit=True, **cached)
 
             if not disk_cache_enabled():
-                return remember(
-                    entry.key,
-                    _compile(fn, args, kwargs),
-                    runtime_key=runtime_key,
-                    hit=False,
-                )
+                built = compile_traced(args, kwargs, holders)
+                return remember(entry.key, built, hit=False, **cached)
 
-            compiled = load_from_disk(entry)
-            if compiled is not None:
-                return remember(entry.key, compiled, runtime_key=runtime_key, hit=True)
+            built = load_from_disk(entry, holders)
+            if built is not None:
+                return remember(entry.key, built, hit=True, **cached)
 
             try:
                 with _FileLock(entry.lock_path, lock_timeout):
-                    compiled = load_from_disk(entry)
-                    if compiled is not None:
-                        return remember(entry.key, compiled, runtime_key=runtime_key, hit=True)
+                    built = load_from_disk(entry, holders)
+                    if built is not None:
+                        return remember(entry.key, built, hit=True, **cached)
                     if entry.object_path.exists():
                         logger.warning(
                             "Replacing corrupt CuTeDSL cache artifact %s",
                             entry.object_path,
                         )
                         entry.object_path.unlink(missing_ok=True)
-                    compiled = compile_and_publish(entry, args, kwargs, strict=False)
-                    return remember(entry.key, compiled, runtime_key=runtime_key, hit=False)
+                    built = compile_and_publish(entry, args, kwargs, strict=False)
+                    return remember(entry.key, built, hit=False, **cached)
             except CacheLockError:
                 logger.warning(
                     "CuTeDSL cache lock unavailable for key %s; compiling without disk cache",
                     entry.key,
                     exc_info=True,
                 )
-                return remember(
-                    entry.key,
-                    _compile(fn, args, kwargs),
-                    runtime_key=runtime_key,
-                    hit=False,
-                )
+                built = compile_traced(args, kwargs, holders)
+                return remember(entry.key, built, hit=False, **cached)
 
     def by_static_key(static_key: Hashable, compile_call: Callable[[], T]) -> T:
         """Return the launch cached under a caller-computed ``static_key``.
@@ -450,7 +536,8 @@ def jit_cache(
         ``compile_call`` must call this function and is invoked only on a miss, so a warm launch
         skips building and hashing the full argument key. The caller guarantees that
         ``static_key`` determines ``compile_call``'s arguments completely; the compile target is
-        added here. A hit counts in ``cache_info`` like any other hit.
+        added here. A hit counts in ``cache_info`` like any other hit, but restores no trace
+        records: use it where the arguments that were compiled are the ones reused.
         """
         nonlocal hits
         reset_after_fork()
@@ -485,19 +572,21 @@ def jit_cache(
             raise RuntimeError("parallel CuTeDSL precompilation requires the disk cache")
         key_args, key_kwargs = key_arguments(args, kwargs)
         entry = _cache_entry(fn, key_args, key_kwargs, source_paths, get_compile_target())
-        if _artifact_exists(entry.object_path):
+        holders = _trace_holders(args, kwargs)
+        if entry_complete(entry, holders):
             return
         with _FileLock(entry.lock_path, lock_timeout):
-            if _artifact_exists(entry.object_path):
+            if entry_complete(entry, holders):
                 return
             entry.object_path.unlink(missing_ok=True)
             compile_and_publish(entry, args, kwargs, strict=True)
 
     def is_cached(*args: P.args, **kwargs: P.kwargs) -> bool:
-        """Return whether a nonempty disk artifact exists for this invocation."""
+        """Return whether a nonempty disk artifact (and its trace records, when an argument
+        keeps them) exists for this invocation."""
         key_args, key_kwargs = key_arguments(args, kwargs)
         entry = _cache_entry(fn, key_args, key_kwargs, source_paths, get_compile_target())
-        return _artifact_exists(entry.object_path)
+        return entry_complete(entry, _trace_holders(args, kwargs))
 
     def prepare_cache() -> None:
         """Warm source fingerprinting before compiler workers are forked."""

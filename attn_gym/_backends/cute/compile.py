@@ -139,7 +139,8 @@ def precompile_many(
             encoding="utf-8",
         )
         # This trusted, one-shot payload is created and consumed inside the
-        # private TemporaryDirectory; persistent cache entries are never pickled.
+        # private TemporaryDirectory. Persistent entries pickle only the trace
+        # records the cache wrote beside an object file it loads as code.
         calls_path.write_bytes(pickle.dumps(pending_calls, protocol=pickle.HIGHEST_PROTOCOL))
         try:
             completed = subprocess.run(

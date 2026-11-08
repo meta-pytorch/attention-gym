@@ -26,7 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 linear = [
-    "nvidia-cutlass-dsl[cu13]>=4.6.0; sys_platform == 'linux'",
+    # 4.6.0/4.6.1 hang on a bulk copy issued in elect_one() (see _backends/cute/compat.py).
+    "nvidia-cutlass-dsl[cu13]>=4.6.2; sys_platform == 'linux'",
     "apache-tvm-ffi>=0.1.11",
     "packaging",
 ]

@@ -890,6 +890,97 @@ def test_explicit_cache_key_must_be_hashable():
         compile_kernel("value")
 
 
+def test_uncached_calls_bypass_both_caches(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache(uncached=lambda key: key.startswith("trace"))
+    def compile_kernel(key: str) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        return FakeCompiled(key)
+
+    assert compile_kernel("trace")() == "trace"
+    assert compile_kernel("trace")() == "trace"
+    assert compile_kernel("plain")() == "plain"
+    assert compile_kernel("plain")() == "plain"
+    assert compile_count == 3
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=3, currsize=1)
+    assert len(list(isolated_cache.rglob("*.o"))) == 1
+
+
+class TracedConfig:
+    """A compile argument that keeps what its trace found, like a warpdrive kernel."""
+
+    def __init__(self, variant: str):
+        self.variant = variant
+        self.found = None
+
+    def __cute_cache_key__(self) -> str:
+        return self.variant
+
+    def __cute_trace_record__(self) -> str:
+        return self.found
+
+    def __cute_restore_trace__(self, record: str) -> None:
+        self.found = record
+
+
+def test_a_class_argument_keys_by_name_even_with_an_instance_hook():
+    target = cute_target.CompileTarget("test")
+
+    def compile_kernel(kind):
+        return kind
+
+    first = cute_cache._make_key(compile_kernel, (TracedConfig,), {}, target)
+    assert first == cute_cache._make_key(compile_kernel, (TracedConfig,), {}, target)
+    assert first != cute_cache._make_key(compile_kernel, (CompileConfig,), {}, target)
+
+
+def test_a_class_argument_keeps_no_trace_record(isolated_cache):
+    """A class whose instances keep trace records is a plain value: cold, memory and disk calls
+    neither record nor restore through its unbound hooks."""
+
+    @cute_cache.jit_cache
+    def compile_kernel(kind: type) -> FakeCompiled:
+        return FakeCompiled(kind.__name__)
+
+    assert compile_kernel(TracedConfig)() == "TracedConfig"
+    assert compile_kernel(TracedConfig)() == "TracedConfig"
+    compile_kernel.cache_clear()  # also resets the counts
+    assert compile_kernel(TracedConfig)() == "TracedConfig"  # from disk
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=0, currsize=1)
+
+
+def test_cached_calls_restore_the_trace_record(isolated_cache):
+    compile_count = 0
+
+    @cute_cache.jit_cache
+    def compile_kernel(config: TracedConfig) -> FakeCompiled:
+        nonlocal compile_count
+        compile_count += 1
+        config.found = f"traced {config.variant}"
+        return FakeCompiled(config.variant)
+
+    first = TracedConfig("a")
+    assert compile_kernel(first)() == "a" and first.found == "traced a"
+    again = TracedConfig("a")  # memory hit, another instance
+    assert compile_kernel(again)() == "a" and again.found == "traced a"
+    compile_kernel.cache_clear()
+    warm = TracedConfig("a")  # disk hit
+    assert compile_kernel(warm)() == "a" and warm.found == "traced a"
+    assert compile_count == 1
+    assert compile_kernel.cache_info() == cute_cache.CacheInfo(hits=1, misses=0, currsize=1)
+
+    next(isolated_cache.rglob("*.trace")).write_bytes(b"truncated")
+    compile_kernel.cache_clear()
+    rebuilt = TracedConfig("a")
+    assert compile_kernel(rebuilt)() == "a" and rebuilt.found == "traced a"
+    assert compile_count == 2  # an unreadable record recompiles and republishes it
+    assert compile_kernel.is_cached(TracedConfig("a"))
+    next(isolated_cache.rglob("*.trace")).unlink()
+    assert not compile_kernel.is_cached(TracedConfig("a"))
+
+
 def test_runtime_cache_includes_compile_target(isolated_cache, monkeypatch):
     compile_count = 0
     target = cute_target.CompileTarget("first")
@@ -1373,7 +1464,7 @@ def test_winner_key_tracks_candidates_and_namespace():
     assert tune_module._winner_key(Kernel, [1, 2], (64,), ()) != base
 
 
-# A synthetic package: ``pkg.entry.compile_kernel`` reaches every module except the two excluded
+# A synthetic package: ``pkg.entry.compile_kernel`` reaches every module except the three excluded
 # below, through each import form the source key must follow.
 SYNTHETIC_PACKAGE = {
     "__init__.py": "",
@@ -1393,6 +1484,12 @@ from attn_gym._backends.cute.cache import jit_cache
 @jit_cache
 def compile_kernel():
     from pkg import local
+
+
+def report():
+    import importlib
+
+    return importlib.import_module(".hostonly", __package__)
 """,
     "absolute.py": "from pkg import cycle\n",
     "cycle.py": "from pkg import absolute\n",
@@ -1423,6 +1520,8 @@ def __getattr__(name):
     "lazy_target.py": "thing = 1\n",
     # Excluded: nothing imports it.
     "unrelated.py": "VALUE = 1\n",
+    # Excluded: imported by relative name at call time, the opt-out for host-only code.
+    "hostonly.py": "VALUE = 1\n",
 }
 
 
@@ -1452,7 +1551,7 @@ def test_cache_namespace_changes_only_with_imported_sources(synthetic_package, m
     cute_key.source_fingerprint.cache_clear()
 
     changed = compile_kernel.cache_namespace() != baseline
-    assert changed == (module not in {"sub/__init__.py", "unrelated.py"})
+    assert changed == (module not in {"sub/__init__.py", "unrelated.py", "hostonly.py"})
 
 
 def test_callers_outside_the_package_key_on_their_package_imports(
@@ -1480,6 +1579,23 @@ def test_callers_outside_the_package_key_on_their_package_imports(
     assert namespace_after_editing(synthetic_package / "unrelated.py") == baseline
     assert namespace_after_editing(synthetic_package / "relative.py") != baseline
     assert namespace_after_editing(caller) != baseline
+
+
+def test_module_source_digest_follows_the_module_closure(synthetic_package):
+    """A class's module digest changes with the modules it imports, as a namespace does."""
+    importlib.import_module("pkg.entry")
+    cute_key.module_source_digest.cache_clear()
+    baseline = cute_key.module_source_digest("pkg.entry")
+    assert cute_key.module_source_digest("builtins") is None
+
+    def digest_after_editing(module: str) -> str:
+        with (synthetic_package / module).open("a") as source:
+            source.write("EDITED = 1\n")
+        cute_key.module_source_digest.cache_clear()
+        return cute_key.module_source_digest("pkg.entry")
+
+    assert digest_after_editing("unrelated.py") == baseline
+    assert digest_after_editing("relative.py") != baseline
 
 
 def test_kernel_constants_are_part_of_the_kernel_key():

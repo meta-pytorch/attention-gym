@@ -45,21 +45,22 @@ def main(request_path: Path, calls_path: Path) -> int:
     except ImportError:
         pass
 
-    from attn_gym._backends.cute.target import CompileTarget, set_compile_target
-
     target_fields = request["target"]
     capability = target_fields.get("capability")
     if capability is not None:
         target_fields["capability"] = tuple(capability)
-    target = CompileTarget(**target_fields)
-    set_compile_target(target)
-
-    if target.configured_arch is not None:
-        os.environ["CUTE_DSL_ARCH"] = target.configured_arch
-    elif target.capability is not None:
-        major, minor = target.capability
+    # CuTeDSL fixes its architecture when cutlass is first imported, and importing this package
+    # imports cutlass: set it first.
+    if target_fields.get("configured_arch") is not None:
+        os.environ["CUTE_DSL_ARCH"] = target_fields["configured_arch"]
+    elif capability is not None:
+        major, minor = capability
         suffix = "a" if major >= 9 else ""
         os.environ["CUTE_DSL_ARCH"] = f"sm_{major}{minor}{suffix}"
+
+    from attn_gym._backends.cute.target import CompileTarget, set_compile_target
+
+    set_compile_target(CompileTarget(**target_fields))
 
     _compile_fn = _resolve(request["module"], request["qualname"])
     if not callable(getattr(_compile_fn, "precompile", None)):
