@@ -81,7 +81,10 @@ def test_paged_latency_script_runs_without_checkout_on_import_path(tmp_path: Pat
 def test_documented_example_paths_exist(document: Path) -> None:
     """Keep commands, links, and snippet source paths aligned with file moves."""
     text = document.read_text()
-    for example in re.findall(r"examples/[\w./-]+\.(?:py|ipynb)\b", text):
+    # Only top-level ``examples/`` paths; ``attn_gym/warpdrive/examples/x.py`` is a package path.
+    for example in re.findall(r"(?<![\w/.-])examples/[\w./-]+\.(?:py|ipynb)\b", text):
+        assert (REPO_ROOT / example).is_file(), f"{document}: missing {example}"
+    for example in re.findall(r"attn_gym/warpdrive/examples/[\w./-]+\.py\b", text):
         assert (REPO_ROOT / example).is_file(), f"{document}: missing {example}"
     for example, section in re.findall(r'--8<-- "(examples/[^":]+):([^"\n]+)"', text):
         source = (REPO_ROOT / example).read_text()

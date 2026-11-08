@@ -144,6 +144,45 @@ When testing specialization reuse, assert on `compile_fn.cache_info()` (distinct
 `currsize`, launches in `hits + misses`) instead of disabling the disk cache with
 `CUTE_DSL_NO_CACHE`, which forces cold compiles.
 
+## warpdrive
+
+`attn_gym/warpdrive/` is the warp-specialization layer for CuTeDSL kernels (roles, channels,
+work streams); `attn_gym/profiler/` is the intra-kernel profiler its trace backends feed. Load
+the [`authoring-warpdrive`](.agents/skills/authoring-warpdrive/SKILL.md) skill when authoring or
+porting a kernel. The authoring guide, safety contract and topic guides live under
+[`docs/warpdrive/`](docs/warpdrive/index.md) and the profiler under [`docs/profiler.md`](docs/profiler.md);
+they must match the checkout being used. Fuzz report labels live in
+`test/warpdrive_fuzz/CASES.md`, not a public error-code API.
+
+Warpdrive kernels compile through `jit_cache` like every other CuTeDSL kernel, with two extra
+rules:
+
+- Pass a kernel's static choices to its constructor: the key is the constructor call, and a
+  public attribute assigned afterwards (other than `cluster`, work streams, and the IKET,
+  tracing and alias settings) raises.
+- A cached kernel restores its trace results (`describe()`, TMA/alias reports, warnings) without
+  tracing. Only a test that asserts on tracing itself (IKET ranges, monkeypatched trace hooks)
+  takes the `traced_compiles` fixture (`test/conftest.py`) and calls `compile_fn.cache_clear()`.
+
+### warpdrive Testing Tiers
+
+Pick the smallest tier that covers the change; run bigger tiers only when asked or before
+landing core synchronization/scheduling changes.
+
+- Every change (~45 s cold, ~22 s with a warm compile cache on a GB300):
+  `pytest -n 12 test/warpdrive test/profiler`. Fuzz tests are skipped by default (`addopts`
+  deselects the `fuzz` marker).
+- Quick fuzz (~2-3 min, on request or before landing layer changes):
+  `pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz`.
+- Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.
+  Use `tools/warpdrive/fuzz_warpdrive.py {runtime,static,mutate}` under `gpu-run`.
+  `CUTE_DSL_ARCH=sm_100a python tools/warpdrive/warpdrive_sass.py dump OUTDIR` records the
+  seven standard configs; `compare BEFORE AFTER` gates on PTX and compiler identity and prints
+  SASS diffs (`--strict-sass` also requires identical SASS). ptxas can assign registers
+  differently from identical PTX (seen on the small decode configs), so a SASS-only diff with
+  identical PTX is not a code change. `tools/warpdrive/warpdrive_ptx_audit.py DIR` screens a
+  dump for the saved-thread-index ptxas hazard without a GPU.
+
 ## cuDNN Vendor Maintenance
 
 `tools/cudnn_fe/` contains the GDN/KDA vendor/import tools, mechanical restyle and audit,
@@ -166,6 +205,8 @@ before changing the covered subsystem:
   registration, fake implementations, autograd, `opcheck`, and `torch.compile` validation.
 - [`cutedsl-tunable-kernel-template`](.agents/skills/cutedsl-tunable-kernel-template/SKILL.md) —
   typed config generation, cached TVM-FFI compilation, parallel compile, and sequential tuning.
+- [`authoring-warpdrive`](.agents/skills/authoring-warpdrive/SKILL.md) —
+  warp-specialized CuTeDSL kernels from roles, channels and work streams, or ports to that API.
 
 ## Agent Scratch Space
 

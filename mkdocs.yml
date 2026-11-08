@@ -74,6 +74,20 @@ nav:
       - Linear Attention: linear.md
       - Sparse Attention: sparse.md
       - Utilities: utilities.md
+      - Profiler: profiler.md
+  - warpdrive:
+      - warpdrive/index.md
+      - Write a kernel: warpdrive/writing-kernels.md
+      - Safety contract: warpdrive/guarantees.md
+      - Roles: warpdrive/roles.md
+      - Scheduling: warpdrive/scheduling.md
+      - Channels: warpdrive/channels.md
+      - Storage: warpdrive/storage.md
+      - Clusters: warpdrive/clusters.md
+      - Dropping down: warpdrive/dropping-down.md
+      - Tracing: warpdrive/tracing.md
+      - Configuration: warpdrive/configuration.md
+      - Examples: warpdrive/examples.md
   - Examples: examples.md
   - Development:
       - developers/index.md
