@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.utils import _document_ids, ptr_offset
+from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
 
 
 def can_use_shared_kv_schedule(
@@ -240,3 +240,125 @@ def online_softmax_update(accumulator, running_max, running_sum, logits, values)
     accumulator += tl.dot(probabilities.to(values.dtype), values, input_precision="tf32x3")
     running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
     return accumulator, new_max, running_sum
+
+
+# Sizes and the batch stride of ``kv_indices`` only feed bounds, offsets, and loop trip counts.
+# A constexpr TOPK measured no faster on B200 (QSA top-k 2051), so top-k widths share a kernel.
+@triton.jit(
+    do_not_specialize=["num_documents", "KV_INDICES_BATCH_STRIDE", "S", "SPARSE_SEQ_LEN", "TOPK"]
+)
+def _resolve_selected_rows(
+    kv_indices_ptr,
+    rows_ptr,
+    counts_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
+    num_documents,
+    KV_INDICES_BATCH_STRIDE,
+    KV_INDICES_STRIDES,
+    S,
+    SPARSE_SEQ_LEN,
+    TOPK,
+    HAS_CU_SEQLENS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Compact one query's valid selections, as global sparse-pool rows, to its row's front."""
+    KV_INDICES_STRIDES = offset_strides(
+        (KV_INDICES_BATCH_STRIDE, KV_INDICES_STRIDES[0], KV_INDICES_STRIDES[1]),
+        USE_INT64_OFFSETS,
+    )
+    row = tl.program_id(0).to(tl.int64)
+    batch = row // S
+    query_position = row % S
+    candidate_start = 0
+    candidate_end = SPARSE_SEQ_LEN
+    if HAS_CU_SEQLENS:
+        _, _, candidate_start, candidate_end = load_document_bounds(
+            cu_seqlens_ptr, cu_seqlens_k_ptr, query_position, num_documents, S, True
+        )
+    count = 0
+    for start in range(0, TOPK, BLOCK_K):
+        slots = start + tl.arange(0, BLOCK_K)
+        indices = tl.load(
+            kv_indices_ptr + ptr_offset((batch, query_position, slots), KV_INDICES_STRIDES),
+            mask=slots < TOPK,
+            other=-1,
+        )
+        valid = (indices >= 0) & (indices < candidate_end - candidate_start)
+        # Mask local coordinates before adding the document base, including int64 sentinels.
+        local = tl.where(valid, indices, 0)
+        rows = local + candidate_start
+        positions = count + tl.cumsum(valid.to(tl.int32), axis=0) - 1
+        tl.store(rows_ptr + row * TOPK + positions, rows.to(rows_ptr.dtype.element_ty), mask=valid)
+        count += tl.sum(valid.to(tl.int32), axis=0)
+    tl.store(counts_ptr + row, count)
+
+
+def resolve_selected_rows(
+    kv_indices: torch.Tensor,
+    sparse_seq_len: int,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Resolve document-local selections to global pool rows, compacted per query.
+
+    Returns ``(rows, counts)``. ``rows`` [B, S, topk] (int32, or int64 for pools
+    of 2**31 rows or more) holds each query's valid selections in their original order
+    (repeats included) as global pool rows in its first ``counts[b, s]`` entries; the rest are
+    unspecified and never read. The grouped kernels then skip per-gather document checks and
+    loop over full tiles of rows without masks, masking only the last, partial tile.
+    """
+    batch, seq_len, topk = kv_indices.shape
+    device = kv_indices.device
+    # int32 rows, unless the pool is too long for them.
+    rows = torch.empty(
+        (batch, seq_len, topk),
+        device=device,
+        dtype=torch.int32 if sparse_seq_len < 2**31 else torch.int64,
+    )
+    # The kernel writes every count.
+    counts = torch.empty((batch, seq_len), device=device, dtype=torch.int32)
+    if topk == 0:
+        return rows, counts.zero_()
+    has_cu_seqlens = cu_seqlens is not None
+    _resolve_selected_rows[(batch * seq_len,)](
+        kv_indices,
+        rows,
+        counts,
+        cu_seqlens,
+        cu_seqlens_k,
+        cu_seqlens.numel() - 1 if has_cu_seqlens else 0,
+        KV_INDICES_BATCH_STRIDE=kv_indices.stride(0),
+        KV_INDICES_STRIDES=kv_indices.stride()[1:],
+        S=seq_len,
+        SPARSE_SEQ_LEN=sparse_seq_len,
+        TOPK=topk,
+        HAS_CU_SEQLENS=has_cu_seqlens,
+        USE_INT64_OFFSETS=requires_int64_offsets(kv_indices),
+        BLOCK_K=256,
+        num_warps=4,
+    )
+    return rows, counts
+
+
+@triton.jit
+def head_block_heads(head_block, H: tl.constexpr, KV_HEADS: tl.constexpr, BLOCK_H: tl.constexpr):
+    """``(kv_head, heads, head_mask)`` for one index of a head-block grid axis.
+
+    With KV_HEADS == 1 the blocks tile all H query heads, which read KV head 0. Otherwise they
+    enumerate (KV head, block of its H // KV_HEADS query heads), so each block reads one KV
+    head and each gathered K/V row serves the whole block.
+    """
+    if KV_HEADS == 1:
+        kv_head = 0
+        heads = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+        head_mask = heads < H
+    else:
+        group = H // KV_HEADS
+        blocks_per_group = (group + BLOCK_H - 1) // BLOCK_H
+        kv_head = head_block // blocks_per_group
+        group_offsets = (head_block % blocks_per_group) * BLOCK_H + tl.arange(0, BLOCK_H)
+        heads = kv_head * group + group_offsets
+        head_mask = group_offsets < group
+    return kv_head, heads, head_mask
