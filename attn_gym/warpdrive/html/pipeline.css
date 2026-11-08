@@ -1,0 +1,59 @@
+/* describe(format="html"): the pipeline graph. */
+#graph { display: block; font-family: var(--mono); max-width: 100%; height: auto; }
+#graph text { fill: var(--ink); }
+.card { fill: var(--card); stroke: var(--ink); stroke-width: 1; }
+.card.back { fill: var(--panel); stroke: var(--muted); }
+.card.raw { stroke-dasharray: 4 3; }
+.role-name { font-size: 13px; font-weight: 600; }
+#graph .role-facts { font-size: 10.5px; fill: var(--muted); }
+.warp { fill: none; stroke: var(--rule); stroke-width: 1; }
+.warp.on { fill: var(--ink); stroke: var(--ink); opacity: 0.75; }
+.chip-body { fill: var(--card); stroke: var(--muted); stroke-width: 1; }
+.chip-name { font-size: 11px; font-weight: 600; }
+#graph .chip-kind { font-size: 9.5px; fill: var(--muted); }
+.bar.tma, .tick.tma { fill: var(--tma); }
+.bar.umma, .tick.umma { fill: var(--umma); }
+.bar.threads, .tick.threads { fill: var(--threads); }
+.bar.named, .tick.named { fill: var(--named); }
+.tick { opacity: 0.55; }
+.badge rect { fill: none; stroke: var(--muted); stroke-width: 0.8; }
+#graph .badge-t { font-size: 8.5px; fill: var(--muted); }
+.badge.pair rect { stroke: var(--ink); }
+#graph .badge.pair .badge-t, #graph .badge.place .badge-t { fill: var(--ink); }
+.badge.warn rect { stroke: var(--red); }
+#graph .badge.warn .badge-t { fill: var(--red); }
+.badge.ok rect { stroke: var(--green); }
+#graph .badge.ok .badge-t { fill: var(--green); }
+.hub { fill: var(--card); stroke: var(--sync); stroke-width: 1.2; }
+.hub-mark { fill: none; stroke: var(--sync); stroke-width: 1.2; }
+#graph .hub-name { font-size: 10.5px; fill: var(--muted); }
+.external { fill: none; stroke: var(--muted); stroke-dasharray: 4 3; }
+#graph .ext-t { font-size: 10.5px; fill: var(--muted); }
+.stream { fill: var(--card); stroke: var(--rule); }
+.stream-bar { fill: var(--green); }
+.stream-name { font-size: 11.5px; font-weight: 600; }
+#graph .stream-t { font-size: 9.5px; fill: var(--muted); }
+.wire .line { fill: none; stroke-width: 1.6; stroke-linecap: round; }
+.wire.pair .line { stroke-width: 4.6; }
+.wire .gap { fill: none; stroke: var(--panel); stroke-width: 1.6; }
+.wire.tma .line { stroke: var(--tma); }
+.wire.umma .line { stroke: var(--umma); }
+.wire.threads .line { stroke: var(--threads); }
+.wire.named .line { stroke: var(--named); }
+.wire.stream .line { stroke: var(--green); stroke-dasharray: 5 4; }
+.wire.spoke line, .spoke-key { stroke: var(--sync); stroke-width: 1.1; stroke-dasharray: 1.5 3;
+  stroke-linecap: round; }
+#graph .wire-label { font-size: 9px; fill: var(--muted); }
+.arrow.tma { fill: var(--tma); }
+.arrow.umma { fill: var(--umma); }
+.arrow.threads { fill: var(--threads); }
+.arrow.named { fill: var(--named); }
+.arrow.stream { fill: var(--green); }
+.node { cursor: pointer; outline: none; }
+#graph.focus .node, #graph.focus .wire { opacity: 0.22; transition: opacity 120ms; }
+#graph.focus .hl { opacity: 1; }
+.node.hl.sel .card, .node.hl.sel .chip-body, .node.hl.sel .hub, .node.hl.sel .external,
+.node.hl.sel .stream { stroke: var(--amber); stroke-width: 2; }
+.node:focus-visible .card, .node:focus-visible .chip-body { stroke: var(--amber); stroke-width: 2; }
+.legend .wire .line { fill: none; }
+@media (prefers-reduced-motion: reduce) { #graph.focus .node, #graph.focus .wire { transition: none; } }

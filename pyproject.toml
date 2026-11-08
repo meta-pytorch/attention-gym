@@ -99,8 +99,12 @@ packages = ["attn_gym"]
 testpaths = ["test"]
 norecursedirs = ["agent_space"]
 # `-n` honors `xdist_group` marks, so tests that pin specific GPUs never run concurrently.
-addopts = "--dist loadgroup"
-markers = ["full_autotune: exercise every production Triton autotuning candidate"]
+# Seeded warpdrive fuzz cases are skipped by default; run them with `pytest -m fuzz`.
+addopts = "--dist loadgroup -m 'not fuzz'"
+markers = [
+    "full_autotune: exercise every production Triton autotuning candidate",
+    "fuzz: seeded warpdrive fuzz cases; long campaigns use tools/warpdrive/fuzz_warpdrive.py",
+]
 
 # ---------- RUFF ------------
 [tool.ruff]
@@ -154,3 +158,5 @@ ignore = ['E231', 'E731']
 # CuTeDSL traces if-expressions and nested ifs as device selects/branches; min/max builtins and
 # `and` do not trace the same way on dynamic values, so keep the vendored control flow.
 "attn_gym/linear/_delta_rule/cudnn_fe/{common,kernel,tile_dsl}/*.py" = ["FURB136", "PLR1730", "SIM102"]
+# The same holds for warpdrive's and the profiler's traced code and the kernels their tests build.
+"{attn_gym/warpdrive,attn_gym/profiler,test/warpdrive,test/warpdrive_fuzz}/**/*.py" = ["SIM102"]
