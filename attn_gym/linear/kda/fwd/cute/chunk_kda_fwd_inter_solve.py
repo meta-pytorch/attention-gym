@@ -19,8 +19,6 @@ from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear._delta_rule.chunk_schedule import (
@@ -39,6 +37,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_k4b_inverse_cutedsl import (
     ChunkKDAFwdK4bInverseCuteDSL,
 )
 from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
+from attn_gym.warpdrive.cache import compile_tvm_ffi, get_compile_target, jit_cache
 
 _SUPPORTED_HEAD_DIM = 128
 _SUPPORTED_CHUNK_SIZE = 64

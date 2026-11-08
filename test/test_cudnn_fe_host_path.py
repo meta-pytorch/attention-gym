@@ -10,7 +10,6 @@ import torch
 
 pytest.importorskip("cutlass.experimental")
 
-from attn_gym._backends.cute import cache as cute_cache
 from attn_gym.linear import chunk_gdn, chunk_kda
 from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
 from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
@@ -21,6 +20,7 @@ from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
 )
 from attn_gym.testing import make_gdn_test_inputs
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
+from attn_gym.warpdrive.cache import jit as cute_cache
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),

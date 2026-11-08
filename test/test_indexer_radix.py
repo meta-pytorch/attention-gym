@@ -221,7 +221,7 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, de
     """
     import cutlass
 
-    from attn_gym._backends.cute.target import (
+    from attn_gym.warpdrive.cache import (
         detect_compile_target,
         get_compile_target,
         set_compile_target,
@@ -276,7 +276,7 @@ def test_radix_deterministic_causal_window_boundary(
     """Causal rows whose visible candidates straddle one 65536-bit bitmap window."""
     import cutlass
 
-    from attn_gym._backends.cute.target import (
+    from attn_gym.warpdrive.cache import (
         detect_compile_target,
         get_compile_target,
         set_compile_target,

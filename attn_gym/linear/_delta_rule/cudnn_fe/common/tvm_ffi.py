@@ -8,7 +8,7 @@ import cutlass
 from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
-from attn_gym._backends.cute import make_fake_strided_tensor
+from attn_gym.warpdrive.cache import make_fake_strided_tensor
 
 # v1.30 adds seed and final-state destinations to the work-item ABI.
 WORK_ITEM_FIELDS = 10

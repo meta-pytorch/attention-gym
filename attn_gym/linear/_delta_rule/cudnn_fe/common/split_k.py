@@ -74,7 +74,7 @@ import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.tma import ld_global_v2, ld_global_v4

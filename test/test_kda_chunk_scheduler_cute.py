@@ -11,13 +11,13 @@ from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
+from attn_gym.warpdrive.compat import SmemAllocator
 
 
 def _expected_tensor(lengths: list[int], chunk_size: int) -> tuple[torch.Tensor, list[int]]:

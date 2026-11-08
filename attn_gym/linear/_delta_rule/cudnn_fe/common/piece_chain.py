@@ -36,7 +36,7 @@ import cutlass
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
-from attn_gym._backends.cute.compat import SmemAllocator
+from attn_gym.warpdrive.compat import SmemAllocator
 
 from ..tile_dsl.barrier import launch_dependent_grids, wait_on_dependent_grids
 from ..tile_dsl.handles import smem_data_ptr

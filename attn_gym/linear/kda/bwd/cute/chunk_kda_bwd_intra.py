@@ -23,9 +23,7 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache, run_tunable
-from attn_gym._backends.cute.compat import SmemAllocator
-from attn_gym._backends.cute.target import CompileTarget, detect_compile_target, get_compile_target
+from attn_gym._backends.cute import run_tunable
 from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
@@ -34,6 +32,14 @@ from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
+from attn_gym.warpdrive.cache import (
+    CompileTarget,
+    compile_tvm_ffi,
+    detect_compile_target,
+    get_compile_target,
+    jit_cache,
+)
+from attn_gym.warpdrive.compat import SmemAllocator
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4

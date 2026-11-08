@@ -144,7 +144,7 @@ def test_rule_resolves_imported_identities(case):
 def test_house_style_forms_are_not_reported():
     text = src(
         """
-        from attn_gym._backends.cute import jit_cache
+        from attn_gym.warpdrive.cache import jit_cache
 
         def arrive(mb):
             cute.arch.mbarrier_arrive(mb.data_ptr())

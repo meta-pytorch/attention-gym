@@ -36,17 +36,17 @@ import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, cute
 
-from attn_gym._backends.cute import (
-    compile_tvm_ffi,
-    jit_cache,
-    make_fake_strided_tensor,
-    tensor_supports_contiguous_dim,
-)
-from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute import tensor_supports_contiguous_dim
 from attn_gym._backends.cute.utils import CuteDType, cute_dtype, requires_int64_abi
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.types import GateTransform
 from attn_gym.utils import cdiv
+from attn_gym.warpdrive.cache import (
+    compile_tvm_ffi,
+    get_compile_target,
+    jit_cache,
+    make_fake_strided_tensor,
+)
 
 _HEAD_DIM = 128
 _HEADS_PER_BLOCK = 8

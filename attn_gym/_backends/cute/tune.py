@@ -15,14 +15,16 @@ from typing import Any, Protocol, TypeVar
 
 import torch
 
-from ._key import _canonicalize
-from .cache import cache_enabled, get_cache_path
-from .compile import (
-    DEFAULT_COMPILE_TIMEOUT_SECONDS,
-    _materialize_calls,
+from attn_gym.warpdrive.cache import (
+    CompileTarget,
+    cache_enabled,
     compile_many,
+    get_cache_path,
+    get_compile_target,
+    set_compile_target,
 )
-from .target import CompileTarget, get_compile_target, set_compile_target
+from attn_gym.warpdrive.cache._key import _canonicalize
+from attn_gym.warpdrive.cache.compile import DEFAULT_COMPILE_TIMEOUT_SECONDS, _materialize_calls
 
 ConfigT = TypeVar("ConfigT")
 _WINNERS_LOCK = threading.Lock()

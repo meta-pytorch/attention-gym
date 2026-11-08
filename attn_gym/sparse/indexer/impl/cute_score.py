@@ -23,11 +23,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym._backends.cute.compat import (
-    SmemAllocator,
-    TmemAllocator,
-    get_num_tmem_alloc_cols,
-)
+from attn_gym.warpdrive.compat import SmemAllocator, TmemAllocator, get_num_tmem_alloc_cols
 
 from .cute_kernel_base import IndexerScoreKernelBase
 

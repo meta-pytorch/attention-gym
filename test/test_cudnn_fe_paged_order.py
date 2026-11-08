@@ -6,7 +6,6 @@ import torch
 cutlass = pytest.importorskip("cutlass")
 cute = pytest.importorskip("cutlass.cute")
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym.linear._delta_rule.cudnn_fe.common import split_k
 from attn_gym.linear._delta_rule.cudnn_fe.common.tvm_ffi import (
     make_counter_signature,
@@ -14,6 +13,7 @@ from attn_gym.linear._delta_rule.cudnn_fe.common.tvm_ffi import (
     make_paged_route_signatures,
     make_work_items_signature,
 )
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,

@@ -44,20 +44,19 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym._backends.cute import (
-    TMA_ALIGNMENT_BYTES,
-    compile_tvm_ffi,
-    jit_cache,
-    make_fake_strided_tensor,
-    tensor_supports_tma,
-)
-from attn_gym._backends.cute.compat import SmemAllocator
+from attn_gym._backends.cute import TMA_ALIGNMENT_BYTES, tensor_supports_tma
 from attn_gym._backends.cute.device import cta_reduce_sum
-from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.cute.utils import CuteDType, cute_dtype, requires_int64_abi
 from attn_gym.linear.kda.fwd.cute.gate_fwd import softplus_terms
 from attn_gym.linear.types import GateTransform
 from attn_gym.utils import cdiv
+from attn_gym.warpdrive.cache import (
+    compile_tvm_ffi,
+    get_compile_target,
+    jit_cache,
+    make_fake_strided_tensor,
+)
+from attn_gym.warpdrive.compat import SmemAllocator
 
 _TILE_TOKENS = 32
 

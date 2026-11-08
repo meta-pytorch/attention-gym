@@ -53,7 +53,7 @@ from dataclasses import dataclass
 
 from cutlass import cute
 
-from attn_gym._backends.cute import function_cache_key
+from attn_gym.warpdrive.cache import function_cache_key
 
 
 @cute.jit

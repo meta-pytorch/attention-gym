@@ -30,13 +30,13 @@ import cutlass
 from cutlass import Int32, cute
 from cutlass.cute.nvgpu import warp
 
-from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleKind
 from attn_gym.linear.kda.fwd.cute.chunk_schedule import ChunkSchedule
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
+from attn_gym.warpdrive.compat import SmemAllocator
 
 
 class ChunkKDAFwdK3bOffdiagCuteDSL:

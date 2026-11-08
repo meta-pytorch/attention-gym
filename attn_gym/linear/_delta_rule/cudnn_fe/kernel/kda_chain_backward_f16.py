@@ -39,7 +39,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import cute
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 from ..common.host import get_dtype
 from ..common.piece_chain import dtype_name, launch_state_chain

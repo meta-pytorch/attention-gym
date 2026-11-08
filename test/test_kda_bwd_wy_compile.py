@@ -5,9 +5,8 @@ from pathlib import Path
 import pytest
 import torch
 
-from attn_gym._backends.cute import target as cute_target
-from attn_gym._backends.cute.compile import precompile_many
-from attn_gym._backends.cute.target import CompileTarget
+from attn_gym.warpdrive.cache import CompileTarget, precompile_many
+from attn_gym.warpdrive.cache import target as cute_target
 
 
 # Each case is a deliberately cold ~10s compile; the diagonal covers both dtypes and layouts.
