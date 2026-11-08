@@ -210,17 +210,12 @@ def _recurrent_delta_rule_fwd_kernel(
         # exp(g) computed as exp2(g * log2(e)); the FMA folds into the exp2 argument.
         b_state *= tl.exp2(b_g * LOG2_E)
 
-        if PREFETCH:
-            # q @ (S + k delta) = q @ S + (q . k) delta lets both reductions read decayed S
-            # without waiting for the state update.
-            b_o = tl.sum(b_q * b_state, 0)
-            b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
-            b_o += tl.sum(b_q * b_k, 0) * b_delta
-            b_state += b_k * b_delta[None, :]
-        else:
-            b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
-            b_state += b_k * b_delta[None, :]
-            b_o = tl.sum(b_q * b_state, 0)
+        # One expression for every launch config. q @ S + (q . k) delta equals the output
+        # below but rounds differently, so choosing it per grid would make a token's output
+        # depend on the rest of the batch.
+        b_delta = (b_v - tl.sum(b_k * b_state, 0)) * b_beta
+        b_state += b_k * b_delta[None, :]
+        b_o = tl.sum(b_q * b_state, 0)
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
 
     if STORE_FINAL_STATE:
@@ -340,8 +335,9 @@ def launch_recurrent_delta_rule_fwd(
     sequence_heads = num_sequences * heads
     average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
     tokens_bucket = min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT)
-    # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
-    # Prefetch was slower for K > 128.
+    # Up to 16 sequence-heads, prefetch hides load latency (GB300, 256+ tokens per sequence:
+    # 0.80-0.85x unpaged, 0.86-0.99x paged, at K=64 and K=128). Prefetch was slower for K > 128.
+    # It changes only when operands load, so it keeps the scan's output bits.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
     use_autotune = autotune and state_indices is None
     kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel

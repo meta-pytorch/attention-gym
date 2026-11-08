@@ -243,6 +243,8 @@ def recurrent_gdn(
             garbage: they start from zero and overwrite the slot, even for empty sequences.
         autotune: Benchmark candidate value-tile sizes for non-paged execution when true; paged
             execution always uses deterministic heuristics because it mutates the state cache.
+            Without autotuning, a sequence's output bits do not depend on the other sequences
+            in the call or on how its tokens are split across calls.
         impl: ``"fused"`` uses the inference-only Triton scan; ``"reference"`` uses eager
             PyTorch with autograd support.
 

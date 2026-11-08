@@ -251,3 +251,67 @@ def test_recurrent_reuses_tuning_across_token_counts(monkeypatch):
     inputs = _make_inputs(tokens=1, dtype=torch.bfloat16, initial_state=False)
     recurrent_gdn(*inputs[:5], autotune=True)
     assert len(tuner.cache) == 2
+
+
+def _paged_scan(sequences, *, has_initial_state: bool, pool: torch.Tensor) -> list[torch.Tensor]:
+    """Run each ``(q, k, v, gate, beta)`` sequence from pool slot ``i + 1`` in one packed call."""
+    lengths = torch.tensor([0] + [s[0].shape[0] for s in sequences], device="cuda")
+    cu_seqlens = lengths.cumsum(0).to(torch.int32)
+    q, k, v, gate, beta = (torch.cat([s[i] for s in sequences]).unsqueeze(0) for i in range(5))
+    num_sequences = len(sequences)
+    output, _ = recurrent_gdn(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        pool,
+        cu_seqlens=cu_seqlens,
+        state_indices=torch.arange(1, num_sequences + 1, dtype=torch.int32, device="cuda"),
+        has_initial_state=torch.full(
+            (num_sequences,), has_initial_state, dtype=torch.bool, device="cuda"
+        ),
+        autotune=False,
+    )
+    return [output[0, cu_seqlens[i] : cu_seqlens[i + 1]] for i in range(num_sequences)]
+
+
+@pytest.mark.parametrize("key_dim", [64, 128])
+def test_paged_scan_output_is_batch_invariant(key_dim):
+    """A sequence's output bits do not depend on the rest of the batch or on how its tokens
+    are split across calls, although each case picks a different launch config: alone it fills
+    4 sequence-heads (prefetched), packed with 7 others it fills 32, and decoding scans one
+    token per sequence."""
+    torch.manual_seed(0)
+    heads, value_dim = 4, 128
+
+    def sequence(tokens):
+        q = F.normalize(torch.randn(tokens, heads, key_dim, device="cuda"), dim=-1)
+        k = F.normalize(torch.randn_like(q), dim=-1)
+        v = torch.randn(tokens, heads, value_dim, device="cuda")
+        gate = F.logsigmoid(torch.randn(tokens, heads, device="cuda"))
+        beta = torch.sigmoid(torch.randn(tokens, heads, device="cuda"))
+        return q.bfloat16(), k.bfloat16(), v.bfloat16(), gate, beta
+
+    def new_pool(num_sequences):
+        return torch.zeros(num_sequences + 1, heads, value_dim, key_dim, device="cuda")
+
+    target = sequence(61)
+    others = [sequence(tokens) for tokens in (5, 17, 33, 64, 90, 1, 48)]
+    with torch.no_grad():
+        alone = _paged_scan([target], has_initial_state=False, pool=new_pool(1))[0]
+        packed = _paged_scan([target, *others], has_initial_state=False, pool=new_pool(8))[0]
+        pool = new_pool(2)
+        decoded = torch.cat(
+            [
+                _paged_scan(
+                    [[x[t : t + 1] for x in target], sequence(1)],
+                    has_initial_state=t > 0,
+                    pool=pool,
+                )[0]
+                for t in range(target[0].shape[0])
+            ]
+        )
+
+    assert torch.equal(packed, alone)
+    assert torch.equal(decoded, alone)
