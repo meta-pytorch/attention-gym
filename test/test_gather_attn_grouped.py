@@ -579,27 +579,38 @@ def test_every_tuner_config_matches_reference(monkeypatch, case):
     _assert_matches_reference(inputs, mode, **options)
 
 
-@pytest.mark.parametrize("mode", ["atomic", "deterministic"])
-@pytest.mark.parametrize("base", ["dense", "window"])
+@pytest.mark.parametrize("mode", ["atomic", "key-major", "deterministic"])
+@pytest.mark.parametrize("base", ["dense", "all-dense", "window"])
 def test_grouped_cuda_graph_replays_new_inputs(monkeypatch, base, mode):
-    """Capture into one CUDA graph, which reads nothing back to the host (a host read fails
-    capture), and replay on new values and selections to match eager.
+    """Forward and backward capture into one CUDA graph, so they read nothing back to the
+    host (a host read fails capture), and a replay on new values and selections matches eager.
 
-    Atomic mode captures the forward and backward; deterministic mode, which keeps the
-    key-major dK/dV, captures only the forward here. Shifting every query's selections to its
-    neighbour, plus a repeat in the first query, changes which tiles are dense, so nothing
-    sized at capture may depend on them. ``window`` adds the local dK/dV kernel. Only atomic
-    sparse dK/dV may differ, by FP32 summation order.
+    Shifting every query's selections to its neighbour, plus a repeat in the first query,
+    changes which tiles are dense and how many selections the key-major map holds, so nothing
+    sized at capture may depend on them. ``all-dense`` captures with no gather selections and
+    replays with some. Nothing may compile or tune during capture: eager and captured launches
+    share every kernel and specialization. ``window`` adds the local dK/dV kernel, and its
+    4736-slot map takes ATen's large sort. Only atomic sparse dK/dV may differ, by FP32
+    summation order.
     """
     _force_mode(monkeypatch, mode)
-    if base == "dense":
-        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
+    key_major_launches = []
+    key_major_launch = backward._gather_attn_bwd_dsparse_kv_grouped
+
+    class CountingLaunch:
+        def __getitem__(self, grid):
+            key_major_launches.append(grid)
+            return key_major_launch[grid]
+
+    monkeypatch.setattr(backward, "_gather_attn_bwd_dsparse_kv_grouped", CountingLaunch())
+    if base != "window":
+        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, base == "all-dense", "short")
     else:
         inputs = make_gather_attn_test_inputs(
             heads=24,
             kv_heads=2,
             head_dim=128,
-            tokens=40,
+            tokens=128,
             sparse_tokens=79,
             topk=37,
             separate_values=True,
@@ -610,42 +621,45 @@ def test_grouped_cuda_graph_replays_new_inputs(monkeypatch, base, mode):
     options["kernel_options"] = {"backend": "triton"}
     leaves = _differentiable_leaves(inputs)
     grad_output = torch.randn_like(inputs["query"])
-    with_backward = mode == "atomic"
-
-    def step():
-        if with_backward:
-            return _run(inputs, leaves, grad_output, **options)
-        with torch.no_grad():
-            output, aux = gather_attn(**inputs, **options, return_aux=AuxRequest(lse=True))
-        return output, aux.lse, ()
-
     with _deterministic_algorithms(mode == "deterministic"):
         # Warm up (compile and tune) on a side stream, as CUDA graph capture requires.
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            step()
+            _run(inputs, leaves, grad_output, **options)
         torch.cuda.current_stream().wait_stream(stream)
+        warm_up_launches = len(key_major_launches)
+        captured_compiles = []
+
+        def record_compile(*args, **kwargs):
+            captured_compiles.append(kwargs.get("repr"))
+            return False
+
+        compile_hook = triton.knobs.runtime.jit_cache_hook
+        monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", record_compile)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            captured = step()
+            captured = _run(inputs, leaves, grad_output, **options)
+        monkeypatch.setattr(triton.knobs.runtime, "jit_cache_hook", compile_hook)
+        assert len(key_major_launches) == 2 * warm_up_launches
+        assert not captured_compiles
         with torch.no_grad():
             for _, tensor in leaves:
                 tensor.copy_(torch.randn_like(tensor))
             grad_output.copy_(torch.randn_like(grad_output))
             replay_indices = inputs["kv_indices"].roll(1, dims=1)
             replay_indices[:, 0, 1] = replay_indices[:, 0, 0]
-            if base == "dense":
+            if base != "window":
                 captured_plan = _planned_tile_spans(inputs, options)[..., 1] >= 0
             inputs["kv_indices"].copy_(replay_indices)
-        if base == "dense":
+        if base != "window":
             assert not torch.equal(
                 captured_plan, _planned_tile_spans(inputs, options)[..., 1] >= 0
             )
         graph.replay()
-        expected = step()
+        expected = _run(inputs, leaves, grad_output, **options)
     torch.cuda.synchronize()
-    names = ["output", "lse", *(name for name, _ in leaves if with_backward)]
+    names = ["output", "lse", *(name for name, _ in leaves)]
     for name, actual, reference in zip(
         names,
         (captured[0], captured[1], *captured[2]),

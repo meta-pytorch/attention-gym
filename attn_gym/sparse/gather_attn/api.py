@@ -396,13 +396,11 @@ def gather_attn(
             themselves as both values (local_v is local_kv and sparse_v is sparse_kv)
             runs them as shared values; other aliases, such as views, count as separate
             values. With kv_heads == num_heads, separate values run one query head per
-            grouped-schedule tile, slower than the shared-value MHA kernels. CUDA graph
-            capture of their Triton backward is tested only on the atomic path the default
-            mode picks for small heads. With sliding_window_size=0, the grouped
-            schedule reads every pool row in the selection span of a run of nearby
-            queries, selected or not, so a NaN or Inf in an unselected row near selected
-            ones can make those queries' outputs and gradients NaN. Keep unused pool
-            capacity finite, for example zero-filled.
+            grouped-schedule tile, slower than the shared-value MHA kernels. With
+            sliding_window_size=0, the grouped schedule reads every pool row in the
+            selection span of a run of nearby queries, selected or not, so a NaN or Inf
+            in an unselected row near selected ones can make those queries' outputs and
+            gradients NaN. Keep unused pool capacity finite, for example zero-filled.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return (output, GatherAttnAux) containing the requested
