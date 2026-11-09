@@ -1,5 +1,3 @@
-import importlib  # the cute package re-exports tune(), shadowing the tune module
-
 import pytest
 import torch
 import triton
@@ -20,14 +18,6 @@ def _accumulate_kernel(x, out, n, BLOCK: tl.constexpr):
 def _snapshot_out(_grid, args):
     snapshot = args["out"].clone()
     return lambda: args["out"].copy_(snapshot)
-
-
-@pytest.fixture
-def isolated_winners(tmp_path, monkeypatch):
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
-    monkeypatch.setattr(tune_module, "_WINNERS", {})
-    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
 
 
 def test_tuned_triton_kernel_mutates_its_output_exactly_once(isolated_winners):

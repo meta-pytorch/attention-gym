@@ -1,10 +1,12 @@
 """Shared pytest fixtures."""
 
+import importlib
 import os
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -87,6 +89,19 @@ def fresh_compile_cache() -> Iterator[None]:
         yield
     finally:
         torch.compiler.reset()
+
+
+@pytest.fixture
+def isolated_winners(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    """Start from empty in-memory and on-disk tuning winner caches, so tuned launches tune.
+
+    Returns the tuning module; its ``_WINNERS`` holds the winners chosen during the test.
+    """
+    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    tune = importlib.import_module("attn_gym._backends.cute.tune")
+    monkeypatch.setattr(tune, "_WINNERS", {})
+    monkeypatch.setattr(tune, "_WINNERS_FAST", {})
+    return tune
 
 
 @pytest.fixture
