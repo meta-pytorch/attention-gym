@@ -399,8 +399,8 @@ def gather_attn(
             capture of their Triton backward is not tested yet. With
             sliding_window_size=0, that schedule reads every pool row in the selection
             span of a run of nearby queries, selected or not, so a NaN or Inf in an
-            unselected row near selected ones can make those queries' outputs NaN. Keep
-            unused pool capacity finite, for example zero-filled.
+            unselected row near selected ones can make those queries' outputs and
+            gradients NaN. Keep unused pool capacity finite, for example zero-filled.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return (output, GatherAttnAux) containing the requested

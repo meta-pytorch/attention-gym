@@ -233,16 +233,22 @@ def _dense_tile_inputs(heads, kv_heads, head_dim, separate_values, packed, all_d
 
 
 def _spy_dense_launches(monkeypatch):
-    """Count launches of the dense-tile forward kernel."""
-    launches = []
-    tuner = forward._FWD_DENSE
+    """Count launches of the three dense-tile kernels: forward, dQ, and dK/dV."""
+    launches = {}
+    for module, name in (
+        (forward, "_FWD_DENSE"),
+        (backward, "BWD_DQ_DENSE"),
+        (backward, "BWD_DSPARSE_KV_DENSE"),
+    ):
+        tuner = getattr(module, name)
+        launches[name] = 0
 
-    class CountingLaunch:
-        def __getitem__(self, grid):
-            launches.append(grid)
-            return tuner[grid]
+        class CountingLaunch:
+            def __getitem__(self, grid, _tuner=tuner, _name=name):
+                launches[_name] += 1
+                return _tuner[grid]
 
-    monkeypatch.setattr(forward, "_FWD_DENSE", CountingLaunch())
+        monkeypatch.setattr(module, name, CountingLaunch())
     return launches
 
 
@@ -264,7 +270,9 @@ def _planned_tile_spans(inputs, options):
         options.get("cu_seqlens_k"),
         mask_words=mask_words,
     )
-    return plan_dense_tiles(counts, selection_spans, options.get("cu_seqlens"), tile_queries)
+    return plan_dense_tiles(
+        counts, selection_spans, options.get("cu_seqlens"), tile_queries, document_bounds=False
+    )[0]
 
 
 @pytest.mark.usefixtures("nan_filled_empty")
@@ -295,9 +303,9 @@ def test_dense_tiles_match_reference(
 ):
     """Dense tiles walk their span under selection bitmaps; gather tiles keep the rest.
 
-    With ``all_dense`` every tile is dense, so the gather forward skips every query; the
-    backward still gathers every selection. Groups 3 and 48 leave part of each 128-row tile
-    empty; D=192 pads the head tile. The dense kernel must run.
+    With ``all_dense`` every tile is dense, so the key-major map holds only unused slots. Groups
+    3 and 48 leave part of each 128-row tile empty; D=192 pads the head tile. Every dense kernel
+    must run.
     """
     launches = _spy_dense_launches(monkeypatch)
     inputs, options = _dense_tile_inputs(
@@ -310,7 +318,7 @@ def test_dense_tiles_match_reference(
         # Some dense tile walks several 64-key tiles and reads past its first two words.
         assert (tile_spans[..., 1][dense] >= 64).any()
     _assert_matches_reference(inputs, mode, **options)
-    assert launches
+    assert all(launches.values()), launches
 
 
 def _qsa_indices(document_lengths, budget_blocks, generator):
@@ -366,7 +374,7 @@ def test_qsa_block_selections_match_reference(monkeypatch, heads, kv_heads, mode
     dense = _planned_tile_spans(inputs, options)[..., 1] >= 0
     assert dense.any() and not dense.all()
     _assert_matches_reference(inputs, mode, **options)
-    assert launches
+    assert all(launches.values()), launches
 
 
 def _misaligned(tensor):
@@ -465,7 +473,7 @@ def test_grouped_input_variants_match_reference(monkeypatch, base, variant, mode
         dense = _planned_tile_spans(inputs, options)[..., 1] >= 0
         assert dense.any() and not dense.all()
     _assert_matches_reference(inputs, mode, grad_output=grad_output, **options)
-    assert bool(launches) == (base == "dense")
+    assert all(launches.values()) == (base == "dense"), launches
 
 
 def _valid_candidates(*tuners_and_args):
@@ -477,7 +485,13 @@ def _valid_candidates(*tuners_and_args):
 
 
 _GATHER_ARGS = {"TOPK": 64, "D": 128, "WINDOW": 19}
-_DENSE_ARGS = {"TOPK": 48, "D": 256, "WINDOW": 0}
+_DENSE_ARGS = {
+    "TOPK": 48,
+    "D": 256,
+    "WINDOW": 0,
+    "BLOCK_D": 256,
+    "query_ptr": torch.empty(0, dtype=torch.bfloat16),
+}
 _TUNER_CASES = {
     "gather": _valid_candidates(
         (forward._FWD_GROUPED, _GATHER_ARGS),
@@ -486,7 +500,9 @@ _TUNER_CASES = {
     "dense": _valid_candidates(
         (forward._FWD_DENSE, _DENSE_ARGS),
         (forward._FWD_GROUPED, _DENSE_ARGS),
+        (backward.BWD_DQ_DENSE, _DENSE_ARGS),
         (shared_backward.BWD_DQ_GROUPED, _DENSE_ARGS),
+        (backward.BWD_DSPARSE_KV_DENSE, _DENSE_ARGS),
     ),
 }
 
@@ -507,7 +523,7 @@ def test_every_tuner_config_matches_reference(case):
     candidate list, so shorter lists repeat but none is skipped.
 
     ``gather`` (D=128, a window, top-k 64) covers the gather forward, dQ, and dK/dV
-    candidates, and ``dense`` (D=256) the dense forward's and the D=256 gather candidates.
+    candidates, and ``dense`` (D=256) the dense-tile kernels' and the D=256 gather candidates.
     """
     if case == "dense":
         inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "long")
@@ -635,8 +651,8 @@ def test_keys_passed_as_values_run_as_shared_values(monkeypatch, heads, kv_heads
 
 @pytest.mark.parametrize("packed", [False, True])
 def test_dense_tile_plan_matches_recount(packed):
-    """Selection bitmaps, spans, the bitmap-exact flag, and the dense-tile plan match a Python
-    recount of their definitions."""
+    """Selection bitmaps, spans, the bitmap-exact flag, the dense-tile plan, and each
+    document's dense-tile bounds match a Python recount of their definitions."""
     from attn_gym.sparse.gather_attn.impl.triton.primitives import (
         DENSE_SPAN_RATIO,
         dense_tile_shape,
@@ -653,12 +669,17 @@ def test_dense_tile_plan_matches_recount(packed):
     _, counts, masks, spans = resolve_selected_rows(
         kv_indices, pool, cu_seqlens, cu_seqlens_k, mask_words=mask_words
     )
-    tile_spans = plan_dense_tiles(counts, spans, cu_seqlens, tile_queries)
+    tile_spans, bounds = plan_dense_tiles(
+        counts, spans, cu_seqlens, tile_queries, document_bounds=True
+    )
 
     bits = 32 * mask_words
     query_offsets = cu_seqlens.tolist() if packed else [0, tokens]
     key_offsets = cu_seqlens_k.tolist() if packed else [0, pool]
     num_tiles = triton.cdiv(tokens, tile_queries)
+    expected_bounds = [
+        [num_tiles, -1, -1] for _ in range(len(query_offsets) - 1 if packed else batch)
+    ]
     masks, spans, tile_spans = masks.cpu(), spans.cpu(), tile_spans.cpu()
     for b in range(batch):
         query_spans = []
@@ -687,6 +708,12 @@ def test_dense_tile_plan_matches_recount(packed):
                 and (not packed or members[0][0] == members[-1][0])
             )
             assert tile_spans[b, tile].tolist() == [span_lo, span_hi if dense else -1]
+            if dense:
+                document_bounds = expected_bounds[members[0][0] if packed else b]
+                document_bounds[0] = min(document_bounds[0], tile)
+                document_bounds[1] = max(document_bounds[1], tile)
+                document_bounds[2] = max(document_bounds[2], span_hi)
+    assert bounds.tolist() == expected_bounds
     assert 0 < (tile_spans[..., 1] >= 0).sum() < tile_spans[..., 1].numel()
 
 
@@ -776,51 +803,65 @@ def test_tile_query_map_counts_every_valid_selection(packed, dtype, dense, wide_
 @pytest.mark.parametrize(
     "separate_values", [False, True], ids=["shared-values", "separate-values"]
 )
-def test_unselected_keys_get_zero_gradients(separate_values):
+@pytest.mark.parametrize("path", ["gather", "dense"])
+def test_unselected_keys_get_zero_gradients(monkeypatch, separate_values, path):
     """Keys no query selects keep zero dK/dV even when they share a key tile with selected
     keys and hold NaN, as inactive pool capacity may. A nonfinite delta (rowsum(dO * O)) in one
-    document also stays out of another document's keys in the same tile."""
+    document also stays out of keys it did not select, including another document's keys in
+    the same tile.
+
+    ``gather`` turns dense tiles off; ``dense`` plans dense tiles in both documents, whose
+    spans cover the unselected keys between their selections."""
+    if path == "gather":
+        for module in (forward, backward):
+            monkeypatch.setattr(module, "dense_tile_shape", lambda *args: None)
     generator = torch.Generator(device="cuda").manual_seed(0)
 
     def randn(*shape):
         return torch.randn(*shape, device="cuda", dtype=torch.bfloat16, generator=generator)
 
     heads, kv_heads, head_dim, tokens, pool_rows = 24, 2, 64, 64, 96
-    query = randn(1, heads, tokens, head_dim)
     pools = [randn(1, kv_heads, pool_rows, head_dim) for _ in range(1 + separate_values)]
     # Documents of 36 and 28 queries over 36 and 30 keys: rows 66 onward are inactive capacity.
     # Row 33, which document 0 selects, makes that document's outputs and deltas NaN.
     for pool in pools:
         pool[:, :, 66:] = float("nan")
         pool[:, :, 33] = float("nan")
-    kv_indices = torch.full((1, tokens, 2), -1, device="cuda")
-    kv_indices[0, :, 0] = 0
-    # Row 33 (document 0) and row 36 (document 1) share the key tile of rows 32-63; row 65
-    # (document 1's local 29) shares its tile with the capacity.
-    kv_indices[0, :36, 1] = 33
-    kv_indices[0, 36:, 1] = 29
-    leaves = [tensor.requires_grad_() for tensor in (query, *pools)]
-    grad_output = randn(*query.shape)
-    output = gather_attn(
-        query,
-        None,
-        pools[0],
-        kv_indices,
-        sliding_window_size=0,
-        sparse_v=pools[-1] if separate_values else None,
-        cu_seqlens=cumulative_sequence_offsets([36, 28]),
-        cu_seqlens_k=cumulative_sequence_offsets([36, 30]),
-        kernel_options={"backend": "triton"},
-    )
-    pool_gradients = torch.autograd.grad(output, leaves, grad_output)[1:]
+    # Every fourth key plus the document's last: rows 0, 4, ..., 32, 33 for document 0 and
+    # 36, 40, ..., 64, 65 for document 1. Rows 32-63 hold both documents' keys, and rows 64
+    # and 65 share their tile with the capacity.
+    kv_indices = torch.full((1, tokens, 16), -1, device="cuda")
     unselected = torch.ones(pool_rows, dtype=torch.bool, device="cuda")
-    unselected[[0, 33, 36, 65]] = False
+    for start, stop, last in ((0, 36, 33), (36, 64, 29)):
+        local = list(range(0, last, 4)) + [last]
+        kv_indices[0, start:stop, : len(local)] = torch.tensor(local, device="cuda")
+        unselected[[start + index for index in local]] = False
+    inputs = {
+        "query": randn(1, heads, tokens, head_dim),
+        "local_kv": None,
+        "sparse_kv": pools[0],
+        "kv_indices": kv_indices,
+        "sparse_v": pools[-1] if separate_values else None,
+    }
+    options = {
+        "sliding_window_size": 0,
+        "cu_seqlens": cumulative_sequence_offsets([36, 28]),
+        "cu_seqlens_k": cumulative_sequence_offsets([36, 30]),
+        "kernel_options": {"backend": "triton"},
+    }
+    if path == "dense":
+        dense = _planned_tile_spans(inputs, options)[0, :, 1] >= 0
+        # Tiles of 10 queries: 0-2 lie in document 0 and 4-5 in document 1.
+        assert dense[[0, 1, 2, 4, 5]].all(), dense
+    leaves = [tensor.requires_grad_() for tensor in (inputs["query"], *pools)]
+    output = gather_attn(**inputs, **options)
+    pool_gradients = torch.autograd.grad(output, leaves, randn(*output.shape))[1:]
     for gradient in pool_gradients:
         assert torch.equal(
             gradient[:, :, unselected], torch.zeros_like(gradient[:, :, unselected])
         )
-        # Only document 1's queries, whose deltas are finite, select rows 36 and 65.
-        assert gradient[:, :, [36, 65]].isfinite().all()
+        # Only document 1's queries, whose deltas are finite, select rows 36 onward.
+        assert gradient[:, :, 36:66].isfinite().all()
 
 
 def test_resolver_reuses_one_binary_across_shapes(triton_compiles):
@@ -852,7 +893,8 @@ def test_dense_tile_kernels_reuse_one_binary_across_shapes(triton_compiles):
     each dense-tile kernel across Triton's == 1 and multiple-of-16 classes.
 
     Heads, head dim, and top-k stay fixed, so the tile shape and kernel config do too: groups
-    of 12 make 10-query tiles.
+    of 12 make 10-query tiles. The planner builds one binary for the forward and one with
+    the backward's document bounds.
     """
     # (S, tiles, documents, pool): (1, 1, 1, 1), (16, 2, 2, 16), (160, 16, 16, 208),
     # (37, 4, 3, 49), (320, 32, 10, 350).
@@ -873,35 +915,45 @@ def test_dense_tile_kernels_reuse_one_binary_across_shapes(triton_compiles):
             separate_values=True,
             dtype=torch.bfloat16,
         )
-        gather_attn(
+        leaves = [
+            tensor.requires_grad_() for tensor in inputs.values() if tensor.is_floating_point()
+        ]
+        output = gather_attn(
             **inputs,
             sliding_window_size=0,
             cu_seqlens=cumulative_sequence_offsets(documents),
             cu_seqlens_k=cumulative_sequence_offsets(key_lengths),
             kernel_options={"backend": "triton"},
         )
-    assert triton_compiles["_plan_dense_tiles"] == 1
-    assert triton_compiles["_gather_attn_fwd_dense"] == 1
+        torch.autograd.grad(output, leaves, torch.randn_like(output))
+    assert triton_compiles["_plan_dense_tiles"] == 2
+    for kernel in (
+        "_gather_attn_fwd_dense",
+        "_gather_attn_bwd_dq_dense",
+        "_gather_attn_bwd_dsparse_kv_dense",
+    ):
+        assert triton_compiles[kernel] == 1, kernel
 
 
 @pytest.mark.xfail(
     raises=AssertionError,
     strict=True,
-    reason="dense tiles multiply unselected values by zero probabilities",
+    reason="dense tiles multiply unselected rows by zero probabilities and dS",
 )
-def test_dense_tiles_ignore_unselected_nan_values():
-    """A NaN in a value row no query selects leaves the output finite.
+@pytest.mark.parametrize("poisoned", ["values", "keys"])
+def test_dense_tiles_ignore_unselected_nan_rows(poisoned):
+    """A NaN in a pool row no query selects leaves the output and dQ finite.
 
     Every query selects only key 1, so the one dense tile's span is [1, 1], but its first
-    K/V tile starts at key 0: 0 * NaN poisons P @ V.
+    K/V tile starts at key 0: 0 * NaN poisons P @ V with a NaN value and dS @ K with a NaN key.
     """
     query = torch.randn(1, 24, 10, 64, device="cuda", dtype=torch.bfloat16)
     keys = torch.randn(1, 2, 2, 64, device="cuda", dtype=torch.bfloat16)
     values = torch.randn_like(keys)
-    values[:, :, 0] = torch.nan
+    (values if poisoned == "values" else keys)[:, :, 0] = torch.nan
     indices = torch.ones(1, 10, 1, device="cuda", dtype=torch.int64)
     output = gather_attn(
-        query,
+        query.requires_grad_(),
         None,
         keys,
         indices,
@@ -909,7 +961,9 @@ def test_dense_tiles_ignore_unselected_nan_values():
         sliding_window_size=0,
         kernel_options={"backend": "triton"},
     )
+    (grad_query,) = torch.autograd.grad(output, query, torch.randn_like(output))
     assert output.isfinite().all()
+    assert grad_query.isfinite().all()
 
 
 @pytest.mark.parametrize(
