@@ -37,7 +37,8 @@ Output order and tie-breaking are unspecified, including between repeated calls.
   and is intended for correctness checks and small inputs.
 - `impl="fused"` (the default) selects **CuTe on SM100/SM103**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
-  keep their selection state on chip. CuTe separates score generation from radix Top-K and
+  keep their selection state on chip. CuTe generates scores with
+  [warpdrive](warpdrive/index.md) TMA/MMA/epilogue kernels, separately from radix Top-K, and
   reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
   batch size. Large inputs are processed in slabs rather than an unbounded quadratic score
   allocation. This scratch is additional to the returned indices; Triton needs no global
