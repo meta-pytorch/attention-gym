@@ -10,7 +10,9 @@ from triton.tools.tensor_descriptor import TensorDescriptor
 from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
+from ..routing import uses_grouped_schedule
 from .forward import ROPE_REQUIREMENTS
+from .key_major_backward import _gather_attn_bwd_dsparse_kv_grouped, build_tile_query_map
 from .primitives import (
     TileConfig,
     can_use_shared_kv_schedule,
@@ -20,11 +22,13 @@ from .primitives import (
     offset_strides,
     optional_strides,
     prune_wide_backward_configs,
+    resolve_selected_rows,
     select_tiles,
     store_bhsd,
     tuning_key,
 )
 from .shared_backward import (
+    BWD_DQ_GROUPED,
     BWD_DQ_SHARED,
     BWD_DSPARSE_KV_SHARED,
     BWD_DSPARSE_KV_SHARED_ATOMIC,
@@ -204,6 +208,7 @@ def _gather_attn_bwd_dq(
 def _gather_attn_bwd_dlocal_kv(
     query_ptr,
     local_kv_ptr,
+    local_v_ptr,
     query_rope_ptr,
     local_rope_ptr,
     cu_seqlens_ptr,
@@ -212,16 +217,21 @@ def _gather_attn_bwd_dlocal_kv(
     grad_output_ptr,
     lse_ptr,
     grad_local_kv_ptr,
+    grad_local_v_ptr,
     grad_local_rope_ptr,
     QUERY_STRIDES,
     LOCAL_KV_STRIDES,
+    LOCAL_V_STRIDES,
     GRAD_LOCAL_KV_STRIDES,
+    GRAD_LOCAL_V_STRIDES,
     QUERY_ROPE_STRIDES,
     LOCAL_ROPE_STRIDES,
     GRAD_LOCAL_ROPE_STRIDES,
     num_documents,
     LSE_STRIDES,
     H: tl.constexpr,
+    GROUP: tl.constexpr,
+    V_IS_K: tl.constexpr,
     S,
     D: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -236,13 +246,20 @@ def _gather_attn_bwd_dlocal_kv(
 ):
     """Backward for dKV (local sliding window).
 
-    With ROPE_DIM, key-only query and local RoPE tensors join the scores, and the local RoPE
-    receives only dS^T Q_rope.
+    Each program writes its query head's partial gradient; query head h reads KV head
+    h // GROUP, and the launcher sums each group's partials. With V_IS_K the key and value
+    gradients add into one dKV; otherwise dK and dV are written separately. With ROPE_DIM
+    (GROUP == 1 and V_IS_K only), key-only query and local RoPE tensors join the scores, and
+    the local RoPE receives only dS^T Q_rope.
     """
+    tl.static_assert(not ROPE_DIM or (GROUP == 1 and V_IS_K))
     S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
     LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
     GRAD_LOCAL_KV_STRIDES = offset_strides(GRAD_LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+    if not V_IS_K:
+        LOCAL_V_STRIDES = offset_strides(LOCAL_V_STRIDES, USE_INT64_OFFSETS)
+        GRAD_LOCAL_V_STRIDES = offset_strides(GRAD_LOCAL_V_STRIDES, USE_INT64_OFFSETS)
     LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
     if ROPE_DIM:
         QUERY_ROPE_STRIDES = offset_strides(QUERY_ROPE_STRIDES, USE_INT64_OFFSETS)
@@ -256,6 +273,10 @@ def _gather_attn_bwd_dlocal_kv(
         batch_head = batch_head.to(tl.int64)
     head = batch_head % H
     batch = batch_head // H
+    if GROUP == 1:
+        kv_head = head
+    else:
+        kv_head = head // GROUP
 
     offsets_n = key_block * BLOCK_N + tl.arange(0, BLOCK_N)
     offsets_d = tl.arange(0, BLOCK_D)
@@ -266,11 +287,23 @@ def _gather_attn_bwd_dlocal_kv(
         local_kv_ptr,
         LOCAL_KV_STRIDES,
         batch,
-        head,
+        kv_head,
         offsets_n,
         offsets_d,
         key_mask[:, None] & dimension_mask[None, :],
     )
+    if V_IS_K:
+        local_v = local_values
+    else:
+        local_v = load_bhsd(
+            local_v_ptr,
+            LOCAL_V_STRIDES,
+            batch,
+            kv_head,
+            offsets_n,
+            offsets_d,
+            key_mask[:, None] & dimension_mask[None, :],
+        )
     if ROPE_DIM:
         offsets_rope = tl.arange(0, ROPE_DIM)
         local_rope = load_bhsd(
@@ -290,6 +323,8 @@ def _gather_attn_bwd_dlocal_kv(
         )
 
     grad_values = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
+    if not V_IS_K:
+        grad_keys = tl.zeros((BLOCK_N, BLOCK_D), tl.float32)
     first_query = key_block * BLOCK_N
     offsets_m_base = tl.arange(0, BLOCK_M)
 
@@ -330,7 +365,7 @@ def _gather_attn_bwd_dlocal_kv(
 
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
-        grad_probabilities = tl.dot(grad_output, tl.trans(local_values), input_precision="tf32x3")
+        grad_probabilities = tl.dot(grad_output, tl.trans(local_v), input_precision="tf32x3")
         # A masked query may have a nonfinite delta from another document.
         grad_scores = tl.where(valid, probabilities * (grad_probabilities - delta[:, None]), 0.0)
         grad_values += tl.dot(
@@ -338,7 +373,7 @@ def _gather_attn_bwd_dlocal_kv(
             grad_output,
             input_precision="tf32x3",
         )
-        grad_values += (
+        grad_key_tile = (
             tl.dot(
                 tl.trans(grad_scores.to(query.dtype)),
                 query,
@@ -346,6 +381,10 @@ def _gather_attn_bwd_dlocal_kv(
             )
             * SCALE
         )
+        if V_IS_K:
+            grad_values += grad_key_tile
+        else:
+            grad_keys += grad_key_tile
         if ROPE_DIM:
             grad_rope += (
                 tl.dot(
@@ -358,7 +397,7 @@ def _gather_attn_bwd_dlocal_kv(
 
     store_bhsd(
         grad_local_kv_ptr,
-        grad_values,
+        grad_values if V_IS_K else grad_keys,
         GRAD_LOCAL_KV_STRIDES,
         batch,
         head,
@@ -366,6 +405,17 @@ def _gather_attn_bwd_dlocal_kv(
         offsets_d,
         key_mask[:, None] & dimension_mask[None, :],
     )
+    if not V_IS_K:
+        store_bhsd(
+            grad_local_v_ptr,
+            grad_values,
+            GRAD_LOCAL_V_STRIDES,
+            batch,
+            head,
+            offsets_n,
+            offsets_d,
+            key_mask[:, None] & dimension_mask[None, :],
+        )
     if ROPE_DIM:
         store_bhsd(
             grad_local_rope_ptr,
@@ -753,24 +803,50 @@ def _launch_backward(
     share_kv: bool,
     scale: float,
     *,
+    kv_heads: int,
+    sparse_v: torch.Tensor | None = None,
+    local_v: torch.Tensor | None = None,
     query_rope: torch.Tensor | None = None,
     sparse_rope: torch.Tensor | None = None,
     local_rope: torch.Tensor | None = None,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor | None,
-    torch.Tensor,
-]:
+) -> tuple[torch.Tensor | None, ...]:
     """Launch backward kernels for gather attention.
 
-    Returns ``(dq, dsparse, dlocal, dq_rope, dsparse_rope, dlocal_rope, dsink)``; a gradient
-    is None exactly when its input is. Key-only RoPE runs only on the shared-KV schedule,
-    whose sparse gradients are atomic, so the reverse query map may be None.
+    Returns ``(dq, dsparse, dlocal, dq_rope, dsparse_rope, dlocal_rope, dsink, dsparse_v,
+    dlocal_v)``; a gradient is None exactly when its input is. ``kv_heads`` is the KV head
+    count before the op broadcasts a single shared head; separate values or
+    1 < kv_heads < heads run on the grouped schedule. Key-only RoPE runs only on the
+    shared-KV schedule, whose sparse gradients are atomic, so the reverse query map may be
+    None.
     """
+    if uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None):
+        dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v = _launch_grouped_backward(
+            query,
+            sparse_kv,
+            local_kv,
+            kv_indices,
+            attention_sink,
+            cu_seqlens,
+            cu_seqlens_k,
+            output,
+            lse,
+            grad_output,
+            sliding_window_size,
+            scale,
+            kv_heads=kv_heads,
+            sparse_v=sparse_v,
+            local_v=local_v,
+        )
+        # Zero-width RoPE pairs add nothing to the scores; their gradients are empty.
+        rope_grads = (
+            None if rope is None else rope.new_empty((*rope.shape[:1], heads, *rope.shape[2:]))
+            for rope, heads in (
+                (query_rope, query.shape[1]),
+                (sparse_rope, kv_heads),
+                (local_rope, kv_heads),
+            )
+        )
+        return (dq, dsparse, dlocal, *rope_grads, dsink, dsparse_v, dlocal_v)
     if query_rope is not None and query_rope.shape[-1] == 0:
         # Zero-width RoPE adds nothing to the scores; its gradients are empty.
         grads = _launch_backward(
@@ -789,6 +865,7 @@ def _launch_backward(
             sliding_window_size,
             share_kv,
             scale,
+            kv_heads=kv_heads,
         )
         kv_heads = 1 if share_kv else query.shape[1]
         rope_grads = (
@@ -799,7 +876,7 @@ def _launch_backward(
                 (local_rope, kv_heads),
             )
         )
-        return (*grads[:3], *rope_grads, grads[-1])
+        return (*grads[:3], *rope_grads, *grads[6:])
 
     batch, heads, seq_len, head_dim = query.shape
     sparse_seq_len = sparse_kv.shape[2]
@@ -873,10 +950,13 @@ def _launch_backward(
             query,
             sparse_kv,
             kernel_local_kv,
+            sparse_kv,
+            kernel_local_kv,
             query_rope,
             sparse_rope,
             kernel_local_rope,
             kv_indices,
+            None,
             cu_seqlens,
             cu_seqlens_k,
             output,
@@ -886,9 +966,12 @@ def _launch_backward(
             grad_query,
             grad_query_rope,
             grad_sink_partials,
+            None,
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
             LOCAL_KV_STRIDES=optional_strides(kernel_local_kv),
+            SPARSE_V_STRIDES=sparse_kv.stride(),
+            LOCAL_V_STRIDES=optional_strides(kernel_local_kv),
             QUERY_ROPE_STRIDES=optional_strides(query_rope),
             SPARSE_ROPE_STRIDES=optional_strides(sparse_rope),
             LOCAL_ROPE_STRIDES=optional_strides(kernel_local_rope),
@@ -897,6 +980,9 @@ def _launch_backward(
             LSE_STRIDES=lse.stride(),
             GRAD_SINK_PARTIALS_STRIDES=grad_sink_partials.stride(),
             H=heads,
+            KV_HEADS=1,
+            V_IS_K=True,
+            STORE_DELTA=False,
             S=seq_len,
             D=head_dim,
             ROPE_DIM=rope_dim,
@@ -909,6 +995,8 @@ def _launch_backward(
             BLOCK_H=block_h,
             BLOCK_K=block_k,
             BLOCK_D=block_d,
+            SPARSE_STAGES=2,
+            RESOLVED_INDICES=False,
         )
     else:
         # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
@@ -1006,6 +1094,7 @@ def _launch_backward(
             _gather_attn_bwd_dlocal_kv[local_grid](
                 query,
                 local_kv,
+                local_kv,
                 query_rope,
                 kernel_local_rope,
                 cu_seqlens,
@@ -1014,16 +1103,21 @@ def _launch_backward(
                 grad_output,
                 lse,
                 grad_local_kv,
+                grad_local_kv,
                 grad_local_rope if rope_dim else None,
                 QUERY_STRIDES=query.stride(),
                 LOCAL_KV_STRIDES=local_kv.stride(),
+                LOCAL_V_STRIDES=local_kv.stride(),
                 GRAD_LOCAL_KV_STRIDES=grad_local_kv.stride(),
+                GRAD_LOCAL_V_STRIDES=grad_local_kv.stride(),
                 QUERY_ROPE_STRIDES=optional_strides(query_rope),
                 LOCAL_ROPE_STRIDES=optional_strides(kernel_local_rope),
                 GRAD_LOCAL_ROPE_STRIDES=optional_strides(grad_local_rope) if rope_dim else None,
                 num_documents=num_documents,
                 LSE_STRIDES=lse.stride(),
                 H=heads,
+                GROUP=1,
+                V_IS_K=True,
                 S=seq_len,
                 D=head_dim,
                 ROPE_DIM=rope_dim,
@@ -1165,4 +1259,276 @@ def _launch_backward(
         grad_sparse_rope,
         grad_local_rope,
         grad_sink_fp32.to(attention_sink.dtype),
+        None,
+        None,
+    )
+
+
+def _launch_grouped_backward(
+    query: torch.Tensor,
+    sparse_kv: torch.Tensor,
+    local_kv: torch.Tensor | None,
+    kv_indices: torch.Tensor,
+    attention_sink: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    cu_seqlens_k: torch.Tensor | None,
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    grad_output: torch.Tensor,
+    sliding_window_size: int,
+    scale: float,
+    *,
+    kv_heads: int,
+    sparse_v: torch.Tensor | None,
+    local_v: torch.Tensor | None,
+) -> tuple[torch.Tensor, ...]:
+    """Backward for separate values or grouped KV heads, mirroring the grouped forward.
+
+    dQ reuses each gathered KV row across a query-head group. Sparse dK/dV is key-major
+    (see ``key_major_backward``) and deterministic, so it needs no query map from the forward.
+    Local gradients write one partial per query head, which is summed over each KV
+    head's group here instead of with atomics. Returns
+    ``(dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v)``; a gradient is None exactly when its
+    input is. Local tensors are not read without a window.
+    """
+    batch, heads, seq_len, head_dim = query.shape
+    group = heads // kv_heads
+    sparse_seq_len = sparse_kv.shape[2]
+    topk = kv_indices.shape[-1]
+    block_d = max(16, triton.next_power_of_2(head_dim))
+    v_is_k = sparse_v is None
+    window = sliding_window_size
+    # Kernels never read local tensors without a window.
+    kernel_local_kv = local_kv if window else None
+    sparse_values = sparse_kv if v_is_k else sparse_v
+    local_values = kernel_local_kv if v_is_k or not window else local_v
+    grad_output = grad_output.contiguous()
+    has_cu_seqlens = cu_seqlens is not None
+    num_documents = cu_seqlens.numel() - 1 if has_cu_seqlens else 0
+    use_int64_offsets = requires_int64_offsets(
+        query,
+        sparse_kv,
+        kernel_local_kv,
+        sparse_v,
+        local_values if window else None,
+        kv_indices,
+        output,
+        grad_output,
+        lse,
+        cu_seqlens,
+        cu_seqlens_k,
+    )
+
+    def sum_groups(per_head: torch.Tensor) -> torch.Tensor:
+        """Reduce [B, H, N, D] query-head partials to [B, kv_heads, N, D]."""
+        return per_head.view(batch, kv_heads, group, *per_head.shape[2:]).sum(dim=2)
+
+    # tl.dot needs at least 16 rows; partial head tiles are masked.
+    block_h = 16 if head_dim > 128 else max(16, min(32, triton.next_power_of_2(group)))
+    grad_query = torch.empty(query.shape, dtype=query.dtype, device=query.device)
+    grad_sink_partials = torch.empty(
+        (batch, heads, seq_len), dtype=torch.float32, device=query.device
+    )
+    sparse_backward = topk > 0 and sparse_seq_len > 0
+    tile = 32
+    # Recomputed rather than saved from the forward, which would hold the rows (hundreds of MB
+    # at 32k tokens) between passes.
+    selected_rows, selected_counts = resolve_selected_rows(
+        kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k
+    )
+    # rowsum(dO * O) for the key-major sparse pass, laid out like the LSE.
+    delta = torch.empty(lse.shape, dtype=lse.dtype, device=lse.device) if sparse_backward else None
+    BWD_DQ_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
+        query,
+        sparse_kv,
+        kernel_local_kv,
+        sparse_values,
+        local_values,
+        None,
+        None,
+        None,
+        selected_rows,
+        selected_counts,
+        cu_seqlens,
+        cu_seqlens_k,
+        output,
+        grad_output,
+        lse,
+        attention_sink,
+        grad_query,
+        None,
+        grad_sink_partials,
+        delta,
+        QUERY_STRIDES=query.stride(),
+        SPARSE_KV_STRIDES=sparse_kv.stride(),
+        LOCAL_KV_STRIDES=optional_strides(kernel_local_kv),
+        SPARSE_V_STRIDES=sparse_values.stride(),
+        LOCAL_V_STRIDES=optional_strides(local_values),
+        QUERY_ROPE_STRIDES=None,
+        SPARSE_ROPE_STRIDES=None,
+        LOCAL_ROPE_STRIDES=None,
+        KV_INDICES_STRIDES=selected_rows.stride(),
+        num_documents=num_documents,
+        LSE_STRIDES=lse.stride(),
+        GRAD_SINK_PARTIALS_STRIDES=grad_sink_partials.stride(),
+        H=heads,
+        KV_HEADS=kv_heads,
+        V_IS_K=v_is_k,
+        # Only the key-major pass reads the rowsum.
+        STORE_DELTA=sparse_backward,
+        S=seq_len,
+        D=head_dim,
+        ROPE_DIM=0,
+        SPARSE_SEQ_LEN=sparse_seq_len,
+        TOPK=topk,
+        WINDOW=sliding_window_size,
+        SCALE=scale,
+        HAS_CU_SEQLENS=has_cu_seqlens,
+        USE_INT64_OFFSETS=use_int64_offsets,
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        RESOLVED_INDICES=True,
+    )
+    grad_sink = grad_sink_partials.sum(dim=(0, 2)).to(attention_sink.dtype)
+
+    local_shape = (batch, kv_heads, seq_len, head_dim)
+    if not window:
+        # A pool passed without a window gets a zero gradient; an absent one gets None.
+        grad_local_kv, grad_local_v = (
+            None
+            if tensor is None
+            else torch.zeros(local_shape, dtype=tensor.dtype, device=tensor.device)
+            for tensor in (local_kv, local_v)
+        )
+    else:
+        block_m, block_n, num_warps, num_stages, *_ = select_tiles(
+            GENERIC_DLOCAL_KV_TILES, block_d, query.element_size(), query.device
+        )
+        partial_local_kv = torch.empty(query.shape, dtype=local_kv.dtype, device=local_kv.device)
+        partial_local_v = (
+            partial_local_kv
+            if v_is_k
+            else torch.empty(query.shape, dtype=local_kv.dtype, device=local_kv.device)
+        )
+        _gather_attn_bwd_dlocal_kv[(triton.cdiv(seq_len, block_n), batch * heads)](
+            query,
+            local_kv,
+            local_values,
+            None,
+            None,
+            cu_seqlens,
+            cu_seqlens_k,
+            output,
+            grad_output,
+            lse,
+            partial_local_kv,
+            partial_local_v,
+            None,
+            QUERY_STRIDES=query.stride(),
+            LOCAL_KV_STRIDES=local_kv.stride(),
+            LOCAL_V_STRIDES=local_values.stride(),
+            GRAD_LOCAL_KV_STRIDES=partial_local_kv.stride(),
+            GRAD_LOCAL_V_STRIDES=partial_local_v.stride(),
+            QUERY_ROPE_STRIDES=None,
+            LOCAL_ROPE_STRIDES=None,
+            GRAD_LOCAL_ROPE_STRIDES=None,
+            num_documents=num_documents,
+            LSE_STRIDES=lse.stride(),
+            H=heads,
+            GROUP=group,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            D=head_dim,
+            ROPE_DIM=0,
+            WINDOW=sliding_window_size,
+            SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            USE_INT64_OFFSETS=use_int64_offsets
+            or requires_int64_offsets(partial_local_kv, partial_local_v),
+            NUM_QUERY_TILES=triton.cdiv(sliding_window_size + block_n - 1, block_m),
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_D=block_d,
+            num_warps=num_warps,
+            num_stages=num_stages,
+        )
+        grad_local_kv = sum_groups(partial_local_kv)
+        grad_local_v = None if v_is_k else sum_groups(partial_local_v)
+        # Free the per-head partials before the sparse dK/dV map's sort, the backward's peak.
+        del partial_local_kv, partial_local_v
+
+    sparse_shape = (batch, kv_heads, sparse_seq_len, head_dim)
+    if not sparse_backward:
+        grad_sparse_kv = torch.zeros(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
+        grad_sparse_v = (
+            None
+            if v_is_k
+            else torch.zeros(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
+        )
+    else:
+        # Each program owns its key tile's gradient rows, so this is deterministic.
+        pair_queries, pair_masks, tile_offsets = build_tile_query_map(
+            selected_rows, selected_counts, sparse_seq_len, tile
+        )
+        grad_sparse_kv = torch.empty(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
+        grad_sparse_v = (
+            grad_sparse_kv
+            if v_is_k
+            else torch.empty(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
+        )
+        # TMA gathers need 16-byte-aligned bases, which a contiguous view at an odd
+        # storage offset lacks; a copy gets a fresh, aligned allocation.
+        query_rows, grad_output_rows = (
+            (tensor if can_use_tma(tensor) else tensor.clone()).view(-1, head_dim)
+            for tensor in (query, grad_output)
+        )
+        # Two 4-warp CTAs per SM overlap one CTA's gathers with the other's MMAs; software
+        # pipelining instead needs a third gather buffer and drops to one CTA per SM. 8 warps
+        # were never more than noise faster on B200 and up to 46% slower on 32k-token
+        # documents, so this one fixed config launches without tuning.
+        _gather_attn_bwd_dsparse_kv_grouped[(triton.cdiv(sparse_seq_len, tile), kv_heads, batch)](
+            TensorDescriptor.from_tensor(query_rows, [1, block_d]),
+            sparse_kv,
+            sparse_values,
+            TensorDescriptor.from_tensor(grad_output_rows, [1, block_d]),
+            lse,
+            delta,
+            pair_queries,
+            pair_masks,
+            tile_offsets,
+            grad_sparse_kv,
+            grad_sparse_v,
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_values.stride(),
+            LSE_STRIDES=lse.stride(),
+            PAIR_STRIDES=pair_queries.stride(),
+            TILE_OFFSETS_STRIDES=tile_offsets.stride(),
+            GRAD_SPARSE_KV_STRIDES=grad_sparse_kv.stride(),
+            GRAD_SPARSE_V_STRIDES=grad_sparse_v.stride(),
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            D=head_dim,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            SCALE=scale,
+            # Rows enumerate (pair, group head) and pair offsets span the batch, both bounded
+            # by the map's capacity (seq_len * topk padded to 16).
+            USE_INT64_OFFSETS=use_int64_offsets
+            or requires_int64_offsets(grad_sparse_kv, grad_sparse_v)
+            or triton.cdiv(seq_len * topk, 16) * 16 * max(group, batch) >= 2**31,
+            TILE=tile,
+            BLOCK_M=64,
+            BLOCK_D=block_d,
+            num_warps=4,
+            num_stages=1,
+        )
+
+    return (
+        grad_query,
+        grad_sparse_kv,
+        grad_local_kv,
+        grad_sink,
+        None if v_is_k else grad_sparse_v,
+        None if v_is_k else grad_local_v,
     )
