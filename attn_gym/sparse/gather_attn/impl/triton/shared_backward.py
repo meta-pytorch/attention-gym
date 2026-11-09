@@ -423,10 +423,20 @@ def _gather_attn_bwd_dq_shared(
     )
 
 
-@triton.jit(do_not_specialize_on_alignment=["num_documents", "SPARSE_SEQ_LEN"])
+@triton.jit(
+    do_not_specialize=[
+        "KV_INDICES_BATCH_STRIDE",
+        "num_documents",
+        "LSE_BATCH_STRIDE",
+        "LSE_HEAD_STRIDE",
+        "S",
+        "SPARSE_SEQ_LEN",
+    ]
+)
 def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_ptr,
     sparse_kv_ptr,
+    sparse_v_ptr,
     query_rope_ptr,
     sparse_rope_ptr,
     kv_indices_ptr,
@@ -436,17 +446,25 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     grad_output_ptr,
     lse_ptr,
     grad_sparse_kv_ptr,
+    grad_sparse_v_ptr,
     grad_sparse_rope_ptr,
     QUERY_STRIDES,
     SPARSE_KV_STRIDES,
+    SPARSE_V_STRIDES,
     QUERY_ROPE_STRIDES,
     SPARSE_ROPE_STRIDES,
+    KV_INDICES_BATCH_STRIDE,
     KV_INDICES_STRIDES,
     num_documents,
+    LSE_BATCH_STRIDE,
+    LSE_HEAD_STRIDE,
     LSE_STRIDES,
     GRAD_SPARSE_KV_STRIDES,
+    GRAD_SPARSE_V_STRIDES,
     GRAD_SPARSE_ROPE_STRIDES,
     H: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    V_IS_K: tl.constexpr,
     S,
     D: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -458,18 +476,33 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     BLOCK_H: tl.constexpr,
     BLOCK_K: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    tile_spans_ptr=None,
+    DENSE_TILE_QUERIES: tl.constexpr = 0,
 ):
-    """Atomically scatter one query's sparse-KV gradient tile into shared dKV.
+    """Atomically scatter one query's sparse-KV gradient tile into its KV head's dKV.
 
-    D is the latent width; with ROPE_DIM the key-only sparse RoPE receives only dS^T Q_rope.
+    Head blocks map to KV heads as in the shared forward schedule. With V_IS_K the key and
+    value gradients add into one shared dKV; otherwise dK and dV scatter separately.
+    DENSE_TILE_QUERIES skips queries whose gradients ``_gather_attn_bwd_dsparse_kv_dense``
+    already wrote. With ROPE_DIM (one shared KV head that is also V) the key-only sparse RoPE
+    receives only dS^T Q_rope.
     """
+    tl.static_assert(not ROPE_DIM or (KV_HEADS == 1 and V_IS_K))
     S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
     SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
-    KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
-    LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
+    KV_INDICES_STRIDES = offset_strides(
+        (KV_INDICES_BATCH_STRIDE, KV_INDICES_STRIDES[0], KV_INDICES_STRIDES[1]),
+        USE_INT64_OFFSETS,
+    )
+    LSE_STRIDES = offset_strides(
+        (LSE_BATCH_STRIDE, LSE_HEAD_STRIDE, LSE_STRIDES[0]), USE_INT64_OFFSETS
+    )
     GRAD_SPARSE_KV_STRIDES = offset_strides(GRAD_SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    if not V_IS_K:
+        SPARSE_V_STRIDES = offset_strides(SPARSE_V_STRIDES, USE_INT64_OFFSETS)
+        GRAD_SPARSE_V_STRIDES = offset_strides(GRAD_SPARSE_V_STRIDES, USE_INT64_OFFSETS)
     if ROPE_DIM:
         QUERY_ROPE_STRIDES = offset_strides(QUERY_ROPE_STRIDES, USE_INT64_OFFSETS)
         SPARSE_ROPE_STRIDES = offset_strides(SPARSE_ROPE_STRIDES, USE_INT64_OFFSETS)
@@ -478,14 +511,15 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     query_position = tl.program_id(0)
     batch = tl.program_id(1)
     tile = tl.program_id(2)
+    if in_dense_tile(tile_spans_ptr, batch, query_position, S, DENSE_TILE_QUERIES):
+        return
     num_selected_tiles = tl.cdiv(TOPK, BLOCK_K)
     head_block = tile // num_selected_tiles
     selected_block = tile % num_selected_tiles
 
-    offsets_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    kv_head, offsets_h, head_mask = head_block_heads(head_block, H, KV_HEADS, BLOCK_H)
     offsets_k = selected_block * BLOCK_K + tl.arange(0, BLOCK_K)
     offsets_d = tl.arange(0, BLOCK_D)
-    head_mask = offsets_h < H
     selected_mask = offsets_k < TOPK
     dimension_mask = offsets_d < D
 
@@ -525,15 +559,28 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
         mask=head_mask,
         other=0.0,
     )
+    selected_dimension_mask = selected_valid[:, None] & dimension_mask[None, :]
     sparse_values = tl.load(
         sparse_kv_ptr
         + ptr_offset(
-            (batch, 0, selected_indices[:, None], offsets_d[None, :]),
+            (batch, kv_head, selected_indices[:, None], offsets_d[None, :]),
             SPARSE_KV_STRIDES,
         ),
-        mask=selected_valid[:, None] & dimension_mask[None, :],
+        mask=selected_dimension_mask,
         other=0.0,
     )
+    if V_IS_K:
+        sparse_v = sparse_values
+    else:
+        sparse_v = tl.load(
+            sparse_v_ptr
+            + ptr_offset(
+                (batch, kv_head, selected_indices[:, None], offsets_d[None, :]),
+                SPARSE_V_STRIDES,
+            ),
+            mask=selected_dimension_mask,
+            other=0.0,
+        )
 
     scores = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3")
     if ROPE_DIM:
@@ -565,31 +612,60 @@ def _gather_attn_bwd_dsparse_kv_shared_atomic(
     )
     grad_probabilities = tl.dot(
         grad_output,
-        tl.trans(sparse_values),
+        tl.trans(sparse_v),
         input_precision="tf32x3",
     )
     delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
     grad_scores = probabilities * (grad_probabilities - delta[:, None])
-    grad_values = tl.dot(
-        tl.trans(probabilities.to(grad_output.dtype)),
-        grad_output,
-        input_precision="tf32x3",
-    )
-    grad_values += tl.dot(
-        tl.trans((grad_scores * SCALE).to(query.dtype)),
-        query,
-        input_precision="tf32x3",
-    )
-
-    tl.atomic_add(
-        grad_sparse_kv_ptr
-        + ptr_offset(
-            (batch, 0, selected_indices[:, None], offsets_d[None, :]),
-            GRAD_SPARSE_KV_STRIDES,
-        ),
-        grad_values,
-        mask=selected_valid[:, None] & dimension_mask[None, :],
-    )
+    if V_IS_K:
+        grad_values = tl.dot(
+            tl.trans(probabilities.to(grad_output.dtype)),
+            grad_output,
+            input_precision="tf32x3",
+        )
+        grad_values += tl.dot(
+            tl.trans((grad_scores * SCALE).to(query.dtype)),
+            query,
+            input_precision="tf32x3",
+        )
+        tl.atomic_add(
+            grad_sparse_kv_ptr
+            + ptr_offset(
+                (batch, kv_head, selected_indices[:, None], offsets_d[None, :]),
+                GRAD_SPARSE_KV_STRIDES,
+            ),
+            grad_values,
+            mask=selected_dimension_mask,
+        )
+    else:
+        grad_value_tile = tl.dot(
+            tl.trans(probabilities.to(grad_output.dtype)),
+            grad_output,
+            input_precision="tf32x3",
+        )
+        grad_key_tile = tl.dot(
+            tl.trans((grad_scores * SCALE).to(query.dtype)),
+            query,
+            input_precision="tf32x3",
+        )
+        tl.atomic_add(
+            grad_sparse_kv_ptr
+            + ptr_offset(
+                (batch, kv_head, selected_indices[:, None], offsets_d[None, :]),
+                GRAD_SPARSE_KV_STRIDES,
+            ),
+            grad_key_tile,
+            mask=selected_dimension_mask,
+        )
+        tl.atomic_add(
+            grad_sparse_v_ptr
+            + ptr_offset(
+                (batch, kv_head, selected_indices[:, None], offsets_d[None, :]),
+                GRAD_SPARSE_V_STRIDES,
+            ),
+            grad_value_tile,
+            mask=selected_dimension_mask,
+        )
     if ROPE_DIM:
         grad_rope = tl.dot(
             tl.trans((grad_scores * SCALE).to(query_rope.dtype)),
@@ -759,6 +835,26 @@ def _zero_grad_sparse_kv(_grid, args):
     return restore
 
 
+def _restore_grad_sparse_kv_and_v(_grid, args):
+    """Restore every atomic output, zeros or the dense tiles' gradients, before each launch.
+
+    With V_IS_K the key and value outputs are the same tensor.
+    """
+    outputs = (
+        args["grad_sparse_kv_ptr"],
+        args["grad_sparse_v_ptr"],
+        args.get("grad_sparse_rope_ptr"),
+    )
+    unique = {id(output): output for output in outputs if output is not None}.values()
+    snapshots = [(output, output.clone()) for output in unique]
+
+    def restore():
+        for output, snapshot in snapshots:
+            output.copy_(snapshot)
+
+    return restore
+
+
 BWD_DQ_SHARED = TritonTuner(
     _gather_attn_bwd_dq_shared,
     [
@@ -836,9 +932,19 @@ BWD_DSPARSE_KV_SHARED_ATOMIC = TritonTuner(
             (32, 64, 8),
         )
     ],
-    key=tuning_key("query_ptr", "H", "D", "ROPE_DIM", "TOPK", "HAS_CU_SEQLENS"),
+    key=tuning_key(
+        "query_ptr",
+        "H",
+        "KV_HEADS",
+        "V_IS_K",
+        "D",
+        "ROPE_DIM",
+        "TOPK",
+        "HAS_CU_SEQLENS",
+        "DENSE_TILE_QUERIES",
+    ),
     prune=prune_wide_backward_configs,
-    reset=_zero_grad_sparse_kv,
+    reset=_restore_grad_sparse_kv_and_v,
 )
 # Different BLOCK_H configs write different partial slots, so stale slots are cleared.
 BWD_DSPARSE_KV_SHARED = TritonTuner(

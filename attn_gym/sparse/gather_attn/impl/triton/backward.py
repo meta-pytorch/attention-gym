@@ -1162,6 +1162,7 @@ def _launch_backward(
         BWD_DSPARSE_KV_SHARED_ATOMIC[sparse_grid](
             query,
             sparse_kv,
+            sparse_kv,
             query_rope,
             sparse_rope,
             kv_indices,
@@ -1171,17 +1172,25 @@ def _launch_backward(
             grad_output,
             lse,
             grad_sparse_kv_fp32,
+            grad_sparse_kv_fp32,
             grad_sparse_rope_fp32,
             QUERY_STRIDES=query.stride(),
             SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_kv.stride(),
             QUERY_ROPE_STRIDES=optional_strides(query_rope),
             SPARSE_ROPE_STRIDES=optional_strides(sparse_rope),
-            KV_INDICES_STRIDES=kv_indices.stride(),
+            KV_INDICES_BATCH_STRIDE=kv_indices.stride(0),
+            KV_INDICES_STRIDES=kv_indices.stride()[1:],
             num_documents=num_documents,
-            LSE_STRIDES=lse.stride(),
+            LSE_BATCH_STRIDE=lse.stride(0),
+            LSE_HEAD_STRIDE=lse.stride(1),
+            LSE_STRIDES=lse.stride()[2:],
             GRAD_SPARSE_KV_STRIDES=grad_sparse_kv_fp32.stride(),
+            GRAD_SPARSE_V_STRIDES=grad_sparse_kv_fp32.stride(),
             GRAD_SPARSE_ROPE_STRIDES=optional_strides(grad_sparse_rope_fp32),
             H=heads,
+            KV_HEADS=1,
+            V_IS_K=True,
             S=seq_len,
             D=head_dim,
             ROPE_DIM=rope_dim,
@@ -1191,6 +1200,7 @@ def _launch_backward(
             HAS_CU_SEQLENS=has_cu_seqlens,
             USE_INT64_OFFSETS=use_int64_offsets,
             BLOCK_D=block_d,
+            DENSE_TILE_QUERIES=0,
         )
         grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
         if rope_dim:
@@ -1268,6 +1278,26 @@ def _launch_backward(
     )
 
 
+def _prefer_atomic_dsparse_kv(
+    group: int, head_dim: int, v_is_k: bool, topk: int, keys_per_document: float, tile: int
+) -> bool:
+    """Whether query-major atomics beat the key-major sparse dK/dV pass.
+
+    Key-major gathers a query's ``group`` rows of Q and dO once per (query, key tile) pair,
+    so it wins when each pair covers several selected keys. Atomics instead gather and add one
+    K (and V) row per selection, which is cheap for small heads. The density is estimated for
+    uniformly random selections, a lower bound for the clustered selections of block-sparse
+    indexers. The threshold, linear in head_dim, comes from B200 sweeps over group (2-32),
+    head_dim (64-256), topk (64-2048), document length (2k-32k), and shared or separate
+    values: the measured crossover is about 3 rows per selection at D=64 and 6 at D=128, and
+    atomics were never more than 3% faster at D=256.
+    """
+    selected = min(1.0, topk / max(1.0, keys_per_document))
+    keys_per_pair = tile * selected / (1 - (1 - selected) ** tile)
+    rows_per_selection = group / (keys_per_pair * (1 if v_is_k else 2))
+    return rows_per_selection >= 3 * head_dim / 64
+
+
 def _launch_grouped_backward(
     query: torch.Tensor,
     sparse_kv: torch.Tensor,
@@ -1289,7 +1319,8 @@ def _launch_grouped_backward(
     """Backward for separate values or grouped KV heads, mirroring the grouped forward.
 
     dQ reuses each gathered KV row across a query-head group. Sparse dK/dV is key-major
-    (see ``key_major_backward``) and deterministic, so it needs no query map from the forward.
+    (see ``key_major_backward``) and deterministic, so it needs no query map from the forward;
+    the default mode switches to query-major atomics for sparse selections over small heads.
     Dense tiles (see ``plan_dense_tiles``) take dQ and their dK/dV share from
     ``dense_backward``, and the gather kernels skip their queries. Local gradients write one
     partial per query head, which is summed over each KV head's group here instead of with
@@ -1324,6 +1355,10 @@ def _launch_grouped_backward(
         cu_seqlens_k,
     )
 
+    def rounded(gradient: torch.Tensor) -> torch.Tensor:
+        """Round an FP32 pool gradient to the pool's dtype."""
+        return gradient.to(sparse_kv.dtype)
+
     def sum_groups(per_head: torch.Tensor) -> torch.Tensor:
         """Reduce [B, H, N, D] query-head partials to [B, kv_heads, N, D]."""
         return per_head.view(batch, kv_heads, group, *per_head.shape[2:]).sum(dim=2)
@@ -1336,6 +1371,13 @@ def _launch_grouped_backward(
     )
     sparse_backward = topk > 0 and sparse_seq_len > 0
     tile = 32
+    use_atomic = (
+        sparse_backward
+        and not torch.are_deterministic_algorithms_enabled()
+        and _prefer_atomic_dsparse_kv(
+            group, head_dim, v_is_k, topk, sparse_seq_len / max(1, num_documents), tile
+        )
+    )
     dense_shape = dense_tile_shape(heads, kv_heads, topk, sliding_window_size)
     tile_queries, mask_words = dense_shape or (0, 0)
     # Recomputed rather than saved from the forward: about 2% of a QSA step against holding
@@ -1344,7 +1386,8 @@ def _launch_grouped_backward(
         kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k, mask_words=mask_words
     )
     # rowsum(dO * O) for the key-major and dense sparse passes, laid out like the LSE.
-    store_delta = sparse_backward or dense_shape is not None
+    key_major = sparse_backward and not use_atomic
+    store_delta = key_major or dense_shape is not None
     delta = torch.empty(lse.shape, dtype=lse.dtype, device=lse.device) if store_delta else None
     tile_spans = None
     num_dense_tiles = 0
@@ -1437,7 +1480,7 @@ def _launch_grouped_backward(
         KV_HEADS=kv_heads,
         V_IS_K=v_is_k,
         # Only the key-major pass reads gather queries' rowsum; dense rows come from BWD_DQ_DENSE.
-        STORE_DELTA=sparse_backward,
+        STORE_DELTA=key_major,
         S=seq_len,
         D=head_dim,
         ROPE_DIM=0,
@@ -1580,6 +1623,74 @@ def _launch_grouped_backward(
             if v_is_k
             else torch.zeros(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
         )
+    elif use_atomic:
+        if grad_dense_kv is not None:
+            grad_sparse_kv_fp32, grad_sparse_v_fp32 = grad_dense_kv, grad_dense_v
+        else:
+            grad_sparse_kv_fp32 = torch.zeros(
+                sparse_shape, dtype=torch.float32, device=sparse_kv.device
+            )
+            grad_sparse_v_fp32 = (
+                grad_sparse_kv_fp32
+                if v_is_k
+                else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
+            )
+        BWD_DSPARSE_KV_SHARED_ATOMIC[
+            lambda meta: (
+                seq_len,
+                batch,
+                kv_heads
+                * triton.cdiv(group, meta["BLOCK_H"])
+                * triton.cdiv(topk, meta["BLOCK_K"]),
+            )
+        ](
+            query,
+            sparse_kv,
+            sparse_values,
+            None,
+            None,
+            kv_indices,
+            cu_seqlens,
+            cu_seqlens_k,
+            output,
+            grad_output,
+            lse,
+            grad_sparse_kv_fp32,
+            grad_sparse_v_fp32,
+            None,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_values.stride(),
+            QUERY_ROPE_STRIDES=None,
+            SPARSE_ROPE_STRIDES=None,
+            KV_INDICES_BATCH_STRIDE=kv_indices.stride(0),
+            KV_INDICES_STRIDES=kv_indices.stride()[1:],
+            num_documents=num_documents,
+            LSE_BATCH_STRIDE=lse.stride(0),
+            LSE_HEAD_STRIDE=lse.stride(1),
+            LSE_STRIDES=lse.stride()[2:],
+            GRAD_SPARSE_KV_STRIDES=grad_sparse_kv_fp32.stride(),
+            GRAD_SPARSE_V_STRIDES=grad_sparse_v_fp32.stride(),
+            GRAD_SPARSE_ROPE_STRIDES=None,
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            D=head_dim,
+            ROPE_DIM=0,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            TOPK=topk,
+            SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            # Expanded pools address far less storage than their contiguous gradients.
+            USE_INT64_OFFSETS=use_int64_offsets
+            or requires_int64_offsets(grad_sparse_kv_fp32, grad_sparse_v_fp32),
+            BLOCK_D=block_d,
+            tile_spans_ptr=tile_spans,
+            DENSE_TILE_QUERIES=tile_queries,
+        )
+        grad_sparse_kv = rounded(grad_sparse_kv_fp32)
+        grad_sparse_v = grad_sparse_kv if v_is_k else rounded(grad_sparse_v_fp32)
     else:
         # Each program owns its key tile's gradient rows, so this is deterministic.
         gather_counts = selected_counts

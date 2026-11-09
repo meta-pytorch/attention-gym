@@ -371,9 +371,10 @@ def gather_attn(
             but nonempty paired RoPE has no strict deterministic backward there.
             Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with
-            Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward
-            supports deterministic accumulation when deterministic algorithms are
-            enabled; otherwise it may use nondeterministic atomics.
+            Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward, and
+            the grouped schedule's sparse dK/dV for sparse selections over small heads,
+            accumulate with nondeterministic atomics unless deterministic algorithms
+            are enabled.
 
         scale: Positive multiplier for query-key logits. Bare tensors default to
             1 / sqrt(latent_dim). Paired inputs, including zero-width RoPE pairs,
@@ -396,11 +397,12 @@ def gather_attn(
             runs them as shared values; other aliases, such as views, count as separate
             values. With kv_heads == num_heads, separate values run one query head per
             grouped-schedule tile, slower than the shared-value MHA kernels. CUDA graph
-            capture of their Triton backward is not tested yet. With
-            sliding_window_size=0, that schedule reads every pool row in the selection
-            span of a run of nearby queries, selected or not, so a NaN or Inf in an
-            unselected row near selected ones can make those queries' outputs and
-            gradients NaN. Keep unused pool capacity finite, for example zero-filled.
+            capture of their Triton backward is tested only on the atomic path the default
+            mode picks for small heads. With sliding_window_size=0, the grouped
+            schedule reads every pool row in the selection span of a run of nearby
+            queries, selected or not, so a NaN or Inf in an unselected row near selected
+            ones can make those queries' outputs and gradients NaN. Keep unused pool
+            capacity finite, for example zero-filled.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return (output, GatherAttnAux) containing the requested
