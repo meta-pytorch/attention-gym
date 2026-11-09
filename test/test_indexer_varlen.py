@@ -87,6 +87,8 @@ def _per_document(inputs, topk, ratio, causal):
     [
         ([0, 3, 9, 0, 7, 6, 0], 4, 3, True, 2, 16),
         ([0, 3, 9, 0, 7, 6, 0], 4, 3, True, 32, 128),
+        ([0, 3, 9, 0, 7, 6, 0], 4, 3, True, 64, 128),
+        ([1, 300, 0, 129], 1, 5, True, 64, 128),
         ([1, 4, 0, 7], 1, 3, False, 2, 16),
         ([0, 1, 3, 0], 4, 5, True, 2, 16),
         ([0, 0], 4, 3, True, 2, 16),
@@ -97,6 +99,8 @@ def _per_document(inputs, topk, ratio, causal):
     ids=[
         "ragged-generic",
         "ragged-paired",
+        "ragged-paired-h64",
+        "multi-tile-paired-h64",
         "noncausal",
         "empty-pool",
         "empty-docs",

@@ -54,21 +54,45 @@ def _compile_scores(
     ``has_candidate_bounds`` scores only each query's packed ``candidate_bounds`` interval.
     """
     import cutlass
-    from cutlass import cute
 
     from .cute_score import IndexerScoreKernel
     from .cute_score_generic import IndexerGenericScoreKernel
 
-    operation = (
-        IndexerScoreKernel if heads in (32, 64) and head_dim == 128 else IndexerGenericScoreKernel
-    )(
-        heads,
-        head_dim,
-        causal,
-        use_int64_offsets,
-        compress_ratio=compress_ratio,
-        contiguous_weight_heads=contiguous_weight_heads,
+    options = {
+        "compress_ratio": compress_ratio,
+        "contiguous_weight_heads": contiguous_weight_heads,
+    }
+    if heads in (32, 64) and head_dim == 128:
+        io_dtype = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
+        operation = IndexerScoreKernel(
+            heads, head_dim, causal, use_int64_offsets, **options, dtype=io_dtype
+        )
+    else:
+        operation = IndexerGenericScoreKernel(
+            heads, head_dim, causal, use_int64_offsets, **options
+        )
+    args = score_compile_args(
+        dtype, heads, head_dim, use_int64_offsets, contiguous_weight_heads, has_candidate_bounds
     )
+    if has_candidate_bounds:
+        return compile_tvm_ffi(
+            operation.with_candidate_bounds, *args, name=f"{operation.get_name()}_packed"
+        )
+    return compile_tvm_ffi(operation, *args)
+
+
+def score_compile_args(
+    dtype: torch.dtype,
+    heads: int,
+    head_dim: int,
+    use_int64_offsets: bool,
+    contiguous_weight_heads: bool,
+    has_candidate_bounds: bool,
+) -> tuple:
+    """Fake runtime arguments of a score kernel entrypoint, without the stream."""
+    import cutlass
+    from cutlass import cute
+
     io_dtype = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
@@ -100,13 +124,8 @@ def _compile_scores(
     )
     args = (q, k, weights, scores, integer(0), cutlass.Float32(1.0))
     if has_candidate_bounds:
-        return compile_tvm_ffi(
-            operation.with_candidate_bounds,
-            *args,
-            _fake_candidate_bounds(tokens, use_int64_offsets),
-            name=f"{operation.get_name()}_packed",
-        )
-    return compile_tvm_ffi(operation, *args)
+        return (*args, _fake_candidate_bounds(tokens, use_int64_offsets))
+    return args
 
 
 def _fake_candidate_bounds(tokens, use_int64_offsets: bool):

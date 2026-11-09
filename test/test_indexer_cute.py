@@ -13,7 +13,11 @@ import torch
 
 from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.ops import _indexer_op
-from attn_gym.testing.indexer import assert_indexer_selection, indexer_reference_scores
+from attn_gym.testing.indexer import (
+    assert_indexer_selection,
+    indexer_reference_scores,
+    make_indexer_test_inputs,
+)
 
 
 def _skip_no_supported_gpu():
@@ -418,3 +422,68 @@ def test_cute_dynamic_fullgraph(strided, heads, dim):
         expected = lightning_indexer(q, k, w, 16, causal=True, impl="fused")
         assert_indexer_selection(expected, q, k, w, 16, True)
         assert_indexer_selection(actual, q, k, w, 16, True)
+
+
+@pytest.mark.parametrize("heads,dim", [(64, 128)], ids=["packed_heads"])
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "varlen"])
+def test_cute_score_compiles_once_across_shapes(heads, dim, packed):
+    """Batch, tokens, slab pairs and candidates stay runtime values of one score artifact.
+
+    One key per static tuple, launched across T = 1, multiples of 16, odd T and both sides of
+    the 512-pair slab edge.
+    """
+    _skip_no_supported_gpu()
+    from attn_gym.sparse.indexer.impl import cute as impl
+
+    impl._compile_scores.cache_clear()
+    # T = 1, multiples of 16, odd, and both sides of the 512-pair slab edge (T = 1024).
+    shapes = ((1, 1), (2, 16), (3, 17), (2, 32), (1, 1023), (1, 1024), (1, 1025))
+    try:
+        for batch, tokens in shapes:
+            batch = 1 if packed else batch
+            q, k, w = make_indexer_test_inputs(tokens, heads, dim, torch.bfloat16, batch=batch)
+            kwargs = {}
+            if packed:
+                offsets = torch.tensor([0, tokens // 3, tokens], device="cuda").int()
+                kwargs = {"cu_seqlens": offsets, "cu_seqlens_k": offsets}
+            actual = lightning_indexer(q, k, w, 16, causal=True, impl="fused", **kwargs)
+            assert actual.shape == (batch, tokens, 16)
+            if not packed and tokens >= 16:  # the oracle needs S >= topk
+                assert_indexer_selection(actual, q, k, w, 16, True)
+        info = impl._compile_scores.cache_info()
+        assert info.currsize == 1
+        assert info.hits + info.misses == len(shapes)
+    finally:
+        impl._compile_scores.cache_clear()
+
+
+@pytest.mark.parametrize("heads,dim,packed", [(64, 128, False), (32, 128, True)])
+def test_cute_score_kernels_verify_tma(monkeypatch, heads, dim, packed):
+    """Every TMA ring's copies match its armed bytes and completion scope after tracing."""
+    _skip_no_supported_gpu()
+    from attn_gym.sparse.indexer.impl import cute as impl
+    from attn_gym.warpdrive.cache import (
+        detect_compile_target,
+        get_compile_target,
+        set_compile_target,
+    )
+
+    entries = []
+    compile_tvm_ffi = impl.compile_tvm_ffi
+
+    def compile_and_keep(entry, *args, **kwargs):
+        entries.append(entry)
+        return compile_tvm_ffi(entry, *args, **kwargs)
+
+    monkeypatch.setattr(impl, "compile_tvm_ffi", compile_and_keep)
+    previous = get_compile_target()
+    try:
+        set_compile_target(detect_compile_target(torch.cuda.current_device()))
+        impl._compile_scores.__wrapped__(torch.bfloat16, heads, dim, True, 1, False, True, packed)
+    finally:
+        set_compile_target(previous)
+    (entry,) = entries
+    op = getattr(entry, "__self__", entry)
+    tma = [c.tma for c in op.checks().channels.values() if c.tma is not None]
+    rings = 2 if heads in (32, 64) and dim == 128 else 1  # q and k, or the combined ab
+    assert tma == ["verified"] * rings, op.describe()
