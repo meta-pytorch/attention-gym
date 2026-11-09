@@ -115,8 +115,10 @@ ring does not add: read stage 0 -> overwrite overlapping bytes in stage 1
 ```
 
 In a cluster, each CTA allocates its own copy at the same offset. Bound buffers are allowed
-on pair-scoped channels, unlike layer-owned `payload`s. Binding adds no DSMEM publication
-or fence; `remote_scope` still defaults to `"cta"`. For ordinary memory read by a peer,
+on pair-scoped channels, unlike layer-owned `payload`s. Binding adds no DSMEM publication;
+`remote_scope` still defaults to `"cta"`. On a `Threads`/`Warps` channel to `Umma` it
+derives `commit_fence="smem_async"` ([Storage and fences](channels.md#storage-and-fences)).
+For ordinary memory read by a peer,
 follow the [pair memory-scope rules](clusters.md#memory-scope).
 
 ## Check declared aliases

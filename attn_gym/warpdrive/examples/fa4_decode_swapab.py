@@ -323,9 +323,8 @@ class SwapABDecode(WarpSpecialized):
             self.v = Ring(n_v, Tma(self.kv_stage_bytes), Umma, buffer=v_buf)
         rr = Sharing.ROUND_ROBIN  # softmax[0|1] take alternate KV blocks
         self.s = Ring(s_stages, Umma, Threads, consumer_sharing=rr)
-        self.p = Ring(
-            p_stages, Threads, Umma, producer_sharing=rr, commit_fence="smem_async", buffer=p_buf
-        )
+        # The derived smem_async fence orders P's SMEM stores before the PV MMA reads them.
+        self.p = Ring(p_stages, Threads, Umma, producer_sharing=rr, buffer=p_buf)
         self.o = Ring(O_STAGES, Umma, Threads, release_fence="tmem_store")
         self.row_max = Ring(
             1, Threads, Threads, sync="named", producer_sharing=rr, turnstile="mufu"

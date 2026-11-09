@@ -20,6 +20,7 @@ import cutlass
 from cutlass import cute
 
 from attn_gym.testing.warpdrive import raises_protocol as _raises_protocol
+from attn_gym.testing.warpdrive import status
 from attn_gym.warpdrive import (
     Consumer,
     CtaPair,
@@ -531,7 +532,7 @@ def test_decode_shared_kv_describe(decode, requires_blackwell):
         decode.compile_decode(op)
     text = op.describe()
     # The MMAs' K/V reads and the loads are annotated: the stage handoff orders them.
-    assert "V ~ K (smem)  no hazard found" in text, text
+    assert status(op, "V ~ K") == "no hazard found", text
     assert "epochs    unverified (load's acquire runs inside a dynamic loop or branch)" in text
     split = decode.SwapABDecode(8)
     assert "_shared" not in split.get_name()

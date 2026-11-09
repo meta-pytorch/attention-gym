@@ -5,7 +5,6 @@ dQ allows TMA reduce-add ordering error. Cover the wrapper contract on small sha
 benchmarks cover large shapes.
 """
 
-import re
 import warnings
 
 import pytest
@@ -16,6 +15,7 @@ pytest.importorskip("flash_attn.cute")
 
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
+from attn_gym.testing.warpdrive import alias_section
 from attn_gym.warpdrive import (
     Cluster,
     CtaPair,
@@ -203,11 +203,11 @@ def test_traced_diagnostics_are_quiet(kernel):
         for channel in ("k", "kt", "v", "q", "qt", "do"):
             assert op._ws_tma[channel].status().startswith("verified CtaGroup.TWO"), channel
         return
-    text = op.describe()
-    alias = text[text.index("Alias diagnostic") :]
-    assert "potential hazard" not in alias.split("\n", 1)[1]
-    for pair in ("P ~ S", "dS ~ dP", "dQ ~ dP", "dQ ~ dS"):
-        assert re.search(rf"\n  {re.escape(pair)} \(tmem\)  unverified\n", alias), alias
+    alias = alias_section(op)
+    aliases = op.checks().aliases
+    assert "potential hazard" not in aliases.values(), alias
+    for pair in (("P", "S"), ("dS", "dP"), ("dQ", "dP"), ("dQ", "dS")):
+        assert aliases[pair] == "unverified", alias
     assert "unknown epoch correspondence" in alias
     assert "[tmem_store]" not in alias  # The ds commit needs both store fences.
 

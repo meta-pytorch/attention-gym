@@ -612,14 +612,24 @@ self.stats = Ring(2, Threads, Threads, payload=(cutlass.Float32, (32,)))
 This allocates uninitialized, 16-byte-aligned SMEM of shape `(32, 2)`—generally `(*shape, n)`.
 `h.data` selects the handle's stage. User pair-scoped channels cannot own these payloads.
 For swizzled tiles, multiple buffers or overlaps, use [`SmemPlan` and `buffer=`](storage.md).
-Binding a buffer selects storage; it adds no fence or remote memory scope.
+Binding a buffer leaves remote memory scope unchanged. It derives a commit fence for
+`Threads`/`Warps` -> `Umma` channels (see below).
 
 Declare fences on the side that needs them, before its managed signal:
 
 | Fence kind | Instruction |
 |---|---|
 | `"tmem_store"` | `tcgen05.wait::st` |
+| `"tmem_load"` | `tcgen05.wait::ld` |
 | `"smem_async"` | `fence.proxy.async` |
+
+`tmem_store` completes TMEM stores for a reader, usually an MMA. `tmem_load` waits for
+`tcgen05.ld` to finish before a later MMA overwrites those columns. If every release needs
+that wait, declare `release_fence="tmem_load"` rather than calling
+`fence_view_async_tmem_load()` before each release (FA4 backward's `dq` and `dkv`). Keep the
+fence at the use site when only one path needs it (persistent GEMM's `early_release`);
+a channel fence runs on every managed release.
+`smem_async` orders generic SMEM accesses against the async proxy (TMA, `tcgen05.mma`).
 
 `commit_fence`/`release_fence` accept a string or ordered tuple of distinct kinds. For
 example, FA4 backward's dS uses `commit_fence=("tmem_store", "smem_async")` to hand over both
@@ -645,12 +655,27 @@ every reading thread runs `fence_async_shared()` after its last read and before 
 as the CTA-pair FA4 backward does for dPsum. Another value replaces the default rather than
 adding to it, so include `"smem_async"` when you also need `"tmem_store"`. `describe()` prints
 a replaced default as `override  release_fence smem_async -> ...`. `Umma` consumers read through
-the async proxy and get no default. A Threads-written stage that an MMA reads still needs an
-explicit `commit_fence="smem_async"`. The layer cannot tell whether the producer wrote SMEM or
-TMEM.
+the async proxy and get no default.
+
+**A `Threads` or `Warps` channel to `Umma` with SMEM storage (`payload=` or `buffer=`)
+defaults to `commit_fence="smem_async"`.** Each writing thread must fence its ordinary stores
+before arrival: `tcgen05.mma` reads through the async proxy (PTX ISA, tcgen05 "Shared Memory
+Accesses"). A proxy fence acts only within its thread, so `Warps` runs it in every lane before
+the elected arrival. FA4 decode's P ring uses this default.
+
+Declare `commit_fence=()` only if producers make no generic writes to that storage or run
+`fence_async_shared()` after their last write and before arrival. CTA-pair FA4 backward's
+`ds` opts out: `make_ds` fences its writers before raw signaling, and the managed relay makes
+no generic writes. An explicit value replaces the default; single-CTA `ds` also hands over
+TMEM stores, so it declares `("tmem_store", "smem_async")`. `describe()` prints replacements as
+`override  commit_fence smem_async -> ...`.
+
+Without SMEM storage, a TMEM or register handoff gets no default: declare `"tmem_store"`
+for TMEM stores. On pair-scoped channels, `remote_scope` still controls the arrival's memory
+scope ([Memory scope](clusters.md#memory-scope)); the proxy fence does not change it.
 
 `commit(signal=False)` and `release(signal=False)` omit **both signal and all its fences**,
-including a derived `release_fence`.
+including a derived `commit_fence` or `release_fence`.
 The alias diagnostic credits fences by membership: a TMEM-store handoff without
 `"tmem_store"`, or an SMEM-store-to-async-reader handoff without `"smem_async"`, remains
 unverified. It compares declared overlaps of different buffers, not a ring refilling its own

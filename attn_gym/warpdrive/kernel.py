@@ -49,7 +49,7 @@ from attn_gym.warpdrive.cluster import (
     rank_value,
 )
 from attn_gym.warpdrive.compat import SmemAllocator, TmemAllocator
-from attn_gym.warpdrive.describe import describe_kernel
+from attn_gym.warpdrive.describe import KernelChecks, describe_kernel, kernel_checks
 from attn_gym.warpdrive.named import NamedBarrier
 from attn_gym.warpdrive.protocol import (
     ProtocolError,
@@ -1145,6 +1145,15 @@ class WarpSpecialized(metaclass=_KernelType):
         # every kernel's compile key, which hashes the modules a kernel imports (AGENTS.md,
         # "Adding CuTeDSL Kernels").
         return importlib.import_module(".describe_graph", __package__).describe_graph(self, format)
+
+    def checks(self) -> KernelChecks:
+        """Channel and alias verdicts from ``describe()``, as ``describe.KernelChecks``.
+
+        Includes TMA copies, epoch ownership and declared overlaps. Applicable channel checks
+        are ``"not checked yet"`` before compilation; a ``jit_cache`` load restores the results.
+        """
+        self._collect()
+        return kernel_checks(self)
 
     def _barrier_plan(self):
         """``(owner, offset, {cta rank: arrival counts})`` of every mbarrier in allocation
