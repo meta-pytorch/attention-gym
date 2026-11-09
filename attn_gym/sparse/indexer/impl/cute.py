@@ -58,19 +58,17 @@ def _compile_scores(
     from .cute_score import IndexerScoreKernel
     from .cute_score_generic import IndexerGenericScoreKernel
 
-    options = {
-        "compress_ratio": compress_ratio,
-        "contiguous_weight_heads": contiguous_weight_heads,
-    }
-    if heads in (32, 64) and head_dim == 128:
-        io_dtype = cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16
-        operation = IndexerScoreKernel(
-            heads, head_dim, causal, use_int64_offsets, **options, dtype=io_dtype
-        )
-    else:
-        operation = IndexerGenericScoreKernel(
-            heads, head_dim, causal, use_int64_offsets, **options
-        )
+    operation = (
+        IndexerScoreKernel if heads in (32, 64) and head_dim == 128 else IndexerGenericScoreKernel
+    )(
+        heads,
+        head_dim,
+        causal,
+        use_int64_offsets,
+        compress_ratio=compress_ratio,
+        contiguous_weight_heads=contiguous_weight_heads,
+        dtype=cutlass.BFloat16 if dtype == torch.bfloat16 else cutlass.Float16,
+    )
     args = score_compile_args(
         dtype, heads, head_dim, use_int64_offsets, contiguous_weight_heads, has_candidate_bounds
     )

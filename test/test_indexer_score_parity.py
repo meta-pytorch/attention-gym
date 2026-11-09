@@ -1,4 +1,4 @@
-"""Bitwise parity of the warpdrive CuTe score kernel with its pre-warpdrive version.
+"""Bitwise parity of the warpdrive CuTe score kernels with their pre-warpdrive versions.
 
 The port changes only synchronization and work decoding, so every written slab entry, and
 every entry left untouched, must match the legacy kernels bit for bit. Removed together with
@@ -143,8 +143,16 @@ def test_packed_kernel_slab_parity(heads, mode, abi):
     assert any(wrote)
 
 
+@pytest.mark.parametrize("abi", ABIS[1:], ids=ABI_IDS[1:])
+@pytest.mark.parametrize("mode", MODES, ids=MODE_IDS)
+@pytest.mark.parametrize("heads,head_dim", [(2, 16), (66, 48), (128, 128), (130, 96), (258, 384)])
+def test_generic_kernel_slab_parity(heads, head_dim, mode, abi):
+    wrote = [_check(heads, head_dim, mode, abi, *shape) for shape in SHAPES]
+    assert any(wrote)
+
+
 @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("heads,head_dim", [(64, 128), (32, 128)])
+@pytest.mark.parametrize("heads,head_dim", [(64, 128), (32, 128), (66, 96)])
 @pytest.mark.parametrize("packed", [False, True])
 def test_public_indices_match_legacy(monkeypatch, deterministic, heads, head_dim, packed):
     """Deterministic indices are identical; otherwise each row selects the same set."""

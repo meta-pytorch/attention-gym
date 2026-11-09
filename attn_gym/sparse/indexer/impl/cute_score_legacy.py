@@ -518,7 +518,7 @@ def compile_legacy_scores(
     has_candidate_bounds: bool = False,
 ):
     """``cute._compile_scores`` with the pre-warpdrive kernels, for parity tests and A/B timing."""
-    from .cute_score_generic import IndexerGenericScoreKernel
+    from .cute_score_generic_legacy import IndexerGenericScoreKernel
 
     operation = (
         IndexerScoreKernel if heads in (32, 64) and head_dim == 128 else IndexerGenericScoreKernel
