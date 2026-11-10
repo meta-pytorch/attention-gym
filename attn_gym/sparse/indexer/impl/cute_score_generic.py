@@ -311,6 +311,13 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
             tmem_thread.partition_D(cute.make_identity_tensor(acc_tile.shape)).shape, Float32
         )
         assert cute.size(logits) == self.tile_heads
+        # With one head tile, the columns past H hold logits of TMA zero-filled Q rows: their
+        # ReLU is +0 against weight 0, so each adds +0 to its sum. They are left unloaded, which
+        # frees their registers, and one +0 added to the total keeps it bitwise equal: the only
+        # value a +0 addition changes is -0 (from an underflowing product), and a total of -0
+        # would otherwise survive.
+        live_heads = min(cute.round_up(self.heads, 4), self.tile_heads)
+        live_loads = cute.ceil_div(live_heads, cute.size(logits, mode=[0]))
         rW = cute.make_rmem_tensor((self.tile_heads,), Float32)
         num_candidates = self.upcast_offset(params.scores.shape[2])
         while work.valid:
@@ -332,21 +339,28 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
                 sum3 = Float32(0.0)
                 for head_tile in cutlass.range(self.head_tiles, unroll=0):
                     acc_full = acc.wait()
-                    cute.copy(
-                        tmem_copy,
-                        tmem_thread.partition_S(accumulator[(None, None, None, acc_full.index)]),
-                        logits,
+                    tmem_stage = tmem_thread.partition_S(
+                        accumulator[(None, None, None, acc_full.index)]
                     )
+                    if cutlass.const_expr(live_heads == self.tile_heads):
+                        cute.copy(tmem_copy, tmem_stage, logits)
+                    else:
+                        for load in cutlass.range_constexpr(live_loads):
+                            cute.copy(
+                                tmem_copy,
+                                tmem_stage[None, load, None, None],
+                                logits[None, load, None, None],
+                            )
                     acc_full.release()
                     # Invalid lanes still wait and release: the acc release counts all 128.
                     if valid:
-                        for offset in cutlass.range_constexpr(self.tile_heads):
+                        for offset in cutlass.range_constexpr(live_heads):
                             head = self.upcast_offset(head_tile) * self.tile_heads + offset
                             weight = Float32(0.0)
                             if head < self.heads:
                                 weight = Float32(weights[head])
                             rW[offset] = weight
-                        for group in cutlass.range_constexpr(self.tile_heads // 4):
+                        for group in cutlass.range_constexpr(live_heads // 4):
                             offset = group * 4
                             x0 = Float32(logits[offset])
                             x1 = Float32(logits[offset + 1])
@@ -361,9 +375,12 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
                             sum2 = sum2 + x2 * rW[offset + 2]
                             sum3 = sum3 + x3 * rW[offset + 3]
                 if valid:
+                    total = (sum0 + sum1) + (sum2 + sum3)
+                    if cutlass.const_expr(live_heads < self.tile_heads):
+                        total = total + Float32(0.0)
                     params.scores[self.upcast_offset(local_pair), qi, candidate] = (
-                        (sum0 + sum1) + (sum2 + sum3)
-                    ) * params.score_scale
+                        total * params.score_scale
+                    )
             work.advance()
         return acc, work
 

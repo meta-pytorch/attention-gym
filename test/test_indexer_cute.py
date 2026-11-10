@@ -485,3 +485,39 @@ def test_cute_score_kernels_verify_tma(monkeypatch, heads, dim, packed):
     tma = [c.tma for c in op.checks().channels.values() if c.tma is not None]
     rings = 2 if heads in (32, 64) and dim == 128 else 1  # q and k, or the combined ab
     assert tma == ["verified"] * rings, op.describe()
+
+
+@pytest.mark.parametrize("heads", [2, 16, 20, 48])
+@pytest.mark.parametrize("causal", [False, True], ids=["noncausal", "causal"])
+def test_cute_generic_scores_match_zero_padded_head_tile(heads, causal):
+    """Fewer than 64 heads score bitwise like the same heads padded to a full 64-head tile with
+    zero queries and weights, also when K holds inf and NaN (whose padded logits are NaN) and
+    when every weighted logit underflows to -0 (which the padded heads' +0 additions clear)."""
+    _skip_no_supported_gpu()
+    import cutlass
+
+    from attn_gym.sparse.indexer.impl import cute as impl
+
+    batch, tokens, dim = 2, 300, 64
+    gen = torch.Generator(device="cuda").manual_seed(5)
+    q = torch.randn(batch, tokens, heads, dim, device="cuda", generator=gen).bfloat16()
+    k = torch.randn(batch, tokens, dim, device="cuda", generator=gen).bfloat16()
+    w = torch.randn(batch, tokens, heads, device="cuda", generator=gen).bfloat16()
+    k[0, 7, 3], k[1, 200, 0] = float("inf"), float("nan")
+    # Logits 64 * 2**-80 against weight -2**-80: each product, -2**-154, underflows to -0.
+    k[1, :64], q[1, 50], w[1, 50] = 2.0**-40, 2.0**-40, -(2.0**-80)
+    padded = [
+        torch.zeros(*x.shape[:2], 64, *x.shape[3:], dtype=x.dtype, device="cuda") for x in (q, w)
+    ]
+    padded[0][:, :, :heads], padded[1][:, :, :heads] = q, w
+    scale = cutlass.Float32(1.0 / math.sqrt(heads * dim))
+    scores = []
+    for h, (qq, ww) in ((heads, (q, w)), (64, padded)):
+        out = torch.zeros(batch * tokens // 2, 2, tokens, device="cuda")
+        compiled = impl._compile_scores(torch.bfloat16, h, dim, causal, 1, False, True, False)
+        compiled(qq, k, ww, out, cutlass.Int32(0), scale)
+        scores.append(out)
+    assert scores[0].isnan().any() and scores[0].isfinite().any()
+    underflow = scores[1][(tokens + 50) // 2, 0, :51]
+    assert torch.equal(underflow.view(torch.int32), torch.zeros_like(underflow).view(torch.int32))
+    assert torch.equal(scores[0].view(torch.int32), scores[1].view(torch.int32))
