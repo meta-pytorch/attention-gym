@@ -424,19 +424,15 @@ def test_cute_dynamic_fullgraph(strided, heads, dim):
         assert_indexer_selection(actual, q, k, w, 16, True)
 
 
-@pytest.mark.parametrize("heads,dim", [(64, 128)], ids=["packed_heads"])
+@pytest.mark.parametrize("heads,dim", [(64, 128), (66, 96)], ids=["packed_heads", "generic"])
 @pytest.mark.parametrize("packed", [False, True], ids=["dense", "varlen"])
 def test_cute_score_compiles_once_across_shapes(heads, dim, packed):
-    """Batch, tokens, slab pairs and candidates stay runtime values of one score artifact.
-
-    One key per static tuple, launched across T = 1, multiples of 16, odd T and both sides of
-    the 512-pair slab edge.
-    """
+    """One score kernel per static tuple serves every batch, token, pair and candidate count."""
     _skip_no_supported_gpu()
     from attn_gym.sparse.indexer.impl import cute as impl
 
     impl._compile_scores.cache_clear()
-    # T = 1, multiples of 16, odd, and both sides of the 512-pair slab edge (T = 1024).
+    # T = 1, multiples of 16, odd T, and both sides of the 512-pair slab edge at T = 1024.
     shapes = ((1, 1), (2, 16), (3, 17), (2, 32), (1, 1023), (1, 1024), (1, 1025))
     try:
         for batch, tokens in shapes:
@@ -457,9 +453,11 @@ def test_cute_score_compiles_once_across_shapes(heads, dim, packed):
         impl._compile_scores.cache_clear()
 
 
-@pytest.mark.parametrize("heads,dim,packed", [(64, 128, False), (32, 128, True)])
+@pytest.mark.parametrize(
+    "heads,dim,packed", [(64, 128, False), (32, 128, True), (66, 96, False), (130, 96, True)]
+)
 def test_cute_score_kernels_verify_tma(monkeypatch, heads, dim, packed):
-    """Every TMA ring's copies match its armed bytes and completion scope after tracing."""
+    """Tracing verifies every TMA ring's copies against its armed bytes and completion scope."""
     _skip_no_supported_gpu()
     from attn_gym.sparse.indexer.impl import cute as impl
     from attn_gym.warpdrive.cache import (
