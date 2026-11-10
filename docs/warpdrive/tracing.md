@@ -486,6 +486,34 @@ process per CTA and one track per role and forwards the rest to the profiler's `
 The [Qwen megakernel](examples.md#qwen3-06b-decode-megakernel) traces every SM's instruction
 rows this way and links rows across CTAs.
 
+### Role summary
+
+`role_summary(ranges, op=None)` turns the ranges of either backend into one row per role:
+work items, p50/p90 item time, and the share of item time spent in the role's wait ranges
+(`*.acquire`, `*.wait`, `*.peek`, `*.tail`, `*.turn`, `*.sync`; a wait nested in another counts
+once). Without `op`, the outermost non-wait ranges on each warp name the roles; with it, the
+rows follow the declared roles and list one recording warp each. An IKET capture of the
+persistent GEMM with no kernel changes:
+
+```python
+from attn_gym.warpdrive.profiler import parse_iket
+from attn_gym.warpdrive.trace_session import role_summary
+
+print(role_summary(parse_iket("traces/gemm/capture.trace.json")))
+```
+
+```text
+role                 warp  items    p50 ns    p90 ns     wait     work
+epilogue                0    512   19312.0   22976.0    88.1%    11.9%
+...
+load                    4    512   19040.0   20160.0    86.4%    13.6%
+mma                     5    512   19392.0   20320.0    38.2%    61.8%
+```
+
+Wait time needs `waits=True`; with `waits=False` every row reads 0% wait. IKET lists every warp
+of a role, globaltimer its first warp only. Overlapping waits on different roles are not
+additive kernel time.
+
 ## Join a capture to the pipeline plan
 
 ```python

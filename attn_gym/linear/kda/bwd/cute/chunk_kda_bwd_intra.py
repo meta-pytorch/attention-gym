@@ -1618,8 +1618,17 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             gref_qk1 = sG_tile[gref_qk_offset + 1]
             gref_t0 = sG_tile[gref_t_offset]
             gref_t1 = sG_tile[gref_t_offset + 1]
-            qk_from_prev0 = cute.math.exp2(gref_prev0 - gref_qk0, fastmath=fastmath)
-            qk_from_prev1 = cute.math.exp2(gref_prev1 - gref_qk1, fastmath=fastmath)
+            # Earlier keys are rebased at the subchunk's first row g_row0, in-subchunk keys at
+            # its middle row g_mid. Derive a row's earlier-key factor 2^(g_r - g_row0) from
+            # its diagonal factor 2^(g_r - g_mid), not the reverse: at the gate bound
+            # 2^(g_r - g_mid) lies in [2^-59.7, 2^68.3] and 2^(g_mid - g_row0) in
+            # [2^-68.3, 1], so both are normal, and their product leaves the normal range
+            # only when the true 2^(g_r - g_row0) does, where every earlier-key term already
+            # has a decay below 2^-126. Deriving the diagonal factor from a flushed
+            # 2^(g_r - g_row0) instead dropped the last rows' in-subchunk terms at gates
+            # steeper than about -5.82 nats per token.
+            prev_from_qk0 = cute.math.exp2(gref_qk0 - gref_prev0, fastmath=fastmath)
+            prev_from_qk1 = cute.math.exp2(gref_qk1 - gref_prev1, fastmath=fastmath)
             tref0 = cute.math.exp2(gref_t0 - gref_qk0, fastmath=fastmath)
             tref1 = cute.math.exp2(gref_t1 - gref_qk1, fastmath=fastmath)
 
@@ -1687,10 +1696,10 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
                 grow0 = sG_tile[row_offset]
                 grow1 = sG_tile[row_offset + 1]
                 beta_row = sBeta_tile[row]
-                qscale_prev0 = cute.math.exp2(grow0 - gref_prev0, fastmath=fastmath)
-                qscale_prev1 = cute.math.exp2(grow1 - gref_prev1, fastmath=fastmath)
-                qscale_diag0 = qscale_prev0 * qk_from_prev0
-                qscale_diag1 = qscale_prev1 * qk_from_prev1
+                qscale_diag0 = cute.math.exp2(grow0 - gref_qk0, fastmath=fastmath)
+                qscale_diag1 = cute.math.exp2(grow1 - gref_qk1, fastmath=fastmath)
+                qscale_prev0 = qscale_diag0 * prev_from_qk0
+                qscale_prev1 = qscale_diag1 * prev_from_qk1
                 dscale0 = cute.math.exp2(gref_qk0 - grow0, fastmath=fastmath)
                 dscale1 = cute.math.exp2(gref_qk1 - grow1, fastmath=fastmath)
                 tscale0 = dscale0 * tref0

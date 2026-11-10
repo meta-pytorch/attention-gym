@@ -95,7 +95,7 @@ def chunk_kda_fwd_factors(
         )
 
     with profiler_range("kda/cute/intra_engine"):
-        Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata, fastmath=fastmath)
+        Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata)
         Akk = (
             chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size, output_dtype=q.dtype)
             if metadata is None

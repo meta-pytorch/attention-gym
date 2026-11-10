@@ -17,6 +17,7 @@ from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     bwd_wy_dqkg_reference,
     cumulative_sequence_offsets,
+    packed_chunk_routes,
 )
 
 pytestmark = pytest.mark.skipif(
@@ -105,15 +106,7 @@ def _sequence_local_reference(inputs: StageInputs, lengths: list[int]):
 def test_ragged_wy_matches_independent_numerical_reference(dtype):
     lengths = [65, 0, 63]
     cu_seqlens = cumulative_sequence_offsets(lengths)
-    chunk_routes = torch.tensor(
-        [
-            (sequence, chunk)
-            for sequence, length in enumerate(lengths)
-            for chunk in range((length + 63) // 64)
-        ],
-        device="cuda",
-        dtype=torch.int64,
-    )
+    chunk_routes = packed_chunk_routes(lengths)
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, sum(lengths), 64)
     inputs = _inputs(sum(lengths), metadata.capacity, dtype)
     actual = _run(inputs, metadata)
