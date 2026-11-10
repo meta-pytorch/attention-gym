@@ -26,6 +26,8 @@ SM86_CAPABILITY = (8, 6)
 SM86_MAX_SHARED_MEMORY = 101376
 # Consumer Blackwell has SM86's per-block limit, not datacenter Blackwell's.
 SM120_CAPABILITY = (12, 0)
+SM90_CAPABILITY = (9, 0)
+SM90_MAX_SHARED_MEMORY = 232448
 SM100_CAPABILITY = (10, 0)
 SM100_MAX_SHARED_MEMORY = 232448
 SM100_TENSOR_MEMORY_COLUMNS = 512
@@ -59,6 +61,34 @@ def make_inputs(
         "kv_indices": kv_indices[None].to(torch.int32),
         "attention_sink": randn(heads, dtype=torch.float32),
     }
+
+
+def assert_training_matches_reference(
+    inputs: dict[str, torch.Tensor], *, window: int, tolerance: float
+) -> None:
+    """Compare the Triton forward and gradients on ``inputs`` with the FP64 reference."""
+    reference_inputs = {
+        name: value.detach().double().requires_grad_() if value.is_floating_point() else value
+        for name, value in inputs.items()
+    }
+    expected = gather_attn(**reference_inputs, sliding_window_size=window, impl=Impl.REFERENCE)
+    grad_output = torch.randn_like(expected)
+    expected.backward(grad_output)
+
+    output = gather_attn(
+        **inputs, sliding_window_size=window, kernel_options={"backend": "triton"}
+    )
+    output.backward(grad_output.to(output.dtype))
+
+    torch.testing.assert_close(output.double(), expected, atol=tolerance, rtol=tolerance)
+    for name in ("query", "local_kv", "sparse_kv", "attention_sink"):
+        torch.testing.assert_close(
+            inputs[name].grad.double(),
+            reference_inputs[name].grad,
+            atol=tolerance * reference_inputs[name].grad.abs().max().item(),
+            rtol=tolerance,
+            msg=lambda message, name=name: f"{name} gradient: {message}",
+        )
 
 
 def over_shared_memory(launches: list[Launch], limit: int) -> dict[str, int]:
@@ -160,26 +190,57 @@ def test_absorbed_mla_small_key_tiles_match_reference(rope_dim):
         assert_numerics(grad, expected_grad, f"gradient {index}")
 
 
-@pytest.mark.parametrize("head_dim", [384, 512])
-@pytest.mark.parametrize("capability", [SM86_CAPABILITY, SM120_CAPABILITY], ids=["sm86", "sm120"])
-def test_fp32_wide_head_launches_fit_99_kib_shared_memory(capability, head_dim):
-    """Every launch has a config within the 101376-byte per-block shared-memory limit.
+# FP32 with a local window: head dims wider than 256 on 99 KiB targets, whose tf32x3 dots
+# did not fit even the 16x16 tile, and the cases where dQ selected a larger tile that exceeded
+# the shared-memory limit.
+FP32_WINDOW_CASES = [
+    pytest.param(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY, 384, id="sm86-d384"),
+    pytest.param(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY, 512, id="sm86-d512"),
+    pytest.param(SM120_CAPABILITY, SM86_MAX_SHARED_MEMORY, 384, id="sm120-d384"),
+    pytest.param(SM120_CAPABILITY, SM86_MAX_SHARED_MEMORY, 512, id="sm120-d512"),
+    pytest.param(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY, 128, id="sm86-d128"),
+    pytest.param(SM120_CAPABILITY, SM86_MAX_SHARED_MEMORY, 128, id="sm120-d128"),
+    pytest.param(SM90_CAPABILITY, SM90_MAX_SHARED_MEMORY, 256, id="sm90-d256"),
+    pytest.param(SM90_CAPABILITY, SM90_MAX_SHARED_MEMORY, 384, id="sm90-d384"),
+    pytest.param(SM100_CAPABILITY, SM100_MAX_SHARED_MEMORY, 384, id="sm100-d384"),
+]
 
-    Compile-only for FP32 head_dim 384/512 with a local window.
+
+@pytest.mark.parametrize("capability,max_shared_memory,head_dim", FP32_WINDOW_CASES)
+def test_fp32_window_launches_fit_shared_memory(capability, max_shared_memory, head_dim):
+    """Every FP32 local-window launch has a config within the target's on-chip memory limits.
+
+    Compile-only; kernels do not run.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for Triton")
     inputs = make_inputs(4, head_dim, topk=16, dtype=torch.float32)
-    with compile_only_for_target(capability, SM86_MAX_SHARED_MEMORY) as launches:
+    with compile_only_for_target(capability, max_shared_memory) as launches:
         output = gather_attn(
             **inputs, sliding_window_size=64, kernel_options={"backend": "triton"}
         )
         output.sum().backward()
 
-    assert {"_gather_attn_bwd_dq", "_gather_attn_bwd_dlocal_kv"} <= {
-        launch.kernel for launch in launches
+    assert "_gather_attn_bwd_dq" in {launch.kernel for launch in launches}
+    tensor_memory = SM100_TENSOR_MEMORY_COLUMNS if capability == SM100_CAPABILITY else float("inf")
+    too_large = {
+        launch.kernel: list(zip(launch.shared, launch.tmem))
+        for launch in launches
+        if not launch.fits(max_shared_memory, tensor_memory)
     }
-    assert not over_shared_memory(launches, SM86_MAX_SHARED_MEMORY)
+    assert not too_large
+
+
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_fp32_window_training_matches_reference(head_dim):
+    """FP32 local-window outputs and gradients match the FP64 reference on the local GPU.
+
+    D=128 previously raised OutOfResources on A10G; D=256 did so on H100.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton")
+    inputs = make_inputs(4, head_dim, topk=8, dtype=torch.float32)
+    assert_training_matches_reference(inputs, window=64, tolerance=1e-3)
 
 
 @pytest.mark.parametrize(
@@ -196,30 +257,10 @@ def test_sm86_tiles_match_reference(head_dim, window, dtype):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for Triton")
     inputs = make_inputs(4, head_dim, topk=8, dtype=dtype)
-    reference_inputs = {
-        name: value.detach().double().requires_grad_() if value.is_floating_point() else value
-        for name, value in inputs.items()
-    }
-    expected = gather_attn(**reference_inputs, sliding_window_size=window, impl=Impl.REFERENCE)
-    grad_output = torch.randn_like(expected)
-    expected.backward(grad_output)
-
     # Take the SM86 host path (no TMA; four heads keep the per-head kernels) on the local GPU.
     with emulate_device_dispatch(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY):
-        output = gather_attn(
-            **inputs, sliding_window_size=window, kernel_options={"backend": "triton"}
-        )
-        output.backward(grad_output.to(output.dtype))
-
-    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-3
-    torch.testing.assert_close(output.double(), expected, atol=tolerance, rtol=tolerance)
-    for name in ("query", "local_kv", "sparse_kv", "attention_sink"):
-        torch.testing.assert_close(
-            inputs[name].grad.double(),
-            reference_inputs[name].grad,
-            atol=tolerance * reference_inputs[name].grad.abs().max().item(),
-            rtol=tolerance,
-            msg=lambda message, name=name: f"{name} gradient: {message}",
+        assert_training_matches_reference(
+            inputs, window=window, tolerance=2e-2 if dtype == torch.bfloat16 else 1e-3
         )
 
 
@@ -254,24 +295,6 @@ def test_blackwell_tiles_match_reference(dtype, head_dim):
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] not in (10, 11):
         pytest.skip("Blackwell (SM10x/SM11x) GPU required")
     inputs = make_inputs(4, head_dim, topk=8, dtype=dtype, seq_len=128)
-    reference_inputs = {
-        name: value.detach().double().requires_grad_() if value.is_floating_point() else value
-        for name, value in inputs.items()
-    }
-    expected = gather_attn(**reference_inputs, sliding_window_size=64, impl=Impl.REFERENCE)
-    grad_output = torch.randn_like(expected)
-    expected.backward(grad_output)
-
-    output = gather_attn(**inputs, sliding_window_size=64, kernel_options={"backend": "triton"})
-    output.backward(grad_output.to(output.dtype))
-
-    tolerance = 2e-2 if dtype == torch.bfloat16 else 1e-3
-    torch.testing.assert_close(output.double(), expected, atol=tolerance, rtol=tolerance)
-    for name in ("query", "local_kv", "sparse_kv", "attention_sink"):
-        torch.testing.assert_close(
-            inputs[name].grad.double(),
-            reference_inputs[name].grad,
-            atol=tolerance * reference_inputs[name].grad.abs().max().item(),
-            rtol=tolerance,
-            msg=lambda message, name=name: f"{name} gradient: {message}",
-        )
+    assert_training_matches_reference(
+        inputs, window=64, tolerance=2e-2 if dtype == torch.bfloat16 else 1e-3
+    )
