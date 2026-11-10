@@ -184,6 +184,6 @@ stay nested; crossing ranges move to sibling overlap tracks. The writer and pipe
   independent of the displayed iteration count.
 - The depth+1 counterfactual sets reuse distance to `depth + 1`. It represents an extra stage
   only for one use per iteration, and is a prediction to test, not a measured speedup.
-- `report` shows interior-iteration region medians and one iteration's timeline in ns. Pass
-  `range_overhead_ns=IKET_RANGE_OVERHEAD_NS` from `profiler.pipeline.summary` to flag short
-  regions. The constant estimates one IKET push/pop pair; it is not a measurement of your run.
+- `report` shows interior-iteration region medians and one iteration's timeline in ns. To
+  flag short regions, pass `range_overhead_ns=`, the recorder's cost per range measured on your
+  hardware and toolchain.
