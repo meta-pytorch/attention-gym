@@ -78,8 +78,8 @@ class TileConfig(NamedTuple):
     # Tensor-memory columns: the largest ``metadata.tmem_size`` measured on SM103 (GB300) for
     # BF16 and FP32 at D in {64, 128, 256} with Triton 3.8. Only 64-row tiles use tcgen05 MMAs.
     tmem_cols: int = 0
-    # ``tl.dot`` input precision for FP32 operands in the per-head dQ and local-KV backward;
-    # other dtypes ignore it.
+    # ``tl.dot`` input precision for FP32 operands in the per-head local-KV backward; other
+    # dtypes ignore it.
     dot_precision: str = "tf32x3"
 
 

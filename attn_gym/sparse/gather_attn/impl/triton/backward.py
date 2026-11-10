@@ -73,7 +73,6 @@ def _gather_attn_bwd_dq(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
-    DOT_PRECISION: tl.constexpr,
 ):
     """Accumulate query and sink gradients over both attention branches.
 
@@ -151,6 +150,8 @@ def _gather_attn_bwd_dq(
         grad_query += grad_scores[:, None] * sparse_value * SCALE
 
     if WINDOW:
+        # FP32 runs these dots only on the 16x16 tile, where exact dots fit and are faster
+        # than tf32x3 (see GENERIC_DQ_TILES); other dtypes ignore the precision.
         first_key = query_block * BLOCK_M - WINDOW + 1
         offsets_n_base = tl.arange(0, BLOCK_N)
         for key_tile in tl.range(0, NUM_LOCAL_TILES):
@@ -166,7 +167,7 @@ def _gather_attn_bwd_dq(
                 offsets_d,
                 key_mask[:, None] & dimension_mask[None, :],
             )
-            scores = tl.dot(query, tl.trans(local_values), input_precision=DOT_PRECISION) * SCALE
+            scores = tl.dot(query, tl.trans(local_values), input_precision="ieee") * SCALE
             valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
             if HAS_CU_SEQLENS:
                 valid &= offsets_n[None, :] >= query_start[:, None]
@@ -174,14 +175,14 @@ def _gather_attn_bwd_dq(
             probabilities = tl.exp(scores - lse[:, None])
             probabilities = tl.where(valid, probabilities, 0.0)
             grad_probabilities = tl.dot(
-                grad_output, tl.trans(local_values), input_precision=DOT_PRECISION
+                grad_output, tl.trans(local_values), input_precision="ieee"
             )
             grad_scores = probabilities * (grad_probabilities - delta[:, None])
             grad_query += (
                 tl.dot(
                     grad_scores.to(local_values.dtype),
                     local_values,
-                    input_precision=DOT_PRECISION,
+                    input_precision="ieee",
                 )
                 * SCALE
             )
@@ -783,11 +784,14 @@ def _build_index_query_map(
 #
 # The 16x16 tiles (tl.dot's minimum) run FP32 dots as "ieee": tf32x3 dots do not fit 99 KiB of
 # shared memory at BLOCK_D=512. The TMA local-KV kernel keeps tf32x3, which is faster there.
+#
+# FP32 with a local window always takes the last dQ tile, so the other dQ entries' shared_rows
+# hold for BF16 and FP16 only.
 GENERIC_DQ_TILES = (
     TileConfig(64, 32, 8, 3, shared_rows=208, tmem_cols=512),
     TileConfig(64, 32, 8, 2, shared_rows=192, tmem_cols=512),
     TileConfig(32, 32, 4, 2, shared_rows=112),
-    TileConfig(16, 16, 4, 1, shared_rows=64, dot_precision="ieee"),
+    TileConfig(16, 16, 4, 1, shared_rows=64),
 )
 GENERIC_DLOCAL_KV_TILES = (
     TileConfig(64, 32, 8, 3, shared_rows=484, tmem_cols=512),
@@ -1010,13 +1014,13 @@ def _launch_backward(
             RESOLVED_INDICES=False,
         )
     else:
-        # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
-        dq_tile = (
+        # Full-width D=512 operands otherwise exceed per-block shared-memory limits. FP32 window
+        # dots on the larger tiles stage more shared memory than shared_rows estimates.
+        block_m, block_n, num_warps, num_stages, *_ = (
             GENERIC_DQ_TILES[-1]
-            if head_dim == 512
+            if head_dim == 512 or (window and query.dtype == torch.float32)
             else select_tiles(GENERIC_DQ_TILES, block_d, query.element_size(), query.device)
         )
-        block_m, block_n, num_warps, num_stages, *_ = dq_tile
         num_local_key_tiles = triton.cdiv(window + block_m - 1, block_n) if window else 0
         grad_sink_partials = torch.empty(
             batch,
@@ -1057,7 +1061,6 @@ def _launch_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
-            DOT_PRECISION=dq_tile.dot_precision,
             num_warps=num_warps,
             num_stages=num_stages,
         )
