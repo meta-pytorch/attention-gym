@@ -73,6 +73,7 @@ def _gather_attn_bwd_dq(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     """Accumulate query and sink gradients over both attention branches.
 
@@ -165,7 +166,7 @@ def _gather_attn_bwd_dq(
                 offsets_d,
                 key_mask[:, None] & dimension_mask[None, :],
             )
-            scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3") * SCALE
+            scores = tl.dot(query, tl.trans(local_values), input_precision=DOT_PRECISION) * SCALE
             valid = causal_window_mask(offsets_m, offsets_n, query_mask, key_mask, WINDOW)
             if HAS_CU_SEQLENS:
                 valid &= offsets_n[None, :] >= query_start[:, None]
@@ -173,14 +174,14 @@ def _gather_attn_bwd_dq(
             probabilities = tl.exp(scores - lse[:, None])
             probabilities = tl.where(valid, probabilities, 0.0)
             grad_probabilities = tl.dot(
-                grad_output, tl.trans(local_values), input_precision="tf32x3"
+                grad_output, tl.trans(local_values), input_precision=DOT_PRECISION
             )
             grad_scores = probabilities * (grad_probabilities - delta[:, None])
             grad_query += (
                 tl.dot(
                     grad_scores.to(local_values.dtype),
                     local_values,
-                    input_precision="tf32x3",
+                    input_precision=DOT_PRECISION,
                 )
                 * SCALE
             )
@@ -247,6 +248,7 @@ def _gather_attn_bwd_dlocal_kv(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    DOT_PRECISION: tl.constexpr,
 ):
     """Backward for dKV (local sliding window).
 
@@ -338,7 +340,7 @@ def _gather_attn_bwd_dlocal_kv(
         query_mask = offsets_m < S
         matrix_mask = query_mask[:, None] & dimension_mask[None, :]
         query = load_bhsd(query_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask)
-        scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3")
+        scores = tl.dot(query, tl.trans(local_values), input_precision=DOT_PRECISION)
         if ROPE_DIM:
             query_rope = load_bhsd(
                 query_rope_ptr,
@@ -349,7 +351,9 @@ def _gather_attn_bwd_dlocal_kv(
                 offsets_rope,
                 query_mask[:, None],
             )
-            scores = tl.dot(query_rope, tl.trans(local_rope), acc=scores, input_precision="tf32x3")
+            scores = tl.dot(
+                query_rope, tl.trans(local_rope), acc=scores, input_precision=DOT_PRECISION
+            )
         scores *= SCALE
         output = load_bhsd(
             output_ptr, QUERY_STRIDES, batch, head, offsets_m, offsets_d, matrix_mask
@@ -369,19 +373,19 @@ def _gather_attn_bwd_dlocal_kv(
 
         probabilities = tl.exp(scores - lse[:, None])
         probabilities = tl.where(valid, probabilities, 0.0)
-        grad_probabilities = tl.dot(grad_output, tl.trans(local_v), input_precision="tf32x3")
+        grad_probabilities = tl.dot(grad_output, tl.trans(local_v), input_precision=DOT_PRECISION)
         # A masked query may have a nonfinite delta from another document.
         grad_scores = tl.where(valid, probabilities * (grad_probabilities - delta[:, None]), 0.0)
         grad_values += tl.dot(
             tl.trans(probabilities.to(grad_output.dtype)),
             grad_output,
-            input_precision="tf32x3",
+            input_precision=DOT_PRECISION,
         )
         grad_key_tile = (
             tl.dot(
                 tl.trans(grad_scores.to(query.dtype)),
                 query,
-                input_precision="tf32x3",
+                input_precision=DOT_PRECISION,
             )
             * SCALE
         )
@@ -394,7 +398,7 @@ def _gather_attn_bwd_dlocal_kv(
                 tl.dot(
                     tl.trans(grad_scores.to(query_rope.dtype)),
                     query_rope,
-                    input_precision="tf32x3",
+                    input_precision=DOT_PRECISION,
                 )
                 * SCALE
             )
@@ -776,17 +780,20 @@ def _build_index_query_map(
 
 # Preferred first; later entries fit smaller shared memory (e.g. SM80, or SM86 at D=256).
 # Software-pipelined query tiles make the local-KV gradient the largest consumer.
+#
+# The 16x16 tiles (tl.dot's minimum) run FP32 dots as "ieee": tf32x3 dots do not fit 99 KiB of
+# shared memory at BLOCK_D=512. The TMA local-KV kernel keeps tf32x3, which is faster there.
 GENERIC_DQ_TILES = (
     TileConfig(64, 32, 8, 3, shared_rows=208, tmem_cols=512),
     TileConfig(64, 32, 8, 2, shared_rows=192, tmem_cols=512),
     TileConfig(32, 32, 4, 2, shared_rows=112),
-    TileConfig(16, 16, 4, 1, shared_rows=64),
+    TileConfig(16, 16, 4, 1, shared_rows=64, dot_precision="ieee"),
 )
 GENERIC_DLOCAL_KV_TILES = (
     TileConfig(64, 32, 8, 3, shared_rows=484, tmem_cols=512),
     TileConfig(64, 32, 8, 2, shared_rows=290, tmem_cols=512),
     TileConfig(32, 32, 4, 2, shared_rows=177),
-    TileConfig(16, 16, 4, 1, shared_rows=68),
+    TileConfig(16, 16, 4, 1, shared_rows=68, dot_precision="ieee"),
 )
 
 
@@ -1004,11 +1011,12 @@ def _launch_backward(
         )
     else:
         # Full-width D=512 operands otherwise exceed per-block shared-memory limits.
-        block_m, block_n, num_warps, num_stages, *_ = (
-            TileConfig(16, 16, 4, 1)
+        dq_tile = (
+            GENERIC_DQ_TILES[-1]
             if head_dim == 512
             else select_tiles(GENERIC_DQ_TILES, block_d, query.element_size(), query.device)
         )
+        block_m, block_n, num_warps, num_stages, *_ = dq_tile
         num_local_key_tiles = triton.cdiv(window + block_m - 1, block_n) if window else 0
         grad_sink_partials = torch.empty(
             batch,
@@ -1049,6 +1057,7 @@ def _launch_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
+            DOT_PRECISION=dq_tile.dot_precision,
             num_warps=num_warps,
             num_stages=num_stages,
         )
@@ -1056,13 +1065,14 @@ def _launch_backward(
 
     if window:
         # Key-only RoPE adds a second operand tile; size the tiles for both.
-        block_m, block_n, num_warps, num_stages, *_ = (
-            TileConfig(16, 16, 4, 1)
+        local_tile = (
+            GENERIC_DLOCAL_KV_TILES[-1]
             if head_dim == 512
             else select_tiles(
                 GENERIC_DLOCAL_KV_TILES, block_d + rope_dim, query.element_size(), query.device
             )
         )
+        block_m, block_n, num_warps, num_stages, *_ = local_tile
         num_local_query_tiles = triton.cdiv(window + block_n - 1, block_m)
         local_grid = (triton.cdiv(seq_len, block_n), batch * heads)
         if not rope_dim and all(map(can_use_tma, (query, local_kv, grad_output))):
@@ -1133,6 +1143,7 @@ def _launch_backward(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_D=block_d,
+                DOT_PRECISION=local_tile.dot_precision,
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
@@ -1508,9 +1519,10 @@ def _launch_grouped_backward(
             for tensor in (local_kv, local_v)
         )
     else:
-        block_m, block_n, num_warps, num_stages, *_ = select_tiles(
+        local_tile = select_tiles(
             GENERIC_DLOCAL_KV_TILES, block_d, query.element_size(), query.device
         )
+        block_m, block_n, num_warps, num_stages, *_ = local_tile
         partial_local_kv = torch.empty(query.shape, dtype=local_kv.dtype, device=local_kv.device)
         partial_local_v = (
             partial_local_kv
@@ -1556,6 +1568,7 @@ def _launch_grouped_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
+            DOT_PRECISION=local_tile.dot_precision,
             num_warps=num_warps,
             num_stages=num_stages,
         )
