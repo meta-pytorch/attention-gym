@@ -189,18 +189,21 @@ class IndexerScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         batch = global_pair // pairs_per_batch
         batch_pair = global_pair % pairs_per_batch
         query0 = batch_pair * 2
-        query_last = query0 + 1 if query0 + 1 < num_queries else query0
-        first_tile = self.upcast_offset(0)
-        tile_end = self.upcast_offset(
-            cute.ceil_div(self.visible_candidates(query_last), self.tile_candidates)
-            if self.causal
-            else cute.ceil_div(self.upcast_offset(params.scores.shape[2]), self.tile_candidates)
-        )
-        intervals = None
         if cutlass.const_expr(params.candidate_bounds is not None):
             first_tile, tile_end, intervals = self.pair_tiles(
                 params.candidate_bounds, query0, num_queries
             )
+        else:
+            query_last = query0 + 1 if query0 + 1 < num_queries else query0
+            first_tile = self.upcast_offset(0)
+            tile_end = self.upcast_offset(
+                cute.ceil_div(self.visible_candidates(query_last), self.tile_candidates)
+                if self.causal
+                else cute.ceil_div(
+                    self.upcast_offset(params.scores.shape[2]), self.tile_candidates
+                )
+            )
+            intervals = None
         return batch, batch_pair, query0, first_tile, tile_end, intervals
 
     # ------------------------------------------------------------------ roles
