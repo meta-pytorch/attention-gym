@@ -169,3 +169,51 @@ def test_fwd_engine_preserves_zero_capacity_shapes(packed):
     assert akkod.shape == (0, 2 * 256)
     assert aqk.shape == akk.shape == (1, tokens, 2, BT)
     assert akkd.shape == (1, tokens, 2, 16)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+def test_fwd_engine_compiles_once_across_shapes(packed):
+    """One kernel per static tuple serves every token, chunk and sequence count."""
+    from attn_gym.linear.kda.fwd.cute import chunk_kda_fwd_intra_engine as engine
+
+    engine._compile_intra_engine_fwd.cache_clear()
+    # One chunk, multiples of 16 chunks, other counts, and more units than launched CTAs.
+    shapes = ([64], [128], [1024], [64 * 17], [64 * 96])
+    if packed:
+        shapes = ([1], [65, 0, 63], [16] * 16, [1000, 24], [0, 0, 0, 37], [64 * 96])
+    try:
+        for lengths in shapes:
+            metadata, q, k, gate, beta = _inputs(lengths, heads=2)
+            aqk, akkod, akkd = engine.kda_intra_engine_fwd(
+                q, k, gate, beta, D**-0.5, metadata if packed else None
+            )
+            assert aqk.shape == (1, sum(lengths), 2, BT)
+            assert torch.isfinite(akkod).all() and torch.isfinite(akkd).all()
+        info = engine._compile_intra_engine_fwd.cache_info()
+        assert info.currsize == 1
+        assert info.hits + info.misses == len(shapes)
+    finally:
+        engine._compile_intra_engine_fwd.cache_clear()
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
+def test_fwd_engine_trace_checks(monkeypatch, packed):
+    """Tracing verifies both TMA rings' copies and finds no hazard on the operand overlaps."""
+    from attn_gym.linear.kda.fwd.cute import chunk_kda_fwd_intra_engine as engine
+
+    entries = []
+    compile_tvm_ffi = engine.compile_tvm_ffi
+
+    def compile_and_keep(entry, *args, **kwargs):
+        entries.append(entry)
+        return compile_tvm_ffi(entry, *args, **kwargs)
+
+    monkeypatch.setattr(engine, "compile_tvm_ffi", compile_and_keep)
+    engine._compile_intra_engine_fwd.__wrapped__(2, D, packed, False)
+    (op,) = entries
+    checks = op.checks()
+    assert {name: c.tma for name, c in checks.channels.items() if c.tma is not None} == {
+        "raw": "verified",
+        "rawg": "verified",
+    }, op.describe()
+    assert set(checks.aliases.values()) == {"no hazard found"}, op.describe()

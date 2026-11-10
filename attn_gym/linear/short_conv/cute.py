@@ -25,6 +25,7 @@ from typing import ClassVar
 
 import cutlass
 import torch
+from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
@@ -705,6 +706,41 @@ class CausalConv1dPagedForward(CausalConv1dSiluForward):
         )
 
 
+def _decode_launch_bound(
+    width: int,
+    dtype: ShortConvDType,
+    config: ShortConvConfig,
+    input_alignment: int,
+    activation: Activation,
+    history: bool,
+) -> dict:
+    """Launch options pinning decode at 32 registers (a full SM: 2048 threads, at most 32 CTAs).
+
+    Only the measured case gets them: width 4, 4 x 16-bit channels per thread loaded as one
+    vector, 64-256 threads, a built-in activation and the initial-state flag. ptxas puts the
+    BF16 ones at 34 (SiLU) or 40 (no activation) registers, 12 or 8 of 16 CTAs per SM at 128
+    threads, FP16 ones at 32, and all fit 32 without spilling. Wider groups (8 x 16-bit,
+    4 x FP32), scalar loads and width 5 spill at 32, and the other measured decodes compile to
+    the same code under the bound, so they keep ptxas's choice. With a bound above one CTA,
+    CuTeDSL also derives a shared-memory carveout (0, all L1), which measured up to 2.6% slower
+    where the bound leaves the code unchanged, so the driver default is kept.
+    """
+    if not (
+        history
+        and width == 4
+        and config.channels_per_thread == 4
+        and dtype.cute_type.width == 16
+        and input_alignment == 8
+        and config.threads in (64, 128, 256)
+        and activation.name in ("silu", None)
+    ):
+        return {}
+    return {
+        "min_blocks_per_mp": 2048 // config.threads,
+        "preferred_smem_carveout": int(cuda.CUshared_carveout.CU_SHAREDMEM_CARVEOUT_DEFAULT),
+    }
+
+
 class CausalConv1dSiluDecode(ShortConvKernel):
     """Advance a paged causal history by one token per sequence, activation fused."""
 
@@ -720,7 +756,9 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         activation,
         grid: str,
         use_has_initial_state: bool = False,
+        launch_bound: dict | None = None,
     ):
+        """``launch_bound``: extra ``launch`` options (``_decode_launch_bound``)."""
         assert channels % config.channels_per_thread == 0, (
             f"decode channels ({channels}) must be divisible by channels_per_thread "
             f"({config.channels_per_thread})"
@@ -729,6 +767,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         self.activation = activation
         self.use_has_initial_state = use_has_initial_state
         self.work = _sequence_work(grid)
+        self.launch_bound = launch_bound or {}
 
     def get_name(self) -> str:
         """Name the artifact without the runtime-bound sequence axis."""
@@ -819,6 +858,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
             grid=work.grid(),
             block=(self.threads, 1, 1),
             stream=stream,
+            **self.launch_bound,
         )
 
 
@@ -3569,8 +3609,11 @@ def _compile_decode(
     use_has_initial_state: bool = False,
 ):
     """Compile one decode specialization, shared across batch sizes and pool depths."""
+    bound = _decode_launch_bound(
+        width, dtype, config, input_alignment, activation, use_has_initial_state
+    )
     operation = CausalConv1dSiluDecode(
-        channels, width, config, dtype, activation.forward, grid, use_has_initial_state
+        channels, width, config, dtype, activation.forward, grid, use_has_initial_state, bound
     )
     return compile_tvm_ffi(
         operation,
