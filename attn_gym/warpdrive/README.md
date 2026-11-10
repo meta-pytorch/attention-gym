@@ -138,7 +138,7 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 
 - [Tour](../../docs/warpdrive/tour.ipynb): every noun and verb on small runnable kernels, executed on a GB300.
 - [Roles](../../docs/warpdrive/roles.md): placement, params, returned state and register budgets.
-- [Scheduling](../../docs/warpdrive/scheduling.md): launch setup, custom work lists and CUTLASS/FA4 mappings.
+- [Scheduling](../../docs/warpdrive/scheduling.md): launch setup, custom work lists and external tile orders.
 - [Channels](../../docs/warpdrive/channels.md): rings, slots, round-robin instances, exclusive consumers,
   named barriers, overlapping handles, try tokens, previews, TMEM and turnstiles.
 - [Storage](../../docs/warpdrive/storage.md): stage views and checking declared aliases.

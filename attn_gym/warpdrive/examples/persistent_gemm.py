@@ -8,7 +8,7 @@ Choose the schedule, mapping and cluster at construction::
 
     PersistentGemm(schedule=StaticPersistent())  # or OneShot(), AtomicPersistent()
     PersistentGemm(schedule=ClusterLaunchControl())  # or your own IndexSchedule
-    PersistentGemm(mapping=CutlassRaster(swizzle=8))  # any WorkMap, or an adapter
+    PersistentGemm(mapping=Raster(swizzle=8))  # or your own WorkMap
     PersistentGemm(cluster=CtaPair())  # 2-CTA: 256x224 MMA tiles, CtaGroup.TWO
     PersistentGemm(cluster=Cluster(2, 2, pair=True), tile_n=224)  # two pairs share A tiles
 

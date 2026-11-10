@@ -34,8 +34,8 @@ Channels support these handoffs (``channels.py``):
 
 Declare ``self.work = WorkStream(mapping=..., schedule=...)`` and bind ``work: WorkCursor``.
 Schedules are ``OneShot``, ``StaticPersistent``, ``AtomicPersistent``, ``ClusterLaunchControl``
-or an ``IndexSchedule`` subclass. Mappings are ``Raster``, a ``WorkMap`` subclass or an
-``adapters.py`` CUTLASS/FA4 tile-order adapter. ``self.cluster = CtaPair()`` or
+or an ``IndexSchedule`` subclass. Mappings are ``Raster`` or a ``WorkMap`` subclass.
+``self.cluster = CtaPair()`` or
 ``Cluster(m, n, pair=...)`` supplies cluster scope and multicast TMA loads; pin MMA to
 ``@role(..., cta="leader")``. See ``examples/`` for GEMM, persistent GEMM and FA4 forward.
 
@@ -88,7 +88,6 @@ import importlib
 # Lazy imports let torch-only code use warpdrive.cache without loading the layer or cutlass.
 # Absolute module names keep these imports visible to compile keys.
 _EXPORTS = {
-    "attn_gym.warpdrive.adapters": ("CutlassRaster", "Fa4Mapping"),
     "attn_gym.warpdrive.alias": (
         "bulk_commit_group",
         "bulk_wait_group",
@@ -153,8 +152,6 @@ __all__ = [
     "ClusterLaunchControl",
     "Consumer",
     "CtaPair",
-    "CutlassRaster",
-    "Fa4Mapping",
     "Handle",
     "IndexSchedule",
     "Instance",

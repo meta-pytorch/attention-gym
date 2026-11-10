@@ -1,4 +1,9 @@
-"""External scheduler tile orders as warpdrive work mappings.
+"""Worked examples of extending WorkMap with external tile orders.
+
+``CutlassRaster`` wraps CUTLASS's static persistent order; ``Fa4Mapping`` wraps FA4's tile
+schedulers. These WorkMap examples are not core scheduling policy. FA4's mapping belongs to
+whoever uses FA4's order; callers must keep inputs within its supported host-arithmetic domain.
+Only constructing ``Fa4Mapping`` requires ``flash_attn``.
 
 The adapter supplies ``index -> tile``; the warpdrive schedule distributes indices::
 

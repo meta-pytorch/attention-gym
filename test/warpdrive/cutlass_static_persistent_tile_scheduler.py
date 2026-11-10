@@ -27,7 +27,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 # ruff: noqa
-# Vendored test oracle for attn_gym.warpdrive.adapters.CutlassRaster.
+# Vendored test oracle for attn_gym.warpdrive.examples.external_maps.CutlassRaster.
 # Source: https://github.com/NVIDIA/cutlass, examples/python/CuTeDSL/helpers/
 # static_persistent_tile_scheduler.py at e13f5cd4142c43efc37c2f6339923eb4a57afb99 (the BSD-3
 # replacement of the deprecated cutlass.utils copy; not shipped in the nvidia-cutlass-dsl wheel).
