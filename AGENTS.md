@@ -103,32 +103,68 @@ performance:
 
 ## Adding CuTeDSL Kernels
 
-Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache`
-(`attn_gym/_backends/cute/cache.py`); see the `cutedsl-tunable-kernel-template` skill for the
-full adapter. A compiled kernel is stored on disk and reused until one of its key inputs changes:
+Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache` from
+`attn_gym.warpdrive.cache`; see [`docs/warpdrive/cache.md`](docs/warpdrive/cache.md) for the
+full contract and the `cutedsl-tunable-kernel-template` skill for the tuning adapter. Entries
+live under `WARPDRIVE_CACHE_DIR` (default `$XDG_CACHE_HOME/warpdrive`). A disk entry is reused
+until the compile arguments, compile target, toolchain versions, codegen environment variables
+(`attn_gym/warpdrive/cache/_key.py`), or the source of the compile module and every `attn_gym`
+module it imports transitively change. Imports are found statically, so:
 
-- the compile function's arguments (static, pickleable values) and the compile target;
-- the Python, cutlass, tvm_ffi, torch, and CUDA versions and the codegen environment variables
-  listed in `attn_gym/_backends/cute/_key.py` (`CUTE_DSL_ARCH` reaches it through the target);
-- the source of the compile function's module and of every `attn_gym` module it imports,
-  directly or transitively (`_key.module_closure`). Unrelated modules do not invalidate it.
+- Reach traced code with ordinary `import`/`from` statements (or a string-literal
+  `importlib.import_module("attn_gym.x.y")`); computed module names are invisible.
+- `import pkg.sub.module` does not hash `pkg/sub/__init__.py`; keep `__init__` files to
+  re-exports.
+- Use `extra_sources=(...)` only for files read while tracing or code outside `attn_gym`; never
+  for modules already imported. For a class defined outside the compile module's imports, include
+  `module_source_digest(cls.__module__)` in its `__cute_cache_key__()`.
+- Host-only code tracing never runs may be imported at call time by relative name
+  (`importlib.import_module(".mod", __package__)`) to stay out of the key; never traced code.
 
-Imports are found statically, so keep the code a kernel traces reachable by import:
+A kernel loaded from disk was never traced: arguments restore what tracing recorded through
+`__cute_trace_record__`/`__cute_restore_trace__`, and `jit_cache(uncached=predicate)` compiles
+selected calls without either cache when the trace itself is needed. To test specialization
+reuse, assert on `compile_fn.cache_info()` (distinct keys in `currsize`, launches in
+`hits + misses`) instead of setting `CUTE_DSL_NO_CACHE`, which forces cold compiles.
 
-- Import kernel helpers, constants, and ops with ordinary `import`/`from` statements (local and
-  relative imports are fine). A module named as a string literal, as in
-  `importlib.import_module("attn_gym.x.y")`, also counts; computed module names do not.
-- `import pkg.sub.module` does not add `pkg/sub/__init__.py`; keep package `__init__` files to
-  plain re-exports rather than state a kernel depends on.
-- Pass `extra_sources=(...)` to `jit_cache` only for inputs import analysis cannot see: files read
-  while tracing, or code outside `attn_gym` other than the versioned dependencies above. A class
-  passed as a compile argument is keyed by its module and name only, so if its module is not
-  imported by the compile module, list that module in `extra_sources`.
-- Do not add `extra_sources` for modules the compile module already imports; they are hashed.
+## warpdrive
 
-When testing specialization reuse, assert on `compile_fn.cache_info()` (distinct keys in
-`currsize`, launches in `hits + misses`) instead of disabling the disk cache with
-`CUTE_DSL_NO_CACHE`, which forces cold compiles.
+`attn_gym/warpdrive/` helps write warp-specialized CuTeDSL kernels (roles, channels, work
+streams) and is the CuTeDSL authoring base of the repository: `cache/` (compile cache),
+`compat.py` (CuTeDSL version shims) and `profiler/` (intra-kernel profiler). Nothing under it
+imports the rest of `attn_gym` (`test/warpdrive/test_warpdrive_boundary.py`). Load the
+[`authoring-warpdrive`](.agents/skills/authoring-warpdrive/SKILL.md) skill when authoring or
+porting a kernel. Docs live under [`docs/warpdrive/`](docs/warpdrive/index.md) and must match
+the checkout being used. Fuzz report labels name cases in `test/warpdrive_fuzz/{static,mutate}.py`;
+they are not a public error-code API.
+
+Warpdrive kernels compile through `jit_cache` with two extra rules:
+
+- Pass a kernel's static choices to its constructor: the key is the constructor call, and a
+  public attribute assigned afterwards (other than `cluster`, work streams, and the IKET,
+  tracing and alias settings) raises.
+- A cached kernel restores its trace results (`describe()`, TMA/alias reports, warnings) without
+  tracing. Only a test that asserts on tracing itself (IKET ranges, monkeypatched trace hooks)
+  takes the `traced_compiles` fixture (`test/conftest.py`) and calls `compile_fn.cache_clear()`.
+
+### warpdrive Testing Tiers
+
+Pick the smallest tier that covers the change; run bigger tiers only when asked or before
+landing core synchronization/scheduling changes.
+
+- Every change (~45 s cold, ~22 s with a warm compile cache on a GB300):
+  `pytest -n 12 test/warpdrive test/profiler`. Fuzz tests are skipped by default (`addopts`
+  deselects the `fuzz` marker).
+- Quick fuzz (~2-3 min, on request or before landing layer changes):
+  `pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz`. It includes the mutant check:
+  each synthetic layer bug in `test/warpdrive_fuzz/runtime_mutants.py` must fail or hang its
+  listed test (three hang by design, 90 s each).
+- Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.
+  Use `tools/warpdrive/fuzz_warpdrive.py {static,mutate}` (compile-only).
+  `CUTE_DSL_ARCH=sm_100a python tools/warpdrive/warpdrive_sass.py dump OUTDIR` records the
+  seven standard configs; `compare BEFORE AFTER` gates on PTX and compiler identity and prints
+  SASS diffs (`--strict-sass` also requires identical SASS). ptxas can assign registers
+  differently from identical PTX, so a SASS-only diff with identical PTX is not a code change.
 
 ## cuDNN Vendor Maintenance
 
@@ -152,6 +188,8 @@ before changing the covered subsystem:
   registration, fake implementations, autograd, `opcheck`, and `torch.compile` validation.
 - [`cutedsl-tunable-kernel-template`](.agents/skills/cutedsl-tunable-kernel-template/SKILL.md) —
   typed config generation, cached TVM-FFI compilation, parallel compile, and sequential tuning.
+- [`authoring-warpdrive`](.agents/skills/authoring-warpdrive/SKILL.md) —
+  warp-specialized CuTeDSL kernels from roles, channels and work streams, or ports to that API.
 
 ## Agent Scratch Space
 

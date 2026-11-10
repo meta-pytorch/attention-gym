@@ -264,7 +264,7 @@ def test_batch_sizes_reuse_shared_schedule(
 
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     # Start without in-process or on-disk winners so every tuning decision is observed.
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tune_module, "_WINNERS", {})
     monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
     tuned = Counter()

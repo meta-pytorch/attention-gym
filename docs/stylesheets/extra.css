@@ -1846,3 +1846,10 @@ body.trace-embed-fullscreen-open {
     padding-left: 1rem;
   }
 }
+
+/* ── Light/dark image pairs: GitHub's #gh-*-mode-only fragments, following the site toggle ── */
+
+[data-md-color-scheme="slate"] img[src$="#gh-light-mode-only"],
+[data-md-color-scheme="default"] img[src$="#gh-dark-mode-only"] {
+  display: none;
+}

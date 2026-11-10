@@ -29,7 +29,7 @@ def test_wy_backward_nvvm_compatibility(
 
     target = CompileTarget("cuda", configured_arch="sm_100a", sm_count=132)
     monkeypatch.setattr(cute_target, "_target", target)
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
     args = (2, 128, 64, dtype, 128**-0.5, True, 1, ragged)
     assert not _compile_chunk_kda_bwd_wy_dqkg.is_cached(*args)

@@ -16,7 +16,7 @@ from .._common import activate_tree, check_tree
 from .diff import compare, render
 from .sass import carve_cubins
 
-CACHE_VARIABLES = ("CUTE_DSL_CACHE_DIR", "ATTN_GYM_CUTE_CACHE_DIR")
+CACHE_VARIABLES = ("CUTE_DSL_CACHE_DIR", "WARPDRIVE_CACHE_DIR")
 
 
 def snapshot(out: Path, tree: Path | None, selected: list[str]) -> int:

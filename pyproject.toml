@@ -26,7 +26,8 @@ dependencies = [
 
 [project.optional-dependencies]
 linear = [
-    "nvidia-cutlass-dsl[cu13]>=4.6.0; sys_platform == 'linux'",
+    # 4.6.0/4.6.1 hang on a bulk copy issued in elect_one() (see attn_gym/warpdrive/compat.py).
+    "nvidia-cutlass-dsl[cu13]>=4.6.2; sys_platform == 'linux'",
     "apache-tvm-ffi>=0.1.11",
     "packaging",
 ]
@@ -44,6 +45,7 @@ tests = [
     "pytest-xdist",
     "typer",
     "jsonargparse[signatures]",
+    "perfetto",  # warpdrive tracing/profiler tests read and write Perfetto traces
     "flash-attn-4[cu13]>=4.0.0b38; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
@@ -98,10 +100,12 @@ packages = ["attn_gym"]
 testpaths = ["test"]
 norecursedirs = ["agent_space"]
 # `-n` honors `xdist_group` marks, so tests that pin specific GPUs never run concurrently.
-addopts = "--dist loadgroup"
+# Seeded warpdrive fuzz cases are skipped by default; run them with `pytest -m fuzz`.
+addopts = "--dist loadgroup -m 'not fuzz'"
 markers = [
     "full_autotune: exercise every production Triton autotuning candidate",
     "tuner_config(index): pin every gather_attn Triton tuner to that valid candidate",
+    "fuzz: warpdrive fuzz cases and layer mutant check; long campaigns: tools/warpdrive/fuzz_warpdrive.py",
 ]
 
 # ---------- RUFF ------------
@@ -156,3 +160,5 @@ ignore = ['E231', 'E731']
 # CuTeDSL traces if-expressions and nested ifs as device selects/branches; min/max builtins and
 # `and` do not trace the same way on dynamic values, so keep the vendored control flow.
 "attn_gym/linear/_delta_rule/cudnn_fe/{common,kernel,tile_dsl}/*.py" = ["FURB136", "PLR1730", "SIM102"]
+# The same holds for warpdrive's traced code (profiler included) and the kernels its tests build.
+"{attn_gym/warpdrive,test/warpdrive,test/warpdrive_fuzz,test/profiler}/**/*.py" = ["SIM102"]

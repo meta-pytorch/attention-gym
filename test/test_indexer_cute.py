@@ -364,7 +364,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
     _skip_no_supported_gpu()
     from attn_gym.sparse.indexer.impl import cute as impl
 
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
     compilers = (impl._compile_scores, impl._compile_topk)
     for compiler in compilers:

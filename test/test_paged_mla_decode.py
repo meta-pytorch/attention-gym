@@ -381,7 +381,7 @@ def test_autotune_matches_reference_and_reuses_winner(
     while a shorter ``max_seqlen_k`` bucket re-tunes."""
     pytest.importorskip("flash_attn.cute")
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")
-    monkeypatch.setenv("ATTN_GYM_CUTE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tune_module, "_WINNERS", {})
     monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
     winners = []

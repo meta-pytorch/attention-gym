@@ -23,6 +23,9 @@ os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
 
 import torch
 
+# Shared assertion helpers get pytest's rewritten (introspecting) asserts.
+pytest.register_assert_rewrite("attn_gym.testing.warpdrive")
+
 
 def _configure_worker_parallelism(config: pytest.Config) -> None:
     if sys.platform != "linux" or not hasattr(config, "workerinput"):
@@ -80,6 +83,28 @@ def _reset_shared_compile_wrapper() -> Iterator[None]:
     from torch._dynamo.external_utils import wrap_inline
 
     reset_code(wrap_inline(len).__code__)
+
+
+@pytest.fixture
+def requires_blackwell() -> None:
+    """Skip unless an SM100-family GPU (the warpdrive target) is present."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("warpdrive tests require SM100-family GPUs")
+
+
+@pytest.fixture
+def traced_compiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep this test's compiles out of the jit_cache disk cache (``CUTE_DSL_NO_CACHE``).
+
+    For tests that assert on tracing itself (IKET ranges emitted, monkeypatched trace hooks).
+    A cached warpdrive kernel restores what its trace reported (describe(), alias findings, TMA
+    reports, warnings), but nothing is traced. The in-memory cache still applies: clear the
+    compile function (``cache_clear()``) when an earlier test in the process may have compiled
+    the same key.
+    """
+    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
 
 
 @pytest.fixture
