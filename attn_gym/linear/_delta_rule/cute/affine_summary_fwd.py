@@ -51,7 +51,7 @@ range (NOTE [Terminology], "Summary work is bounded by fragments").
 *work item* and *partial* are the ``work`` table contract between the planner and the
 kernels, defined in ``attn_gym.linear._delta_rule.triton.work_items``.
 
-Architecture (SM100 warp specialization, mirrors ``kda/bwd/cute/chunk_delta_h_bwd.py``):
+Architecture (SM100 warpdrive roles):
   - One CTA per (column tile, head, work item); 6 warps. The recurrence is a serial latency
     chain (~1.1 us per chunk at BN=32), so when ``heads * tiles`` leaves SMs idle the wrapper
     cuts the ranges' chunks into as many items as fill the machine (``plan_work_items``)
@@ -76,20 +76,17 @@ Limitations:
   - Contiguous inputs; SM100 (tcgen05) only.
 """
 
-# NOTE: no `from __future__ import annotations` — cute.struct requires
-# eager-evaluated annotations.
-
-from enum import IntEnum
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import cute, pipeline
+from cutlass import cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
-from cutlass.cute.typing import Float32, Int32, Int64
+from cutlass.cute.typing import Float32, Int32
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import get_device_properties
@@ -97,8 +94,26 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.constants import is_sm100_kda_capability
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
+from attn_gym.warpdrive import (
+    Consumer,
+    Local,
+    OneShot,
+    Producer,
+    Ring,
+    SmemPlan,
+    Threads,
+    Tma,
+    Tmem,
+    TmemPlan,
+    Umma,
+    Warps,
+    WarpSpecialized,
+    WorkCursor,
+    WorkStream,
+    role,
+)
 from attn_gym.warpdrive.cache import compile_tvm_ffi, get_compile_target, jit_cache
-from attn_gym.warpdrive.compat import LayoutEnum, SmemAllocator, TmemAllocator
+from attn_gym.warpdrive.compat import LayoutEnum
 
 BT = 64  # chunk size
 KEY_DIM = 128
@@ -183,15 +198,6 @@ def decode_work_row(work_table: cute.Tensor, work: Int32, whole_ranges: cutlass.
     return start, work_table[work, 3], work_table[work, 1], work_table[work, 2]
 
 
-class WarpRole(IntEnum):
-    """Warp-role boundaries in the affine-summary kernel."""
-
-    CUDA = 0
-    LOAD = 4
-    MMA = 5
-    END = 6
-
-
 class TmaOp(NamedTuple):
     """One TMA copy atom and its tensor-map descriptor."""
 
@@ -228,17 +234,33 @@ class SmemLayouts(NamedTuple):
     tmpb_store: cute.ComposedLayout
 
 
-class _AffineSummaryFwdOp:
+@dataclass(frozen=True)
+class ForwardSummaryParams:
+    """Shared layouts and runtime inputs; channel state stays local to each role."""
+
+    work_table: cute.Tensor
+    out: cute.Tensor
+    mmas: Mmas
+    tma: TmaOps
+    wx_layout: cute.Layout
+    kt_layout: cute.Layout
+    sW: cute.Tensor
+    sKg: cute.Tensor
+    sU: cute.Tensor
+    sXb: cute.Tensor
+    sXb_store: cute.Tensor
+    sTmpb: cute.Tensor
+    sTmpb_store: cute.Tensor
+    gk_3d: cute.Tensor
+
+
+class _AffineSummaryFwdOp(WarpSpecialized):
     """Warp-specialized SM100 chunk recurrence over one augmented-state column tile.
 
     The fp32 ``[K, BN]`` state slice persists in CUDA-warp registers; each chunk
     snapshots it (and later ``Tmp``) into SMEM as hi/lo I/O-dtype halves feeding
     two-pass SS-mode UMMAs.
     """
-
-    CUDA_WARP_IDS = tuple(range(WarpRole.CUDA, WarpRole.LOAD))
-    WARP_SZ = cute.arch.WARP_SIZE
-    CTA_THREADS = WarpRole.END * WARP_SZ
 
     def __init__(
         self,
@@ -274,11 +296,26 @@ class _AffineSummaryFwdOp:
         self.u_depth = 2
         self.gk_depth = 2
 
-        self.tmem_free_bar = pipeline.NamedBarrier(
-            barrier_id=2,
-            num_threads=self.CTA_THREADS,
-        )
-        self.align = 1024
+        self.smem_plan = SmemPlan()
+        w = self.smem_plan.buffer("W", self.io_type, align=1024)
+        kg = self.smem_plan.buffer("Kg", self.io_type, align=1024)
+        xb = self.smem_plan.buffer("Xb", self.io_type, align=1024)
+        tmpb = self.smem_plan.buffer("Tmpb", self.io_type, align=1024)
+        u = self.smem_plan.buffer("U", self.io_type, align=1024)
+        gk = self.smem_plan.buffer("Gk", Float32, align=128)
+        xb_store = self.smem_plan.buffer("XbStore", self.io_type, align=1024, overlaps=xb)
+        tmpb_store = self.smem_plan.buffer("TmpbStore", self.io_type, align=1024, overlaps=tmpb)
+        io_bytes = self.io_type.width // 8
+        self.w = Ring(self.w_depth, Tma(BT * KEY_DIM * io_bytes), Umma, buffer=w)
+        self.kg = Ring(self.kg_depth, Tma(KEY_DIM * BT * io_bytes), Umma, buffer=kg)
+        self.u = Ring(self.u_depth, Tma(self.BN * BT * io_bytes), Umma, buffer=u)
+        self.gk = Ring(self.gk_depth, Tma(KEY_DIM * 4), Warps, buffer=gk)
+        self.xb = Ring(2, Threads, Umma, buffer={"B": xb, "Store": xb_store})
+        self.tmpb = Ring(2, Threads, Umma, buffer={"B": tmpb, "Store": tmpb_store})
+        self.wx = Ring(1, Umma, Threads, release_fence="tmem_load")
+        self.kt = Ring(1, Umma, Threads, release_fence="tmem_load")
+        self.tmem_plan = TmemPlan().region("wx", self.BN).region("kt", self.BN)
+        self.work = WorkStream(schedule=OneShot())
 
     def get_name(self) -> str:
         """Return a stable profiler and artifact name for this specialization."""
@@ -351,7 +388,6 @@ class _AffineSummaryFwdOp:
             self.kt_tile[:2],
             tcgen05.OperandSource.SMEM,
         )
-        self.tm_wx, self.tm_kt, self.tm_tot = self._plan_tmem(mma_wx, mma_kt)
 
         # --- SMEM staged layouts ---
         # A operands ride their TMA rings; B operands hold hi/lo halves of the
@@ -433,35 +469,7 @@ class _AffineSummaryFwdOp:
             (KEY_DIM, 1),
         )
 
-        self.w_bytes = cute.size_in_bytes(self.io_type, s_w_one)
-        self.kg_bytes = cute.size_in_bytes(self.io_type, s_kg_one)
-        self.u_bytes = cute.size_in_bytes(self.io_type, s_u_one)
-        self.gk_bytes = cute.size_in_bytes(Float32, s_gk_2d)
-
-        io_type = self.io_type
-        align = self.align
-
-        @cute.struct
-        class Shared:
-            bar_w: cute.struct.MemRange[Int64, self.w_depth * 2]
-            bar_kg: cute.struct.MemRange[Int64, self.kg_depth * 2]
-            bar_u: cute.struct.MemRange[Int64, self.u_depth * 2]
-            bar_gk: cute.struct.MemRange[Int64, self.gk_depth * 2]
-            bar_xb: cute.struct.MemRange[Int64, 2 * 2]
-            bar_tmpb: cute.struct.MemRange[Int64, 2 * 2]
-            bar_wx: cute.struct.MemRange[Int64, 1 * 2]
-            bar_kt: cute.struct.MemRange[Int64, 1 * 2]
-            tmem_buf: Int32
-            sW: cute.struct.Align[cute.struct.MemRange[io_type, cute.cosize(s_w_staged)], align]
-            sKg: cute.struct.Align[cute.struct.MemRange[io_type, cute.cosize(s_kg_staged)], align]
-            sXb: cute.struct.Align[cute.struct.MemRange[io_type, cute.cosize(s_xb_staged)], align]
-            sTmpb: cute.struct.Align[
-                cute.struct.MemRange[io_type, cute.cosize(s_tmpb_staged)], align
-            ]
-            sU: cute.struct.Align[cute.struct.MemRange[io_type, cute.cosize(s_u_staged)], align]
-            sGK: cute.struct.Align[cute.struct.MemRange[Float32, KEY_DIM * self.gk_depth], 128]
-
-        self.shared_type = Shared
+        bound = self.work.bind((SUMMARY_DIM // self.BN, self.heads, Int32(mOut.shape[0])))
 
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
@@ -483,56 +491,28 @@ class _AffineSummaryFwdOp:
                 s_tmpb_staged,
                 s_tmpb_store_staged,
             ),
+            bound,
         ).launch(
-            grid=(SUMMARY_DIM // self.BN, self.heads, cute.size(mOut.shape[0])),
-            block=(self.CTA_THREADS, 1, 1),
+            **self.launch_config(bound),
             stream=stream,
             min_blocks_per_mp=1,
         )
-
-    def _plan_tmem(self, mma_wx: cute.TiledMma, mma_kt: cute.TiledMma) -> tuple[int, int, int]:
-        """Assign disjoint TMEM column regions to the two accumulators."""
-        wx_shape = mma_wx.partition_shape_C(self.wx_tile[:2])
-        n_wx = tcgen05.find_tmem_tensor_col_offset(
-            mma_wx.make_fragment_C(cute.append(wx_shape, 1))
-        )
-        kt_shape = mma_kt.partition_shape_C(self.kt_tile[:2])
-        n_kt = tcgen05.find_tmem_tensor_col_offset(
-            mma_kt.make_fragment_C(cute.append(kt_shape, 1))
-        )
-        raw = n_wx + n_kt
-        total = 32
-        while total < raw:
-            total *= 2
-        assert total <= 512, f"TMEM overflow: {total}>512"
-        return 0, n_wx, total
 
     # ------------------------------------------------------------------
     # Warp roles
     # ------------------------------------------------------------------
 
+    @role(warps=4)
     @cute.jit
     def run_load(
         self,
-        head,
-        col_tile,
-        is_value,
-        start,
-        length,
-        chunk_begin,
-        chunk_end,
-        tma,
-        mma_wx,
-        mma_kt,
-        mma_ktu,
-        sW,
-        sKg,
-        sU,
-        gk_3d,
-        pw_P,
-        pkg_P,
-        pu_P,
-        pgk_P,
+        params: ForwardSummaryParams,
+        *,
+        w: Producer,
+        kg: Producer,
+        u: Producer,
+        gk: Producer,
+        work: WorkCursor,
     ):
         """Own the per-chunk TMA G2S loads for w, kg^T, u, and the gate row.
 
@@ -540,78 +520,89 @@ class _AffineSummaryFwdOp:
         its token mode and chunk ``ct`` reads tokens ``start + ct * BT`` onward. A partial last
         chunk clamps the gate row here; the MMA warp zeroes each over-read operand stage.
         """
-        batch = Int32(0)
-        desc_w = cute.domain_offset((start, 0, (0, 0)), tma.w.desc)
-        desc_kg = cute.domain_offset((0, start, (0, 0)), tma.kg.desc)
-        desc_u = cute.domain_offset((0, start, (0, 0)), tma.u.desc)
-        desc_gk = cute.domain_offset((0, start, (0, 0)), tma.gk.desc)
-        tWs, tWg = self._part_a(tma.w.atom, desc_w, sW, self.wx_tile, mma_wx, batch, head)
-        tKgs, tKgg = self._part_a(tma.kg.atom, desc_kg, sKg, self.kt_tile, mma_kt, batch, head)
-        sUp, gUp = self._part_b(tma.u.atom, desc_u, sU, self.kt_tile, mma_ktu, batch, head)
-        gGK_l = desc_gk[None, None, (head, batch)]
-        sGKp, gGKp = self._part_epi(tma.gk.atom, gGK_l, (KEY_DIM, 1), gk_3d)
+        sW = params.sW
+        sKg = params.sKg
+        sU = params.sU
+        gk_3d = params.gk_3d
+        mma_wx, mma_kt, mma_ktu = params.mmas
+        tma = params.tma
+        cpasync.prefetch_descriptor(tma.w.atom)
+        cpasync.prefetch_descriptor(tma.kg.atom)
+        cpasync.prefetch_descriptor(tma.u.atom)
+        cpasync.prefetch_descriptor(tma.gk.atom)
+        while work.valid:
+            col_tile, head, row = work.item
+            start, length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
+            )
+            col_base = col_tile * self.BN
+            is_value = col_base < VAL_DIM
+            batch = Int32(0)
+            desc_w = cute.domain_offset((start, 0, (0, 0)), tma.w.desc)
+            desc_kg = cute.domain_offset((0, start, (0, 0)), tma.kg.desc)
+            desc_u = cute.domain_offset((0, start, (0, 0)), tma.u.desc)
+            desc_gk = cute.domain_offset((0, start, (0, 0)), tma.gk.desc)
+            tWs, tWg = self._part_a(tma.w.atom, desc_w, sW, self.wx_tile, mma_wx, batch, head)
+            tKgs, tKgg = self._part_a(tma.kg.atom, desc_kg, sKg, self.kt_tile, mma_kt, batch, head)
+            sUp, gUp = self._part_b(tma.u.atom, desc_u, sU, self.kt_tile, mma_ktu, batch, head)
+            gGK_l = desc_gk[None, None, (head, batch)]
+            sGKp, gGKp = self._part_epi(tma.gk.atom, gGK_l, (KEY_DIM, 1), gk_3d)
 
-        for ct in cutlass.range(chunk_begin, chunk_end, unroll=0):
-            wh = pw_P.acquire_and_advance()
-            cute.copy(
-                atom=tma.w.atom,
-                src=tWg[None, ct, 0],
-                dst=tWs[None, wh.index],
-                tma_bar_ptr=wh.barrier,
-            )
-            kgh = pkg_P.acquire_and_advance()
-            cute.copy(
-                atom=tma.kg.atom,
-                src=tKgg[None, 0, ct],
-                dst=tKgs[None, kgh.index],
-                tma_bar_ptr=kgh.barrier,
-            )
-            if is_value:
-                uh = pu_P.acquire_and_advance()
+            for ct in cutlass.range(chunk_begin, chunk_end, unroll=0):
+                wh = w.acquire()
                 cute.copy(
-                    atom=tma.u.atom,
-                    src=gUp[None, col_tile, ct],
-                    dst=sUp[None, uh.index],
-                    tma_bar_ptr=uh.barrier,
+                    atom=tma.w.atom,
+                    src=tWg[None, ct, 0],
+                    dst=tWs[None, wh.index],
+                    tma_bar_ptr=wh.barrier,
                 )
-            # The chunk-final gate row: the range's last token when the chunk is partial.
-            gk_t = cutlass.min(ct * BT + BT - 1, length - 1)
-            gkh = pgk_P.acquire_and_advance()
-            cute.copy(
-                atom=tma.gk.atom,
-                src=gGKp[(None, 0, gk_t)],
-                dst=sGKp[None, gkh.index],
-                tma_bar_ptr=gkh.barrier,
-            )
+                wh.commit()
+                kgh = kg.acquire()
+                cute.copy(
+                    atom=tma.kg.atom,
+                    src=tKgg[None, 0, ct],
+                    dst=tKgs[None, kgh.index],
+                    tma_bar_ptr=kgh.barrier,
+                )
+                kgh.commit()
+                if is_value:
+                    uh = u.acquire()
+                    cute.copy(
+                        atom=tma.u.atom,
+                        src=gUp[None, col_tile, ct],
+                        dst=sUp[None, uh.index],
+                        tma_bar_ptr=uh.barrier,
+                    )
+                    uh.commit()
+                # The chunk-final gate row: the range's last token when the chunk is partial.
+                gk_t = cutlass.min(ct * BT + BT - 1, length - 1)
+                gkh = gk.acquire()
+                cute.copy(
+                    atom=tma.gk.atom,
+                    src=gGKp[(None, 0, gk_t)],
+                    dst=sGKp[None, gkh.index],
+                    tma_bar_ptr=gkh.barrier,
+                )
+                gkh.commit()
+            work.advance()
+        return w, kg, u, gk, work
 
+    @role(warps=5)
     @cute.jit
     def run_mma(
         self,
-        is_value,
-        num_chunks,
-        tail_chunk,
-        tail_valid_rows,
-        sW,
-        sKg,
-        sU,
-        mma_wx,
-        mma_kt,
-        mma_ktu,
-        t_wx_acc,
-        t_w_a,
-        t_xb_b,
-        t_kt_acc,
-        t_kg_a,
-        t_kg_au,
-        t_u_b,
-        t_tmpb_b,
-        pw_C,
-        pkg_C,
-        pu_C,
-        pxb_C,
-        ptmpb_C,
-        pwx_P,
-        pkt_P,
+        params: ForwardSummaryParams,
+        *,
+        w: Consumer,
+        kg: Consumer,
+        u: Consumer,
+        xb: Consumer,
+        tmpb: Consumer,
+        wx: Producer,
+        kt: Producer,
+        work: WorkCursor,
+        me: Local,
+        tmem: Tmem,
     ):
         """Consume operand stages and produce the two TMEM results per chunk.
 
@@ -620,95 +611,130 @@ class _AffineSummaryFwdOp:
         passes over ``Kg^T @ (-wx)``; MMA1 likewise runs two passes over the
         hi/lo state snapshot, recovering ~fp32 operand precision.
 
-        Chunk ``tail_chunk`` holds only ``tail_valid_rows`` range tokens. Its ``w``, ``kg^T``,
-        and ``u`` stages are zeroed past that boundary before UMMA reads them. Multiplying by a
-        zero mask would retain NaN/Inf from uninitialized capacity slack.
+        Chunk ``tail_chunk`` holds only ``tail_valid_rows`` range tokens. After each full TMA
+        wait, the MMA warp alone zeroes its ``w``, ``kg^T``, and ``u`` stages past that boundary;
+        a zero mask would retain NaN/Inf from uninitialized capacity slack. ``zero_tail_tokens``
+        fences every writer and synchronizes the warp before the elected UMMA issuer reads it.
+        The handle's UMMA release completes those reads before the next TMA fill; the same proxy
+        fence also orders the generic tail writes before that fill.
         """
-        tid, _, _ = cute.arch.thread_idx()
-        mma_tid = tid - WarpRole.MMA * self.WARP_SZ
-        for ct in cutlass.range(0, num_chunks, unroll=0):
-            is_tail = ct == tail_chunk and tail_valid_rows != 0
-            # --- MMA2a: kg^T(SMEM A) × U(SMEM B) → kt(TMEM), value tiles only ---
-            kgh = pkg_C.wait_and_advance()
-            if is_tail:
-                zero_tail_tokens(sKg, kgh.index, tail_valid_rows, mma_tid, self.io_type, 1)
-            ktd = pkt_P.acquire_and_advance()
-            if is_value:
-                uh = pu_C.wait_and_advance()
+        sW = params.sW
+        sKg = params.sKg
+        sU = params.sU
+        mma_wx, mma_kt, mma_ktu = params.mmas
+        t_wx_acc = cute.make_tensor(tmem.ptr("wx"), params.wx_layout)
+        t_kt_acc = cute.make_tensor(tmem.ptr("kt"), params.kt_layout)
+        t_w_a = mma_wx.make_fragment_A(sW)
+        t_xb_b = mma_wx.make_fragment_B(params.sXb)
+        t_kg_a = mma_kt.make_fragment_A(sKg)
+        t_kg_au = mma_ktu.make_fragment_A(sKg)
+        t_u_b = mma_ktu.make_fragment_B(sU)
+        t_tmpb_b = mma_kt.make_fragment_B(params.sTmpb)
+        mma_tid = me.tid
+        while work.valid:
+            col_tile, _head, row = work.item
+            _start, length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
+            )
+            col_base = col_tile * self.BN
+            is_value = col_base < VAL_DIM
+            # The range's last chunk may be partial; only the item that scans it must neutralize
+            # the over-read rows. An all-zero row has num_chunks == 0 and stores the identity.
+            range_chunks = (length + BT - 1) // BT
+            tail_valid_rows = length - (range_chunks - 1) * BT  # == BT when the last chunk is full
+            if tail_valid_rows == BT:
+                tail_valid_rows = Int32(0)
+            tail_chunk = range_chunks - 1 - chunk_begin  # local index of the range's last chunk
+            num_chunks = chunk_end - chunk_begin
+            for ct in cutlass.range(0, num_chunks, unroll=0):
+                is_tail = ct == tail_chunk and tail_valid_rows != 0
+                # --- MMA2a: kg^T(SMEM A) × U(SMEM B) → kt(TMEM), value tiles only ---
+                kgh = kg.wait()
                 if is_tail:
-                    zero_tail_tokens(sU, uh.index, tail_valid_rows, mma_tid, self.io_type, 1)
-                for kp in cutlass.range_constexpr(cute.size(t_kg_au, mode=[2])):
-                    mma_ktu.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
-                    cute.gemm(
-                        mma_ktu,
-                        t_kt_acc[None, None, None, ktd.index],
-                        t_kg_au[None, None, kp, kgh.index],
-                        t_u_b[None, None, kp, uh.index],
-                        t_kt_acc[None, None, None, ktd.index],
-                    )
-                uh.release()
+                    zero_tail_tokens(sKg, kgh.index, tail_valid_rows, mma_tid, self.io_type, 1)
+                ktd = kt.acquire()
+                if is_value:
+                    uh = u.wait()
+                    if is_tail:
+                        zero_tail_tokens(sU, uh.index, tail_valid_rows, mma_tid, self.io_type, 1)
+                    for kp in cutlass.range_constexpr(cute.size(t_kg_au, mode=[2])):
+                        mma_ktu.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(kp != 0))
+                        cute.gemm(
+                            mma_ktu,
+                            t_kt_acc[None, None, None, ktd.index],
+                            t_kg_au[None, None, kp, kgh.index],
+                            t_u_b[None, None, kp, uh.index],
+                            t_kt_acc[None, None, None, ktd.index],
+                        )
+                    uh.release()
 
-            # --- MMA1: w(SMEM A) × X snapshot(SMEM B) → wx(TMEM) ---
-            wh = pw_C.wait_and_advance()
-            if is_tail:
-                zero_tail_tokens(sW, wh.index, tail_valid_rows, mma_tid, self.io_type, 0)
-            wxd = pwx_P.acquire_and_advance()
-            for split in cutlass.range_constexpr(2):
-                # Each hi/lo half is one pipeline stage, published separately.
-                xbh = pxb_C.wait_and_advance()
-                for kp in cutlass.range_constexpr(cute.size(t_w_a, mode=[2])):
-                    mma_wx.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(split != 0 or kp != 0))
-                    cute.gemm(
-                        mma_wx,
-                        t_wx_acc[None, None, None, wxd.index],
-                        t_w_a[None, None, kp, wh.index],
-                        t_xb_b[None, None, kp, xbh.index],
-                        t_wx_acc[None, None, None, wxd.index],
-                    )
-                xbh.release()
-            wxd.commit()
-            wh.release()
+                # --- MMA1: w(SMEM A) × X snapshot(SMEM B) → wx(TMEM) ---
+                wh = w.wait()
+                if is_tail:
+                    zero_tail_tokens(sW, wh.index, tail_valid_rows, mma_tid, self.io_type, 0)
+                wxd = wx.acquire()
+                for split in cutlass.range_constexpr(2):
+                    # Each hi/lo half is one pipeline stage, published separately.
+                    xbh = xb.wait()
+                    xbh.access("B", read=True, by="umma")
+                    for kp in cutlass.range_constexpr(cute.size(t_w_a, mode=[2])):
+                        mma_wx.set(
+                            tcgen05.Field.ACCUMULATE, cutlass.Boolean(split != 0 or kp != 0)
+                        )
+                        cute.gemm(
+                            mma_wx,
+                            t_wx_acc[None, None, None, wxd.index],
+                            t_w_a[None, None, kp, wh.index],
+                            t_xb_b[None, None, kp, xbh.index],
+                            t_wx_acc[None, None, None, wxd.index],
+                        )
+                    xbh.release()
+                wxd.commit()
+                wh.release()
 
-            # --- MMA2b: kg^T(SMEM A) × -wx hi/lo(SMEM B) → kt(TMEM) ---
-            for split in cutlass.range_constexpr(2):
-                tmpbh = ptmpb_C.wait_and_advance()
-                for kp in cutlass.range_constexpr(cute.size(t_kg_a, mode=[2])):
-                    # The first pass overwrites unless MMA2a already seeded kt.
-                    first = split == 0 and kp == 0
-                    mma_kt.set(tcgen05.Field.ACCUMULATE, is_value if first else True)
-                    cute.gemm(
-                        mma_kt,
-                        t_kt_acc[None, None, None, ktd.index],
-                        t_kg_a[None, None, kp, kgh.index],
-                        t_tmpb_b[None, None, kp, tmpbh.index],
-                        t_kt_acc[None, None, None, ktd.index],
-                    )
-                tmpbh.release()
-            ktd.commit()
-            kgh.release()
+                # --- MMA2b: kg^T(SMEM A) × -wx hi/lo(SMEM B) → kt(TMEM) ---
+                for split in cutlass.range_constexpr(2):
+                    tmpbh = tmpb.wait()
+                    tmpbh.access("B", read=True, by="umma")
+                    for kp in cutlass.range_constexpr(cute.size(t_kg_a, mode=[2])):
+                        # The first pass overwrites unless MMA2a already seeded kt.
+                        first = split == 0 and kp == 0
+                        mma_kt.set(tcgen05.Field.ACCUMULATE, is_value if first else True)
+                        cute.gemm(
+                            mma_kt,
+                            t_kt_acc[None, None, None, ktd.index],
+                            t_kg_a[None, None, kp, kgh.index],
+                            t_tmpb_b[None, None, kp, tmpbh.index],
+                            t_kt_acc[None, None, None, ktd.index],
+                        )
+                    tmpbh.release()
+                ktd.commit()
+                kgh.release()
+            work.advance()
+        return w, kg, u, xb, tmpb, wx, kt, work
 
+    @role(warps=range(4))
     @cute.jit
     def run_state(
         self,
-        head,
-        work,
-        col_base,
-        num_chunks,
-        mOut,
-        t_wx_acc,
-        t_kt_acc,
-        sXb_store,
-        sTmpb_store,
-        gk_buf,
-        pxb_P,
-        ptmpb_P,
-        pgk_C,
-        pwx_C,
-        pkt_C,
+        params: ForwardSummaryParams,
+        *,
+        xb: Producer,
+        tmpb: Producer,
+        gk: Consumer,
+        wx: Consumer,
+        kt: Consumer,
+        work: WorkCursor,
+        me: Local,
+        tmem: Tmem,
     ):
         """Own the fp32 state registers; produce B operands and fold in results."""
-        tid, _, _ = cute.arch.thread_idx()
-        local_tid = tid % (self.WARP_SZ * len(self.CUDA_WARP_IDS))
+        sXb_store = params.sXb_store
+        sTmpb_store = params.sTmpb_store
+        gk_buf = params.gk_3d[(None, 0, None)]
+        t_wx_acc = cute.make_tensor(tmem.ptr("wx"), params.wx_layout)
+        t_kt_acc = cute.make_tensor(tmem.ptr("kt"), params.kt_layout)
+        local_tid = me.tmem_row
 
         # --- T2R setup: read MMA1 (wx) accumulator (BT, BN fp32) from TMEM ---
         t2r_wx_atom = cute.make_copy_atom(
@@ -754,91 +780,100 @@ class _AffineSummaryFwdOp:
         tc_r2s_tmpb = cute.make_tiled_copy_D(r2s_atom_tmpb, tc_t2r_wx)
         thr_r2s_tmpb = tc_r2s_tmpb.get_slice(local_tid)
 
-        # X starts as this tile's slice of [0 | I]: value-tile columns are zero
-        # and identity-tile column (col_base + nc) carries a one at key row kc.
-        st = cute.make_rmem_tensor(coords_kv.shape, Float32)
-        st.fill(Float32(0.0))
-        for ei in cutlass.range(cute.size(st), unroll_full=True):
-            kc, nc = coords_kv[ei]
-            if col_base + nc == VAL_DIM + kc:
-                st[ei] = Float32(1.0)
-
-        for _ct in cutlass.range(0, num_chunks, unroll=0):
-            # ---- Phase 1: R2S X hi/lo → sXb (B operand for MMA1) ----
-            # Publish the hi half as soon as it exists so MMA1 starts its first
-            # pass while the lo residual is still being formed and stored.
-            xbh = pxb_P.acquire_and_advance()
-            st_hi = cute.make_rmem_tensor(st.shape, self.io_type)
-            st_hi.store(st.load().to(self.io_type))
-            cute.copy(
-                tc_r2s_xb,
-                tc_r2s_xb.retile(st_hi),
-                thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
+        while work.valid:
+            col_tile, head, row = work.item
+            _start, _length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
             )
-            cute.arch.fence_proxy("async.shared", space="cta")
-            xbh.commit()
-            xbh = pxb_P.acquire_and_advance()
-            st_lo = cute.make_rmem_tensor(st.shape, self.io_type)
-            st_lo.store((st.load() - st_hi.load().to(Float32)).to(self.io_type))
-            cute.copy(
-                tc_r2s_xb,
-                tc_r2s_xb.retile(st_lo),
-                thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
-            )
-            cute.arch.fence_proxy("async.shared", space="cta")
-            xbh.commit()
-
-            # ---- Phase 2: T2R wx = W @ X ----
-            wxh = pwx_C.wait_and_advance()
-            wx_reg = cute.make_rmem_tensor(coords_tv.shape, Float32)
-            cute.copy(tc_t2r_wx, p_t_wx[(None, None, None, wxh.index)], wx_reg)
-            cute.arch.fence_view_async_tmem_load()
-            wxh.release()
-
-            # ---- Phase 3: R2S -wx hi/lo (the U term accumulates via MMA2a) ----
-            tmpbh = ptmpb_P.acquire_and_advance()
-            tmp = cute.make_rmem_tensor(coords_tv.shape, Float32)
-            for ei in cutlass.range_constexpr(cute.size(tmp)):
-                tmp[ei] = Float32(0.0) - wx_reg[ei]
-            tmp_hi = cute.make_rmem_tensor(tmp.shape, self.io_type)
-            tmp_hi.store(tmp.load().to(self.io_type))
-            cute.copy(
-                tc_r2s_tmpb,
-                tc_r2s_tmpb.retile(tmp_hi),
-                thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
-            )
-            cute.arch.fence_proxy("async.shared", space="cta")
-            tmpbh.commit()
-            tmpbh = ptmpb_P.acquire_and_advance()
-            tmp_lo = cute.make_rmem_tensor(tmp.shape, self.io_type)
-            tmp_lo.store((tmp.load() - tmp_hi.load().to(Float32)).to(self.io_type))
-            cute.copy(
-                tc_r2s_tmpb,
-                tc_r2s_tmpb.retile(tmp_lo),
-                thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
-            )
-            cute.arch.fence_proxy("async.shared", space="cta")
-            tmpbh.commit()
-
-            # ---- Phase 4: decay X, then add kt = Kg^T @ Tmp ----
-            gkh = pgk_C.wait_and_advance()
+            col_base = col_tile * self.BN
+            num_chunks = chunk_end - chunk_begin
+            # X starts as this tile's slice of [0 | I]: value-tile columns are zero
+            # and identity-tile column (col_base + nc) carries a one at key row kc.
+            st = cute.make_rmem_tensor(coords_kv.shape, Float32)
+            st.fill(Float32(0.0))
             for ei in cutlass.range(cute.size(st), unroll_full=True):
                 kc, nc = coords_kv[ei]
-                st[ei] = st[ei] * cute.math.exp2(gk_buf[kc, gkh.index], fastmath=self.fastmath)
-            gkh.release()
+                if col_base + nc == VAL_DIM + kc:
+                    st[ei] = Float32(1.0)
 
-            kth = pkt_C.wait_and_advance()
-            kt_reg = cute.make_rmem_tensor(coords_kv.shape, Float32)
-            cute.copy(tc_t2r_kt, p_t_kt[(None, None, None, kth.index)], kt_reg)
-            cute.arch.fence_view_async_tmem_load()
-            kth.release()
-            for ei in cutlass.range_constexpr(cute.size(st)):
-                st[ei] = st[ei] + kt_reg[ei]
+            for _ct in cutlass.range(0, num_chunks, unroll=0):
+                # ---- Phase 1: R2S X hi/lo → sXb (B operand for MMA1) ----
+                # Publish the hi half as soon as it exists so MMA1 starts its first
+                # pass while the lo residual is still being formed and stored.
+                xbh = xb.acquire()
+                xbh.access("Store", write=True, by="threads")
+                st_hi = cute.make_rmem_tensor(st.shape, self.io_type)
+                st_hi.store(st.load().to(self.io_type))
+                cute.copy(
+                    tc_r2s_xb,
+                    tc_r2s_xb.retile(st_hi),
+                    thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
+                )
+                xbh.commit()
+                xbh = xb.acquire()
+                xbh.access("Store", write=True, by="threads")
+                st_lo = cute.make_rmem_tensor(st.shape, self.io_type)
+                st_lo.store((st.load() - st_hi.load().to(Float32)).to(self.io_type))
+                cute.copy(
+                    tc_r2s_xb,
+                    tc_r2s_xb.retile(st_lo),
+                    thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
+                )
+                xbh.commit()
 
-        # Epilogue: store the V-first packed transpose out[s, h, col, k] = X[k, col].
-        for ei in cutlass.range(cute.size(st), unroll_full=True):
-            kc, nc = coords_kv[ei]
-            mOut[work, head, col_base + nc, kc] = st[ei]
+                # Decay overlaps MMA1; keeping the gate release here keeps its proxy fence
+                # off the final kt handoff.
+                gkh = gk.wait()
+                for ei in cutlass.range(cute.size(st), unroll_full=True):
+                    kc, nc = coords_kv[ei]
+                    st[ei] = st[ei] * cute.math.exp2(gk_buf[kc, gkh.index], fastmath=self.fastmath)
+                gkh.release()
+
+                # ---- Phase 2: T2R wx = W @ X ----
+                wxh = wx.wait()
+                wx_reg = cute.make_rmem_tensor(coords_tv.shape, Float32)
+                cute.copy(tc_t2r_wx, p_t_wx[(None, None, None, wxh.index)], wx_reg)
+                wxh.release()
+
+                # ---- Phase 3: R2S -wx hi/lo (the U term accumulates via MMA2a) ----
+                tmpbh = tmpb.acquire()
+                tmpbh.access("Store", write=True, by="threads")
+                tmp = cute.make_rmem_tensor(coords_tv.shape, Float32)
+                for ei in cutlass.range_constexpr(cute.size(tmp)):
+                    tmp[ei] = Float32(0.0) - wx_reg[ei]
+                tmp_hi = cute.make_rmem_tensor(tmp.shape, self.io_type)
+                tmp_hi.store(tmp.load().to(self.io_type))
+                cute.copy(
+                    tc_r2s_tmpb,
+                    tc_r2s_tmpb.retile(tmp_hi),
+                    thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
+                )
+                tmpbh.commit()
+                tmpbh = tmpb.acquire()
+                tmpbh.access("Store", write=True, by="threads")
+                tmp_lo = cute.make_rmem_tensor(tmp.shape, self.io_type)
+                tmp_lo.store((tmp.load() - tmp_hi.load().to(Float32)).to(self.io_type))
+                cute.copy(
+                    tc_r2s_tmpb,
+                    tc_r2s_tmpb.retile(tmp_lo),
+                    thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
+                )
+                tmpbh.commit()
+
+                # ---- Phase 4: add kt = Kg^T @ Tmp ----
+                kth = kt.wait()
+                kt_reg = cute.make_rmem_tensor(coords_kv.shape, Float32)
+                cute.copy(tc_t2r_kt, p_t_kt[(None, None, None, kth.index)], kt_reg)
+                kth.release()
+                for ei in cutlass.range_constexpr(cute.size(st)):
+                    st[ei] = st[ei] + kt_reg[ei]
+
+            # Epilogue: store the V-first packed transpose out[s, h, col, k] = X[k, col].
+            for ei in cutlass.range(cute.size(st), unroll_full=True):
+                kc, nc = coords_kv[ei]
+                params.out[row, head, col_base + nc, kc] = st[ei]
+            work.advance()
+        return xb, tmpb, gk, wx, kt, work
 
     # ------------------------------------------------------------------
     # Device kernel
@@ -852,243 +887,49 @@ class _AffineSummaryFwdOp:
         mWork: cute.Tensor,
         mOut: cute.Tensor,
         smem_layouts: SmemLayouts,
+        bound,
     ):
-        mma_wx, mma_kt, mma_ktu = mmas
-        (
-            s_w_staged,
-            s_kg_staged,
-            s_u_staged,
-            s_xb_staged,
-            s_xb_store_staged,
-            s_tmpb_staged,
-            s_tmpb_store_staged,
-        ) = smem_layouts
-        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
-        if warp_id == WarpRole.LOAD:
-            cpasync.prefetch_descriptor(tma.w.atom)
-            cpasync.prefetch_descriptor(tma.kg.atom)
-            cpasync.prefetch_descriptor(tma.u.atom)
-            cpasync.prefetch_descriptor(tma.gk.atom)
-
-        sa = SmemAllocator()
-        sm = sa.allocate(self.shared_type)
-
-        gk_3d = sm.sGK.get_tensor(
-            cute.make_layout(
-                (KEY_DIM, 1, self.gk_depth),
-                stride=(1, KEY_DIM, KEY_DIM),
-            )
+        (s_w, s_kg, s_u, s_xb, s_xb_store, s_tmpb, s_tmpb_store) = smem_layouts
+        gk_layout = cute.make_layout((KEY_DIM, 1, self.gk_depth), stride=(1, KEY_DIM, KEY_DIM))
+        self.begin_roles(
+            work=bound,
+            layouts={
+                "W": s_w,
+                "Kg": s_kg,
+                "U": s_u,
+                "Xb": s_xb,
+                "XbStore": s_xb_store,
+                "Tmpb": s_tmpb,
+                "TmpbStore": s_tmpb_store,
+                "Gk": gk_layout,
+            },
         )
-        gk_buf = gk_3d[(None, 0, None)]
-
-        # #
-        # Pipeline creation
-        #
-        n_cuda = self.WARP_SZ * len(self.CUDA_WARP_IDS)
-
-        # w → MMA1 (TmaUmma)
-        pw_P, pw_C = pipeline.PipelineTmaUmma.create(
-            num_stages=self.w_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.w_bytes,
-            barrier_storage=sm.bar_w.data_ptr(),
-        ).make_participants()
-
-        # kg^T → MMA2 (TmaUmma)
-        pkg_P, pkg_C = pipeline.PipelineTmaUmma.create(
-            num_stages=self.kg_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.kg_bytes,
-            barrier_storage=sm.bar_kg.data_ptr(),
-        ).make_participants()
-
-        # u → MMA2 (TmaUmma)
-        pu_P, pu_C = pipeline.PipelineTmaUmma.create(
-            num_stages=self.u_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.u_bytes,
-            barrier_storage=sm.bar_u.data_ptr(),
-        ).make_participants()
-
-        # gk → CUDA warps (TmaAsync). Each consuming warp contributes one
-        # elected-lane arrival, so the group count is the warp count, not 128 threads.
-        pgk_P, pgk_C = pipeline.PipelineTmaAsync.create(
-            num_stages=self.gk_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len(self.CUDA_WARP_IDS)
-            ),
-            tx_count=self.gk_bytes,
-            barrier_storage=sm.bar_gk.data_ptr(),
-        ).make_participants()
-
-        # X snapshot → MMA1 (AsyncUmma, one stage per hi/lo half)
-        pxb_P, pxb_C = pipeline.PipelineAsyncUmma.create(
-            num_stages=2,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, n_cuda),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            barrier_storage=sm.bar_xb.data_ptr(),
-        ).make_participants()
-
-        # Tmp → MMA2 (AsyncUmma, one stage per hi/lo half)
-        ptmpb_P, ptmpb_C = pipeline.PipelineAsyncUmma.create(
-            num_stages=2,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, n_cuda),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            barrier_storage=sm.bar_tmpb.data_ptr(),
-        ).make_participants()
-
-        # MMA1 done → CUDA (UmmaAsync)
-        pwx_P, pwx_C = pipeline.PipelineUmmaAsync.create(
-            num_stages=1,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, n_cuda),
-            barrier_storage=sm.bar_wx.data_ptr(),
-        ).make_participants()
-
-        # MMA2 done → CUDA (UmmaAsync)
-        pkt_P, pkt_C = pipeline.PipelineUmmaAsync.create(
-            num_stages=1,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, n_cuda),
-            barrier_storage=sm.bar_kt.data_ptr(),
-        ).make_participants()
-
-        # #
-        # TMEM allocation
-        #
-        tmem_bar = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
-        tmem = TmemAllocator(
-            sm.tmem_buf,
-            barrier_for_retrieve=tmem_bar,
-            allocator_warp_id=WarpRole.LOAD,
+        mma_wx, mma_kt, _mma_ktu = mmas
+        wx_fragment = mma_wx.make_fragment_C(
+            cute.append(mma_wx.partition_shape_C(self.wx_tile[:2]), 1)
         )
-        tmem.allocate(self.tm_tot)
-        # Relinquish the permit immediately: it only promises this CTA allocates no more TMEM,
-        # while the columns just allocated stay owned until ``tmem.free``. Holding it to exit
-        # blocks a co-resident CTA's allocation and serializes chains that would overlap.
-        tmem.relinquish_alloc_permit()
-        tmem.wait_for_alloc()
-        tp = tmem.retrieve_ptr(Float32)
-
-        # #
-        # SMEM view tensors and MMA fragments
-        #
-        sW = sm.sW.get_tensor(s_w_staged.outer, swizzle=s_w_staged.inner)
-        sKg = sm.sKg.get_tensor(s_kg_staged.outer, swizzle=s_kg_staged.inner)
-        sU = sm.sU.get_tensor(s_u_staged.outer, swizzle=s_u_staged.inner)
-        sXb = sm.sXb.get_tensor(s_xb_staged.outer, swizzle=s_xb_staged.inner)
-        sXb_store = sm.sXb.get_tensor(s_xb_store_staged.outer, swizzle=s_xb_store_staged.inner)
-        sTmpb = sm.sTmpb.get_tensor(s_tmpb_staged.outer, swizzle=s_tmpb_staged.inner)
-        sTmpb_store = sm.sTmpb.get_tensor(
-            s_tmpb_store_staged.outer, swizzle=s_tmpb_store_staged.inner
+        assert tcgen05.find_tmem_tensor_col_offset(wx_fragment) <= self.BN
+        kt_fragment = mma_kt.make_fragment_C(
+            cute.append(mma_kt.partition_shape_C(self.kt_tile[:2]), 1)
         )
-
-        t_w_a = mma_wx.make_fragment_A(sW)
-        t_xb_b = mma_wx.make_fragment_B(sXb)
-        wx_shape = mma_wx.partition_shape_C(self.wx_tile[:2])
-        wx_fk = mma_wx.make_fragment_C(cute.append(wx_shape, 1))
-        t_wx_acc = cute.make_tensor(tp + self.tm_wx, wx_fk.layout)
-
-        t_kg_a = mma_kt.make_fragment_A(sKg)
-        t_kg_au = mma_ktu.make_fragment_A(sKg)
-        t_u_b = mma_ktu.make_fragment_B(sU)
-        t_tmpb_b = mma_kt.make_fragment_B(sTmpb)
-        kt_shape = mma_kt.partition_shape_C(self.kt_tile[:2])
-        kt_fk = mma_kt.make_fragment_C(cute.append(kt_shape, 1))
-        t_kt_acc = cute.make_tensor(tp + self.tm_kt, kt_fk.layout)
-
-        # #
-        # Role dispatch: one CTA owns one (column tile, head, work item) state slice.
-        #
-        col_tile, head, work = cute.arch.block_idx()
-        col_base = col_tile * self.BN
-        is_value = col_base < VAL_DIM
-        start, length, chunk_begin, chunk_end = decode_work_row(mWork, work, self.whole_ranges)
-        # The range's last chunk may be partial; only the item that scans it must neutralize
-        # the over-read rows. An all-zero row has num_chunks == 0 and stores the identity.
-        num_chunks = (length + BT - 1) // BT
-        tail_valid_rows = length - (num_chunks - 1) * BT  # == BT when the last chunk is full
-        if tail_valid_rows == BT:
-            tail_valid_rows = Int32(0)
-        tail_chunk = num_chunks - 1 - chunk_begin  # local index of the range's last chunk
-
-        if warp_id in self.CUDA_WARP_IDS:
-            self.run_state(
-                head=head,
-                work=work,
-                col_base=col_base,
-                num_chunks=chunk_end - chunk_begin,
-                mOut=mOut,
-                t_wx_acc=t_wx_acc,
-                t_kt_acc=t_kt_acc,
-                sXb_store=sXb_store,
-                sTmpb_store=sTmpb_store,
-                gk_buf=gk_buf,
-                pxb_P=pxb_P,
-                ptmpb_P=ptmpb_P,
-                pgk_C=pgk_C,
-                pwx_C=pwx_C,
-                pkt_C=pkt_C,
-            )
-        elif warp_id == WarpRole.LOAD:
-            self.run_load(
-                head=head,
-                col_tile=col_tile,
-                is_value=is_value,
-                start=start,
-                length=length,
-                chunk_begin=chunk_begin,
-                chunk_end=chunk_end,
-                tma=tma,
-                mma_wx=mma_wx,
-                mma_kt=mma_kt,
-                mma_ktu=mma_ktu,
-                sW=sW,
-                sKg=sKg,
-                sU=sU,
-                gk_3d=gk_3d,
-                pw_P=pw_P,
-                pkg_P=pkg_P,
-                pu_P=pu_P,
-                pgk_P=pgk_P,
-            )
-        elif warp_id == WarpRole.MMA:
-            self.run_mma(
-                is_value=is_value,
-                num_chunks=chunk_end - chunk_begin,
-                tail_chunk=tail_chunk,
-                tail_valid_rows=tail_valid_rows,
-                sW=sW,
-                sKg=sKg,
-                sU=sU,
-                mma_wx=mma_wx,
-                mma_kt=mma_kt,
-                mma_ktu=mma_ktu,
-                t_wx_acc=t_wx_acc,
-                t_w_a=t_w_a,
-                t_xb_b=t_xb_b,
-                t_kt_acc=t_kt_acc,
-                t_kg_a=t_kg_a,
-                t_kg_au=t_kg_au,
-                t_u_b=t_u_b,
-                t_tmpb_b=t_tmpb_b,
-                pw_C=pw_C,
-                pkg_C=pkg_C,
-                pu_C=pu_C,
-                pxb_C=pxb_C,
-                ptmpb_C=ptmpb_C,
-                pwx_P=pwx_P,
-                pkt_P=pkt_P,
-            )
-
-        # TMEM teardown (all warps)
-        self.tmem_free_bar.arrive_and_wait()
-        tmem.free(tp)
+        assert tcgen05.find_tmem_tensor_col_offset(kt_fragment) <= self.BN
+        params = ForwardSummaryParams(
+            work_table=mWork,
+            out=mOut,
+            mmas=mmas,
+            tma=tma,
+            wx_layout=wx_fragment.layout,
+            kt_layout=kt_fragment.layout,
+            sW=self.buffer("W"),
+            sKg=self.buffer("Kg"),
+            sU=self.buffer("U"),
+            sXb=self.buffer("Xb"),
+            sXb_store=self.buffer("XbStore"),
+            sTmpb=self.buffer("Tmpb"),
+            sTmpb_store=self.buffer("TmpbStore"),
+            gk_3d=self.buffer("Gk"),
+        )
+        self.run_roles(params)
 
     # ------------------------------------------------------------------
     # TMA partition helpers
@@ -1182,8 +1023,8 @@ def _compile_affine_summary(
 MIN_CHUNKS_PER_ITEM = 16
 # Widening an otherwise one-wave scan pays for the extra planner/fold at long spans.
 MIN_CHUNKS_FOR_WIDE_SPLIT = 128
-# The forward launches and both Triton fallbacks put ranges or work items on grid.z (limit
-# 65535); leave room for the work budget, which is at most the SM count.
+# Both Triton fallbacks put ranges or work items on grid.z (limit 65535); leave room for
+# the work budget, which is at most the SM count. Native OneShot work has a 1-D fallback.
 MAX_RANGES = 65535 - 1024
 
 
