@@ -9,6 +9,10 @@ CuTe DSL K4b: 4×4 block lower-triangular matrix inverse.
 
 Exact grid: (total_chunks, H, 1) — one CTA per (chunk, head).
 Persistent grid: (chunk_workers, H, 1) — each CTA strides over chunks.
+Both come from a warpdrive work stream: ``OneShot(grid="2d")`` over (1, head, chunk) for the
+exact grid, ``TilePersistent("m", units=chunk_workers)`` over (chunk, head, 1) for the persistent
+one, bounded by the active chunk count ``chunk_offsets[-1]``. The worker count stays a compile-time
+stride: with a ``gridDim.x`` stride this register-heavy loop measured 2-11% slower.
 128 threads (4 warps):
     Phase 1: Per-warp OD register load + preinverted diagonal-block load
     Phase 2a: Warps 0-2 parallel Schur L1 (Ai10, Ai21, Ai32), Warp 3 stores diags
@@ -38,6 +42,13 @@ from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_work,
 )
 from attn_gym.warpdrive.compat import SmemAllocator
+from attn_gym.warpdrive.scheduling import (
+    BoundWork,
+    LastEntry,
+    OneShot,
+    TilePersistent,
+    WorkStream,
+)
 
 
 class ChunkKDAFwdK4bInverseCuteDSL:
@@ -64,10 +75,12 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             assert chunk_schedule is ChunkSchedule.RAGGED and chunk_workers > 0, (
                 "persistent execution requires a positive ragged chunk-worker grid"
             )
+            schedule = TilePersistent("m", units=chunk_workers)
         else:
             assert chunk_workers == 0, "static execution does not use chunk workers"
+            schedule = OneShot(grid="2d")
         self.schedule_kind = schedule_kind
-        self.chunk_workers = chunk_workers
+        self.work = WorkStream(schedule=schedule)
         self.use_int64_offsets = use_int64_offsets
         self.BC = BC
         self.BT = chunk_size
@@ -120,12 +133,10 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mAkk.element_type
-        chunk_axis = (
-            self.chunk_workers
-            if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
-            else total_chunks
-        )
-        grid = (chunk_axis, H, 1)
+        if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
+            work = self.work.bind((total_chunks, H, 1), limit=LastEntry(chunk_offsets))
+        else:
+            work = self.work.bind((1, H, total_chunks))
 
         sSchurA_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC + 8, 1))
         sAi_layout = cute.make_layout((self.BC, self.BC), stride=(self.BC, 1))
@@ -193,7 +204,8 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             smem_copy_B,
             tiled_mma,
             SharedStorage,
-        ).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
+            work,
+        ).launch(grid=work.grid(), block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -210,9 +222,16 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         smem_copy_B: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
+        work: BoundWork,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        chunk_idx, head_idx, _ = cute.arch.block_idx()
+        if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
+            chunks = work.cursor()
+            trips = chunks.trip_count()
+            _, head_idx, _ = chunks.item  # the first item: blockIdx, no decode
+        else:
+            # Every capacity chunk runs, as in the exact grid: no ``valid`` test.
+            _, (_, head_idx, chunk_idx) = work.single_item()
 
         # ── Shared memory, allocated once and reused across persistent iterations ──
         smem = SmemAllocator()
@@ -243,10 +262,10 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         )
 
         if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
-            active_chunks = load_ragged_chunk_count(chunk_offsets)
             # No unroll: K4b's register-heavy Schur body regresses under
             # unroll=2 (0.97x -> 0.87x measured vs the static grid).
-            for current_chunk in cutlass.range(chunk_idx, active_chunks, self.chunk_workers):
+            for k in cutlass.range(trips):
+                current_chunk, _, _ = chunks.item_at(k)
                 self._process_chunk(
                     mAkkOD,
                     mAkkd,
