@@ -258,8 +258,6 @@ def test_batch_sizes_reuse_shared_schedule(
 ):
     """New batch sizes launch the shared-KV kernels and tuned configs of an earlier one."""
     _cuda()
-    if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("The shared-KV schedule requires Blackwell")
     import importlib
 
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")

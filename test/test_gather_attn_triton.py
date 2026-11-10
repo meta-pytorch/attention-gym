@@ -558,8 +558,8 @@ def test_precision_vs_fp64(share_kv, num_topk, dtype, scale):
 def test_triton_fp32_row_reductions(heads, head_dim, share_kv):
     """Sparse logits and sink delta retain FP32 arithmetic for BF16 inputs."""
     _skip_no_cuda()
-    if share_kv and torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("Blackwell required for the shared-KV schedule")
+    if share_kv and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("Ampere or newer required for the shared-KV schedule")
     inputs = _make_inputs(
         heads=heads,
         head_dim=head_dim,

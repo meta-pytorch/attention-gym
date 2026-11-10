@@ -1,4 +1,4 @@
-"""Blackwell shared-KV schedules for gather-attention backward.
+"""Shared-KV schedules for gather-attention backward.
 
 The default sparse-dKV schedule forms query-owned top-k-by-dimension gradient tiles and
 atomically scatters them into one FP32 shared-KV gradient. Deterministic mode instead uses

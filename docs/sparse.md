@@ -195,8 +195,8 @@ the query's bare/paired form, even when the local window is zero.
 Automatic fused selection prefers eligible CuTe/FA4 calls on SM100/SM103, otherwise it
 selects Triton. This is **not a general paired-input fallback**: nonempty rotary components
 run only on the restricted Triton shared-KV schedule below. In particular, nonempty paired
-FP16 calls and nonempty paired calls on Hopper are not supported by either fused backend;
-use the reference implementation for those inputs.
+FP16 calls are not supported by either fused backend; use the reference implementation for
+those inputs.
 
 Here `H` is the query head count, `D` the latent width, `R` the rotary width, and `W` the local
 window size. All query/KV components must share a dtype and device; the optional sink can
@@ -206,7 +206,7 @@ also use FP32. Local and sparse pools must have the same KV head count: one shar
 | Input form | CuTe (FA4 sparse MLA) | Triton |
 |---|---|---|
 | Bare tensors | SM100/SM103, BF16, one shared KV head, `1 <= H <= 128`, `D = 512`; no additional window-size bound in the adapter | Generic CUDA path for FP16/BF16/FP32, shared or per-head KV; no fixed `H`, `D`, or `W` eligibility bounds in the generic launcher. A specialized BF16 shared-KV schedule uses the same GPU, `H`, `D`, `W`, and latent-stride constraints as nonempty pairs below, without rotary requirements. |
-| Nonempty `(latent, rope)` pairs (`R > 0`) | Same CuTe constraints as bare, with `R = 64` | Compute capability major >= 10, BF16, one shared KV head, `16 <= H <= 128`, `D` in `{16, 32, ..., 128, 512}`, `R` in `{16, 32, 64, 128}`, `0 <= W <= 2048`; shared-schedule stride requirements below must hold. No generic paired path. |
+| Nonempty `(latent, rope)` pairs (`R > 0`) | Same CuTe constraints as bare, with `R = 64` | Compute capability major >= 8 (Ampere or newer, including Hopper and SM120), BF16, one shared KV head, `16 <= H <= 128`, `D` in `{16, 32, ..., 128, 512}`, `R` in `{16, 32, 64, 128}`, `0 <= W <= 2048`; shared-schedule stride requirements below must hold. No generic paired path. |
 | Zero-width pairs (`R = 0`) | Same eligibility as bare tensors | Same eligibility as bare tensors; rotary operands are omitted from the kernels and their gradients have empty feature dimensions. |
 
 Zero-width pairs retain paired-form validation and require explicit `scale`; they do not gain

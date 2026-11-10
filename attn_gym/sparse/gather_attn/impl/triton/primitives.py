@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
 
 
@@ -21,10 +22,12 @@ def can_use_shared_kv_schedule(
     sparse_rope: torch.Tensor | None = None,
     local_rope: torch.Tensor | None = None,
 ) -> bool:
-    """Check the shared Blackwell forward/backward schedule's layout and shape limits.
+    """Check the shared-KV forward/backward schedule's device, layout, and shape limits.
 
-    The latent KV is both key and value. Optional key-only RoPE tensors add a second logit
-    dot; with RoPE, ``sparse_rope`` (and ``local_rope`` under a window) must be given.
+    The schedule needs BF16 tensor cores (Ampere or newer); ``shared_forward_tiles`` fits its
+    tiles to the device's shared memory. The latent KV is both key and value. Optional key-only
+    RoPE tensors add a second logit dot; with RoPE, ``sparse_rope`` (and ``local_rope`` under a
+    window) must be given.
     """
     _, heads, _, head_dim = query.shape
     rope_tensors = (sparse_rope, local_rope) if sliding_window_size else (sparse_rope,)
@@ -40,8 +43,7 @@ def can_use_shared_kv_schedule(
         )
     )
     return (
-        torch.cuda.get_device_capability(query.device)[0] >= 10
-        and query.dtype == torch.bfloat16
+        query.dtype == torch.bfloat16
         and sparse_kv.stride(1) == 0
         and query.stride(-1) == 1
         and sparse_kv.stride(-1) == 1
@@ -52,6 +54,7 @@ def can_use_shared_kv_schedule(
         and (head_dim <= 128 or head_dim == 512)
         and rope_ok
         and sliding_window_size <= 2048
+        and get_device_properties(query.device).major >= 8
     )
 
 
@@ -92,7 +95,7 @@ def select_tiles(
 
     Candidates are ordered by preference; the last one is the fallback for tiny budgets.
     """
-    properties = torch.cuda.get_device_properties(device)
+    properties = get_device_properties(device)
     shared_budget = properties.shared_memory_per_block_optin
     # SM10x/SM11x accumulate tcgen05 MMAs in tensor memory; other GPUs have none.
     tmem_budget = TENSOR_MEMORY_COLUMNS if properties.major in (10, 11) else float("inf")
@@ -105,6 +108,29 @@ def select_tiles(
         ),
         candidates[-1],
     )
+
+
+def shared_forward_tiles(query: torch.Tensor, rope_dim: int) -> tuple[int, int]:
+    """Choose shared-KV forward head and key tiles that fit the device's shared memory.
+
+    A key tile holds selected sparse keys or local-window keys. ``tl.dot`` stages query and
+    key operands in shared memory, bounded by ``BLOCK_H + 2 * key_rows`` rows of latent plus
+    RoPE width (Triton 3.8, four warps; measured for SM86, SM90, and SM120 at D in {128, 512}).
+    Devices with 99 KiB per block need smaller key tiles for wide rows; the 16-key fallback
+    fits every accepted shape.
+    """
+    _, heads, _, head_dim = query.shape
+    # A smaller head tile keeps D=512 accumulators within on-chip resources.
+    block_h = triton.next_power_of_2(heads)
+    if head_dim > 128:
+        block_h = min(32, block_h)
+    candidates = [
+        TileConfig(block_h, key_rows, 4, 1, shared_rows=block_h + 2 * key_rows)
+        for key_rows in (64, 32, 16)
+    ]
+    row_width = max(16, triton.next_power_of_2(head_dim)) + rope_dim
+    tile = select_tiles(candidates, row_width, query.element_size(), query.device)
+    return block_h, tile.block_n
 
 
 def optional_strides(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
