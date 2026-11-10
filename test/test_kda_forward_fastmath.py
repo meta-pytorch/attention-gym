@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from attn_gym.linear import chunk_kda
-from attn_gym.linear.kda.constants import is_sm100_kda_capability
+from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE, is_sm100_kda_capability
 from attn_gym.testing.kda import cumulative_sequence_offsets, kda_reference, make_kda_test_inputs
 
 requires_cuda = pytest.mark.skipif(
@@ -70,20 +70,16 @@ def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
 
 
 @requires_blackwell
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="chunk_kda_bwd_intra still rebases each strip at its first row and flushes with "
-    "fastmath=True; follow-up: the forward engine's shifted rebase",
-)
-def test_default_fastmath_gate_gradient_at_gate_bound():
-    """The default fastmath keeps the gate gradient accurate at a constant -5.9 nats per token.
+@pytest.mark.parametrize("gate_value", [-5.9, -MAX_GATE_LOWER_BOUND_MAGNITUDE])
+def test_default_fastmath_gate_gradient_at_gate_bound(gate_value):
+    """The default fastmath keeps the gate gradient accurate at constant gates near the bound.
 
-    The forward engine keeps every decay there; the backward intra kernel's flush-to-zero
-    rebase does not (rel-L2 0.8-3.2 across seeds; with its fastmath forced off, 2.5e-3).
+    The backward intra kernel used to derive each row's in-subchunk factor from its
+    earlier-key factor, which the flush-to-zero exp2 zeroed for a 16-row subchunk's last row,
+    dropping that row's in-subchunk terms (rel-L2 0.8-3.2 across seeds).
     """
     pytest.importorskip("cutlass")
-    inputs = make_kda_test_inputs(128, normalize_qk=True, gate_value=-5.9, seed=3)
+    inputs = make_kda_test_inputs(128, normalize_qk=True, gate_value=gate_value, seed=3)
     generator = torch.Generator(device="cuda").manual_seed(4)
     d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
     leaves = [value.detach().clone().requires_grad_() for value in inputs]

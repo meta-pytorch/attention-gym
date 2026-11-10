@@ -24,6 +24,24 @@ def cumulative_sequence_offsets(
     return torch.tensor(offsets, device=device, dtype=torch.int32)
 
 
+def packed_chunk_routes(
+    lengths: Sequence[int],
+    chunk_size: int = 64,
+    *,
+    device: torch.device | str = "cuda",
+) -> torch.Tensor:
+    """List the ``(sequence, chunk)`` pair of every chunk of a packed batch, as int64."""
+    return torch.tensor(
+        [
+            (sequence, chunk)
+            for sequence, length in enumerate(lengths)
+            for chunk in range(-(-length // chunk_size))
+        ],
+        device=device,
+        dtype=torch.int64,
+    )
+
+
 def strided_state_pool(
     num_slots: int,
     heads: int,
@@ -453,5 +471,6 @@ __all__ = [
     "cumulative_sequence_offsets",
     "kda_reference",
     "make_kda_test_inputs",
+    "packed_chunk_routes",
     "relative_rms_error",
 ]

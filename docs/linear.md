@@ -457,10 +457,11 @@ newer).
 One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100/SM103 always uses the
 flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
 in the normal range, so both values give the same Aqk/Akk factors (for model-scale Q/K entries;
-entries must stay below `2^63` in magnitude). The backward intra-chunk kernel still flushes: with
-`fastmath=True` and gates steeper than about -5.8 nats per token, the gate gradient error can be
-of the order of its own norm (rel-L2 0.8-3.2 measured at constant -5.9 and -5.914 gates), so use
-`fastmath=False` near the gate bound.
+entries must stay below `2^63` in magnitude). The backward intra-chunk kernel splits its decays so
+that a factor flushes only when the decay it belongs to is below `2^-126`, so `fastmath=True`
+gradients stay accurate up to the gate bound; such a decay is still lost with `fastmath=True` even
+when a large K entry would make its term normal. Its in-subchunk factors reach `2^68.3` there, so
+at the gate bound the backward needs Q entries and `beta`-scaled K entries below `2^59.7`.
 
 Use the same value for staged forward and backward preparation. Choose it before warmup and
 CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.
