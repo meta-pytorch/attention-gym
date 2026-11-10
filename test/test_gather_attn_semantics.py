@@ -12,6 +12,8 @@ import pytest
 import torch
 
 from attn_gym.sparse.gather_attn import Impl, gather_attn
+from attn_gym.testing.gather_attn import make_gather_attn_test_inputs
+from attn_gym.testing.kda import cumulative_sequence_offsets
 
 IMPLEMENTATIONS = [(Impl.REFERENCE, None)]
 if torch.cuda.is_available():
@@ -956,6 +958,63 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
     # Atomic sparse-dKV accumulation order may differ across compiled and eager launches.
     torch.testing.assert_close(actual_grads[2], expected_grads[2], atol=0.06, rtol=0.03)
     torch.testing.assert_close(actual_grads[3], expected_grads[3], atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
+@pytest.mark.usefixtures("fresh_compile_cache")
+@pytest.mark.parametrize("case", ["one-pool", "one-offsets", "one-pool-and-offsets"])
+@pytest.mark.parametrize("heads", [4, 16])
+def test_repeated_inputs_torch_compile_fullgraph(case, heads):
+    """One tensor passed as several inputs compiles with gradients and matches eager bitwise:
+    one pool for local and sparse keys, one offsets tensor for both packed partitions, or
+    both at once, as QSA calls it. 16 heads also reach the shared-KV Blackwell schedule.
+
+    The pool's gradient must also equal the sum of separate local and sparse leaves' gradients,
+    which a gradient lost on the repeated input would break on both paths alike."""
+    inputs = make_gather_attn_test_inputs(
+        heads=heads,
+        kv_heads=1,
+        head_dim=64,
+        tokens=16,
+        sparse_tokens=16,
+        topk=4,
+        separate_values=False,
+        dtype=torch.bfloat16,
+    )
+    options = {"sliding_window_size": 3, "kernel_options": {"backend": "triton"}}
+    if "pool" in case:
+        inputs["sparse_kv"] = inputs["local_kv"]
+    if "offsets" in case:
+        offsets = cumulative_sequence_offsets([9, 7])
+        options |= {"cu_seqlens": offsets, "cu_seqlens_k": offsets}
+    leaves = [inputs[name].requires_grad_(True) for name in ("query", "local_kv", "sparse_kv")]
+    leaves.append(inputs["attention_sink"].requires_grad_(True))
+    grad_output = torch.randn_like(inputs["query"])
+    previous = torch.are_deterministic_algorithms_enabled()
+    # Deterministic accumulation makes eager and compiled gradients bitwise comparable.
+    torch.use_deterministic_algorithms(True)
+    try:
+        results = []
+        for function in (gather_attn, torch.compile(gather_attn, fullgraph=True)):
+            output = function(**inputs, **options)
+            results.append((output, *torch.autograd.grad(output, leaves, grad_output)))
+        pairs = list(zip(*results, strict=True))
+        if "pool" in case:
+            split = {
+                **inputs,
+                "local_kv": inputs["local_kv"].detach().clone().requires_grad_(True),
+                "sparse_kv": inputs["local_kv"].detach().clone().requires_grad_(True),
+            }
+            output = gather_attn(**split, **options)
+            pool_grad = torch.add(
+                *torch.autograd.grad(output, (split["local_kv"], split["sparse_kv"]), grad_output)
+            )
+            pairs += [(result[2], pool_grad) for result in results]
+    finally:
+        torch.use_deterministic_algorithms(previous)
+    # Reduce every exact comparison on the device and read the flags back once.
+    matches = torch.stack([(actual == expected).all() for actual, expected in pairs]).tolist()
+    assert all(matches), matches
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for compile test")
