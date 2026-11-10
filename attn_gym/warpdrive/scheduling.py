@@ -762,7 +762,7 @@ class WorkStream:
 
     ``ready``: readiness hook run once before the first decode, wherever decoding happens.
     ``scheduler_warp``: warp of a broadcast schedule's scheduler role; by default the lowest
-    warp no role claims, usually a warpgroup padding warp.
+    warp no role claims, usually a warpgroup padding warp. Local schedules normalize it to None.
     ``record``: when > 0, every role and the scheduler log ``(index, %globaltimer_lo)`` for
     their first ``record`` items per CTA into the workspace (see ``timeline``).
     """
@@ -804,6 +804,8 @@ class WorkStream:
             raise ValueError(
                 f"WorkStream.scheduler_warp must be an int in [0, 32), got {self.scheduler_warp!r}"
             )
+        if not self.schedule.broadcast:
+            self.scheduler_warp = None
         if type(self.record) is not int or self.record < 0:
             raise ValueError(f"WorkStream.record must be a nonnegative int, got {self.record!r}")
         if self.schedule.broadcast and (
