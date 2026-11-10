@@ -410,8 +410,8 @@ want to understand.
 | | `"iket"` | `"globaltimer"` |
 |---|---|---|
 | Records | every warp, with NVIDIA's `run-iket` | lane 0 of each role instance's first warp, into a profile buffer |
-| Kernel | unchanged | passes an int64 buffer: `self.run_roles(ctx, trace_buffer=trace)` |
-| Capture | `run-iket` around a script that launches once | `trace_session(op, num_ctas)` around a launch |
+| Kernel | unchanged | unchanged (optional explicit `trace_buffer` takes precedence) |
+| Capture | `run-iket` around a script that launches once | `trace_session(op)` around a launch |
 | Result | IKET JSON/Perfetto; `parse_iket(path)` decodes it into the profiler's `Range`s | `session.ranges`; a Perfetto trace with one process per CTA and one track per role |
 | Payloads | `trace_region`'s, as the range's `payloadVal` (`Range.payload`) | `trace_region`'s and each work item's index, as `Range.payload` |
 
@@ -447,6 +447,22 @@ IKET ranges may also sit outside the roles. Under IKET, work-item ranges carry n
 
 ### globaltimer
 
+Use `enable_trace` + `trace_session`, no kernel changes:
+
+```python
+op = PersistentGemm().enable_trace("globaltimer")
+fn = compile_persistent_gemm(op)
+with trace_session(op) as session:
+    fn(a, b, out, workspace, max_ctas)
+```
+
+Import `trace_session` and `role_summary` from `attn_gym.warpdrive.trace_session`. The layer
+keeps one int64 buffer per device and size for the process and bakes its address into the
+traced build (and its compile key): compile on the launch device, keep one traced launch per
+session, and don't overlap sessions. `enable_trace(ctas=N)` sets how many CTAs record (default:
+the device's SM count). `compile_many`/`precompile_many` workers can't build globaltimer
+kernels, since the address belongs to the launching process; cached entries still load.
+
 The globaltimer backend records the profiler's full records (two `%globaltimer` reads and four
 8-byte stores per range) in static slots: one profiling unit per CTA, an equal share of
 `events_per_role` slots (default 1024) per role instance, the role's first warp as the record's
@@ -455,10 +471,8 @@ An open range's start sits in SMEM (8 bytes per nesting level and role), so a ra
 register over the code it spans. Ranges past a role's share are dropped and `trace_session`
 warns; a buffer with fewer units than the grid has CTAs records the first CTAs only.
 
-The kernel takes the buffer as an argument in every build (compiled from a fake `Int64` tensor
-of shape `(cute.sym_int(),)`; a disabled build ignores it) and hands it to the layer. Of the
-examples only the Qwen megakernel does; the others support IKET only, and enabling globaltimer
-on them raises `ProtocolError` at compile time.
+An explicit buffer still takes precedence. Existing kernels such as the Qwen megakernel
+can accept a fake `Int64` tensor of shape `(cute.sym_int(),)` and hand it to the layer:
 
 ```python
 @cute.kernel
@@ -479,12 +493,31 @@ with trace_session(op, num_ctas, trace_path="kernel.pftrace") as session:
 print(summarize_by_tag(session.ranges)["mma"])
 ```
 
-`trace_session` wraps `profile_session`. The decoded `Range`s have the range name as `name`, the
+For explicit buffers, `trace_session(op, num_ctas)` allocates through `profile_session`;
+pass `session.prof.tensor` to the launch as above. For layer-owned buffers, omit `num_ctas`
+(or supply the same count as `enable_trace(ctas=...)`). The decoded `Range`s have the range name as `name`, the
 CTA as `cta=(c,)`, the role's first warp as `warp`, and the payload. For another trace layout,
 `trace_session.write_trace(path, op, session.ranges, name=..., args=..., flows=...)` keeps one
 process per CTA and one track per role and forwards the rest to the profiler's `write_ranges`.
 The [Qwen megakernel](examples.md#qwen3-06b-decode-megakernel) traces every SM's instruction
 rows this way and links rows across CTAs.
+
+### Summarize role work and waits
+
+```python
+report = role_summary(session.ranges, op)
+print(report)
+for role in report.roles:
+    print(role.name, role.items, role.wait_share)
+```
+
+The text table and dataclasses report per-role item count, p50/p90 item duration in ns,
+and wait/work shares. Each track is the role's first warp; names come from `op`, or from
+outermost range names when it is omitted. A role without a cursor counts its whole-body
+range as one item. Wait time sums the outermost `.acquire`, `.wait`, `.peek`, `.tail`, `.turn`
+and `.sync` ranges inside the role's items on the same CTA and warp (a channel wait inside a
+turn counts once), divided by summed item time. It describes the recording warp, not kernel
+elapsed time, and dropped records are not reconstructed.
 
 ## Join a capture to the pipeline plan
 

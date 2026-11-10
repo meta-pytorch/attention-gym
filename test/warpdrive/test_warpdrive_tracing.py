@@ -372,15 +372,7 @@ def test_ranges_must_nest(traced_compiles, backend):
         compile_traced_ring.__wrapped__(AdvanceInRegion().enable_trace(backend))
 
 
-def test_globaltimer_needs_a_buffer_and_a_role():
-    class NoBuffer(TracedRing):
-        @cute.kernel
-        def kernel(self, out: cute.Tensor, trace: cute.Tensor, bound):
-            self.begin_roles(work=bound)
-            self.run_roles(SimpleNamespace(out=out))
-
-    with pytest.raises(ProtocolError, match="trace_buffer"):
-        compile_traced_ring.__wrapped__(NoBuffer().enable_trace("globaltimer"))
+def test_globaltimer_needs_a_role():
     with pytest.raises(ProtocolError, match="outside a role"):
         compile_traced_ring.__wrapped__(RegionOutsideRoles().enable_trace("globaltimer"))
     compile_traced_ring.__wrapped__(RegionOutsideRoles().enable_iket())  # IKET may: no error

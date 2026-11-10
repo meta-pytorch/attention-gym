@@ -6,6 +6,7 @@ import copy
 import functools
 import importlib
 import inspect
+import os
 import pickle
 import warnings
 from collections.abc import Mapping
@@ -481,9 +482,13 @@ class WarpSpecialized(metaclass=_KernelType):
         if isinstance(self._ws_init, TypeError):
             raise self._ws_init
         state = vars(self)
-        settings = {k: state[k] for k in (*_HOST_SETTINGS, "cluster") if k in state}
+        settings = {
+            k: state[k] for k in (*_HOST_SETTINGS, "cluster", "_ws_trace_ctas") if k in state
+        }
         # A stream refers back to its owner; ship its declaration and let setattr re-own it.
         settings |= {k: replace(v) for k, v in state.items() if isinstance(v, WorkStream)}
+        if self.trace_backend == "globaltimer":
+            settings["_ws_trace_origin_pid"] = os.getpid()
         return _rebuild, (type(self), *self._ws_init, settings)
 
     def __setattr__(self, name, value):
@@ -1028,14 +1033,21 @@ class WarpSpecialized(metaclass=_KernelType):
             "named_users": self._ws_named_users,
             "ownership": self._ws_ownership,
             "trace_tags": self._ws_trace_tags,
+            "trace_owned": getattr(self, "_ws_trace_owned", False),
         }
 
     def __cute_restore_trace__(self, record: dict) -> None:
         """Load a cached build's trace record, so ``describe()`` and the warnings match a cold
-        compile. An instance that traced, or already took a record, keeps its own. Restored
-        SMEM entries have no tensors: ``buffer()`` works only while tracing."""
+        compile. An instance that traced, or already took a record, keeps its own diagnostics,
+        but the trace tags and buffer ownership always come from the build being served: an
+        instance traced untraced first may now get a cached globaltimer build. Restored SMEM
+        entries have no tensors: ``buffer()`` works only while tracing."""
         self._collect()
-        if record is None or getattr(self, "_ws_traced", False):
+        if record is None:
+            return
+        self._ws_trace_tags = list(record["trace_tags"])
+        self._ws_trace_owned = record["trace_owned"]
+        if getattr(self, "_ws_traced", False):
             return
         record = pickle.loads(pickle.dumps(record))  # this instance's own copies
         buffers = self.smem_plan.buffers if self.smem_plan is not None else {}
@@ -1048,18 +1060,23 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_uses = record["uses"]
         self._ws_named_users = record["named_users"]
         self._ws_ownership = record["ownership"]
-        self._ws_trace_tags = record["trace_tags"]
         self._ws_traced = True
         self._report_trace()
 
     def enable_trace(
-        self, backend: str | None, *, waits: bool = True, events_per_role: int = 1024
+        self,
+        backend: str | None,
+        *,
+        waits: bool = True,
+        events_per_role: int = 1024,
+        ctas: int | None = None,
     ):
         """Emit ranges named after roles and channels in the next compile.
 
         ``backend``: ``"iket"`` records IKET ranges for ``run-iket``; ``"globaltimer"`` writes
-        profiler records into the buffer passed to ``run_roles(..., trace_buffer=...)``,
+        profiler records into a layer-owned buffer (or an explicit ``run_roles`` buffer),
         decoded by ``trace_session.trace_session``; ``None`` emits no ranges and no IR.
+        ``ctas`` sizes the layer-owned buffer, defaulting to the current device's SM count.
         ``waits=False`` keeps only the role, work-item and ``trace_region`` ranges: wait ranges
         are costly (about 35% on FA4 under ``run-iket``), role ranges nearly free.
         ``events_per_role``: globaltimer records per role instance and CTA; later ranges are
@@ -1074,8 +1091,11 @@ class WarpSpecialized(metaclass=_KernelType):
             )
         if type(events_per_role) is not int or events_per_role < 1:
             raise ValueError(f"events_per_role must be a positive int, got {events_per_role!r}")
+        if ctas is not None and (type(ctas) is not int or ctas < 1):
+            raise ValueError(f"ctas must be a positive int or None, got {ctas!r}")
         self.trace_backend, self.trace_waits = backend, waits
         self.trace_events_per_role = events_per_role
+        self._ws_trace_ctas = ctas
         return self
 
     def _trace_settings(self) -> tuple:
@@ -1084,7 +1104,18 @@ class WarpSpecialized(metaclass=_KernelType):
             return (None,)
         if self.trace_backend == "iket":
             return ("iket", self.trace_waits)
-        return (self.trace_backend, self.trace_waits, self.trace_events_per_role)
+        prof = importlib.import_module(".trace_session", __package__).owned_buffer(self)
+        self._ws_trace_address = (
+            prof.tensor.device.index,
+            prof.tensor.data_ptr(),
+            prof.tensor.numel(),
+        )
+        return (
+            self.trace_backend,
+            self.trace_waits,
+            self.trace_events_per_role,
+            self._ws_trace_address,
+        )
 
     def enable_iket(self, enabled: bool = True, *, waits: bool = True):
         """``enable_trace("iket", waits=waits)``, or ``enable_trace(None)`` when not enabled."""
@@ -1414,8 +1445,9 @@ class WarpSpecialized(metaclass=_KernelType):
     @cute.jit
     def run_roles(self, params, trace_buffer=None):
         """Dispatch the roles with the kernel's params, then tear down. ``trace_buffer``: the
-        int64 profile buffer of a ``"globaltimer"`` trace (any shape; allocated by
-        ``trace_session.trace_session``); ignored by other backends."""
+        optional explicit int64 profile buffer of a ``"globaltimer"`` trace (any shape).
+        When omitted, globaltimer uses the layer-owned, compile-keyed buffer. Ignored by
+        other backends."""
         params = self._role_context(params)
         self._ws_trace = self._start_trace(trace_buffer)
         clustered = self.cluster.size > 1
@@ -1464,10 +1496,15 @@ class WarpSpecialized(metaclass=_KernelType):
             return None
         if self.trace_backend == "iket":
             return IketTrace()
+        # Uncached compiles bypass key hashing; refresh size and device there too,
+        # including explicit-buffer builds (all globaltimer builds key the address).
+        self._trace_settings()
+        self._ws_trace_owned = buffer is None
         if buffer is None:
-            raise ProtocolError(
-                "enable_trace('globaltimer') records into a profile buffer: pass "
-                "run_roles(params, trace_buffer=...) (see trace_session.py)"
+            _, address, size = self._ws_trace_address
+            buffer = cute.make_tensor(
+                cute.make_ptr(cutlass.Int64, address, cute.AddressSpace.gmem, assumed_align=16),
+                cute.make_layout(size),
             )
         trace = tracing.GlobaltimerTrace(
             buffer, self._ws_trace_starts, len(self._ws_roles), self.trace_events_per_role
