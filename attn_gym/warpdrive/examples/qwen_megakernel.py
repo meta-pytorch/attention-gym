@@ -40,8 +40,8 @@ Every per-step intermediate has its own per-layer buffer, so a launch has no wri
 hazards. The new K/V row at ``pos`` is written by the one attention row whose TMA-loaded block
 holds it (masked), after those loads completed.
 
-The step is latency-bound: about 140 dependent phases, each ~1 us of input propagation plus
-1-3 us of row latency (docs/warpdrive/examples.md). ``QwenMegakernel(trace="globaltimer")``
+The step is latency-bound: about 140 dependent phases, each paying input propagation plus its
+row's latency (docs/warpdrive/examples.md). ``QwenMegakernel(trace="globaltimer")``
 records every CTA's work items and ``trace_region``s with the table row as payload
 (``qwen_megakernel_trace`` decodes them into phase spans and a Perfetto trace);
 ``trace="iket"`` emits the same ranges for ``run-iket``.
@@ -377,8 +377,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         """``stages``: weight/KV ring depth in 16 KB stages.
         ``splits``: KV splits per kv head, so 8 x splits attention rows per layer. It is static
         while the position is a runtime value, so pick it for the contexts a runner decodes,
-        not the capacity. On a 152-SM GB300, 19 (one attention row per SM) measured faster
-        than 16 at ctx 6208-8192 and slower at 1024-6144.
+        not the capacity. On a 152-SM GB300, 19 (one attention row per SM) is faster than 16
+        at long contexts and slower at short ones.
         ``schedule``: ``"static"`` runs a host-assigned per-CTA row list (``StaticPersistent``
         over a ``[slot][cta]`` table; needs every CTA resident), ``"atomic"`` claims rows in
         dependency order (``AtomicPersistent``, one row decoded ahead).

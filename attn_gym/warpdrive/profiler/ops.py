@@ -184,8 +184,8 @@ def compact_event_stop(
     Pair with :func:`read_globaltimer_lo32` for the start timestamp. The record is
     ``tag(8) | dur_ns(24) | ts_lo32(32)`` (bits 63..56, 55..32, 31..0); ``tag`` is masked to
     8 bits and ``dur_ns`` wraps at 2^24 ns (~16.7 ms), so use :func:`event_stop` for longer
-    regions. For the same workload, :func:`compact_event_stop_smem` has ~30-50 ns less observer
-    overhead per event, at the cost of an end-of-kernel flush.
+    regions. For the same workload, :func:`compact_event_stop_smem` has less observer overhead
+    per event, at the cost of an end-of-kernel flush.
 
     Lane 0 of the calling warp stores, and only for ``0 <= event_idx < max_events_per_unit``:
     an out-of-range slot is dropped rather than written over a neighboring unit. The caller
@@ -212,7 +212,7 @@ def compact_event_stop_smem(
     """Record one compact event into the CTA's shared-memory slice, one ``STS.64`` per event.
 
     The record matches :func:`compact_event_stop`, but shared memory needs no global address
-    math, so an inner region's ``dur_ns`` reads ~30-50 ns smaller for the same work. Pair with
+    math, so an inner region's ``dur_ns`` reads smaller for the same work. Pair with
     :func:`read_globaltimer_lo32` for the start timestamp and call
     :func:`compact_flush_smem_to_gmem` once at kernel exit, outside the recorded regions.
 

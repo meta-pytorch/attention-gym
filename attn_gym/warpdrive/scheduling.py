@@ -1677,7 +1677,7 @@ def _tile_persistent_dims(space, axis: str, units):
 def _tile_grid(stream) -> bool:
     """One item per CTA in plain raster order: launch the tile space as the grid (``l`` folded
     into x for ``"2d"``) and take the item from ``blockIdx``. Decoding a 1-D index divides
-    by the extents on the load warp's path to its first copy (about 0.2 us on a 512^3 GEMM)."""
+    by the extents on the load warp's path to its first copy."""
     mapping = stream.mapping
     return (
         type(stream.schedule) is OneShot  # a subclass may override first_index()
