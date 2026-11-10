@@ -3441,3 +3441,158 @@ def test_short_conv_training_forward_reuses_tail_classes(packed, with_state):
         _assert_training_reference(actual, gradients, x, weight, initial, incoming, boundaries)
         specializations = 2 if call >= 2 and not packed else 1
         _assert_specializations(compile_fn, calls=call + 1, specializations=specializations)
+
+
+# NOTE [Sequence-count grid classes]
+# Decode, the paged state update and the initial-state gradient use NOTE [Sequence launch grids]
+# in cute.py: counts up to 65535 share the tile-grid kernel; larger counts share the folded-grid
+# kernel. These cases cover plain-int specialization classes (1, multiples of 16, others) and
+# both sides of the grid switch. Each count is paired with the expected cumulative kernel count.
+# The tests use 1032 channels: three channel blocks at the default schedules, the last partial.
+_SEQUENCE_COUNT_CLASSES = ((1, 1), (16, 1), (17, 1), (65535, 1), (65536, 2), (3, 2), (65537, 2))
+
+
+def _many_packed_sequences(sequences: int, channels: int = 1032, width: int = 5):
+    """Pack ``sequences`` sequences of 0 to 3 tokens: empty ones and ones shorter than history.
+
+    The defaults give four history positions and, at the default schedules, three channel
+    blocks, so a folded grid decoded with the wrong extent misses items.
+    """
+    lengths = (torch.arange(sequences, device="cuda") + 1) % 4
+    offsets = F.pad(lengths.cumsum(0), (1, 0)).to(torch.int32)
+    x = torch.randn(1, int(offsets[-1]), channels, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(channels, width, device="cuda", dtype=x.dtype)
+    state = torch.randn(sequences, width - 1, channels, device="cuda", dtype=x.dtype)
+    return x, weight, state, offsets
+
+
+def _routed_slots(sequences: int):
+    """Route sequences to distinct positive slots, with padding and fresh sequences mixed in.
+
+    Returns the int32 slots (zero for padding), the live-sequence mask and the resumed mask.
+    """
+    order = torch.arange(sequences, device="cuda")
+    live, resumed = order % 5 != 3, order % 3 != 1
+    slots = (torch.randperm(sequences, device="cuda") + 1) * live
+    return slots.to(torch.int32), live, resumed
+
+
+def test_short_conv_decode_folds_sequences_past_grid_limit():
+    """One decode kernel serves sequence counts up to 65535; a second serves larger counts."""
+    compile_fn = cute_backend._compile_decode
+    compile_fn.cache_clear()
+    torch.manual_seed(131)
+    channels, width = 1032, 4
+    weight = torch.randn(channels, width, device="cuda", dtype=torch.bfloat16)
+    for sequences, specializations in _SEQUENCE_COUNT_CLASSES:
+        x = torch.randn(sequences, channels, device="cuda", dtype=weight.dtype)
+        state = torch.randn(sequences + 1, width - 1, channels, device="cuda", dtype=x.dtype)
+        slots, live, resumed = _routed_slots(sequences)
+        history = torch.cat([state[slots.long()], x.unsqueeze(1)], dim=1)
+        history[~resumed, :-1] = 0
+        expected_state = state.clone()
+        expected_state[slots[live].long()] = history[live, 1:]
+
+        actual = causal_conv1d_decode(
+            x, weight, state, activation="silu", state_indices=slots, has_initial_state=resumed
+        )
+
+        expected = _reference(history, weight)[:, -1]
+        expected[~live] = 0
+        torch.testing.assert_close(actual, expected, rtol=2e-2, atol=2e-2)
+        torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
+        assert compile_fn.cache_info().currsize == specializations, sequences
+
+
+def test_paged_short_conv_prefill_folds_sequences_past_grid_limit(monkeypatch):
+    """Packed state updates reuse one kernel up to 65535 sequences and a second above that."""
+    compile_fn = cute_backend._compile_paged_state_update
+    compile_fn.cache_clear()
+    torch.manual_seed(137)
+
+    def run(sequences: int):
+        x, weight, initial_state, offsets = _many_packed_sequences(sequences)
+        slots, live, resumed = _routed_slots(sequences)
+        state = torch.randn(sequences + 1, *initial_state.shape[1:], device="cuda", dtype=x.dtype)
+        state[slots[live].long()] = initial_state[live]
+        expected_state = state.clone()
+        with torch.no_grad():
+            # The training forward uses a time-tiled grid and returns the final history.
+            expected, final_state = causal_conv1d(
+                x,
+                weight,
+                activation="silu",
+                cu_seqlens=offsets,
+                initial_state=initial_state * resumed[:, None, None],
+                return_final_state=True,
+            )
+            expected[:, (~live).repeat_interleave(offsets.diff())] = 0
+            expected_state[slots[live].long()] = final_state[live]
+
+            def paged():
+                advanced = state.clone()
+                output = paged_causal_conv1d(
+                    x,
+                    weight,
+                    advanced,
+                    slots,
+                    activation="silu",
+                    cu_seqlens=offsets,
+                    has_initial_state=resumed,
+                )
+                return output, advanced
+
+            actual = paged()
+            for value, reference in zip(actual, (expected, expected_state), strict=True):
+                torch.testing.assert_close(value, reference, rtol=0, atol=0)
+        return paged, actual
+
+    for sequences, specializations in _SEQUENCE_COUNT_CLASSES:
+        paged, actual = run(sequences)
+        assert compile_fn.cache_info().currsize == specializations, sequences
+    # Rerun the last sequence count on the folded grid through the 64-bit ABI.
+    monkeypatch.setattr(cute_backend, "requires_int64_abi", lambda *tensors: True)
+    for value, reference in zip(paged(), actual, strict=True):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+    assert compile_fn.cache_info().currsize == specializations + 1
+
+
+def test_short_conv_initial_state_gradient_folds_sequences_past_grid_limit(monkeypatch):
+    """Packed initial-state gradients reuse one kernel per sequence-count grid class.
+
+    Folded-grid gradients match two halves launched separately on the tile grid.
+    """
+    compile_fn = cute_backend._compile_initial_state_gradient
+    compile_fn.cache_clear()
+    torch.manual_seed(139)
+
+    def gradient(x, weight, offsets, initial_state, incoming):
+        initial_state = initial_state.clone().requires_grad_()
+        output = causal_conv1d(
+            x, weight, activation="silu", cu_seqlens=offsets, initial_state=initial_state
+        )
+        return torch.autograd.grad(output, initial_state, incoming)[0]
+
+    for sequences, specializations in _SEQUENCE_COUNT_CLASSES:
+        x, weight, initial_state, offsets = _many_packed_sequences(sequences)
+        incoming = torch.randn_like(x)
+        actual = gradient(x, weight, offsets, initial_state, incoming)
+        assert compile_fn.cache_info().currsize == specializations, sequences
+        if sequences <= 65535:
+            continue  # test_short_conv_training_reuses_jit_cache checks the tile grid's values
+        cut = sequences // 2
+        token = int(offsets[cut])
+        halves = [
+            gradient(x[:, tokens], weight, offsets[rows] - offsets[rows][0], state, dy[:, tokens])
+            for tokens, rows, state, dy in (
+                (slice(None, token), slice(None, cut + 1), initial_state[:cut], incoming),
+                (slice(token, None), slice(cut, None), initial_state[cut:], incoming),
+            )
+        ]
+        torch.testing.assert_close(actual, torch.cat(halves), rtol=0, atol=0)
+        assert compile_fn.cache_info().currsize == specializations
+    # Rerun the last sequence count on the folded grid through the 64-bit ABI.
+    monkeypatch.setattr(cute_backend, "requires_int64_abi", lambda *tensors: True)
+    forced = gradient(x, weight, offsets, initial_state, incoming)
+    torch.testing.assert_close(forced, actual, rtol=0, atol=0)
+    assert compile_fn.cache_info().currsize == specializations + 1

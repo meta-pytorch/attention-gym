@@ -43,6 +43,7 @@ from attn_gym.linear.short_conv.activations import Activation, resolve_activatio
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import SmemAllocator
+from attn_gym.warpdrive.scheduling import BoundWork, OneShot, WorkStream
 
 ShortConvDType = CuteDType
 SHORT_CONV_DTYPES = {
@@ -367,11 +368,16 @@ class ShortConvKernel:
                 weights[channel_offset, tap] = Float32(weight[channel + channel_offset, tap])
         return weights
 
+    @property
+    def channel_blocks(self) -> int:
+        """Number of CTAs needed to cover the channels, with one channel group per thread."""
+        return cdiv(self.channels, self.threads * self.channels_per_thread)
+
     def launch_grid(self, time_blocks, batches, cu_seqlens: cute.Tensor | None):
         """Return the time-tiled grid; see NOTE [Long-sequence launch grids]."""
         return (
             time_blocks,
-            cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
+            self.channel_blocks,
             1 if cutlass.const_expr(cu_seqlens is not None) else batches,
         )
 
@@ -393,6 +399,29 @@ class ShortConvKernel:
 # CUDA limits grid.y and grid.z to 65,535 blocks, while grid.x supports over two billion.
 # Time is the only practically unbounded launch axis, so every time-tiled kernel maps time
 # to grid.x, channels to grid.y, and batch to grid.z.
+
+# NOTE [Sequence launch grids]
+# The kernels without a time axis (decode, paged state update, initial-state gradient) run one
+# CTA per (channel block, row, sequence) item of a warpdrive ``OneShot`` stream and read it with
+# ``BoundWork.single_item()``. Rows are the ``W - 1`` history positions of the initial-state
+# gradient and a single row elsewhere. The sequence is the stream's ``l``. The launcher picks
+# the grid with ``_sequence_grid``: the tile grid while the sequences fit grid.z, and above
+# 65,535 the ``"fold_l"`` variant, which folds the sequence into grid.x and recovers it with one
+# division. The kernels ignore ``single_item()``'s ``valid``: input validation rejects an empty
+# space.
+
+
+def _sequence_work(grid: str) -> WorkStream:
+    """Declare the stream of NOTE [Sequence launch grids] on one static ``grid``."""
+    return WorkStream(schedule=OneShot(grid=grid))
+
+
+def _sequence_grid(sequences: int) -> str:
+    """Pick the static grid of NOTE [Sequence launch grids] for one launch."""
+    # Only the sequence count can pass a grid limit: grid.x fits any channel-block count, and
+    # the rows are bounded by the unrolled width.
+    return OneShot.grid_for((1, 1, sequences))
+
 
 # NOTE [Packed forward active endpoint]
 # CUDA Graph capture fixes the physical token capacity T, while cu_seqlens[-1]
@@ -689,6 +718,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         config: ShortConvConfig,
         dtype: ShortConvDType,
         activation,
+        grid: str,
         use_has_initial_state: bool = False,
     ):
         assert channels % config.channels_per_thread == 0, (
@@ -698,10 +728,13 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         super().__init__(channels, width, config, dtype)
         self.activation = activation
         self.use_has_initial_state = use_has_initial_state
+        self.work = _sequence_work(grid)
 
     def get_name(self) -> str:
         """Name the artifact without the runtime-bound sequence axis."""
-        return f"{super().get_name()}_his{int(self.use_has_initial_state)}"
+        return (
+            f"{super().get_name()}_his{int(self.use_has_initial_state)}_{self.work.schedule.grid}"
+        )
 
     @cute.kernel
     def kernel(
@@ -712,10 +745,11 @@ class CausalConv1dSiluDecode(ShortConvKernel):
         state: cute.Tensor,
         state_indices: cute.Tensor | None,
         has_initial_state: cute.Tensor | None,
+        work: BoundWork,
     ):
         """Advance one packed channel group of one sequence's history."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, sequence, _ = cute.arch.block_idx()
+        _, (channel_block, _, sequence) = work.single_item()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
 
@@ -780,12 +814,9 @@ class CausalConv1dSiluDecode(ShortConvKernel):
     ):
         """Launch the configured decode specialization."""
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(x, weight, output, state, state_indices, has_initial_state).launch(
-            grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                cute.size(x, mode=[0]),
-                1,
-            ),
+        work = self.work.bind((self.channel_blocks, 1, cute.size(x, mode=[0])))
+        self.kernel(x, weight, output, state, state_indices, has_initial_state, work).launch(
+            grid=work.grid(),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -797,6 +828,22 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
     kernel_kind = "paged_state"
     time_tiled = False
 
+    def __init__(
+        self,
+        channels: int,
+        width: int,
+        config: ShortConvConfig,
+        dtype: ShortConvDType,
+        grid: str,
+        use_int64_offsets: bool = False,
+    ):
+        super().__init__(channels, width, config, dtype, use_int64_offsets)
+        self.work = _sequence_work(grid)
+
+    def get_name(self) -> str:
+        """Name the artifact without the runtime-bound sequence axis."""
+        return f"{super().get_name()}_{self.work.schedule.grid}"
+
     @cute.kernel
     def kernel(
         self,
@@ -806,10 +853,11 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
         has_initial_state: cute.Tensor | None,
         cu_seqlens: cute.Tensor | None,
         tokens: Int32,
+        work: BoundWork,
     ):
         """Advance one selected history slot without a compact staging tensor."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, sequence, _ = cute.arch.block_idx()
+        _, (channel_block, _, sequence) = work.single_item()
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
 
@@ -864,12 +912,9 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
     ):
         """Launch one state-update task per sequence and channel group."""
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(x, state, state_indices, has_initial_state, cu_seqlens, tokens).launch(
-            grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                cute.size(state_indices),
-                1,
-            ),
+        work = self.work.bind((self.channel_blocks, 1, cute.size(state_indices)))
+        self.kernel(x, state, state_indices, has_initial_state, cu_seqlens, tokens, work).launch(
+            grid=work.grid(),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -2381,6 +2426,28 @@ class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
     kernel_kind = "dstate"
     time_tiled = False
 
+    def __init__(
+        self,
+        channels: int,
+        width: int,
+        config: ShortConvConfig,
+        dtype: ShortConvDType,
+        d_activation,
+        grid: str,
+        use_int64_offsets: bool = False,
+    ):
+        super().__init__(channels, width, config, dtype, d_activation, use_int64_offsets)
+        self.work = _sequence_work(grid)
+        # The tile grid launches a sequence's history positions back to back. Folding sequences
+        # into grid.x with history on grid.y separates them by a pass over all sequences
+        # (measured 1.14-1.16x slower). Keep them adjacent by folding history into m:
+        # m = channel_block + channel_blocks * history.
+        self.fold_history = grid == "fold_l"
+
+    def get_name(self) -> str:
+        """Name the artifact without the runtime-bound sequence axis."""
+        return f"{super().get_name()}_{self.work.schedule.grid}"
+
     @cute.kernel
     def kernel(
         self,
@@ -2391,10 +2458,14 @@ class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
         grad_initial_state: cute.Tensor,
         cu_seqlens: cute.Tensor | None,
         tokens: Int32,
+        work: BoundWork,
     ):
         """Differentiate one history position and packed channel group."""
         thread_idx, _, _ = cute.arch.thread_idx()
-        channel_block, history_offset, sequence = cute.arch.block_idx()
+        _, (channel_block, history_offset, sequence) = work.single_item()
+        if cutlass.const_expr(self.fold_history):
+            history_offset = channel_block // self.channel_blocks
+            channel_block = channel_block % self.channel_blocks
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
 
@@ -2490,6 +2561,12 @@ class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
     ):
         """Launch the initial-state gradient specialization."""
         self.kernel.set_name_prefix(self.get_name())
+        sequences = initial_state.shape[0] // (self.width - 1)
+        work = self.work.bind(
+            (self.channel_blocks * (self.width - 1), 1, sequences)
+            if cutlass.const_expr(self.fold_history)
+            else (self.channel_blocks, self.width - 1, sequences)
+        )
         self.kernel(
             x,
             weight,
@@ -2498,12 +2575,9 @@ class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
             grad_initial_state,
             cu_seqlens,
             tokens,
+            work,
         ).launch(
-            grid=(
-                cute.ceil_div(self.channels, self.threads * self.channels_per_thread),
-                self.width - 1,
-                initial_state.shape[0] // (self.width - 1),
-            ),
+            grid=work.grid(),
             block=(self.threads, 1, 1),
             stream=stream,
         )
@@ -2741,6 +2815,7 @@ def _compile_initial_state_gradient(
     input_alignment: int,
     packed: bool,
     activation: Activation,
+    grid: str,
     use_int64_offsets: bool = False,
 ):
     """Compile one initial-state gradient specialization."""
@@ -2752,6 +2827,7 @@ def _compile_initial_state_gradient(
         config,
         dtype,
         derivative,
+        grid,
         use_int64_offsets,
     )
     return compile_tvm_ffi(
@@ -3086,6 +3162,7 @@ def _launch_backward(
             _input_alignment(x, input_config),
             packed,
             resolved_activation,
+            _sequence_grid(initial_state.shape[0]),
             _needs_int64(x, weight, grad_output, initial_state, grad_initial_state),
         )(
             x,
@@ -3456,6 +3533,7 @@ def _compile_paged_state_update(
     input_alignment: int,
     packed: bool,
     use_has_initial_state: bool,
+    grid: str,
     use_int64_offsets: bool = False,
 ):
     """Compile paged state updates with runtime token and sequence counts and input strides."""
@@ -3464,6 +3542,7 @@ def _compile_paged_state_update(
         width,
         config,
         dtype,
+        grid,
         use_int64_offsets,
     )
     return compile_tvm_ffi(
@@ -3486,11 +3565,12 @@ def _compile_decode(
     input_alignment: int,
     paged: bool,
     activation: Activation,
+    grid: str,
     use_has_initial_state: bool = False,
 ):
     """Compile one decode specialization, shared across batch sizes and pool depths."""
     operation = CausalConv1dSiluDecode(
-        channels, width, config, dtype, activation.forward, use_has_initial_state
+        channels, width, config, dtype, activation.forward, grid, use_has_initial_state
     )
     return compile_tvm_ffi(
         operation,
@@ -3531,6 +3611,7 @@ def _launch_decode(
         _input_alignment(x, config),
         state_indices is not None,
         resolved_activation,
+        _sequence_grid(x.shape[0]),
         has_initial_state is not None,
     )
     compiled(x, weight, output, state, state_indices, has_initial_state)
@@ -3590,6 +3671,7 @@ def _launch_paged_forward(
         input_alignment,
         packed,
         has_initial_state is not None,
+        _sequence_grid(state_indices.shape[0]),
         use_int64_offsets,
     )(
         x,
