@@ -454,6 +454,14 @@ newer).
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
 | `kernel_options={"backend": "cudnn"}` | Native backend math | `ValueError`: unsupported |
 
+One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100/SM103 always uses the
+flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
+in the normal range, so both values give the same Aqk/Akk factors (for model-scale Q/K entries;
+entries must stay below `2^63` in magnitude). The backward intra-chunk kernel still flushes: with
+`fastmath=True` and gates steeper than about -5.8 nats per token, the gate gradient error can be
+of the order of its own norm (rel-L2 0.8-3.2 measured at constant -5.9 and -5.914 gates), so use
+`fastmath=False` near the gate bound.
+
 Use the same value for staged forward and backward preparation. Choose it before warmup and
 CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.
 

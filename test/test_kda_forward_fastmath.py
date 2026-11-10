@@ -7,7 +7,7 @@ import torch
 
 from attn_gym.linear import chunk_kda
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
-from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
+from attn_gym.testing.kda import cumulative_sequence_offsets, kda_reference, make_kda_test_inputs
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
@@ -40,6 +40,13 @@ def test_cudnn_precision_request_is_rejected_before_cuda_dispatch(monkeypatch):
 @requires_blackwell
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
+    """Both fastmath modes keep a decayed term that crosses a 16-token strip boundary.
+
+    The intra engine splits each pair's decay into two strip-rebased factors. Rebasing at the
+    strip's first row put this pair's row factor at exp(-88), which the flush-to-zero ``ex2``
+    of ``fastmath=True`` zeroed; the engine now shifts the rebase by 2^64, so both factors stay
+    normal and the engine has no fastmath switch.
+    """
     pytest.importorskip("cutlass")
     q = torch.zeros(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
     q[..., 0] = 1
@@ -51,19 +58,42 @@ def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
     beta.requires_grad_()
     operation = torch.compile(chunk_kda, fullgraph=True) if compiled else chunk_kda
 
-    # Token 15 writes state; token 16 reads exp(-5.5). Rebasing splits this into
-    # exp(-88) * exp(82.5), so flushing the subnormal loses a visible contribution.
+    # Token 15 writes state; token 16 reads exp(-5.5).
     golden = gate[0, 16, 0, 0].double().exp().expand(128).to(q.dtype)
-    for fastmath in (False, True, False):
-        output, _ = operation(q, k, v, gate, beta, scale=1.0, autotune=False, fastmath=fastmath)
-        expected = torch.zeros_like(golden) if fastmath else golden
-        torch.testing.assert_close(output[0, 16, 0], expected, rtol=0, atol=0)
+    for fastmath in (False, True, None):
+        options = {} if fastmath is None else {"fastmath": fastmath}
+        output, _ = operation(q, k, v, gate, beta, scale=1.0, autotune=False, **options)
+        torch.testing.assert_close(output[0, 16, 0], golden, rtol=0, atol=0)
         dv, dbeta = torch.autograd.grad(output[0, 16, 0, 0], (v, beta))
-        torch.testing.assert_close(dv[0, 15, 0, 0], expected[0], rtol=0, atol=0)
-        torch.testing.assert_close(dbeta[0, 15, 0], expected[0].to(beta.dtype), rtol=0, atol=0)
+        torch.testing.assert_close(dv[0, 15, 0, 0], golden[0], rtol=0, atol=0)
+        torch.testing.assert_close(dbeta[0, 15, 0], golden[0].to(beta.dtype), rtol=0, atol=0)
 
-    default, _ = operation(q, k, v, gate, beta, scale=1.0, autotune=False)
-    assert torch.count_nonzero(default[0, 16, 0]) == 0
+
+@requires_blackwell
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="chunk_kda_bwd_intra still rebases each strip at its first row and flushes with "
+    "fastmath=True; follow-up: the forward engine's shifted rebase",
+)
+def test_default_fastmath_gate_gradient_at_gate_bound():
+    """The default fastmath keeps the gate gradient accurate at a constant -5.9 nats per token.
+
+    The forward engine keeps every decay there; the backward intra kernel's flush-to-zero
+    rebase does not (rel-L2 0.8-3.2 across seeds; with its fastmath forced off, 2.5e-3).
+    """
+    pytest.importorskip("cutlass")
+    inputs = make_kda_test_inputs(128, normalize_qk=True, gate_value=-5.9, seed=3)
+    generator = torch.Generator(device="cuda").manual_seed(4)
+    d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
+    leaves = [value.detach().clone().requires_grad_() for value in inputs]
+    output, _ = chunk_kda(*leaves, autotune=False)
+    (d_gate,) = torch.autograd.grad(output, leaves[3], d_output)
+    reference = [value.detach().double().requires_grad_() for value in inputs]
+    expected, _ = kda_reference(*reference, output_final_state=False)
+    (expected_d_gate,) = torch.autograd.grad(expected, reference[3], d_output.double())
+    error = (d_gate.double() - expected_d_gate).norm() / expected_d_gate.norm()
+    assert error < 1e-2
 
 
 @requires_cuda
