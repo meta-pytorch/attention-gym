@@ -167,7 +167,7 @@ def tcgen05_ld_32x32b(num: int, taddr: int):
 
 
 @cute.jit
-def tcgen05_st_32x32b(num: int, taddr: int, values):
+def tcgen05_st_32x32b(taddr: int, values):
     """Store an opaque vector of 32-bit values to TMEM."""
 
     @dsl_user_op
@@ -1068,7 +1068,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             self.acc_dtype,
             self.cta_group,
             self.dApost_tiler[:2],  # (64, 64)
-            # tcgen05.OperandSource.SMEM,  # SS mode
         )
 
         # dA3post_tiled_mma: SS MN,MN (64,64)
@@ -1081,7 +1080,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             self.acc_dtype,
             self.cta_group,
             self.dApost_tiler[:2],  # (64, 64)
-            # tcgen05.OperandSource.SMEM,  # SS mode
         )
 
         # ===================== SMEM layouts =====================
@@ -1349,9 +1347,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             vloop_tiled_mma,
             dA_vloop_tiled_mma,
             dvb_tiled_mma,
-            dA_kloop_tiled_mma,
-            dA2post_tiled_mma,
-            dA3post_tiled_mma,
             # TMA atoms
             tma_atom_dv,
             tma_tensor_dv,
@@ -1391,8 +1386,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             k_epi_smem_layout,
             q_epi_smem_layout,
             # GMEM tensors
-            q,
-            k,
             g,
             beta,
             dq,
@@ -1421,9 +1414,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         vloop_tiled_mma: cute.TiledMma,
         dA_vloop_tiled_mma: cute.TiledMma,
         dvb_tiled_mma: cute.TiledMma,
-        dA_kloop_tiled_mma: cute.TiledMma,
-        dA2post_tiled_mma: cute.TiledMma,
-        dA3post_tiled_mma: cute.TiledMma,
         # TMA atoms + tensors
         tma_atom_dv: cute.CopyAtom,
         tma_tensor_dv: cute.Tensor,
@@ -1463,8 +1453,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         k_epi_smem_layout: cute.ComposedLayout,
         q_epi_smem_layout: cute.ComposedLayout,
         # GMEM tensors
-        q_gmem: cute.Tensor,
-        k_gmem: cute.Tensor,
         g_gmem: cute.Tensor,
         beta_gmem: cute.Tensor,
         dq_gmem: cute.Tensor,
@@ -1803,11 +1791,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             dq_f32_val_store = rDq.load()
             dq_i32_vec = reinterpret_cast(dq_f32_val_store, Float32, bk_num_cols_per_wg, Int32)
             # store to TMEM first to reduce register usage
-            tcgen05_st_32x32b(
-                bk_num_cols_per_wg,
-                TMEM_DQ_SCALED_OFF + wg_idx * bk_num_cols_per_wg,
-                dq_i32_vec,
-            )
+            tcgen05_st_32x32b(TMEM_DQ_SCALED_OFF + wg_idx * bk_num_cols_per_wg, dq_i32_vec)
             cute.arch.fence_view_async_tmem_store()
             dq_base_addr = (
                 dq_gmem.iterator
