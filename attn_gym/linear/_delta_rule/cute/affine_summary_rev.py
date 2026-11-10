@@ -488,8 +488,8 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         The item scans its chunks from ``[0 | I]`` into output row ``w``; see ``decode_work_row``
         for the row layout. An all-zero row stores the identity.
         """
-        # Raster decodes runtime extents, once per item in each role. Its m-fastest order
-        # is the previous flat layout: column tile, then head, then work-table row.
+        # Raster decodes runtime extents once per item in each role, m fastest: column tile,
+        # then head, then work-table row.
         column_tile, head, row = work_index
         start, length, chunk_begin, chunk_end = decode_work_row(work_table, row, self.whole_ranges)
         return column_tile, head, row, start, length, chunk_begin, chunk_end
@@ -1225,10 +1225,10 @@ def build_state_grad_summaries(
 
     The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
     across different ``bounds`` values of the same shape. The tokens right after a partial last
-    chunk are read and then cancelled (through zeroed ``dO`` rows and ``w`` columns), so they must
-    be finite. Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses
-    the native UMMA kernel; other capability 8.0+ targets use Triton. Both backends split long
-    ranges into work items when the static budget permits, then compose on the device.
+    chunk are read but dropped by selection, so they may hold anything. Supported scope: B=1,
+    fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
+    capability 8.0+ targets use Triton. Both backends split long ranges into work items when
+    the static budget permits, then compose on the device.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape

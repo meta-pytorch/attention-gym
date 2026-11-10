@@ -508,7 +508,7 @@ def test_oneshot_grid_is_a_static_choice():
         Raster().describe()
     )
     with pytest.raises(ValueError, match="'auto', '3d', '2d' or '1d'"):
-        OneShot(grid="tiles")
+        OneShot(grid="bogus")
 
     class Shifted(OneShot):
         def first_index(self, problem):
@@ -980,19 +980,20 @@ def test_tile_persistent_cap_is_runtime(requires_blackwell):
 
 
 def test_tile_persistent_assignment_keeps_a_folded_grid_order():
-    """``TilePersistent("n")`` over ``(pairs, chunks, heads)`` launches the CTAs of a hand-built
-    ``(workers * pairs, heads)`` grid that folds the pair into x (KDA K3b), in the same order and
-    with the same items: CTA ``x + pairs * workers * head`` with ``x = worker * pairs + pair``."""
+    """``TilePersistent("n")`` over ``(pairs, chunks, heads)`` lists its CTAs with the pair
+    fastest, then the worker, then the head: CTA ``x + pairs * workers * head`` with
+    ``x = worker * pairs + pair`` runs chunks ``worker, worker + workers, ...`` of that pair and
+    head."""
     pairs, chunks, heads, workers = 6, 11, 3, 4
     rows = WorkStream(schedule=TilePersistent("n")).assignment(
         (pairs, chunks, heads), max_ctas=workers
     )
-    legacy = []
+    expected = []
     for head in range(heads):
         for x in range(workers * pairs):
             worker, pair = divmod(x, pairs)
-            legacy.append([(c, (pair, c, head)) for c in range(worker, chunks, workers)])
-    assert rows == legacy
+            expected.append([(c, (pair, c, head)) for c in range(worker, chunks, workers)])
+    assert rows == expected
 
 
 def test_limit_rejections():

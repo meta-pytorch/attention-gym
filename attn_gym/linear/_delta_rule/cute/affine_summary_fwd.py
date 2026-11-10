@@ -1082,8 +1082,8 @@ def build_state_summaries(
 
     The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
     across different ``bounds`` values of the same shape. The tokens right after a partial last
-    chunk are read and then cancelled, so they must be finite. Supported scope: B=1, fixed
-    K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
+    chunk are read but dropped by selection, so they may hold anything. Supported scope: B=1,
+    fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
     capability 8.0+ targets use Triton. Both backends split long ranges into work items when
     the static budget permits, then compose their partial maps on the device.
     """

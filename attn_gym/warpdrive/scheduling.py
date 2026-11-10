@@ -37,7 +37,8 @@ grid and the distribution:
   index.
   ``BoundWork.grid`` covers empty spaces and spaces past Int32.
 * **distribution**, derived from the schedule. Index sequences every role can compute
-  (``OneShot``, ``StaticPersistent``, ``TilePersistent``) are decoded locally in each role with no synchronization.
+  (``OneShot``, ``StaticPersistent``, ``TilePersistent``) are decoded locally in each role
+  with no synchronization.
   Claimed indices (``AtomicPersistent``, ``ClusterLaunchControl``) are claimed by a layer-owned
   scheduler warp, decoded once, and broadcast as ``[index, item words]`` over a ``Ring`` whose
   consumers are every role that takes a ``WorkCursor``. The layer derives the ring's arrival
@@ -237,7 +238,7 @@ class Raster(WorkMap):
     ``decode`` uses only ``+ - * // %`` and ``min``, so it runs on Python ints (tests) and on
     device ``Int32`` values alike. Its intermediates are nonnegative and bounded by
     ``max(index, item count)``, so it cannot overflow for any index of a space the launch
-    admits (``BoundWork.grid``), and it may run on unsigned values (the flat ``OneShot`` grid).
+    admits (``BoundWork.grid``), and it may run on unsigned values (``OneShot(grid="1d")``).
 
     ``bind`` treats a negative extent as zero and maps an empty space to ``(1, 1, 0)``: no
     items, and every divisor in ``decode`` is positive. ``decode`` is therefore defined for any
@@ -392,9 +393,10 @@ class Limit:
     ``__extract_mlir_values__``/``__new_from_mlir_values__`` for the tensors or scalars it holds
     (``LastEntry`` shows the pattern). It is bound in the jit entry point, so it is not part of
     ``WorkStream.get_key()``: a kernel that binds a limit only for some configurations must name
-    them in its own compile key, as it does for any other choice of its entry point. Only local schedules take a limit: a broadcast schedule's
-    scheduler warp claims indices for every role, so it has no per-role bound to apply.
-    ``WorkStream.assignment`` lists the host-side sequence and ignores limits.
+    them in its own compile key, as it does for any other choice of its entry point. Only local
+    schedules take a limit: a broadcast schedule's scheduler warp claims indices for every role,
+    so it has no per-role bound to apply. ``WorkStream.assignment`` lists the host-side sequence
+    and ignores limits.
     """
 
     def read(self):
@@ -577,7 +579,7 @@ class OneShot(IndexSchedule):
 
     def get_key(self) -> str:
         key = super().get_key()  # names the class, and the grid as a field
-        return key.removesuffix("_gridauto")  # the default keeps the key it always had
+        return key.removesuffix("_gridauto")  # the default grid adds no suffix
 
     def describe(self) -> str:
         grid = "" if self.grid == "auto" else f"grid={self.grid!r}"
@@ -613,9 +615,8 @@ class TilePersistent(IndexSchedule):
 
     ``units`` (a positive int) instead fixes the axis extent of the grid at compile time and makes
     the stride that constant; CTAs past the axis extent run no item, and ``max_ctas`` is not read.
-    A compile-time stride lets the loop step by an immediate: the KDA K4b loop measured 11% slower
-    with a ``gridDim`` stride in an ``scf.for`` and 2% slower in a counted loop. It specializes
-    the kernel on ``units``, so bucket it (a power of two capped at the SM count, say).
+    A compile-time stride lets the loop step by an immediate. It specializes the kernel on
+    ``units``, so bucket it (a power of two capped at the SM count, say).
 
     The stream's index is that axis coordinate, and ``total`` is the axis extent (0 for an empty
     space), so a ``Limit`` bounds the coordinate. Items are decoded without division: the words
@@ -978,13 +979,13 @@ class WorkStream:
         ``(index, item)``.
 
         Only a local schedule fixes the sequences before the launch: ``OneShot``,
-        ``StaticPersistent``, or a custom one whose ``first_index`` and ``next_index`` are plain
-        arithmetic on ``problem``. Claimed indices depend on run-time order. The sequences are
-        the schedule's own, run on a host ``problem`` whose ``units()`` and ``first_unit()`` are
-        ints. ``space`` and ``max_ctas`` are the launch's, as host values (``Raster`` takes int
-        extents); a persistent schedule needs ``max_ctas``. CTA ``c`` is ``blockIdx.x`` of the
-        1-D launch grid, in work unit ``c // cs``, and every CTA of a unit runs its items. A
-        ``OneShot`` tile-grid launch places unit ``u`` at
+        ``StaticPersistent``, ``TilePersistent``, or a custom one whose ``first_index`` and
+        ``next_index`` are plain arithmetic on ``problem``. Claimed indices depend on run-time
+        order. The sequences are the schedule's own, run on a host ``problem`` whose ``units()``
+        and ``first_unit()`` are ints. ``space`` and ``max_ctas`` are the launch's, as host values
+        (``Raster`` takes int extents); a persistent schedule needs ``max_ctas``. CTA ``c`` is
+        ``blockIdx.x`` of the 1-D launch grid, in work unit ``c // cs``, and every CTA of a unit
+        runs its items. A ``OneShot`` tile-grid launch places unit ``u`` at
         ``(u % m_tiles, (u // m_tiles) % n_tiles, ...)`` instead (``grid="2d"``: at
         ``(u % m_tiles + m_tiles * l, n)``).
 
@@ -1441,8 +1442,8 @@ def _unsigned_raster_words(mapping, index, space):
 
     An index and the bound extents are nonnegative, so the unsigned decode returns the same
     words while its divisions skip the sign handling of Int32 floor division, most of the
-    decode's instructions. Only the flat grid decodes this way; the other schedules keep the
-    signed decode their kernels were measured with.
+    decode's instructions. Only ``OneShot(grid="1d")`` decodes this way; the other schedules
+    use the signed decode.
     """
     _, words, _ = mapping.decode(Uint32(index), tuple(Uint32(e) for e in space), None)
     return tuple(Int32(w) for w in words)
