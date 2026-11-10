@@ -107,6 +107,20 @@ def turn_no_wait():
     channels._TurnScope.__enter__ = __enter__
 
 
+def per_role_join_short():
+    """Per-role consumer joins expect one warp fewer: each epoch's surplus arrivals complete
+    the next phase early until the producer's parity wait misses a phase and hangs."""
+    orig = Channel.slot_counts
+
+    def slot_counts(self, side):
+        counts = orig(self, side)
+        if side == "consumer" and self.per_role:
+            return [c - 32 if c > 32 else c for c in counts]
+        return counts
+
+    Channel.slot_counts = slot_counts
+
+
 def pair_join_short():
     """Pair-scoped Threads joins expect one warp fewer on the leader's barrier."""
     orig = cluster.derive_scope
@@ -242,6 +256,11 @@ MUTANTS = {
         "test_concurrent_launches_use_one_workspace_per_stream",
     ),
     "turn_no_wait": (turn_no_wait, "test_warpdrive.py", "test_turnstile_alternates_seats"),
+    "per_role_join_short": (
+        per_role_join_short,
+        "test_warpdrive_per_role.py",
+        "test_joint_gemm_mma_and_cuda_threads_read_every_stage[300-136-776]",
+    ),
     "pair_join_short": (
         pair_join_short,
         "test_warpdrive_cluster.py",

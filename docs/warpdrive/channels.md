@@ -116,6 +116,40 @@ multi-warp releases: FA4 and CUTLASS signal per warp.
 Use [count overrides or raw barriers](dropping-down.md) for async-copy relay warps or sparse
 protocols. Changing a count neither elects lanes nor synchronizes their work.
 
+## Per-role consumer mechanisms
+
+When an MMA warp and CUDA threads both read every stage, give each consumer role its own
+mechanism:
+
+```python
+self.h = Ring(2, Tma(stage_bytes), {"mma": Umma, "cuda": Threads}, buffer=h_buf)
+```
+
+The dict replaces the single consumer mechanism and names the consumer roles (it implies
+`consumer_roles`). Every key must bind a consumer end, and every consumer role must be a key.
+The side joins: both roles take every epoch, and each bound instance contributes its own
+role's [count](#counts-come-from-the-roles). With a one-warp `mma` and an eight-warp `cuda`:
+
+| Role | Mechanism | Release | Fence before it | EMPTY arrivals |
+|---|---|---|---|---|
+| `mma` | `Umma` | elected `tcgen05.commit` | none (MMAs read through the async proxy) | 1 |
+| `cuda` | `Threads` | every thread arrives | `smem_async` (derived on a `Tma` ring) | 256 |
+| `cuda` | `Warps` | warp sync, one elected arrival per warp | `smem_async` | 8 |
+
+With `Threads` the empty count is 257, the sum; `describe()` shows
+`Tma(… B) -> {mma: Umma, cuda: Threads}`, `empty 257` and
+`release_fence smem_async (cuda)`. No setting changes the count except an `empty_counts`
+[override](dropping-down.md).
+
+The [derived release fence](#storage-and-fences) applies to the `Threads`/`Warps` roles only,
+as does an explicit `release_fence=`. Declare `release_fence=()` only if the thread roles make no
+generic access to what the producer fills; the alias diagnostic checks each handle against its
+own role's mechanism and fences.
+
+Limits: an mbarrier `JOIN` side (round-robin, exclusive and named channels reject a dict),
+CTA-local placement with no multicast or `fills`, and each `Umma` role a single-warp,
+single-instance role. Producers take one mechanism.
+
 ## Slots and instances
 
 Use `Slots` for independently reused buffers, rather than one ordered ring:

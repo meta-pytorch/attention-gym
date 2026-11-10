@@ -115,7 +115,17 @@ def wire_mechanism(graph: Graph, edge: Edge, chans: dict) -> str:
         return ""
     ch = chans[edge.channels[0]]
     from_junction = any(n.id == edge.src and n.kind == "channel" for n in graph.nodes)
-    return mechanism(ch.consumer if from_junction else ch.producer, ch.named)
+    if not from_junction:
+        return mechanism(ch.producer, ch.named)
+    return mechanism(consumer_mechanism(ch, graph, edge.dst), ch.named)
+
+
+def consumer_mechanism(ch, graph: Graph, node: str):
+    """The mechanism the consumer drawn as ``node`` signals with (its role's, when per-role)."""
+    if not ch.per_role:
+        return ch.consumer
+    ref = next(n.ref for n in graph.nodes if n.id == node)
+    return next(ch.mechanism("consumer", ri.role) for ri, _ in ch.consumers if ri.name == ref)
 
 
 # Model
