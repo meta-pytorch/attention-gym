@@ -126,14 +126,12 @@ directly recorded; stage reuse is a dependency `num_stages` tiles apart.
 <a id="global-or-shared-memory"></a>
 <a id="full-records"></a>
 <a id="buffer-layouts"></a>
-<a id="annotated-kernels"></a>
-<a id="capture-cli"></a>
 
 ## Manual instrumentation
 
 For standalone CuTeDSL kernels, use `compact_profile_region` to time selected code regions.
 The [reference](profiler-reference.md#manual-recording) covers buffer setup, compact/full
-formats, custom Perfetto views, and IKET annotations with the capture CLI.
+formats and custom Perfetto views.
 
 ## Examples
 
@@ -144,7 +142,7 @@ Run these as `python examples/profiler/<name>.py`:
 - `measure_profiler_overhead.py`: the same kernel with profiling disabled and enabled.
 
 Implementation references: `attn_gym/warpdrive/{tracing,trace_session,pipeline_plan}.py` for
-warpdrive integration; `profiler/pipeline/capture.py` for the capture CLI; and
+warpdrive integration; and
 `test/profiler/` for recorder and analysis tests. The
 [`Qwen trace example`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel_trace.py)
 shows instruction-row grouping and cross-CTA flows.

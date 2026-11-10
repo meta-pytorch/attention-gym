@@ -4,11 +4,6 @@ from __future__ import annotations
 
 from importlib import import_module
 
-# The annotation markers run while kernels trace, so they load eagerly and are hashed into the
-# compile keys of kernels that import them from here. The plan model, extractor, join, analysis
-# and writers load on first use and stay out of those keys.
-from attn_gym.warpdrive.profiler.pipeline.annotations import PipelineAnnotations
-
 _LAZY_EXPORTS = {
     "Dependency": "plan",
     "PipelinePlan": "plan",
@@ -17,7 +12,6 @@ _LAZY_EXPORTS = {
     "Role": "plan",
     "SourceLocation": "plan",
     "Timeline": "plan",
-    "extract_plan": "extract",
     "MeasuredCapture": "measure",
     "MeasuredRegion": "measure",
     "join": "measure",
@@ -41,7 +35,6 @@ __all__ = [
     "MeasuredCapture",
     "MeasuredRegion",
     "PipelineAnalysis",
-    "PipelineAnnotations",
     "PipelinePlan",
     "Region",
     "Resource",
@@ -49,7 +42,6 @@ __all__ = [
     "SourceLocation",
     "Timeline",
     "analyze_pipeline",
-    "extract_plan",
     "join",
     "report",
     "write_pipeline_perfetto",
