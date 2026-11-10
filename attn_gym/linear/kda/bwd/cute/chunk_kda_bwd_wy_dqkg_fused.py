@@ -722,7 +722,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         # in a span, waiting for it in the first tile and committing it in the last (dA after
         # the K loop). Taking them before the V loop serializes the next unit's MMAs behind the
         # CUDA warps' dk/dA reads, and unrolling that loop spills the MMA warp's hoisted
-        # descriptors (78 STL at 56 registers).
+        # descriptors.
         self.dq_acc = Ring(self.mma_stage, Umma, Threads, **acc)
         self.dw_acc = Ring(self.mma_stage, Umma, Threads, **acc)
         self.dk_acc = Ring(self.mma_stage, Umma, Threads, **acc)

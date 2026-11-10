@@ -22,10 +22,9 @@ roles' seven warps to eight for the 192/56-register warpgroup split. Bias tiles 
 output-gradient sources; transition tiles skip those streams entirely. Only the final FP32
 partial is written to global memory.
 
-The chunk recurrence is a serial latency chain (~1.3 us per chunk at BN=32), so when
-``heads * tiles`` leaves SMs idle the wrapper cuts the ranges' chunks into work items that
-each scan from ``[0 | I]`` and ``compose_work_items`` folds the partials per range on the
-device.
+The chunk recurrence is a serial latency chain, so when ``heads * tiles`` leaves SMs idle the
+wrapper cuts the ranges' chunks into work items that each scan from ``[0 | I]`` and
+``compose_work_items`` folds the partials per range on the device.
 
 The fp32-valued MMA B operands (state ``X`` and the corrected write gradient
 ``dv``) are split into hi/lo halves of the I/O dtype and accumulated in two UMMA
@@ -163,8 +162,8 @@ class ReverseSummaryParams:
 class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
     """Compute reverse affine summaries with persistent TMA/UMMA state tiles."""
 
-    # Augmented-state columns per CTA. A BN=16 tile covered half the columns for only ~25% less
-    # time per chunk; work items fill idle SMs instead.
+    # Augmented-state columns per CTA. A BN=16 tile covers half the columns in only slightly
+    # less time per chunk; work items fill idle SMs instead.
     BN = 32
 
     def __init__(

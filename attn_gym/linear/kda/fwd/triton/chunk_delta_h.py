@@ -557,8 +557,7 @@ def _delta_h_launch(
     if sequence_workers:
         # Keep one machine-sized wave on the primary schedule, then stride persistent
         # workers over the remaining work. Blackwell warp-specializes the first launch;
-        # Hopper uses ordinary pipelining. This reduced N=512, M=32 graph replay from
-        # 1.22 ms to 0.68 ms on B200.
+        # Hopper uses ordinary pipelining.
         chunk_delta_h_kernel[(sequence_workers, value_tiles)](
             *kernel_args,
             **kernel_options,

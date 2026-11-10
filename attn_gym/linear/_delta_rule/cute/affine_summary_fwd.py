@@ -53,9 +53,9 @@ kernels, defined in ``attn_gym.linear._delta_rule.triton.work_items``.
 
 Architecture (SM100 warpdrive roles):
   - One CTA per (column tile, head, work item); 6 warps. The recurrence is a serial latency
-    chain (~1.1 us per chunk at BN=32), so when ``heads * tiles`` leaves SMs idle the wrapper
-    cuts the ranges' chunks into as many items as fill the machine (``plan_work_items``)
-    and ``compose_work_items`` folds the partials per range, both on the device.
+    chain, so when ``heads * tiles`` leaves SMs idle the wrapper cuts the ranges' chunks into
+    as many items as fill the machine (``plan_work_items``) and ``compose_work_items`` folds
+    the partials per range, both on the device.
   - CUDA warps (0-3) keep the fp32 ``[K, BN]`` state tile in registers across the item's
     chunks and produce the two SMEM MMA B operands per chunk.
   - Load warp (4) TMA-stages ``w``, ``kg^T``, ``u``, and the chunk-final gate row.
@@ -1016,9 +1016,9 @@ def _compile_affine_summary(
     )
 
 
-# Splitting adds the planner and the fold (two small launches) while a chunk costs ~1.1-1.3 us,
-# so a work item must carry enough chunks for the shortened chain to pay for them. Measured
-# crossover on GB200 is ~32 chunks total; 16 chunks per item keeps every split a win.
+# Splitting adds the planner and the fold (two small launches), so a work item must carry
+# enough chunks for the shortened chain to pay for them. This floor puts the smallest split at
+# the measured crossover, so every split is a win.
 MIN_CHUNKS_PER_ITEM = 16
 # Widening an otherwise one-wave scan pays for the extra planner/fold at long spans.
 MIN_CHUNKS_FOR_WIDE_SPLIT = 128

@@ -202,9 +202,9 @@ class KdaIntraFwdEngine(WarpSpecialized):
         Akk[i, j] = beta[i] * sum_d kgq[i, d] * kgk[j, d]  (strict lower)
 
     Warp plan: compute(0-7) production + drain/store, load(8) TMA, mma(9). No role declares a
-    register budget: an active 208/48 split measured 5-10% slower on dense shapes. The
-    16x16 diagonal-block Neumann inverses (K4b's Akkd input) run in a separate tiny Triton kernel
-    invoked by the Python wrapper.
+    register budget: an active 208/48 split is slower on dense shapes. The 16x16 diagonal-block
+    Neumann inverses (K4b's Akkd input) run in a separate tiny Triton kernel invoked by the
+    Python wrapper.
 
     The roles run a hand-rolled persistent loop, not a ``WorkStream``. Compute is skewed by one
     unit: it produces unit ``it`` while the MMA of ``it - 1`` runs, then drains ``it - 1``, so it
@@ -323,7 +323,7 @@ class KdaIntraFwdEngine(WarpSpecialized):
         """Gate and store one 16-token strip's Qg, Kgq (rows >= row0) and Kgk (its 16 rows).
 
         All exponents are computed from the staged gates before any operand is gated; computing
-        them inside the masked loop measured 3-4% slower on dense shapes.
+        them inside the masked loop is slower on dense shapes.
         """
         row0 = sc * 16
         ref = cute.make_rmem_tensor((4,), self.acc_type)
@@ -392,7 +392,7 @@ class KdaIntraFwdEngine(WarpSpecialized):
         g_beta, g_aqk, g_akkod, g_akkd = params.g_beta, params.g_aqk, params.g_akkod, params.g_akkd
         n_iters = params.num_units
         # me.tid is already below 256; the modulo tells the compiler, which then folds the dense
-        # row predicates of the production loop (6-7% of the dense kernel time).
+        # row predicates of the production loop.
         local_tid = me.tid % me.threads
         # The M64 accumulator has one row pair per thread of a single warpgroup: only rows
         # 0-127 load it.

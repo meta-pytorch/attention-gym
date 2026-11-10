@@ -240,8 +240,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
 
         if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
             # unroll=2 interleaves two chunks' gating loads, restoring the
-            # load->use distance the scheduler achieves in the static body
-            # (median 46 vs 14 instructions; long_scoreboard 25 -> ~12 cyc/inst).
+            # load->use distance the scheduler achieves in the static body.
             # unroll=4 crosses a code-size/register cliff and loses it again.
             for k in cutlass.range(trips, unroll=2):
                 _, current_chunk, _ = chunks.item_at(k)

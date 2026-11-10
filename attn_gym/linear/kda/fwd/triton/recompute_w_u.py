@@ -10,9 +10,9 @@
 # FLOP/byte B200 balance point), so tensor-core operand ceremony is pure
 # overhead: `tl.dot` consumes register operands directly and converts the FP32
 # gates in flight. A tcgen05/UMMA version (removed in favour of this kernel)
-# spent ~40% of its runtime on the staging -> convert -> swizzled-SMEM round
+# spent much of its runtime on the staging -> convert -> swizzled-SMEM round
 # trip at BT=64; its register accumulators are what make it necessary again if
-# chunk_size ever grows past 64 (measured ~70x cliff at BT=256, PR #311).
+# chunk_size ever grows past 64 (a performance cliff at BT=256, PR #311).
 #
 # Computes per chunk, reading only the inclusive lower triangle of A and
 # mapping grouped value heads onto ``key_head = value_head // (H_V // H_K)``

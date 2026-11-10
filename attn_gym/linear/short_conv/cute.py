@@ -163,9 +163,8 @@ def advance_sequence_bounds(
     (self-healing) or ``==`` (skips the inactive-tail re-lookup); once-only side
     effects such as the input-gradient terminal flush MUST use ``==``. Any
     traversal-stride change must revisit every ``== sequence_end`` trigger. The
-    ``skip_sequence_boundaries`` constexpr fast path is perf-load-bearing
-    (GB300, C=12288: 17-19% for full-capacity replays; a runtime bool loses
-    28-33%).
+    ``skip_sequence_boundaries`` constexpr fast path is perf-load-bearing for
+    full-capacity replays; a runtime bool in its place is slower still.
     """
     if time >= sequence_end:
         sequence, sequence_start, sequence_end = sequence_bounds(cu_seqlens, time)
@@ -717,13 +716,13 @@ def _decode_launch_bound(
     """Launch options pinning decode at 32 registers (a full SM: 2048 threads, at most 32 CTAs).
 
     Only the measured case gets them: width 4, 4 x 16-bit channels per thread loaded as one
-    vector, 64-256 threads, a built-in activation and the initial-state flag. ptxas puts the
-    BF16 ones at 34 (SiLU) or 40 (no activation) registers, 12 or 8 of 16 CTAs per SM at 128
-    threads, FP16 ones at 32, and all fit 32 without spilling. Wider groups (8 x 16-bit,
-    4 x FP32), scalar loads and width 5 spill at 32, and the other measured decodes compile to
-    the same code under the bound, so they keep ptxas's choice. With a bound above one CTA,
-    CuTeDSL also derives a shared-memory carveout (0, all L1), which measured up to 2.6% slower
-    where the bound leaves the code unchanged, so the driver default is kept.
+    vector, 64-256 threads, a built-in activation and the initial-state flag. Unbounded,
+    ptxas gives the BF16 ones more registers, which costs resident CTAs per SM, and all fit 32
+    without spilling. Wider groups (8 x 16-bit, 4 x FP32), scalar loads and width 5 spill at
+    32, and the other measured decodes compile to the same code under the bound, so they keep
+    ptxas's choice. With a bound above one CTA, CuTeDSL also derives a shared-memory carveout
+    (0, all L1), which is slower where the bound leaves the code unchanged, so the driver
+    default is kept.
     """
     if not (
         history
@@ -2479,8 +2478,8 @@ class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
         super().__init__(channels, width, config, dtype, d_activation, use_int64_offsets)
         self.work = _sequence_work(grid)
         # The tile grid launches a sequence's history positions back to back. Folding sequences
-        # into grid.x with history on grid.y separates them by a pass over all sequences
-        # (measured 1.14-1.16x slower). Keep them adjacent by folding history into m:
+        # into grid.x with history on grid.y separates them by a pass over all sequences,
+        # which is slower. Keep them adjacent by folding history into m:
         # m = channel_block + channel_blocks * history.
         self.fold_history = grid == "2d"
 
