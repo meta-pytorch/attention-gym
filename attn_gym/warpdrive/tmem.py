@@ -141,7 +141,7 @@ class TmemView:
         return self._base + self.cols(name, slot)
 
     def view(self, name: str, slot: int = 0, **access):
-        """Return an FP32 pointer to ``name[slot]`` and annotate an access here (see ``access``)."""
+        """FP32 TMEM pointer to ``name[slot]``, annotating an access here (see ``access``)."""
         self.access(name, slot, **access)
         return self._base + self._col(name, slot)
 
