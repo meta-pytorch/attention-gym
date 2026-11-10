@@ -461,11 +461,16 @@ def _streams(kernel) -> str:
         if sched is not None:
             lines.append(f"{pad}scheduler warp {sched.first_warp} broadcasts over {name}_ring")
         else:
-            grid = (
-                "; launch grid = tile space (1-D past 65535 n_tiles or l)"
-                if _tile_grid(st)
-                else ""
-            )
+            grid = ""
+            if _tile_grid(st):
+                grid = (
+                    "; launch grid = "
+                    + {
+                        "auto": "tile space (1-D past 65535 n_tiles or l)",
+                        "tiles": "tile space",
+                        "fold_l": "(m_tiles * l, n_tiles)",
+                    }[st.schedule.grid]
+                )
             lines.append(f"{pad}decoded locally in every role{grid}")
         users = [r for r in st.roles if sched is None or r != sched.name]
         lines.append(f"{pad}roles: {', '.join(users)}")

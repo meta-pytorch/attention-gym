@@ -27,8 +27,14 @@ grid and the distribution:
   the 65535 limit of ``gridDim.y``/``z`` it falls back to a 1-D grid: the kernel sees
   ``gridDim.y = gridDim.z = 1`` with more than one ``(n, l)`` pair and decodes the index in a
   prologue branch that tile-grid launches skip. A hand-built ``(total, 1, 1)`` grid is also
-  correct, just not division-free. Every other combination launches a 1-D grid and decodes the
-  index. ``BoundWork.grid`` covers empty spaces and spaces past Int32.
+  correct, just not division-free. That is ``OneShot(grid="auto")``, the default. Its branch
+  merges ``blockIdx`` with a decoded index, which takes every value derived from the item off
+  the uniform datapath, so the grid can be a static choice instead: ``OneShot(grid="tiles")``
+  compiles the tile grid without the branch, ``"fold_l"`` the grid ``(m_tiles * l, n_tiles)``
+  for an ``l`` past the limit, and ``"flat"`` the 1-D grid alone; ``OneShot.grid_for(space)``
+  picks among them on the host. Every other combination launches a 1-D grid and decodes the
+  index.
+  ``BoundWork.grid`` covers empty spaces and spaces past Int32.
 * **distribution**, derived from the schedule. Index sequences every role can compute
   (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
   Claimed indices (``AtomicPersistent``, ``ClusterLaunchControl``) are claimed by a layer-owned
@@ -80,13 +86,14 @@ import re
 from dataclasses import dataclass, field, fields, is_dataclass
 
 import cutlass
-from cutlass import Int32, Int64, cute
+from cutlass import Int32, Int64, Uint32, cute
 
 from attn_gym.warpdrive.channels import Ring, Slots, Threads, Tma
 from attn_gym.warpdrive.compat import store_async_dsmem
 from attn_gym.warpdrive.protocol import (
     Lineage,
     ProtocolError,
+    RoleTrace,
     current_block,
     user_site,
 )
@@ -223,8 +230,9 @@ class Raster(WorkMap):
     causal attention).
 
     ``decode`` uses only ``+ - * // %`` and ``min``, so it runs on Python ints (tests) and on
-    device ``Int32`` values alike. Its intermediates are bounded by ``max(index, item count)``,
-    so it cannot overflow for any index of a space the launch admits (``BoundWork.grid``).
+    device ``Int32`` values alike. Its intermediates are nonnegative and bounded by
+    ``max(index, item count)``, so it cannot overflow for any index of a space the launch
+    admits (``BoundWork.grid``), and it may run on unsigned values (the flat ``OneShot`` grid).
 
     ``bind`` treats a negative extent as zero and maps an empty space to ``(1, 1, 0)``: no
     items, and every divisor in ``decode`` is 1. ``decode`` is therefore defined for any index
@@ -449,10 +457,60 @@ class IndexSchedule:
 
 @dataclass(frozen=True)
 class OneShot(IndexSchedule):
-    """One item per CTA, ``grid = total`` (the classic non-persistent launch)."""
+    """One item per CTA, ``grid = total`` (the classic non-persistent launch).
 
+    ``grid`` chooses, at compile time, the launch grid of a plain ``Raster()`` stream:
+
+    * ``"auto"``: the tile space, or the 1-D grid when ``n_tiles`` or ``l`` exceeds 65535. One
+      kernel serves both through a prologue branch on the launch shape. Any other mapping
+      launches the 1-D grid.
+    * ``"tiles"``: the tile space only, the item read from ``blockIdx`` with no branch. Needs
+      ``n_tiles`` and ``l`` of at most 65535.
+    * ``"fold_l"``: the grid ``(m_tiles * l, n_tiles, 1)``, for an ``l`` past 65535: ``l`` is
+      folded into ``blockIdx.x`` and recovered with one division by ``m_tiles``, and ``n`` is
+      ``blockIdx.y``. Needs ``n_tiles`` of at most 65535.
+    * ``"flat"``: the 1-D grid only, every index decoded (two divisions for ``Raster()``), for
+      any ``Raster``. Other mappings always launch the 1-D grid, under ``"auto"``.
+
+    ``"tiles"`` and ``"fold_l"`` need plain ``Raster()`` without ``record`` and a launch on
+    ``BoundWork.grid``. A space past their limit cannot launch: static extents raise a
+    ``ValueError`` from ``BoundWork.grid``; runtime extents cannot raise from the jit entry
+    point, so CUDA rejects the grid before any CTA runs (``CUDA launch failed:
+    cudaErrorInvalidValue (1)``, ``CUDA rejected the launch configuration before running the
+    kernel``).
+
+    A wrapper that must cover every space selects the variant with
+    ``OneShot(grid=OneShot.grid_for(space))``: at most three compiled kernels, and two when one
+    of ``n_tiles`` and ``l`` is bounded by the model.
+    """
+
+    grid: str = "auto"
     persistent = False
     uses_max_ctas = False
+
+    def __post_init__(self):
+        if self.grid not in ("auto", "tiles", "fold_l", "flat"):
+            raise ValueError(
+                f"OneShot.grid must be 'auto', 'tiles', 'fold_l' or 'flat', got {self.grid!r}"
+            )
+
+    @staticmethod
+    def grid_for(space) -> str:
+        """Host: the cheapest static ``grid`` that launches ``space = (m_tiles, n_tiles, l)``,
+        given as Python ints: ``"tiles"`` when ``n_tiles`` and ``l`` fit ``gridDim.y``/``z``,
+        ``"fold_l"`` when only ``n_tiles`` does, else ``"flat"``."""
+        _, n_tiles, layers = space
+        if n_tiles > MAX_GRID_YZ:
+            return "flat"
+        return "tiles" if layers <= MAX_GRID_YZ else "fold_l"
+
+    def get_key(self) -> str:
+        key = super().get_key()  # names the class, and the grid as a field
+        return key.removesuffix("_gridauto")  # the default keeps the key it always had
+
+    def describe(self) -> str:
+        grid = "" if self.grid == "auto" else f"grid={self.grid!r}"
+        return f"{type(self).__name__}({grid})"
 
     def index_limit(self, total, units, cs: int):
         return total * cs  # the 1-D grid; the terminal index is ``total``
@@ -615,6 +673,20 @@ class WorkStream:
             type(self.schedule.stages) is not int or self.schedule.stages <= 0
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
+        if isinstance(self.schedule, OneShot):
+            grid = self.schedule.grid
+            if grid in ("tiles", "fold_l") and not _tile_grid(self):
+                raise ValueError(
+                    f"OneShot(grid={grid!r}) reads the item from blockIdx: it needs OneShot "
+                    f"itself, the plain Raster() mapping and no record, not {self.describe()}"
+                    + (f" with record={self.record}" if self.record else "")
+                )
+            if grid == "flat" and type(self.mapping) is not Raster:
+                raise ValueError(
+                    "OneShot(grid='flat') chooses the grid of a Raster stream; "
+                    f"{type(self.mapping).__name__} always launches the 1-D grid, so leave "
+                    "grid='auto'"
+                )
 
     @property
     def cluster_size(self) -> int:
@@ -680,26 +752,19 @@ class WorkStream:
 
         Only for non-persistent local schedules (``OneShot``), where a unit has at most one
         item. It runs the readiness hook, drops items and reads the item the way the cursor
-        does, so it stays correct on the 1-D fallback grid, a hand-built ``(total, 1, 1)`` grid,
-        a cluster and custom mappings. ``valid`` is false for an empty space or a dropped item.
+        does, so it stays correct on the 1-D fallback grid, a hand-built ``(total, 1, 1)`` grid
+        (``OneShot(grid="tiles")`` and ``"fold_l"`` need ``BoundWork.grid``), a cluster and
+        custom mappings. ``valid`` is false for an empty space or a dropped item.
         Call it after ``begin_roles``.
         """
-        if self.schedule.persistent or self.schedule.broadcast:
-            raise ProtocolError(
-                f"WorkStream {self.name or '?'}: single_item() needs a non-persistent local "
-                f"schedule (OneShot), not {self.schedule.describe()}; a role that runs several "
-                f"items takes `{self.name or 'work'}: WorkCursor` and loops"
-            )
+        _check_single_item(self)
         problems = getattr(self.owner, "_ws_problems", {})
         if self.name not in problems:
             raise ProtocolError(
                 f"WorkStream {self.name or '?'}: call single_item() inside a role, after "
                 "begin_roles()"
             )
-        problem = problems[self.name]
-        first = Int32(self.schedule.first_index(problem))
-        index, words, _ = _local_start(self, first, problem)
-        return index < problem.total, self.mapping.unpack(words)
+        return _single_item(self, problems[self.name])
 
     # ---- host, plain Python ------------------------------------------------ #
 
@@ -763,7 +828,8 @@ class WorkStream:
         extents); a persistent schedule needs ``max_ctas``. CTA ``c`` is ``blockIdx.x`` of the
         1-D launch grid, in work unit ``c // cs``, and every CTA of a unit runs its items. A
         ``OneShot`` tile-grid launch places unit ``u`` at
-        ``(u % m_tiles, (u // m_tiles) % n_tiles, ...)`` instead.
+        ``(u % m_tiles, (u // m_tiles) % n_tiles, ...)`` instead (``grid="fold_l"``: at
+        ``(u % m_tiles + m_tiles * l, n)``).
 
         ``decode(index) -> (keep, item)`` is the host counterpart of ``mapping.decode``, for a
         mapping that reads tables or device data. By default a ``decodes_any_index`` mapping
@@ -889,20 +955,57 @@ class BoundWork:
         unit = self._in_units(bidx)
         if _tile_grid(self.stream):
             em, en, _ = self.space
+            if self.stream.schedule.grid == "fold_l":
+                unit, bidz = _unfold_l(unit, em)
             unit = unit + em * (bidy + en * bidz)
         return unit
 
     def start(self):
         """Device-side, in the kernel prologue (``begin_roles``): the first item's words of a
-        ``_tile_grid`` stream. Every role shares them, which keeps the 1-D fallback branch off
-        the roles' paths."""
+        ``_tile_grid`` stream. Every role shares them, which keeps the 1-D fallback branch of
+        ``OneShot(grid="auto")`` off the roles' paths."""
         self.first_words = None
         if _tile_grid(self.stream):
             bidx, bidy, bidz = cute.arch.block_idx()
-            unit = Int32(self._in_units(bidx))
-            self.first_words = _grid_item(
-                self.stream.mapping, self.space, unit, Int32(bidy), Int32(bidz)
+            words = Int32(self._in_units(bidx)), Int32(bidy), Int32(bidz)
+            match self.stream.schedule.grid:
+                case "auto":
+                    words = _grid_item(self.stream.mapping, self.space, *words)
+                case "fold_l":
+                    m, li = _unfold_l(words[0], self.space[0])
+                    words = m, words[1], li
+            self.first_words = words
+
+    # ---- device, in a kernel without roles ---------------------------------- #
+
+    def single_item(self):
+        """``valid, item = bound.single_item()``: this CTA's item in a plain ``@cute.kernel``
+        that received ``bound``, with the semantics of ``WorkStream.single_item``.
+
+        A kernel without roles takes the stream's grid and mapping without
+        ``begin_roles``/``run_roles``, so it pays no barrier-init fence or CTA sync.
+        """
+        _check_plain(self.stream, "single_item")
+        _check_single_item(self.stream)
+        self.start()
+        return _single_item(self.stream, self)
+
+    def cursor(self) -> WorkCursor:
+        """``work = bound.cursor()``: a local-schedule cursor for a plain ``@cute.kernel``.
+
+        Loop as a role does (``while work.valid: ...; work.advance()``). One loop runs every
+        item, so there is no cross-role agreement to check: tracing does not verify the loop
+        shape, and nothing needs draining.
+        """
+        _check_plain(self.stream, "cursor")
+        if self.stream.schedule.broadcast:
+            raise ProtocolError(
+                f"BoundWork.cursor() needs a local schedule, not "
+                f"{self.stream.schedule.describe()}: a broadcast schedule needs a scheduler "
+                "warp and a work ring, so declare roles"
             )
+        self.start()
+        return WorkCursor.create(self.stream, self, None, RoleTrace("kernel", None))
 
     def _uses_workspace(self) -> bool:
         return self.stream.schedule.uses_workspace or bool(self.stream.record)
@@ -934,11 +1037,13 @@ class BoundWork:
         over plain ``Raster()`` (``tile_grid_dims``); ``max_ctas`` caps CTAs, so a cluster of
         ``cs`` CTAs launches at most ``max_ctas // cs`` clusters. An empty space launches one
         work unit. A space whose ``schedule.index_limit`` exceeds Int32 gets a zero-wide grid,
-        which CUDA rejects at launch."""
+        which CUDA rejects at launch. ``OneShot(grid="tiles")`` and ``"fold_l"`` have no 1-D
+        grid: static extents past their 65535 limit raise here, and runtime ones launch the
+        grid as is, which CUDA rejects."""
         schedule = self.stream.schedule
         units = schedule.launch_units(self.total, _unit_cap(schedule, self.max_ctas, self.cs))
         if _tile_grid(self.stream):
-            x, y, z = tile_grid_dims(self.space, self.cs)
+            x, y, z = tile_grid_dims(self.space, self.cs, schedule.grid)
         else:
             x, y, z = units * self.cs, 1, 1
         # Every grid extent and index must fit Int32. Past that the grid is zero-wide, so CUDA
@@ -1095,7 +1200,67 @@ def _local_start(stream, first, problem):
     state = _start(stream.mapping, problem.space)
     if _tile_grid(stream):
         return first, problem.first_words, state
+    if _flat_raster(stream):
+        return first, _unsigned_raster_words(stream.mapping, first, problem.space), state
     return _local_item(stream, first, problem, state)
+
+
+def _flat_raster(stream) -> bool:
+    """``OneShot(grid="flat")`` over ``Raster``: every CTA decodes its one index."""
+    return (
+        isinstance(stream.schedule, OneShot)
+        and stream.schedule.grid == "flat"
+        and type(stream.mapping) is Raster
+    )
+
+
+def _unsigned_raster_words(mapping, index, space):
+    """``Raster`` words of ``index``, decoded in unsigned arithmetic.
+
+    An index and the bound extents are nonnegative, so the unsigned decode returns the same
+    words while its divisions skip the sign handling of Int32 floor division, most of the
+    decode's instructions. Only the flat grid decodes this way; the other schedules keep the
+    signed decode their kernels were measured with.
+    """
+    _, words, _ = mapping.decode(Uint32(index), tuple(Uint32(e) for e in space), None)
+    return tuple(Int32(w) for w in words)
+
+
+def _check_single_item(stream):
+    if stream.schedule.persistent or stream.schedule.broadcast:
+        raise ProtocolError(
+            f"WorkStream {stream.name or '?'}: single_item() needs a non-persistent local "
+            f"schedule (OneShot), not {stream.schedule.describe()}; code that runs several "
+            "items loops on a WorkCursor"
+        )
+
+
+def _check_plain(stream, method: str):
+    """``BoundWork``'s device methods serve kernels without roles: the roles of a
+    ``WarpSpecialized`` kernel share the prologue's start values and the loop checks, and
+    ``record`` logs per role."""
+    if stream.owner is not None:
+        raise ProtocolError(
+            f"BoundWork.{method}() is for kernels without roles; roles of "
+            f"{type(stream.owner).__name__} take `{stream.name}: WorkCursor` or call "
+            f"self.{stream.name}.single_item()"
+        )
+    if stream.record:
+        raise ProtocolError(
+            f"BoundWork.{method}(): WorkStream(record=...) logs per role; declare roles"
+        )
+
+
+def _single_item(stream, problem):
+    """``(valid, item)`` of a ``OneShot`` unit, decoded as a local cursor would."""
+    first = Int32(stream.schedule.first_index(problem))
+    index, words, _ = _local_start(stream, first, problem)
+    valid = index < problem.total
+    if _tile_grid(stream) and stream.schedule.grid != "auto":
+        # The grid holds one CTA per item, so only an empty space's one CTA has no item: a test
+        # of the count alone, with no index to compute.
+        valid = problem.total > 0
+    return valid, stream.mapping.unpack(words)
 
 
 @cute.jit
@@ -1177,26 +1342,49 @@ def resident_ctas(index: int, cs: int) -> int:
         return HardwareInfo(index).get_max_active_clusters(cs) * cs
 
 
-def tile_grid_dims(space, cs: int = 1):
-    """Launch grid of a ``_tile_grid`` stream over ``space = (m_tiles, n_tiles, l)``: the tile
-    space when ``n_tiles`` and ``l`` fit ``gridDim.y``/``z``, else the 1-D grid of ``total``
-    items; one work unit when the space is empty (an extent <= 0). Works on Python ints and on
-    DSL extents."""
+def tile_grid_dims(space, cs: int = 1, grid: str = "auto"):
+    """Launch grid of a ``_tile_grid`` stream over ``space = (m_tiles, n_tiles, l)``, for its
+    ``OneShot.grid`` (``"auto"``, ``"tiles"`` or ``"fold_l"``); one work unit when the space is
+    empty (an extent <= 0). Works on Python ints and on DSL extents.
+
+    ``"auto"``: the tile space when ``n_tiles`` and ``l`` fit ``gridDim.y``/``z``, else the 1-D
+    grid of ``total`` items. ``"tiles"``: the tile space. ``"fold_l"``:
+    ``(m_tiles * l, n_tiles, 1)``. The last two have no alternative: static extents past their
+    limit raise, and DSL extents are returned as they are.
+    """
     em, en, el = space
+    x, y, z = (em * el, en, 1) if grid == "fold_l" else (em, en, el)
     if all(isinstance(e, int) for e in space):
         if min(space) <= 0:
             return (cs, 1, 1)
-        if en <= MAX_GRID_YZ and el <= MAX_GRID_YZ:
-            return (em * cs, en, el)
-        return (em * en * el * cs, 1, 1)
+        if max(y, z) <= MAX_GRID_YZ:
+            return (x * cs, y, z)
+        if grid == "auto":
+            return (em * en * el * cs, 1, 1)
+        raise ValueError(
+            f"OneShot(grid={grid!r}) cannot launch the space {tuple(space)}: gridDim.y/z are "
+            f"limited to {MAX_GRID_YZ}. OneShot.grid_for(space) selects a grid that fits "
+            "('fold_l' or 'flat')"
+        )
     nonempty = (em > 0) & (en > 0) & (el > 0)
-    tiles = nonempty & (en <= MAX_GRID_YZ) & (el <= MAX_GRID_YZ)
     one = Int32(1)
+    fits, x_otherwise = nonempty, one
+    if grid == "auto":
+        fits = nonempty & (en <= MAX_GRID_YZ) & (el <= MAX_GRID_YZ)
+        x_otherwise = cutlass.select_(nonempty, em * en * el, one)
     return (
-        Int32(cutlass.select_(tiles, em, cutlass.select_(nonempty, em * en * el, one))) * cs,
-        Int32(cutlass.select_(tiles, en, one)),
-        Int32(cutlass.select_(tiles, el, one)),
+        Int32(cutlass.select_(fits, x, x_otherwise)) * cs,
+        Int32(cutlass.select_(fits, y, one)),
+        Int32(cutlass.select_(fits, Int32(z), one)),
     )
+
+
+@cute.jit
+def _unfold_l(x, em):
+    """``(m, l)`` of a ``"fold_l"`` grid's ``x = m + m_tiles * l``. Both operands are
+    nonnegative, so the division is unsigned, with no sign handling."""
+    li = Int32(Uint32(x) // Uint32(em))
+    return x - li * em, li
 
 
 @cute.jit
@@ -1215,12 +1403,13 @@ def _grid_item(mapping, space, m, n, li):
 
 
 def _tile_grid(stream) -> bool:
-    """One item per CTA in plain raster order: launch the tile space as the grid and take the
-    item from ``blockIdx``. Decoding a 1-D index divides by the extents on the load warp's path
-    to its first copy (about 0.2 us on a 512^3 GEMM)."""
+    """One item per CTA in plain raster order: launch the tile space as the grid (``l`` folded
+    into x for ``"fold_l"``) and take the item from ``blockIdx``. Decoding a 1-D index divides
+    by the extents on the load warp's path to its first copy (about 0.2 us on a 512^3 GEMM)."""
     mapping = stream.mapping
     return (
         type(stream.schedule) is OneShot  # a subclass may override first_index()
+        and stream.schedule.grid != "flat"
         and type(mapping) is Raster
         and mapping.along == "m"
         and mapping.swizzle == 1

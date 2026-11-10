@@ -173,6 +173,38 @@ Plain `Raster()` with `OneShot()` normally launches
 65535, it switches to a decoded 1-D grid. A hand-built `(total * cluster_size, 1, 1)` grid is
 also supported for this path. Other built-in combinations use 1-D grids.
 
+That is `OneShot(grid="auto")`: one kernel for both grids, with a prologue branch on the launch
+shape. The branch merges `blockIdx` with a decoded index, so the item, and every address and
+predicate computed from it, leaves the uniform datapath (a pointwise kernel measured 4-5%
+slower). When that matters, make the grid a static choice:
+
+| `OneShot(grid=...)` | Launch grid | Item |
+|---|---|---|
+| `"auto"` (default) | Tile space, or 1-D past 65535 `n_tiles` or `l` | `blockIdx`, or decoded behind a runtime branch |
+| `"tiles"` | `(m_tiles, n_tiles, l)`; needs `n_tiles`, `l` <= 65535 | `blockIdx`, no branch and no division |
+| `"fold_l"` | `(m_tiles * l, n_tiles, 1)`; needs `n_tiles` <= 65535 | `n` is `blockIdx.y`; `l` and `m` from `blockIdx.x` with one division |
+| `"flat"` | 1-D only | Always decoded: two divisions for `Raster()` |
+
+`"tiles"` and `"fold_l"` need plain `Raster()` without `record` and a launch on
+`bound.grid()`. `OneShot.grid_for((m_tiles, n_tiles, l))` returns the cheapest grid that
+launches a space given as Python ints, so a wrapper picks the variant before compiling:
+`"tiles"` when `n_tiles` and `l` fit, `"fold_l"` when only `n_tiles` does, else `"flat"`.
+
+```python
+op = MyKernel(grid=OneShot.grid_for((chunks, heads, batch)))
+# in MyKernel.__init__:
+self.work = WorkStream(schedule=OneShot(grid=grid))
+```
+
+That is at most three compiled variants, and two when the model bounds `n_tiles` or `l`: with
+heads on n and batch on l, only `"tiles"` and `"fold_l"` are ever selected.
+
+A `"tiles"` or `"fold_l"` kernel bound to a space past its limit cannot launch. Static extents
+raise a `ValueError` from `bound.grid()`. Runtime extents cannot raise from the jit entry
+point, so the grid is launched as is and CUDA rejects it before any CTA runs:
+`CUDA launch failed: cudaErrorInvalidValue (1)`, `CUDA rejected the launch configuration before
+running the kernel.`
+
 If any Raster extent is `<= 0`:
 
 - Host-side binding normalizes space to `(1, 1, 0)`.
@@ -434,3 +466,37 @@ It handles the fallback grid, clusters, mappings, readiness and dropped items li
 cursor. Call it after `begin_roles()`, only with a nonpersistent local schedule such as
 `OneShot()`. Persistent and broadcast schedules reject it; managed roles instead take a
 `WorkCursor` and loop.
+
+## Without roles
+
+A kernel with no warp roles can still take its grid and items from a stream. Declare the
+stream on a plain class, bind it in the entry point, pass `bound` to the `@cute.kernel`, and
+read the work from `bound`:
+
+```python
+self.work = WorkStream(schedule=OneShot(grid=grid))  # in __init__ of a plain class
+
+# In __call__ (@cute.jit):
+bound = self.work.bind((chunks, heads, batch))
+self.kernel(x, bound).launch(grid=bound.grid(), block=(128, 1, 1), stream=stream)
+
+# In the kernel:
+valid, (chunk, head, batch) = bound.single_item()
+if valid:
+    ...
+```
+
+`bound.cursor()` returns a `WorkCursor` for a local persistent schedule; loop on it as a role
+does. There is no `begin_roles()`/`run_roles()`, so the kernel pays no barrier-initialization
+fence or CTA sync, and gets no placement, channels or storage plans.
+
+Both methods raise `ProtocolError` for:
+
+- a stream declared on a `WarpSpecialized` kernel (its roles take a `WorkCursor` or call
+  `self.work.single_item()`);
+- `WorkStream(record=...)`, which logs per role;
+- a broadcast schedule (`AtomicPersistent`, `ClusterLaunchControl`), which needs a scheduler
+  warp and a work ring;
+- `single_item()` with a persistent schedule.
+
+One loop runs every item, so the cursor's loop shape is not checked here.
