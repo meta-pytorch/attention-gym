@@ -153,8 +153,9 @@ Pick the smallest tier that covers the change; run bigger tiers only when asked 
 landing core synchronization/scheduling changes.
 
 - Every change (~45 s cold, ~22 s with a warm compile cache on a GB300):
-  `pytest -n 12 test/warpdrive test/profiler`. Fuzz tests are skipped by default (`addopts`
-  deselects the `fuzz` marker).
+  `pytest -n 12 test/warpdrive test/profiler test/warpdrive_fuzz`. Tests marked `fuzz` are
+  skipped by default (`addopts` deselects the marker); the unmarked regressions in
+  `test/warpdrive_fuzz/test_static.py` are compile-only and run here.
 - Quick fuzz (~2-3 min, on request or before landing layer changes):
   `pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz`. It includes the mutant check:
   each synthetic layer bug in `test/warpdrive_fuzz/runtime_mutants.py` must fail or hang its
