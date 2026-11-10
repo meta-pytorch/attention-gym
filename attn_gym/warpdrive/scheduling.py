@@ -18,14 +18,14 @@ grid and the distribution:
 
   (``max`` is ``max_ctas``.)
 * **mapping** (a ``WorkMap``): ``index -> work item``, a tuple of Int32 words that ``unpack()``
-  turns into whatever the roles consume. ``Raster`` is the tile mapping: row/column raster, L2
-  swizzle bands, and reversed axes for longest-processing-time-first. The mapping owns its
-  runtime ``space``, the item count (``count64``), and ``decode``, which returns
-  ``(keep, words)``; a mapping that declares ``skips`` may drop empty items.
-* **launch grid**: ``OneShot`` with the default ``Raster()`` (along m, no swizzle or reversal)
-  launches the tile space itself, ``(m_tiles, n_tiles, l)`` CTAs (times the cluster size along
-  x), and reads the item from ``blockIdx`` with no division. When ``n_tiles`` or ``l`` exceeds
-  the 65535 limit of ``gridDim.y``/``z`` it falls back to a 1-D grid: the kernel sees
+  turns into whatever the roles consume. ``Raster`` is the tile mapping: row/column raster and
+  L2 swizzle bands. The mapping owns its runtime ``space``, the item count (``count64``), and
+  ``decode``, which returns ``(keep, words)``; a mapping that declares ``skips`` may drop empty
+  items.
+* **launch grid**: ``OneShot`` with the default ``Raster()`` (along m, no swizzle) launches the
+  tile space itself, ``(m_tiles, n_tiles, l)`` CTAs (times the cluster size along x), and reads
+  the item from ``blockIdx`` with no division. When ``n_tiles`` or ``l`` exceeds the 65535
+  limit of ``gridDim.y``/``z`` it falls back to a 1-D grid: the kernel sees
   ``gridDim.y = gridDim.z = 1`` with more than one ``(n, l)`` pair and decodes the index in a
   prologue branch that tile-grid launches skip. A hand-built ``(total, 1, 1)`` grid is also
   correct, just not division-free. That is ``OneShot(grid="auto")``, the default. Its branch
@@ -232,8 +232,6 @@ class Raster(WorkMap):
     tiles and finish one band before the next. Inside a band its tiles are innermost, so
     ``k * swizzle`` consecutive indices touch ``swizzle`` operand panels on the banded axis
     instead of ``k * swizzle`` (CUTLASS raster + swizzle). The last band may be narrower.
-    ``reverse``: axes visited high to low (``reverse="m"`` is longest-processing-time-first for
-    causal attention).
 
     ``decode`` uses only ``+ - * // %`` and ``min``, so it runs on Python ints (tests) and on
     device ``Int32`` values alike. Its intermediates are nonnegative and bounded by
@@ -253,7 +251,6 @@ class Raster(WorkMap):
 
     along: str = "m"
     swizzle: int = 1
-    reverse: tuple[str, ...] = ()
     words = 3
     decodes_any_index = True
 
@@ -262,11 +259,6 @@ class Raster(WorkMap):
             raise ValueError(f"Raster.along must be 'm' or 'n', got {self.along!r}")
         if type(self.swizzle) is not int or self.swizzle < 1:
             raise ValueError(f"Raster.swizzle must be a positive int, got {self.swizzle!r}")
-        if isinstance(self.reverse, str):
-            object.__setattr__(self, "reverse", (self.reverse,))
-        bad = [a for a in self.reverse if a not in AXES]
-        if bad:
-            raise ValueError(f"Raster.reverse axes must be among {AXES}, got {bad}")
 
     def bind(self, space):
         if len(space) != 3:
@@ -296,7 +288,7 @@ class Raster(WorkMap):
         return cutlass.min(cutlass.min(Int64(em) * en, limit) * el, limit)
 
     def decode(self, index, space, state):
-        em, en, el = space
+        em, en, _ = space
         per_l = em * en
         li = index // per_l
         r = index - li * per_l
@@ -313,25 +305,15 @@ class Raster(WorkMap):
             a = local // width
             b = start + (local - a * width)
         m, n = (a, b) if self.along == "m" else (b, a)
-        if "m" in self.reverse:
-            m = em - 1 - m
-        if "n" in self.reverse:
-            n = en - 1 - n
-        if "l" in self.reverse:
-            li = el - 1 - li
         return True, (m, n, li), state
 
     def get_key(self) -> str:
-        return f"{self.along}{self.swizzle}" + (
-            "r" + "".join(self.reverse) if self.reverse else ""
-        )
+        return f"{self.along}{self.swizzle}"
 
     def describe(self) -> str:
         parts = [f"along={self.along}"]
         if self.swizzle > 1:
             parts.append(f"swizzle={self.swizzle}")
-        if self.reverse:
-            parts.append(f"reverse={self.reverse}")
         return f"Raster({', '.join(parts)})"
 
 
@@ -1618,7 +1600,6 @@ def _tile_grid(stream) -> bool:
         and type(mapping) is Raster
         and mapping.along == "m"
         and mapping.swizzle == 1
-        and not mapping.reverse
     )
 
 

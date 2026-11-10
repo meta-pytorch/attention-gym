@@ -276,7 +276,6 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
     add("bad along", "E82", lambda: Raster(along="k"), "along")
     for value in (0, 1.5, True):
         add(f"swizzle={value!r}", "E83", lambda v=value: Raster(swizzle=v), "swizzle")
-    add("bad reverse", "E84", lambda: Raster(reverse=("k",)), "reverse")
     reject(
         "slot-bound Ring",
         "E19",

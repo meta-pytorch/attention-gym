@@ -144,7 +144,9 @@ Raster options:
 - `along="m"` chooses the raster axis; `"n"` chooses the other one.
 - `swizzle=8` groups the other axis into eight-tile bands, visiting the band's tiles
   innermost. The final band may be narrower.
-- `reverse="m"` visits m high-to-low. l is always the slowest axis.
+
+l is always the slowest axis. Other orders, such as longest-processing-time-first, are
+[custom mappings](#custom-mappings).
 
 For positive extents Raster is a bijection. Its decode intermediates stay within
 `max(index, item_count)`, avoiding overflow for admitted indices.
