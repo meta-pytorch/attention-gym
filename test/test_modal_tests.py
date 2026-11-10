@@ -2,6 +2,9 @@
 
 import contextlib
 import os
+import shutil
+import subprocess
+import sys
 import time
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -48,6 +51,39 @@ def test_image_ships_runner_with_requested_dependencies(runner: ModuleType, extr
     image.pip_install_from_pyproject.assert_called_once_with(
         str(runner.ROOT_PATH / "pyproject.toml"), optional_dependencies=extras, pre=True
     )
+
+
+def test_remote_pytest_keeps_fuzz_opt_in(runner: ModuleType, tmp_path: Path):
+    """The mounted configuration must exclude fuzz, while explicit selection still runs it."""
+    image = Mock()
+    image.pip_install_from_pyproject.return_value = image
+    image.add_local_dir.return_value = image
+
+    def mount_file(source: Path, remote_path: str):
+        shutil.copyfile(source, tmp_path / Path(remote_path).name)
+        return image
+
+    image.add_local_file.side_effect = mount_file
+    runner.configure_local_image(image, ["tests"])
+    tests = tmp_path / "test"
+    tests.mkdir()
+    (tests / "test_selection.py").write_text(
+        "import pytest\n"
+        "def test_default():\n    pass\n"
+        "@pytest.mark.fuzz\ndef test_campaign():\n    pass\n"
+    )
+    for options, selected in (([], "test_default"), (["-m", "fuzz"], "test_campaign")):
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", "-n", "0", "-v", *options],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "1 passed, 1 deselected" in result.stdout, result.stdout
+        assert f"test_selection.py::{selected} PASSED" in result.stdout, result.stdout
+        assert "PytestUnknownMarkWarning" not in result.stdout, result.stdout
 
 
 def test_failure_report_includes_assertions_and_errors(runner: ModuleType, tmp_path: Path):
@@ -136,6 +172,25 @@ def test_compile_cache_round_trip_keeps_recent_entries(runner: ModuleType, tmp_p
     assert (restored / files[0]).read_bytes() == b"kernel.o"
     assert (restored / files[0]).stat().st_mtime == pytest.approx(compiled_at, abs=1)
     assert [path.name for path in archive.parent.iterdir()] == ["main.tar"]
+
+
+def test_failed_cache_upload_preserves_previous_archive(
+    runner: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """An interrupted upload must not destroy the last cache a later run can restore."""
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    entry = cache / "kernel.o"
+    entry.write_bytes(b"previous compile")
+    archive = tmp_path / "volume" / "main.tar"
+    runner.save_compile_cache(cache, archive, max_age_seconds=60)
+    entry.write_bytes(b"new compile")
+    monkeypatch.setattr(runner.shutil, "copyfile", Mock(side_effect=OSError("upload failed")))
+    with pytest.raises(OSError, match="upload failed"):
+        runner.save_compile_cache(cache, archive, max_age_seconds=60)
+    restored = tmp_path / "restored"
+    runner.restore_compile_cache(archive, restored)
+    assert (restored / "kernel.o").read_bytes() == b"previous compile"
 
 
 @pytest.mark.parametrize("first_code", [0, 1, -9])

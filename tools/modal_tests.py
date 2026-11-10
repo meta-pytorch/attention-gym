@@ -1,12 +1,16 @@
 import contextlib
 import importlib
 import os
+import platform
+import shutil
 import subprocess
 import tarfile
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import modal
@@ -78,6 +82,8 @@ def configure_local_image(
         .add_local_dir(ROOT_PATH / "benchmarks", remote_path="/root/benchmarks")
         .add_local_dir(ROOT_PATH / "docs", remote_path="/root/docs")
         .add_local_file(ROOT_PATH / "README.md", remote_path="/root/README.md")
+        # The default suite excludes fuzz campaigns and intentional mutant hangs.
+        .add_local_file(ROOT_PATH / "pyproject.toml", remote_path="/root/pyproject.toml")
     )
 
 
@@ -161,7 +167,7 @@ def execute_pytest(
             "--tb=short",
             "--instafail",
             "--maxfail=5",
-            "--durations=50",
+            "--durations=60",
             f"--junitxml={report_path}",
         ],
         cwd="/root",
@@ -177,45 +183,70 @@ def execute_pytest(
 
 def restore_compile_cache(archive: Path, cache_dir: Path) -> None:
     """Unpack a previous run's compile artifacts; a missing archive is a cold start."""
+    start = time.perf_counter()
+    print(f"restoring compile cache from {archive}", flush=True)
     if not archive.is_file():
         print(f"no compile cache at {archive}; compiling from scratch", flush=True)
         return
-    start = time.perf_counter()
     cache_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive) as tar:
         tar.extractall(cache_dir, filter="data")
     size_mb = archive.stat().st_size / 2**20
-    print(f"restored {size_mb:.0f} MiB compile cache in {time.perf_counter() - start:.1f}s")
+    print(
+        f"restored {size_mb:.0f} MiB compile cache in {time.perf_counter() - start:.1f}s",
+        flush=True,
+    )
 
 
 def save_compile_cache(cache_dir: Path, archive: Path, max_age_seconds: float) -> None:
-    """Archive artifacts written or restored within ``max_age_seconds``, replacing ``archive``.
+    """Archive artifacts with mtimes within ``max_age_seconds``, replacing ``archive``.
 
     Restoring preserves each file's original mtime, so an entry ages from when it was compiled.
     """
     if not cache_dir.is_dir():
         return
+    start = time.perf_counter()
+    print(f"saving compile cache to {archive}", flush=True)
     cutoff = time.time() - max_age_seconds
     staging = archive.with_name(f"{archive.name}.partial")
     archive.parent.mkdir(parents=True, exist_ok=True)
-    with tarfile.open(staging, "w") as tar:
-        for path in sorted(cache_dir.rglob("*")):
-            if path.is_file() and not path.is_symlink() and path.stat().st_mtime >= cutoff:
-                tar.add(path, arcname=path.relative_to(cache_dir), recursive=False)
-    staging.replace(archive)
-    print(f"saved {archive.stat().st_size / 2**20:.0f} MiB compile cache to {archive}")
+    # Tar emits many small writes. Build it on local disk, then stream one file to the Volume.
+    with tempfile.TemporaryDirectory(prefix="attention-gym-cache-") as temp_dir:
+        local_archive = Path(temp_dir) / archive.name
+        with tarfile.open(local_archive, "w") as tar:
+            for path in sorted(cache_dir.rglob("*")):
+                if path.is_file() and not path.is_symlink() and path.stat().st_mtime >= cutoff:
+                    tar.add(path, arcname=path.relative_to(cache_dir), recursive=False)
+        shutil.copyfile(local_archive, staging)
+        staging.replace(archive)
+    print(
+        f"saved {archive.stat().st_size / 2**20:.0f} MiB compile cache to {archive} "
+        f"in {time.perf_counter() - start:.1f}s",
+        flush=True,
+    )
 
 
 @contextlib.contextmanager
 def persistent_compile_cache(suite: str) -> Iterator[None]:
     """Restore ``suite``'s compile cache from the Volume and save it back, even after failures."""
+    print(f"container started for {suite} at {datetime.now(UTC).isoformat()}", flush=True)
+    packages = []
+    for package in ("torch", "nvidia-cutlass-dsl", "flash-attn-4"):
+        try:
+            packages.append(f"{package}={version(package)}")
+        except PackageNotFoundError:
+            packages.append(f"{package}=not-installed")
+    print(f"{platform.machine()}: {', '.join(packages)}", flush=True)
     archive = CACHE_VOLUME_PATH / f"{suite}.tar"
     restore_compile_cache(archive, COMPILE_CACHE_PATH)
     try:
         yield
     finally:
         save_compile_cache(COMPILE_CACHE_PATH, archive, CACHE_MAX_AGE_SECONDS)
+        start = time.perf_counter()
+        print("committing compile cache Volume", flush=True)
         CACHE_VOLUME.commit()
+        print(f"committed compile cache Volume in {time.perf_counter() - start:.1f}s", flush=True)
 
 
 @app.function(
@@ -262,8 +293,11 @@ def run_cudnn_pytest() -> tuple[int, str]:
 @app.local_entrypoint()
 def main() -> None:
     """Publish each suite immediately and stop allocating GPUs after a failed suite."""
-    for suite in (run_pytest, run_cudnn_pytest):
+    for suite_name, suite in (("main", run_pytest), ("cudnn", run_cudnn_pytest)):
+        start = time.perf_counter()
+        print(f"requesting {suite_name} at {datetime.now(UTC).isoformat()}", flush=True)
         return_code, summary = suite.remote()
+        print(f"{suite_name} returned in {time.perf_counter() - start:.1f}s", flush=True)
         print(f"\n{summary}", flush=True)
         if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
             with Path(summary_path).open("a") as summary_file:

@@ -9,10 +9,12 @@ on:
 permissions:
   contents: read
 
+# Let the active main run finish its image build and save its compile cache. GitHub keeps
+# only the latest pending run for this group; bursts of merges must not cancel every build.
 # Attached Modal apps stop on client exit/disconnection; never add --detach below.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   pytest:
@@ -36,4 +38,4 @@ jobs:
         run: python -m pip install modal
 
       - name: Run pytest on a B200
-        run: exec modal run -m tools.modal_tests
+        run: exec modal run --timestamps -m tools.modal_tests
