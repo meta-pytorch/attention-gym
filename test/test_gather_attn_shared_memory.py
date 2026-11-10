@@ -160,9 +160,36 @@ def test_absorbed_mla_small_key_tiles_match_reference(rope_dim):
         assert_numerics(grad, expected_grad, f"gradient {index}")
 
 
+@pytest.mark.parametrize("head_dim", [384, 512])
+@pytest.mark.parametrize("capability", [SM86_CAPABILITY, SM120_CAPABILITY], ids=["sm86", "sm120"])
+def test_fp32_wide_head_launches_fit_99_kib_shared_memory(capability, head_dim):
+    """Every launch has a config within the 101376-byte per-block shared-memory limit.
+
+    Compile-only for FP32 head_dim 384/512 with a local window.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton")
+    inputs = make_inputs(4, head_dim, topk=16, dtype=torch.float32)
+    with compile_only_for_target(capability, SM86_MAX_SHARED_MEMORY) as launches:
+        output = gather_attn(
+            **inputs, sliding_window_size=64, kernel_options={"backend": "triton"}
+        )
+        output.sum().backward()
+
+    assert {"_gather_attn_bwd_dq", "_gather_attn_bwd_dlocal_kv"} <= {
+        launch.kernel for launch in launches
+    }
+    assert not over_shared_memory(launches, SM86_MAX_SHARED_MEMORY)
+
+
 @pytest.mark.parametrize(
     "head_dim,window,dtype",
-    [(256, 64, torch.bfloat16), (128, 64, torch.bfloat16), (256, 64, torch.float32)],
+    [
+        (256, 64, torch.bfloat16),
+        (128, 64, torch.bfloat16),
+        (256, 64, torch.float32),
+        (512, 64, torch.float32),
+    ],
 )
 def test_sm86_tiles_match_reference(head_dim, window, dtype):
     """The tiles selected for a 99 KiB budget compute the same forward and gradients."""
