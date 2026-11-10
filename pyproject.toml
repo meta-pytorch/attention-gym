@@ -81,10 +81,6 @@ conflicts = [
     ],
 ]
 
-[tool.uv.sources]
-# FA4 main for #3140 (in-kernel 2CTA head padding); drop once a release includes it.
-flash-attn-4 = { git = "https://github.com/Dao-AILab/flash-attention", rev = "2ed4a1f0fc0e36a6ca7b861bfbf86ebb82c4c592", subdirectory = "flash_attn/cute" }
-
 [tool.hatch.version]
 source = "vcs"
 
