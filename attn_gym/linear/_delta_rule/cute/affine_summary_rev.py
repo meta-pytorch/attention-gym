@@ -49,7 +49,17 @@ from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.constants import is_sm100_kda_capability
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
+    _CUTE_IO_TYPES,
+    _IO_TYPE_NAMES,
+    BT,
+    DATA_ALIGN_BYTES,
+    KEY_DIM,
     MAX_RANGES,
+    SUMMARY_DIM,
+    VAL_DIM,
+    _aligned,
+    _feature_sequence_head_batch_view,
+    _sequence_feature_head_batch_view,
     decode_work_row,
     plan_work_budget,
     zero_tail_tokens,
@@ -78,36 +88,9 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, get_compile_target, jit_cache
 from attn_gym.warpdrive.compat import LayoutEnum
 
-BT = 64
-KEY_DIM = 128
-VAL_DIM = 128
-SUMMARY_DIM = VAL_DIM + KEY_DIM
-DATA_ALIGN_BYTES = 16
-
-_IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
-_CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
 # The flat compile cache builds the op internally. Keep host launch resources separate;
 # StaticPersistent reads only max_ctas, but carries the same workspace ABI as other schedules.
 _LAUNCH_WORK = WorkStream(schedule=StaticPersistent())
-
-
-def _aligned(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize the uncommon contiguous view that misses the TMA alignment."""
-    return tensor if tensor.data_ptr() % DATA_ALIGN_BYTES == 0 else tensor.clone()
-
-
-@cute.jit
-def _sequence_feature_head_batch_view(tensor):
-    """Re-rank ``[B,T,H,D]`` as ``[T,D,(H,B)]`` for a TMA operand."""
-    layout = cute.group_modes(cute.select(tensor.layout, mode=[1, 3, 2, 0]), 2, 4)
-    return cute.make_tensor(tensor.iterator, layout)
-
-
-@cute.jit
-def _feature_sequence_head_batch_view(tensor):
-    """Re-rank ``[B,T,H,D]`` as ``[D,T,(H,B)]`` for a TMA operand."""
-    layout = cute.group_modes(cute.select(tensor.layout, mode=[3, 1, 2, 0]), 2, 4)
-    return cute.make_tensor(tensor.iterator, layout)
 
 
 class TmaOp(NamedTuple):
