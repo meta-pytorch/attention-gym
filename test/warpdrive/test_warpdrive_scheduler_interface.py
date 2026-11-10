@@ -44,6 +44,7 @@ from attn_gym.warpdrive import (
     Readiness,
     SingleCta,
     StaticPersistent,
+    TilePersistent,
     WorkMap,
     WorkStream,
     role,
@@ -651,6 +652,17 @@ def _plain_hits(op, ext, max_ctas=148):
         (OneShot(grid="1d"), Raster(swizzle=2, reverse="m"), "static_mn", (5, 3, 2)),
         (StaticPersistent(), None, "static_mn", (9, 7, 2)),
         (StaticPersistent(), Raster(along="n", swizzle=3), "static_m", (9, 7, 2)),
+        # One axis walked per CTA (max_ctas=4 units along it), the others from blockIdx.
+        (TilePersistent("m"), None, "cursor", (9, 3, 2)),
+        (TilePersistent("n"), None, "cursor", (3, 9, 2)),
+        (TilePersistent("l"), None, "cursor", (3, 2, 9)),
+        (TilePersistent("n"), None, "static_mn", (3, 2, 2)),
+        (TilePersistent("m"), None, "cursor", (0, 3, 2)),
+        (TilePersistent("n"), None, "cursor", (3, 9, 0)),
+        # A compile-time stride: the grid's axis is exactly `units`, idle CTAs run nothing.
+        (TilePersistent("m", units=4), None, "cursor", (9, 3, 2)),
+        (TilePersistent("n", units=16), None, "cursor", (3, 9, 2)),
+        (TilePersistent("l", units=3), None, "cursor", (2, 3, 7)),
     ],
     ids=lambda v: v if isinstance(v, str) else None,
 )
@@ -842,13 +854,17 @@ def compile_limit_toy(op):
         (OneShot(grid="3d"), "item", False),
         (OneShot(grid="3d"), "item", True),
         (OneShot(grid="1d"), "cursor", True),
+        (TilePersistent("n"), "cursor", False),
+        (TilePersistent("m"), "cursor", True),
     ],
-    ids=["static_roles", "static_plain", "auto_roles", "tiles_roles", "tiles_plain", "flat_plain"],
-)
+    ids=["static_roles", "static_plain", "auto_roles", "tiles_roles", "tiles_plain", "flat_plain",
+         "tile_n_roles", "tile_m_plain"],
+)  # fmt: skip
 def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule, mode, plain):
     """Every decoding site reads the limit once and ends at ``min(total, limit)``: the first
     ``limit`` indices run, once, in every role; 0 runs nothing; a limit at or past the total
-    changes nothing. One compile serves every limit."""
+    changes nothing. ``TilePersistent``'s index is its axis coordinate. One compile serves every
+    limit."""
     op = LimitPlainToy(schedule, mode=mode) if plain else LimitToy(schedule, mode)
     fn = compile_limit_toy(op)
     em, en, el = 5, 3, 2
@@ -859,11 +875,63 @@ def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule,
         table = torch.tensor([0, 3, limit], dtype=torch.int32, device="cuda")
         fn(hits, table, em, en, el, 4)
         torch.cuda.synchronize()
-        expect = torch.zeros(total, dtype=torch.int32)
-        expect[: min(limit, total)] = 1  # plain Raster: the linear index is the tile id
+        # Plain Raster: the linear index is the tile id ((l * en + n) * em + m).
+        tiles = itertools.product(range(el), range(en), range(em))
+        index = {
+            TilePersistent: lambda li, n, m: (m, n, li)["mnl".index(schedule.axis)],
+        }.get(type(schedule), lambda li, n, m: (li * en + n) * em + m)
+        expect = torch.tensor([int(index(*t) < limit) for t in tiles], dtype=torch.int32)
         rows = [0] if plain else [0, 1, 2] if mode == "item" else [0, 1]
         for r in range(3):
             assert torch.equal(hits[r].cpu(), expect if r in rows else 0 * expect), (limit, r)
+
+
+def test_tile_persistent_reads_without_division(requires_blackwell, tmp_path, monkeypatch):
+    """``TilePersistent`` reads two coordinates from ``blockIdx`` and steps the third by
+    ``gridDim``: no division anywhere, and ``max_ctas`` is a runtime value."""
+    from cutlass.base_dsl.compiler import Compiler
+
+    compile_fn = Compiler.compile
+
+    def dump_ptx(self, module, pipeline, *args, **kwargs):
+        option = f"dump-ptx-path='{tmp_path / 'kernel'}' "
+        pipeline = pipeline.replace("cute-to-nvvm{", "cute-to-nvvm{" + option, 1)
+        return compile_fn(self, module, pipeline, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "compile", dump_ptx)
+    compile_plain_toy.__wrapped__(PlainToy(TilePersistent("n"), mode="cursor"))
+    (ptx,) = tmp_path.glob("*.ptx")
+    text = ptx.read_text(errors="ignore")
+    assert "%nctaid.y" in text and all(f"%ctaid.{a}" in text for a in "xyz")
+    assert not re.search(r"^\s*(div|rem)\.", text, re.MULTILINE)
+
+
+def test_tile_persistent_cap_is_runtime(requires_blackwell):
+    """One compile serves every ``max_ctas`` (here, the SM count's stand-in) and every space."""
+    op = PlainToy(TilePersistent("n"), mode="cursor")
+    _plain_hits(op, (3, 9, 2), max_ctas=4)
+    before = compile_plain_toy.cache_info()
+    for max_ctas, ext in [(1, (3, 9, 2)), (3, (2, 17, 3)), (148, (3, 9, 2)), (7, (1, 1, 1))]:
+        expect = torch.ones(math.prod(ext), dtype=torch.int32)
+        assert torch.equal(_plain_hits(op, ext, max_ctas=max_ctas), expect), (max_ctas, ext)
+    after = compile_plain_toy.cache_info()
+    assert after.currsize == before.currsize and after.misses == before.misses
+
+
+def test_tile_persistent_assignment_keeps_a_folded_grid_order():
+    """``TilePersistent("n")`` over ``(pairs, chunks, heads)`` launches the CTAs of a hand-built
+    ``(workers * pairs, heads)`` grid that folds the pair into x (KDA K3b), in the same order and
+    with the same items: CTA ``x + pairs * workers * head`` with ``x = worker * pairs + pair``."""
+    pairs, chunks, heads, workers = 6, 11, 3, 4
+    rows = WorkStream(schedule=TilePersistent("n")).assignment(
+        (pairs, chunks, heads), max_ctas=workers
+    )
+    legacy = []
+    for head in range(heads):
+        for x in range(workers * pairs):
+            worker, pair = divmod(x, pairs)
+            legacy.append([(c, (pair, c, head)) for c in range(worker, chunks, workers)])
+    assert rows == legacy
 
 
 def test_limit_rejections():
@@ -1199,3 +1267,42 @@ def test_split_k_partials_reduce_on_the_host(requires_blackwell, schedule, clust
         reduced = torch.where(written, partial.cpu(), 0).sum(0)
         assert torch.equal(reduced, x.cpu().sum(1, dtype=torch.int32))
         assert ws[:2].tolist() == [0, 0]
+
+
+def test_tile_persistent_units_fix_the_grid_and_stride():
+    """``units`` launches exactly that many CTAs along the axis, reads no ``max_ctas`` and
+    names itself in the compile key."""
+    schedule = TilePersistent("n", units=4)
+    assert not schedule.uses_max_ctas and schedule.get_key().endswith("_units4")
+    rows = WorkStream(schedule=schedule).assignment((2, 3, 1))
+    assert len(rows) == 2 * 4 * 1
+    assert rows[:2] == [[(0, (0, 0, 0))], [(0, (1, 0, 0))]]  # CTA (x, y=0): chunk 0 only
+    assert rows[-1] == []  # y=3 is past the 3 chunks
+    for units in (0, -1, 2.0):
+        with pytest.raises(ValueError, match="units must be a positive int"):
+            TilePersistent("m", units=units)
+
+
+def test_tile_persistent_rejections():
+    with pytest.raises(ValueError, match="axis must be one of"):
+        TilePersistent("k")
+    for mapping in (Raster(swizzle=2), Raster(along="n"), SkipOdd()):
+        with pytest.raises(ValueError, match="plain Raster"):
+            WorkStream(mapping=mapping, schedule=TilePersistent("m"))
+    with pytest.raises(ValueError, match="no record"):
+        WorkStream(schedule=TilePersistent("m"), record=2)
+    for max_ctas in (4, Int32(4)):  # a static l past gridDim.z raises with any cap
+        bound = WorkStream(schedule=TilePersistent("n")).bind((2, 3, 70000), None, max_ctas)
+        with pytest.raises(ValueError, match="gridDim.y/z are limited"):
+            bound.grid()
+    with pytest.raises(ValueError, match="units on gridDim.y/z"):
+        TilePersistent("n", units=70000)
+    with pytest.raises(ValueError, match="drop decode"):
+        WorkStream(schedule=TilePersistent("m")).assignment((2, 2, 1), 2, decode=lambda i: i)
+
+
+def test_tile_persistent_launch_bounds_the_axis_not_the_space():
+    """The Int32 launch check bounds the axis coordinate: a space of 3e9 items whose
+    coordinates all fit launches."""
+    bound = WorkStream(schedule=TilePersistent("n")).bind((16, 3_000_000, 64), None, 152)
+    assert bound.grid() == (16, 152, 64)

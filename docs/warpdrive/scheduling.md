@@ -39,6 +39,7 @@ For positive extents Raster is a bijection. Its decode intermediates stay within
 |---|---|---|
 | `OneShot()` | Return terminal index `total`; no local reassignment of dropped items | Local |
 | `StaticPersistent()` | Add U, the number of launched units | Local |
+| `TilePersistent(axis)` | Step its `axis` coordinate by `gridDim[axis]`; the other two stay at `blockIdx` | Local |
 | `AtomicPersistent(stages=2)` | Claim from a global atomic counter | Scheduler warp |
 | `ClusterLaunchControl(stages=2)` | Cancel an unlaunched unit and take its work | Scheduler warp |
 
@@ -53,6 +54,21 @@ unit 2:  2 -> 5      -> terminal
 The local schedules fix these sequences before the launch, so the host can list them:
 `work.assignment(space, max_ctas)` returns each CTA's `(index, item)` list in run order
 ([drawn per CTA](tracing.md#see-which-cta-runs-what)).
+
+`TilePersistent(axis="m" | "n" | "l")` launches the plain `Raster()` tile space with that axis
+capped at `max_ctas` units, so `max_ctas` caps the units along the axis (per slice of the other
+two), not the CTA count. Each CTA keeps the other two coordinates from `blockIdx`, with no
+division, and walks its axis coordinate by `gridDim[axis]`. The stream's index is that
+coordinate and `total` the axis extent, so a [limit](#a-device-read-limit) bounds the
+coordinate. A hand-built grid that persists along one axis and folds another into x, such as
+`(workers * pairs, heads)` with `x = worker * pairs + pair`, keeps its CTA order as
+`TilePersistent("n")` over `(pairs, chunks, heads)`: the launch is `(pairs, workers, heads)`,
+and `assignment()` lists the same items per CTA. It needs a single-CTA cluster and no `record`.
+
+`TilePersistent(axis, units=n)` fixes the grid's axis extent at `n` instead (CTAs past the axis
+extent run nothing, and `max_ctas` is not read), which makes the stride a compile-time constant.
+A register-heavy loop can need that: KDA K4b ran 2% slower with a `gridDim` stride in a counted
+loop and 11% slower in an `scf.for`. It specializes the kernel on `n`, so bucket it.
 
 Atomic claims are unique but have no fixed inter-unit order. CLC recovers the canceled
 work index from its CTA x coordinate divided by cluster size. It waits for every cancellation

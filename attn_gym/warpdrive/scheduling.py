@@ -11,6 +11,7 @@ grid and the distribution:
   ==================================  ======================================  =====================
   ``OneShot()``                       none (one item per CTA)                 ``total`` (see below)
   ``StaticPersistent()``              ``index + gridDim.x``                   ``min(total, max)``
+  ``TilePersistent(axis)``            ``coordinate + gridDim[axis]``          tiles, axis capped
   ``AtomicPersistent(stages)``        ``gridDim.x + atomicAdd(counter, 1)``   ``min(total, max)``
   ``ClusterLaunchControl(stages)``    ``clusterlaunchcontrol.try_cancel``     ``total``
   ==================================  ======================================  =====================
@@ -36,7 +37,7 @@ grid and the distribution:
   index.
   ``BoundWork.grid`` covers empty spaces and spaces past Int32.
 * **distribution**, derived from the schedule. Index sequences every role can compute
-  (``OneShot``, ``StaticPersistent``) are decoded locally in each role with no synchronization.
+  (``OneShot``, ``StaticPersistent``, ``TilePersistent``) are decoded locally in each role with no synchronization.
   Claimed indices (``AtomicPersistent``, ``ClusterLaunchControl``) are claimed by a layer-owned
   scheduler warp, decoded once, and broadcast as ``[index, item words]`` over a ``Ring`` whose
   consumers are every role that takes a ``WorkCursor``. The layer derives the ring's arrival
@@ -82,6 +83,8 @@ from __future__ import annotations
 
 import functools
 import inspect
+import itertools
+import math
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
 
@@ -593,6 +596,72 @@ class StaticPersistent(IndexSchedule):
         return index + problem.units()
 
 
+@dataclass(frozen=True)
+class TilePersistent(IndexSchedule):
+    """Persistent along one ``axis`` of a plain ``Raster()`` tile space, the other two fixed per
+    CTA.
+
+    The launch grid is the tile space with ``axis`` capped at ``max_ctas`` units:
+    ``(min(m_tiles, max_ctas), n_tiles, l)`` for ``axis="m"``, and likewise for ``"n"`` (on
+    ``gridDim.y``) and ``"l"`` (``gridDim.z``). A CTA reads the two other coordinates from
+    ``blockIdx`` with no division, so address arithmetic on them keeps compile-time strides, and
+    walks its axis coordinate ``c = blockIdx[axis], c + gridDim[axis], ...``. ``max_ctas``
+    therefore caps the units along ``axis`` (per slice of the other two axes), not the total
+    CTA count; it is a runtime value, so changing it does not recompile.
+
+    ``units`` (a positive int) instead fixes the axis extent of the grid at compile time and makes
+    the stride that constant; CTAs past the axis extent run no item, and ``max_ctas`` is not read.
+    A compile-time stride lets the loop step by an immediate: the KDA K4b loop measured 11% slower
+    with a ``gridDim`` stride in an ``scf.for`` and 2% slower in a counted loop. It specializes
+    the kernel on ``units``, so bucket it (a power of two capped at the SM count, say).
+
+    The stream's index is that axis coordinate, and ``total`` is the axis extent (0 for an empty
+    space), so a ``Limit`` bounds the coordinate. Items are decoded without division: the words
+    are ``blockIdx`` with the axis coordinate replaced. Needs the plain ``Raster()`` mapping, a
+    single-CTA cluster and no ``record``; ``n_tiles`` and ``l`` must fit ``gridDim.y``/``z``
+    unless that axis is the capped one.
+    """
+
+    axis: str = "m"
+    units: int | None = None
+
+    def __post_init__(self):
+        if self.axis not in AXES:
+            raise ValueError(f"TilePersistent.axis must be one of {AXES}, got {self.axis!r}")
+        if self.units is not None and (type(self.units) is not int or self.units < 1):
+            raise ValueError(f"TilePersistent.units must be a positive int, got {self.units!r}")
+        if self.units is not None and self.axis != "m" and self.units > MAX_GRID_YZ:
+            raise ValueError(
+                f"TilePersistent(axis={self.axis!r}) launches units on gridDim.y/z, limited to "
+                f"{MAX_GRID_YZ}; got units={self.units}"
+            )
+
+    @property
+    def uses_max_ctas(self) -> bool:
+        return self.units is None
+
+    def get_key(self) -> str:
+        units = "" if self.units is None else f"_units{self.units}"
+        return f"tilepersistent_axis{self.axis}{units}"
+
+    def describe(self) -> str:
+        units = "" if self.units is None else f", units={self.units}"
+        return f"TilePersistent(axis={self.axis!r}{units})"
+
+    def launch_units(self, total, max_units):
+        if self.units is not None:
+            return self.units
+        return super().launch_units(total, max_units)
+
+    def first_index(self, problem):
+        return cute.arch.block_idx()[AXES.index(self.axis)]
+
+    def next_index(self, index, problem):
+        if self.units is not None:
+            return index + self.units
+        return index + cute.arch.grid_dim()[AXES.index(self.axis)]
+
+
 @cute.jit
 def _claim_atomic(workspace, units):
     old = Int32(0)
@@ -739,6 +808,14 @@ class WorkStream:
             type(self.schedule.stages) is not int or self.schedule.stages <= 0
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
+        if isinstance(self.schedule, TilePersistent) and (
+            type(self.mapping) is not Raster or self.mapping != Raster() or self.record
+        ):
+            raise ValueError(
+                f"{self.schedule.describe()} reads the item from blockIdx: it needs the plain "
+                f"Raster() mapping and no record, not {self.describe()}"
+                + (f" with record={self.record}" if self.record else "")
+            )
         if isinstance(self.schedule, OneShot):
             grid = self.schedule.grid
             if grid in ("3d", "2d") and not _tile_grid(self):
@@ -913,8 +990,16 @@ class WorkStream:
         words; any other keeps every index with item ``None``, so a mapping that ``skips``
         needs ``decode``. Items the decode drops are left out, as the roles skip them. A space
         the launch would reject (past Int32) raises.
+
+        ``TilePersistent`` lists its CTAs in launch order (``blockIdx.x`` fastest, then ``y``,
+        ``z``); each runs the items along its axis, and ``index`` is the axis coordinate.
         """
         schedule, mapping = self.schedule, self.mapping
+        if isinstance(schedule, TilePersistent):
+            if decode is not None:
+                raise ValueError(f"{schedule.describe()} reads items from blockIdx; drop decode")
+            _check_single_cta(self, self.cluster_size)
+            return _tile_persistent_assignment(mapping.bind(space), schedule, max_ctas)
         if schedule.broadcast:
             raise ValueError(
                 f"{schedule.describe()} claims indices at run time; only a local schedule has a "
@@ -984,6 +1069,23 @@ class WorkStream:
         return out
 
 
+def _tile_persistent_assignment(space, schedule, max_ctas) -> list[list[tuple]]:
+    """``WorkStream.assignment`` of a ``TilePersistent`` schedule over a bound static space."""
+    k = AXES.index(schedule.axis)
+    total = space[k] if math.prod(space) > 0 else 0
+    if schedule.units is None and max_ctas is None:
+        raise ValueError(f"{schedule.describe()} needs max_ctas")
+    units = schedule.launch_units(total, max_ctas)
+    dims = _tile_persistent_dims(space, schedule.axis, units)
+    rows = []
+    for z, y, x in itertools.product(*(range(d) for d in reversed(dims))):  # x fastest
+        block = (x, y, z)
+        rows.append(
+            [(c, block[:k] + (c,) + block[k + 1 :]) for c in range(block[k], total, units)]
+        )
+    return rows
+
+
 @dataclass(frozen=True)
 class _HostProblem:
     """What a local schedule reads of ``BoundWork``, for one work unit on the host
@@ -1013,6 +1115,12 @@ class BoundWork:
         if total is None:  # host: count once; the kernel's copies carry the narrowed count
             self.count64 = stream.mapping.count64(space)
             total = _narrow(self.count64)
+            if _tile_persistent(stream):  # the stream's index is the axis coordinate
+                extent = space[AXES.index(stream.schedule.axis)]
+                if isinstance(self.count64, int):
+                    total = extent if self.count64 > 0 else 0
+                else:
+                    total = Int32(cutlass.select_(self.count64 > 0, Int32(extent), Int32(0)))
         self.total = total
         self.limit = limit  # a Limit, read per decoding site (``_limited``)
         self.cs = stream.cluster_size  # CTAs per work unit
@@ -1042,6 +1150,9 @@ class BoundWork:
         ``_tile_grid`` stream. Every role shares them, which keeps the 1-D fallback branch of
         ``OneShot(grid="auto")`` off the roles' paths."""
         self.first_words = None
+        if _tile_persistent(self.stream):
+            _check_single_cta(self.stream, self.cs)
+            self.first_words = tuple(Int32(b) for b in cute.arch.block_idx())
         if _tile_grid(self.stream):
             bidx, bidy, bidz = cute.arch.block_idx()
             words = Int32(self._in_units(bidx)), Int32(bidy), Int32(bidz)
@@ -1139,12 +1250,16 @@ class BoundWork:
         units = schedule.launch_units(self.total, _unit_cap(schedule, self.max_ctas, self.cs))
         if _tile_grid(self.stream):
             x, y, z = tile_grid_dims(self.space, self.cs, schedule.grid)
+        elif _tile_persistent(self.stream):
+            _check_single_cta(self.stream, self.cs)
+            x, y, z = _tile_persistent_dims(self.space, schedule.axis, units)
         else:
             x, y, z = units * self.cs, 1, 1
         # Every grid extent and index must fit Int32. Past that the grid is zero-wide, so CUDA
         # rejects the launch instead of the kernel covering a wrapped space. This is host code
         # in the jit entry point: kernels pay nothing for the check.
-        count = self.count64
+        # TilePersistent indexes its axis coordinate, so the axis extent bounds its indices.
+        count = self.total if _tile_persistent(self.stream) else self.count64
         if isinstance(count, int) and isinstance(units, int):  # static extents: plain host ints
             return (x if schedule.index_limit(count, units, self.cs) <= INT32_MAX else 0), y, z
         limit = schedule.index_limit(Int64(count), Int64(units), self.cs)
@@ -1241,6 +1356,12 @@ def _decode(stream, index, problem, state):
     """``(words, state)`` of ``index``: decoded for a valid index, zeros (and ``state``) past the
     end. Only a mapping with ``decodes_any_index`` is evaluated unconditionally (no branch)."""
     mapping = stream.mapping
+    if _tile_grid(stream):
+        return problem.first_words, state
+    if _tile_persistent(stream):  # blockIdx with the axis coordinate replaced: no division
+        axis = AXES.index(stream.schedule.axis)
+        words = problem.first_words
+        return words[:axis] + (Int32(index),) + words[axis + 1 :], state
     if mapping.decodes_any_index:
         _, words, state = _keep_words(mapping, index, problem.space, state)
     else:
@@ -1294,8 +1415,8 @@ def _local_start(stream, first, problem):
         stream.ready.wait()
     problem = problem._limited()
     state = _start(stream.mapping, problem.space)
-    if _tile_grid(stream):
-        return problem, first, problem.first_words, state
+    if _tile_grid(stream) or _tile_persistent(stream):
+        return problem, first, _decode(stream, first, problem, state)[0], state
     if _flat_raster(stream):
         words = _unsigned_raster_words(stream.mapping, first, problem.space)
         return problem, first, words, state
@@ -1502,6 +1623,40 @@ def _grid_item(mapping, space, m, n, li):
         _, (dm, dn, dl), _ = decode(m, space, None)
         m, n, li = Int32(dm), Int32(dn), Int32(dl)
     return m, n, li
+
+
+def _tile_persistent(stream) -> bool:
+    """``TilePersistent``: the tile space with one axis capped and walked by each CTA."""
+    return isinstance(stream.schedule, TilePersistent)
+
+
+def _check_single_cta(stream, cs: int):
+    if cs != 1:
+        raise ProtocolError(
+            f"{stream.schedule.describe()} launches single CTAs; a cluster of {cs} CTAs needs "
+            "a 1-D schedule"
+        )
+
+
+def _tile_persistent_dims(space, axis: str, units):
+    """Launch grid of ``TilePersistent(axis)``: the tile space with ``axis`` replaced by
+    ``units``, or one CTA for an empty space. Static extents past the y/z limit raise; DSL ones
+    are launched as they are, which CUDA rejects."""
+    k = AXES.index(axis)
+    dims = list(space)
+    dims[k] = units
+    # A static y/z extent past the limit raises whatever the other extents are (the axis is
+    # capped by its units, checked where they are chosen).
+    if any(isinstance(d, int) and d > MAX_GRID_YZ for j, d in enumerate(dims[1:], 1) if j != k):
+        raise ValueError(
+            f"TilePersistent(axis={axis!r}) cannot launch the space {tuple(space)}: "
+            f"gridDim.y/z are limited to {MAX_GRID_YZ}"
+        )
+    if all(isinstance(e, int) for e in (*space, units)):
+        return (1, 1, 1) if min(space) <= 0 else tuple(dims)
+    em, en, el = (Int32(e) for e in space)
+    nonempty = (em > 0) & (en > 0) & (el > 0)
+    return tuple(Int32(cutlass.select_(nonempty, Int32(d), Int32(1))) for d in dims)
 
 
 def _tile_grid(stream) -> bool:
