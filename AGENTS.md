@@ -145,8 +145,10 @@ Warpdrive kernels compile through `jit_cache` with two extra rules:
   public attribute assigned afterwards (other than `cluster`, work streams, and the IKET,
   tracing and alias settings) raises.
 - A cached kernel restores its trace results (`describe()`, TMA/alias reports, warnings) without
-  tracing. Only a test that asserts on tracing itself (IKET ranges, monkeypatched trace hooks)
-  takes the `traced_compiles` fixture (`test/conftest.py`) and calls `compile_fn.cache_clear()`.
+  tracing. Only a test that asserts on tracing itself (IKET ranges, monkeypatched trace hooks,
+  the PTX of a compile) bypasses the cache: it takes the `traced_compiles` fixture
+  (`test/conftest.py`) and calls `compile_fn.cache_clear()`, or calls
+  `compile_fn.__wrapped__(...)`, which compiles that one call without either cache.
 
 ### warpdrive Testing Tiers
 
