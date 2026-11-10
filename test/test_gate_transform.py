@@ -364,6 +364,68 @@ def test_softplus_backends_agree_on_d128(fastmath: bool):
         )
 
 
+@requires_cute
+def test_cute_gate_compiles_two_grid_variants():
+    """Batch, tokens and tile counts are runtime values: one kernel serves every shape whose
+    batch fits ``gridDim.z``, and one more (the batch folded into ``gridDim.x``) the batches past 65535."""
+    from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_bwd
+    from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_fwd
+
+    compile_fns = (cute_fwd._compile_gate_transform_fwd, cute_bwd._compile_gate_transform_bwd)
+    lower_bound = -4.6875  # this test's own compile key, so every variant below is a new entry
+    before = [fn.cache_info().currsize for fn in compile_fns]
+
+    def run(batch: int, tokens: int):
+        raw_gate, A_log, dt_bias = make_gate_inputs(VECTOR128, batch=batch, tokens=tokens, heads=8)
+        d_gate = torch.randn(raw_gate.shape, device="cuda")
+        reference_inputs = [t.detach().requires_grad_() for t in (raw_gate, A_log, dt_bias)]
+        reference = gate_transform(
+            *reference_inputs, kind="bounded", lower_bound=lower_bound, impl="reference"
+        )
+        gate = cute_fwd._gate_transform_fwd_cuda(
+            raw_gate, A_log, dt_bias, lower_bound, False, GateTransform.BOUNDED
+        )
+        torch.testing.assert_close(gate, reference, rtol=2e-5, atol=2e-5)
+        grads = cute_bwd._gate_transform_bwd_cuda(
+            raw_gate, A_log, dt_bias, d_gate, lower_bound, False, GateTransform.BOUNDED
+        )
+        expected_grads = torch.autograd.grad(reference, reference_inputs, d_gate)
+        # d_raw_gate rounds to bf16; the parameter gradients sum B * T rows in FP32.
+        rows = math.sqrt(batch * tokens)
+        tolerances = ((1e-2, 8e-3), (3e-3, 5e-4 * rows), (3e-3, 5e-5 * rows))
+        for grad, expected, (rtol, atol) in zip(grads, expected_grads, tolerances, strict=True):
+            torch.testing.assert_close(grad.float(), expected.float(), rtol=rtol, atol=atol)
+        return [fn.cache_info().currsize - old for fn, old in zip(compile_fns, before)]
+
+    # Specialization classes of a plain int (1, multiples of 16, others), tile and stage edges.
+    for batch, tokens in [(1, 1), (16, 32), (3, 97), (17, 16), (2, 4096), (65535, 1)]:
+        assert run(batch, tokens) == [1, 1], (batch, tokens)
+    for batch, tokens in [(65536, 1), (65537, 3)]:
+        assert run(batch, tokens) == [2, 2], (batch, tokens)
+    assert run(2, 65) == [2, 2]
+
+
+@requires_cute
+@pytest.mark.parametrize(("batch", "tokens"), [(0, 65), (2, 0)])
+def test_cute_gate_launchers_skip_an_empty_space(batch: int, tokens: int):
+    """The kernels assume every CTA has an item, so the launchers must not launch an empty
+    space (the public ``gate_transform`` rejects one earlier): empty outputs, zero gradients."""
+    from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_bwd
+    from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_fwd
+
+    raw_gate, A_log, dt_bias = make_gate_inputs(VECTOR128, batch=batch, tokens=tokens)
+    softplus = GateTransform.SOFTPLUS
+    gate = cute_fwd._gate_transform_fwd_cuda(raw_gate, A_log, dt_bias, 0.0, False, softplus)
+    assert gate.shape == raw_gate.shape
+    d_raw_gate, dA_log, d_dt_bias = cute_bwd._gate_transform_bwd_cuda(
+        raw_gate, A_log, dt_bias, gate, 0.0, False, softplus
+    )
+    torch.cuda.synchronize()
+    assert d_raw_gate.shape == raw_gate.shape
+    assert dA_log.shape == A_log.shape and d_dt_bias.shape == dt_bias.shape
+    assert not dA_log.any() and not d_dt_bias.any()
+
+
 @pytest.mark.parametrize("shape", [SCALAR, VECTOR128])
 def test_fused_softplus_fullgraph_dynamic_tokens(shape: str):
     """Reuse one fullgraph callable across batch and token sizes with backward, both backends."""

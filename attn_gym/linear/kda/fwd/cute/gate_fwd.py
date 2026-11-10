@@ -19,8 +19,10 @@ is::
 
 It covers ``8 * 128`` elements exactly, gives each thread one contiguous eight-value
 load and one contiguous 32-byte FP32 store, and predicates only the final partial head
-group. Token count and batch size are represented directly by grid dimensions, so no
-sequence-length divisibility or token padding is required.
+group. A warpdrive ``OneShot`` stream over ``(head groups * tokens, 1, batch)`` owns the grid,
+so no sequence-length divisibility or token padding is required. Its grid is a compile-time
+choice the launcher makes with ``OneShot.grid_for``: the tile grid, or the batch folded into
+``gridDim.x`` past the 65535 ``gridDim.z`` limit.
 
 The launcher selects a compact 16-byte-aligned signature for the model path and a general
 signature with a contiguous last mode, dynamic outer strides, and element-size alignment.
@@ -47,6 +49,7 @@ from attn_gym.warpdrive.cache import (
     jit_cache,
     make_fake_strided_tensor,
 )
+from attn_gym.warpdrive.scheduling import BoundWork, OneShot, WorkStream
 
 _HEAD_DIM = 128
 _HEADS_PER_BLOCK = 8
@@ -100,7 +103,7 @@ class _GateTransformForward:
         lower_bound: float,
         fastmath: bool,
         compact_layout: bool,
-        flatten_batch: bool,
+        grid: str,
         use_int64_offsets: bool,
         transform: GateTransform,
     ) -> None:
@@ -111,8 +114,9 @@ class _GateTransformForward:
         self.transform = transform
         self.fastmath = fastmath
         self.compact_layout = compact_layout
-        self.flatten_batch = flatten_batch
         self.use_int64_offsets = use_int64_offsets
+        # Items (head group + head groups * token, 0, batch), one per CTA.
+        self.work = WorkStream(schedule=OneShot(grid=grid))
 
     def get_name(self) -> str:
         """Return a stable profiler name for this specialization."""
@@ -120,7 +124,7 @@ class _GateTransformForward:
         return (
             f"kda_{self.transform.value}_gate_fwd_{self.dtype.name}_h{self.heads}_d{_HEAD_DIM}"
             f"_v{_VALUES_PER_THREAD}"
-            f"_lb{lower_bound}_c{int(self.compact_layout)}_fb{int(self.flatten_batch)}"
+            f"_lb{lower_bound}_c{int(self.compact_layout)}_{self.work.schedule.grid}"
             f"_fm{int(self.fastmath)}_i64{int(self.use_int64_offsets)}"
         )
 
@@ -131,17 +135,14 @@ class _GateTransformForward:
         A_log: cute.Tensor,
         dt_bias: cute.Tensor,
         gate: cute.Tensor,
+        work: BoundWork,
     ) -> None:
         """Transform one token and up to eight heads."""
         thread, _, _ = cute.arch.thread_idx()
-        block, _, batch = cute.arch.block_idx()
+        # Every CTA has an item: the launcher does not launch an empty space.
+        _, (block, _, batch) = work.single_item()
         head_group = block % self.head_groups
-        token_or_token_batch = block // self.head_groups
-        if cutlass.const_expr(self.flatten_batch):
-            batch = token_or_token_batch // raw_gate.shape[1]
-            token = token_or_token_batch % raw_gate.shape[1]
-        else:
-            token = token_or_token_batch
+        token = block // self.head_groups
         head = head_group * _HEADS_PER_BLOCK + thread // 16
         channel_group = thread % 16
 
@@ -185,10 +186,9 @@ class _GateTransformForward:
     ) -> None:
         """Launch one CTA per ``(head group, token, batch)`` coordinate."""
         self.kernel.set_name_prefix(self.get_name())
-        batch_grid = 1 if cutlass.const_expr(self.flatten_batch) else raw_gate.shape[0]
-        batch_tiles = raw_gate.shape[0] if cutlass.const_expr(self.flatten_batch) else 1
-        self.kernel(raw_gate, A_log, dt_bias, gate).launch(
-            grid=(self.head_groups * raw_gate.shape[1] * batch_tiles, 1, batch_grid),
+        work = self.work.bind((self.head_groups * raw_gate.shape[1], 1, raw_gate.shape[0]))
+        self.kernel(raw_gate, A_log, dt_bias, gate, work).launch(
+            grid=work.grid(),
             block=(_THREADS, 1, 1),
             stream=stream,
         )
@@ -211,7 +211,7 @@ def _compile_gate_transform_fwd(
     lower_bound: float,
     fastmath: bool,
     compact_layout: bool,
-    flatten_batch: bool,
+    grid: str,
     use_int64_offsets: bool,
     transform: GateTransform,
 ):
@@ -225,7 +225,7 @@ def _compile_gate_transform_fwd(
         lower_bound,
         fastmath,
         compact_layout,
-        flatten_batch,
+        grid,
         use_int64_offsets,
         transform,
     )
@@ -291,13 +291,16 @@ def _gate_transform_fwd_cuda(
         for tensor in inputs
     )
     gate = torch.empty(raw_gate.shape, device=raw_gate.device, dtype=torch.float32)
+    batch, tokens, heads, _ = raw_gate.shape
+    if min(batch, tokens, heads) == 0:  # the kernel assumes every CTA has an item
+        return gate
     compiled = _compile_gate_transform_fwd(
         dtype,
-        raw_gate.shape[2],
+        heads,
         lower_bound,
         fastmath,
         compact_layout,
-        raw_gate.shape[0] > 65535,
+        OneShot.grid_for((cdiv(heads, _HEADS_PER_BLOCK) * tokens, 1, batch)),
         requires_int64_abi(raw_gate, A_log, dt_bias, gate),
         transform,
     )

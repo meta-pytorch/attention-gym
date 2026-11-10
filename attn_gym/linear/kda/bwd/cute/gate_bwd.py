@@ -57,6 +57,7 @@ from attn_gym.warpdrive.cache import (
     make_fake_strided_tensor,
 )
 from attn_gym.warpdrive.compat import SmemAllocator
+from attn_gym.warpdrive.scheduling import BoundWork, OneShot, WorkStream
 
 _TILE_TOKENS = 32
 
@@ -77,7 +78,7 @@ class _GateTransformBwdTmaOp:
         head_dim: int,
         lower_bound: float,
         fastmath: bool,
-        flatten_batch: bool,
+        grid: str,
         use_int64_offsets: bool,
         transform: GateTransform,
     ):
@@ -88,8 +89,9 @@ class _GateTransformBwdTmaOp:
         self.lower_bound = lower_bound
         self.transform = transform
         self.fastmath = fastmath
-        self.flatten_batch = flatten_batch
         self.use_int64_offsets = use_int64_offsets
+        # Items (32-token tile, head, batch), one per CTA.
+        self.work = WorkStream(schedule=OneShot(grid=grid))
         self.tokens_per_stage = 8
         subtiles = self.chunk_size // self.tokens_per_stage
         # Every TMA stage must begin at a 128-byte-aligned shared address.
@@ -103,7 +105,7 @@ class _GateTransformBwdTmaOp:
             f"kda_{self.transform.value}_gate_bwd_{self.dtype.name}_h{self.heads}_d{self.head_dim}"
             f"_bt{self.chunk_size}"
             f"_lb{lower_bound}_tma_tps{self.tokens_per_stage}_s{self.stages}"
-            f"_fb{int(self.flatten_batch)}_fm{int(self.fastmath)}"
+            f"_{self.work.schedule.grid}_fm{int(self.fastmath)}"
             f"_i64{int(self.use_int64_offsets)}"
         )
 
@@ -158,14 +160,12 @@ class _GateTransformBwdTmaOp:
         tma_tensor_g: cute.Tensor,
         tma_atom_d: cute.CopyAtom,
         tma_tensor_d: cute.Tensor,
+        work: BoundWork,
     ):
         """Differentiate one asynchronously TMA-staged token tile."""
         tidx, _, _ = cute.arch.thread_idx()
-        chunk, head, batch = cute.arch.block_idx()
-        if cutlass.const_expr(self.flatten_batch):
-            chunks = cute.ceil_div(mG.shape[1], self.chunk_size)
-            batch = chunk // chunks
-            chunk = chunk % chunks
+        # Every CTA has a tile: the launcher does not launch an empty space.
+        _, (chunk, head, batch) = work.single_item()
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         subtiles = self.chunk_size // self.tokens_per_stage
 
@@ -360,9 +360,9 @@ class _GateTransformBwdTmaOp:
         )
 
         self.kernel.set_name_prefix(self.get_name())
-        chunks = cute.ceil_div(mG.shape[1], self.chunk_size)
-        batch_grid = 1 if cutlass.const_expr(self.flatten_batch) else mG.shape[0]
-        batch_tiles = mG.shape[0] if cutlass.const_expr(self.flatten_batch) else 1
+        work = self.work.bind(
+            (cute.ceil_div(mG.shape[1], self.chunk_size), self.heads, mG.shape[0])
+        )
         self.kernel(
             mG,
             mA_log,
@@ -374,8 +374,9 @@ class _GateTransformBwdTmaOp:
             tma_tensor_g,
             tma_atom_d,
             tma_tensor_d,
+            work,
         ).launch(
-            grid=(chunks * batch_tiles, self.heads, batch_grid),
+            grid=work.grid(),
             block=(self.head_dim, 1, 1),
             stream=stream,
         )
@@ -388,7 +389,7 @@ def _compile_gate_transform_bwd(
     head_dim: int,
     lower_bound: float,
     fastmath: bool,
-    flatten_batch: bool,
+    grid: str,
     use_int64_offsets: bool,
     transform: GateTransform,
 ):
@@ -399,7 +400,7 @@ def _compile_gate_transform_bwd(
         head_dim,
         lower_bound,
         fastmath,
-        flatten_batch,
+        grid,
         use_int64_offsets=use_int64_offsets,
         transform=transform,
     )
@@ -499,14 +500,29 @@ def _gate_transform_bwd_cuda(
     if raw_gate.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         raise TypeError(f"unsupported raw_gate dtype: {raw_gate.dtype}")
     dtype = cute_dtype(raw_gate.dtype)
-    compiled = _compile_gate_transform_bwd(
-        dtype,
-        raw_gate.shape[2],
-        raw_gate.shape[3],
-        lower_bound,
-        fastmath,
-        raw_gate.shape[0] > 65535,
-        requires_int64_abi(
+    batch, chunks, heads = partial_shape
+    # The kernel assumes every CTA has a tile, so an empty space is not launched: its
+    # partials reduce to zero gradients.
+    if min(partial_shape) > 0:
+        compiled = _compile_gate_transform_bwd(
+            dtype,
+            raw_gate.shape[2],
+            raw_gate.shape[3],
+            lower_bound,
+            fastmath,
+            OneShot.grid_for((chunks, heads, batch)),
+            requires_int64_abi(
+                raw_gate,
+                A_log,
+                dt_bias,
+                d_gate,
+                d_raw_gate,
+                dA_log_partial,
+                d_dt_bias_partial,
+            ),
+            transform,
+        )
+        compiled(
             raw_gate,
             A_log,
             dt_bias,
@@ -514,18 +530,7 @@ def _gate_transform_bwd_cuda(
             d_raw_gate,
             dA_log_partial,
             d_dt_bias_partial,
-        ),
-        transform,
-    )
-    compiled(
-        raw_gate,
-        A_log,
-        dt_bias,
-        d_gate,
-        d_raw_gate,
-        dA_log_partial,
-        d_dt_bias_partial,
-    )
+        )
     # Reducing the per-tile partials here keeps the post-pass off the full [B, T, H, D] tensors
     # and gives every fused gate backend one reduced parameter-gradient contract.
     return d_raw_gate, dA_log_partial.sum((0, 1)), d_dt_bias_partial.sum((0, 1))

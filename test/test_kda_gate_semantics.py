@@ -15,7 +15,9 @@ from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.gate import _gate_transform_bwd_op, _gate_transform_fwd_op
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda import bound_gate, chunk_kda
+from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_gate_bwd
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
+from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_gate_fwd
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
@@ -213,24 +215,56 @@ def test_bound_gate_supports_general_layouts(layout: str):
         )
 
 
-@pytest.mark.parametrize(("batch", "tokens"), [(1, 65536), (65536, 1)])
-def test_bound_gate_supports_large_grid_axes(batch: int, tokens: int):
-    """Avoid CUDA grid y/z limits for long sequences and large batches."""
+def _record_gate_launches(monkeypatch) -> list[torch.Tensor]:
+    """Record the ``raw_gate`` each compiled gate kernel (forward, then backward) receives."""
+    launched = []
+    for module, name in (
+        (cute_gate_fwd, "_compile_gate_transform_fwd"),
+        (cute_gate_bwd, "_compile_gate_transform_bwd"),
+    ):
+        compile_fn = getattr(module, name)
+
+        def compile_and_record(*args, _compile_fn=compile_fn):
+            compiled = _compile_fn(*args)
+
+            def launch(raw_gate, *tensors):
+                launched.append(raw_gate)
+                return compiled(raw_gate, *tensors)
+
+            return launch
+
+        monkeypatch.setattr(module, name, compile_and_record)
+    return launched
+
+
+@pytest.mark.parametrize(
+    ("batch", "tokens", "strided"),
+    [(1, 65536, False), (65536, 1, False), (65537, 33, False), (65537, 33, True)],
+)
+def test_bound_gate_supports_large_grid_axes(monkeypatch, batch: int, tokens: int, strided: bool):
+    """Avoid CUDA grid y/z limits for long sequences and large batches (several backward
+    tiles per batch in the last cases, whose batch is folded into ``gridDim.x``; the strided
+    one reads a head slice of a wider buffer in place)."""
     torch.manual_seed(41)
+    raw_gate = torch.randn(batch, tokens, 3 if strided else 1, 128, device="cuda").bfloat16()
+    if strided:
+        raw_gate = raw_gate[:, :, 1:2]
+        assert not raw_gate.is_contiguous()
     inputs = (
-        torch.randn(
-            batch, tokens, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
-        ),
+        raw_gate.requires_grad_(),
         torch.randn(1, device="cuda", requires_grad=True),
         torch.randn(1, 128, device="cuda", requires_grad=True),
     )
     expected_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
+    launched = _record_gate_launches(monkeypatch)
     actual = bound_gate(*inputs, impl="fused")
     expected = bound_gate(*expected_inputs, impl="reference")
     torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
     cotangent = torch.randn_like(actual)
     actual_gradients = torch.autograd.grad(actual, inputs, cotangent)
+    # Both kernels read the gate in place: a copy would hide the strided launch.
+    assert [raw.stride() for raw in launched] == [raw_gate.stride()] * 2
     expected_gradients = torch.autograd.grad(expected, expected_inputs, cotangent)
     for actual_gradient, expected_gradient in zip(
         actual_gradients, expected_gradients, strict=True
