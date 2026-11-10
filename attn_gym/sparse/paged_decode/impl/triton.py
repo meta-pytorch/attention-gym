@@ -2,7 +2,7 @@
 
 One program owns a (sequence, query) pair, a KV head with its query-head group, and one split of
 the row's key tiles. Sparse tiles come first, then window tiles, dealt to splits round-robin; a
-second kernel merges the splits by LSE. Indices stay logical: each key column reads its index
+second kernel merges their softmax statistics. Indices stay logical: each key column reads its index
 block's id, adds its offset inside the block, and translates the entry through the block table,
 so no expanded token list or physical slot list is ever materialized.
 """
@@ -81,7 +81,7 @@ def _paged_sparse_decode_kernel(
     Out,
     Lse,
     PartialOut,
-    PartialLse,
+    PartialStats,
     num_rows,
     num_splits,
     stride_q_row,
@@ -301,20 +301,21 @@ def _paged_sparse_decode_kernel(
             tl.store(Lse + row.to(tl.int64) * NUM_HEADS + first_head + heads, lse, mask=head_mask)
     else:
         partial_row = (split * num_rows + row).to(tl.int64) * NUM_HEADS + first_head + heads
-        out = tl.where(l_i[:, None] > 0, acc / l_i[:, None], 0.0)
+        # Keep unnormalized sums and maxima: the merge can normalize once, avoiding a
+        # division and log2 per split followed by an exp2 to reconstruct the weights.
         tl.store(
             PartialOut + partial_row[:, None] * HEAD_DIM_V + dims_v[None, :],
-            out,
+            acc,
             mask=head_mask[:, None],
         )
-        lse = tl.where(l_i > 0, m_i + tl.math.log2(l_i), float("-inf"))
-        tl.store(PartialLse + partial_row, lse, mask=head_mask)
+        tl.store(PartialStats + 2 * partial_row, m_i, mask=head_mask)
+        tl.store(PartialStats + 2 * partial_row + 1, l_i, mask=head_mask)
 
 
 @triton.jit(do_not_specialize=["num_rows", "num_splits"])
 def _merge_splits_kernel(
     PartialOut,
-    PartialLse,
+    PartialStats,
     Sink,
     Out,
     Lse,
@@ -337,14 +338,15 @@ def _merge_splits_kernel(
     splits = tl.arange(0, BLOCK_SPLITS)
     dims = tl.arange(0, HEAD_DIM_V)
     partial_row = (splits.to(tl.int64) * num_rows + row) * NUM_HEADS + head
-    lse = tl.load(PartialLse + partial_row, mask=splits < num_splits, other=float("-inf"))
-    m = tl.max(lse, axis=0)
+    maxima = tl.load(PartialStats + 2 * partial_row, mask=splits < num_splits, other=float("-inf"))
+    sums = tl.load(PartialStats + 2 * partial_row + 1, mask=splits < num_splits, other=0.0)
+    m = tl.max(maxima, axis=0)
     if HAS_SINK:
         sink = tl.load(Sink + head).to(tl.float32) * 1.4426950408889634
         m = tl.maximum(m, sink)
     m_safe = tl.where(m == float("-inf"), 0.0, m)
-    weights = tl.math.exp2(lse - m_safe)
-    denominator = tl.sum(weights, axis=0)
+    weights = tl.math.exp2(maxima - m_safe)
+    denominator = tl.sum(weights * sums, axis=0)
     if HAS_SINK:
         denominator += tl.math.exp2(sink - m_safe)
     partial = tl.load(
@@ -474,11 +476,11 @@ def paged_sparse_decode(
         partial_out = torch.empty(
             num_splits, num_rows, num_heads, head_dim_v, dtype=torch.float32, device=query.device
         )
-        partial_lse = torch.empty(
-            num_splits, num_rows, num_heads, dtype=torch.float32, device=query.device
+        partial_stats = torch.empty(
+            num_splits, num_rows, num_heads, 2, dtype=torch.float32, device=query.device
         )
     else:
-        partial_out = partial_lse = out
+        partial_out = partial_stats = out
 
     _paged_sparse_decode_kernel[(seqused_k.shape[0], max_seqlen_q * kv_heads, num_splits)](
         query,
@@ -496,7 +498,7 @@ def paged_sparse_decode(
         out,
         lse if lse is not None else out,
         partial_out,
-        partial_lse,
+        partial_stats,
         num_rows,
         num_splits,
         query.stride(0),
@@ -544,7 +546,7 @@ def paged_sparse_decode(
     if num_splits > 1:
         _merge_splits_kernel[(num_rows, num_heads)](
             partial_out,
-            partial_lse,
+            partial_stats,
             attention_sink if attention_sink is not None else query,
             out,
             lse if lse is not None else out,
