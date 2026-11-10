@@ -4,6 +4,7 @@ import tempfile
 from unittest.mock import patch
 
 import torch
+import torch._functorch.config
 from torch.nn.attention.flex_attention import FlexKernelOptions, create_block_mask, flex_attention
 
 from attn_gym.masks import causal_mask
