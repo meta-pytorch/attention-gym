@@ -1164,7 +1164,7 @@ class FlashAttentionBackward(WarpSpecialized):
             softmax_scale * LOG2_E,
             bound,
             pair_args,
-        ).launch(**self.launch_config(bound), stream=stream, min_blocks_per_mp=1)
+        ).launch(**self.launch_config(bound), stream=stream)
 
 
 class FlashAttentionBackward2Cta(FlashAttentionBackward):

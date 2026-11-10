@@ -1216,17 +1216,39 @@ class WarpSpecialized(metaclass=_KernelType):
             raise ProtocolError(f"no barriers named {name!r} (have {sorted(self._ws_bars)})")
         return self._ws_bars[name]
 
-    def launch_config(self, work=None, grid=None) -> dict:
+    def launch_config(self, work=None, grid=None, min_blocks_per_mp: int | None = None) -> dict:
         """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``.
         A kernel with a ``WorkStream`` passes its ``BoundWork``, whose schedule sets the grid (a
-        ``OneShot`` over plain ``Raster()`` launches the tile space)."""
+        ``OneShot`` over plain ``Raster()`` launches the tile space).
+
+        When a role declares ``regs``, the config also sets ``min_blocks_per_mp=1``: ptxas keeps
+        ``setmaxnreg`` only with a ``.minnctapersm`` (or ``.maxnreg``) entry directive, and
+        without it silently compiles every warp at one count, spilling a role that needs its
+        larger budget. ``min_blocks_per_mp`` passes another value through; with budgets only 1
+        fits, since they split the whole register file among one CTA's warps.
+        """
         if work is not None:
             grid = work.grid()
-        return {
+        cfg = {
             "grid": grid,
             "block": (self.num_threads, 1, 1),
             "cluster": self.cluster.launch_cluster(),
         }
+        budgets = any(r.regs is not None for r in self._ws_roles)
+        if min_blocks_per_mp is not None:
+            if type(min_blocks_per_mp) is not int or min_blocks_per_mp < 1:
+                raise ValueError(
+                    f"min_blocks_per_mp must be a positive int, got {min_blocks_per_mp!r}"
+                )
+            if budgets and min_blocks_per_mp != 1:
+                raise ValueError(
+                    f"{type(self).__name__}: role register budgets split the whole register "
+                    f"file among one CTA, so min_blocks_per_mp must be 1, got {min_blocks_per_mp}"
+                )
+            cfg["min_blocks_per_mp"] = min_blocks_per_mp
+        elif budgets:
+            cfg["min_blocks_per_mp"] = 1
+        return cfg
 
     # ---- device-side ------------------------------------------------------- #
 

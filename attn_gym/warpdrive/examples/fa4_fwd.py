@@ -833,7 +833,7 @@ class FlashAttentionForward(WarpSpecialized):
             p_layout,
             sO_layout,
             bound,
-        ).launch(**self.launch_config(bound), stream=stream, min_blocks_per_mp=1)
+        ).launch(**self.launch_config(bound), stream=stream)
 
 
 @jit_cache(uncached=lambda op: op.trace_protocol)
