@@ -158,7 +158,7 @@ landing core synchronization/scheduling changes.
 - Quick fuzz (~2-3 min, on request or before landing layer changes):
   `pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz`. It includes the mutant check:
   each synthetic layer bug in `test/warpdrive_fuzz/runtime_mutants.py` must fail or hang its
-  listed test (three hang by design, 90 s each).
+  listed test (four hang by design, 90 s each).
 - Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.
   Use `tools/warpdrive/fuzz_warpdrive.py {static,mutate}` (compile-only).
   `CUTE_DSL_ARCH=sm_100a python tools/warpdrive/warpdrive_sass.py dump OUTDIR` records the

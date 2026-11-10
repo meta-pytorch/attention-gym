@@ -67,7 +67,7 @@ class Gemm(WarpSpecialized):  # excerpt; other roles and the kernel prologue are
         self.tmem_plan = TmemPlan().region("acc", 256)
         self.work = WorkStream(schedule=OneShot())
 
-    @role(warps=4, regs=40)
+    @role(warps=4, regs=48)
     @cute.jit
     def load(self, params: GemmParams, *, ab: Producer, work: WorkCursor):
         ab = ab.views(A=params.tAsA, B=params.tBsB)

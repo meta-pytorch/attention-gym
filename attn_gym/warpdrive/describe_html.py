@@ -24,6 +24,7 @@ from attn_gym.warpdrive.describe_graph import (
     Graph,
     _warps,
     build_graph,
+    consumer_mechanism,
     mechanism,
     wire_mechanism,
 )
@@ -150,7 +151,8 @@ def _items(graph: Graph, kernel):
                 chip = f"chip_{i}"
                 boxes[chip] = _chip_box(chip, list(e.channels), e.lines, kernel)
                 ch = chans[e.channels[0]]
-                prod, cons = (mechanism(m, ch.named) for m in (ch.producer, ch.consumer))
+                prod = mechanism(ch.producer, ch.named)
+                cons = mechanism(consumer_mechanism(ch, graph, e.dst), ch.named)
                 wires.append(_Wire(e.src, chip, "into", prod, e.cross_cta, chip=chip))
                 wires.append(_Wire(chip, e.dst, "flow", cons, e.cross_cta, chip=chip))
     return boxes, wires, "\n".join(panel)
@@ -255,7 +257,9 @@ def _chip_badges(names: list[str], kernel, ch) -> list[tuple[str, str]]:
 
 def _chip_box(cid: str, names: list[str], lines, kernel) -> _Box:
     ch = kernel._ws_chans[names[0]]
-    prod, cons = (mechanism(m, ch.named) for m in (ch.producer, ch.consumer))
+    prod = mechanism(ch.producer, ch.named)
+    # A per-role consumer side splits its half of the bar between its mechanisms.
+    cons = list(dict.fromkeys(mechanism(m, ch.named) for m in ch.mechanisms("consumer")))
     label = ", ".join(names)
     kind = ("slots" if ch.fixed else "ring") + (" each" if len(names) > 1 else "")
     ticks_w = ch.n * 9
@@ -263,10 +267,14 @@ def _chip_box(cid: str, names: list[str], lines, kernel) -> _Box:
     badges_w = sum(_tw(t, 8.5) + 11 for t, _ in badges)
     w = max(_tw(label, 11) + 16, ticks_w + _tw(kind, 9.5) + 22, badges_w + 12, 56)
     h = 34 + (15 if badges else 0)
+    seg = (w / 2 - 1) / len(cons)
     parts = [
         f'<rect class="chip-body" width="{w:.1f}" height="{h}" rx="3"/>',
         f'<rect class="bar {prod}" x="1" y="1" width="{w / 2 - 1:.1f}" height="3"/>',
-        f'<rect class="bar {cons}" x="{w / 2:.1f}" y="1" width="{w / 2 - 1:.1f}" height="3"/>',
+        *(
+            f'<rect class="bar {c}" x="{w / 2 + k * seg:.1f}" y="1" width="{seg:.1f}" height="3"/>'
+            for k, c in enumerate(cons)
+        ),
         _text(8, 16, label, "chip-name"),
     ]
     for s in range(ch.n):

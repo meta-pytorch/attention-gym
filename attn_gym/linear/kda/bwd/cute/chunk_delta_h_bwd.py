@@ -1643,7 +1643,7 @@ class BlackwellDeltaHBwd(WarpSpecialized):
             use_dht,
             use_dh0,
             bound,
-        ).launch(**self.launch_config(bound), stream=stream, min_blocks_per_mp=1)
+        ).launch(**self.launch_config(bound), stream=stream)
 
     # ------------------------------------------------------------------
     # Device kernel: bind storage, build fragments, run the roles

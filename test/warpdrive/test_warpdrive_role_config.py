@@ -1,6 +1,10 @@
 """Test ``roles=`` overrides: binding, validation, specialization reuse, and handoffs."""
 
+import re
+import shutil
+import subprocess
 from dataclasses import FrozenInstanceError, dataclass, field, replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,6 +14,7 @@ pytest.importorskip("cutlass.cute")
 import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import cute
+from cutlass._mlir._mlir_libs._cutlass_ir import _aot_support
 
 from attn_gym.warpdrive import (
     Consumer,
@@ -536,3 +541,79 @@ def test_moved_fa4_roles_match_defaults(requires_blackwell):
     actual, actual_lse = fa4_fwd(q, k, v, roles=roles)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual_lse, expected_lse, rtol=0, atol=0)
+
+
+class BudgetProbe(WarpSpecialized):
+    """A 12-warp kernel whose compute role keeps about 200 floats live: more than the 168
+    registers a 384-thread launch starts with, so only its 232 budget avoids spilling."""
+
+    @role(warps=range(8), regs=232)
+    @cute.jit
+    def compute(self, ctx):
+        t = cute.arch.thread_idx()[0]
+        vals = cute.make_rmem_tensor((200,), cutlass.Float32)
+        for i in cutlass.range_constexpr(200):
+            vals[i] = ctx.out[t + i * 384]
+        for j in cutlass.range(4, unroll=1):
+            for i in cutlass.range_constexpr(200):
+                vals[i] = vals[i] * vals[(i + 1) % 200] + cutlass.Float32(j)
+        acc = cutlass.Float32(0.0)
+        for i in cutlass.range_constexpr(200):
+            acc = acc + vals[i]
+        ctx.out[t] = acc
+
+    @role(warps=8, regs=40)
+    @cute.jit
+    def side(self, ctx):
+        pass
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, stream: cuda.CUstream):
+        self.kernel(out).launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
+
+
+def test_budgets_survive_to_sass(requires_blackwell, tmp_path):
+    """launch_config's min_blocks_per_mp=1 makes ptxas keep setmaxnreg; without it the role
+    compiles at 32 registers with about 760 bytes of spills."""
+    disassembler = shutil.which("nvdisasm")
+    if disassembler is None:
+        pytest.skip("the SASS check requires nvdisasm")
+    op = BudgetProbe()
+    assert op.launch_config(grid=(1, 1, 1))["min_blocks_per_mp"] == 1
+    fake = make_fake_compact_tensor(cutlass.Float32, (1 << 20,), assumed_align=4)
+    compiled = cute.compile(op, fake, cuda.CUstream(0))
+    obj = bytes(
+        _aot_support.export_module_to_bytes(
+            compiled.ir_module, format="o", opt_level=3, enable_pic=True
+        )
+    )
+    cubin = tmp_path / "probe.cubin"
+    cubin.write_bytes(obj[[m.start() for m in re.finditer(b"\x7fELF", obj)][1] :])
+    sass = subprocess.check_output([disassembler, str(cubin)], text=True)
+    assert "USETMAXREG.TRY_ALLOC.CTAPOOL UP0, 0xe8" in sass  # 232
+    assert "USETMAXREG.DEALLOC.CTAPOOL 0x28" in sass  # 40
+    assert "STL" not in sass  # no spills
+
+
+class Unbudgeted(WarpSpecialized):
+    @role(warps=0)
+    @cute.jit
+    def only(self, ctx):
+        pass
+
+
+def test_launch_config_min_blocks():
+    budgeted, plain = BudgetProbe(), Unbudgeted()
+    assert budgeted.launch_config(grid=(1, 1, 1))["min_blocks_per_mp"] == 1
+    assert "min_blocks_per_mp" not in plain.launch_config(grid=(1, 1, 1))
+    assert plain.launch_config(grid=(1, 1, 1), min_blocks_per_mp=2)["min_blocks_per_mp"] == 2
+    assert budgeted.launch_config(grid=(1, 1, 1), min_blocks_per_mp=1)["min_blocks_per_mp"] == 1
+    with pytest.raises(ValueError, match="positive int"):
+        plain.launch_config(grid=(1, 1, 1), min_blocks_per_mp=0)
+    with pytest.raises(ValueError, match="must be 1"):
+        budgeted.launch_config(grid=(1, 1, 1), min_blocks_per_mp=2)

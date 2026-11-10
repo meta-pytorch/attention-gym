@@ -767,11 +767,9 @@ class WarpSpecialized(metaclass=_KernelType):
         leaders = set(cluster.ctas(LEADER))
         if cluster.size > 1:
             for name, ch in chans.items():
-                for side, mech, bound in (
-                    ("producer", ch.producer, ch.producers),
-                    ("consumer", ch.consumer, ch.consumers),
-                ):
-                    if mech is not Umma:
+                for side, bound in (("producer", ch.producers), ("consumer", ch.consumers)):
+                    commits = [ri for ri, _ in bound if ch.mechanism(side, ri.role) is Umma]
+                    if not commits:
                         continue
                     # A CTA's data is read or written by its pair leader's MMAs (its own without
                     # pairs), so every leader the other side needs must commit. Without pairs, a
@@ -783,7 +781,7 @@ class WarpSpecialized(metaclass=_KernelType):
                         served = {
                             cluster.group(c)[0] for ri, _ in other for c in cluster.ctas(ri.cta)
                         }
-                    for ri, _ in bound:
+                    for ri in commits:
                         ctas = set(cluster.ctas(ri.cta))
                         if ctas <= leaders and not served <= ctas:
                             raise ProtocolError(
@@ -845,8 +843,14 @@ class WarpSpecialized(metaclass=_KernelType):
                     raise ValueError(f"warp {w} claimed by {owner[w]} and {r.name}")
                 owner[w] = r.name
         for name, chan in chans.items():
+            if chan.per_role:
+                unbound = [k for k in chan.consumer if all(r.role != k for r, _ in chan.consumers)]
+                if unbound:
+                    raise ProtocolError(
+                        f"channel {name}: per-role consumer(s) {unbound} take no Consumer end; "
+                        "every key of the consumer dict must bind one"
+                    )
             for side in SIDES:
-                mech = chan.producer if side == "producer" else chan.consumer
                 bound = chan.producers if side == "producer" else chan.consumers
                 if side == chan.external:
                     if bound:
@@ -868,24 +872,13 @@ class WarpSpecialized(metaclass=_KernelType):
                             f"{[r.name for r, _ in bound]}"
                         )
                     _check_turns(name, side, bound)
-                if mech is Threads or mech is Warps:
-                    continue
-                how = getattr(mech, "__name__", repr(mech))  # Umma, or Tma(tx_bytes=...)
-                one_at_a_time = chan.sharing(side) is not Sharing.JOIN
-                if len(bound) > 1 and not one_at_a_time:
-                    raise ProtocolError(
-                        f"channel {name}: {side} side signals once ({how}) but has several "
-                        f"roles {[r.name for r, _ in bound]}"
-                    )
-                # One elected thread signals; every warp of a wider role would issue its own
-                # arrive (and its own TMA copies or MMAs).
-                for r, _ in bound:
-                    if r.num_warps > 1:
-                        raise ProtocolError(
-                            f"channel {name}: {side} side signals once ({how}) from one "
-                            f"elected thread, but role {r.name} spans {r.num_warps} warps and "
-                            "each would signal; issue it from a single-warp role"
-                        )
+                # A per-role side's roles signal independently, each with its own mechanism.
+                if side == "consumer" and chan.per_role:
+                    groups = [[b for b in bound if b[0].role == k] for k in chan.consumer]
+                else:
+                    groups = [bound]
+                for group in groups:
+                    _check_signal_once(name, side, chan, group)
             if chan.exclusive:
                 _check_exclusive(name, chan)
             if chan.named:
@@ -1216,17 +1209,39 @@ class WarpSpecialized(metaclass=_KernelType):
             raise ProtocolError(f"no barriers named {name!r} (have {sorted(self._ws_bars)})")
         return self._ws_bars[name]
 
-    def launch_config(self, work=None, grid=None) -> dict:
+    def launch_config(self, work=None, grid=None, min_blocks_per_mp: int | None = None) -> dict:
         """``grid``/``block``/``cluster`` for ``kernel(...).launch(**cfg, stream=stream)``.
         A kernel with a ``WorkStream`` passes its ``BoundWork``, whose schedule sets the grid (a
-        ``OneShot`` over plain ``Raster()`` launches the tile space)."""
+        ``OneShot`` over plain ``Raster()`` launches the tile space).
+
+        When a role declares ``regs``, the config also sets ``min_blocks_per_mp=1``: ptxas keeps
+        ``setmaxnreg`` only with a ``.minnctapersm`` (or ``.maxnreg``) entry directive, and
+        without it silently compiles every warp at one count, spilling a role that needs its
+        larger budget. ``min_blocks_per_mp`` passes another value through; with budgets only 1
+        fits, since they split the whole register file among one CTA's warps.
+        """
         if work is not None:
             grid = work.grid()
-        return {
+        cfg = {
             "grid": grid,
             "block": (self.num_threads, 1, 1),
             "cluster": self.cluster.launch_cluster(),
         }
+        budgets = any(r.regs is not None for r in self._ws_roles)
+        if min_blocks_per_mp is not None:
+            if type(min_blocks_per_mp) is not int or min_blocks_per_mp < 1:
+                raise ValueError(
+                    f"min_blocks_per_mp must be a positive int, got {min_blocks_per_mp!r}"
+                )
+            if budgets and min_blocks_per_mp != 1:
+                raise ValueError(
+                    f"{type(self).__name__}: role register budgets split the whole register "
+                    f"file among one CTA, so min_blocks_per_mp must be 1, got {min_blocks_per_mp}"
+                )
+            cfg["min_blocks_per_mp"] = min_blocks_per_mp
+        elif budgets:
+            cfg["min_blocks_per_mp"] = 1
+        return cfg
 
     # ---- device-side ------------------------------------------------------- #
 
@@ -1940,6 +1955,7 @@ class WarpSpecialized(metaclass=_KernelType):
             state,
             ri.cta,
             stride=turns,
+            role=ri.role,
         )
         if chan.named and not is_prod:
             if bound is not None:
@@ -2013,6 +2029,29 @@ def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]
     return final
 
 
+def _check_signal_once(name: str, side: str, chan, bound):
+    """A ``Tma`` or ``Umma`` signal is one elected arrival: one single-warp instance signals
+    each epoch."""
+    mech = chan.mechanism(side, bound[0][0].role)
+    if mech is Threads or mech is Warps:
+        return
+    how = getattr(mech, "__name__", repr(mech))  # Umma, or Tma(tx_bytes=...)
+    if len(bound) > 1 and chan.sharing(side) is Sharing.JOIN:
+        raise ProtocolError(
+            f"channel {name}: {side} side signals once ({how}) but has several "
+            f"roles {[r.name for r, _ in bound]}"
+        )
+    # One elected thread signals; every warp of a wider role would issue its own arrive (and
+    # its own TMA copies or MMAs).
+    for r, _ in bound:
+        if r.num_warps > 1:
+            raise ProtocolError(
+                f"channel {name}: {side} side signals once ({how}) from one elected thread, "
+                f"but role {r.name} spans {r.num_warps} warps and each would signal; issue it "
+                "from a single-warp role"
+            )
+
+
 def _check_turns(name: str, side: str, bound):
     roles = {r.role for r, _ in bound}
     widths = {r.num_threads for r, _ in bound}
@@ -2045,7 +2084,9 @@ def _check_exclusive(name: str, chan):
         raise ProtocolError(
             f"channel {name}: exclusive consumer role(s) {missing} take no Consumer end"
         )
-    contributions = {r.name: arrivals(chan.consumer, r.num_threads) for r in consumers}
+    contributions = {
+        r.name: arrivals(chan.mechanism("consumer", r.role), r.num_threads) for r in consumers
+    }
     if not chan.empty_counts_overridden and len(set(contributions.values())) > 1:
         raise ProtocolError(
             f"channel {name}: exclusive consumers must contribute equal arrivals (each epoch "

@@ -57,6 +57,7 @@ the traced loop structure, not matching runtime trip counts inside different rol
 
 **Own the memory ordering.** A channel's fences run before its managed signal: the declared ones,
 which default to `smem_async` on the release of a TMA-filled channel with thread consumers
+(the thread roles only, on a [per-role consumer side](channels.md#per-role-consumer-mechanisms))
 and on the commit of a thread-written channel with SMEM storage that an MMA consumes.
 TMA stores, raw async copies, TMEM aliases and storage
 shared across channels may need additional waits and proxy fences. Complete that work before

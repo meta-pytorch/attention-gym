@@ -164,8 +164,8 @@ The diagrams below are the uncompiled output for the single-CTA GEMM, FA4 forwar
 %% Gemm: 8 warps, single CTA, tcgen05 CtaGroup.ONE
 flowchart LR
   role_epilogue["epilogue<br>warps 0-3 · 160 regs"]
-  role_load["load<br>warp 4 · 40 regs"]
-  role_mma["mma<br>warp 5 · 40 regs"]
+  role_load["load<br>warp 4 · 48 regs"]
+  role_mma["mma<br>warp 5 · 48 regs"]
   stream_work[["stream work<br>OneShot(), Raster(along=m)<br>decoded locally in every role"]]
   role_load -->|"ab · Ring(3)<br>Tma(49152 B) -#gt; Umma<br>full 1 x3, tx 49152 B<br>empty 1 x3<br>buffer A, B"| role_mma
   role_mma -->|"acc · Ring(1)<br>Umma -#gt; Threads<br>full 1<br>empty 128"| role_epilogue
