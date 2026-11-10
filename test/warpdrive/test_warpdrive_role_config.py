@@ -401,6 +401,68 @@ def test_tmem_row_needs_whole_warpgroups(requires_blackwell):
         compile_probe(LocalProbe({"rows": RoleConfig(range(6, 8))}))
 
 
+OUT_OF_RANGE = (24301, 24302, 24303)  # sentinels stored only when an index leaves its range
+
+
+class LocalRangeProbe(WarpSpecialized):
+    """Guard a store on each role-local index leaving its range, at offset 0 and past it."""
+
+    def get_name(self) -> str:
+        return "warpdrive_local_range_probe"
+
+    @cute.jit
+    def guard(self, ctx: ProbeCtx, me: Local):
+        if me.tid >= me.threads:
+            ctx.out[0, 0] = cutlass.Int32(OUT_OF_RANGE[0])
+        if me.warp >= me.warps:
+            ctx.out[0, 1] = cutlass.Int32(OUT_OF_RANGE[1])
+        if me.tid < 0:  # past offset 0 only the assumption proves tid - first thread >= 0
+            ctx.out[0, 2] = cutlass.Int32(OUT_OF_RANGE[2])
+
+    @role(warps=range(2))
+    @cute.jit
+    def first(self, ctx: ProbeCtx, me: Local):
+        self.guard(ctx, me)
+
+    @role(warps=range(2, 5))
+    @cute.jit
+    def offset(self, ctx: ProbeCtx, me: Local):
+        self.guard(ctx, me)
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, reps: cutlass.Int32):
+        self.begin_roles()
+        self.run_roles(ProbeCtx(out, reps))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, reps: cutlass.Int32, stream: cuda.CUstream):
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(out, reps).launch(
+            grid=(1, 1, 1), block=(self.num_threads, 1, 1), stream=stream
+        )
+
+
+def test_local_indices_carry_their_range(requires_blackwell, tmp_path, monkeypatch):
+    """The compiler knows ``0 <= me.tid < me.threads`` and ``me.warp < me.warps``, so stores
+    guarded on leaving those ranges fold away."""
+    from cutlass.base_dsl.compiler import Compiler
+
+    compile_fn = Compiler.compile
+
+    def dump_ptx(self, module, pipeline, *args, **kwargs):
+        option = f"dump-ptx-path='{tmp_path / 'probe'}' "
+        pipeline = pipeline.replace("cute-to-nvvm{", "cute-to-nvvm{" + option, 1)
+        return compile_fn(self, module, pipeline, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "compile", dump_ptx)
+    compile_probe.__wrapped__(LocalRangeProbe())  # bypass the cache: the PTX needs a compile
+    (ptx,) = tmp_path.glob("probe*.ptx")
+    text = ptx.read_text(errors="ignore")
+    assert "st.global" not in text
+    for sentinel in OUT_OF_RANGE:
+        assert str(sentinel) not in text
+
+
 # Epilogue on the next warpgroup, and on warps 2-5 (no budgets), which straddle two warpgroups:
 # the epilogue's TMEM rows follow the hardware warp quadrant, its other indices the role.
 GEMM_PLACEMENTS = {

@@ -14,7 +14,8 @@ from dataclasses import dataclass, fields, is_dataclass, replace
 from types import SimpleNamespace
 
 import cutlass
-from cutlass import Int32, cute, pipeline
+from cutlass import Int32, Uint32, cute, pipeline
+from cutlass._mlir.dialects import llvm
 
 from attn_gym.warpdrive import alias, tracing
 from attn_gym.warpdrive.cache._key import canonical_key, module_source_digest
@@ -152,13 +153,15 @@ class Local:
     def tid(self) -> Int32:
         """Thread index within the instance, ``0 .. threads - 1``."""
         tid = cute.arch.thread_idx()[0]
-        return tid - self._first_warp * WARP_SIZE if self._first_warp else tid
+        return _assume_below(
+            tid - self._first_warp * WARP_SIZE if self._first_warp else tid, self.threads
+        )
 
     @property
     def warp(self) -> Int32:
         """Warp index within the instance, ``0 .. warps - 1`` (warp-uniform)."""
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        return warp - self._first_warp if self._first_warp else warp
+        return _assume_below(warp - self._first_warp if self._first_warp else warp, self.warps)
 
     @property
     def lane(self) -> Int32:
@@ -181,6 +184,17 @@ class Local:
                 f"TMEM lanes once), but the instance has {self.warps} warps"
             )
         return cute.arch.thread_idx()[0] % self.threads
+
+
+def _assume_below(value: Int32, bound: int) -> Int32:
+    """``value``, with ``0 <= value < bound`` stated to LLVM.
+
+    Role dispatch guarantees the range, but LLVM does not derive it from the dispatch branch, so
+    predicates and index math on role-local indices would stay runtime work. The unsigned compare
+    states both bounds; the assumption emits no instruction.
+    """
+    llvm.intr_assume((Uint32(value) < Uint32(bound)).ir_value(), [], [])
+    return value
 
 
 class Turn:
