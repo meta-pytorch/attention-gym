@@ -30,7 +30,7 @@ def test_wy_backward_nvvm_compatibility(
     monkeypatch.setattr(cute_target, "_target", target)
     monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
-    args = (2, 128, 64, dtype, 128**-0.5, True, 1, ragged)
+    args = (2, 128, 64, dtype, 128**-0.5, True, ragged)
     assert not _compile_chunk_kda_bwd_wy_dqkg.is_cached(*args)
     precompile_many(
         _compile_chunk_kda_bwd_wy_dqkg,
