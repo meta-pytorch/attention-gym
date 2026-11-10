@@ -9,7 +9,12 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    _document_ids,
+    offset_strides,
+    ptr_offset,
+    requires_int64_offsets,
+)
 
 
 def can_use_shared_kv_schedule(
@@ -151,15 +156,6 @@ def prune_wide_backward_configs(configs, args):
         and config.num_stages == 1
         and all(size <= 16 for size in config.kwargs.values())
     ]
-
-
-@triton.jit
-def offset_strides(strides, USE_INT64_OFFSETS: tl.constexpr):
-    """Select address width before multiplying runtime strides and indices."""
-    result = ()
-    for axis in tl.static_range(len(strides)):
-        result += (tl.cast(strides[axis], tl.int64 if USE_INT64_OFFSETS else tl.int32),)
-    return result
 
 
 @triton.jit

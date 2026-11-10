@@ -11,12 +11,11 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.tune import TritonTuner, tuning_key
-from attn_gym._backends.triton.utils import _document_ids, ptr_offset
+from attn_gym._backends.triton.utils import _document_ids, offset_strides, ptr_offset
 
 from .primitives import (
     dense_tile_rows,
     load_document_bounds,
-    offset_strides,
     selection_bits,
 )
 
