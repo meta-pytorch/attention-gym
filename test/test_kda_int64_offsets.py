@@ -106,8 +106,16 @@ def test_forced_int64_dense_delta_h_fusion_matches_default_path(monkeypatch):
 
 
 @pytest.mark.skipif(not CUTE_CAPABLE, reason="the CuTe KDA kernels require capability 10.x")
-def test_forced_int64_bound_gate_matches_default_path(monkeypatch):
-    """Force the private gate backward's wide ABI on an ordinary input."""
+@pytest.mark.parametrize(
+    ("batch", "tokens", "heads"),
+    [
+        pytest.param(1, 65, 2, id="tile-grid"),
+        # The batch folded into gridDim.x: two backward tiles per batch, the second partial.
+        pytest.param(65537, 33, 1, id="folded-batch"),
+    ],
+)
+def test_forced_int64_bound_gate_matches_default_path(monkeypatch, batch, tokens, heads):
+    """Force the private gate forward's and backward's wide ABI on an ordinary input."""
     import attn_gym.linear.kda.bwd.cute.gate_bwd as gate_module
     import attn_gym.linear.kda.fwd.cute.gate_fwd as gate_forward_module
     from attn_gym.linear.kda import bound_gate
@@ -115,9 +123,11 @@ def test_forced_int64_bound_gate_matches_default_path(monkeypatch):
     def run():
         torch.manual_seed(19)
         inputs = (
-            torch.randn(1, 65, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True),
-            torch.randn(2, device="cuda", requires_grad=True),
-            torch.randn(2, 128, device="cuda", requires_grad=True),
+            torch.randn(
+                batch, tokens, heads, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+            ),
+            torch.randn(heads, device="cuda", requires_grad=True),
+            torch.randn(heads, 128, device="cuda", requires_grad=True),
         )
         output = bound_gate(*inputs, impl="fused")
         return (output, *torch.autograd.grad(output.square().sum(), inputs))
