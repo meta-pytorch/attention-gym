@@ -50,6 +50,43 @@ def normalized_rms(actual: torch.Tensor, expected: torch.Tensor) -> float:
     return (difference.square().mean().sqrt() / denominator).item()
 
 
+def assert_packed_items_match(
+    actual: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor],
+    expected: tuple[torch.Tensor, torch.Tensor | None, torch.Tensor],
+    lengths: list[int],
+    bv: int,
+) -> None:
+    """Check each (value tile, head, sequence) work item's dh, dh0 and dV slice separately.
+
+    One RMS over a whole output dilutes a short item: skipping one value tile's dV store for a
+    3-token document barely moves it. Normalizing per item catches an unwritten or wrong item.
+    """
+    token_begin = chunk_begin = 0
+    for sequence, length in enumerate(lengths):
+        tokens = slice(token_begin, token_begin + length)
+        chunks = slice(chunk_begin, chunk_begin + -(-length // 64))
+        token_begin, chunk_begin = tokens.stop, chunks.stop
+        outputs = {
+            "dh": (actual[0][:, chunks], expected[0][:, chunks]),
+            "dv": (actual[2][:, tokens], expected[2][:, tokens]),
+        }
+        if expected[1] is not None:
+            outputs["dh0"] = (actual[1][sequence][None, None], expected[1][sequence][None, None])
+        for name, (got, reference) in outputs.items():
+            if reference.numel() == 0:
+                continue
+            # (1, rows, heads, ..., value tiles, bv): reduce all but heads and value tiles.
+            got, reference = (x.float().unflatten(-1, (-1, bv)) for x in (got, reference))
+            dims = [dim for dim in range(got.ndim) if dim not in (2, got.ndim - 2)]
+            error = (got - reference).square().sum(dims).sqrt()
+            error = error / reference.square().sum(dims).sqrt().clamp_min(1e-12)
+            head, tile = divmod(error.argmax().item(), error.shape[1])
+            assert error[head, tile].item() <= 2e-2, (
+                f"sequence {sequence} (length {length}) {name}, head {head}, value tile {tile}: "
+                f"normalized RMS {error[head, tile].item():.3g}"
+            )
+
+
 def delta_h_reference(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -314,6 +351,110 @@ def test_packed_delta_h_dv_fusion_matches_reference(
                     result = result[:, :active_chunks]
                     reference = reference[:, :active_chunks]
                 torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("bv", [16, 32])
+def test_packed_delta_h_dv_fusion_persistent_items_match_reference(bv: int):
+    """Several persistent items per CTA, and documents long enough to wrap every ring's phase.
+
+    24 documents x 8 heads x 128 / BV value tiles is 768-1536 items, more than one per SM; the
+    1000-token documents run 16 chunks, wrapping the 4- or 6-stage k ring and the 2-stage rings
+    several times inside one item and again across items.
+    """
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+        _blackwell_delta_h_bwd_dhu_dv_fused_packed,
+    )
+    from attn_gym.testing.kda import cumulative_sequence_offsets
+
+    torch.manual_seed(29)
+    lengths = [1000, 3, 0, 130, 777, 64, 1, 450] * 3
+    tokens, heads = sum(lengths), 8
+    shape = (1, tokens, heads, D)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    k = torch.randn_like(q) / 8
+    w = torch.randn_like(q) / 8
+    d_output = torch.randn_like(q) / 8
+    gate = -torch.rand(shape, device="cuda") / 16
+    rows = torch.arange(64, device="cuda")
+    aqk = torch.randn(1, tokens, heads, 64, device="cuda", dtype=torch.bfloat16) / 16
+    position = torch.cat([torch.arange(length, device="cuda") % 64 for length in lengths])
+    aqk = aqk.masked_fill(rows[None, None, None, :] > position[None, :, None, None], 0)
+    initial_state = torch.randn(len(lengths), heads, D, D, device="cuda") / 32
+    d_final_state = torch.randn_like(initial_state) / 32
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+    expected = delta_h_reference(
+        q,
+        k,
+        w,
+        d_output,
+        aqk,
+        lengths,
+        gate=gate,
+        initial_state=initial_state,
+        d_final_state=d_final_state,
+        scale=D**-0.5,
+    )
+    actual = _blackwell_delta_h_bwd_dhu_dv_fused_packed(
+        q,
+        k,
+        w,
+        d_output,
+        aqk,
+        metadata,
+        gk=gate,
+        h0=initial_state,
+        dht=d_final_state,
+        scale=D**-0.5,
+        bv=bv,
+    )
+    assert_packed_items_match(actual, expected, lengths, bv)
+    torch.testing.assert_close(actual[1][2], d_final_state[2], rtol=0, atol=0)
+
+
+def test_packed_delta_h_dv_fusion_bounded_extent_matches_reference():
+    """Short documents without an initial state take the device-read sequence extent."""
+    from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
+    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+        _blackwell_delta_h_bwd_dhu_dv_fused_packed,
+        should_bound_sequence_extent,
+    )
+    from attn_gym.testing.kda import cumulative_sequence_offsets
+
+    torch.manual_seed(31)
+    # Trailing empty documents past the last active one are the ones the bound drops.
+    lengths = [130, 3, 0, 60] * 8 + [0] * 16
+    tokens, heads = sum(lengths), 8
+    assert should_bound_sequence_extent(tokens, len(lengths), heads, 64, False)
+    shape = (1, tokens, heads, D)
+    q = torch.randn(shape, device="cuda", dtype=torch.bfloat16) / 8
+    k = torch.randn_like(q) / 8
+    w = torch.randn_like(q) / 8
+    d_output = torch.randn_like(q) / 8
+    gate = -torch.rand(shape, device="cuda") / 16
+    rows = torch.arange(64, device="cuda")
+    aqk = torch.randn(1, tokens, heads, 64, device="cuda", dtype=torch.bfloat16) / 16
+    position = torch.cat([torch.arange(length, device="cuda") % 64 for length in lengths])
+    aqk = aqk.masked_fill(rows[None, None, None, :] > position[None, :, None, None], 0)
+    d_final_state = torch.randn(len(lengths), heads, D, D, device="cuda") / 32
+    metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, 64)
+    expected = delta_h_reference(
+        q,
+        k,
+        w,
+        d_output,
+        aqk,
+        lengths,
+        gate=gate,
+        initial_state=None,
+        d_final_state=d_final_state,
+        scale=D**-0.5,
+    )
+    actual = _blackwell_delta_h_bwd_dhu_dv_fused_packed(
+        q, k, w, d_output, aqk, metadata, gk=gate, dht=d_final_state, scale=D**-0.5, bv=32
+    )
+    assert actual[1] is None
+    assert_packed_items_match(actual, expected, lengths, bv=32)
 
 
 def test_packed_delta_h_dv_fusion_cuda_graph_replays_smaller_endpoint():
