@@ -177,7 +177,8 @@ Carry state and respect handle lifetimes:
 - Close a handle exactly once, within its opening dynamic region. Do not keep using its
   pointers after release.
 - For non-nested lifetimes, use explicit `acquire/wait/commit/release`; see
-  [overlapping handles](channels.md#overlapping-handles).
+  [overlapping handles](channels.md#overlapping-handles). To hold a stage from a counted
+  loop's first iteration to its last, use a [span](channels.md#spans).
 
 ## Wire the prologue, launch and cache
 

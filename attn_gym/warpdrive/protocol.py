@@ -402,14 +402,16 @@ class RoleTrace:
             handle.unclosed_ok = opt
         self.open.append(handle)
 
-    def closed(self, handle, op: str):
+    def closed(self, handle, op: str, region_checked: bool = False):
+        """Record ``op`` closing ``handle``. ``region_checked``: the caller checked where this
+        close runs itself (a ``Span`` closes in its loop's last iteration)."""
         site = user_site()
         if handle.closed_at is not None:
             raise ProtocolError(
                 f"{self.role_name}: {handle.what} closed twice: {handle.closed_op} at "
                 f"{handle.closed_at}, then {op} at {site}"
             )
-        cross = current_block() != handle.block
+        cross = not region_checked and current_block() != handle.block
         if cross and not self.opt_out("cross_region", f"{handle.what} {op} at {site}"):
             raise ProtocolError(
                 f"{self.role_name}: {handle.what} opened at {handle.site} but {op} at "

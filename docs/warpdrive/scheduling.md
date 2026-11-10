@@ -39,6 +39,7 @@ For positive extents Raster is a bijection. Its decode intermediates stay within
 |---|---|---|
 | `OneShot()` | Return terminal index `total`; no local reassignment of dropped items | Local |
 | `StaticPersistent()` | Add U, the number of launched units | Local |
+| `TilePersistent(axis)` | Step its `axis` coordinate by `gridDim[axis]`; the other two stay at `blockIdx` | Local |
 | `AtomicPersistent(stages=2)` | Claim from a global atomic counter | Scheduler warp |
 | `ClusterLaunchControl(stages=2)` | Cancel an unlaunched unit and take its work | Scheduler warp |
 
@@ -53,6 +54,21 @@ unit 2:  2 -> 5      -> terminal
 The local schedules fix these sequences before the launch, so the host can list them:
 `work.assignment(space, max_ctas)` returns each CTA's `(index, item)` list in run order
 ([drawn per CTA](tracing.md#see-which-cta-runs-what)).
+
+`TilePersistent(axis="m" | "n" | "l")` launches the plain `Raster()` tile space with that axis
+capped at `max_ctas` units, so `max_ctas` caps the units along the axis (per slice of the other
+two), not the CTA count. Each CTA keeps the other two coordinates from `blockIdx`, with no
+division, and walks its axis coordinate by `gridDim[axis]`. The stream's index is that
+coordinate and `total` the axis extent, so a [limit](#a-device-read-limit) bounds the
+coordinate. A hand-built grid that persists along one axis and folds another into x, such as
+`(workers * pairs, heads)` with `x = worker * pairs + pair`, keeps its CTA order as
+`TilePersistent("n")` over `(pairs, chunks, heads)`: the launch is `(pairs, workers, heads)`,
+and `assignment()` lists the same items per CTA. It needs a single-CTA cluster and no `record`.
+
+`TilePersistent(axis, units=n)` fixes the grid's axis extent at `n` instead (CTAs past the axis
+extent run nothing, and `max_ctas` is not read), which makes the stride a compile-time constant.
+A register-heavy loop can need that: KDA K4b ran 2% slower with a `gridDim` stride in a counted
+loop and 11% slower in an `scf.for`. It specializes the kernel on `n`, so bucket it.
 
 Atomic claims are unique but have no fixed inter-unit order. CLC recovers the canceled
 work index from its CTA x coordinate divided by cluster size. It waits for every cancellation
@@ -87,6 +103,25 @@ directly at the end of the loop body, and return the cursor.
 The checker rejects item reads after advance, including lookahead reads of the next item
 inside the same iteration. It does not prove advance is lexically last, detect every cursor
 rebind/stale restore, or prove useful and matching work happened before it.
+
+### A counted loop
+
+A `while work.valid` loop is an `scf.while`, which `cutlass.range(..., unroll=n)` cannot
+unroll. A local `StaticPersistent` or `TilePersistent` stream over `Raster()` (a mapping that
+keeps every item, decodes any index and keeps no state) without `record` can loop over a trip
+count instead:
+
+```python
+for k in cutlass.range(work.trip_count(), unroll=2):  # two items' loads overlap
+    m, n, l = work.item_at(k)
+    ...
+```
+
+Item `k` is index `first + k * stride`, and `trip_count()` is
+`ceil((end - first) / stride)` (0 when the first index is already terminal), with `end` the total
+or the [limit](#a-device-read-limit). A cursor runs in one mode: calling `advance()` on a counted
+cursor, or `trip_count()` on an advanced one, raises at trace time. Return the cursor from the
+role as usual.
 
 ### What the scheduler warp buffers
 
@@ -205,9 +240,15 @@ point, so the grid is launched as is and CUDA rejects it before any CTA runs:
 `CUDA launch failed: cudaErrorInvalidValue (1)`, `CUDA rejected the launch configuration before
 running the kernel.`
 
+Pass `m_tiles` and `n_tiles` as Python ints when they are compile-time constants (heads, a
+channel-block count): binding keeps them static beside runtime extents, so `Raster.decode` and
+the `"2d"` unfold divide by constants. `l` is never a divisor; with any runtime extent it
+binds as a runtime value.
+
 If any Raster extent is `<= 0`:
 
-- Host-side binding normalizes space to `(1, 1, 0)`.
+- Host-side binding normalizes space to `(1, 1, 0)` (a runtime-empty space with static tile
+  extents keeps them and binds `l = 0`).
 - Every built-in schedule launches one unit, with `work.valid == False` in every role.
 - No guarded decode runs; any-index decoders may evaluate and discard a result.
 - No divisor is zero and the atomic workspace remains zeroed.
@@ -350,6 +391,28 @@ bound = self.work.bind((table, length), workspace, max_ctas)
 `count64()` returns capacity. `decode()` reads row `index`, keeps it if `index < length[0]`,
 and passes `state=None` through. Even a dropped row read stays within capacity; its words
 are ignored. The schedule visits all capacity, so avoid excessive padding.
+
+### A device-read limit
+
+When the live items are a prefix of the stream, end it there instead of dropping the rest
+one decode at a time: bind a `Limit`, which every decoding site reads once, after the
+readiness hook, and which ends the stream at `min(total, limit)` in the schedule's index
+order.
+
+```python
+from attn_gym.warpdrive import LastEntry
+
+# In the entry point: chunk_offsets is the int32 prefix sum whose last entry counts live chunks.
+bound = self.work.bind((chunk_capacity, 1, 1), None, max_ctas, limit=LastEntry(chunk_offsets))
+```
+
+Indices at or past the limit are terminal: no role decodes them, `single_item()` reports them
+invalid, and a limit of 0 runs nothing. Each role reads the limit itself, so `read()` must give
+every role and CTA the same value: it may read only memory written before the launch (or
+before `ready` returns) and not written during it. `LastEntry(table, scale)` reads
+`scale * table[size - 1]`; a custom `Limit` implements `read()` and the DSL-value protocol
+(`__extract_mlir_values__`/`__new_from_mlir_values__`). Only local schedules take a limit, and
+`assignment()` ignores it.
 
 `PdlWait()` issues `griddepcontrol.wait` once per decoding site: each local role, or the
 broadcast scheduler. It supplies only the wait, not the producer or dependent-launch setup.

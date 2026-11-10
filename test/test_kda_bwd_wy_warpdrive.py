@@ -158,4 +158,9 @@ def test_wy_protocol_checks(monkeypatch, traced_compiles, ragged, scalar_gate):
         assert f"signal    Tma({tx} B) -> {{mma: Umma, cuda: Threads}}" in text, text
     assert "release_fence smem_async (cuda)" in text, text
     assert op.g.scope.empty_counts[0] == [8 + 2], text  # CUDA and aux warps
+    # The accumulators held across the V loop are managed: one commit, every CUDA thread.
+    for name in ("dq_acc", "dw_acc", "dk_acc", "dA_acc"):
+        scope = getattr(op, name).scope
+        assert (scope.full_counts[0], scope.empty_counts[0]) == ([1], [256]), text
+    assert "unchecked" not in text.replace("user-driven (unchecked)", ""), text
     assert "potential hazard" not in text, text

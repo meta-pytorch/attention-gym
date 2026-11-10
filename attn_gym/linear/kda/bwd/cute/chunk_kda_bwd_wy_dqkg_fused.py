@@ -26,7 +26,7 @@ from cutlass._mlir.dialects import arith as _arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass._mlir.dialects import vector as _vector
-from cutlass.cute.arch import elect_one, mbarrier_arrive, mbarrier_wait
+from cutlass.cute.arch import elect_one, mbarrier_wait
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.nvgpu.tcgen05 import make_umma_smem_desc, smem_descriptor_to_int
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
@@ -718,17 +718,15 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         acc = {"release_fence": "tmem_load"}
         self.dvb = Ring(self.mma_stage, Umma, Threads, **acc)
         self.dkgb = Ring(self.mma_stage, Umma, Threads, **acc)
-        # dq, dw, dk and dA accumulate over both V tiles: the MMA warp takes each accumulator
-        # in the first tile and commits it in the last (dA after the K loop), which a handle
-        # cannot span in the dynamic V loop. Unrolling that loop spills the MMA warp's hoisted
-        # descriptors (78 STL at 56 registers), so these handoffs stay raw: full (count 1,
-        # tcgen05.commit) at +0 and empty (count 256, every CUDA thread after tcgen05.wait::ld)
-        # at +1.
-        acc_counts = [1, 8 * 32]
-        self.dq_acc = Barriers(2, counts=acc_counts)
-        self.dw_acc = Barriers(2, counts=acc_counts)
-        self.dk_acc = Barriers(2, counts=acc_counts)
-        self.dA_acc = Barriers(2, counts=acc_counts)
+        # dq, dw, dk and dA accumulate over both V tiles: the MMA warp holds each accumulator
+        # in a span, waiting for it in the first tile and committing it in the last (dA after
+        # the K loop). Taking them before the V loop serializes the next unit's MMAs behind the
+        # CUDA warps' dk/dA reads, and unrolling that loop spills the MMA warp's hoisted
+        # descriptors (78 STL at 56 registers).
+        self.dq_acc = Ring(self.mma_stage, Umma, Threads, **acc)
+        self.dw_acc = Ring(self.mma_stage, Umma, Threads, **acc)
+        self.dk_acc = Ring(self.mma_stage, Umma, Threads, **acc)
+        self.dA_acc = Ring(self.mma_stage, Umma, Threads, **acc)
         self.dA2 = Ring(self.mma_stage, Umma, Threads, **acc)
         self.dA3 = Ring(self.mma_stage, Umma, Threads, **acc)
         # CUDA threads write MMA operands: dw into Dw, kg over K, dA and dA2 over Q.
@@ -1588,16 +1586,16 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         v: Consumer,
         dvb: Consumer,
         g: Consumer,
-        dq_acc: Barriers,
-        dw_acc: Barriers,
+        dq_acc: Consumer,
+        dw_acc: Consumer,
         dw_op: Producer,
         k: Consumer,
         kg_op: Producer,
         dkgb: Consumer,
-        dk_acc: Barriers,
+        dk_acc: Consumer,
         q: Consumer,
         dg: Producer,
-        dA_acc: Barriers,
+        dA_acc: Consumer,
         dA_op: Producer,
         dA2: Consumer,
         dA2_op: Producer,
@@ -1639,10 +1637,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         bt_col_base = warp_col_tile * (self.BT // 2) + wg_idx * bt_num_cols_per_wg
         # 8 fp32 store each time for store_256b
         num_stores_f32 = bk_num_cols_per_wg // 8
-        dq_phase = Int32(0)
-        dw_phase = Int32(0)
-        dk_phase = Int32(0)
-        dA_phase = Int32(0)
 
         for wu_iter in cutlass.range(0, params.num_iters, unroll=0):
             _, i_hv, _, tok_offset, tile_idx, sub_seq_len = self._work(params, wu_iter)
@@ -1792,15 +1786,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             rG_exp_val = cute.exp2(rG_val, fastmath=self.use_fast_math)
 
             # wait for dq, dq=dq*gk_exp*scale, GMEM store
-            mbarrier_wait(dq_acc, dq_phase)
+            dq_h = dq_acc.wait()
             tcgen05_fence_after()
             dq_i32 = tcgen05_ld_32x32b(
                 bk_num_cols_per_wg, TMEM_DQ_ACC_OFF + wg_idx * bk_num_cols_per_wg
             )
             tcgen05_fence_before()
-            cute.arch.fence_view_async_tmem_load()
-            mbarrier_arrive(dq_acc + 1)
-            dq_phase ^= 1
+            dq_h.release()
 
             dq_f32 = reinterpret_cast(dq_i32, Int32, bk_num_cols_per_wg, Float32)
             dq_f32_val = TensorSSA(dq_f32, (bk_num_cols_per_wg,), Float32)
@@ -1829,15 +1821,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     store_256b(dq_base_addr + s * 32, chunk)
 
             # wait for dw
-            mbarrier_wait(dw_acc, dw_phase)
+            dw_h = dw_acc.wait()
             tcgen05_fence_after()
             dw_i32 = tcgen05_ld_32x32b(
                 bk_num_cols_per_wg, TMEM_DW_ACC_OFF + wg_idx * bk_num_cols_per_wg
             )
             tcgen05_fence_before()
-            cute.arch.fence_view_async_tmem_load()
-            mbarrier_arrive(dw_acc + 1)
-            dw_phase ^= 1
+            dw_h.release()
 
             # dw = -dw, convert to the I/O dtype, write to smem
             dw_f32 = reinterpret_cast(dw_i32, Int32, bk_num_cols_per_wg, Float32)
@@ -1932,15 +1922,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 db_gmem[(tok_offset + tile_idx * self.BT + local_tidx, (i_hv, Int32(0)))] = db_sum
 
             # dk = dk * exp2(gn[None, :] - g)
-            mbarrier_wait(dk_acc, dk_phase)
+            dk_h = dk_acc.wait()
             tcgen05_fence_after()
             dk_i32 = tcgen05_ld_32x32b(
                 bk_num_cols_per_wg, TMEM_DK_ACC_OFF + wg_idx * bk_num_cols_per_wg
             )
             tcgen05_fence_before()
-            cute.arch.fence_view_async_tmem_load()
-            mbarrier_arrive(dk_acc + 1)
-            dk_phase ^= 1
+            dk_h.release()
 
             dk_f32 = reinterpret_cast(dk_i32, Int32, bk_num_cols_per_wg, Float32)
             dk_f32_val = TensorSSA(dk_f32, (bk_num_cols_per_wg,), Float32)
@@ -2047,15 +2035,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
 
             g_h.release()
 
-            mbarrier_wait(dA_acc, dA_phase)
+            dA_h = dA_acc.wait()
             tcgen05_fence_after()
             dA_i32 = tcgen05_ld_32x32b(
                 bt_num_cols_per_wg, TMEM_DA_ACC_OFF + wg_idx * bt_num_cols_per_wg
             )
             tcgen05_fence_before()
-            cute.arch.fence_view_async_tmem_load()
-            mbarrier_arrive(dA_acc + 1)
-            dA_phase ^= 1
+            dA_h.release()
             # NOTE: only release k smem after dA finished, because kg reuses k smem in dA += dw @ kg^T
             k_h.release()
 
@@ -2151,12 +2137,16 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             v,
             dvb,
             g,
+            dq_acc,
+            dw_acc,
             dw_op,
             k,
             kg_op,
             dkgb,
+            dk_acc,
             q,
             dg,
+            dA_acc,
             dA_op,
             dA2,
             dA2_op,
@@ -2396,10 +2386,10 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         v: Consumer,
         vnew: Consumer,
         dvb: Producer,
-        dq_acc: Barriers,
-        dw_acc: Barriers,
-        dA_acc: Barriers,
-        dk_acc: Barriers,
+        dq_acc: Producer,
+        dw_acc: Producer,
+        dA_acc: Producer,
+        dk_acc: Producer,
         dw_op: Consumer,
         kg_op: Consumer,
         dkgb: Producer,
@@ -2412,13 +2402,10 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         me: Local,
     ):
         """Weight-stationary tcgen05 MMAs into fixed TMEM columns; the dq/dw/dk/dA accumulators
-        are taken in the first V tile and committed in the last (dA after the K loop)."""
+        are spans waited for in the first V tile and committed in the last (dA after the K
+        loop)."""
         smem = self._smem(params)
         lane_idx = me.lane
-        dq_phase = Int32(1)
-        dw_phase = Int32(1)
-        dk_phase = Int32(1)
-        dA_phase = Int32(1)
         vloop_phase = Int32(0)  # vloop_done completes once per V tile
         for wu_iter in cutlass.range(0, params.num_iters, unroll=0):
             _, _, _, _, _, sub_seq_len = self._work(params, wu_iter)
@@ -2456,6 +2443,8 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 # Make generic-proxy SMEM stores visible to UMMA async-proxy readers.
                 cute.arch.fence_proxy("async.shared", space="cta")
 
+            dq_span, dw_span = dq_acc.span(), dw_acc.span()
+            dk_span, dA_span = dk_acc.span(), dA_acc.span()
             for v_iter in cutlass.range(self.num_v_tiles):
                 is_accum = v_iter != 0
                 h_h = h.wait()
@@ -2476,8 +2465,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                                 )
                     cute.arch.fence_proxy("async.shared", space="cta")
 
-                if v_iter == 0:
-                    mbarrier_wait(dq_acc + 1, dq_phase)
+                dq_span.begin(v_iter)
                 # dq+=do@h
                 sDo_k_cur = smem.sDo_k[(None, None, None, do_h.index)]
                 sH_k_cur = smem.sH_k[(None, None, None, h_h.index)]
@@ -2501,9 +2489,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 )
 
                 do_h.release()
-                if v_iter == self.num_v_tiles - 1:
-                    umma_arrive(dq_acc)
-                    dq_phase ^= 1
+                dq_span.commit(v_iter)
 
                 dv_h = dv.wait()
                 sDv_raw = cute.make_ptr(
@@ -2544,8 +2530,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     )
 
                 # dw += dv @ h
-                if v_iter == 0:
-                    mbarrier_wait(dw_acc + 1, dw_phase)
+                dw_span.begin(v_iter)
 
                 sDv_k_cur = smem.sDv_k[(None, None, None, dv_h.index)]
                 desc_a_i64 = smem_descriptor_to_int(
@@ -2583,8 +2568,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                                 smem_store_f16x8_sw128(sV_raw, row, col * 8, zeros8, self.io_dtype)
                     cute.arch.fence_proxy("async.shared", space="cta")
 
-                if v_iter == 0:
-                    mbarrier_wait(dA_acc + 1, dA_phase)
+                dA_span.begin(v_iter)
                 sV_k_cur = smem.sV_k[(None, None, None, v_h.index)]
                 desc_a_i64 = smem_descriptor_to_int(
                     make_umma_smem_desc(sDv_k_cur.iterator, sDv_k_cur.layout, "k")
@@ -2607,9 +2591,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
 
                 # the dv release is a tcgen05.commit covering dv@h and dv@v^T
                 dv_h.release()
-                if v_iter == self.num_v_tiles - 1:
-                    umma_arrive(dw_acc)
-                    dw_phase ^= 1
+                dw_span.commit(v_iter)
 
                 v_h.release()
 
@@ -2631,8 +2613,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                                 )
                     cute.arch.fence_proxy("async.shared", space="cta")
 
-                if v_iter == 0:
-                    mbarrier_wait(dk_acc + 1, dk_phase)
+                dk_span.begin(v_iter)
                 sVnew_k_cur = smem.sVnew_k[(None, None, None, vnew_h.index)]
                 sDh_k_cur = smem.sDh_k[(None, None, None, h_h.index)]
                 desc_a_i64 = smem_descriptor_to_int(
@@ -2656,9 +2637,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
 
                 # the vnew release is a tcgen05.commit
                 vnew_h.release()
-                if v_iter == self.num_v_tiles - 1:
-                    umma_arrive(dk_acc)
-                    dk_phase ^= 1
+                dk_span.commit(v_iter)
 
                 h_h.release()
 
@@ -2716,8 +2695,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 True,
             )
 
-            umma_arrive(dA_acc)
-            dA_phase ^= 1
+            dA_span.commit()
             kg_s.release()
             dw_s.release()
 
@@ -2786,6 +2764,10 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             v,
             vnew,
             dvb,
+            dq_acc,
+            dw_acc,
+            dA_acc,
+            dk_acc,
             dw_op,
             kg_op,
             dkgb,
