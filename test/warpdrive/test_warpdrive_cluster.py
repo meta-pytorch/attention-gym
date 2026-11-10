@@ -609,14 +609,6 @@ def test_pair_stream_with_leader_only_users(requires_blackwell, schedule):
         assert out.tolist() == [1] * (m_tiles * n_tiles), (m_tiles, n_tiles, cap)
 
 
-def test_pair_record_workspace_covers_whole_clusters(requires_blackwell):
-    op = PairStream(WorkStream(mapping=Raster(), schedule=StaticPersistent(), record=3))
-    op.describe()  # binds the roles the log is sized by
-    ws, cap = op.work.launch_args("cuda", max_ctas=1)
-    roles = len(op.work.roles)
-    assert cap == 1 and ws.numel() >= 4 + roles * 2 * 3 * 2  # one cluster = two CTAs
-
-
 # Persistent GEMM on clusters
 
 PAIR_GEMM_SHAPES = [

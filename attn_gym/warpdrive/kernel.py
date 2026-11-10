@@ -1003,7 +1003,7 @@ class WarpSpecialized(metaclass=_KernelType):
         return (
             self._ws_init_key,
             self.cluster,
-            tuple((s.schedule, s.mapping, s.ready, s.record, s.scheduler_warp) for s in streams),
+            tuple((s.schedule, s.mapping, s.ready, s.scheduler_warp) for s in streams),
             (self.alias_check, self.trace_protocol, self._trace_settings()),
             self.role_config_key(),
             tuple((m, module_source_digest(m)) for m in modules),
@@ -1898,7 +1898,6 @@ class WarpSpecialized(metaclass=_KernelType):
                         end,
                         trace,
                         scheduler=ann is _SchedulerCursor,
-                        slot=(st.roles.index(r.name), r.first_warp),
                     )
                 )
             elif ann is _SchedulerFetch:

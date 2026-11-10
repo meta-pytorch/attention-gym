@@ -889,12 +889,6 @@ def test_placeholder_is_per_resolved_device(monkeypatch):
     assert on0.kind == on1.kind == "zeros" and current[0] == 0
 
 
-def test_record_needs_a_bound_stream(requires_blackwell):
-    stream = WorkStream(schedule=StaticPersistent(), record=4)
-    with pytest.raises(ValueError, match="before launch_args"):
-        stream.launch_args("cuda")
-
-
 def test_describe_places_scheduler_and_counts():
     text = ScheduleToy(ClusterLaunchControl(stages=3)).describe()
     assert "  3      work.scheduler     -  all\n" in text

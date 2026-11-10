@@ -273,8 +273,6 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
             lambda v=value: WorkStream(scheduler_warp=v),
             "scheduler_warp",
         )
-    for value in (-1, True, 1.5):
-        add(f"record={value!r}", "G6", lambda v=value: WorkStream(record=v), "record")
     add("bad along", "E82", lambda: Raster(along="k"), "along")
     for value in (0, 1.5, True):
         add(f"swizzle={value!r}", "E83", lambda v=value: Raster(swizzle=v), "swizzle")

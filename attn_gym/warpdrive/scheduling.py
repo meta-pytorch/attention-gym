@@ -547,12 +547,11 @@ class OneShot(IndexSchedule):
     * ``"1d"``: the 1-D grid only, every index decoded (two divisions for ``Raster()``), for
       any ``Raster``. Other mappings always launch the 1-D grid, under ``"auto"``.
 
-    ``"3d"`` and ``"2d"`` need plain ``Raster()`` without ``record`` and a launch on
-    ``BoundWork.grid``. A space past their limit cannot launch: static extents raise a
-    ``ValueError`` from ``BoundWork.grid``; runtime extents cannot raise from the jit entry
-    point, so CUDA rejects the grid before any CTA runs (``CUDA launch failed:
-    cudaErrorInvalidValue (1)``, ``CUDA rejected the launch configuration before running the
-    kernel``).
+    ``"3d"`` and ``"2d"`` need plain ``Raster()`` and a launch on ``BoundWork.grid``. A space
+    past their limit cannot launch: static extents raise a ``ValueError`` from
+    ``BoundWork.grid``; runtime extents cannot raise from the jit entry point, so CUDA rejects
+    the grid before any CTA runs (``CUDA launch failed: cudaErrorInvalidValue (1)``, ``CUDA
+    rejected the launch configuration before running the kernel``).
 
     A wrapper that must cover every space selects the variant with
     ``OneShot(grid=OneShot.grid_for(space))``: at most three compiled kernels, and two when one
@@ -621,8 +620,8 @@ class TilePersistent(IndexSchedule):
     The stream's index is that axis coordinate, and ``total`` is the axis extent (0 for an empty
     space), so a ``Limit`` bounds the coordinate. Items are decoded without division: the words
     are ``blockIdx`` with the axis coordinate replaced. Needs the plain ``Raster()`` mapping, a
-    single-CTA cluster and no ``record``; ``n_tiles`` and ``l`` must fit ``gridDim.y``/``z``
-    unless that axis is the capped one.
+    single-CTA cluster; ``n_tiles`` and ``l`` must fit ``gridDim.y``/``z`` unless that axis is
+    the capped one.
     """
 
     axis: str = "m"
@@ -764,17 +763,15 @@ class WorkStream:
     ``ready``: readiness hook run once before the first decode, wherever decoding happens.
     ``scheduler_warp``: warp of a broadcast schedule's scheduler role; by default the lowest
     warp no role claims, usually a warpgroup padding warp. Local schedules normalize it to None.
-    ``record``: when > 0, every role and the scheduler log ``(index, %globaltimer_lo)`` for
-    their first ``record`` items per CTA into the workspace (see ``timeline``).
     """
 
     mapping: WorkMap = field(default_factory=Raster)
     schedule: IndexSchedule = field(default_factory=OneShot)
     ready: Readiness | None = None
     scheduler_warp: int | None = None
-    record: int = 0
     name: str = field(default="", init=False)
-    roles: list = field(default_factory=list, init=False)  # recording order (set by the layer)
+    # Its users in warp order, then its scheduler (set by the layer; describe() lists them).
+    roles: list = field(default_factory=list, init=False)
     # The declaring kernel (set on attribute assignment); its cluster fixes CTAs per work unit.
     owner: object = field(default=None, init=False, repr=False, compare=False)
     _workspaces: dict = field(default_factory=dict, init=False, repr=False)
@@ -807,27 +804,23 @@ class WorkStream:
             )
         if not self.schedule.broadcast:
             self.scheduler_warp = None
-        if type(self.record) is not int or self.record < 0:
-            raise ValueError(f"WorkStream.record must be a nonnegative int, got {self.record!r}")
         if self.schedule.broadcast and (
             type(self.schedule.stages) is not int or self.schedule.stages <= 0
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
         if isinstance(self.schedule, TilePersistent) and (
-            type(self.mapping) is not Raster or self.mapping != Raster() or self.record
+            type(self.mapping) is not Raster or self.mapping != Raster()
         ):
             raise ValueError(
                 f"{self.schedule.describe()} reads the item from blockIdx: it needs the plain "
-                f"Raster() mapping and no record, not {self.describe()}"
-                + (f" with record={self.record}" if self.record else "")
+                f"Raster() mapping, not {self.describe()}"
             )
         if isinstance(self.schedule, OneShot):
             grid = self.schedule.grid
             if grid in ("3d", "2d") and not _tile_grid(self):
                 raise ValueError(
                     f"OneShot(grid={grid!r}) reads the item from blockIdx: it needs OneShot "
-                    f"itself, the plain Raster() mapping and no record, not {self.describe()}"
-                    + (f" with record={self.record}" if self.record else "")
+                    f"itself and the plain Raster() mapping, not {self.describe()}"
                 )
             if grid == "1d" and type(self.mapping) is not Raster:
                 raise ValueError(
@@ -877,20 +870,17 @@ class WorkStream:
         """Compile-key fragment: only compile-time choices (never extents or SM counts)."""
         key = f"{self.schedule.get_key()}_{self.mapping.get_key()}"
         ready = f"_{self.ready.get_key()}" if self.ready else ""
-        return key + ready + (f"_rec{self.record}" if self.record else "")
+        return key + ready
 
     # ---- host, inside the @cute.jit entry point ---------------------------- #
 
     def bind(self, space, workspace=None, max_ctas=None, limit: Limit | None = None) -> BoundWork:
         """Bind the runtime space (``Raster``: ``(m_tiles, n_tiles, l)``). ``workspace``: the
-        int32 tensor from ``launch_args``, holding ``AtomicPersistent``'s counters and the
-        ``record`` log.
+        int32 tensor from ``launch_args``, holding ``AtomicPersistent``'s counters.
         ``max_ctas``: the runtime persistent grid cap, typically the SM count.
         ``limit``: a ``Limit`` read on the device that ends the stream early (local schedules)."""
         if workspace is None and self.schedule.uses_workspace:
             raise ValueError(f"{self.schedule.describe()} needs a workspace tensor")
-        if workspace is None and self.record:
-            raise ValueError("WorkStream(record=...) needs a workspace tensor")
         if limit is not None and not isinstance(limit, Limit):
             raise TypeError(
                 f"WorkStream.bind(limit=...) takes a Limit, got {type(limit).__name__}"
@@ -930,14 +920,12 @@ class WorkStream:
         """``(workspace, max_ctas)`` for the compiled entry point.
 
         One workspace is cached per (device, current stream): launches on one stream run in
-        order, so they may share it. A schedule that reads no workspace, without ``record``,
-        gets one placeholder per device, which the kernel never reads or writes.
+        order, so they may share it. A schedule that reads no workspace gets one placeholder per
+        device, which the kernel never reads or writes.
 
         ``max_ctas`` defaults to the CTAs of every cluster that can be resident at once (the SM
         count for one CTA; fewer for clusters that do not tile the GPCs), so a persistent grid
-        runs in one wave. With ``record``, ``max_ctas`` must cover the launch grid in CTAs
-        (CLC/OneShot: the item count times the cluster size); it is rounded up to whole
-        clusters.
+        runs in one wave.
         """
         import torch
 
@@ -946,16 +934,7 @@ class WorkStream:
         device = torch.device("cuda", index)  # "cuda" means the current device: cache by index
         sms = resident_ctas(index, self.cluster_size)
         words = 4
-        if self.record:
-            if not self.roles:
-                raise ValueError(
-                    "WorkStream(record=...) sizes its log by role count: compile the kernel "
-                    "(or call describe()) before launch_args()"
-                )
-            cs = self.cluster_size
-            ctas = -(-(max_ctas or sms) // cs) * cs  # the grid launches whole clusters
-            words += len(self.roles) * ctas * self.record * 2
-        if not self.schedule.uses_workspace and not self.record:
+        if not self.schedule.uses_workspace:
             # The kernel never touches it: one tensor per device serves every stream, and it is
             # only zeroed outside a capture, so a CUDA graph on a new stream records no fill.
             ws = self._workspaces.get(device)
@@ -967,11 +946,9 @@ class WorkStream:
             return ws, max_ctas or sms
         stream = torch.cuda.current_stream(device).cuda_stream
         ws = self._workspaces.get((device, stream))
-        if ws is None or ws.numel() < words:
+        if ws is None:
             ws = torch.zeros(words, dtype=torch.int32, device=device)
             self._workspaces[(device, stream)] = ws
-        if self.record:
-            ws[4:].fill_(-1)
         return ws, max_ctas or sms
 
     def assignment(self, space, max_ctas: int | None = None, decode=None) -> list[list[tuple]]:
@@ -1047,31 +1024,6 @@ class WorkStream:
                 index = int(schedule.next_index(index, problem))
             rows += [list(items) for _ in range(cs)]
         return rows
-
-    def timeline(self, workspace, ctas: int) -> dict:
-        """Decode a ``record`` workspace: ``{role: [[(index, t_ns), ...] per CTA]}`` with times
-        relative to the earliest event (``%globaltimer_lo`` wraps every ~4.3 s)."""
-        rec = (
-            workspace[4 : 4 + len(self.roles) * ctas * self.record * 2]
-            .view(len(self.roles), ctas, self.record, 2)
-            .cpu()
-            .long()
-        )
-        valid = rec[..., 0] >= 0
-        t = rec[..., 1] & 0xFFFFFFFF
-        t0 = t[valid].min() if valid.any() else 0
-        t = (t - t0) % (1 << 32)
-        out = {}
-        for r, name in enumerate(self.roles):
-            out[name] = [
-                [
-                    (int(rec[r, b, k, 0]), int(t[r, b, k]))
-                    for k in range(self.record)
-                    if valid[r, b, k]
-                ]
-                for b in range(ctas)
-            ]
-        return out
 
 
 def _tile_persistent_assignment(space, schedule, max_ctas) -> list[list[tuple]]:
@@ -1212,14 +1164,11 @@ class BoundWork:
         new.first_words = getattr(self, "first_words", None)
         return new
 
-    def _uses_workspace(self) -> bool:
-        return self.stream.schedule.uses_workspace or bool(self.stream.record)
-
     def __extract_mlir_values__(self):
         values = cutlass.extract_mlir_values(self.space)
         if not isinstance(self.total, int):  # a static total stays a constant
             values += cutlass.extract_mlir_values(self.total)
-        if self._uses_workspace():
+        if self.stream.schedule.uses_workspace:
             values += cutlass.extract_mlir_values(self.workspace)
         if self.limit is not None:
             values += cutlass.extract_mlir_values(self.limit)
@@ -1232,7 +1181,7 @@ class BoundWork:
         if not isinstance(total, int):
             total, n = Int32(values[n]), n + 1
         ws = None
-        if self._uses_workspace():
+        if self.stream.schedule.uses_workspace:
             k = len(cutlass.extract_mlir_values(self.workspace))
             ws, n = cutlass.new_from_mlir_values(self.workspace, values[n : n + k]), n + k
         limit = None
@@ -1460,17 +1409,12 @@ def _check_single_item(stream):
 
 def _check_plain(stream, method: str):
     """``BoundWork``'s device methods serve kernels without roles: the roles of a
-    ``WarpSpecialized`` kernel share the prologue's start values and the loop checks, and
-    ``record`` logs per role."""
+    ``WarpSpecialized`` kernel share the prologue's start values and the loop checks."""
     if stream.owner is not None:
         raise ProtocolError(
             f"BoundWork.{method}() is for kernels without roles; roles of "
             f"{type(stream.owner).__name__} take `{stream.name}: WorkCursor` or call "
             f"self.{stream.name}.single_item()"
-        )
-    if stream.record:
-        raise ProtocolError(
-            f"BoundWork.{method}(): WorkStream(record=...) logs per role; declare roles"
         )
 
 
@@ -1485,17 +1429,6 @@ def _single_item(stream, problem):
         # of the count alone, with no index to compute.
         valid = problem.total > 0
     return valid, stream.mapping.unpack(words)
-
-
-@cute.jit
-def _record(workspace, slot, index, total, count, cap: int):
-    role, warp = slot
-    first_lane = (cute.arch.lane_idx() == 0) & (cute.arch.warp_idx() == warp)
-    if first_lane & (index < total) & (count < cap):
-        bidx, _, _ = cute.arch.block_idx()
-        off = 4 + ((role * cute.arch.grid_dim()[0] + bidx) * cap + count) * 2
-        workspace[off] = index
-        workspace[off + 1] = cute.arch.globaltimer_lo()
 
 
 @dataclass
@@ -1686,7 +1619,6 @@ def _tile_grid(stream) -> bool:
         and mapping.along == "m"
         and mapping.swizzle == 1
         and not mapping.reverse
-        and not stream.record  # the recording log indexes CTAs by blockIdx.x
     )
 
 
@@ -1708,24 +1640,22 @@ class WorkCursor:
     scheduler warp), and, in broadcast mode, the role's consumer end of the work ring.
     """
 
-    def __init__(self, stream, problem, end, index, words, rec, count=None, slot=None, state=None):
+    def __init__(self, stream, problem, end, index, words, rec, state=None):
         self._stream, self._problem, self._end, self._rec = stream, problem, end, rec
         self.index, self._words = index, words
-        self._count, self._slot = count, slot  # recording: items seen, (role ordinal, warp)
         self._state = state  # WorkMap.decode state of a decoding cursor (None: stateless)
         self._copy = rec.lineage.add()
 
     @staticmethod
-    def create(stream, problem, end, trace, *, scheduler: bool = False, slot=None):
+    def create(stream, problem, end, trace, *, scheduler: bool = False):
         """Local mode (``end`` is None): run the hooks and decode here. Broadcast mode: decode
         ``first_index`` locally (a pure any-index mapping without hooks), or receive the first
         item from the scheduler, which publishes it in ``scheduler_role``. In broadcast mode
         only the scheduler's cursor keeps a decode state."""
         rec = _CursorRecord(trace.role_name, stream.name or "work", trace=trace)
         trace.checks.append(rec.check)
-        count = Int32(0) if stream.record else None
         first = Int32(stream.schedule.first_index(problem))
-        cur = WorkCursor(stream, problem, end, first, (), rec, count, slot)
+        cur = WorkCursor(stream, problem, end, first, (), rec)
         if end is None:
             cur._problem, cur.index, cur._words, cur._state = _local_start(stream, first, problem)
         elif not _publishes_first(stream):
@@ -1745,25 +1675,13 @@ class WorkCursor:
         return cur
 
     def _enter_item(self):
-        """Bookkeeping at the start of each item: the record log and the item's trace range."""
-        if self._count is not None:
-            _record(
-                self._problem.workspace,
-                self._slot,
-                self.index,
-                self._problem.total,
-                self._count,
-                self._stream.record,
-            )
-            self._count = self._count + 1
+        """Bookkeeping at the start of each item: the item's trace range."""
         trace = self._rec.trace
         if trace.ranges is not None:  # one range per work item, named after the role
             push_if(trace.ranges, self.index < self._problem.total, trace.role_name)
 
     def __extract_mlir_values__(self):
         values = [self.index.ir_value()] + [w.ir_value() for w in self._words]
-        if self._count is not None:
-            values.append(self._count.ir_value())
         if self._state is not None:
             values += cutlass.extract_mlir_values(self._state)
         if self._end is not None:
@@ -1773,9 +1691,6 @@ class WorkCursor:
     def __new_from_mlir_values__(self, values):
         n = 1 + len(self._words)
         words = tuple(Int32(v) for v in values[1:n])
-        count = None
-        if self._count is not None:
-            count, n = Int32(values[n]), n + 1
         state = None
         if self._state is not None:
             k = len(cutlass.extract_mlir_values(self._state))
@@ -1788,8 +1703,6 @@ class WorkCursor:
             Int32(values[0]),
             words,
             self._rec,
-            count,
-            self._slot,
             state,
         )
 
@@ -1858,11 +1771,10 @@ class WorkCursor:
 
         Instead of ``while work.valid: ...; work.advance()``, for a local ``StaticPersistent``
         or ``TilePersistent`` stream whose mapping keeps every item, decodes any index and keeps
-        no decode state (``Raster``), without ``record``. Item ``k`` is index
-        ``first + k * stride``; the count is ``ceil((end - first) / stride)``, or 0 when the
-        first index is already terminal, with ``end`` the total or the limit. A cursor runs in
-        one mode: ``advance()`` on a counted cursor, or ``trip_count()`` on an advanced one,
-        raises at trace time.
+        no decode state (``Raster``). Item ``k`` is index ``first + k * stride``; the count is
+        ``ceil((end - first) / stride)``, or 0 when the first index is already terminal, with
+        ``end`` the total or the limit. A cursor runs in one mode: ``advance()`` on a counted
+        cursor, or ``trip_count()`` on an advanced one, raises at trace time.
         """
         self._check_current()
         stream, rec = self._stream, self._rec
@@ -1875,8 +1787,6 @@ class WorkCursor:
             why = f"{type(stream.mapping).__name__} does not decode every index unguarded"
         elif self._state is not None:
             why = f"{type(stream.mapping).__name__} keeps a decode state"
-        elif stream.record:
-            why = "WorkStream(record=...) logs per advance()"
         elif rec.advances:
             why = f"it already advances at {rec.advances[0][0]}"
         elif rec.counted:

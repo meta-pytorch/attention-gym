@@ -521,7 +521,6 @@ def test_oneshot_grid_is_a_static_choice():
             {"mapping": Raster(along="n")},
             {"mapping": Raster(reverse="m")},
             {"mapping": SkipOdd()},
-            {"record": 2},
             {"schedule": Shifted(grid=grid)},
         ):
             with pytest.raises(ValueError, match=rf"OneShot\(grid='{grid}'\) reads the item"):
@@ -801,10 +800,6 @@ def test_plain_kernel_access_rejections():
         with pytest.raises(ProtocolError, match="is for kernels without roles"):
             method()
     workspace = object()  # never read: the checks run first
-    recorded = WorkStream(schedule=OneShot(), record=2).bind((2, 2, 1), workspace)
-    for method in (recorded.single_item, recorded.cursor):
-        with pytest.raises(ProtocolError, match=r"record=\.\.\.\) logs per role"):
-            method()
     for schedule in (AtomicPersistent(), ClusterLaunchControl()):
         bound = WorkStream(schedule=schedule).bind((2, 2, 1), workspace, 4)
         with pytest.raises(ProtocolError, match="cursor\\(\\) needs a local schedule"):
@@ -1351,8 +1346,6 @@ def test_tile_persistent_rejections():
     for mapping in (Raster(swizzle=2), Raster(along="n"), SkipOdd()):
         with pytest.raises(ValueError, match="plain Raster"):
             WorkStream(mapping=mapping, schedule=TilePersistent("m"))
-    with pytest.raises(ValueError, match="no record"):
-        WorkStream(schedule=TilePersistent("m"), record=2)
     for max_ctas in (4, Int32(4)):  # a static l past gridDim.z raises with any cap
         bound = WorkStream(schedule=TilePersistent("n")).bind((2, 3, 70000), None, max_ctas)
         with pytest.raises(ValueError, match="gridDim.y/z are limited"):

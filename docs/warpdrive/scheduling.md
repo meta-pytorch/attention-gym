@@ -127,8 +127,8 @@ graph replay. It is not a statement that all earlier item computations have fini
 stream can share it; different streams get separate workspaces. Never share one between
 concurrent launches: their claims and resets would interfere.
 
-Without `record`, schedules that use no workspace (`OneShot`, `StaticPersistent`,
-`TilePersistent`, CLC) receive one placeholder per device. The kernel never accesses it; graph
+Schedules that use no workspace (`OneShot`, `StaticPersistent`, `TilePersistent`, CLC)
+receive one placeholder per device. The kernel never accesses it; graph
 capture on a new stream therefore records no fill.
 
 ## Built-in schedule details
@@ -158,7 +158,7 @@ steps through chunks by `gridDim.y`, without division.
 The axis can be `"m"`, `"n"` or `"l"`. `max_ctas` caps that axis per slice of the other two,
 not the total CTA count. The stream index is the axis coordinate and `total` is its extent,
 so a [limit](#a-device-read-limit) bounds that coordinate. This schedule needs plain
-`Raster()`, a single-CTA cluster and no `record`.
+`Raster()` and a single-CTA cluster.
 
 `TilePersistent(axis, units=n)` fixes the grid's axis extent and stride at compile time.
 CTAs past the work extent run nothing; `max_ctas` is ignored. Bucket `n` to bound the number
@@ -168,7 +168,7 @@ of compiled variants.
 
 To unroll work across items, use a counted loop. `while work.valid` lowers to `scf.while`
 and cannot use `cutlass.range(..., unroll=n)`. The counted form supports local
-`StaticPersistent` or `TilePersistent` streams over `Raster()` without `record`: the mapping
+`StaticPersistent` or `TilePersistent` streams over `Raster()`: the mapping
 must keep every item, decode any index and carry no state.
 
 ```python
@@ -226,7 +226,7 @@ a static grid. The table shows single-CTA grids; clusters multiply x by `cluster
 | `"2d"` | `(m_tiles * l, n_tiles, 1)`; needs `n_tiles` <= 65535 | `n` is `blockIdx.y`; `l` and `m` from `blockIdx.x` with one division |
 | `"1d"` | 1-D only | Always decoded: two divisions for `Raster()` |
 
-`"3d"` and `"2d"` need plain `Raster()` without `record` and a launch on
+`"3d"` and `"2d"` need plain `Raster()` and a launch on
 `bound.grid()`. `OneShot.grid_for((m_tiles, n_tiles, l))` returns the cheapest grid that
 launches a space given as Python ints, so a wrapper picks the variant before compiling:
 `"3d"` when `n_tiles` and `l` fit, `"2d"` when only `n_tiles` does, else `"1d"`.
@@ -273,7 +273,7 @@ which CUDA rejects instead of running wrapped work. A hand-built grid is your re
 The failed launch leaves no sticky CUDA error, but invalidates active CUDA-graph capture.
 
 Raster runtime extents become Int32 before binding; passing wider values cannot enlarge the
-supported space. Custom mapping arithmetic, `record` offsets and other launch resources must
+supported space. Custom mapping arithmetic and other launch resources must
 independently fit Int32 and CUDA limits.
 
 ## Custom mappings
@@ -560,7 +560,6 @@ Both methods raise `ProtocolError` for:
 
 - a stream declared on a `WarpSpecialized` kernel (its roles take a `WorkCursor` or call
   `self.work.single_item()`);
-- `WorkStream(record=...)`, which logs per role;
 - a broadcast schedule (`AtomicPersistent`, `ClusterLaunchControl`), which needs a scheduler
   warp and a work ring;
 - `single_item()` with a persistent schedule.

@@ -271,7 +271,7 @@ def compile_kernel(op: MyKernel):
 `op.__cute_cache_key__()` includes:
 
 - The constructor call, with defaults filled in and its arguments copied/frozen for the key.
-- Cluster and each work stream's schedule, mapping, readiness, recording and scheduler warp.
+- Cluster and each work stream's schedule, mapping, readiness and scheduler warp.
 - The trace settings that change the code (`enable_trace`'s backend, and its `waits` and
   `events_per_role` where they apply), `trace_protocol`, `alias_check`, and resolved roles.
 - Source of the modules defining the kernel, cluster and stream-component classes, including
