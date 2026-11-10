@@ -60,15 +60,13 @@ capped at `max_ctas` units, so `max_ctas` caps the units along the axis (per sli
 two), not the CTA count. Each CTA keeps the other two coordinates from `blockIdx`, with no
 division, and walks its axis coordinate by `gridDim[axis]`. The stream's index is that
 coordinate and `total` the axis extent, so a [limit](#a-device-read-limit) bounds the
-coordinate. A hand-built grid that persists along one axis and folds another into x, such as
-`(workers * pairs, heads)` with `x = worker * pairs + pair`, keeps its CTA order as
-`TilePersistent("n")` over `(pairs, chunks, heads)`: the launch is `(pairs, workers, heads)`,
-and `assignment()` lists the same items per CTA. It needs a single-CTA cluster and no `record`.
+coordinate. `TilePersistent("n")` over `(pairs, chunks, heads)` launches
+`(pairs, workers, heads)`, with `workers` at most `max_ctas`. It needs a single-CTA cluster and
+no `record`.
 
 `TilePersistent(axis, units=n)` fixes the grid's axis extent at `n` instead (CTAs past the axis
 extent run nothing, and `max_ctas` is not read), which makes the stride a compile-time constant.
-A register-heavy loop can need that: KDA K4b ran 2% slower with a `gridDim` stride in a counted
-loop and 11% slower in an `scf.for`. It specializes the kernel on `n`, so bucket it.
+A register-heavy loop can need that. It specializes the kernel on `n`, so bucket it.
 
 Atomic claims are unique but have no fixed inter-unit order. CLC recovers the canceled
 work index from its CTA x coordinate divided by cluster size. It waits for every cancellation
@@ -212,8 +210,8 @@ also supported for this path. Other built-in combinations use 1-D grids.
 
 That is `OneShot(grid="auto")`: one kernel for both grids, with a prologue branch on the launch
 shape. The branch merges `blockIdx` with a decoded index, so the item, and every address and
-predicate computed from it, leaves the uniform datapath (a pointwise kernel measured 4-5%
-slower). When that matters, make the grid a static choice:
+predicate computed from it, leaves the uniform datapath, which slows a pointwise kernel
+noticeably. When that matters, make the grid a static choice:
 
 | `OneShot(grid=...)` | Launch grid | Item |
 |---|---|---|

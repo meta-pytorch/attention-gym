@@ -305,7 +305,7 @@ themselves. An exclusive consumer may skip it:
 ```
 
 The ownership report names the first wait needing this rendezvous, but inserts no handshake.
-Dynamic schedules leave the check to you. A three-stage test toy hangs without that rendezvous.
+Dynamic schedules leave the check to you; a consumer that skips the rendezvous can hang.
 
 The alias diagnostic checks an exclusive ring's same-stage release/reuse edge: its consumers
 are not an unordered fan-out. It cannot match owners across channels, so paths through this
@@ -570,7 +570,7 @@ Both closes accept `signal=False`, and a span is otherwise a handle: `index`, `p
 Acquiring before the loop is the simpler form when the role has nothing else to do first;
 unrolling the loop with `cutlass.range_constexpr` and an ordinary handle is another. A span
 keeps the loop dynamic and the wait late: in WY, taking the four accumulators before the V
-loop measured 6-12% slower, and unrolling it 27-37% slower (the MMA warp spilled).
+loop is slower, and unrolling it spills the MMA warp.
 
 Tracing checks, and raises `ProtocolError` otherwise:
 

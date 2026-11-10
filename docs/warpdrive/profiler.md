@@ -212,8 +212,8 @@ a ring's reuse distance with `depth + 1`, which matches one use per iteration on
 
 `report(timeline, measured, analysis, range_overhead_ns=None)` renders per-role region medians
 over the interior iterations, one iteration's timeline in ns, and the scheduler findings; pass
-`summary.IKET_RANGE_OVERHEAD_NS` (~50 ns per IKET push/pop on GB200) to flag regions dominated
-by instrumentation.
+`summary.IKET_RANGE_OVERHEAD_NS` (the cost of one IKET push/pop pair) to flag regions
+dominated by instrumentation.
 
 ### Annotated kernels
 
