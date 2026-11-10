@@ -21,6 +21,7 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 - `flex_attention/` — masks/score mods, notebooks, MLA, paged/ring attention, and runtime integration
 - `linear/` — KDA/GDN training, context parallelism, and decoding
 - `sparse/` — compressed sparse attention, VSA, and FastWan integration
+- `profiler/` — intra-kernel profiler recordings on small CuTeDSL kernels
 
 Keep variant-specific names in filenames rather than adding nested example directories.
 

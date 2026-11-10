@@ -1,20 +1,30 @@
-# Intra-Kernel Profiling for CUTE DSL
+# Profiler
 
-Record code regions **inside** GPU kernels, decode them into ranges, analyze them against a
-pipeline plan, and export native [Perfetto](https://ui.perfetto.dev/) traces.
+[Back to warpdrive](index.md)
+
+`attn_gym.warpdrive.profiler` records code regions **inside** a CuTeDSL kernel, decodes them
+into ranges, analyzes them against a pipeline plan, and exports native
+[Perfetto](https://ui.perfetto.dev/) traces. A warpdrive kernel gets its ranges from
+[`enable_trace`](tracing.md#tracing-backends) without hand-placed regions; this page covers the
+recorders and analysis underneath, which any CuTeDSL kernel can use directly.
 
 > Inspired by [gau-nernst's intra-kernel profiling for AMD MI300X](https://gau-nernst.github.io/amd-a2a/#intra-kernel-profiling)
 
-## Quick Start
+## Quick start
 
 ```python
-from cutlass import Int32
+import cutlass
+from cutlass import Int32, cute
+
 from attn_gym.warpdrive.profiler import (
     compact_anchor_init,
     compact_profile_region,
     profile_session,
     summarize_by_tag,
 )
+
+TAG_COMPUTE = 0  # the position of "compute" in tag_names
+
 
 @cute.kernel
 def my_kernel(output, prof_buf, max_events):
@@ -24,6 +34,7 @@ def my_kernel(output, prof_buf, max_events):
         with compact_profile_region(prof_buf, max_events, Int32(TAG_COMPUTE), bidx, Int32(i)):
             compute_something()
 
+
 with profile_session(
     max_events_per_unit=4,
     num_units=(num_blocks, "Block"),
@@ -32,12 +43,16 @@ with profile_session(
     compact=True,
     expected_events_per_unit=4,
 ) as session:
-    my_kernel(output, session.prof.tensor, session.prof.max_events_per_unit)
+    # `compiled` is the compiled entry point that launches my_kernel.
+    compiled(output, session.prof.tensor, session.prof.max_events_per_unit)
 
 print(summarize_by_tag(session.ranges)["compute"])
 ```
 
-`session.ranges` is set after the block exits.
+A tag is its name's position in `tag_names`; `session.tags.id("compute")` returns it for a
+kernel that takes the tag as an argument. `session.ranges` is set after the block exits.
+[`warp_specialized_static.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/warp_specialized_static.py)
+is a complete script of this shape.
 
 ## One model, two recorders
 
@@ -97,7 +112,7 @@ on your kernel, compile it with `enabled=False` and `True`, as
 `event_stop(buf, unit_id, event_idx, start_ns, tag, warp, max_events, payload=None)` (with
 `read_globaltimer()` for the start) stores a 32-byte record: 64-bit start and duration, the tag
 word, and the warp. It is unguarded: the caller elects the recording thread and keeps the slot
-in range. Warpdrive's globaltimer backend records these, since its ranges need a warp, a
+in range. The globaltimer backend of warpdrive records these, since its ranges need a warp, a
 payload (a work item's index) and durations past 2^24 ns.
 
 ## Statistics and traces
@@ -135,7 +150,8 @@ used by the pipeline trace; the `perfetto` package is imported only when a trace
 ## Worked example
 
 [`examples/profiler/cute_profiler_buffering.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/cute_profiler_buffering.py)
-(`python examples/profiler/cute_profiler_buffering.py --trace-dir DIR`) compares two otherwise identical warp-specialized kernels: one shared-memory stage forces
+(`python examples/profiler/cute_profiler_buffering.py --trace-dir DIR`) compares two otherwise
+identical warp-specialized kernels: one shared-memory stage forces
 `load i -> wait i -> compute/store i -> release i -> load i+1`; two stages let the producer load
 tile `i + 1` while the consumer works on tile `i`. The example records compact shared-memory
 ranges for one sampled CTA, joins them to the kernel's pipeline plan (stage reuse is a
@@ -268,13 +284,23 @@ full    (R = 4):  slice[0]     = unused
                   slice[1 + 4*i + 3] = warp
 ```
 
-Importing `attn_gym.warpdrive.profiler` loads the device recorders (`attn_gym/warpdrive/profiler/ops.py`) eagerly, and
-they import CuTeDSL, so host-only analysis still needs `cutlass` installed. Host code (decoding,
-statistics, trace writers) loads on first use.
+Importing `attn_gym.warpdrive.profiler` loads the device recorders
+(`attn_gym/warpdrive/profiler/ops.py`) eagerly, and they import CuTeDSL, so host-only analysis
+still needs `cutlass` installed. Host code (decoding, statistics, trace writers) loads on first
+use.
 
 ## Examples
 
-The profiler's users in this repository:
+Scripts under `examples/profiler/`, each runnable as `python examples/profiler/<name>.py`:
+
+- [`cute_profiler_buffering.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/cute_profiler_buffering.py):
+  the worked example above, compact smem ranges joined to a pipeline plan.
+- [`measure_profiler_overhead.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/measure_profiler_overhead.py):
+  the same kernel compiled with `enabled=False` and `True`.
+- [`warp_specialized_static.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/warp_specialized_static.py):
+  one region per warp role, compact gmem records in static slots.
+
+The profiler's users elsewhere in this repository:
 
 - [`attn_gym/warpdrive/tracing.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/tracing.py) and
   [`trace_session.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/trace_session.py): warpdrive's globaltimer
@@ -287,15 +313,3 @@ The profiler's users in this repository:
   capture CLI above, from `run-iket` to the enriched trace and report.
 - [`test/profiler/`](https://github.com/meta-pytorch/attention-gym/blob/main/test/profiler): compact gmem/smem recording, statistics and the
   pipeline analysis on small kernels.
-
-- [`examples/profiler/cute_profiler_buffering.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/cute_profiler_buffering.py):
-  the worked example above, compact smem ranges joined to a pipeline plan.
-- [`examples/profiler/measure_profiler_overhead.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/measure_profiler_overhead.py):
-  the same kernel compiled with `enabled=False` and `True`.
-
-- [`examples/profiler/warp_specialized_static.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/profiler/warp_specialized_static.py):
-  one region per warp role, compact gmem records in static slots.
-
-A sampled-CTA SGEMM with a custom trace layout
-([`cute_sgemm_profile.py`](https://github.com/drisspg/transformer_nuggets/blob/main/examples/cute_sgemm_profile.py))
-profiles transformer_nuggets' own SGEMM kernel and stays there.
