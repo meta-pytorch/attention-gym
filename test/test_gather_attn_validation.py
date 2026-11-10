@@ -196,12 +196,14 @@ def test_local_kv_heads_must_match_sparse_kv(inputs):
         gather_attn(**inputs, impl=Impl.REFERENCE)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("case", ["separate_values", "grouped_heads"])
-def test_fused_rejects_separate_values_and_grouped_heads(inputs, case):
-    """Fused kernels do not implement these yet; they must not silently compute MQA/MHA."""
+def test_cute_rejects_separate_values_and_grouped_heads(inputs, case):
+    """FA4's gather path is MLA-only; it must not silently compute shared-KV MQA."""
     call = {**inputs, **_values(inputs)} if case == "separate_values" else _grouped(inputs)
-    with pytest.raises(ValueError, match="fused gather_attn requires keys that are also"):
-        gather_attn(**call, impl=Impl.FUSED)
+    call = {name: tensor.cuda() for name, tensor in call.items()}
+    with pytest.raises(ValueError, match="CuTe gather_attn backend requires keys that are"):
+        gather_attn(**call, kernel_options={"backend": "cute"})
 
 
 @pytest.mark.usefixtures("fresh_compile_cache")
