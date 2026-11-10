@@ -53,11 +53,33 @@ def _deterministic_algorithms(enabled):
         torch.use_deterministic_algorithms(was_enabled, warn_only=was_warn_only)
 
 
+def _force_mode(monkeypatch, mode):
+    """Pick the sparse dK/dV kernel: query-major atomics, key-major, or deterministic mode.
+
+    The density heuristic prefers atomics in deterministic mode too, so only the
+    deterministic override keeps that mode key-major. Each mode fails the test if the other
+    kernel runs: the atomic launch, or the key-major map build.
+    """
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError(f"{mode} mode ran the other sparse dK/dV kernel")
+
+    class ForbiddenLaunch:
+        def __getitem__(self, grid):
+            return forbidden
+
+    monkeypatch.setattr(backward, "_prefer_atomic_dsparse_kv", lambda *args: mode != "key-major")
+    if mode == "atomic":
+        monkeypatch.setattr(backward, "build_tile_query_map", forbidden)
+    else:
+        monkeypatch.setattr(backward, "BWD_DSPARSE_KV_SHARED_ATOMIC", ForbiddenLaunch())
+
+
 def _assert_matches_reference(inputs, mode, *, grad_output=None, **options):
     """Bound Triton output, LSE, and every input gradient by bf16 reference error vs FP64.
 
-    Triton runs in real deterministic mode for ``deterministic``, and a second run must be
-    bitwise equal in both modes.
+    Triton runs in real deterministic mode for ``deterministic``. Without atomics (every mode
+    but ``atomic``) a second run must be bitwise equal.
     """
     leaves = _differentiable_leaves(inputs)
     high_precision_inputs = {
@@ -121,12 +143,13 @@ def _assert_matches_reference(inputs, mode, *, grad_output=None, **options):
             gradient_reductions,
             quantized_intermediates=2 if name == "attention_sink" else 0,
         )
-    for first, second in zip(actual[2], repeat, strict=True):
-        assert torch.equal(first, second)
+    if mode != "atomic":
+        for first, second in zip(actual[2], repeat, strict=True):
+            assert torch.equal(first, second)
 
 
 @pytest.mark.usefixtures("nan_filled_empty")
-@pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize("mode", ["atomic", "key-major", "deterministic"])
 @pytest.mark.parametrize(
     "heads,kv_heads,head_dim,separate_values,documents,window,topk",
     [
@@ -153,7 +176,7 @@ def _assert_matches_reference(inputs, mode, *, grad_output=None, **options):
     ],
 )
 def test_grouped_matches_reference(
-    heads, kv_heads, head_dim, separate_values, documents, window, topk, mode
+    monkeypatch, heads, kv_heads, head_dim, separate_values, documents, window, topk, mode
 ):
     """Forward and every gradient match for each query-head group, including masked head tiles.
 
@@ -162,6 +185,7 @@ def test_grouped_matches_reference(
     query positions past the last document. Groups of 48 span several head blocks per KV
     head in the forward (D=256) or the backward (D=64). Fresh buffers start as NaN.
     """
+    _force_mode(monkeypatch, mode)
     inputs = make_gather_attn_test_inputs(
         heads=heads,
         kv_heads=kv_heads,
@@ -276,7 +300,7 @@ def _planned_tile_spans(inputs, options):
 
 
 @pytest.mark.usefixtures("nan_filled_empty")
-@pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize("mode", ["atomic", "key-major", "deterministic"])
 @pytest.mark.parametrize(
     "heads,kv_heads,head_dim,separate_values,packed",
     [
@@ -307,6 +331,7 @@ def test_dense_tiles_match_reference(
     3 and 48 leave part of each 128-row tile empty; D=192 pads the head tile. Every dense kernel
     must run.
     """
+    _force_mode(monkeypatch, mode)
     launches = _spy_dense_launches(monkeypatch)
     inputs, options = _dense_tile_inputs(
         heads, kv_heads, head_dim, separate_values, packed, all_dense, spans
@@ -344,7 +369,7 @@ def _qsa_indices(document_lengths, budget_blocks, generator):
 
 
 @pytest.mark.usefixtures("nan_filled_empty")
-@pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize("mode", ["atomic", "key-major", "deterministic"])
 @pytest.mark.parametrize("heads,kv_heads", [(24, 2), (12, 1)], ids=["24-2", "12-1"])
 def test_qsa_block_selections_match_reference(monkeypatch, heads, kv_heads, mode):
     """QSA's regime at reduced size: D=256, one pool for local and sparse keys and values, no
@@ -353,6 +378,7 @@ def test_qsa_block_selections_match_reference(monkeypatch, heads, kv_heads, mode
     Early queries' tiles go dense over 20-word bitmaps; later queries select past the bitmap
     and gather, so the key-major map inverts thousands of distinct keys.
     """
+    _force_mode(monkeypatch, mode)
     launches = _spy_dense_launches(monkeypatch)
     document_lengths = [1024, 512]
     inputs = make_gather_attn_test_inputs(
@@ -384,7 +410,7 @@ def _misaligned(tensor):
 
 
 @pytest.mark.usefixtures("nan_filled_empty")
-@pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize("mode", ["atomic", "key-major", "deterministic"])
 @pytest.mark.parametrize(
     "base,variant",
     [
@@ -417,6 +443,7 @@ def test_grouped_input_variants_match_reference(monkeypatch, base, variant, mode
     """
     from attn_gym.sparse.gather_attn.impl.triton import primitives
 
+    _force_mode(monkeypatch, mode)
     launches = _spy_dense_launches(monkeypatch)
     if base == "dense":
         inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
@@ -497,6 +524,7 @@ _TUNER_CASES = {
         (forward._FWD_GROUPED, _GATHER_ARGS),
         (shared_backward.BWD_DQ_GROUPED, _GATHER_ARGS),
     ),
+    "atomic": _valid_candidates((backward.BWD_DSPARSE_KV_SHARED_ATOMIC, _GATHER_ARGS)),
     "dense": _valid_candidates(
         (forward._FWD_DENSE, _DENSE_ARGS),
         (forward._FWD_GROUPED, _DENSE_ARGS),
@@ -516,14 +544,15 @@ _TUNER_CASES = {
     ],
 )
 @pytest.mark.usefixtures("nan_filled_empty")
-def test_every_tuner_config_matches_reference(case):
+def test_every_tuner_config_matches_reference(monkeypatch, case):
     """Every grouped tuner candidate is correct, not only the first: the ``tuner_config``
     marker pins each tuner to that index of its valid candidates (see
     ``gather_attn_single_config``), and each case runs as many indices as its largest valid
     candidate list, so shorter lists repeat but none is skipped.
 
-    ``gather`` (D=128, a window, top-k 64) covers the gather forward, dQ, and dK/dV
-    candidates, and ``dense`` (D=256) the dense-tile kernels' and the D=256 gather candidates.
+    ``gather`` (D=128, a window, top-k 64) covers the gather forward and dQ candidates,
+    ``atomic`` the atomic dK/dV candidates, and ``dense`` (D=256) the dense-tile kernels' and
+    the D=256 gather candidates.
     """
     if case == "dense":
         inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "long")
@@ -545,20 +574,24 @@ def test_every_tuner_config_matches_reference(case):
     assert inputs["kv_indices"].shape[-1] == counted["TOPK"]
     assert inputs["query"].shape[-1] == counted["D"]
     assert options["sliding_window_size"] == counted["WINDOW"]
-    _assert_matches_reference(inputs, "default", **options)
+    mode = "atomic" if case == "atomic" else "key-major"
+    _force_mode(monkeypatch, mode)
+    _assert_matches_reference(inputs, mode, **options)
 
 
-@pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize("mode", ["atomic", "deterministic"])
 @pytest.mark.parametrize("base", ["dense", "window"])
-@torch.no_grad()
-def test_grouped_cuda_graph_replays_new_inputs(base, mode):
-    """The forward captures into a CUDA graph, so it reads nothing back to the host (a host
-    read fails capture), and a replay on new values and selections matches eager bitwise.
+def test_grouped_cuda_graph_replays_new_inputs(monkeypatch, base, mode):
+    """Capture into one CUDA graph, which reads nothing back to the host (a host read fails
+    capture), and replay on new values and selections to match eager.
 
-    Only the forward is captured here. Shifting every query's selections to its neighbour,
-    plus a repeat in the first query, changes which tiles are dense, so nothing sized at
-    capture may depend on them.
+    Atomic mode captures the forward and backward; deterministic mode, which keeps the
+    key-major dK/dV, captures only the forward here. Shifting every query's selections to its
+    neighbour, plus a repeat in the first query, changes which tiles are dense, so nothing
+    sized at capture may depend on them. ``window`` adds the local dK/dV kernel. Only atomic
+    sparse dK/dV may differ, by FP32 summation order.
     """
+    _force_mode(monkeypatch, mode)
     if base == "dense":
         inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
     else:
@@ -575,10 +608,16 @@ def test_grouped_cuda_graph_replays_new_inputs(base, mode):
         )
         options = {"sliding_window_size": 19}
     options["kernel_options"] = {"backend": "triton"}
+    leaves = _differentiable_leaves(inputs)
+    grad_output = torch.randn_like(inputs["query"])
+    with_backward = mode == "atomic"
 
     def step():
-        output, aux = gather_attn(**inputs, **options, return_aux=AuxRequest(lse=True))
-        return output, aux.lse
+        if with_backward:
+            return _run(inputs, leaves, grad_output, **options)
+        with torch.no_grad():
+            output, aux = gather_attn(**inputs, **options, return_aux=AuxRequest(lse=True))
+        return output, aux.lse, ()
 
     with _deterministic_algorithms(mode == "deterministic"):
         # Warm up (compile and tune) on a side stream, as CUDA graph capture requires.
@@ -590,14 +629,15 @@ def test_grouped_cuda_graph_replays_new_inputs(base, mode):
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = step()
-        for tensor in inputs.values():
-            if tensor is not None and tensor.is_floating_point():
+        with torch.no_grad():
+            for _, tensor in leaves:
                 tensor.copy_(torch.randn_like(tensor))
-        replay_indices = inputs["kv_indices"].roll(1, dims=1)
-        replay_indices[:, 0, 1] = replay_indices[:, 0, 0]
-        if base == "dense":
-            captured_plan = _planned_tile_spans(inputs, options)[..., 1] >= 0
-        inputs["kv_indices"].copy_(replay_indices)
+            grad_output.copy_(torch.randn_like(grad_output))
+            replay_indices = inputs["kv_indices"].roll(1, dims=1)
+            replay_indices[:, 0, 1] = replay_indices[:, 0, 0]
+            if base == "dense":
+                captured_plan = _planned_tile_spans(inputs, options)[..., 1] >= 0
+            inputs["kv_indices"].copy_(replay_indices)
         if base == "dense":
             assert not torch.equal(
                 captured_plan, _planned_tile_spans(inputs, options)[..., 1] >= 0
@@ -605,8 +645,18 @@ def test_grouped_cuda_graph_replays_new_inputs(base, mode):
         graph.replay()
         expected = step()
     torch.cuda.synchronize()
-    for actual, reference in zip(captured, expected, strict=True):
-        assert torch.equal(actual, reference)
+    names = ["output", "lse", *(name for name, _ in leaves if with_backward)]
+    for name, actual, reference in zip(
+        names,
+        (captured[0], captured[1], *captured[2]),
+        (expected[0], expected[1], *expected[2]),
+        strict=True,
+    ):
+        if mode == "atomic" and name in ("sparse_kv", "sparse_v"):
+            # One bf16 rounding of a reordered FP32 sum.
+            torch.testing.assert_close(actual, reference, atol=1e-5, rtol=2**-7)
+        else:
+            assert torch.equal(actual, reference), name
 
 
 @pytest.mark.parametrize("heads,kv_heads", [(16, 1), (4, 4), (24, 2)], ids=["mqa", "mha", "gqa"])
@@ -804,7 +854,8 @@ def test_tile_query_map_counts_every_valid_selection(packed, dtype, dense, wide_
     "separate_values", [False, True], ids=["shared-values", "separate-values"]
 )
 @pytest.mark.parametrize("path", ["gather", "dense"])
-def test_unselected_keys_get_zero_gradients(monkeypatch, separate_values, path):
+@pytest.mark.parametrize("mode", ["key-major", "atomic"])
+def test_unselected_keys_get_zero_gradients(monkeypatch, separate_values, path, mode):
     """Keys no query selects keep zero dK/dV even when they share a key tile with selected
     keys and hold NaN, as inactive pool capacity may. A nonfinite delta (rowsum(dO * O)) in one
     document also stays out of keys it did not select, including another document's keys in
@@ -812,6 +863,7 @@ def test_unselected_keys_get_zero_gradients(monkeypatch, separate_values, path):
 
     ``gather`` turns dense tiles off; ``dense`` plans dense tiles in both documents, whose
     spans cover the unselected keys between their selections."""
+    _force_mode(monkeypatch, mode)
     if path == "gather":
         for module in (forward, backward):
             monkeypatch.setattr(module, "dense_tile_shape", lambda *args: None)
@@ -935,6 +987,46 @@ def test_dense_tile_kernels_reuse_one_binary_across_shapes(triton_compiles):
         assert triton_compiles[kernel] == 1, kernel
 
 
+def test_atomic_dsparse_kv_reuses_one_binary_across_shapes(monkeypatch, triton_compiles):
+    """Sequence lengths, document counts, pool lengths, and their strides reuse one binary of
+    the atomic sparse dK/dV kernel across Triton's == 1 and multiple-of-16 classes.
+
+    Top-k 37 keeps the indices' batch stride, top-k times the sequence length, off both
+    classes unless the sequence length moves it there.
+    """
+    _force_mode(monkeypatch, "atomic")
+    # (S, documents, pool): (1, 1, 1), (16, 2, 16), (160, 16, 208), (37, 3, 49), (320, 10, 350).
+    for documents, key_lengths in (
+        ([1], [1]),
+        ([8, 8], [11, 5]),
+        ([10] * 16, [13] * 16),
+        ([5, 0, 32], [7, 2, 40]),
+        ([32] * 10, [35] * 10),
+    ):
+        inputs = make_gather_attn_test_inputs(
+            heads=16,
+            kv_heads=2,
+            head_dim=64,
+            tokens=sum(documents),
+            sparse_tokens=sum(key_lengths),
+            topk=37,
+            separate_values=True,
+            dtype=torch.bfloat16,
+        )
+        leaves = [
+            tensor.requires_grad_() for tensor in inputs.values() if tensor.is_floating_point()
+        ]
+        output = gather_attn(
+            **inputs,
+            sliding_window_size=0,
+            cu_seqlens=cumulative_sequence_offsets(documents),
+            cu_seqlens_k=cumulative_sequence_offsets(key_lengths),
+            kernel_options={"backend": "triton"},
+        )
+        torch.autograd.grad(output, leaves, torch.randn_like(output))
+    assert triton_compiles["_gather_attn_bwd_dsparse_kv_shared_atomic"] == 1
+
+
 @pytest.mark.xfail(
     raises=AssertionError,
     strict=True,
@@ -964,6 +1056,78 @@ def test_dense_tiles_ignore_unselected_nan_rows(poisoned):
     (grad_query,) = torch.autograd.grad(output, query, torch.randn_like(output))
     assert output.isfinite().all()
     assert grad_query.isfinite().all()
+
+
+@pytest.mark.parametrize(
+    "group,head_dim,v_is_k,topk,keys_per_document,atomic",
+    [
+        (12, 256, False, 2051, 8192, False),
+        (12, 256, False, 2051, 32768, False),
+        (1, 128, False, 128, 8192, False),
+        (8, 128, False, 512, 8192, False),
+        (16, 64, False, 512, 8192, True),
+        (8, 128, True, 128, 8192, True),
+        (8, 64, False, 256, 8192, False),
+        (8, 128, False, 128, 8192, False),
+    ],
+    ids=[
+        "qsa-8k",
+        "qsa-32k",
+        "mha",
+        "gqa-dense",
+        "mqa-d64",
+        "gqa-sparse-shared-values",
+        "gqa-d64-separate-values",
+        "gqa-d128-separate-values",
+    ],
+)
+def test_sparse_kv_backward_choice(group, head_dim, v_is_k, topk, keys_per_document, atomic):
+    """QSA keeps the key-major dK/dV; sparse selections over small heads use atomics."""
+    from attn_gym.sparse.gather_attn.impl.triton import backward
+
+    choice = backward._prefer_atomic_dsparse_kv(
+        group, head_dim, v_is_k, topk, keys_per_document, 32
+    )
+    assert choice == atomic
+
+
+def test_atomic_dsparse_kv_addresses_expanded_pool_gradients(monkeypatch):
+    """A pool expanded across KV heads addresses little storage, but its contiguous FP32
+    gradient does not: the last head's rows lie past signed int32 offsets."""
+    if torch.cuda.mem_get_info()[0] < 24 * 2**30:
+        pytest.skip("needs an 8 GiB FP32 pool gradient plus headroom")
+    _force_mode(monkeypatch, "atomic")
+    pool = 2**23 + 1
+    generator = torch.Generator(device="cuda").manual_seed(0)
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16, generator=generator)
+
+    query, local_kv, last_key = randn(1, 32, 3, 64), randn(1, 4, 3, 64), randn(1, 1, 1, 64)
+    grad_output = randn(1, 32, 3, 64)
+
+    def run(sparse_rows, last_row):
+        leaves = [query.clone().requires_grad_(), local_kv.clone().requires_grad_()]
+        sparse_kv = torch.zeros(1, 1, sparse_rows, 64, device="cuda", dtype=torch.bfloat16)
+        sparse_kv[:, :, -1:] = last_key
+        leaves.append(sparse_kv.requires_grad_())
+        indices = torch.full((1, 3, 1), last_row, device="cuda", dtype=torch.int32)
+        output = gather_attn(
+            leaves[0],
+            leaves[1],
+            sparse_kv.expand(-1, 4, -1, -1),
+            indices,
+            sliding_window_size=1,
+            kernel_options={"backend": "triton"},
+        )
+        return output, *torch.autograd.grad(output, leaves, grad_output)
+
+    expected = run(1, 0)
+    actual = run(pool, pool - 1)
+    for value, reference in zip(actual[:3], expected[:3], strict=True):
+        torch.testing.assert_close(value, reference)
+    torch.testing.assert_close(actual[3][:, :, -1:], expected[3])
+    assert not actual[3][:, :, :-1].any()
 
 
 @pytest.mark.parametrize(
@@ -1044,7 +1208,7 @@ def test_ineligible_grouped_inputs_raise(dtype, head_dim, window):
 )
 def test_grouped_fullgraph(case):
     """Grouped inputs trace through fullgraph compile, forward and backward, and match eager
-    bitwise, including the LSE: separate values, grouped heads with shared values (no dV),
+    bitwise, including the LSE: separate values, grouped heads whose dV outputs stay empty,
     dense tiles, and QSA's packed call with one pool for local and sparse keys (and values)
     and one offsets tensor for both partitions."""
     if case == "dense-tiles":
@@ -1123,14 +1287,15 @@ def test_grouped_dynamic_shapes_compile_once():
     assert frames[0] == frames[-1], frames
 
 
-@pytest.mark.parametrize("mode", ["default", "deterministic"])
-def test_grouped_matches_on_a_side_stream(mode):
+@pytest.mark.parametrize("mode", ["key-major", "deterministic"])
+def test_grouped_matches_on_a_side_stream(monkeypatch, mode):
     """Forward and backward on a busy non-default stream equal the default-stream run bitwise.
 
     A sleep queued first keeps the side stream's kernels pending while the host queues the
     rest of the step, so every kernel and buffer must follow the current stream. The warm-up
     selects nothing to gather, so buffers it recycles hold stale values for the timed runs.
     """
+    _force_mode(monkeypatch, mode)
     inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
     options["kernel_options"] = {"backend": "triton"}
     leaves = _differentiable_leaves(inputs)

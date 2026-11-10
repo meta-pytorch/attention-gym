@@ -239,11 +239,13 @@ def test_sequence_lengths_reuse_triton_kernels(
     finally:
         torch.use_deterministic_algorithms(previous)
     # Lse row strides are tuple elements, which Triton always specializes, so attention kernels
-    # keep one binary per T % 16 class; the reverse-map kernel takes no T-sized strides.
+    # keep one binary per T % 16 class; the reverse-map kernel takes no T-sized strides, and the
+    # atomic dK/dV takes them as unspecialized scalars.
     attention = {
         name: count for name, count in multi_document.items() if name.startswith("_gather_attn")
     }
     assert multi_document["_index_query_map_keys"] == 1
+    assert attention.pop("_gather_attn_bwd_dsparse_kv_shared_atomic", 1) == 1
     assert attention and set(attention.values()) == {2}, multi_document
     # One document adds at most its ``== 1`` binary per kernel, which the key kernel keeps.
     single_document = attention_compiles() - multi_document
