@@ -390,13 +390,13 @@ def gather_attn(
             reuse sparse_kv as the values. Separate values and 1 < kv_heads < num_heads
             run on Impl.REFERENCE, or on the Triton backend with SM100 or SM103,
             bfloat16 inputs, head_dim <= 256 and divisible by 16, unit inner strides,
-            and sliding_window_size <= 2048; other inputs raise. The Triton backend runs
-            them without gradients for now. The CuTe backend requires shared values and
-            one KV head. Passing the key tensor objects themselves as both values
-            (local_v is local_kv and sparse_v is sparse_kv) runs them as shared values;
-            other aliases, such as views, count as separate values. With
-            kv_heads == num_heads, separate values run one query head per
-            grouped-schedule tile, slower than the shared-value MHA kernels.
+            and sliding_window_size <= 2048; other inputs raise. The CuTe backend
+            requires shared values and one KV head. Passing the key tensor objects
+            themselves as both values (local_v is local_kv and sparse_v is sparse_kv)
+            runs them as shared values; other aliases, such as views, count as separate
+            values. With kv_heads == num_heads, separate values run one query head per
+            grouped-schedule tile, slower than the shared-value MHA kernels. CUDA graph
+            capture of their Triton backward is not tested yet.
 
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return (output, GatherAttnAux) containing the requested

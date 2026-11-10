@@ -12,11 +12,75 @@ from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import ptr_offset
 
 from .primitives import (
+    head_block_heads,
     load_document_bounds,
     offset_strides,
     prune_wide_backward_configs,
     tuning_key,
 )
+
+
+@triton.jit
+def _resolved_dq_tile(
+    query,
+    grad_output,
+    lse,
+    delta,
+    sparse_kv_ptr,
+    sparse_v_ptr,
+    selected_rows_ptr,
+    remaining,
+    batch,
+    kv_head,
+    offsets_k,
+    offsets_d,
+    dimension_mask,
+    head_mask,
+    grad_query,
+    SPARSE_KV_STRIDES,
+    SPARSE_V_STRIDES,
+    V_IS_K: tl.constexpr,
+    SCALE: tl.constexpr,
+    MASKED: tl.constexpr,
+):
+    """Accumulate dQ over one tile of compacted selections; only the last tile is MASKED."""
+    if MASKED:
+        selected_valid = offsets_k < remaining
+        selected_idx = tl.load(selected_rows_ptr + offsets_k, mask=selected_valid, other=0)
+        selected_mask = selected_valid[:, None] & dimension_mask[None, :]
+        probability_mask = head_mask[:, None] & selected_valid[None, :]
+    else:
+        selected_idx = tl.load(selected_rows_ptr + offsets_k)
+        selected_mask = dimension_mask[None, :]
+        probability_mask = head_mask[:, None]
+    sparse_values = tl.load(
+        sparse_kv_ptr
+        + ptr_offset(
+            (batch, kv_head, selected_idx[:, None], offsets_d[None, :]), SPARSE_KV_STRIDES
+        ),
+        mask=selected_mask,
+        other=0.0,
+    )
+    if V_IS_K:
+        sparse_v = sparse_values
+    else:
+        sparse_v = tl.load(
+            sparse_v_ptr
+            + ptr_offset(
+                (batch, kv_head, selected_idx[:, None], offsets_d[None, :]), SPARSE_V_STRIDES
+            ),
+            mask=selected_mask,
+            other=0.0,
+        )
+    scores = tl.dot(query, tl.trans(sparse_values), input_precision="tf32x3") * SCALE
+    probabilities = tl.where(probability_mask, tl.exp(scores - lse[:, None]), 0.0)
+    grad_probabilities = tl.dot(grad_output, tl.trans(sparse_v), input_precision="tf32x3")
+    grad_scores = probabilities * (grad_probabilities - delta[:, None])
+    return (
+        grad_query
+        + tl.dot(grad_scores.to(sparse_values.dtype), sparse_values, input_precision="tf32x3")
+        * SCALE
+    )
 
 
 # Counts drop only the multiple-of-16 hint; == 1 folds the single-document search.
@@ -25,10 +89,13 @@ def _gather_attn_bwd_dq_shared(
     query_ptr,
     sparse_kv_ptr,
     local_kv_ptr,
+    sparse_v_ptr,
+    local_v_ptr,
     query_rope_ptr,
     sparse_rope_ptr,
     local_rope_ptr,
     kv_indices_ptr,
+    selected_counts_ptr,
     cu_seqlens_ptr,
     cu_seqlens_k_ptr,
     output_ptr,
@@ -38,9 +105,12 @@ def _gather_attn_bwd_dq_shared(
     grad_query_ptr,
     grad_query_rope_ptr,
     grad_sink_partials_ptr,
+    delta_ptr,
     QUERY_STRIDES,
     SPARSE_KV_STRIDES,
     LOCAL_KV_STRIDES,
+    SPARSE_V_STRIDES,
+    LOCAL_V_STRIDES,
     QUERY_ROPE_STRIDES,
     SPARSE_ROPE_STRIDES,
     LOCAL_ROPE_STRIDES,
@@ -49,6 +119,9 @@ def _gather_attn_bwd_dq_shared(
     LSE_STRIDES,
     GRAD_SINK_PARTIALS_STRIDES,
     H: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    V_IS_K: tl.constexpr,
+    STORE_DELTA: tl.constexpr,
     S,
     D: tl.constexpr,
     ROPE_DIM: tl.constexpr,
@@ -62,12 +135,21 @@ def _gather_attn_bwd_dq_shared(
     BLOCK_K: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    SPARSE_STAGES: tl.constexpr,
+    RESOLVED_INDICES: tl.constexpr,
 ):
-    """Compute query gradients across heads while reusing shared KV tiles.
+    """Compute query gradients across the query heads that share one KV head.
 
-    D is the latent width; with ROPE_DIM the key-only query receives its own gradient,
+    Heads map to KV heads as in the shared forward schedule; V_IS_K reuses each key tile
+    as its value tile for the dP = dO V^T product. STORE_DELTA also writes rowsum(dO * O),
+    laid out like the LSE, for the key-major sparse dK/dV pass. RESOLVED_INDICES reads
+    ``resolve_selected_rows`` output (compacted rows and counts) as in the shared forward.
+
+    With ROPE_DIM (shared-KV schedule only) the key-only query receives its own gradient,
     stored with the query RoPE strides. Local tensors are None when WINDOW is 0.
     """
+    tl.static_assert(RESOLVED_INDICES or (KV_HEADS == 1 and V_IS_K))
+    tl.static_assert(not (RESOLVED_INDICES and ROPE_DIM))
     S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     SPARSE_SEQ_LEN = tl.cast(SPARSE_SEQ_LEN, tl.int64 if USE_INT64_OFFSETS else tl.int32)
     QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
@@ -75,8 +157,12 @@ def _gather_attn_bwd_dq_shared(
     KV_INDICES_STRIDES = offset_strides(KV_INDICES_STRIDES, USE_INT64_OFFSETS)
     LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
     GRAD_SINK_PARTIALS_STRIDES = offset_strides(GRAD_SINK_PARTIALS_STRIDES, USE_INT64_OFFSETS)
+    if not V_IS_K:
+        SPARSE_V_STRIDES = offset_strides(SPARSE_V_STRIDES, USE_INT64_OFFSETS)
     if WINDOW:
         LOCAL_KV_STRIDES = offset_strides(LOCAL_KV_STRIDES, USE_INT64_OFFSETS)
+        if not V_IS_K:
+            LOCAL_V_STRIDES = offset_strides(LOCAL_V_STRIDES, USE_INT64_OFFSETS)
     if ROPE_DIM:
         QUERY_ROPE_STRIDES = offset_strides(QUERY_ROPE_STRIDES, USE_INT64_OFFSETS)
         SPARSE_ROPE_STRIDES = offset_strides(SPARSE_ROPE_STRIDES, USE_INT64_OFFSETS)
@@ -87,9 +173,8 @@ def _gather_attn_bwd_dq_shared(
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
 
-    offsets_h = head_block * BLOCK_H + tl.arange(0, BLOCK_H)
+    kv_head, offsets_h, head_mask = head_block_heads(head_block, H, KV_HEADS, BLOCK_H)
     offsets_d = tl.arange(0, BLOCK_D)
-    head_mask = offsets_h < H
     dimension_mask = offsets_d < D
     matrix_mask = head_mask[:, None] & dimension_mask[None, :]
 
@@ -113,6 +198,12 @@ def _gather_attn_bwd_dq_shared(
         other=0.0,
     )
     delta = tl.sum(grad_output.to(tl.float32) * output.to(tl.float32), axis=1)
+    if STORE_DELTA:
+        tl.store(
+            delta_ptr + ptr_offset((batch, offsets_h, sequence), LSE_STRIDES),
+            delta,
+            mask=head_mask,
+        )
     grad_query = tl.zeros((BLOCK_H, BLOCK_D), tl.float32)
 
     candidate_start = 0
@@ -122,9 +213,60 @@ def _gather_attn_bwd_dq_shared(
             cu_seqlens_ptr, cu_seqlens_k_ptr, sequence, num_documents, S, USE_INT64_OFFSETS
         )
 
-    if TOPK:
+    if TOPK and RESOLVED_INDICES:
         offsets_k = tl.arange(0, BLOCK_K)
-        for selected_start in tl.range(0, TOPK, BLOCK_K, num_stages=2):
+        selected_rows_ptr = kv_indices_ptr + ptr_offset((batch, sequence, 0), KV_INDICES_STRIDES)
+        selected_count = tl.load(selected_counts_ptr + batch * S + sequence)
+        full_end = selected_count // BLOCK_K * BLOCK_K
+        for selected_start in tl.range(0, full_end, BLOCK_K, num_stages=SPARSE_STAGES):
+            grad_query = _resolved_dq_tile(
+                query,
+                grad_output,
+                lse,
+                delta,
+                sparse_kv_ptr,
+                sparse_v_ptr,
+                selected_rows_ptr + selected_start,
+                selected_count - selected_start,
+                batch,
+                kv_head,
+                offsets_k,
+                offsets_d,
+                dimension_mask,
+                head_mask,
+                grad_query,
+                SPARSE_KV_STRIDES,
+                SPARSE_V_STRIDES,
+                V_IS_K,
+                SCALE,
+                False,
+            )
+        if full_end < selected_count:
+            grad_query = _resolved_dq_tile(
+                query,
+                grad_output,
+                lse,
+                delta,
+                sparse_kv_ptr,
+                sparse_v_ptr,
+                selected_rows_ptr + full_end,
+                selected_count - full_end,
+                batch,
+                kv_head,
+                offsets_k,
+                offsets_d,
+                dimension_mask,
+                head_mask,
+                grad_query,
+                SPARSE_KV_STRIDES,
+                SPARSE_V_STRIDES,
+                V_IS_K,
+                SCALE,
+                True,
+            )
+    elif TOPK:
+        offsets_k = tl.arange(0, BLOCK_K)
+        for selected_start in tl.range(0, TOPK, BLOCK_K, num_stages=SPARSE_STAGES):
             selected_offsets = selected_start + offsets_k
             selected_idx = tl.load(
                 kv_indices_ptr
@@ -138,6 +280,7 @@ def _gather_attn_bwd_dq_shared(
                 & (selected_idx < candidate_end - candidate_start)
             )
             selected_idx = tl.where(selected_valid, selected_idx, 0) + candidate_start
+            # Only the shared-KV schedule reads raw indices: one KV head that is also V.
             sparse_values = tl.load(
                 sparse_kv_ptr
                 + ptr_offset(
@@ -197,15 +340,28 @@ def _gather_attn_bwd_dq_shared(
             local_valid = (offsets_n >= 0) & (offsets_n <= sequence) & (offsets_n < S)
             if HAS_CU_SEQLENS:
                 local_valid &= offsets_n >= query_start
+            local_mask = local_valid[:, None] & dimension_mask[None, :]
             local_values = tl.load(
                 local_kv_ptr
                 + ptr_offset(
-                    (batch, 0, offsets_n[:, None], offsets_d[None, :]),
+                    (batch, kv_head, offsets_n[:, None], offsets_d[None, :]),
                     LOCAL_KV_STRIDES,
                 ),
-                mask=local_valid[:, None] & dimension_mask[None, :],
+                mask=local_mask,
                 other=0.0,
             )
+            if V_IS_K:
+                local_v = local_values
+            else:
+                local_v = tl.load(
+                    local_v_ptr
+                    + ptr_offset(
+                        (batch, kv_head, offsets_n[:, None], offsets_d[None, :]),
+                        LOCAL_V_STRIDES,
+                    ),
+                    mask=local_mask,
+                    other=0.0,
+                )
             scores = tl.dot(query, tl.trans(local_values), input_precision="tf32x3")
             if ROPE_DIM:
                 local_rope = tl.load(
@@ -226,9 +382,7 @@ def _gather_attn_bwd_dq_shared(
                 tl.exp(scores - lse[:, None]),
                 0.0,
             )
-            grad_probabilities = tl.dot(
-                grad_output, tl.trans(local_values), input_precision="tf32x3"
-            )
+            grad_probabilities = tl.dot(grad_output, tl.trans(local_v), input_precision="tf32x3")
             grad_scores = probabilities * (grad_probabilities - delta[:, None])
             grad_query += (
                 tl.dot(
@@ -606,8 +760,60 @@ BWD_DQ_SHARED = TritonTuner(
         for block_n in (16, 64, 128)
         for num_warps in (4, 8)
     ],
-    key=tuning_key("query_ptr", "H", "D", "ROPE_DIM", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    key=tuning_key(
+        "query_ptr",
+        "H",
+        "KV_HEADS",
+        "V_IS_K",
+        "STORE_DELTA",
+        "D",
+        "ROPE_DIM",
+        "TOPK",
+        "WINDOW",
+        "HAS_CU_SEQLENS",
+    ),
     prune=prune_shared_dq_configs,
+)
+
+
+def prune_grouped_dq_configs(configs, args):
+    """Bound the selection tile by the top-k and the local tile by the head dimension."""
+    max_block_k = max(32, triton.next_power_of_2(args["TOPK"]))
+    block_ns = (64,) if args["D"] > 128 or args["WINDOW"] == 0 else (64, 128)
+    return [
+        config
+        for config in configs
+        if config.kwargs["BLOCK_K"] <= max_block_k and config.kwargs["BLOCK_N"] in block_ns
+    ]
+
+
+# The grouped schedule also tunes the selection tile and its software-pipelining depth.
+BWD_DQ_GROUPED = TritonTuner(
+    _gather_attn_bwd_dq_shared,
+    [
+        triton.Config(
+            {"BLOCK_K": block_k, "BLOCK_N": block_n, "SPARSE_STAGES": stages},
+            num_warps=num_warps,
+            num_stages=1,
+            maxnreg=maxnreg,
+        )
+        for block_k, stages in ((64, 3), (64, 2), (32, 3), (32, 2))
+        for block_n in (64, 128)
+        # Capping registers can fit a third 4-warp CTA per SM, worth a few spills.
+        for num_warps, maxnreg in ((4, None), (4, 168), (8, None))
+    ],
+    key=tuning_key(
+        "query_ptr",
+        "H",
+        "KV_HEADS",
+        "V_IS_K",
+        "STORE_DELTA",
+        "D",
+        "TOPK",
+        "WINDOW",
+        "HAS_CU_SEQLENS",
+    ),
+    prune=prune_grouped_dq_configs,
 )
 # Atomic configs accumulate into the same FP32 output, so it is cleared between trials.
 BWD_DSPARSE_KV_SHARED_ATOMIC = TritonTuner(
