@@ -1286,7 +1286,8 @@ def _launch_grouped_backward(
 
     dQ reuses each gathered KV row across a query-head group. Sparse dK/dV is key-major
     (see ``key_major_backward``) and deterministic, so it needs no query map from the forward.
-    Local gradients write one partial per query head, which is summed over each KV
+    Every selection runs on the gather kernels, including queries the forward handled in dense
+    tiles. Local gradients write one partial per query head, which is summed over each KV
     head's group here instead of with atomics. Returns
     ``(dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v)``; a gradient is None exactly when its
     input is. Local tensors are not read without a window.
@@ -1333,7 +1334,7 @@ def _launch_grouped_backward(
     tile = 32
     # Recomputed rather than saved from the forward, which would hold the rows (hundreds of MB
     # at 32k tokens) between passes.
-    selected_rows, selected_counts = resolve_selected_rows(
+    selected_rows, selected_counts, _, _ = resolve_selected_rows(
         kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k
     )
     # rowsum(dO * O) for the key-major sparse pass, laid out like the LSE.

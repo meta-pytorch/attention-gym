@@ -180,6 +180,139 @@ def test_grouped_matches_reference(
     _assert_matches_reference(inputs, mode, **options)
 
 
+def _dense_tile_inputs(heads, kv_heads, head_dim, separate_values, packed, all_dense, spans):
+    """Distinct document-local selections, -1 padded, so tiles can take the dense path.
+
+    Unless ``all_dense``, a repeat and tiles straddling documents keep some tiles on the
+    gather kernels, with empty and partly padded queries inside dense tiles. ``long`` spans
+    (top-k 48 over keys of up to 170) cover several K/V tiles and bitmap words per dense tile.
+    """
+    topk = 48 if spans == "long" else 16
+    tile_queries = 128 // (heads // kv_heads)
+    # With all_dense, documents of whole tiles keep every tile inside one document.
+    if packed:
+        query_lengths = [tile_queries * 2, tile_queries] if all_dense else [11, 9, 13]
+        short_keys, long_keys = (
+            ([23, 21], [150, 170]) if all_dense else ([23, 21, 35], [150, 130, 170])
+        )
+    else:
+        query_lengths = [tile_queries * 3] if all_dense else [33]
+        short_keys, long_keys = [40], [170]
+    key_lengths = long_keys if spans == "long" else short_keys
+    batch = 1 if packed else 2
+    query_documents = [d for d, length in enumerate(query_lengths) for _ in range(length)]
+    inputs = make_gather_attn_test_inputs(
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        tokens=len(query_documents),
+        sparse_tokens=sum(key_lengths),
+        topk=topk,
+        separate_values=separate_values,
+        dtype=torch.bfloat16,
+        batch=batch,
+    )
+    generator = torch.Generator().manual_seed(0)
+    indices = torch.full((batch, len(query_documents), topk), -1, dtype=torch.int64)
+    for b in range(batch):
+        for position, document in enumerate(query_documents):
+            chosen = torch.randperm(key_lengths[document], generator=generator)[:topk]
+            indices[b, position, : chosen.numel()] = chosen
+    indices[:, 1::4, -3:] = -1
+    if not all_dense:
+        indices[:, 25] = -1
+        # A repeat makes its query, and so its tile, gather: the last batch row for MHA,
+        # whose 128-query tiles span the whole sequence.
+        indices[-1, 12, 1] = indices[-1, 12, 0]
+    inputs["kv_indices"] = indices.cuda()
+    options = {"sliding_window_size": 0}
+    if packed:
+        options["cu_seqlens"] = cumulative_sequence_offsets(query_lengths)
+        options["cu_seqlens_k"] = cumulative_sequence_offsets(key_lengths)
+    return inputs, options
+
+
+def _spy_dense_launches(monkeypatch):
+    """Count launches of the dense-tile forward kernel."""
+    launches = []
+    tuner = forward._FWD_DENSE
+
+    class CountingLaunch:
+        def __getitem__(self, grid):
+            launches.append(grid)
+            return tuner[grid]
+
+    monkeypatch.setattr(forward, "_FWD_DENSE", CountingLaunch())
+    return launches
+
+
+def _planned_tile_spans(inputs, options):
+    """The dense-tile plan for window-0 inputs: ``tile_spans`` [B, tiles, 2], ``hi`` -1 for
+    tiles left to the gather kernels."""
+    from attn_gym.sparse.gather_attn.impl.triton.primitives import (
+        dense_tile_shape,
+        plan_dense_tiles,
+        resolve_selected_rows,
+    )
+
+    heads, kv_heads = inputs["query"].shape[1], inputs["sparse_kv"].shape[1]
+    tile_queries, mask_words = dense_tile_shape(heads, kv_heads, inputs["kv_indices"].shape[-1], 0)
+    _, counts, _, selection_spans = resolve_selected_rows(
+        inputs["kv_indices"],
+        inputs["sparse_kv"].shape[2],
+        options.get("cu_seqlens"),
+        options.get("cu_seqlens_k"),
+        mask_words=mask_words,
+    )
+    return plan_dense_tiles(counts, selection_spans, options.get("cu_seqlens"), tile_queries)
+
+
+@pytest.mark.usefixtures("nan_filled_empty")
+@pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize(
+    "heads,kv_heads,head_dim,separate_values,packed",
+    [
+        (24, 2, 256, True, True),
+        (32, 4, 128, False, False),
+        (16, 1, 64, True, False),
+        (4, 4, 64, True, False),
+        (6, 2, 192, True, False),
+        (48, 1, 64, True, False),
+    ],
+    ids=[
+        "gqa-group12-d256-packed",
+        "gqa-shared-values",
+        "mqa-separate-values",
+        "mha",
+        "gqa-group3-d192",
+        "mqa-group48",
+    ],
+)
+@pytest.mark.parametrize("all_dense", [False, True], ids=["mixed", "all-dense"])
+@pytest.mark.parametrize("spans", ["short", "long"])
+def test_dense_tiles_match_reference(
+    monkeypatch, heads, kv_heads, head_dim, separate_values, packed, mode, all_dense, spans
+):
+    """Dense tiles walk their span under selection bitmaps; gather tiles keep the rest.
+
+    With ``all_dense`` every tile is dense, so the gather forward skips every query; the
+    backward still gathers every selection. Groups 3 and 48 leave part of each 128-row tile
+    empty; D=192 pads the head tile. The dense kernel must run.
+    """
+    launches = _spy_dense_launches(monkeypatch)
+    inputs, options = _dense_tile_inputs(
+        heads, kv_heads, head_dim, separate_values, packed, all_dense, spans
+    )
+    tile_spans = _planned_tile_spans(inputs, options)
+    dense = tile_spans[..., 1] >= 0
+    assert dense.all() if all_dense else dense.any() and not dense.all()
+    if spans == "long":
+        # Some dense tile walks several 64-key tiles and reads past its first two words.
+        assert (tile_spans[..., 1][dense] >= 64).any()
+    _assert_matches_reference(inputs, mode, **options)
+    assert launches
+
+
 def _qsa_indices(document_lengths, budget_blocks, generator):
     """QSA selections: up to ``budget_blocks`` distinct random complete causal 4-token blocks
     plus the query's partial tail block, as document-local indices padded with -1."""
@@ -205,11 +338,14 @@ def _qsa_indices(document_lengths, budget_blocks, generator):
 @pytest.mark.usefixtures("nan_filled_empty")
 @pytest.mark.parametrize("mode", ["default", "deterministic"])
 @pytest.mark.parametrize("heads,kv_heads", [(24, 2), (12, 1)], ids=["24-2", "12-1"])
-def test_qsa_block_selections_match_reference(heads, kv_heads, mode):
+def test_qsa_block_selections_match_reference(monkeypatch, heads, kv_heads, mode):
     """QSA's regime at reduced size: D=256, one pool for local and sparse keys and values, no
-    sink, window 0, and distinct 4-token blocks (top-k 131) over 1024- and 512-token documents,
-    so the key-major map inverts thousands of distinct keys.
+    sink, window 0, and distinct 4-token blocks (top-k 131) over 1024- and 512-token documents.
+
+    Early queries' tiles go dense over 20-word bitmaps; later queries select past the bitmap
+    and gather, so the key-major map inverts thousands of distinct keys.
     """
+    launches = _spy_dense_launches(monkeypatch)
     document_lengths = [1024, 512]
     inputs = make_gather_attn_test_inputs(
         heads=heads,
@@ -227,7 +363,10 @@ def test_qsa_block_selections_match_reference(heads, kv_heads, mode):
     inputs["kv_indices"] = inputs["kv_indices"].cuda()
     offsets = cumulative_sequence_offsets(document_lengths)
     options = {"sliding_window_size": 0, "cu_seqlens": offsets, "cu_seqlens_k": offsets}
+    dense = _planned_tile_spans(inputs, options)[..., 1] >= 0
+    assert dense.any() and not dense.all()
     _assert_matches_reference(inputs, mode, **options)
+    assert launches
 
 
 def _misaligned(tensor):
@@ -239,49 +378,57 @@ def _misaligned(tensor):
 @pytest.mark.usefixtures("nan_filled_empty")
 @pytest.mark.parametrize("mode", ["default", "deterministic"])
 @pytest.mark.parametrize(
-    "variant",
+    "base,variant",
     [
-        "no-sink",
-        "fp32-sink",
-        "aliased-pools",
-        "int32-indices",
-        "bshd-strides",
-        "misaligned",
-        "int64-offsets",
-        "fused-kv-buffer",
-        "mixed-layouts",
-        "empty-pool",
-        "no-selections",
-    ],
+        (base, variant)
+        for base in ("gather", "dense")
+        for variant in (
+            "no-sink",
+            "fp32-sink",
+            "aliased-pools",
+            "int32-indices",
+            "bshd-strides",
+            "misaligned",
+            "int64-offsets",
+            "fused-kv-buffer",
+            "mixed-layouts",
+        )
+    ]
+    + [("gather", "empty-pool"), ("gather", "no-selections")],
 )
-def test_grouped_input_variants_match_reference(monkeypatch, variant, mode):
-    """Grouped inputs QSA-style callers pass, on the gather kernels with a local window.
+def test_grouped_input_variants_match_reference(monkeypatch, base, variant, mode):
+    """Grouped inputs QSA-style callers pass, on the gather kernels (with a local window) and
+    on mixed dense and gather tiles.
 
     ``aliased-pools`` passes one tensor as both the local and sparse keys (and values), as
     QSA does; ``misaligned`` starts the query and output gradient off a 16-byte boundary,
     which TMA gathers cannot read in place; ``int64-offsets`` forces 64-bit addressing.
     ``fused-kv-buffer`` slices keys and values from one [..., 2 * D] buffer and
     ``mixed-layouts`` keeps keys BHSD with values BSHD, so values' strides differ from the
-    keys'.
+    keys'. Every ``dense`` variant still plans dense tiles next to gather tiles.
     """
     from attn_gym.sparse.gather_attn.impl.triton import primitives
 
-    documents = ([11, 9, 13], [23, 21, 35])
-    inputs = make_gather_attn_test_inputs(
-        heads=24,
-        kv_heads=2,
-        head_dim=256,
-        tokens=40,
-        sparse_tokens=sum(documents[1]),
-        topk=37,
-        separate_values=True,
-        dtype=torch.bfloat16,
-    )
-    options = {
-        "sliding_window_size": 19,
-        "cu_seqlens": cumulative_sequence_offsets(documents[0]),
-        "cu_seqlens_k": cumulative_sequence_offsets(documents[1]),
-    }
+    launches = _spy_dense_launches(monkeypatch)
+    if base == "dense":
+        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
+    else:
+        documents = ([11, 9, 13], [23, 21, 35])
+        inputs = make_gather_attn_test_inputs(
+            heads=24,
+            kv_heads=2,
+            head_dim=256,
+            tokens=40,
+            sparse_tokens=sum(documents[1]),
+            topk=37,
+            separate_values=True,
+            dtype=torch.bfloat16,
+        )
+        options = {
+            "sliding_window_size": 19,
+            "cu_seqlens": cumulative_sequence_offsets(documents[0]),
+            "cu_seqlens_k": cumulative_sequence_offsets(documents[1]),
+        }
     grad_output = torch.randn_like(inputs["query"])
     if variant == "no-sink":
         inputs["attention_sink"] = None
@@ -314,7 +461,11 @@ def test_grouped_input_variants_match_reference(monkeypatch, variant, mode):
         options["cu_seqlens_k"] = torch.zeros_like(options["cu_seqlens_k"])
     else:
         inputs["kv_indices"] = inputs["kv_indices"][..., :0]
+    if base == "dense":
+        dense = _planned_tile_spans(inputs, options)[..., 1] >= 0
+        assert dense.any() and not dense.all()
     _assert_matches_reference(inputs, mode, grad_output=grad_output, **options)
+    assert bool(launches) == (base == "dense")
 
 
 def _valid_candidates(*tuners_and_args):
@@ -326,10 +477,16 @@ def _valid_candidates(*tuners_and_args):
 
 
 _GATHER_ARGS = {"TOPK": 64, "D": 128, "WINDOW": 19}
+_DENSE_ARGS = {"TOPK": 48, "D": 256, "WINDOW": 0}
 _TUNER_CASES = {
     "gather": _valid_candidates(
         (forward._FWD_GROUPED, _GATHER_ARGS),
         (shared_backward.BWD_DQ_GROUPED, _GATHER_ARGS),
+    ),
+    "dense": _valid_candidates(
+        (forward._FWD_DENSE, _DENSE_ARGS),
+        (forward._FWD_GROUPED, _DENSE_ARGS),
+        (shared_backward.BWD_DQ_GROUPED, _DENSE_ARGS),
     ),
 }
 
@@ -350,22 +507,25 @@ def test_every_tuner_config_matches_reference(case):
     candidate list, so shorter lists repeat but none is skipped.
 
     ``gather`` (D=128, a window, top-k 64) covers the gather forward, dQ, and dK/dV
-    candidates.
+    candidates, and ``dense`` (D=256) the dense forward's and the D=256 gather candidates.
     """
-    inputs = make_gather_attn_test_inputs(
-        heads=32,
-        kv_heads=4,
-        head_dim=128,
-        tokens=40,
-        sparse_tokens=79,
-        topk=64,
-        separate_values=True,
-        dtype=torch.bfloat16,
-        batch=2,
-    )
-    options = {"sliding_window_size": 19}
+    if case == "dense":
+        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "long")
+    else:
+        inputs = make_gather_attn_test_inputs(
+            heads=32,
+            kv_heads=4,
+            head_dim=128,
+            tokens=40,
+            sparse_tokens=79,
+            topk=64,
+            separate_values=True,
+            dtype=torch.bfloat16,
+            batch=2,
+        )
+        options = {"sliding_window_size": 19}
     # The candidate counts above come from these inputs' launch arguments.
-    counted = _GATHER_ARGS
+    counted = _DENSE_ARGS if case == "dense" else _GATHER_ARGS
     assert inputs["kv_indices"].shape[-1] == counted["TOPK"]
     assert inputs["query"].shape[-1] == counted["D"]
     assert options["sliding_window_size"] == counted["WINDOW"]
@@ -373,26 +533,31 @@ def test_every_tuner_config_matches_reference(case):
 
 
 @pytest.mark.parametrize("mode", ["default", "deterministic"])
+@pytest.mark.parametrize("base", ["dense", "window"])
 @torch.no_grad()
-def test_grouped_cuda_graph_replays_new_inputs(mode):
+def test_grouped_cuda_graph_replays_new_inputs(base, mode):
     """The forward captures into a CUDA graph, so it reads nothing back to the host (a host
     read fails capture), and a replay on new values and selections matches eager bitwise.
 
     Only the forward is captured here. Shifting every query's selections to its neighbour,
-    plus a repeat in the first query, changes every query's compacted rows and counts.
+    plus a repeat in the first query, changes which tiles are dense, so nothing sized at
+    capture may depend on them.
     """
-    inputs = make_gather_attn_test_inputs(
-        heads=24,
-        kv_heads=2,
-        head_dim=128,
-        tokens=40,
-        sparse_tokens=79,
-        topk=37,
-        separate_values=True,
-        dtype=torch.bfloat16,
-        batch=2,
-    )
-    options = {"sliding_window_size": 19}
+    if base == "dense":
+        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
+    else:
+        inputs = make_gather_attn_test_inputs(
+            heads=24,
+            kv_heads=2,
+            head_dim=128,
+            tokens=40,
+            sparse_tokens=79,
+            topk=37,
+            separate_values=True,
+            dtype=torch.bfloat16,
+            batch=2,
+        )
+        options = {"sliding_window_size": 19}
     options["kernel_options"] = {"backend": "triton"}
 
     def step():
@@ -414,7 +579,13 @@ def test_grouped_cuda_graph_replays_new_inputs(mode):
                 tensor.copy_(torch.randn_like(tensor))
         replay_indices = inputs["kv_indices"].roll(1, dims=1)
         replay_indices[:, 0, 1] = replay_indices[:, 0, 0]
+        if base == "dense":
+            captured_plan = _planned_tile_spans(inputs, options)[..., 1] >= 0
         inputs["kv_indices"].copy_(replay_indices)
+        if base == "dense":
+            assert not torch.equal(
+                captured_plan, _planned_tile_spans(inputs, options)[..., 1] >= 0
+            )
         graph.replay()
         expected = step()
     torch.cuda.synchronize()
@@ -463,6 +634,63 @@ def test_keys_passed_as_values_run_as_shared_values(monkeypatch, heads, kv_heads
 
 
 @pytest.mark.parametrize("packed", [False, True])
+def test_dense_tile_plan_matches_recount(packed):
+    """Selection bitmaps, spans, the bitmap-exact flag, and the dense-tile plan match a Python
+    recount of their definitions."""
+    from attn_gym.sparse.gather_attn.impl.triton.primitives import (
+        DENSE_SPAN_RATIO,
+        dense_tile_shape,
+        plan_dense_tiles,
+        resolve_selected_rows,
+    )
+
+    inputs, options = _dense_tile_inputs(24, 2, 256, True, packed, False, "long")
+    kv_indices = inputs["kv_indices"]
+    batch, tokens, topk = kv_indices.shape
+    pool = inputs["sparse_kv"].shape[2]
+    cu_seqlens, cu_seqlens_k = options.get("cu_seqlens"), options.get("cu_seqlens_k")
+    tile_queries, mask_words = dense_tile_shape(24, 2, topk, 0)
+    _, counts, masks, spans = resolve_selected_rows(
+        kv_indices, pool, cu_seqlens, cu_seqlens_k, mask_words=mask_words
+    )
+    tile_spans = plan_dense_tiles(counts, spans, cu_seqlens, tile_queries)
+
+    bits = 32 * mask_words
+    query_offsets = cu_seqlens.tolist() if packed else [0, tokens]
+    key_offsets = cu_seqlens_k.tolist() if packed else [0, pool]
+    num_tiles = triton.cdiv(tokens, tile_queries)
+    masks, spans, tile_spans = masks.cpu(), spans.cpu(), tile_spans.cpu()
+    for b in range(batch):
+        query_spans = []
+        for query in range(tokens):
+            document = sum(offset <= query for offset in query_offsets[1:])
+            key_count = key_offsets[document + 1] - key_offsets[document]
+            local = [i for i in kv_indices[b, query].tolist() if 0 <= i < key_count]
+            words = [0] * mask_words
+            for index in local:
+                if index < bits:
+                    words[index // 32] |= 1 << index % 32
+            assert [word & 0xFFFFFFFF for word in masks[b, query].tolist()] == words
+            exact = len(set(local)) == len(local) and all(index < bits for index in local)
+            lo, hi = min([bits, *local]), max(local, default=-1)
+            assert spans[b, query].tolist() == [lo, hi if exact else -2]
+            query_spans.append((document, len(local), lo, hi if exact else -2))
+        for tile in range(num_tiles):
+            members = query_spans[tile * tile_queries : (tile + 1) * tile_queries]
+            selected = sum(count for _, count, _, _ in members)
+            span_lo = min((lo for _, count, lo, _ in members if count), default=2**30)
+            span_hi = max((hi for _, count, _, hi in members if count), default=-1)
+            dense = (
+                all(hi >= -1 for _, _, _, hi in members)
+                and selected > 0
+                and (span_hi - span_lo + 1) * len(members) <= DENSE_SPAN_RATIO * selected
+                and (not packed or members[0][0] == members[-1][0])
+            )
+            assert tile_spans[b, tile].tolist() == [span_lo, span_hi if dense else -1]
+    assert 0 < (tile_spans[..., 1] >= 0).sum() < tile_spans[..., 1].numel()
+
+
+@pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("dense", [False, True], ids=["sparse", "dense"])
 @pytest.mark.parametrize("wide_keys", [False, True], ids=["int32-keys", "int64-keys"])
@@ -499,7 +727,9 @@ def test_tile_query_map_counts_every_valid_selection(packed, dtype, dense, wide_
     cu_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32) if packed else None
     cu_k = torch.tensor(k_offsets, device="cuda", dtype=torch.int32) if packed else None
 
-    selected_rows, selected_counts = resolve_selected_rows(indices, sparse_tokens, cu_q, cu_k)
+    selected_rows, selected_counts, _, _ = resolve_selected_rows(
+        indices, sparse_tokens, cu_q, cu_k
+    )
     pair_queries, pair_masks, tile_offsets = build_tile_query_map(
         selected_rows, selected_counts, sparse_tokens, tile
     )
@@ -617,6 +847,71 @@ def test_resolver_reuses_one_binary_across_shapes(triton_compiles):
     assert triton_compiles["_resolve_selected_rows"] == 1
 
 
+def test_dense_tile_kernels_reuse_one_binary_across_shapes(triton_compiles):
+    """Sequence lengths, tile counts, document counts, and pool lengths reuse one binary of
+    each dense-tile kernel across Triton's == 1 and multiple-of-16 classes.
+
+    Heads, head dim, and top-k stay fixed, so the tile shape and kernel config do too: groups
+    of 12 make 10-query tiles.
+    """
+    # (S, tiles, documents, pool): (1, 1, 1, 1), (16, 2, 2, 16), (160, 16, 16, 208),
+    # (37, 4, 3, 49), (320, 32, 10, 350).
+    for documents, key_lengths in (
+        ([1], [1]),
+        ([8, 8], [11, 5]),
+        ([10] * 16, [13] * 16),
+        ([5, 0, 32], [7, 2, 40]),
+        ([32] * 10, [35] * 10),
+    ):
+        inputs = make_gather_attn_test_inputs(
+            heads=24,
+            kv_heads=2,
+            head_dim=128,
+            tokens=sum(documents),
+            sparse_tokens=sum(key_lengths),
+            topk=16,
+            separate_values=True,
+            dtype=torch.bfloat16,
+        )
+        gather_attn(
+            **inputs,
+            sliding_window_size=0,
+            cu_seqlens=cumulative_sequence_offsets(documents),
+            cu_seqlens_k=cumulative_sequence_offsets(key_lengths),
+            kernel_options={"backend": "triton"},
+        )
+    assert triton_compiles["_plan_dense_tiles"] == 1
+    assert triton_compiles["_gather_attn_fwd_dense"] == 1
+
+
+@pytest.mark.xfail(
+    raises=AssertionError,
+    strict=True,
+    reason="dense tiles multiply unselected values by zero probabilities",
+)
+def test_dense_tiles_ignore_unselected_nan_values():
+    """A NaN in a value row no query selects leaves the output finite.
+
+    Every query selects only key 1, so the one dense tile's span is [1, 1], but its first
+    K/V tile starts at key 0: 0 * NaN poisons P @ V.
+    """
+    query = torch.randn(1, 24, 10, 64, device="cuda", dtype=torch.bfloat16)
+    keys = torch.randn(1, 2, 2, 64, device="cuda", dtype=torch.bfloat16)
+    values = torch.randn_like(keys)
+    values[:, :, 0] = torch.nan
+    indices = torch.ones(1, 10, 1, device="cuda", dtype=torch.int64)
+    output = gather_attn(
+        query,
+        None,
+        keys,
+        indices,
+        sparse_v=values,
+        sliding_window_size=0,
+        kernel_options={"backend": "triton"},
+    )
+    assert output.isfinite().all()
+
+
 @pytest.mark.parametrize(
     "dtype,heads,head_dim,window,expected",
     [
@@ -690,13 +985,17 @@ def test_ineligible_grouped_inputs_raise(dtype, head_dim, window):
 
 
 @pytest.mark.usefixtures("fresh_compile_cache")
-@pytest.mark.parametrize("case", ["separate-values", "grouped-shared-values", "one-pool"])
+@pytest.mark.parametrize(
+    "case", ["separate-values", "grouped-shared-values", "dense-tiles", "one-pool"]
+)
 def test_grouped_fullgraph(case):
     """Grouped inputs trace through fullgraph compile, forward and backward, and match eager
     bitwise, including the LSE: separate values, grouped heads with shared values (no dV),
-    and QSA's packed call with one pool for local and sparse keys (and values) and one offsets
-    tensor for both partitions."""
-    if case == "one-pool":
+    dense tiles, and QSA's packed call with one pool for local and sparse keys (and values)
+    and one offsets tensor for both partitions."""
+    if case == "dense-tiles":
+        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
+    elif case == "one-pool":
         inputs = make_gather_attn_test_inputs(
             heads=24,
             kv_heads=2,
@@ -778,23 +1077,8 @@ def test_grouped_matches_on_a_side_stream(mode):
     rest of the step, so every kernel and buffer must follow the current stream. The warm-up
     selects nothing to gather, so buffers it recycles hold stale values for the timed runs.
     """
-    documents = ([11, 9, 13], [23, 21, 35])
-    inputs = make_gather_attn_test_inputs(
-        heads=24,
-        kv_heads=2,
-        head_dim=256,
-        tokens=sum(documents[0]),
-        sparse_tokens=sum(documents[1]),
-        topk=16,
-        separate_values=True,
-        dtype=torch.bfloat16,
-    )
-    options = {
-        "sliding_window_size": 0,
-        "cu_seqlens": cumulative_sequence_offsets(documents[0]),
-        "cu_seqlens_k": cumulative_sequence_offsets(documents[1]),
-        "kernel_options": {"backend": "triton"},
-    }
+    inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
+    options["kernel_options"] = {"backend": "triton"}
     leaves = _differentiable_leaves(inputs)
     grad_output = torch.randn_like(inputs["query"])
     with _deterministic_algorithms(mode == "deterministic"):
@@ -819,24 +1103,30 @@ def test_grouped_matches_on_a_side_stream(mode):
 
 
 @pytest.mark.parametrize(
-    "case", ["gqa-shared-values", "gqa-separate-values", "mqa-separate-values"]
+    "case", ["gqa-shared-values", "gqa-separate-values", "mqa-separate-values", "packed-dense"]
 )
 def test_grouped_operator_contracts(case):
     """The opaque operators' schema, fake implementations, autograd registration, and compiled
-    dispatch hold for grouped heads and separate values, including shared values' absent dV."""
+    dispatch hold for grouped heads and separate values, including shared values' absent dV,
+    and for packed window-0 inputs with dense tiles."""
     from attn_gym.sparse.gather_attn.impl.ops import _gather_attn_bwd_op, _gather_attn_fwd_op
 
-    inputs = make_gather_attn_test_inputs(
-        heads=8,
-        kv_heads=1 if case.startswith("mqa") else 2,
-        head_dim=64,
-        tokens=20,
-        sparse_tokens=22,
-        topk=5,
-        separate_values=case.endswith("separate-values"),
-        dtype=torch.bfloat16,
-    )
-    offsets, window = (None, None), 7
+    if case == "packed-dense":
+        inputs, options = _dense_tile_inputs(24, 2, 256, True, True, False, "short")
+        offsets = (options["cu_seqlens"], options["cu_seqlens_k"])
+        window = 0
+    else:
+        inputs = make_gather_attn_test_inputs(
+            heads=8,
+            kv_heads=1 if case.startswith("mqa") else 2,
+            head_dim=64,
+            tokens=20,
+            sparse_tokens=22,
+            topk=5,
+            separate_values=case.endswith("separate-values"),
+            dtype=torch.bfloat16,
+        )
+        offsets, window = (None, None), 7
     query, sparse_kv, local_kv = inputs["query"], inputs["sparse_kv"], inputs["local_kv"]
     kv_indices, sink = inputs["kv_indices"], inputs["attention_sink"]
     values = (inputs.get("sparse_v"), inputs.get("local_v"))

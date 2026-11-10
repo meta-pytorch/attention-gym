@@ -10,17 +10,23 @@ from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_in
 
 from ..routing import require_grouped_schedule, uses_grouped_schedule
 from .primitives import (
+    DENSE_TILE_ROWS,
     TileConfig,
     can_use_shared_kv_schedule,
     causal_window_mask,
+    dense_tile_rows,
+    dense_tile_shape,
     head_block_heads,
+    in_dense_tile,
     load_bhsd,
     load_document_bounds,
     offset_strides,
     online_softmax_update,
     optional_strides,
+    plan_dense_tiles,
     resolve_selected_rows,
     select_tiles,
+    selection_bits,
     store_bhsd,
     tuning_key,
 )
@@ -286,6 +292,8 @@ def _gather_attn_fwd_shared(
     BLOCK_D: tl.constexpr,
     SPARSE_STAGES: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr,
+    tile_spans_ptr=None,
+    DENSE_TILE_QUERIES: tl.constexpr = 0,
 ):
     """Process one sequence position across the query heads that share one KV head.
 
@@ -296,7 +304,8 @@ def _gather_attn_fwd_shared(
     ``kv_indices_ptr`` and ``selected_counts_ptr`` hold ``resolve_selected_rows`` output
     (compacted global pool rows and their counts) instead of document-local indices, so only
     the last selection tile needs masks. Raw indices are read only by the shared-KV schedule:
-    one KV head that is also the values.
+    one KV head that is also the values. DENSE_TILE_QUERIES skips the queries
+    ``_gather_attn_fwd_dense`` already wrote.
 
     With ROPE_DIM (shared-KV schedule only), separate key-only query and KV tensors add a
     second logit dot; they never reach the output. Local tensors are None when WINDOW is 0.
@@ -326,6 +335,8 @@ def _gather_attn_fwd_shared(
         sequence = sequence.to(tl.int64)
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
+    if in_dense_tile(tile_spans_ptr, batch, sequence, S, DENSE_TILE_QUERIES):
+        return
 
     kv_head, offsets_h, head_mask = head_block_heads(head_block, H, KV_HEADS, BLOCK_H)
     offsets_d = tl.arange(0, BLOCK_D)
@@ -522,6 +533,148 @@ def _gather_attn_fwd_shared(
         lse_ptr + ptr_offset((batch, offsets_h, sequence), LSE_STRIDES),
         running_max + tl.log(running_sum),
         mask=head_mask,
+    )
+
+
+@triton.jit(
+    do_not_specialize=["LSE_BATCH_STRIDE", "LSE_HEAD_STRIDE", "num_documents", "num_tiles", "S"]
+)
+def _gather_attn_fwd_dense(
+    query_ptr,
+    sparse_kv_ptr,
+    sparse_v_ptr,
+    masks_ptr,
+    tile_spans_ptr,
+    cu_seqlens_ptr,
+    cu_seqlens_k_ptr,
+    attention_sink_ptr,
+    output_ptr,
+    lse_ptr,
+    QUERY_STRIDES,
+    SPARSE_KV_STRIDES,
+    SPARSE_V_STRIDES,
+    LSE_BATCH_STRIDE,
+    LSE_HEAD_STRIDE,
+    LSE_STRIDES,
+    num_documents,
+    num_tiles,
+    H: tl.constexpr,
+    KV_HEADS: tl.constexpr,
+    V_IS_K: tl.constexpr,
+    S,
+    D: tl.constexpr,
+    MASK_WORDS: tl.constexpr,
+    SCALE: tl.constexpr,
+    HAS_CU_SEQLENS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
+    TILE_QUERIES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Walk every key in a dense tile's selection span, masked by each query's bitmap.
+
+    Rows are the (query, head) pairs of TILE_QUERIES consecutive queries and the query heads
+    sharing one KV head, so contiguous K/V tiles feed full tensor-core tiles instead of one
+    query's gathered rows. Tiles ``plan_dense_tiles`` left to the gather kernel exit at once.
+    """
+    S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
+    QUERY_STRIDES = offset_strides(QUERY_STRIDES, USE_INT64_OFFSETS)
+    SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
+    if not V_IS_K:
+        SPARSE_V_STRIDES = offset_strides(SPARSE_V_STRIDES, USE_INT64_OFFSETS)
+    LSE_STRIDES = offset_strides(
+        (LSE_BATCH_STRIDE, LSE_HEAD_STRIDE, LSE_STRIDES[0]), USE_INT64_OFFSETS
+    )
+
+    tile = tl.program_id(0)
+    batch = tl.program_id(1)
+    kv_head = tl.program_id(2)
+    tile_row = batch.to(tl.int64) * num_tiles + tile
+    span_hi = tl.load(tile_spans_ptr + tile_row * 2 + 1)
+    if span_hi < 0:
+        return
+    span_lo = tl.load(tile_spans_ptr + tile_row * 2)
+
+    positions, heads, row_mask = dense_tile_rows(
+        tile, kv_head, S, H // KV_HEADS, TILE_QUERIES, BLOCK_M, USE_INT64_OFFSETS
+    )
+    offsets_d = tl.arange(0, BLOCK_D)
+    dimension_mask = offsets_d < D
+    query = tl.load(
+        query_ptr
+        + ptr_offset(
+            (batch, heads[:, None], positions[:, None], offsets_d[None, :]), QUERY_STRIDES
+        ),
+        mask=row_mask[:, None] & dimension_mask[None, :],
+        other=0.0,
+    )
+    candidate_start = 0
+    if HAS_CU_SEQLENS:
+        _, _, candidate_start, _ = load_document_bounds(
+            cu_seqlens_ptr,
+            cu_seqlens_k_ptr,
+            tile * TILE_QUERIES,
+            num_documents,
+            S,
+            USE_INT64_OFFSETS,
+        )
+
+    # Base-2 online softmax: the running max and logits carry a factor of log2(e).
+    LOG2E: tl.constexpr = 1.4426950408889634
+    sink = tl.load(attention_sink_ptr + heads, mask=row_mask, other=0.0).to(tl.float32)
+    running_max = sink * LOG2E
+    running_sum = tl.full((BLOCK_M,), 1.0, tl.float32)
+    accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+    mask_rows = masks_ptr + (batch.to(tl.int64) * S + positions) * MASK_WORDS
+    offsets_n = tl.arange(0, BLOCK_N)
+    for start in tl.range(span_lo // BLOCK_N * BLOCK_N, span_hi + 1, BLOCK_N):
+        local = start + offsets_n
+        key_mask = (local <= span_hi)[:, None] & dimension_mask[None, :]
+        keys = tl.load(
+            sparse_kv_ptr
+            + ptr_offset(
+                (batch, kv_head, (candidate_start + local)[:, None], offsets_d[None, :]),
+                SPARSE_KV_STRIDES,
+            ),
+            mask=key_mask,
+            other=0.0,
+        )
+        if V_IS_K:
+            values = keys
+        else:
+            values = tl.load(
+                sparse_v_ptr
+                + ptr_offset(
+                    (batch, kv_head, (candidate_start + local)[:, None], offsets_d[None, :]),
+                    SPARSE_V_STRIDES,
+                ),
+                mask=key_mask,
+                other=0.0,
+            )
+        selected = selection_bits(mask_rows, row_mask, start, MASK_WORDS, BLOCK_M, BLOCK_N)
+        logits = tl.dot(query, tl.trans(keys)) * (SCALE * LOG2E)
+        logits = tl.where(selected, logits, -float("inf"))
+        new_max = tl.maximum(running_max, tl.max(logits, axis=1))
+        safe_max = tl.where(new_max == -float("inf"), 0.0, new_max)
+        alpha = tl.math.exp2(running_max - safe_max)
+        probabilities = tl.math.exp2(logits - safe_max[:, None])
+        accumulator = tl.dot(probabilities.to(values.dtype), values, accumulator * alpha[:, None])
+        running_sum = running_sum * alpha + tl.sum(probabilities, axis=1)
+        running_max = new_max
+
+    tl.store(
+        output_ptr
+        + ptr_offset(
+            (batch, heads[:, None], positions[:, None], offsets_d[None, :]), QUERY_STRIDES
+        ),
+        accumulator / tl.where(running_sum > 0, running_sum, 1.0)[:, None],
+        mask=row_mask[:, None] & dimension_mask[None, :],
+    )
+    tl.store(
+        lse_ptr + ptr_offset((batch, heads, positions), LSE_STRIDES),
+        (running_max + tl.math.log2(running_sum)) / LOG2E,
+        mask=row_mask,
     )
 
 
@@ -731,6 +884,15 @@ _FWD_GROUPED = TritonTuner(
     ),
     prune=prune_grouped_forward_configs,
 )
+_FWD_DENSE = TritonTuner(
+    _gather_attn_fwd_dense,
+    [
+        triton.Config({"BLOCK_N": block_n}, num_warps=8, num_stages=num_stages)
+        for block_n in (64, 32)
+        for num_stages in (2, 1)
+    ],
+    key=tuning_key("query_ptr", "H", "KV_HEADS", "V_IS_K", "D", "TILE_QUERIES", "HAS_CU_SEQLENS"),
+)
 
 
 def forward_schedule(
@@ -786,8 +948,9 @@ def _launch_grouped_forward(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Forward for separate values or grouped KV heads (see ``forward_schedule``).
 
-    Selections are first resolved to compacted global rows, which the grouped gather kernel
-    reads. Local tensors are None without a window.
+    Selections are first resolved to compacted global rows. Dense tiles (see
+    ``plan_dense_tiles``) walk their span in ``_gather_attn_fwd_dense``; the grouped gather
+    kernel skips their queries and runs the rest. Local tensors are None without a window.
     """
     batch, heads, seq_len, head_dim = query.shape
     topk = kv_indices.shape[-1]
@@ -816,9 +979,47 @@ def _launch_grouped_forward(
     v_is_k = sparse_v is None
     sparse_v = sparse_kv if v_is_k else sparse_v
     local_v = local_kv if v_is_k or not sliding_window_size else local_v
-    selected_rows, selected_counts = resolve_selected_rows(
-        kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k
+    dense_shape = dense_tile_shape(heads, kv_heads, topk, sliding_window_size)
+    tile_queries, mask_words = dense_shape or (0, 0)
+    selected_rows, selected_counts, masks, spans = resolve_selected_rows(
+        kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k, mask_words=mask_words
     )
+    tile_spans = None
+    if dense_shape is not None:
+        tile_spans = plan_dense_tiles(selected_counts, spans, cu_seqlens, tile_queries)
+        num_tiles = tile_spans.shape[1]
+        _FWD_DENSE[(num_tiles, batch, kv_heads)](
+            query,
+            sparse_kv,
+            sparse_v,
+            masks,
+            tile_spans,
+            cu_seqlens,
+            cu_seqlens_k,
+            attention_sink,
+            output,
+            lse,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_v.stride(),
+            LSE_BATCH_STRIDE=lse.stride(0),
+            LSE_HEAD_STRIDE=lse.stride(1),
+            LSE_STRIDES=lse.stride()[2:],
+            num_documents=num_documents,
+            num_tiles=num_tiles,
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            D=head_dim,
+            MASK_WORDS=mask_words,
+            SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            USE_INT64_OFFSETS=use_int64_offsets,
+            TILE_QUERIES=tile_queries,
+            BLOCK_M=DENSE_TILE_ROWS,
+            BLOCK_D=block_d,
+        )
     _FWD_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
         query,
         sparse_kv,
@@ -861,6 +1062,8 @@ def _launch_grouped_forward(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         RESOLVED_INDICES=True,
+        tile_spans_ptr=tile_spans,
+        DENSE_TILE_QUERIES=tile_queries,
     )
     return output, lse
 

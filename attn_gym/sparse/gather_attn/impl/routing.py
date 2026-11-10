@@ -23,7 +23,7 @@ def require_grouped_schedule(
     forward checks again for direct backend callers. ``kv_tensors`` holds every key and value
     pool the kernels gather from in place; the backend makes the query contiguous itself.
     Head dimensions above 256 are excluded because separate K and V tiles then exceed shared
-    memory, and the tile configurations are sized for datacenter Blackwell's shared memory.
+    memory, and the dense tiles' 128-row operands need datacenter Blackwell's shared memory.
     """
     head_dim = query.shape[-1]
     major, minor = torch.cuda.get_device_capability(query.device)

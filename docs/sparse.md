@@ -233,6 +233,13 @@ positive width can launch.
   FA4 must provide sparse-MLA sink support when a sink is supplied, and head-padding support
   when `H < 128` (FA4 4.0.0b32+); default probability recomputation requires 4.0.0b33+.
 
+Pool rows that no query selects must be finite on Triton's grouped schedule (separate values or
+`1 < kv_heads < H`). With `W = 0`, tiles of nearby queries whose selections fall in a short
+span read every key and value row in that span, selected or not, and give unselected rows zero
+probability. Zero times NaN or Inf is still NaN, so a non-finite unselected value row near
+selected ones can make those queries' outputs NaN. Zero-fill fixed-capacity pool padding rather
+than leaving it NaN.
+
 With `local_kv=None`, Attention Gym passes the latent and rotary sparse pools as separate
 operands without concatenating components or packing the pools. Eligible native layouts avoid
 pool copies; FA4 may normalize other layouts. Supplying a local pool packs both pools into
