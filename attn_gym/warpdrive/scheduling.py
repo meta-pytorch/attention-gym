@@ -57,7 +57,9 @@ schedule=ClusterLaunchControl())``; roles take ``work: WorkCursor`` and loop::
 
 Tracing checks that each role calls ``advance()`` exactly once, directly in the body of a
 ``while work.valid:`` loop (not under a branch or nested loop), so every role steps through
-the same sequence.
+the same sequence. A ``StaticPersistent`` or ``TilePersistent`` stream may instead be looped as
+``for k in cutlass.range(work.trip_count(), unroll=n): item = work.item_at(k)``, which
+``cutlass.range`` can unroll (``WorkCursor.trip_count``).
 
 Clusters (``CtaPair``, ``Cluster``): a work item belongs to a cluster of ``cs`` CTAs. Indices
 count clusters (``blockIdx.x // cs``, ``gridDim.x // cs``), and the grid launches ``cs``
@@ -1501,10 +1503,20 @@ class _CursorRecord:
     cursor: str  # the stream's (and the role parameter's) name, for messages
     advances: list = field(default_factory=list)  # (site, block)
     valid_reads: list = field(default_factory=list)  # (block, valid SSA value identity)
+    counted: list = field(default_factory=list)  # trip_count() sites: a counted loop
+    loop_block: object = None  # the loop body of a counted loop's item_at() calls
     trace: object = None
     lineage: Lineage = field(default_factory=Lineage)
 
     def check(self):
+        if self.counted:  # a counted loop: trip_count() and advance() exclude each other
+            if self.loop_block is None:
+                raise ProtocolError(
+                    f"{self.role}: {self.cursor}.trip_count() at {self.counted[0]} is never "
+                    f"looped over; read each item with {self.cursor}.item_at(k) in "
+                    f"`for k in cutlass.range({self.cursor}.trip_count()):`"
+                )
+            return
         if not self.advances:
             raise ProtocolError(
                 f"{self.role}: takes a WorkCursor but never calls advance(); loop with "
@@ -1811,6 +1823,12 @@ class WorkCursor:
     def advance(self):
         """Move to this CTA's next work item (``valid`` turns false when there is none)."""
         self._check_current()
+        if self._rec.counted:
+            raise ProtocolError(
+                f"{self._rec.role}: advance() at {user_site()} on a cursor counted by "
+                f"trip_count() at {self._rec.counted[0]}; loop either with advance() or over "
+                "trip_count(), not both"
+            )
         self._rec.lineage.advanced(self._copy)
         self._rec.advances.append((user_site(), current_block()))
         trace = self._rec.trace
@@ -1828,6 +1846,71 @@ class WorkCursor:
         else:
             self._receive()
         self._enter_item()
+
+    def trip_count(self):
+        """Items this cursor runs, for a counted loop that ``cutlass.range`` can unroll::
+
+            for k in cutlass.range(work.trip_count(), unroll=2):
+                m, n, l = work.item_at(k)
+
+        Instead of ``while work.valid: ...; work.advance()``, for a local ``StaticPersistent``
+        or ``TilePersistent`` stream whose mapping keeps every item, decodes any index and keeps
+        no decode state (``Raster``), without ``record``. Item ``k`` is index
+        ``first + k * stride``; the count is ``ceil((end - first) / stride)``, or 0 when the
+        first index is already terminal, with ``end`` the total or the limit. A cursor runs in
+        one mode: ``advance()`` on a counted cursor, or ``trip_count()`` on an advanced one,
+        raises at trace time.
+        """
+        self._check_current()
+        stream, rec = self._stream, self._rec
+        why = None
+        if self._end is not None:
+            why = "its items arrive over a broadcast ring"
+        elif type(stream.schedule) not in (StaticPersistent, TilePersistent):
+            why = f"{stream.schedule.describe()} has no fixed stride"
+        elif not stream.mapping.decodes_any_index or stream.mapping.skips:
+            why = f"{type(stream.mapping).__name__} does not decode every index unguarded"
+        elif self._state is not None:
+            why = f"{type(stream.mapping).__name__} keeps a decode state"
+        elif stream.record:
+            why = "WorkStream(record=...) logs per advance()"
+        elif rec.advances:
+            why = f"it already advances at {rec.advances[0][0]}"
+        elif rec.counted:
+            why = f"it is already counted at {rec.counted[0]}, so its items would run twice"
+        if why is not None:
+            raise ProtocolError(
+                f"{rec.role}: trip_count() on {rec.cursor} at {user_site()}: {why}; loop with "
+                f"`while {rec.cursor}.valid: ...; {rec.cursor}.advance()`"
+            )
+        rec.counted.append(user_site())
+        remaining = cutlass.max(Int32(self._problem.total) - self.index, Int32(0))
+        # The fixed index step, computed once where the loop starts (its value dominates it).
+        stride = Int32(stream.schedule.next_index(self.index, self._problem)) - self.index
+        rec.stride = stride
+        return Int32((Uint32(remaining) + Uint32(stride) - 1) // Uint32(stride))
+
+    def item_at(self, k):
+        """Item ``k`` of a counted loop (``trip_count()``): index ``first + k * stride``. Call it
+        only in the body of that one loop; before the loop, ``item`` is the first item."""
+        self._check_current()
+        rec = self._rec
+        if not rec.counted:
+            raise ProtocolError(
+                f"{rec.role}: item_at() at {user_site()} before trip_count(); a counted "
+                f"loop runs `for k in cutlass.range({rec.cursor}.trip_count()): ...`"
+            )
+        block = current_block()
+        if block.owner.name != "scf.for" or rec.loop_block not in (None, block):
+            raise ProtocolError(
+                f"{rec.role}: item_at() at {user_site()} must run directly in the body of the "
+                f"one `for k in cutlass.range({rec.cursor}.trip_count()):` loop, not under a "
+                "branch, a nested loop or another loop"
+            )
+        rec.loop_block = rec.trace.item_block = block  # per-item channel uses count from here
+        index = self.index + Int32(k) * rec.stride
+        words, _ = _decode(self._stream, index, self._problem, None)
+        return self._stream.mapping.unpack(words)
 
     def _receive(self):
         h = self._end.wait()

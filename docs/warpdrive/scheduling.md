@@ -104,6 +104,25 @@ The checker rejects item reads after advance, including lookahead reads of the n
 inside the same iteration. It does not prove advance is lexically last, detect every cursor
 rebind/stale restore, or prove useful and matching work happened before it.
 
+### A counted loop
+
+A `while work.valid` loop is an `scf.while`, which `cutlass.range(..., unroll=n)` cannot
+unroll. A local `StaticPersistent` or `TilePersistent` stream over `Raster()` (a mapping that
+keeps every item, decodes any index and keeps no state) without `record` can loop over a trip
+count instead:
+
+```python
+for k in cutlass.range(work.trip_count(), unroll=2):  # two items' loads overlap
+    m, n, l = work.item_at(k)
+    ...
+```
+
+Item `k` is index `first + k * stride`, and `trip_count()` is
+`ceil((end - first) / stride)` (0 when the first index is already terminal), with `end` the total
+or the [limit](#a-device-read-limit). A cursor runs in one mode: calling `advance()` on a counted
+cursor, or `trip_count()` on an advanced one, raises at trace time. Return the cursor from the
+role as usual.
+
 ### What the scheduler warp buffers
 
 Local schedules compute and decode indices in each role. Atomic and CLC schedules add a

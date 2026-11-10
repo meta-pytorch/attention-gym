@@ -45,6 +45,7 @@ from attn_gym.warpdrive import (
     SingleCta,
     StaticPersistent,
     TilePersistent,
+    WorkCursor,
     WorkMap,
     WorkStream,
     role,
@@ -582,12 +583,32 @@ class PlainToy:
             valid, item = bound.single_item()
             if valid and first_thread:
                 _hit(0, item, ctx)
+        elif cutlass.const_expr(self.mode.startswith("count")):
+            work = bound.cursor()
+            trips = work.trip_count()
+            if cutlass.const_expr(self.mode == "count_twice"):
+                trips = work.trip_count()
+            if cutlass.const_expr(self.mode == "count_item_before_loop"):
+                _hit(0, work.item_at(0), ctx)
+            if cutlass.const_expr(self.mode != "count_no_loop"):
+                for k in cutlass.range(trips, unroll=2):
+                    if cutlass.const_expr(self.mode == "count_item_in_branch"):
+                        if first_thread:
+                            _hit(0, work.item_at(k), ctx)
+                    else:
+                        item = work.item_at(k)
+                        if first_thread:
+                            _hit(0, item, ctx)
+            if cutlass.const_expr(self.mode == "count_then_advance"):
+                work.advance()
         else:
             work = bound.cursor()
             while work.valid:
                 if first_thread:
                     _hit(0, work.item, ctx)
                 work.advance()
+            if cutlass.const_expr(self.mode == "advance_then_count"):
+                work.trip_count()
 
     @cute.jit
     def __call__(
@@ -612,11 +633,14 @@ def compile_plain_toy(op: PlainToy):
 
 
 def _plain_hits(op, ext, max_ctas=148):
-    """Counts per tile; one zero for an empty space, whose idle CTA must count nothing."""
-    hits = torch.zeros(1, max(math.prod(ext), 1), dtype=torch.int32, device="cuda")
+    """Counts per tile; one zero for an empty space, whose idle CTA must count nothing. An item
+    past the space would count in the checked padding."""
+    size, pad = max(math.prod(ext), 1), 64
+    hits = torch.zeros(1, size + pad, dtype=torch.int32, device="cuda")
     compile_plain_toy(op)(hits, *ext, max_ctas)
     torch.cuda.synchronize()
-    return hits[0].cpu()
+    assert not hits[0, size:].any(), "an item past the space ran"
+    return hits[0, :size].cpu()
 
 
 @pytest.mark.parametrize(
@@ -663,6 +687,14 @@ def _plain_hits(op, ext, max_ctas=148):
         (TilePersistent("m", units=4), None, "cursor", (9, 3, 2)),
         (TilePersistent("n", units=16), None, "cursor", (3, 9, 2)),
         (TilePersistent("l", units=3), None, "cursor", (2, 3, 7)),
+        # Counted loops (unroll=2): 126 items over 4 CTAs, not a multiple; empty spaces.
+        (StaticPersistent(), None, "counted", (9, 7, 2)),
+        (StaticPersistent(), None, "counted", (3, 1, 1)),  # fewer items than max_ctas
+        (StaticPersistent(), None, "counted", (0, 7, 2)),
+        (TilePersistent("n"), None, "counted", (3, 9, 2)),
+        (TilePersistent("l"), None, "counted", (2, 3, 2)),  # stride 4 past the extent of 2
+        (TilePersistent("m"), None, "counted", (0, 3, 2)),
+        (TilePersistent("l", units=3), None, "counted", (2, 3, 7)),  # constant stride
     ],
     ids=lambda v: v if isinstance(v, str) else None,
 )
@@ -854,23 +886,27 @@ def compile_limit_toy(op):
         (OneShot(grid="3d"), "item", False),
         (OneShot(grid="3d"), "item", True),
         (OneShot(grid="1d"), "cursor", True),
+        (OneShot(grid="2d"), "item", True),
         (TilePersistent("n"), "cursor", False),
         (TilePersistent("m"), "cursor", True),
+        (StaticPersistent(), "counted", True),
+        (TilePersistent("n"), "counted", True),
     ],
     ids=["static_roles", "static_plain", "auto_roles", "tiles_roles", "tiles_plain", "flat_plain",
-         "tile_n_roles", "tile_m_plain"],
+         "2d_plain", "tile_n_roles", "tile_m_plain", "static_counted", "tile_n_counted"],
 )  # fmt: skip
 def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule, mode, plain):
     """Every decoding site reads the limit once and ends at ``min(total, limit)``: the first
-    ``limit`` indices run, once, in every role; 0 runs nothing; a limit at or past the total
+    ``limit`` indices run, once, in every role; 0 or below runs nothing; a limit at or past the total
     changes nothing. ``TilePersistent``'s index is its axis coordinate. One compile serves every
     limit."""
     op = LimitPlainToy(schedule, mode=mode) if plain else LimitToy(schedule, mode)
     fn = compile_limit_toy(op)
     em, en, el = 5, 3, 2
     total = em * en * el
-    for limit in (0, 7, total, total + 9):
-        hits = torch.zeros(3, total, dtype=torch.int32, device="cuda")
+    for limit in (-3, 0, 7, total, total + 9):
+        pad = 64  # an item past the stream's end would count in the padding
+        hits = torch.zeros(3, total + pad, dtype=torch.int32, device="cuda")
         # A prefix-sum table: only its last entry is read.
         table = torch.tensor([0, 3, limit], dtype=torch.int32, device="cuda")
         fn(hits, table, em, en, el, 4)
@@ -880,10 +916,13 @@ def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule,
         index = {
             TilePersistent: lambda li, n, m: (m, n, li)["mnl".index(schedule.axis)],
         }.get(type(schedule), lambda li, n, m: (li * en + n) * em + m)
-        expect = torch.tensor([int(index(*t) < limit) for t in tiles], dtype=torch.int32)
+        expect = torch.tensor([int(index(*t) < limit) for t in tiles] + [0] * pad)
         rows = [0] if plain else [0, 1, 2] if mode == "item" else [0, 1]
         for r in range(3):
-            assert torch.equal(hits[r].cpu(), expect if r in rows else 0 * expect), (limit, r)
+            assert torch.equal(hits[r].cpu(), expect.int() if r in rows else 0 * expect.int()), (
+                limit,
+                r,
+            )
 
 
 def test_tile_persistent_reads_without_division(requires_blackwell, tmp_path, monkeypatch):
@@ -1306,3 +1345,103 @@ def test_tile_persistent_launch_bounds_the_axis_not_the_space():
     coordinates all fit launches."""
     bound = WorkStream(schedule=TilePersistent("n")).bind((16, 3_000_000, 64), None, 152)
     assert bound.grid() == (16, 152, 64)
+
+
+@pytest.mark.parametrize(
+    "mode, message",
+    [
+        ("count_then_advance", r"advance\(\) at .* on a cursor counted by trip_count\(\)"),
+        ("advance_then_count", r"trip_count\(\) on .*: it already advances"),
+        ("count_twice", r"trip_count\(\) on .*: it is already counted"),
+        ("count_item_before_loop", r"item_at\(\) at .* must run directly in the body"),
+        ("count_item_in_branch", r"item_at\(\) at .* must run directly in the body"),
+    ],
+)
+def test_counted_loop_rejects_misuse(mode, message):
+    """A cursor loops either with advance() or over one trip_count(), reading items with
+    item_at() directly in that loop's body; anything else raises when traced."""
+    with pytest.raises(ProtocolError, match=message):
+        compile_plain_toy.__wrapped__(PlainToy(StaticPersistent(), mode=mode))
+
+
+def test_counted_loop_rejections():
+    """trip_count() needs a fixed stride and an unguarded, stateless decode."""
+    for schedule, mapping, why in [
+        (OneShot(grid="1d"), None, "has no fixed stride"),
+        (StaticPersistent(), SkipOdd(), "does not decode every index unguarded"),
+    ]:
+        with pytest.raises(ProtocolError, match=why):
+            compile_plain_toy.__wrapped__(PlainToy(schedule, mapping, mode="counted"))
+
+
+class CountedRoleToy(StreamToy):
+    """Roles ``a`` (warp 0) and ``b`` (warps 1-2) each loop over ``trip_count()`` and count every
+    item in ``hits[role, tile]``."""
+
+    def __init__(self, schedule, mode: str = "ok"):
+        super().__init__(schedule)
+        self.mode = mode
+
+    @cute.jit
+    def _counted(self, r: int, work, ctx):
+        trips = work.trip_count()
+        if cutlass.const_expr(self.mode == "no_loop" and r == 1):
+            return work
+        for k in cutlass.range(trips, unroll=2):
+            item = work.item_at(k)
+            if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r:
+                _hit(r, item, ctx)
+        return work
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, work: WorkCursor, ctx):
+        return self._counted(0, work, ctx)
+
+    @role(warps=range(1, 3))
+    @cute.jit
+    def b(self, work: WorkCursor, ctx):
+        return self._counted(1, work, ctx)
+
+    @cute.kernel
+    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(hits=hits, em=em, en=en))
+
+    @cute.jit
+    def __call__(
+        self, hits: cute.Tensor, em: Int32, en: Int32, el: Int32, max_ctas: Int32, stream
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+@pytest.mark.parametrize(
+    "schedule", [StaticPersistent(), TilePersistent("n"), TilePersistent("m", units=3)]
+)
+def test_counted_loop_in_roles(requires_blackwell, schedule):
+    """Every role of a warp-specialized kernel runs each item once through a counted loop."""
+    fn = compile_tvm_ffi(
+        CountedRoleToy(schedule),
+        make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int())),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=CountedRoleToy(schedule).get_name(),
+    )
+    ext = (5, 7, 2)
+    hits = torch.zeros(2, math.prod(ext) + 64, dtype=torch.int32, device="cuda")
+    fn(hits, *ext, 4)
+    torch.cuda.synchronize()
+    expect = torch.tensor([1] * math.prod(ext) + [0] * 64, dtype=torch.int32)
+    assert torch.equal(hits[0].cpu(), expect) and torch.equal(hits[1].cpu(), expect)
+
+
+def test_counted_role_must_loop(requires_blackwell):
+    """A role's counted cursor whose items are never read with item_at() raises at role exit."""
+    op = CountedRoleToy(StaticPersistent(), mode="no_loop")
+    hits = make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int()))
+    with pytest.raises(ProtocolError, match=r"trip_count\(\) at .* is never looped over"):
+        compile_tvm_ffi(op, hits, Int32(1), Int32(1), Int32(1), Int32(1), name=op.get_name())
