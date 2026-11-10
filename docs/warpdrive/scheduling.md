@@ -205,9 +205,15 @@ point, so the grid is launched as is and CUDA rejects it before any CTA runs:
 `CUDA launch failed: cudaErrorInvalidValue (1)`, `CUDA rejected the launch configuration before
 running the kernel.`
 
+Pass `m_tiles` and `n_tiles` as Python ints when they are compile-time constants (heads, a
+channel-block count): binding keeps them static beside runtime extents, so `Raster.decode` and
+the `"2d"` unfold divide by constants. `l` is never a divisor; with any runtime extent it
+binds as a runtime value.
+
 If any Raster extent is `<= 0`:
 
-- Host-side binding normalizes space to `(1, 1, 0)`.
+- Host-side binding normalizes space to `(1, 1, 0)` (a runtime-empty space with static tile
+  extents keeps them and binds `l = 0`).
 - Every built-in schedule launches one unit, with `work.valid == False` in every role.
 - No guarded decode runs; any-index decoders may evaluate and discard a result.
 - No divisor is zero and the atomic workspace remains zeroed.

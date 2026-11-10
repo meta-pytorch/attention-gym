@@ -147,6 +147,31 @@ def test_bound_empty_space_has_no_items_and_decodes(mapping):
             mapping.decode(Int32(index), bound, None)
 
 
+@pytest.mark.parametrize("mapping", MAPPINGS, ids=lambda o: o.get_key())
+def test_bound_static_tile_extents_stay_static(mapping):
+    """A static ``m_tiles``/``n_tiles`` beside runtime extents binds as a Python int (so device
+    code divides by a constant), ``l`` as a runtime value; the items are those of the static
+    space, and a runtime-empty space counts none and still decodes."""
+    for ext in [(13, 29, 3), (7, 1, 2), (1, 7, 1)]:
+        em, en, el = ext
+        spaces = [(em, Int32(en), Int32(el)), (em, en, Int32(el)), (Int32(em), en, el)]
+        for space in spaces:
+            bound = mapping.bind(space)
+            static = [type(e) is int for e in space]
+            assert [type(e) is int for e in bound] == static[:2] + [False], space
+            assert int(mapping.count64(bound)) == em * en * el
+            for index in range(em * en * el):
+                got = tuple(int(w) for w in mapping.decode(Int32(index), bound, None)[1])
+                assert got == mapping.decode(index, ext, None)[1], (space, index)
+    for space in [(4, 3, Int32(0)), (4, Int32(0), Int32(5)), (Int32(-1), 3, Int32(2))]:
+        bound = mapping.bind(space)
+        assert int(mapping.count64(bound)) == 0, space
+        assert min(int(e) for e in bound[:2]) >= 1 and int(bound[2]) == 0, space
+        for index in range(4):
+            mapping.decode(Int32(index), bound, None)
+    assert mapping.bind((0, Int32(3), Int32(5))) == (1, 1, 0)  # statically empty
+
+
 @pytest.mark.parametrize(
     "space", [(5, 3, 2), (2**31 - 1, 1, 1), (65537, 65537, 1), (2**31 - 1, 2**31 - 1, 4)]
 )
@@ -1067,3 +1092,10 @@ def test_fa4_fwd_persistent(requires_blackwell, schedule, b, h, sq, sk, max_ctas
     check_fa4_twice(
         b, h, sq, sk, schedule=SCHEDULES[schedule], max_ctas=max_ctas, turnstile=turnstile
     )
+
+
+@pytest.mark.parametrize("grid", ["3d", "2d"])
+def test_static_grid_rejects_a_static_extent_beside_runtime_ones(grid):
+    """A static n_tiles past gridDim.y raises even when other extents are runtime values."""
+    with pytest.raises(ValueError, match="gridDim.y/z are limited"):
+        tile_grid_dims((Int32(3), 70000, Int32(2)), 1, grid)

@@ -556,14 +556,17 @@ def test_static_grid_rejects_an_oversized_static_space(grid, space):
 
 class PlainToy:
     """A kernel without roles: every CTA counts its items in ``hits[tile]``, read with
-    ``bound.single_item()`` (``mode="item"``) or a ``bound.cursor()`` loop."""
+    ``bound.single_item()`` (``mode="item"``) or a ``bound.cursor()`` loop. ``static`` gives
+    ``(m_tiles, n_tiles)`` compile-time values (None: the runtime argument)."""
 
-    def __init__(self, schedule, mapping=None, mode: str = "item"):
+    def __init__(self, schedule, mapping=None, mode: str = "item", static=(None, None)):
         self.work = WorkStream(mapping=mapping or Raster(), schedule=schedule)
         self.mode = mode
+        self.static = static
 
     def get_name(self) -> str:
-        return f"warpdrive_plaintoy_{self.work.get_key()}_{self.mode}"
+        static = "".join("r" if e is None else str(e) for e in self.static)
+        return f"warpdrive_plaintoy_{self.work.get_key()}_{self.mode}_{static}"
 
     def __cute_cache_key__(self) -> str:
         return self.get_name()
@@ -593,7 +596,8 @@ class PlainToy:
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        bound = self.work.bind((em, en, el), None, max_ctas)
+        tiles = (e if s is None else s for e, s in zip((em, en), self.static, strict=True))
+        bound = self.work.bind((*tiles, el), None, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(hits, em, en, bound).launch(grid=bound.grid(), block=(64, 1, 1), stream=stream)
 
@@ -636,13 +640,26 @@ def _plain_hits(op, ext, max_ctas=148):
         (StaticPersistent(), None, "cursor", (9, 7, 2)),  # 4 CTAs run 126 items
         (StaticPersistent(), SkipOdd(swizzle=2), "cursor", (9, 7, 2)),
         (StaticPersistent(), None, "cursor", (0, 7, 2)),
+        # Static tile extents (Python ints) beside runtime ones; l carries emptiness.
+        (OneShot(grid="2d"), None, "static_m", (3, 2, 65537)),
+        (OneShot(grid="2d"), None, "static_m", (3, 2, 0)),
+        (OneShot(grid="3d"), None, "static_mn", (5, 3, 2)),
+        (OneShot(), None, "static_mn", (2, 3, 2)),
+        (OneShot(), None, "static_mn", (5, 3, 0)),
+        (OneShot(grid="1d"), Raster(swizzle=2, reverse="m"), "static_mn", (5, 3, 2)),
+        (StaticPersistent(), None, "static_mn", (9, 7, 2)),
+        (StaticPersistent(), Raster(along="n", swizzle=3), "static_m", (9, 7, 2)),
     ],
     ids=lambda v: v if isinstance(v, str) else None,
 )
 def test_plain_kernel_reads_its_work(requires_blackwell, schedule, mapping, mode, ext):
     """A kernel without roles covers the space once, on every static grid and through a
-    persistent cursor loop."""
-    op = PlainToy(schedule, mapping, mode)
+    persistent cursor loop, also with static tile extents."""
+    em, en, _ = ext
+    static = {"static_m": (em, None), "static_mn": (em, en)}.get(mode, (None, None))
+    if mode.startswith("static"):
+        mode = "cursor" if schedule.persistent else "item"
+    op = PlainToy(schedule, mapping, mode, static)
     em, en, el = ext
     kept = [
         int(mapping is None or not mapping.skips or mapping.kept((m, n, li)))
@@ -676,16 +693,19 @@ def test_tiles_grid_reads_block_idx_without_a_fallback(requires_blackwell, tmp_p
 
     compile_fn = Compiler.compile
 
-    def ptx_of(grid: str) -> str:
+    def ptx_of(grid: str, static=(None, None)) -> str:
+        label = grid + "".join(f"_{e}" for e in static if e is not None)
+        (tmp_path / label).mkdir()
+
         def dump_ptx(self, module, pipeline, *args, **kwargs):
-            option = f"dump-ptx-path='{tmp_path / grid}' "
+            option = f"dump-ptx-path='{tmp_path / label / 'kernel'}' "
             pipeline = pipeline.replace("cute-to-nvvm{", "cute-to-nvvm{" + option, 1)
             return compile_fn(self, module, pipeline, *args, **kwargs)
 
         monkeypatch.setattr(Compiler, "compile", dump_ptx)
         # Bypass the cache: the PTX needs a compile.
-        compile_plain_toy.__wrapped__(PlainToy(OneShot(grid=grid)))
-        (ptx,) = tmp_path.glob(f"{grid}*.ptx")
+        compile_plain_toy.__wrapped__(PlainToy(OneShot(grid=grid), static=static))
+        (ptx,) = (tmp_path / label).glob("*.ptx")
         return ptx.read_text(errors="ignore")
 
     decodes = re.compile(r"^\s*(div|rem)\.", re.MULTILINE)
@@ -698,6 +718,9 @@ def test_tiles_grid_reads_block_idx_without_a_fallback(requires_blackwell, tmp_p
     assert "%ctaid.y" in fold and "%ctaid.z" not in fold and "%nctaid" not in fold
     assert [m.group(0).strip() for m in decodes.finditer(fold)] == ["div."]
     assert "div.u32" in fold
+    # A static m_tiles stays a constant: the unfold multiplies instead of dividing.
+    fold_static = ptx_of("2d", static=(3, None))
+    assert "%ctaid.x" in fold_static and not decodes.search(fold_static)
     flat = ptx_of("1d")  # the 1-D index, decoded unsigned
     assert "%ctaid.y" not in flat and "%nctaid" not in flat
     assert "div.u32" in flat and "div.s32" not in flat and "div.s32" in auto

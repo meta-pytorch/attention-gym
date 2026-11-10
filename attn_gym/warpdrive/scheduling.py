@@ -235,9 +235,14 @@ class Raster(WorkMap):
     admits (``BoundWork.grid``), and it may run on unsigned values (the flat ``OneShot`` grid).
 
     ``bind`` treats a negative extent as zero and maps an empty space to ``(1, 1, 0)``: no
-    items, and every divisor in ``decode`` is 1. ``decode`` is therefore defined for any index
-    (``decodes_any_index``) and keeps every item. ``bind`` runs in the host part of the jit
-    entry point, so kernels pay nothing for it.
+    items, and every divisor in ``decode`` is positive. ``decode`` is therefore defined for any
+    index (``decodes_any_index``) and keeps every item. ``bind`` runs in the host part of the
+    jit entry point, so kernels pay nothing for it.
+
+    A static (Python int) ``m_tiles`` or ``n_tiles`` stays a compile-time constant when other
+    extents are runtime values, so ``decode`` and the ``OneShot(grid="2d")`` unfold divide
+    by a constant. ``l`` is never a divisor; with any runtime extent it is bound as a runtime
+    value, which a runtime-empty space clamps to 0 (and its runtime tile extents to 1).
     """
 
     along: str = "m"
@@ -260,14 +265,21 @@ class Raster(WorkMap):
     def bind(self, space):
         if len(space) != 3:
             raise ValueError(f"Raster space is (m_tiles, n_tiles, l), got {space!r}")
-        if all(isinstance(e, int) for e in space):  # static extents: the same rule on the host
-            if min(space) <= 0:
-                return (1, 1, 0)
+        static = [e for e in space if isinstance(e, int)]
+        if static and min(static) <= 0:  # statically empty: the same rule on the host
+            return (1, 1, 0)
+        if len(static) == 3:
             return tuple(min(e, INT32_MAX) for e in space)
-        em, en, el = (Int32(e) for e in space)
-        # INT32_MAX when every extent is positive, else 0 (clamping the space to (1, 1, 0)).
-        cap = cutlass.max(cutlass.min(cutlass.min(cutlass.min(em, en), el), 1), 0) * INT32_MAX
-        return tuple(cutlass.max(cutlass.min(e, cap), lo) for e, lo in ((em, 1), (en, 1), (el, 0)))
+        # Static tile extents stay constants (positive, checked above). l is never a divisor,
+        # so it is always a runtime value that can carry the emptiness of the space.
+        *tiles, el = (min(e, INT32_MAX) if isinstance(e, int) else Int32(e) for e in space)
+        el = Int32(el)
+        runtime = [e for e in tiles if not isinstance(e, int)] + [el]
+        # INT32_MAX when every runtime extent is positive, else 0 (clamping the runtime tile
+        # extents to 1 and l to 0, so the space has no items).
+        cap = cutlass.max(cutlass.min(functools.reduce(cutlass.min, runtime), 1), 0) * INT32_MAX
+        em, en = (e if isinstance(e, int) else cutlass.max(cutlass.min(e, cap), 1) for e in tiles)
+        return em, en, cutlass.max(cutlass.min(el, cap), 0)
 
     def count64(self, space):
         # Saturates at 2**31 so neither this nor the launch check's arithmetic wraps Int64.
@@ -1352,18 +1364,22 @@ def tile_grid_dims(space, cs: int = 1, grid: str = "auto"):
     """
     em, en, el = space
     x, y, z = (em * el, en, 1) if grid == "2d" else (em, en, el)
-    if all(isinstance(e, int) for e in space):
-        if min(space) <= 0:
-            return (cs, 1, 1)
-        if max(y, z) <= MAX_GRID_YZ:
-            return (x * cs, y, z)
-        if grid == "auto":
-            return (em * en * el * cs, 1, 1)
+    static = all(isinstance(e, int) for e in space)
+    if static and min(space) <= 0:
+        return (cs, 1, 1)
+    # A static y/z extent past the limit cannot launch, whatever the other extents are.
+    too_large = any(isinstance(e, int) and e > MAX_GRID_YZ for e in (y, z))
+    if static and not too_large:
+        return (x * cs, y, z)
+    if static and grid == "auto":
+        return (em * en * el * cs, 1, 1)
+    if too_large and grid != "auto":
         raise ValueError(
             f"OneShot(grid={grid!r}) cannot launch the space {tuple(space)}: gridDim.y/z are "
             f"limited to {MAX_GRID_YZ}. OneShot.grid_for(space) selects a grid that fits "
             "('2d' or '1d')"
         )
+    em, en, el = (Int32(e) for e in space)  # a bound space may mix static tile extents in
     nonempty = (em > 0) & (en > 0) & (el > 0)
     one = Int32(1)
     fits, x_otherwise = nonempty, one
@@ -1372,7 +1388,7 @@ def tile_grid_dims(space, cs: int = 1, grid: str = "auto"):
         x_otherwise = cutlass.select_(nonempty, em * en * el, one)
     return (
         Int32(cutlass.select_(fits, x, x_otherwise)) * cs,
-        Int32(cutlass.select_(fits, y, one)),
+        Int32(cutlass.select_(fits, Int32(y), one)),
         Int32(cutlass.select_(fits, Int32(z), one)),
     )
 
