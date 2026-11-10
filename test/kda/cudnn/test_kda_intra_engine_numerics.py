@@ -105,10 +105,9 @@ def _metadata(lengths, tokens):
     return prepare_ragged_chunk_metadata(cumulative_sequence_offsets(lengths), tokens, BT)
 
 
-def _launch(config, q, k, g, beta, metadata, compile_fn=None):
+def _launch(config, q, k, g, beta, metadata):
     """The three raw outputs of one launch, each from a sentinel fill."""
     heads, use_int64, grid = config
-    compile_fn = compile_fn or engine._compile_intra_engine_fwd
     tokens = q.shape[1]
     capacity = tokens // BT if metadata is None else metadata.capacity
     aqk = torch.full((tokens, heads, BT), SENTINEL, device="cuda", dtype=torch.bfloat16)
@@ -118,7 +117,7 @@ def _launch(config, q, k, g, beta, metadata, compile_fn=None):
     target = detect_compile_target(q.device.index)
     try:
         set_compile_target(target if grid is None else replace(target, sm_count=grid))
-        kernel = compile_fn(heads, D, metadata is not None, use_int64)
+        kernel = engine._compile_intra_engine_fwd(heads, D, metadata is not None, use_int64)
     finally:
         set_compile_target(previous)
     kernel(
@@ -231,33 +230,6 @@ def _cases(config):
 def test_matches_fp64(config):
     for case in _cases(config):
         _check(config, *case)
-
-
-@pytest.mark.parametrize("config", CONFIGS, ids=CONFIG_IDS)
-def test_error_no_worse_than_legacy(config):
-    """Against FP64, no output is less accurate than the pre-warpdrive kernel's exact build.
-
-    Removed together with the legacy module. Rounding differs entry by entry, so the bound is
-    5% of the legacy rel-L2; steep gates where the legacy kernel loses terms come out far below.
-    """
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine_legacy import (
-        compile_legacy_intra_engine_fwd,
-    )
-
-    def legacy(*args):
-        return compile_legacy_intra_engine_fwd(*args, False)
-
-    def rel_l2(got, ref):
-        written = ref != SENTINEL
-        return ((got.double() - ref)[written].norm() / ref[written].norm().clamp_min(1e-30)).item()
-
-    for case in _cases(config):
-        inputs, expected, _ = _case(config, *case)
-        new = _launch(config, *inputs)
-        old = _launch(config, *inputs, compile_fn=legacy)
-        for name, got, base, ref in zip(NAMES, new, old, expected, strict=True):
-            if (ref != SENTINEL).any():
-                assert rel_l2(got, ref) <= 1.05 * rel_l2(base, ref), (case[:3], name)
 
 
 def test_many_units_per_cta_match_fp64():
