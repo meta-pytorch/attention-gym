@@ -1,0 +1,305 @@
+# Copyright (c) 2025 Meta Platforms, Inc. and affiliates.
+# All rights reserved.
+#
+# This source code is licensed under the BSD-style license found in the
+# LICENSE file in the root directory of this source tree.
+
+"""Direct-vector CuTeDSL forward for the bounded and softplus gate transforms.
+
+The transform kind is a compile-time specialization: ``lower_bound * sigmoid(a * z)`` (Kimi/KDA)
+or ``-a * softplus(z)`` (Mamba2/GDN) with ``z = raw + dt_bias`` and ``a = exp(A_log)``. Softplus
+uses the overflow-free form ``max(z, 0) + log1p(exp(-|z|))``; see NOTE [Fastmath Softplus] in
+``attn_gym/linear/_delta_rule/triton/softplus_gate.py`` for the fastmath accuracy contract.
+
+Each CTA owns eight heads of one physical token. The 128-thread/8-value thread-value map
+is::
+
+    head = head_group * 8 + thread // 16
+    channel = (thread % 16) * 8 + value
+
+It covers ``8 * 128`` elements exactly, gives each thread one contiguous eight-value
+load and one contiguous 32-byte FP32 store, and predicates only the final partial head
+group. Token count and batch size are represented directly by grid dimensions, so no
+sequence-length divisibility or token padding is required.
+
+The launcher selects a compact 16-byte-aligned signature for the model path and a general
+signature with a contiguous last mode, dynamic outer strides, and element-size alignment.
+Only an input whose last mode is noncontiguous is materialized into a supported layout.
+"""
+
+from __future__ import annotations
+
+import math
+
+import cutlass
+import torch
+from cuda.bindings import driver as cuda
+from cutlass import Float32, cute
+
+from attn_gym._backends.cute import tensor_supports_contiguous_dim
+from attn_gym._backends.cute.utils import CuteDType, cute_dtype, requires_int64_abi
+from attn_gym.linear.kda.constants import LOG2_E
+from attn_gym.linear.types import GateTransform
+from attn_gym.utils import cdiv
+from attn_gym.warpdrive.cache import (
+    compile_tvm_ffi,
+    get_compile_target,
+    jit_cache,
+    make_fake_strided_tensor,
+)
+
+_HEAD_DIM = 128
+_HEADS_PER_BLOCK = 8
+_THREADS = 128
+_VALUES_PER_THREAD = 8
+_ALIGNMENT = 16
+_LN_2 = math.log(2.0)
+# Below this ``exp(-|z|)`` the fastmath ``log2(1 + e)`` has lost the tail; see NOTE [Fastmath
+# Softplus] in attn_gym/linear/_delta_rule/triton/softplus_gate.py.
+_SMALL_TAIL = 2.0**-8
+
+
+@cute.jit
+def softplus_terms(z, fastmath: cutlass.Constexpr[bool]):
+    """Return ``(e, softplus(z))`` with ``e = exp(-|z|)`` for scalars or vectors.
+
+    The overflow-free form ``softplus(z) = max(z, 0) + log(1 + e)`` shares its one bounded
+    exponential with ``sigmoid(|z|) = 1 / (1 + e)``, which the backward needs as well.
+    fastmath trades the accurate ``log1p`` for the MUFU ``ex2``/``lg2`` intrinsics.
+    """
+    magnitude = cute.math.abs(z)
+    is_vector = isinstance(z, cute.TensorSSA)
+    if cutlass.const_expr(fastmath):
+        e = cute.math.exp2(-magnitude * Float32(LOG2_E), fastmath=True)
+        approx_tail = cute.math.log2(Float32(1.0) + e, fastmath=True) * Float32(_LN_2)
+        series_tail = e - Float32(0.5) * e * e
+        if cutlass.const_expr(is_vector):
+            tail = cute.where(e < Float32(_SMALL_TAIL), series_tail, approx_tail)
+        else:
+            tail = approx_tail
+            if e < Float32(_SMALL_TAIL):
+                tail = series_tail
+    else:
+        e = cute.math.exp(-magnitude)
+        tail = cute.math.log1p(e)
+    # cute.math.max needs operands of one kind: a TensorSSA zero for vectors, a scalar otherwise.
+    if cutlass.const_expr(is_vector):
+        positive = cute.math.max(z, cute.zeros_like(z))
+    else:
+        positive = cute.math.max(z, Float32(0.0))
+    return e, positive + tail
+
+
+class _GateTransformForward:
+    """Apply one gate-transform specialization with direct vector loads and stores."""
+
+    def __init__(
+        self,
+        dtype: CuteDType,
+        heads: int,
+        lower_bound: float,
+        fastmath: bool,
+        compact_layout: bool,
+        flatten_batch: bool,
+        use_int64_offsets: bool,
+        transform: GateTransform,
+    ) -> None:
+        self.dtype = dtype
+        self.heads = heads
+        self.head_groups = cdiv(heads, _HEADS_PER_BLOCK)
+        self.lower_bound = lower_bound
+        self.transform = transform
+        self.fastmath = fastmath
+        self.compact_layout = compact_layout
+        self.flatten_batch = flatten_batch
+        self.use_int64_offsets = use_int64_offsets
+
+    def get_name(self) -> str:
+        """Return a stable profiler name for this specialization."""
+        lower_bound = self.lower_bound.hex().replace("-", "m").replace("+", "p").replace(".", "_")
+        return (
+            f"legacy_kda_{self.transform.value}_gate_fwd_{self.dtype.name}_h{self.heads}_d{_HEAD_DIM}"
+            f"_v{_VALUES_PER_THREAD}"
+            f"_lb{lower_bound}_c{int(self.compact_layout)}_fb{int(self.flatten_batch)}"
+            f"_fm{int(self.fastmath)}_i64{int(self.use_int64_offsets)}"
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        raw_gate: cute.Tensor,
+        A_log: cute.Tensor,
+        dt_bias: cute.Tensor,
+        gate: cute.Tensor,
+    ) -> None:
+        """Transform one token and up to eight heads."""
+        thread, _, _ = cute.arch.thread_idx()
+        block, _, batch = cute.arch.block_idx()
+        head_group = block % self.head_groups
+        token_or_token_batch = block // self.head_groups
+        if cutlass.const_expr(self.flatten_batch):
+            batch = token_or_token_batch // raw_gate.shape[1]
+            token = token_or_token_batch % raw_gate.shape[1]
+        else:
+            token = token_or_token_batch
+        head = head_group * _HEADS_PER_BLOCK + thread // 16
+        channel_group = thread % 16
+
+        if head < self.heads:
+            raw_vector = cute.local_tile(
+                raw_gate[batch, token, head, None],
+                (_VALUES_PER_THREAD,),
+                (channel_group,),
+            )
+            bias_vector = cute.local_tile(
+                dt_bias[head, None],
+                (_VALUES_PER_THREAD,),
+                (channel_group,),
+            )
+            gate_vector = cute.local_tile(
+                gate[batch, token, head, None],
+                (_VALUES_PER_THREAD,),
+                (channel_group,),
+            )
+            raw = raw_vector.load().to(Float32)
+            bias = bias_vector.load()
+            amplitude = cute.math.exp(A_log[head].to(Float32), fastmath=self.fastmath)
+            if cutlass.const_expr(self.transform is GateTransform.SOFTPLUS):
+                _, softplus = softplus_terms(raw + bias, self.fastmath)
+                gate_vector.store(-amplitude * softplus)
+            else:
+                sigmoid = Float32(1.0) / (
+                    Float32(1.0)
+                    + cute.math.exp(-(amplitude * (raw + bias)), fastmath=self.fastmath)
+                )
+                gate_vector.store(Float32(self.lower_bound) * sigmoid)
+
+    @cute.jit
+    def __call__(
+        self,
+        raw_gate: cute.Tensor,
+        A_log: cute.Tensor,
+        dt_bias: cute.Tensor,
+        gate: cute.Tensor,
+        stream: cuda.CUstream,
+    ) -> None:
+        """Launch one CTA per ``(head group, token, batch)`` coordinate."""
+        self.kernel.set_name_prefix(self.get_name())
+        batch_grid = 1 if cutlass.const_expr(self.flatten_batch) else raw_gate.shape[0]
+        batch_tiles = raw_gate.shape[0] if cutlass.const_expr(self.flatten_batch) else 1
+        self.kernel(raw_gate, A_log, dt_bias, gate).launch(
+            grid=(self.head_groups * raw_gate.shape[1] * batch_tiles, 1, batch_grid),
+            block=(_THREADS, 1, 1),
+            stream=stream,
+        )
+
+
+def _fake_compact(dtype: type[cutlass.Numeric], shape: tuple[object, ...]):
+    """Create a row-major compact tensor with the vectorized ABI alignment."""
+    return cute.runtime.make_fake_compact_tensor(
+        dtype,
+        shape,
+        stride_order=tuple(reversed(range(len(shape)))),
+        assumed_align=_ALIGNMENT,
+    )
+
+
+@jit_cache
+def _compile_gate_transform_fwd(
+    dtype: CuteDType,
+    heads: int,
+    lower_bound: float,
+    fastmath: bool,
+    compact_layout: bool,
+    flatten_batch: bool,
+    use_int64_offsets: bool,
+    transform: GateTransform,
+):
+    """Compile one dynamic-batch/token TVM-FFI specialization."""
+    target = get_compile_target()
+    if target.device_type != "cuda" or target.capability is None or target.capability < (9, 0):
+        raise ValueError(f"gate_transform requires CUDA capability >= 9.0; got target={target}")
+    op = _GateTransformForward(
+        dtype,
+        heads,
+        lower_bound,
+        fastmath,
+        compact_layout,
+        flatten_batch,
+        use_int64_offsets,
+        transform,
+    )
+    sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    batch = sym_int()
+    tokens = sym_int()
+
+    if compact_layout:
+        raw_gate = _fake_compact(dtype.cute_type, (batch, tokens, heads, _HEAD_DIM))
+        A_log = _fake_compact(Float32, (heads,))
+        dt_bias = _fake_compact(Float32, (heads, _HEAD_DIM))
+    else:
+        raw_gate = make_fake_strided_tensor(
+            dtype.cute_type,
+            (batch, tokens, heads, _HEAD_DIM),
+            use_int64_strides=use_int64_offsets,
+        )
+        A_log = make_fake_strided_tensor(
+            Float32,
+            (heads,),
+            use_int64_strides=use_int64_offsets,
+        )
+        dt_bias = make_fake_strided_tensor(
+            Float32,
+            (heads, _HEAD_DIM),
+            use_int64_strides=use_int64_offsets,
+        )
+    return compile_tvm_ffi(
+        op,
+        raw_gate,
+        A_log,
+        dt_bias,
+        _fake_compact(Float32, (batch, tokens, heads, _HEAD_DIM)),
+    )
+
+
+def _gate_transform_fwd_cuda(
+    raw_gate: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    lower_bound: float,
+    fastmath: bool,
+    transform: GateTransform,
+) -> torch.Tensor:
+    """Normalize vector alignment and launch the CuTeDSL forward."""
+    if raw_gate.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise TypeError(f"unsupported raw_gate dtype: {raw_gate.dtype}")
+    dtype = cute_dtype(raw_gate.dtype)
+    inputs = (raw_gate, A_log, dt_bias)
+    inputs = tuple(
+        tensor
+        if tensor_supports_contiguous_dim(
+            tensor,
+            alignment_bytes=tensor.element_size(),
+        )
+        else tensor.contiguous()
+        for tensor in inputs
+    )
+    raw_gate, A_log, dt_bias = inputs
+    compact_layout = all(
+        tensor.is_contiguous()
+        and tensor_supports_contiguous_dim(tensor, alignment_bytes=_ALIGNMENT)
+        for tensor in inputs
+    )
+    gate = torch.empty(raw_gate.shape, device=raw_gate.device, dtype=torch.float32)
+    compiled = _compile_gate_transform_fwd(
+        dtype,
+        raw_gate.shape[2],
+        lower_bound,
+        fastmath,
+        compact_layout,
+        raw_gate.shape[0] > 65535,
+        requires_int64_abi(raw_gate, A_log, dt_bias, gate),
+        transform,
+    )
+    compiled(raw_gate, A_log, dt_bias, gate)
+    return gate
