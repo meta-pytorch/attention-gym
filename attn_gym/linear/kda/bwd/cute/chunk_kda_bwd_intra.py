@@ -29,7 +29,6 @@ from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import LN2, is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
-    load_ragged_chunk_count,
     load_ragged_chunk_work,
 )
 from attn_gym.warpdrive.cache import (
@@ -40,6 +39,7 @@ from attn_gym.warpdrive.cache import (
     jit_cache,
 )
 from attn_gym.warpdrive.compat import SmemAllocator
+from attn_gym.warpdrive.scheduling import BoundWork, LastEntry, TilePersistent, WorkStream
 
 BT = 64  # chunk_size
 SUBCHUNKS = 4
@@ -906,7 +906,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     mDg2: cute.Tensor,
     mCuSeqlens: cute.Tensor | None,
     mChunkOffsets: cute.Tensor | None,
-    grid_chunks: Int32,
+    bound: BoundWork,
     ragged: Constexpr,
     use_int64_offsets: Constexpr,
     use_packed_f32x2: Constexpr,
@@ -914,11 +914,9 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     fastmath: Constexpr = True,
 ):
     tidx, _, _ = cute.arch.thread_idx()
-    # Grid is (KC_TOTAL, grid_chunks, H), mirroring Triton's for-loop variant.
-    # kc and head are real grid axes; only the chunk axis is capped at
-    # grid_chunks and walked by each CTA. These per-(kc, head) coordinates are
-    # loop-invariant, so they are computed once outside the chunk loop.
-    kc_idx, chunk_start, head_idx = cute.arch.block_idx()
+    # Only the chunk axis persists; key phase, subchunk and head stay CTA-local.
+    work = bound.cursor()
+    kc_idx, _, head_idx = work.item
     gid = tidx // 4
     tid = tidx % 4
     k_phase = kc_idx // SUBCHUNKS
@@ -927,14 +925,6 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
     row_base = subchunk_idx * BC
     row0 = row_base + gid
     row1 = row0 + 8
-
-    # Both bounds are runtime values: packed replays read the active count
-    # on-device, while dense launches derive it from the symbolic token extent.
-    if cutlass.const_expr(ragged):
-        active_chunks = load_ragged_chunk_count(mChunkOffsets)
-    else:
-        active_chunks = cute.size(mQ.shape[1]) // BT
-    iters = (active_chunks - chunk_start + grid_chunks - 1) // grid_chunks
 
     # SMEM is allocated once and reused across the chunk-loop iterations.
     smem = SmemAllocator()
@@ -969,8 +959,8 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
         swizzle=None,
     )
 
-    for chunk_iter in cutlass.range(iters, unroll=1):
-        chunk_block = chunk_start + chunk_iter * grid_chunks
+    for chunk_iter in cutlass.range(work.trip_count(), unroll=1):
+        _, chunk_block, _ = work.item_at(chunk_iter)
         if cutlass.const_expr(ragged):
             _, _, row_start, valid = load_ragged_chunk_work(
                 mCuSeqlens,
@@ -1934,6 +1924,7 @@ class ChunkKdaBwdIntraHmmaGrid:
         self.use_packed_f32x2 = use_packed_f32x2
         self.use_stmatrix = use_stmatrix
         self.fastmath = fastmath
+        self.work = WorkStream(schedule=TilePersistent("n"))
 
     @cute.jit
     def __call__(
@@ -1953,9 +1944,14 @@ class ChunkKdaBwdIntraHmmaGrid:
         mDg2: cute.Tensor,
         mCuSeqlens: cute.Tensor | None,
         mChunkOffsets: cute.Tensor | None,
+        capacity: Int32,
         grid_chunks: Int32,
         stream: cuda.CUstream = None,
     ):
+        limit = LastEntry(mChunkOffsets) if cutlass.const_expr(self.ragged) else None
+        bound = self.work.bind(
+            (KC_TOTAL, capacity, cute.size(mQ.shape[2])), max_ctas=grid_chunks, limit=limit
+        )
         _chunk_kda_bwd_intra_hmma_grid_kernel.set_name_prefix(
             f"cutlass_dsl_chunk_kda_bwd_intra_fm{int(self.fastmath)}"
         )
@@ -1975,14 +1971,14 @@ class ChunkKdaBwdIntraHmmaGrid:
             mDg2,
             mCuSeqlens,
             mChunkOffsets,
-            grid_chunks,
+            bound,
             self.ragged,
             self.use_int64_offsets,
             self.use_packed_f32x2,
             self.use_stmatrix,
             self.fastmath,
         ).launch(
-            grid=(KC_TOTAL, grid_chunks, cute.size(mQ.shape[2])),
+            grid=bound.grid(),
             block=(32, 1, 1),
             stream=stream,
         )
@@ -2081,6 +2077,7 @@ def _compile_chunk_kda_bwd_intra(
         dg2,
         cu_seqlens,
         chunk_offsets,
+        Int32(1),
         Int32(1),
         name=(
             f"kda_bwd_intra_h{heads}_{cute_dtype(io_type).name}_rg{int(ragged)}"
@@ -2223,8 +2220,8 @@ class ChunkKdaBwdIntraTunable:
             _column_token_head(args.dg2),
             args.cu_seqlens,
             args.chunk_offsets,
-            # Chunks past the capacity have no work, so a larger grid only adds idle CTAs.
-            min(config.grid_chunks, args.capacity),
+            args.capacity,
+            config.grid_chunks,
         )
         db2 = torch.empty_like(args.db)
         elements = args.db.numel()

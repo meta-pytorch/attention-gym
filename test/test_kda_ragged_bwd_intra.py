@@ -14,6 +14,7 @@ import torch
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
     ChunkKdaBwdIntraConfig,
+    _compile_chunk_kda_bwd_intra,
     chunk_kda_bwd_intra,
 )
 from attn_gym.testing.kda import (
@@ -242,6 +243,27 @@ def test_bwd_intra_accepts_zero_tokens(metadata):
     assert dq.dtype == dk.dtype == torch.bfloat16
     assert dg.dtype == db.dtype == torch.float32
     torch.testing.assert_close(db, inputs[8], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ragged", [False, True])
+def test_bwd_intra_reuses_compile_across_grid_caps_and_capacities(ragged):
+    _compile_chunk_kda_bwd_intra.cache_clear()
+    launches = 0
+    for chunks in (1, 16, 17, 33):
+        tokens = chunks * 64
+        lengths = [0, 1, tokens - 1, 0] if ragged else None
+        metadata = _metadata(lengths) if ragged else None
+        inputs = _inputs(tokens)
+        expected = chunk_kda_bwd_intra(*inputs, metadata, config=ChunkKdaBwdIntraConfig(1))
+        launches += 1
+        for cap in (1, 16, 17, 64):
+            actual = chunk_kda_bwd_intra(*inputs, metadata, config=ChunkKdaBwdIntraConfig(cap))
+            launches += 1
+            for output, reference in zip(actual, expected, strict=True):
+                torch.testing.assert_close(output, reference, rtol=0, atol=0)
+            info = _compile_chunk_kda_bwd_intra.cache_info()
+            assert info.currsize == 1
+            assert info.hits + info.misses == launches
 
 
 def test_ragged_bwd_intra_replays_aligned_to_partial():
