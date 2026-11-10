@@ -35,8 +35,8 @@ import cutlass
 from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 from ..common.host import get_dtype
 from ..common.piece_chain import launch_state_chain

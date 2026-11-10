@@ -113,10 +113,10 @@ import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 from cutlass.experimental import cuda
 
-from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.utils import (
     requires_int64_abi,  # noqa: F401  (module-level ABI selector)
 )
+from attn_gym.warpdrive.compat import SmemAllocator
 
 from ..common.blockwise_inverse import invert_unit_lower_16x16_fragments
 from ..common.split_k import (

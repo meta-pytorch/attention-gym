@@ -38,8 +38,8 @@ import cutlass
 import torch
 from cutlass import cute
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 from ..common.host import get_dtype, validate_cuda_tensors
 from ..common.launch import (

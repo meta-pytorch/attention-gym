@@ -10,12 +10,6 @@ from typing import Any, NamedTuple
 
 import torch
 
-from attn_gym.warpdrive.cache.tvm_ffi import (
-    compile_tvm_ffi,
-    make_fake_compact_tensor,
-    make_fake_strided_tensor,
-)
-
 TMA_ALIGNMENT_BYTES = 16
 _CUTE_DTYPES = {
     torch.float16: ("Float16", "fp16"),
@@ -175,11 +169,8 @@ def normalize_compact_tensor(
 
 __all__ = [
     "TMA_ALIGNMENT_BYTES",
-    "compile_tvm_ffi",
     "get_device_properties",
     "initialized_cuda_device",
-    "make_fake_compact_tensor",
-    "make_fake_strided_tensor",
     "normalize_compact_tensor",
     "normalize_tma_rows",
     "tensor_supports_contiguous_dim",

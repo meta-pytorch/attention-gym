@@ -87,7 +87,7 @@ import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
-from attn_gym._backends.cute.compat import SmemAllocator
+from attn_gym.warpdrive.compat import SmemAllocator
 
 from ..common.launch import (
     validate_named_barriers,

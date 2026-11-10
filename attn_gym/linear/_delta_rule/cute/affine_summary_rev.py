@@ -48,9 +48,7 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Int64
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.cute import compile_tvm_ffi, get_device_properties, jit_cache
-from attn_gym._backends.cute.compat import LayoutEnum, SmemAllocator, TmemAllocator
-from attn_gym._backends.cute.target import get_compile_target
+from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.constants import is_sm100_kda_capability
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
@@ -61,6 +59,8 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
 )
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
+from attn_gym.warpdrive.cache import compile_tvm_ffi, get_compile_target, jit_cache
+from attn_gym.warpdrive.compat import LayoutEnum, SmemAllocator, TmemAllocator
 
 BT = 64
 KEY_DIM = 128

@@ -1,7 +1,7 @@
 """Hook ``cute.compile`` and write every compiled cubin into a snapshot directory.
 
 The hook wraps ``cutlass.cute.compile`` (both ``cute.compile(...)`` and
-``cute.compile[options](...)``), which ``attn_gym._backends.cute.utils.compile_tvm_ffi`` resolves
+``cute.compile[options](...)``), which ``attn_gym.warpdrive.cache.compile_tvm_ffi`` resolves
 at call time, so every ``jit_cache`` compile of the drivers passes through it. Each artifact is
 re-exported as a host object, its cubins carved out and disassembled (``nvdisasm``,
 ``cuobjdump --dump-resource-usage``), and the launch's dynamic SMEM size read from the host IR.

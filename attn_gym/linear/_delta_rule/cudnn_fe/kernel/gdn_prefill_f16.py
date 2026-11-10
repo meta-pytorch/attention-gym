@@ -129,7 +129,7 @@ from ..common.thd import (
 )
 
 RCP_LN2 = 1.4426950408889634  # 1/ln(2): natural-log gates -> the kernel's log2 domain
-from attn_gym._backends.cute.compat import SmemAllocator
+from attn_gym.warpdrive.compat import SmemAllocator
 
 from ..tile_dsl.barrier import (
     MBarrier,

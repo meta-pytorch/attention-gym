@@ -2100,7 +2100,7 @@ def _defaulted_activation(value, options={"scale": 2.0}):  # noqa: B006 -- mutab
 
 def test_function_cache_key_covers_defaults_and_nested_functions():
     """Pin the key surface: mutable defaults change keys; nested fns stay serial."""
-    from attn_gym._backends.cute import function_cache_key
+    from attn_gym.warpdrive.cache import function_cache_key
 
     before = function_cache_key(_defaulted_activation)
     _defaulted_activation.__defaults__[0]["scale"] = 3.0

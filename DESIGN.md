@@ -181,6 +181,8 @@ attn_gym/
     cute/
       compilation.py             # Reusable CuTeDSL compilation and caching machinery
       tensor_checks.py           # CuTeDSL-specific device, dtype, layout, and shape checks
+  warpdrive/                     # CuTeDSL authoring base: compile cache, compat, profiler,
+                                 # warp specialization; imports nothing else from attn_gym
   masks/                         # FlexAttention mask and BlockMask construction
   mods/                          # FlexAttention score modifications
   linear/                        # End-to-end linear attention operators
@@ -272,8 +274,8 @@ respective implementation modules.
 ### Shared backend infrastructure
 
 Backend-specific infrastructure that is reused unchanged across attention variants belongs in the
-private `attn_gym._backends` package. Examples include Triton autotuning machinery, CuTeDSL
-compilation caches, and backend-specific tensor capability checks. This code is shared because it
+private `attn_gym._backends` package. Examples include Triton autotuning machinery, the CuTeDSL
+tuning adapter, and backend-specific tensor capability checks. This code is shared because it
 integrates a kernel DSL with PyTorch, not because it implements shared attention mathematics.
 
 Use the narrowest ownership level that fits the behavior:
@@ -284,6 +286,8 @@ Use the narrowest ownership level that fits the behavior:
   `attn_gym/linear/_delta_rule/`, not in a backend-infrastructure package;
 - Triton infrastructure shared by different variants belongs in `attn_gym/_backends/triton/`;
 - CuTeDSL infrastructure shared by different variants belongs in `attn_gym/_backends/cute/`;
+  infrastructure that is generic to CuTeDSL rather than to attention-gym (the compile cache,
+  version compatibility, the intra-kernel profiler) belongs in `attn_gym/warpdrive/`;
 - public types shared by multiple linear or sparse operations belong in a namespace-level module
   such as `attn_gym/linear/types.py`, not in an implementation package.
 

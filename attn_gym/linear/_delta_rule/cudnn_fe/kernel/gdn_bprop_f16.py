@@ -132,9 +132,9 @@ import cutlass.experimental.cuda.tensor_map as tma
 import cutlass.experimental.primitives as nvvm
 from cutlass import cute
 
-from attn_gym._backends.cute import compile_tvm_ffi, jit_cache
-from attn_gym._backends.cute.compat import SmemAllocator
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
+from attn_gym.warpdrive.compat import SmemAllocator
 
 from ..common.blockwise_inverse import (
     blockwise_diagonal_8x8_to_16x16,

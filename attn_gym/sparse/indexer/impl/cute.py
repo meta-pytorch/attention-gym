@@ -12,21 +12,17 @@ from collections.abc import Callable
 
 import torch
 
-from attn_gym._backends.cute import (
-    TMA_ALIGNMENT_BYTES,
-    compile_tvm_ffi,
-    get_device_properties,
-    jit_cache,
-    make_fake_strided_tensor,
-    tensor_supports_tma,
-)
-from attn_gym._backends.cute.target import (
-    detect_compile_target,
-    get_compile_target,
-    set_compile_target,
-)
+from attn_gym._backends.cute import TMA_ALIGNMENT_BYTES, get_device_properties, tensor_supports_tma
 from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int64_abi
 from attn_gym.utils import cdiv
+from attn_gym.warpdrive.cache import (
+    compile_tvm_ffi,
+    detect_compile_target,
+    get_compile_target,
+    jit_cache,
+    make_fake_strided_tensor,
+    set_compile_target,
+)
 
 _HEAD_DIM_GRANULARITY = 16
 _MAX_SEQUENCE = 1 << 20

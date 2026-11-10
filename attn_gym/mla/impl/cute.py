@@ -33,7 +33,7 @@ from typing import Any, NamedTuple
 import torch
 
 from attn_gym._backends.cute import run_tunable
-from attn_gym._backends.cute._key import source_fingerprint
+from attn_gym.warpdrive.cache._key import source_fingerprint
 
 SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 

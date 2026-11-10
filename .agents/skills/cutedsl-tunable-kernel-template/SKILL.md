@@ -10,7 +10,8 @@ Use this after `cutedsl-kernel-template` establishes the core kernel. This skill
 The canonical Attention Gym helpers are:
 
 ```python
-from attn_gym._backends.cute import benchmark_gpu, compile_tvm_ffi, jit_cache, run_tunable, tune
+from attn_gym._backends.cute import benchmark_gpu, run_tunable, tune
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 ```
 
 If another repo has equivalent helpers, reuse them. Do not rebuild cache/process orchestration inside each op.
@@ -57,7 +58,7 @@ integer utilities such as `ceildiv` directly instead of wrapping one arithmetic 
 ```python
 from typing import NamedTuple
 
-from attn_gym._backends.cute.target import CompileTarget
+from attn_gym.warpdrive.cache import CompileTarget
 
 
 class MyConfig(NamedTuple):

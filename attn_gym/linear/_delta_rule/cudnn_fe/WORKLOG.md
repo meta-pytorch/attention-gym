@@ -363,7 +363,7 @@ shared-memory layout; only symbol names changed. Performance was not measured.
   inherent to FP16, not the dBeta formula. BF16 is fine.
 - **FP16 KDA CP:** R8's six FP16 KDA-cuDNN CP cases are xfailed (`cuDNN FP16 gate overflow`).
   KDA FP16 with `gate_scale=5` gives all-NaN output on main and v1.30 alike (FP16 range).
-- **`get_compile_target()` latch:** `attn_gym/_backends/cute/target.py` caches the first detected
+- **`get_compile_target()` latch:** `attn_gym/warpdrive/cache/target.py` caches the first detected
   target process-wide, so a process that switches to a GPU of different compute capability keeps a
   stale target in `jit_cache` keys (mocked 10.0→10.3 repro). Pre-existing; mixed-GPU processes only.
 - **Default-backend beta alignment:** the default (non-cuDNN) WY backend requires a 128-byte-aligned

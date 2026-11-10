@@ -5,10 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym._backends.cute.utils import (
-    make_fake_strided_tensor,
-    tensor_supports_contiguous_dim,
-)
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
+from attn_gym.warpdrive.cache import make_fake_strided_tensor
 
 
 def test_tensor_supports_contiguous_dim_tracks_slice_alignment():

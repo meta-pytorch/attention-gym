@@ -214,7 +214,8 @@ Expose the weakest layout contract the kernel actually needs. Do not require ful
 only one mode must be contiguous, and do not treat alignment as a runtime repair mechanism:
 `assumed_align` is a promise to codegen that may enable wide loads.
 
-Use the shared helpers in `attn_gym._backends.cute`:
+Use the shared helpers in `attn_gym._backends.cute` (`make_fake_strided_tensor` is in
+`attn_gym.warpdrive.cache`):
 
 - `tensor_supports_contiguous_dim(tensor, dim=-1, alignment_bytes=...)` checks that one mode has
   stride 1 and that every slice origin satisfies the promised byte alignment;

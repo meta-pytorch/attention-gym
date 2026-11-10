@@ -17,8 +17,8 @@ from triton.backends.compiler import GPUTarget
 from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
-from attn_gym._backends.cute.target import get_compile_target
 from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym.warpdrive.cache import get_compile_target
 
 
 @dataclass
