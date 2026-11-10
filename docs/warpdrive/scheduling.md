@@ -238,7 +238,7 @@ end. It may run before readiness in the tile-grid prologue. Speculative results 
 but any updated state must remain valid. A skipping map's `keep` is still used only for
 valid indices.
 
-Raster and the external adapters opt in; an item-table reader must not. A subclass replacing
+Raster opts in; an item-table reader must not. A subclass replacing
 `decode` must explicitly opt in again.
 
 ### Decode state
@@ -329,7 +329,7 @@ calling warp.
 Split work also needs distinct indices. A split-K map can return `(tile, split)` and its K
 range, dropping empty splits; a later kernel reduces partials. The decode example's
 `SplitKV` returns `(split, kv_head, batch, splits)`. With per-sequence counts from a preceding
-kernel, it drops excess splits after `PdlWait()`. The FA4 adapter below does not support split-KV.
+kernel, it drops excess splits after `PdlWait()`.
 
 ## Custom index schedules
 
@@ -398,54 +398,24 @@ Host-side contracts:
 Override `index_limit` if the default does not bound your sequence. See `IndexSchedule` in
 [scheduling.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/scheduling.py) for the full method contract.
 
-## CUTLASS and FA4 mappings
+## External tile orders: subclass WorkMap
 
-Adapters reuse **index-to-tile mapping**, not an external scheduler's launch or pipeline:
+An external library's index-to-tile order can be a custom `WorkMap`; warpdrive still owns
+index distribution, the launch grid and the work ring. The worked
+[external_maps.py example](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py)
+shows how to wrap CUTLASS's static persistent order and FA4's tile schedulers. These mappings
+are user code, not part of warpdrive's core API; their library-specific domains belong to
+their users.
 
-```python
-from flash_attn.cute.tile_scheduler import StaticPersistentTileScheduler
-from attn_gym.warpdrive import (
-    ClusterLaunchControl,
-    CutlassRaster,
-    Fa4Mapping,
-    StaticPersistent,
-    WorkStream,
-)
+When wrapping a library, keep the [WorkMap contract](#custom-mappings):
 
-self.work = WorkStream(mapping=CutlassRaster(swizzle=8), schedule=StaticPersistent())
-# Keep the mapping, change how indices are claimed:
-self.work = WorkStream(mapping=CutlassRaster(swizzle=8), schedule=ClusterLaunchControl())
-self.work = WorkStream(
-    mapping=Fa4Mapping(StaticPersistentTileScheduler), schedule=ClusterLaunchControl()
-)
-```
-
-To reproduce an external per-unit sequence:
-
-| Mapping | warpdrive schedule |
-|---|---|
-| `CutlassRaster` | `StaticPersistent()`; padded swizzle tiles removed |
-| `Fa4Mapping(StaticPersistentTileScheduler)` | `StaticPersistent()` |
-| `Fa4Mapping(SingleTileLPTScheduler)` | `OneShot()` |
-
-Both adapters also work with other warpdrive schedules. They normalize empty spaces and
-provide Int64 counts. In clusters, each tile is a **work-unit tile**, one item per cluster;
-FA4 params use a `(1, 1)` cluster shape.
-
-`CutlassRaster` is a native implementation of the BSD-3 CUTLASS CuTeDSL helper at `e13f5cd`,
-not an import of deprecated `cutlass.utils` scheduling. Its padded-space count includes
-indices dropped with `keep=False`. The test oracle is
-[cutlass_static_persistent_tile_scheduler.py](https://github.com/meta-pytorch/attention-gym/blob/main/test/warpdrive/cutlass_static_persistent_tile_scheduler.py).
-
-`Fa4Mapping` imports `flash_attn.cute` at construction:
-
-- Static-persistent mapping binds `(num_block, num_head, num_batch)`.
-- `SingleTileLPTScheduler` adds `seqlen_k` as a fourth entry for L2 sections; `lpt`,
-  `lpt_global`, `head_dim`, `head_dim_v` and `element_size` are constructor choices.
-- No split-KV. Only these two FA4 schedulers are supported.
-- `SingleTileScheduler` needs 3-D `blockIdx`, not one index, and is rejected. External
-  dynamic/CLC schedulers owning SMEM and barriers are not drop-in mappings. The adapter
-  calls none of their advance, prefetch, tail or grid methods.
+- `bind` must make empty spaces safe, including any external host-side parameter construction.
+- `count64` must be exact up to `2**31` (and may saturate there), never wrapping before the
+  launch checks it. The external library's own arithmetic must also support the bound space.
+- `decode` must return an item determined only by the index and bound space, independent of
+  decode state; it wraps an order, not a library-owned pipeline, advance or tail.
+- Set `decodes_any_index=True` only when decoding is safe for every nonnegative Int32 index,
+  including empty spaces and indices past the end.
 
 ## One item in a raw role
 

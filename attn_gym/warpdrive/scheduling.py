@@ -69,7 +69,7 @@ workspace with no host reset. Concurrently running launches must not share a wor
 Custom schedules subclass the public protocols the built-ins use: ``IndexSchedule`` (next
 index), ``WorkMap`` (index -> ``(keep, item)``) and ``Readiness`` (a wait before the first
 decode). Their docstrings give each method's contract and whether it runs on the host or the
-device. ``adapters.py`` wraps external schedulers (CUTLASS, FA4) as mappings.
+device. External tile orders also subclass ``WorkMap``; see ``examples/external_maps.py``.
 """
 
 from __future__ import annotations
@@ -117,7 +117,7 @@ def _field_key(obj, skip: tuple[str, ...] = ()) -> str:
 class WorkMap:
     """Public protocol for ``WorkStream(mapping=...)``: linear work index -> work item.
 
-    Subclass it (``Raster`` and the ``adapters.py`` mappings do) and set or override:
+    Subclass it (as ``Raster`` does) and set or override:
 
     * ``words`` (class attribute, positive int): Int32 words per item. Broadcast schedules ship
       ``[index, *words]`` through the work ring, so keep it small.

@@ -182,8 +182,8 @@ The tiling needs `2 * (tile_n + head_dim) <= 512` TMEM columns. Wrapper checks a
 complete validator of rank, head dimension or device requirements; enforce the full contract
 in another wrapper.
 
-Choose [schedule and mapping](scheduling.md) with `schedule=`/`mapping=` (`Raster` or FA4
-mappings), and [role placement/register budgets](roles.md#choose-placement-in-the-constructor)
+Choose [schedule and mapping](scheduling.md) with `schedule=`/`mapping=` (`Raster` or a
+custom `WorkMap`, including the [external tile orders](scheduling.md#external-tile-orders-subclass-workmap)), and [role placement/register budgets](roles.md#choose-placement-in-the-constructor)
 with `roles={...}`. `tile_n=64` halves the K/V tile; `rescale_threshold` controls FA4's
 lazy rescale; head dimension follows the tensors. See [configuration](configuration.md)
 for all knobs and fixed choices.
