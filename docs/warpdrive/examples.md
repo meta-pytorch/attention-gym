@@ -17,11 +17,14 @@ PyTorch or FA4 feature.
 | Split-KV items, per-sequence counts, round-robin softmax, named mailboxes, SMEM P | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
 | Whole-model persistent decode: host instruction table, static schedule, cooperative launch, epoch-tagged words between CTAs | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
 | Managed producer, raw `external="consumer"` with overridden count, native wait on a `NamedBarrier.id` | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
+| `WorkMap` subclasses that wrap CUTLASS's and FA4's tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
+| Per-CTA schedule pages from `WorkStream.assignment` | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
 
-Each kernel has a `bench_*.py` script beside it. Run benchmarks under a GPU reservation with
-`--output` to save versions, source hashes and every replay sample; compare only columns of
-one run. Headline numbers below are GB300 measurements from November 2026 (CuTeDSL 4.8.0,
-PyTorch 2.15 nightly cu132, FA4 `00807a02`); rerun them before relying on a difference under 5%.
+The larger examples have a `bench_*.py` script beside them. Run benchmarks under a GPU
+reservation with `--output` to save versions, source hashes and every replay sample; compare
+only columns of one run. Headline numbers below are GB300 measurements from November 2026
+(CuTeDSL 4.8.0, PyTorch 2.15 nightly cu132, FA4 `00807a02`); rerun them before relying on a
+difference under 5%.
 
 ## GEMM
 
@@ -369,8 +372,9 @@ kernel and returns BF16 O `(batch, 1, heads, d_v)` and fp32 LSE `(batch, heads, 
 The roles keep FA4's placement: QK and PV MMA warps, K/V-load plus split-LSE warp,
 Q-load/O-store warp, two alternating softmax warpgroups, and correction warpgroup.
 
-- `SplitKV` supplies `(split, kv_head, batch)` items. Per-sequence counts are read after
-  `PdlWait()`; indices past the count are dropped.
+- `SplitKV` supplies `(split, kv_head, batch, splits)` items; the fourth word is the sequence's
+  split count. Per-sequence counts are read after `PdlWait()`; indices past the count are
+  dropped.
 - `Sharing.ROUND_ROBIN` on S, P and row-max/row-sum mailboxes gives softmax[i] blocks
   i, i+2, … with one warpgroup's counts. **OneShot only:** after an odd block count, another
   item would start on softmax[1]'s epochs.

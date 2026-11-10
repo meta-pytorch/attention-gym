@@ -98,7 +98,8 @@ def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
 
 Every managed role must drain a persistent stream, even a role with no per-item work.
 Use exactly `while work.valid:`, read the item before advancing, call `work.advance()` once
-directly at the end of the loop body, and return the cursor.
+directly at the end of the loop body, and return the cursor. A `StaticPersistent` or
+`TilePersistent` stream may use the [counted form](#a-counted-loop) instead.
 
 The checker rejects item reads after advance, including lookahead reads of the next item
 inside the same iteration. It does not prove advance is lexically last, detect every cursor
@@ -173,7 +174,8 @@ them, so switching schedules preserves the ABI.
 
 Static and atomic persistence require `max_ctas`. It caps **CTAs**, not clusters. With
 cluster size `cs`, the cap becomes `max_ctas // cs` units, at least one; both schedules also
-cap units by item count, again at least one.
+cap units by item count, again at least one. `TilePersistent` without `units` requires it too,
+as the cap on the units along its axis.
 
 `launch_args()` estimates how many CTAs fit in resident clusters: the SM count for single
 CTAs or pairs, fewer for four-CTA clusters (36 clusters on a 152-SM GB300). This is a capacity
@@ -197,9 +199,9 @@ stream can share it; calls on different streams obtain different workspaces. Nev
 share one between concurrent launches: they would steal each other's indices and one could
 reset the counter while the other still claims.
 
-Without `record`, schedules that use no workspace (`OneShot`, `StaticPersistent`, CLC) receive
-one placeholder per device. The kernel never accesses it; graph capture on a new stream
-therefore records no fill.
+Without `record`, schedules that use no workspace (`OneShot`, `StaticPersistent`,
+`TilePersistent`, CLC) receive one placeholder per device. The kernel never accesses it; graph
+capture on a new stream therefore records no fill.
 
 ### The grid and empty work
 

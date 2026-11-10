@@ -103,7 +103,7 @@ This teaching kernel keeps one layout family while exposing tile width and buffe
 |---|---|
 | `tile_n` (256) | Positive multiple of 32, at most 256; output width |
 | `ab_stages` (3), `acc_stages` (1) | Input and accumulator ring depths |
-| `roles=` | Overrides epilogue warps 0–3, load 4, MMA 5; budgets 160 / 40 / 40 |
+| `roles=` | Overrides epilogue warps 0–3, load 4, MMA 5; budgets 160 / 48 / 48 |
 
 Fixed choices:
 
@@ -149,8 +149,7 @@ Two softmax warpgroups each own a Q tile. Buffer and math options preserve that 
 | `roles=` | Overrides the placement/budgets below |
 
 Default roles: softmax 0–3 and 4–7 at 192; correction 8–11 at 80; MMA 12, epilogue 13 and
-load 14 at 48. FA4's 176/80/80 and other splits showed no consistent gain
-([attention forward](examples.md#attention-forward)).
+load 14 at 48. FA4's 176/80/80 and other splits showed no consistent gain.
 
 `overlap_o_q` requires a nonpersistent schedule: the next item's Q would overwrite the
 previous item's O staging bytes. `use_ldred_rowmax` requires an SM103-family target.

@@ -220,7 +220,7 @@ choose an available ID with the correct participant count.
 Inspect the report even without a warning. Warn mode reports findings, but some unverified
 cases appear only in `describe()`.
 
-**Model boundary.** This first-phase diagnostic models single-CTA kernels, whole-region/stage
+**Model boundary.** The diagnostic models single-CTA kernels, whole-region/stage
 footprints, same-channel handoffs and cross-channel paths. Its bounded trace runs loops twice
 and persistent work items twice. Clusters, raw/unannotated accesses and unmatched epochs can
 remain unverified. `h.data`, `tmem.ptr`, `tmem.cols` and `tmem.base` are unannotated acquisitions,
@@ -275,4 +275,4 @@ with unchecked("alias", reason="access is ordered by the raw protocol below"):
 
 Only annotations inside the block are excluded. It adds no fence and certifies no safety.
 See [alias.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/alias.py) for modeled rules/PTX references and
-[GUARANTEES.md](guarantees.md) for the broader synchronization contract.
+the [safety contract](guarantees.md) for the synchronization rules beyond aliasing.
