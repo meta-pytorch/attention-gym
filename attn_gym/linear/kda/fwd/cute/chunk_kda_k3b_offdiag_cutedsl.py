@@ -13,9 +13,8 @@ Matches NV C++ kernel_3b_offdiag_matmul.cu architecture:
 
 The grids come from a warpdrive work stream over the (pair, head, chunk) space: the exact grid is
 ``OneShot(grid="2d")`` (the chunk folded into x with the six pairs), the persistent one
-``TilePersistent("n")`` over (pair, chunk, head), which launches its CTAs in the order of the
-hand-built ``(chunk_workers * 6, H)`` grid and strides the chunk by the runtime worker count,
-bounded by the active chunk count ``chunk_offsets[-1]``.
+``TilePersistent("n")`` over (pair, chunk, head), which strides the chunk by the runtime worker
+count, bounded by the active chunk count ``chunk_offsets[-1]``.
   128 threads (4 warps):
       All warps: Phase 1 — fused gating into SMEM
       Warp 0:    Phase 2 — Aqk = sQg @ sKn^T  (MMA)

@@ -230,7 +230,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             trips = chunks.trip_count()
             _, head_idx, _ = chunks.item  # the first item: blockIdx, no decode
         else:
-            # Every capacity chunk runs, as in the exact grid: no ``valid`` test.
+            # The exact grid launches every capacity chunk: no ``valid`` test.
             _, (_, head_idx, chunk_idx) = work.single_item()
 
         # ── Shared memory, allocated once and reused across persistent iterations ──

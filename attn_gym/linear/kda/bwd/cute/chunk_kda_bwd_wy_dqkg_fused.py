@@ -284,10 +284,10 @@ def _resolve_chunk_route(
 
 
 # ── TMEM column offset constants (cta_group::1, M=64, .ws Layout E) ──
-TMEM_DA_ACC_OFF = 0  # [0,32)   32 cols dA fp32 acc; Phase 3 overwrites [0,16)
-TMEM_DQ_ACC_OFF = 32  # [32,96)  64 cols dq fp32 acc; Phase 3 result uses [32,64)
+TMEM_DA_ACC_OFF = 0  # [0,32)   32 cols dA fp32 acc
+TMEM_DQ_ACC_OFF = 32  # [32,96)  64 cols dq fp32 acc
 TMEM_DK_ACC_OFF = 96  # [96,160) 64 cols dk fp32 acc
-TMEM_DW_ACC_OFF = 160  # [160,224] 64 cols dw fp32 acc
+TMEM_DW_ACC_OFF = 160  # [160,224) 64 cols dw fp32 acc
 TMEM_FLEX_OFF = 224  # [224,256) 32 cols dvb time-shared
 TMEM_DKGB_ACC_OFF = 272  # [272,336) 64 cols dkgb fp32 acc
 TMEM_DA2_ACC_OFF = 336  # [336,368) 32 cols dA fp32 acc for dA@A and A@dA
@@ -587,7 +587,7 @@ class WySmem:
 
 class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
     """
-    CuTe DSL kernel for chunk_kda_bwd_kernel_wy_dqkg_fused.
+    Fused WY / dQKG chunk backward for KDA.
 
     Computes backward gradients dq, dk, dv2, dg, db, dA for the KDA
     chunkwise delta-rule backward pass.
@@ -995,7 +995,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
         h = cute.make_tensor(h_ptr, h_layout)
         dh = cute.make_tensor(dh_ptr, h_layout)
 
-        # ===================== MMA setup (4 objects) =====================
+        # ===================== MMA setup =====================
         # All use tcgen05.mma.ws (Layout E, M=64, cta_group::1).
         # 1. vloop_tiled_mma: SS K,K (64,128) — dq, dk, dw
         #    dq += do @ h, dk += vnew @ dh, dw += dv @ h
@@ -1632,8 +1632,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             # NOTE: must sync before next wu_iter's `sDgk[local_tidx] = 0`
             # init, otherwise WG0 of next iter may overwrite sDgk while
             # WG1 of this iter (row == sub_seq_len - 1 lane) is still
-            # reading sDgk[col] above. This was the source of the
-            # non-deterministic dg accuracy bug.
+            # reading sDgk[col].
             self.cuda_sync.sync(aligned=True)
             # fill db, dgk to 0. Each wg zeroes its own sDb column.
             if local_tidx < self.BT:
@@ -1732,8 +1731,8 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 dvb_i32_vec = reinterpret_cast(
                     dvb_io_val, self.io_dtype, bv_num_cols_per_wg, Int32
                 )
-                # bv_num_cols I/O values = bv_num_cols // 16 stores of 256b each.
-                num_stores_per_row = bv_num_cols_per_wg // 16  # = 4 for BV=128
+                # One 256-bit store holds 16 I/O values.
+                num_stores_per_row = bv_num_cols_per_wg // 16
 
                 base_addr = (
                     dv2_gmem.iterator
@@ -2029,9 +2028,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             # NOTE: only release k smem after dA finished, because kg reuses k smem in dA += dw @ kg^T
             k_h.release()
 
-            # dA = dA * beta[None, :], apply strict lower-triangular mask.
-            # Triton reference multiplies by the column beta (`b_beta[None, :]`)
-            # and keeps only `row > col`.
+            # dA = dA * beta[None, :] (the column's beta), strict lower triangle (row > col).
             dA_f32 = reinterpret_cast(dA_i32, Int32, bt_num_cols_per_wg, Float32)
             dA_f32_val = TensorSSA(dA_f32, (bt_num_cols_per_wg,), Float32)
             rDA = cute.make_rmem_tensor((bt_num_cols_per_wg,), self.io_dtype)
@@ -2882,7 +2879,6 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
     def _tma_partition_B(self, tma_atom, tma_tensor, smem, tile_shape, tiled_mma, batch_idx, hidx):
         """Partition a TMA tensor as MMA B-operand (N,K dims).
 
-        Mirrors the identical helper in recompute_wu.py / fwd_o.py.
         ``tma_tensor`` should already have domain_offset applied for varlen.
 
         For tile_shape = (BT, BK, BV) = (M, N, K):
@@ -2910,12 +2906,9 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
     def _epilog_partition_varlen(self, atom, gC_2d, epi_tile, sC):
         """Partition for varlen epilog TMA load (2D tensor with domain_offset).
 
-        Uses local_tile instead of flat_divide to correctly preserve TMA basis
-        stride coordinates through domain_offset.  Matches Flash Attention's
-        pattern: slice mode2 → domain_offset(2D) → local_tile → tma_partition.
-
-        Uses (None, None) to keep all tile-count modes, producing the same
-        rank as _epilog_partition (flat_divide) so copy indexing is unchanged.
+        Uses local_tile instead of flat_divide to preserve TMA basis stride
+        coordinates through domain_offset: slice mode2 → domain_offset(2D) →
+        local_tile → tma_partition. ``(None, None)`` keeps all tile-count modes.
         """
         gC_tiled = cute.local_tile(gC_2d, epi_tile, (None, None))
         sC_g = cute.group_modes(sC, 0, 2)

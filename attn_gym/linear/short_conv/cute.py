@@ -998,7 +998,7 @@ class CausalConv1dSiluInputGradient(ShortConvGradientKernel):
         initial_state: cute.Tensor | None,
         tokens: Int32,
     ):
-        """Compute one packed channel group and ten input-gradient tokens."""
+        """Compute ``times_per_block`` input-gradient tokens of one packed channel group."""
         thread_idx, _, _ = cute.arch.thread_idx()
         time_block, channel_block, batch = cute.arch.block_idx()
         if cutlass.const_expr(cu_seqlens is not None):
