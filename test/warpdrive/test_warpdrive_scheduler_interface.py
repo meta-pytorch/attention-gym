@@ -1,7 +1,9 @@
 """Test custom schedules, WorkMap implementations, and raw-role work-item access."""
 
 import itertools
+import math
 import os
+import re
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import NamedTuple
@@ -46,6 +48,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.packed_work import PackedWork
+from attn_gym.warpdrive.scheduling import tile_grid_dims
 
 # Custom schedules, written against the public protocol only.
 
@@ -368,8 +371,8 @@ class RawItemToy(StreamToy):
     """The managed role ``a`` loops the stream; the raw role ``b`` (warps 1-2) reads its work
     item with ``self.work.single_item()``. Both count each tile in ``hits[role, tile]``."""
 
-    def __init__(self, mapping, mode: str, cluster=None):
-        super().__init__(OneShot(), mapping, cluster)
+    def __init__(self, mapping, mode: str, cluster=None, schedule=None):
+        super().__init__(schedule or OneShot(), mapping, cluster)
         self.mode = mode
 
     def get_name(self) -> str:
@@ -414,47 +417,311 @@ def compile_raw_item_toy(op: RawItemToy):
 
 
 @pytest.mark.parametrize(
-    "mapping, mode, ext, cluster",
+    "mapping, mode, ext, cluster, schedule",
     [
-        (Raster(), "grid", (5, 3, 2), SingleCta()),
-        (Raster(), "grid", (2, 65536, 1), SingleCta()),  # n_tiles past gridDim.y: 1-D fallback
-        (Raster(), "1d", (5, 3, 2), SingleCta()),
-        (Raster(), "grid", (3, 70000, 1), CtaPair()),
-        (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair()),
-        (SkipOdd(swizzle=2), "grid", (9, 7, 2), SingleCta()),
-        (Raster(), "grid", (0, 3, 1), SingleCta()),  # empty: one unit, no valid item
+        (Raster(), "grid", (5, 3, 2), SingleCta(), OneShot()),
+        (Raster(), "grid", (2, 65536, 1), SingleCta(), OneShot()),  # n_tiles past gridDim.y: 1-D fallback
+        (Raster(), "1d", (5, 3, 2), SingleCta(), OneShot()),
+        (Raster(), "grid", (3, 70000, 1), CtaPair(), OneShot()),
+        (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair(), OneShot()),
+        (SkipOdd(swizzle=2), "grid", (9, 7, 2), SingleCta(), OneShot()),
+        (Raster(), "grid", (0, 3, 1), SingleCta(), OneShot()),  # empty: one unit, no valid item
         # A default WorkMap traps if decoded past the end: one CTA per item, plus drops.
-        (CheckedRaster(drop_odd=True), "grid", (9, 7, 2), CtaPair()),
+        (CheckedRaster(drop_odd=True), "grid", (9, 7, 2), CtaPair(), OneShot()),
         # A stateful mapping: single_item starts the state like a managed role.
-        (ChainedTiles(swizzle=2, drop_odd=True), "grid", (9, 7, 2), CtaPair()),
-        (ChainedTiles(swizzle=2), "grid", (0, 3, 1), SingleCta()),
+        (ChainedTiles(swizzle=2, drop_odd=True), "grid", (9, 7, 2), CtaPair(), OneShot()),
+        (ChainedTiles(swizzle=2), "grid", (0, 3, 1), SingleCta(), OneShot()),
+        # Static grids: the roles of a single CTA and of a pair read the same items.
+        (Raster(), "grid", (5, 3, 2), CtaPair(), OneShot(grid="3d")),
+        (Raster(), "grid", (3, 65535, 1), SingleCta(), OneShot(grid="3d")),
+        (Raster(), "grid", (0, 3, 1), CtaPair(), OneShot(grid="3d")),
+        (Raster(), "grid", (3, 2, 65537), CtaPair(), OneShot(grid="2d")),
+        (Raster(), "grid", (5, 3, 0), SingleCta(), OneShot(grid="2d")),
+        (Raster(), "grid", (2, 65536, 1), CtaPair(), OneShot(grid="1d")),
+        (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair(), OneShot(grid="1d")),
+        (Raster(), "grid", (4, 0, 2), SingleCta(), OneShot(grid="1d")),
     ],
     ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip",
-         "empty", "checked_skip", "stateful_skip", "stateful_empty"],
+         "empty", "checked_skip", "stateful_skip", "stateful_empty", "pair_3d", "3d_max_n",
+         "pair_3d_empty", "pair_2d", "2d_empty", "pair_1d", "pair_1d_swizzle",
+         "1d_empty"],
 )  # fmt: skip
-def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster):
-    check_raw_role_single_item(mapping, mode, ext, cluster)
+def test_raw_role_single_item(requires_blackwell, mapping, mode, ext, cluster, schedule):
+    check_raw_role_single_item(mapping, mode, ext, cluster, schedule)
 
 
-def check_raw_role_single_item(mapping, mode, ext, cluster):
-    op = RawItemToy(mapping, mode, cluster)
+def check_raw_role_single_item(mapping, mode, ext, cluster, schedule=None):
+    op = RawItemToy(mapping, mode, cluster, schedule)
     em, en, el = ext
     total = max(em * en * el, 0)
     hits = torch.zeros(2, max(total, 1), dtype=torch.int32, device="cuda")
     fn = compile_raw_item_toy(op)
     fn(hits, em, en, el)
     torch.cuda.synchronize()
-    hits = hits.cpu()[:, :total]
-    kept = torch.tensor(
-        [
-            0 if hasattr(mapping, "kept") and not mapping.kept((m, n, li)) else cluster.size
-            for li in range(el)
-            for n in range(en)
-            for m in range(em)
-        ],
-        dtype=torch.int32,
+    kept = [
+        0 if hasattr(mapping, "kept") and not mapping.kept((m, n, li)) else cluster.size
+        for li in range(el)
+        for n in range(en)
+        for m in range(em)
+    ]
+    # The whole buffer: the idle unit of an empty space must count nothing.
+    kept = torch.tensor(kept or [0], dtype=torch.int32)
+    assert torch.equal(hits[0].cpu(), kept) and torch.equal(hits[1].cpu(), kept)
+
+
+# Static OneShot grids, and kernels without roles
+
+
+def test_oneshot_grid_is_a_static_choice():
+    grids = ("auto", "3d", "2d", "1d")
+    assert [WorkStream(schedule=OneShot(grid=g)).get_key() for g in grids] == [
+        "oneshot0_m1",
+        "oneshot0_grid3d_m1",
+        "oneshot0_grid2d_m1",
+        "oneshot0_grid1d_m1",
+    ]
+    assert WorkStream(schedule=OneShot(grid="3d")).describe() == "OneShot(grid='3d'), " + (
+        Raster().describe()
     )
-    assert torch.equal(hits[0], kept) and torch.equal(hits[1], kept)
+    with pytest.raises(ValueError, match="'auto', '3d', '2d' or '1d'"):
+        OneShot(grid="tiles")
+
+    class Shifted(OneShot):
+        def first_index(self, problem):
+            return problem.first_unit()
+
+    # These grids have no general decode: only the plain raster order is blockIdx.
+    for grid in ("3d", "2d"):
+        for kwargs in (
+            {"mapping": Raster(swizzle=2)},
+            {"mapping": Raster(along="n")},
+            {"mapping": Raster(reverse="m")},
+            {"mapping": SkipOdd()},
+            {"record": 2},
+            {"schedule": Shifted(grid=grid)},
+        ):
+            with pytest.raises(ValueError, match=rf"OneShot\(grid='{grid}'\) reads the item"):
+                WorkStream(**{"schedule": OneShot(grid=grid), **kwargs})
+    # "1d" chooses among a Raster's grids; another mapping only has the 1-D one.
+    flat = WorkStream(mapping=Raster(swizzle=2), schedule=Shifted(grid="1d"))
+    assert flat.get_key() == "shifted0_grid1d_m2"
+    assert flat.describe().startswith("Shifted(grid='1d')")
+    assert WorkStream(schedule=Shifted()).get_key() == "shifted0_m1"
+    for mapping in (SkipOdd(),):
+        with pytest.raises(ValueError, match=r"OneShot\(grid='1d'\) chooses the grid"):
+            WorkStream(mapping=mapping, schedule=OneShot(grid="1d"))
+
+
+@pytest.mark.parametrize(
+    "space, grid, launch",
+    [
+        ((7, 65535, 2), "3d", (7, 65535, 2)),
+        ((7, 2, 65535), "3d", (7, 2, 65535)),
+        ((2**20, 1, 1), "3d", (2**20, 1, 1)),  # gridDim.x has no 65535 limit
+        ((0, 3, 1), "3d", (1, 1, 1)),
+        ((3, 1, 65536), "2d", (3 * 65536, 1, 1)),
+        ((3, 65535, 70000), "2d", (3 * 70000, 65535, 1)),
+        ((1, 65536, 1), "1d", (65536, 1, 1)),
+        ((2, 65536, 65536), "1d", (2**33, 1, 1)),
+    ],
+)
+def test_grid_for_selects_the_static_grid(space, grid, launch):
+    assert OneShot.grid_for(space) == grid
+    # The selected variant launches the space (static extents: the launch grid on the host).
+    x, y, z = WorkStream(schedule=OneShot(grid=grid)).bind(space).grid()
+    assert (x or launch[0], y, z) == launch  # past Int32 the grid is zero-wide
+    assert (x == 0) == (math.prod(space) > 2**31 - 1)
+
+
+def test_static_grids_launch_whole_clusters():
+    assert tile_grid_dims((5, 3, 2), 2, "3d") == (10, 3, 2)
+    assert tile_grid_dims((5, 3, 70000), 2, "2d") == (2 * 5 * 70000, 3, 1)
+    assert tile_grid_dims((5, 0, 70000), 2, "2d") == (2, 1, 1)
+
+
+@pytest.mark.parametrize(
+    "grid, space",
+    [
+        ("3d", (3, 65536, 1)),
+        ("3d", (3, 2, 65536)),
+        ("2d", (3, 65536, 2)),
+        ("2d", (3, 65536, 65536)),
+    ],
+)
+def test_static_grid_rejects_an_oversized_static_space(grid, space):
+    bound = WorkStream(schedule=OneShot(grid=grid)).bind(space)
+    with pytest.raises(ValueError, match=r"OneShot\.grid_for\(space\).*'2d' or '1d'"):
+        bound.grid()
+
+
+class PlainToy:
+    """A kernel without roles: every CTA counts its items in ``hits[tile]``, read with
+    ``bound.single_item()`` (``mode="item"``) or a ``bound.cursor()`` loop."""
+
+    def __init__(self, schedule, mapping=None, mode: str = "item"):
+        self.work = WorkStream(mapping=mapping or Raster(), schedule=schedule)
+        self.mode = mode
+
+    def get_name(self) -> str:
+        return f"warpdrive_plaintoy_{self.work.get_key()}_{self.mode}"
+
+    def __cute_cache_key__(self) -> str:
+        return self.get_name()
+
+    @cute.kernel
+    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        first_thread = cute.arch.thread_idx()[0] == 0
+        ctx = SimpleNamespace(hits=hits, em=em, en=en)
+        if cutlass.const_expr(self.mode == "item"):
+            valid, item = bound.single_item()
+            if valid and first_thread:
+                _hit(0, item, ctx)
+        else:
+            work = bound.cursor()
+            while work.valid:
+                if first_thread:
+                    _hit(0, work.item, ctx)
+                work.advance()
+
+    @cute.jit
+    def __call__(
+        self,
+        hits: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(grid=bound.grid(), block=(64, 1, 1), stream=stream)
+
+
+@jit_cache
+def compile_plain_toy(op: PlainToy):
+    hits = make_fake_compact_tensor(cutlass.Int32, (1, cute.sym_int()))
+    return compile_tvm_ffi(op, hits, Int32(1), Int32(1), Int32(1), Int32(1), name=op.get_name())
+
+
+def _plain_hits(op, ext, max_ctas=148):
+    """Counts per tile; one zero for an empty space, whose idle CTA must count nothing."""
+    hits = torch.zeros(1, max(math.prod(ext), 1), dtype=torch.int32, device="cuda")
+    compile_plain_toy(op)(hits, *ext, max_ctas)
+    torch.cuda.synchronize()
+    return hits[0].cpu()
+
+
+@pytest.mark.parametrize(
+    "schedule, mapping, mode, ext",
+    [
+        (OneShot(), None, "item", (5, 3, 2)),
+        (OneShot(), None, "item", (2, 65536, 1)),  # the runtime 1-D fallback
+        (OneShot(grid="3d"), None, "item", (5, 3, 2)),
+        (OneShot(grid="3d"), None, "item", (3, 65535, 1)),
+        (OneShot(grid="3d"), None, "item", (0, 3, 1)),  # empty: one CTA, no valid item
+        (OneShot(grid="2d"), None, "item", (5, 3, 2)),
+        (OneShot(grid="2d"), None, "item", (3, 2, 65537)),
+        (OneShot(grid="2d"), None, "item", (1, 65535, 3)),
+        (OneShot(grid="2d"), None, "item", (5, 3, 0)),
+        (OneShot(grid="2d"), None, "cursor", (5, 3, 2)),
+        (OneShot(grid="1d"), None, "item", (5, 3, 2)),
+        (OneShot(grid="1d"), None, "item", (2, 65536, 1)),
+        (OneShot(grid="1d"), None, "item", (3, 2, 65537)),
+        (OneShot(grid="1d"), None, "item", (5, 0, 2)),
+        (OneShot(), SkipOdd(swizzle=2), "item", (9, 7, 2)),
+        (OneShot(grid="3d"), None, "cursor", (5, 3, 2)),
+        (OneShot(grid="1d"), Raster(swizzle=3, reverse="m"), "cursor", (7, 5, 2)),
+        (OneShot(grid="1d"), Raster(along="n", reverse=("n", "l")), "item", (7, 5, 3)),
+        (StaticPersistent(), None, "cursor", (9, 7, 2)),  # 4 CTAs run 126 items
+        (StaticPersistent(), SkipOdd(swizzle=2), "cursor", (9, 7, 2)),
+        (StaticPersistent(), None, "cursor", (0, 7, 2)),
+    ],
+    ids=lambda v: v if isinstance(v, str) else None,
+)
+def test_plain_kernel_reads_its_work(requires_blackwell, schedule, mapping, mode, ext):
+    """A kernel without roles covers the space once, on every static grid and through a
+    persistent cursor loop."""
+    op = PlainToy(schedule, mapping, mode)
+    em, en, el = ext
+    kept = [
+        int(mapping is None or not mapping.skips or mapping.kept((m, n, li)))
+        for li in range(el)
+        for n in range(en)
+        for m in range(em)
+    ]
+    kept = torch.tensor(kept or [0], dtype=torch.int32)
+    assert torch.equal(_plain_hits(op, ext, max_ctas=4), kept)
+
+
+@pytest.mark.parametrize(
+    "grid, spaces",
+    [("3d", [(2, 65536, 1), (2, 3, 65536)]), ("2d", [(2, 65536, 1), (1, 65536, 3)])],
+)
+def test_static_grid_rejects_an_oversized_dynamic_space(requires_blackwell, grid, spaces):
+    """Host code in the jit entry cannot raise on a runtime extent, so the grid is launched as
+    is and CUDA rejects it before any CTA runs; the next launch is unaffected."""
+    op = PlainToy(OneShot(grid=grid))
+    for ext in spaces:
+        with pytest.raises(Exception, match=INVALID_LAUNCH):
+            _plain_hits(op, ext)
+    assert _plain_hits(op, (5, 3, 2)).tolist() == [1] * 30
+
+
+def test_tiles_grid_reads_block_idx_without_a_fallback(requires_blackwell, tmp_path, monkeypatch):
+    """``grid="3d"`` takes the item from ``blockIdx`` alone: no branch on the launch shape
+    and no division, where ``"auto"`` keeps both for its 1-D fallback. ``"2d"`` adds one
+    division."""
+    from cutlass.base_dsl.compiler import Compiler
+
+    compile_fn = Compiler.compile
+
+    def ptx_of(grid: str) -> str:
+        def dump_ptx(self, module, pipeline, *args, **kwargs):
+            option = f"dump-ptx-path='{tmp_path / grid}' "
+            pipeline = pipeline.replace("cute-to-nvvm{", "cute-to-nvvm{" + option, 1)
+            return compile_fn(self, module, pipeline, *args, **kwargs)
+
+        monkeypatch.setattr(Compiler, "compile", dump_ptx)
+        # Bypass the cache: the PTX needs a compile.
+        compile_plain_toy.__wrapped__(PlainToy(OneShot(grid=grid)))
+        (ptx,) = tmp_path.glob(f"{grid}*.ptx")
+        return ptx.read_text(errors="ignore")
+
+    decodes = re.compile(r"^\s*(div|rem)\.", re.MULTILINE)
+    tiles = ptx_of("3d")
+    assert all(f"%ctaid.{axis}" in tiles for axis in "xyz")
+    assert "%nctaid" not in tiles and not decodes.search(tiles)
+    auto = ptx_of("auto")
+    assert "%nctaid.y" in auto and decodes.search(auto)
+    fold = ptx_of("2d")  # l from blockIdx.x: one unsigned division, n is blockIdx.y
+    assert "%ctaid.y" in fold and "%ctaid.z" not in fold and "%nctaid" not in fold
+    assert [m.group(0).strip() for m in decodes.finditer(fold)] == ["div."]
+    assert "div.u32" in fold
+    flat = ptx_of("1d")  # the 1-D index, decoded unsigned
+    assert "%ctaid.y" not in flat and "%nctaid" not in flat
+    assert "div.u32" in flat and "div.s32" not in flat and "div.s32" in auto
+
+
+def test_plain_kernel_access_rejections():
+    """``BoundWork.single_item``/``cursor`` serve kernels without roles and local schedules."""
+    owned = StreamToy(OneShot()).work.bind((2, 2, 1))
+    for method in (owned.single_item, owned.cursor):
+        with pytest.raises(ProtocolError, match="is for kernels without roles"):
+            method()
+    workspace = object()  # never read: the checks run first
+    recorded = WorkStream(schedule=OneShot(), record=2).bind((2, 2, 1), workspace)
+    for method in (recorded.single_item, recorded.cursor):
+        with pytest.raises(ProtocolError, match=r"record=\.\.\.\) logs per role"):
+            method()
+    for schedule in (AtomicPersistent(), ClusterLaunchControl()):
+        bound = WorkStream(schedule=schedule).bind((2, 2, 1), workspace, 4)
+        with pytest.raises(ProtocolError, match="cursor\\(\\) needs a local schedule"):
+            bound.cursor()
+        with pytest.raises(ProtocolError, match="non-persistent local schedule"):
+            bound.single_item()
+    with pytest.raises(ProtocolError, match="non-persistent local schedule"):
+        WorkStream(schedule=StaticPersistent()).bind((2, 2, 1), None, 4).single_item()
 
 
 # The persistent GEMM: one argument swaps the schedule.
