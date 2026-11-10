@@ -28,7 +28,9 @@ A handle exposes `h.index`, `h.phase`, `h.full_barrier` (also `h.barrier`),
 **neither its signal nor its fences**. Raw code must supply both, with the effective count.
 That includes a TMA ring's derived `release_fence="smem_async"`: each thread that read the
 stage with ordinary loads runs `fence_async_shared()` before the raw arrival
-([Storage and fences](channels.md#storage-and-fences)).
+([Storage and fences](channels.md#storage-and-fences)). For a thread-written SMEM stage read
+by MMA, raw code must also supply the derived `commit_fence="smem_async"`: each writer runs
+`fence_async_shared()` before arrival.
 The alias diagnostic reports an ordering supplied only by the raw signal as `unverified`.
 
 Changing a count does not make a one-lane release safe. Conceptually:
@@ -128,7 +130,8 @@ using `ring.produce()` normally.
 - The external side takes no managed end binding, role names or fences; those declarations
   raise. Raw code supplies every wait, completion, fence and signal on that side. An external
   consumer of a TMA-filled ring gets no derived release fence. Threads that read the ring with
-  ordinary loads must run `fence_async_shared()` before releasing.
+  ordinary loads must run `fence_async_shared()` before releasing. External producers of SMEM
+  stages read by MMA get no derived commit fence.
 - Only CTA-local mbarrier channels with `Sharing.JOIN` on both sides are supported: no TMA
   multicast or `fills`. Raw code drives the side in each CTA.
 

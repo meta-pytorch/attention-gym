@@ -355,8 +355,10 @@ def test_tma_check_fails_open_on_partial_accounting(mode, tx, reason):
     These kernels are correct, but the check cannot see every copy.
     """
     op = make_tma_toy(SingleCta(), tx=tx, mode=mode)
+    assert op.checks().channels["ld"].tma == "not checked yet"
     with pytest.warns(UserWarning, match=r"could not verify channel\(s\) \['ld'\]"):
         compile_tma_toy(op)
+    assert op.checks().channels["ld"].tma == "unverified"
     assert re.search(rf"tma       unverified \(.*{reason}", op.describe()), op.describe()
 
 
@@ -366,7 +368,7 @@ def test_tma_opt_out_is_listed(requires_blackwell):
     text = op.describe()
     assert "Unchecked opt-outs\n  unchecked tma @ test_warpdrive_hardening.py:" in text
     assert "load: 'toy: atom verified by hand' -> ld barrier at" in text
-    assert "tma       opted out (unchecked)" in text
+    assert op.checks().channels["ld"].tma == "opted out"
 
 
 # Raw state and raw signals on managed ends

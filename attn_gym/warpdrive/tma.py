@@ -102,15 +102,27 @@ class TmaReport:
     unverified: list = field(default_factory=list)
     opted_out: bool = False
 
-    def status(self, fmt_sites=None) -> str:
-        """Format the verdict, byte counts and copy sites.
-
-        ``fmt_sites`` joins sites; the default sorts and comma-separates them.
-        """
+    @property
+    def verdict(self) -> str:
+        """TMA verdict: ``"verified"``, ``"unverified"``, ``"opted out"`` or ``"no copies"``."""
         if self.unverified:
-            return f"unverified ({'; '.join(dict.fromkeys(self.unverified))})"
-        if not self.copies:
-            return "opted out (unchecked)" if self.opted_out else "no TMA copies traced"
+            return "unverified"
+        if self.copies:
+            return "verified"
+        return "opted out" if self.opted_out else "no copies"
+
+    def status(self, fmt_sites=None) -> str:
+        """Format the verdict with byte counts and copy sites, or reasons it is unverified.
+
+        ``fmt_sites`` joins copy sites; the default sorts and comma-separates them.
+        """
+        match self.verdict:
+            case "unverified":
+                return f"unverified ({'; '.join(dict.fromkeys(self.unverified))})"
+            case "opted out":
+                return "opted out (unchecked)"
+            case "no copies":
+                return "no TMA copies traced"
         groups = "/".join(_atom_label(g) for g in sorted(self.groups))
         nbytes = ", ".join(str(b) for b in sorted(self.stage_bytes)) or "not counted"
         sites = (fmt_sites or (lambda s: ", ".join(sorted(s))))(self.copies)

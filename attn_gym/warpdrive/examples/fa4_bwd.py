@@ -277,16 +277,18 @@ class FlashAttentionBackward(WarpSpecialized):
         self.s = Ring(1, Umma, Warps, release_fence="tmem_store")  # P stored over S
         self.dp = Ring(1, Umma, Warps, release_fence="tmem_store")  # dS stored over dP
         if pair:
-            # ds hands over sdS/sdSx; dp hands TMEM dS to dK. No commit fence is needed:
+            # ds hands over sdS/sdSx; dp hands TMEM dS to dK. Disable the derived commit fence:
             # make_ds fences SMEM stores before the exchange, and compute waits for S loads.
-            self.ds = Ring(1, Warps, Umma, buffer={"dS": ds_buf, "dSx": dsx_buf})
+            self.ds = Ring(1, Warps, Umma, buffer={"dS": ds_buf, "dSx": dsx_buf}, commit_fence=())
         else:
             # dS is handed over both in TMEM (tcgen05.st over dP) and in SMEM (sdS): both fences.
             self.ds = Ring(
                 1, Warps, Umma, buffer=ds_buf, commit_fence=("tmem_store", "smem_async")
             )
-        self.dq = Ring(1, Umma, Warps)
-        self.dkv = Slots(2, Umma, Warps)  # slot 0: dV, slot 1: dK
+        # Every consumer finishes its dQ/dK/dV loads (tcgen05.wait::ld) before release.
+        # Only then may the next MMA overwrite those columns.
+        self.dq = Ring(1, Umma, Warps, release_fence="tmem_load")
+        self.dkv = Slots(2, Umma, Warps, release_fence="tmem_load")  # slot 0: dV, slot 1: dK
         if pair:
             # No managed channel lets one CTA fill its peer's stage. Peer compute thread 0
             # arms this raw barrier with the copy byte count; the relay warp waits on it.
@@ -871,7 +873,6 @@ class FlashAttentionBackward(WarpSpecialized):
             with dkv.consume(j):
                 tmem.access(name, read=True)
                 cute.copy(thr_ld, tAcc_t2r, rAcc)
-                cute.arch.fence_view_async_tmem_load()
             if cutlass.const_expr(j == 1):
                 for e in cutlass.range_constexpr(cute.size(rAcc) // 2):
                     rAcc[2 * e], rAcc[2 * e + 1] = cute.arch.mul_packed_f32x2(
@@ -934,7 +935,6 @@ class FlashAttentionBackward(WarpSpecialized):
                 with dq.consume():
                     tmem.access("dQ", read=True)
                     cute.copy(thr_ld, tdQ_t2r, rdQ)
-                    cute.arch.fence_view_async_tmem_load()
                 rdQ_chunks = cute.make_tensor(rdQ.iterator, (self.dq_cols, chunks))
                 for c in cutlass.range_constexpr(chunks):
                     buf = c % self.dq_stages

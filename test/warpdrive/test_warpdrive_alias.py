@@ -71,7 +71,7 @@ def test_fa4_examples_report_no_hazard(kwargs):
     pairs = ["P ~ S", "V ~ K"] + (["O ~ Q"] if kwargs.get("overlap_o_q") else [])
     for pair in pairs:
         assert status(op, pair) == "no hazard found", alias_section(op)
-    assert "potential hazard:" not in alias_section(op)
+    assert "potential hazard" not in op.checks().aliases.values(), alias_section(op)
 
 
 def test_cta_pairs_are_unverified_not_safe():
@@ -193,7 +193,8 @@ def test_qk_overwriting_p_before_pv_is_a_potential_hazard(tmp_path, monkeypatch)
     info = compile_fa4_fwd.cache_info()
     assert (info.hits, info.misses) == (1, 0)
     assert warm_alias == cold_alias
-    assert warm.describe() == cold.describe() and "tma       verified" in warm.describe()
+    assert warm.describe() == cold.describe() and warm.checks() == cold.checks()
+    assert {c.tma for c in warm.checks().channels.values()} == {"verified", None}
 
 
 def test_strict_mode_raises_and_off_or_unchecked_opts_out():
@@ -205,13 +206,14 @@ def test_strict_mode_raises_and_off_or_unchecked_opts_out():
     opted = QkBeforePv(opt_out=True)
     _, alias = compile_quietly(opted)
     assert alias == []
-    assert "potential hazard:" not in alias_section(opted)
+    assert "potential hazard" not in opted.checks().aliases.values(), alias_section(opted)
     assert "unchecked alias @ test_warpdrive_alias.py:" in opted.describe()
 
     off = QkBeforePv()
     off.alias_check = "off"
     _, alias = compile_quietly(off)
     assert alias == [] and "Alias diagnostic" not in off.describe()
+    assert off.checks().aliases == {}
 
 
 # Mutant 2: sO overlapping sQ under a persistent schedule, with and without the epilogue ->

@@ -2,17 +2,69 @@
 
 ``describe_kernel`` reads host state from ``WarpSpecialized._collect``. After compilation,
 it also shows TMA reports, opt-outs, alias findings and the traced protocol.
+``kernel_checks`` returns the channel and alias verdicts as data.
 """
 
 from __future__ import annotations
 
 import textwrap
+from dataclasses import dataclass
+from typing import Literal
 
 from attn_gym.warpdrive.channels import Threads, Tma, Umma, Warps
 from attn_gym.warpdrive.scheduling import _tile_grid, scheduler_role
 
 WIDTH = 100  # wrap channel flows past this many columns
 _LABEL = 8  # width of the channel detail labels ("override")
+NOT_CHECKED = "not checked yet"  # no traced or restored result
+TmaVerdict = Literal["verified", "unverified", "opted out", "no copies", "not checked yet"]
+EpochsVerdict = Literal["verified", "unverified", "not checked yet"]
+AliasStatus = Literal["no hazard found", "unverified", "potential hazard"]
+
+
+@dataclass(frozen=True)
+class ChannelChecks:
+    """One channel's verdicts, with None for checks that do not apply.
+
+    ``tma`` checks copies from a managed ``Tma`` producer (``TmaReport.verdict``).
+    ``epochs`` checks round-robin or exclusive epoch ownership. Applicable checks are
+    ``NOT_CHECKED`` until compilation or cache restoration.
+    """
+
+    tma: TmaVerdict | None = None
+    epochs: EpochsVerdict | None = None
+
+
+@dataclass(frozen=True)
+class KernelChecks:
+    """Channel and alias verdicts returned by ``WarpSpecialized.checks()``.
+
+    ``channels`` includes every channel. ``aliases`` maps each examined overlap to its status,
+    keyed by ``(name, overlapped name)`` (``name ~ overlapped name`` in ``describe()``).
+    It is empty before compilation or with ``alias_check="off"``.
+    """
+
+    channels: dict[str, ChannelChecks]
+    aliases: dict[tuple[str, str], AliasStatus]
+
+
+def kernel_checks(kernel) -> KernelChecks:
+    channels = {}
+    for name, ch in kernel._ws_chans.items():
+        report = kernel._ws_tma.get(name)
+        tma = report.verdict if report is not None else NOT_CHECKED if ch.checks_tma else None
+        epochs = None
+        if ch.owned_epochs:
+            ownership = kernel._ws_ownership.get(name)
+            epochs = NOT_CHECKED if ownership is None else ownership_verdict(ownership)
+        channels[name] = ChannelChecks(tma, epochs)
+    rep = kernel._ws_alias
+    aliases = {} if rep is None else {r.names: r.status for r in rep.results}
+    return KernelChecks(channels, aliases)
+
+
+def ownership_verdict(ownership: str) -> str:
+    return "verified" if ownership.startswith("verified") else "unverified"
 
 
 def describe_kernel(kernel) -> str:
@@ -245,6 +297,7 @@ def _channels(kernel) -> str:
         return ""
     width = max(len(n) for n in chans)
     pad = " " * (2 + width + 2)
+    checks = kernel_checks(kernel).channels
     lines = ["Channels"]
     for name, ch in chans.items():
         head = f"  {name:<{width}}  {channel_kind(ch):<9}"
@@ -288,8 +341,10 @@ def _channels(kernel) -> str:
                         ),
                     )
                 )
-        if ch.owned_epochs:
-            details.append(("epochs", kernel._ws_ownership.get(name, "ownership not traced")))
+        if checks[name].epochs == NOT_CHECKED:
+            details.append(("epochs", "ownership not traced"))
+        elif checks[name].epochs is not None:
+            details.append(("epochs", kernel._ws_ownership[name]))
         if ch.external is not None:
             counts = ch.external_counts.replace("_", " ")
             details.append(
@@ -309,7 +364,7 @@ def _channels(kernel) -> str:
             storage = ch.payload is not None or ch.buffers
             details.append(("storage" if storage else "fences", ", ".join(extra)))
         details += [("override", o) for o in _overrides(ch, kernel.cluster)]
-        tma = _tma_status(kernel, name, ch)
+        tma = _tma_status(kernel, name, checks[name].tma)
         if tma:
             details.append(("tma", tma))
         lines += [f"{pad}{k:<{_LABEL}}  {v}" for k, v in details]
@@ -333,20 +388,23 @@ def _overrides(ch, cluster) -> list[str]:
         note = "  (differs from derived)" if ours != theirs else ""
         out.append(f"remote_scope {ours} -> {theirs}{note}")
     # Internal channels own their fences; the st.async work ring needs none.
-    if ch.derived_release_fence and ch.release_fence_overridden and not ch.internal:
-        ours, theirs = ch.derived_release_fence, ch.release_fence
-        note = "  (differs from derived)" if ours != theirs else ""
-        out.append(f"release_fence {'+'.join(ours)} -> {'+'.join(theirs) or 'none'}{note}")
+    fences = (
+        ("commit_fence", ch.derived_commit_fence, ch.commit_fence_overridden, ch.commit_fence),
+        ("release_fence", ch.derived_release_fence, ch.release_fence_overridden, ch.release_fence),
+    )
+    for key, ours, overridden, theirs in fences:
+        if ours and overridden and not ch.internal:
+            note = "  (differs from derived)" if ours != theirs else ""
+            out.append(f"{key} {'+'.join(ours)} -> {'+'.join(theirs) or 'none'}{note}")
     return out
 
 
-def _tma_status(kernel, name: str, ch) -> str:
-    report = kernel._ws_tma.get(name)
-    if report is not None:
-        return report.status(_sites)
-    if ch.checks_tma:
-        return "not checked yet (compile to check the copies)"
-    return ""
+def _tma_status(kernel, name: str, verdict: str | None) -> str:
+    if verdict is None:
+        return ""
+    if verdict == NOT_CHECKED:
+        return f"{NOT_CHECKED} (compile to check the copies)"
+    return kernel._ws_tma[name].status(_sites)
 
 
 def _turnstiles(kernel) -> str:

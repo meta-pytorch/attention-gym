@@ -304,15 +304,19 @@ class TmaThroughOtherChannel(Model):
 
 
 class ThreadsWriteForUmma(Model):
-    """Threads write X, an MMA reads its overlap Y: the generic-to-async proxy fence comes from
-    ``fence_async_shared()`` in the writer, not from the channel."""
+    """Threads write X; an MMA reads its overlap Y through the async proxy.
 
-    def __init__(self, fence: bool):
+    ``fence="derived"`` uses the channel's commit fence. ``"hand"`` opts out and calls
+    ``fence_async_shared()`` in the writer; None opts out without fencing.
+    """
+
+    def __init__(self, fence: str | None):
         self.fence = fence
         self.smem_plan = SmemPlan()
         x = self.smem_plan.buffer("X", cutlass.Int32, align=128)
         y = self.smem_plan.buffer("Y", cutlass.Int32, overlaps=x)
-        self.a = Ring(2, Threads, Umma, buffer={"X": x, "Y": y})
+        commit_fence = None if fence == "derived" else ()
+        self.a = Ring(2, Threads, Umma, buffer={"X": x, "Y": y}, commit_fence=commit_fence)
 
     def layouts(self):
         return {"X": cute.make_layout((32, 2)), "Y": cute.make_layout((32, 2))}
@@ -323,7 +327,7 @@ class ThreadsWriteForUmma(Model):
         for _ in cutlass.range(ctx.n, unroll=1):
             with a.produce() as h:
                 h.access("X", write=True)
-                if cutlass.const_expr(self.fence):
+                if cutlass.const_expr(self.fence == "hand"):
                     fence_async_shared()
         return a
 
@@ -375,6 +379,7 @@ class StoresToTmemAndSmemForUmma(Model):
 
 FENCE_CALLS = {
     "fence_view_async_tmem_store": "tmem_store",
+    "fence_view_async_tmem_load": "tmem_load",
     "fence_view_async_shared": "smem_async",
 }
 
@@ -386,21 +391,27 @@ FENCE_CALLS = {
         (("smem_async", "tmem_store"), True, True),
         ("smem_async", False, True),
         ("tmem_store", True, False),
-        (None, False, False),
+        (None, False, True),
+        ((), False, False),
     ],
-    ids=["both", "both_reversed", "smem_only", "tmem_only", "none"],
+    ids=["both", "both_reversed", "smem_only", "tmem_only", "derived", "none"],
 )
 def test_commit_fence_tuple_covers_both_stores(monkeypatch, fences, tmem_ok, smem_ok):
-    """Each declared fence covers its store kind; the layer emits exactly the declared fences,
-    in order, once per managed commit (the only fences in this kernel are the commit's)."""
+    """Each fence covers its store kind and runs once per commit, in declaration order.
+
+    None derives smem_async. This model has no fences outside the commit.
+    """
     emitted = record_arch_calls(monkeypatch, FENCE_CALLS)
     op = StoresToTmemAndSmemForUmma(fences)
-    tag = "_".join(fences) if isinstance(fences, tuple) else str(fences).lower()
+    if fences is None:
+        declared = ("smem_async",)
+    else:
+        declared = (fences,) if isinstance(fences, str) else fences
+    tag = "derived" if fences is None else "_".join(declared) or "none"
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         compile_toy.__wrapped__(op, f"fence_tuple_{tag}")  # traced, not cached
-    expected = list(fences) if isinstance(fences, tuple) else [fences] if fences else []
-    assert emitted == expected
+    assert emitted == list(declared)
     text = alias_section(op)
     assert status(op, "dS ~ dP") == ("no hazard found" if tmem_ok else "unverified"), text
     assert status(op, "Y ~ X") == ("no hazard found" if smem_ok else "unverified"), text
@@ -507,6 +518,149 @@ def test_external_consumer_of_a_tma_ring_derives_no_release_fence():
     """External consumers supply their own fences; the layer must derive none for them."""
     ring = Ring(2, Tma(128), Threads, external="consumer", override={"empty_counts": 1})
     assert ring.release_fence == ()
+
+
+class WritesStageForUmma(Model):
+    """Generic-store producer with configurable consumer and storage.
+
+    MMA reads through the async proxy; each writer needs a proxy fence to avoid stale reads.
+    ``storage`` is ``"payload"``, ``"buffer"``, or None for a TMEM handoff.
+    """
+
+    def __init__(self, producer, consumer, storage, **fence):
+        self.storage = storage
+        place = {}
+        if storage == "payload":
+            place = {"payload": (cutlass.Int32, (32,))}
+        elif storage == "buffer":
+            self.smem_plan = SmemPlan()
+            place = {"buffer": self.smem_plan.buffer("X", cutlass.Int32, align=128)}
+        self.ring = Ring(2, producer, consumer, **place, **fence)
+
+    def layouts(self):
+        return {"X": cute.make_layout((32, 2))} if self.storage == "buffer" else {}
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ring: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ring.produce() as h:
+                if cutlass.const_expr(self.storage is not None):
+                    h.data[cute.arch.lane_idx()] = 1
+        return ring
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ring: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ring.consume():
+                pass
+        return ring
+
+
+@pytest.mark.parametrize(
+    "producer, consumer, storage, fence, fenced",
+    [
+        (Threads, Umma, "buffer", {}, True),
+        (Warps, Umma, "payload", {}, True),
+        (Threads, Umma, "buffer", {"commit_fence": ()}, False),
+        (Threads, Umma, None, {}, False),
+        (Threads, Threads, "buffer", {}, False),
+    ],
+    ids=["threads_buffer", "warps_payload", "opt_out", "tmem_handoff", "threads_consumer"],
+)
+def test_thread_written_smem_for_umma_is_proxy_fenced_before_commit(
+    monkeypatch, producer, consumer, storage, fence, fenced
+):
+    """Every SMEM writer fences before committing to an MMA consumer.
+
+    Threads/Warps -> Umma derives fence.proxy.async unless ``commit_fence=()`` opts out.
+    Without SMEM storage, no fence is derived.
+    """
+    names = ("fence_view_async_shared", "mbarrier_arrive")
+    emitted = record_arch_calls(monkeypatch, {name: name for name in names})
+    op = WritesStageForUmma(producer, consumer, storage, **fence)
+    tag = f"{producer.__name__}_{consumer.__name__}_{storage}_{len(fence)}".lower()
+    compile_toy.__wrapped__(op, f"umma_commit_fence_{tag}")  # traced, not cached
+    assert emitted.count("fence_view_async_shared") == fenced
+    if fenced:  # the full-barrier arrival must follow the fence
+        assert emitted[emitted.index("fence_view_async_shared") + 1] == "mbarrier_arrive"
+
+
+@pytest.mark.parametrize(
+    "fence, shown",
+    [
+        (None, None),
+        ("smem_async", "commit_fence smem_async -> smem_async\n"),
+        ((), "commit_fence smem_async -> none  (differs from derived)"),
+        (
+            ("tmem_store", "smem_async"),
+            "commit_fence smem_async -> tmem_store+smem_async  (differs from derived)",
+        ),
+    ],
+    ids=["derived", "explicit_default", "opt_out", "replaced"],
+)
+def test_describe_shows_a_replaced_commit_fence(fence, shown):
+    op = WritesStageForUmma(Threads, Umma, "buffer", commit_fence=fence)
+    text = op.describe()
+    assert ("commit_fence smem_async ->" in text) == (shown is not None), text
+    if shown is not None:
+        assert shown in text, text
+
+
+def test_external_producer_of_an_umma_channel_derives_no_commit_fence():
+    """External producers supply their own fences."""
+    ring = Ring(
+        2,
+        Threads,
+        Umma,
+        payload=(cutlass.Int32, (32,)),
+        external="producer",
+        override={"full_counts": 1},
+    )
+    assert ring.commit_fence == ()
+
+
+class LoadsUmmaStage(Model):
+    """MMA-to-thread handoff model for TMEM stage reuse.
+
+    Consumers must finish TMEM loads with tcgen05.wait::ld before release lets the next MMA
+    overwrite those columns.
+    """
+
+    def __init__(self, consumer, **fence):
+        self.ring = Ring(2, Umma, consumer, **fence)
+
+    @role(warps=0)
+    @cute.jit
+    def mma(self, ctx, *, ring: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ring.produce():
+                pass
+        return ring
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ring: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ring.consume():
+                pass
+        return ring
+
+
+@pytest.mark.parametrize("consumer", [Threads, Warps])
+@pytest.mark.parametrize("fence", ["tmem_load", ("tmem_load", "tmem_store"), None])
+def test_tmem_load_release_fence_waits_for_loads_before_the_release(monkeypatch, consumer, fence):
+    """Every consumer runs tcgen05.wait::ld before its empty-barrier arrival.
+
+    Fences run in declaration order; no release fence is derived for this channel.
+    """
+    emitted = record_arch_calls(monkeypatch, {**FENCE_CALLS, "mbarrier_arrive": "arrive"})
+    op = LoadsUmmaStage(consumer, release_fence=fence)
+    kinds = (fence,) if isinstance(fence, str) else fence or ()
+    tag = "_".join(kinds) or "none"
+    compile_toy.__wrapped__(op, f"tmem_load_fence_{consumer.__name__.lower()}_{tag}")
+    assert emitted == [*kinds, "arrive"]
 
 
 class LoopInsideHandle(LoopCarriedMma):
@@ -754,8 +908,9 @@ VERDICTS = {  # id: (model, pair, status, evidence regex in the alias section)
     ),
     "loop_in_handle": (LoopInsideHandle, "P ~ S", HAZARD, ""),  # the handle must not hide it
     "tma_other_channel": (TmaThroughOtherChannel, "Y ~ X", HAZARD, r"\[complete_tx\]"),
-    "no_proxy_fence": (lambda: ThreadsWriteForUmma(False), "Y ~ X", UNVERIFIED, r"\[proxy\]"),
-    "proxy_fence": (lambda: ThreadsWriteForUmma(True), "Y ~ X", SAFE, ""),
+    "no_proxy_fence": (lambda: ThreadsWriteForUmma(None), "Y ~ X", UNVERIFIED, r"\[proxy\]"),
+    "proxy_fence": (lambda: ThreadsWriteForUmma("hand"), "Y ~ X", SAFE, ""),
+    "derived_proxy_fence": (lambda: ThreadsWriteForUmma("derived"), "Y ~ X", SAFE, ""),
     # Keep signal=False closes in the graph: raw signaling leaves ordering unverified,
     # not a potential hazard, even under strict mode.
     "release": (lambda: RawReleaseOverlap(False), "Q ~ P", SAFE, ""),

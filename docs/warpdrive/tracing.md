@@ -105,6 +105,27 @@ declaration counts alone do not establish progress, and two roles can still wait
 other's first publication. When a kernel times out, attribute the stuck wait (CTA, role,
 epoch) before blaming the layer or the role body.
 
+### Read check results as data
+
+Use `op.checks()` to read verdicts without parsing `describe()`. Both use the same compile
+results, including those restored by `jit_cache`:
+
+```python
+checks = op.checks()
+checks.channels["ab"].tma  # "verified"
+checks.channels["acc"].tma  # None: no TMA check
+checks.aliases  # {("P", "S"): "no hazard found", ...} for declared overlaps
+```
+
+| Field | Values | `describe()` line |
+|---|---|---|
+| `channels[name].tma` | `"verified"`, `"unverified"`, `"opted out"`, `"no copies"`, `"not checked yet"`; `None` without a [TMA check](#tma-checks) | `tma` |
+| `channels[name].epochs` | `"verified"`, `"unverified"`, `"not checked yet"`; `None` without round-robin or exclusive sharing | `epochs` |
+| `aliases[(name, overlapped)]` | `"no hazard found"`, `"unverified"`, `"potential hazard"`; empty before a compile or with `alias_check="off"` | `name ~ overlapped` in the alias diagnostic |
+
+For evidence, read `describe()`: copy sites, byte counts, epoch shares and findings.
+`"not checked yet"` means the instance has not been compiled or restored.
+
 ### Draw the pipeline
 
 `describe(format="mermaid")` draws the same declarations as a
@@ -225,7 +246,7 @@ flowchart LR
   role_load["load<br>warp 13 · 104 regs · cta all"]
   role_relay["relay<br>warp 14 · 104 regs · cta all"]
   stream_work[["stream work<br>OneShot(), Raster(along=m)<br>decoded locally in every role"]]
-  channel_ds("ds · Ring(1)<br>Warps -#gt; Umma<br>full leader 18<br>empty leader 1, peer 1<br>pair-scoped, release_mask 0b11, remote_scope cta, tail<br>buffer dS, dSx")
+  channel_ds("ds · Ring(1)<br>Warps -#gt; Umma<br>full leader 18<br>empty leader 1, peer 1<br>pair-scoped, release_mask 0b11, remote_scope cta, tail<br>override commit_fence smem_async -#gt; none  (differs from derived)<br>buffer dS, dSx")
   named_list_barriers["named barriers<br>compute_sync id 3 · 256 threads<br>reduce_sync id 4 · 128 threads<br>epi_sync_wg0 id 5 · 128 threads<br>epi_sync_wg1 id 6 · 128 threads<br>users known after a compile"]
   barriers_xchg[("xchg<br>Barriers: 1 mbarriers, layer-initialized [1]<br>user-driven (unchecked)<br>roles reach it through barrier_ptr")]
   storage_aliases["storage aliases<br>smem dKepi overlaps K (k)<br>smem dVepi overlaps V (v)<br>tmem P inside S<br>tmem dS inside dP<br>tmem dQ inside S"]
@@ -237,8 +258,8 @@ flowchart LR
   role_load -->|"lse · Ring(1)<br>Tma(512 B) -#gt; Warps<br>full 1, tx 512 B<br>empty 8<br>CTA-local<br>buffer LSE, release_fence smem_async"| role_compute
   role_load -->|"dpsum · Ring(1)<br>Tma(512 B) -#gt; Warps<br>full 1, tx 512 B<br>empty 8<br>CTA-local<br>override release_fence smem_async -#gt; none  (differs from derived)<br>buffer dPsum"| role_compute
   role_mma ==>|"s, dp · Ring(1) each<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 16<br>pair-scoped, commit_mask 0b11, remote_scope cta<br>release_fence tmem_store"| role_compute
-  role_mma ==>|"dq · Ring(1)<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 8<br>pair-scoped, commit_mask 0b11, remote_scope cta"| role_reduce
-  role_mma ==>|"dkv · Slots(2)<br>Umma -#gt; Warps<br>full leader 1 x2, peer 1 x2<br>empty leader 16 x2<br>pair-scoped, commit_mask 0b11, remote_scope cta"| role_compute
+  role_mma ==>|"dq · Ring(1)<br>Umma -#gt; Warps<br>full leader 1, peer 1<br>empty leader 8<br>pair-scoped, commit_mask 0b11, remote_scope cta<br>release_fence tmem_load"| role_reduce
+  role_mma ==>|"dkv · Slots(2)<br>Umma -#gt; Warps<br>full leader 1 x2, peer 1 x2<br>empty leader 16 x2<br>pair-scoped, commit_mask 0b11, remote_scope cta<br>release_fence tmem_load"| role_compute
   classDef role fill:#fbf9f4,stroke:#1a2e22,color:#1a2e22
   class role_reduce,role_compute,role_mma,role_load,role_relay role
   classDef stream fill:#eef2ec,stroke:#5f7f67,color:#1a2e22

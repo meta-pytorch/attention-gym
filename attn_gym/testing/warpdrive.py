@@ -1,6 +1,5 @@
 """Shared host-only helpers for warpdrive tests."""
 
-import re
 from collections.abc import Callable
 
 import pytest
@@ -25,6 +24,8 @@ def alias_section(op: WarpSpecialized) -> str:
 
 
 def status(op: WarpSpecialized, pair: str) -> str:
-    match = re.search(rf"\n  {re.escape(pair)} \((?:tmem|smem)\)  ([a-z ]+)", alias_section(op))
-    assert match, alias_section(op)
-    return match.group(1).strip().split(" among")[0]
+    """Alias status for ``pair``, written as ``"Y ~ X"`` in ``describe()``."""
+    aliases = op.checks().aliases
+    names = tuple(pair.split(" ~ "))
+    assert names in aliases, alias_section(op)
+    return aliases[names]

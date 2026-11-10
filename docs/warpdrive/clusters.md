@@ -219,7 +219,9 @@ Storage is separate from that barrier ordering:
 - User cross-CTA channels cannot have `payload=`: layer-owned payloads are CTA-local.
   The internal work ring is the exception; its scheduler fills every CTA's copy with `st.async`.
 - `SmemPlan` buffers may bind to cross-CTA channels. They allocate separately in each CTA at
-  matching offsets. `buffer=` changes neither scope nor fences.
+  matching offsets. `buffer=` leaves scope unchanged and derives a commit fence for
+  `Threads`/`Warps` -> `Umma`, as `payload=` does
+  ([Storage and fences](channels.md#storage-and-fences)).
 - The phase-1 alias diagnostic reports cluster aliases as `unverified`; it does not analyze
   cross-CTA ordering.
 
