@@ -7,10 +7,9 @@
 """FP64 numerics of the KDA intra-chunk forward engine's raw outputs.
 
 The engine gates its operands with the flush-to-zero ``ex2`` and a shifted strip rebase (module
-docstring of ``chunk_kda_fwd_intra_engine``), so its outputs are not bitwise-equal to any earlier
-kernel. These tests hold the raw Aqk, AkkOD and Akkd of a launch to an FP64 evaluation of the
-same pairwise sums, ``2^(g_i - g_j)`` taken directly, entry by entry, and check that every entry
-the kernel must not write keeps its sentinel.
+docstring of ``chunk_kda_fwd_intra_engine``). These tests hold the raw Aqk, AkkOD and Akkd of a
+launch to an FP64 evaluation of the same pairwise sums, ``2^(g_i - g_j)`` taken directly, entry
+by entry, and check that every entry the kernel must not write keeps its sentinel.
 """
 
 import math
@@ -245,7 +244,7 @@ AMPLITUDES = {"unit": (1.0, 1.0), "large_q": (2.0**62, 1.0), "large_k": (1.0, 2.
 @pytest.mark.parametrize("amplitude", AMPLITUDES, ids=list(AMPLITUDES))
 @pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
 def test_steep_decay_is_exact_to_bf16(packed, amplitude):
-    """Every pair's decay survives the rebase up to the gate bound, down to a 2^-60 floor.
+    """Every pair's decay survives the rebase up to the gate bound, down to a 2^-62 floor.
 
     Head ``h`` has one active channel (q, k along e_0) and a constant per-token gate, so each
     entry is a single term ``q_0 k_0 2^(g_i - g_j)`` that no other channel can mask and the error
@@ -273,6 +272,6 @@ def test_steep_decay_is_exact_to_bf16(packed, amplitude):
     actual = _launch((heads, False, None), q, k, g, beta, metadata)
     for name, got, ref in zip(NAMES, actual, expected, strict=True):
         written = ref != SENTINEL
-        floor = ref[written].abs().max() * 2**-60
+        floor = ref[written].abs().max() * 2**-62
         off, err = _off_entries(got, ref, ref.abs() * RTOL + floor)
         assert not off.any(), f"{name}: {int(off.sum())} entries off, worst {err[off].max():.3e}"
