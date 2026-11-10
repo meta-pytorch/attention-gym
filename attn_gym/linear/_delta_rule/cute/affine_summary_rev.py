@@ -13,11 +13,12 @@ V-first packed transpose ``[local_bias; reverse_transition]``.
 
 Terms (chunk, range, column tile, and why the routing sends one range per fragment) are defined
 in ``affine_summary_fwd``; *work item* and *partial* in
-``attn_gym.linear._delta_rule.triton.work_items``. Each 224-thread CTA is persistent: it walks a
+``attn_gym.linear._delta_rule.triton.work_items``. Each CTA is persistent: it walks a
 grid-strided sequence of flat tile indices, decodes each into (column tile, head, work item), and
 reads the item's token range from the device ``work`` table, so nothing about the layout is baked
 into the launch. Four CUDA warps hold the FP32 state in registers, one warp issues TMA loads, one
-computes gate exponentials, and one issues the four UMMA operations. Bias tiles load the local
+computes gate exponentials, and one issues the four UMMA operations. Warpdrive pads the four
+roles' seven warps to eight for the 160/40-register warpgroup split. Bias tiles load the local
 output-gradient sources; transition tiles skip those streams entirely. Only the final FP32
 partial is written to global memory.
 
@@ -32,20 +33,16 @@ passes, exactly as the forward summary treats ``X`` and ``wx``, so the reverse
 transition is the transpose of the map the forward summary actually evaluates.
 """
 
-# NOTE: no `from __future__ import annotations` — cute.struct requires
-# eager-evaluated annotations.
-
-from enum import IntEnum
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
-from cutlass import Float32, Int32, cute, pipeline
+from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
-from cutlass.cute.typing import Int64
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import get_device_properties
@@ -59,8 +56,27 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
 )
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
+from attn_gym.warpdrive import (
+    Consumer,
+    Local,
+    Producer,
+    Raster,
+    Ring,
+    SmemPlan,
+    StaticPersistent,
+    Threads,
+    Tma,
+    Tmem,
+    TmemPlan,
+    Umma,
+    Warps,
+    WarpSpecialized,
+    WorkCursor,
+    WorkStream,
+    role,
+)
 from attn_gym.warpdrive.cache import compile_tvm_ffi, get_compile_target, jit_cache
-from attn_gym.warpdrive.compat import LayoutEnum, SmemAllocator, TmemAllocator
+from attn_gym.warpdrive.compat import LayoutEnum
 
 BT = 64
 KEY_DIM = 128
@@ -70,6 +86,9 @@ DATA_ALIGN_BYTES = 16
 
 _IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 _CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
+# The flat compile cache builds the op internally. Keep host launch resources separate;
+# StaticPersistent reads only max_ctas, but carries the same workspace ABI as other schedules.
+_LAUNCH_WORK = WorkStream(schedule=StaticPersistent())
 
 
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
@@ -89,16 +108,6 @@ def _feature_sequence_head_batch_view(tensor):
     """Re-rank ``[B,T,H,D]`` as ``[D,T,(H,B)]`` for a TMA operand."""
     layout = cute.group_modes(cute.select(tensor.layout, mode=[3, 1, 2, 0]), 2, 4)
     return cute.make_tensor(tensor.iterator, layout)
-
-
-class WarpRole(IntEnum):
-    """Warp-role boundaries in the persistent summary kernel."""
-
-    STATE = 0
-    LOAD = 4
-    GATE = 5
-    MMA = 6
-    END = 7
 
 
 class TmaOp(NamedTuple):
@@ -142,12 +151,35 @@ class SmemLayouts(NamedTuple):
     aqk: cute.ComposedLayout
 
 
-class BlackwellDeltaAffineSummaryRev:
+@dataclass(frozen=True)
+class ReverseSummaryParams:
+    """Shared layouts and runtime inputs; channel state stays local to each role."""
+
+    work_table: cute.Tensor
+    out: cute.Tensor
+    mmas: Mmas
+    tma: TmaOps
+    scale: Float32
+    dv_layout: cute.Layout
+    qdo_layout: cute.Layout
+    wdv_layout: cute.Layout
+    s_k: cute.Tensor
+    s_state: cute.Tensor
+    s_state_store: cute.Tensor
+    s_q: cute.Tensor
+    s_do: cute.Tensor
+    s_w: cute.Tensor
+    s_dv: cute.Tensor
+    s_dv_store: cute.Tensor
+    s_aqk: cute.Tensor
+    gate_3d: cute.Tensor
+    gate: cute.Tensor
+    gate_exp: cute.Tensor
+
+
+class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
     """Compute reverse affine summaries with persistent TMA/UMMA state tiles."""
 
-    STATE_WARP_IDS = tuple(range(WarpRole.STATE, WarpRole.LOAD))
-    WARP_SIZE = cute.arch.WARP_SIZE
-    CTA_THREADS = WarpRole.END * WARP_SIZE
     # Augmented-state columns per CTA. A BN=16 tile covered half the columns for only ~25% less
     # time per chunk; work items fill idle SMs instead.
     BN = 32
@@ -171,9 +203,6 @@ class BlackwellDeltaAffineSummaryRev:
         # and every row is one item: the ``budget == 1`` case needs no planner and no fold.
         self.whole_ranges = whole_ranges
 
-        self.state_regs = 160
-        self.aux_regs = 40
-
         self.dv_tile = (self.BT, self.BN, self.BK)
         self.qdo_tile = (self.BK, self.BN, self.BT)
         self.aqdo_tile = (self.BT, self.BN, self.BT)
@@ -189,13 +218,49 @@ class BlackwellDeltaAffineSummaryRev:
         self.qdo_acc_depth = 1
         self.wdv_acc_depth = 1
 
-        self.cluster = (1, 1, 1)
         self.cta_group = tcgen05.CtaGroup.ONE
-        self.tmem_free_barrier = pipeline.NamedBarrier(
-            barrier_id=2,
-            num_threads=self.CTA_THREADS,
+        self.smem_plan = SmemPlan()
+        buffers = {
+            name: self.smem_plan.buffer(name, self.io_type, align=1024)
+            for name in ("K", "State", "Q", "Do", "W", "DvOperand", "Aqk")
+        }
+        state_store = self.smem_plan.buffer(
+            "StateStore", self.io_type, align=1024, overlaps=buffers["State"]
         )
-        self.smem_alignment = 1024
+        dv_store = self.smem_plan.buffer(
+            "DvStore", self.io_type, align=1024, overlaps=buffers["DvOperand"]
+        )
+        gate = self.smem_plan.buffer("Gate", Float32, align=128)
+        gate_exp = self.smem_plan.buffer("GateExp", Float32, align=128)
+        io_bytes = self.io_type.width // 8
+        self.k = Ring(self.k_depth, Tma(self.BT * self.BK * io_bytes), Umma, buffer=buffers["K"])
+        self.q = Ring(self.q_depth, Tma(self.BK * self.BT * io_bytes), Umma, buffer=buffers["Q"])
+        self.do = Ring(
+            self.do_depth, Tma(self.BN * self.BT * io_bytes), Umma, buffer=buffers["Do"]
+        )
+        self.w = Ring(self.w_depth, Tma(self.BK * self.BT * io_bytes), Umma, buffer=buffers["W"])
+        self.aqk = Ring(
+            self.aqk_depth, Tma(self.BT * self.BT * io_bytes), Umma, buffer=buffers["Aqk"]
+        )
+        # One elected gate-warp release follows its generic reads and async-proxy fence.
+        self.gate = Ring(self.gate_depth, Tma(self.BK * 4), Warps, buffer=gate)
+        self.gate_ready = Ring(self.gate_depth, Threads, Threads, buffer=gate_exp)
+        self.state_pipe = Ring(
+            2, Threads, Umma, buffer={"State": buffers["State"], "Store": state_store}
+        )
+        self.dv_operand = Ring(
+            2, Threads, Umma, buffer={"Dv": buffers["DvOperand"], "Store": dv_store}
+        )
+        self.dv_pipe = Ring(self.dv_acc_depth, Umma, Threads, release_fence="tmem_load")
+        self.qdo_pipe = Ring(self.qdo_acc_depth, Umma, Threads, release_fence="tmem_load")
+        self.wdv_pipe = Ring(self.wdv_acc_depth, Umma, Threads, release_fence="tmem_load")
+        self.tmem_plan = (
+            TmemPlan()
+            .region("dv", self.BN, self.dv_acc_depth)
+            .region("qdo", self.BN, self.qdo_acc_depth)
+            .region("wdv", self.BN, self.wdv_acc_depth)
+        )
+        self.work = WorkStream(mapping=Raster(), schedule=StaticPersistent())
 
     def get_name(self) -> str:
         """Return a stable artifact and profiler name for this specialization."""
@@ -218,6 +283,8 @@ class BlackwellDeltaAffineSummaryRev:
         work_table: cute.Tensor,
         out: cute.Tensor,
         scale: Float32,
+        workspace: cute.Tensor,
+        max_ctas: Int32,
         stream: cuda.CUstream,
     ):
         """Construct TMA/UMMA descriptors and launch the persistent kernel.
@@ -286,8 +353,6 @@ class BlackwellDeltaAffineSummaryRev:
             tcgen05.OperandSource.SMEM,
         )
         mmas = Mmas(mma_dv, mma_qdo, mma_aqdo, mma_wdv)
-
-        self.tm_dv, self.tm_qdo, self.tm_wdv, self.tm_total = self._plan_tmem(mmas)
 
         s_k = sm100_utils.make_smem_layout_a(
             mma_dv,
@@ -359,7 +424,7 @@ class BlackwellDeltaAffineSummaryRev:
 
         tma_load = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         cluster_layout = cute.tiled_divide(
-            cute.make_layout(self.cluster),
+            cute.make_layout((1, 1, 1)),
             (mma_dv.thr_id.shape,),
         )
 
@@ -424,67 +489,12 @@ class BlackwellDeltaAffineSummaryRev:
             TmaOp(atom_gate, desc_gate),
         )
 
-        self.k_bytes = cute.size_in_bytes(self.io_type, s_k_one)
-        self.q_bytes = cute.size_in_bytes(self.io_type, s_q_one)
-        self.do_bytes = cute.size_in_bytes(self.io_type, s_do_one)
-        self.w_bytes = cute.size_in_bytes(self.io_type, s_w_one)
-        self.aqk_bytes = cute.size_in_bytes(self.io_type, s_aqk_one)
-        self.gate_bytes = cute.size_in_bytes(Float32, s_gate)
-
-        @cute.struct
-        class SharedStorage:
-            bar_k: cute.struct.MemRange[Int64, self.k_depth * 2]
-            bar_q: cute.struct.MemRange[Int64, self.q_depth * 2]
-            bar_do: cute.struct.MemRange[Int64, self.do_depth * 2]
-            bar_w: cute.struct.MemRange[Int64, self.w_depth * 2]
-            bar_aqk: cute.struct.MemRange[Int64, self.aqk_depth * 2]
-            bar_gate: cute.struct.MemRange[Int64, self.gate_depth * 2]
-            bar_gate_ready: cute.struct.MemRange[Int64, self.gate_depth * 2]
-            bar_state: cute.struct.MemRange[Int64, 2 * 2]
-            bar_dv: cute.struct.MemRange[Int64, self.dv_acc_depth * 2]
-            bar_qdo: cute.struct.MemRange[Int64, self.qdo_acc_depth * 2]
-            bar_dv_operand: cute.struct.MemRange[Int64, 2 * 2]
-            bar_wdv: cute.struct.MemRange[Int64, self.wdv_acc_depth * 2]
-            tmem_buf: Int32
-            sK: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_k)], self.smem_alignment
-            ]
-            sState: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_state)], self.smem_alignment
-            ]
-            sQ: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_q)], self.smem_alignment
-            ]
-            sDo: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_do)], self.smem_alignment
-            ]
-            sW: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_w)], self.smem_alignment
-            ]
-            sDv: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_dv)], self.smem_alignment
-            ]
-            sAqk: cute.struct.Align[
-                cute.struct.MemRange[self.io_type, cute.cosize(s_aqk)], self.smem_alignment
-            ]
-            sGate: cute.struct.Align[cute.struct.MemRange[Float32, self.BK * self.gate_depth], 128]
-            sGateExp: cute.struct.Align[
-                cute.struct.MemRange[Float32, self.BK * self.gate_depth], 128
-            ]
-
-        self.shared_type = SharedStorage
+        bound = self.work.bind(
+            (SUMMARY_DIM // self.BN, self.num_heads, Int32(out.shape[0])), workspace, max_ctas
+        )
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(
-            mmas,
-            tma_ops,
-            work_table,
-            out,
-            smem_layouts,
-            scale,
-        ).launch(
-            grid=self._launch_grid(cute.size(out.shape[0])),
-            block=(self.CTA_THREADS, 1, 1),
-            cluster=self.cluster,
+        self.kernel(mmas, tma_ops, work_table, out, smem_layouts, scale, bound).launch(
+            **self.launch_config(bound),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -496,16 +506,11 @@ class BlackwellDeltaAffineSummaryRev:
         The item scans its chunks from ``[0 | I]`` into output row ``w``; see ``decode_work_row``
         for the row layout. An all-zero row stores the identity.
         """
-        # ``column_tiles`` and ``num_heads`` are compile-time constants, so these divisions lower
-        # to shifts and multiply-high sequences; they also run once per work item, not per chunk.
-        column_tiles = SUMMARY_DIM // self.BN
-        column_tile = work_index % column_tiles
-        head = (work_index // column_tiles) % self.num_heads
-        work = work_index // (column_tiles * self.num_heads)
-        start, length, chunk_begin, chunk_end = decode_work_row(
-            work_table, work, self.whole_ranges
-        )
-        return column_tile, head, work, start, length, chunk_begin, chunk_end
+        # Raster decodes runtime extents, once per item in each role. Its m-fastest order
+        # is the previous flat layout: column tile, then head, then work-table row.
+        column_tile, head, row = work_index
+        start, length, chunk_begin, chunk_end = decode_work_row(work_table, row, self.whole_ranges)
+        return column_tile, head, row, start, length, chunk_begin, chunk_end
 
     @cute.jit
     def _tail_valid_rows(self, length):
@@ -515,32 +520,32 @@ class BlackwellDeltaAffineSummaryRev:
             rows = Int32(0)
         return rows
 
+    @role(warps=range(4), regs=160)
     @cute.jit
     def run_state(
         self,
-        block,
-        grid,
-        iterations,
-        work_table,
-        out,
-        t_dv_acc,
-        t_qdo_acc,
-        t_wdv_acc,
-        s_state_store,
-        s_dv_store,
-        state_producer,
-        dv_consumer,
-        dv_operand_producer,
-        gate_consumer,
-        qdo_consumer,
-        wdv_consumer,
-        gate_exp,
-        scale,
+        params: ReverseSummaryParams,
+        *,
+        state_pipe: Producer,
+        dv_pipe: Consumer,
+        dv_operand: Producer,
+        gate_ready: Consumer,
+        qdo_pipe: Consumer,
+        wdv_pipe: Consumer,
+        work: WorkCursor,
+        me: Local,
+        tmem: Tmem,
     ):
         """Keep one FP32 state tile in registers across the reverse chunk scan."""
-        cute.arch.setmaxregister_increase(self.state_regs)
-        tid, _, _ = cute.arch.thread_idx()
-        local_tid = tid % (self.WARP_SIZE * len(self.STATE_WARP_IDS))
+        out = params.out
+        s_state_store = params.s_state_store
+        s_dv_store = params.s_dv_store
+        gate_exp = params.gate_exp
+        scale = params.scale
+        t_dv_acc = cute.make_tensor(tmem.ptr("dv"), params.dv_layout)
+        t_qdo_acc = cute.make_tensor(tmem.ptr("qdo"), params.qdo_layout)
+        t_wdv_acc = cute.make_tensor(tmem.ptr("wdv"), params.wdv_layout)
+        local_tid = me.tmem_row
 
         t2r_dv_atom = cute.make_copy_atom(
             tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BN // 8), tcgen05.Pack.NONE),
@@ -598,11 +603,9 @@ class BlackwellDeltaAffineSummaryRev:
         r2s_dv = cute.make_tiled_copy_D(r2s_dv_atom, t2r_dv)
         r2s_dv_slice = r2s_dv.get_slice(local_tid)
 
-        tile_index = Int32(0)
-        has_work = tile_index < iterations
-        while has_work:
-            column_tile, head, work, _start, _length, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, work_table
+        while work.valid:
+            column_tile, head, row, _start, _length, chunk_begin, chunk_end = self._decode_work(
+                work.item, params.work_table
             )
             has_source = column_tile < VAL_DIM // self.BN
 
@@ -617,7 +620,8 @@ class BlackwellDeltaAffineSummaryRev:
             for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 # Publish the hi half as soon as it exists so MMA1 starts its first
                 # pass while the lo residual is still being formed and stored.
-                hi_handle = state_producer.acquire_and_advance()
+                hi_handle = state_pipe.acquire()
+                hi_handle.access("Store", write=True, by="threads")
                 state_hi = cute.make_rmem_tensor(state.shape, self.io_type)
                 state_hi.store(state.load().to(self.io_type))
                 cute.copy(
@@ -625,9 +629,9 @@ class BlackwellDeltaAffineSummaryRev:
                     r2s_state.retile(state_hi),
                     r2s_state_slice.partition_D(s_state_store[(None, None, hi_handle.index)]),
                 )
-                cute.arch.fence_view_async_shared()
                 hi_handle.commit()
-                lo_handle = state_producer.acquire_and_advance()
+                lo_handle = state_pipe.acquire()
+                lo_handle.access("Store", write=True, by="threads")
                 state_lo = cute.make_rmem_tensor(state.shape, self.io_type)
                 state_lo.store((state.load() - state_hi.load().to(Float32)).to(self.io_type))
                 cute.copy(
@@ -635,20 +639,19 @@ class BlackwellDeltaAffineSummaryRev:
                     r2s_state.retile(state_lo),
                     r2s_state_slice.partition_D(s_state_store[(None, None, lo_handle.index)]),
                 )
-                cute.arch.fence_view_async_shared()
                 lo_handle.commit()
 
-                dv_handle = dv_consumer.wait_and_advance()
+                dv_handle = dv_pipe.wait()
                 dv = cute.make_rmem_tensor(dv_coordinates.shape, self.acc_type)
                 cute.copy(
                     t2r_dv,
                     partitioned_dv[(None, None, None, dv_handle.index)],
                     dv,
                 )
-                cute.arch.fence_view_async_tmem_load()
                 dv_handle.release()
 
-                hi_handle = dv_operand_producer.acquire_and_advance()
+                hi_handle = dv_operand.acquire()
+                hi_handle.access("Store", write=True, by="threads")
                 dv_hi = cute.make_rmem_tensor(dv.shape, self.io_type)
                 dv_hi.store(dv.load().to(self.io_type))
                 cute.copy(
@@ -656,9 +659,9 @@ class BlackwellDeltaAffineSummaryRev:
                     r2s_dv.retile(dv_hi),
                     r2s_dv_slice.partition_D(s_dv_store[(None, None, hi_handle.index)]),
                 )
-                cute.arch.fence_view_async_shared()
                 hi_handle.commit()
-                lo_handle = dv_operand_producer.acquire_and_advance()
+                lo_handle = dv_operand.acquire()
+                lo_handle.access("Store", write=True, by="threads")
                 dv_lo = cute.make_rmem_tensor(dv.shape, self.io_type)
                 dv_lo.store((dv.load() - dv_hi.load().to(Float32)).to(self.io_type))
                 cute.copy(
@@ -666,10 +669,9 @@ class BlackwellDeltaAffineSummaryRev:
                     r2s_dv.retile(dv_lo),
                     r2s_dv_slice.partition_D(s_dv_store[(None, None, lo_handle.index)]),
                 )
-                cute.arch.fence_view_async_shared()
                 lo_handle.commit()
 
-                gate_handle = gate_consumer.wait_and_advance()
+                gate_handle = gate_ready.wait()
                 for element in cutlass.range(cute.size(state), unroll_full=True):
                     key, _column = state_coordinates[element]
                     state[element] = state[element] * gate_exp[(key, gate_handle.index)]
@@ -677,23 +679,21 @@ class BlackwellDeltaAffineSummaryRev:
 
                 qdo = cute.make_rmem_tensor(state_coordinates.shape, self.acc_type)
                 if has_source:
-                    qdo_handle = qdo_consumer.wait_and_advance()
+                    qdo_handle = qdo_pipe.wait()
                     cute.copy(
                         t2r_qdo,
                         partitioned_qdo[(None, None, None, qdo_handle.index)],
                         qdo,
                     )
-                    cute.arch.fence_view_async_tmem_load()
                     qdo_handle.release()
 
-                wdv_handle = wdv_consumer.wait_and_advance()
+                wdv_handle = wdv_pipe.wait()
                 wdv = cute.make_rmem_tensor(wdv_coordinates.shape, self.acc_type)
                 cute.copy(
                     t2r_wdv,
                     partitioned_wdv[(None, None, None, wdv_handle.index)],
                     wdv,
                 )
-                cute.arch.fence_view_async_tmem_load()
                 wdv_handle.release()
 
                 if has_source:
@@ -705,38 +705,41 @@ class BlackwellDeltaAffineSummaryRev:
 
             for element in cutlass.range(cute.size(state), unroll_full=True):
                 key, column = state_coordinates[element]
-                out[work, head, column_tile * self.BN + column, key] = state[element]
+                out[row, head, column_tile * self.BN + column, key] = state[element]
 
-            tile_index = tile_index + 1
-            has_work = tile_index < iterations
+            work.advance()
 
+        return state_pipe, dv_pipe, dv_operand, gate_ready, qdo_pipe, wdv_pipe, work
+
+    @role(warps=4, regs=40)
     @cute.jit
     def run_load(
         self,
-        block,
-        grid,
-        iterations,
-        work_table,
-        mma_dv,
-        mma_qdo,
-        mma_aqdo,
-        mma_wdv,
-        tma,
-        s_k,
-        s_q,
-        s_do,
-        s_w,
-        s_aqk,
-        s_gate,
-        k_producer,
-        q_producer,
-        do_producer,
-        w_producer,
-        aqk_producer,
-        gate_producer,
+        params: ReverseSummaryParams,
+        *,
+        k: Producer,
+        q: Producer,
+        do: Producer,
+        w: Producer,
+        aqk: Producer,
+        gate: Producer,
+        work: WorkCursor,
     ):
         """Issue reverse-order TMA loads for all active operand streams."""
-        cute.arch.setmaxregister_decrease(self.aux_regs)
+        s_k = params.s_k
+        s_q = params.s_q
+        s_do = params.s_do
+        s_w = params.s_w
+        s_aqk = params.s_aqk
+        mma_dv, mma_qdo, mma_aqdo, mma_wdv = params.mmas
+        tma = params.tma
+        s_gate = params.gate_3d
+        cpasync.prefetch_descriptor(tma.k.atom)
+        cpasync.prefetch_descriptor(tma.q.atom)
+        cpasync.prefetch_descriptor(tma.do.atom)
+        cpasync.prefetch_descriptor(tma.w.atom)
+        cpasync.prefetch_descriptor(tma.aqk.atom)
+        cpasync.prefetch_descriptor(tma.gate.atom)
         atom_k, desc_k = tma.k
         atom_q, desc_q = tma.q
         atom_do, desc_do = tma.do
@@ -744,11 +747,9 @@ class BlackwellDeltaAffineSummaryRev:
         atom_aqk, desc_aqk = tma.aqk
         atom_gate, desc_gate = tma.gate
 
-        tile_index = Int32(0)
-        has_work = tile_index < iterations
-        while has_work:
+        while work.valid:
             column_tile, head, _work, start, length, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, work_table
+                work.item, params.work_table
             )
             has_source = column_tile < VAL_DIM // self.BN
 
@@ -803,7 +804,7 @@ class BlackwellDeltaAffineSummaryRev:
             for chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 reverse_chunk = chunk_end - 1 - (chunk - chunk_begin)
 
-                gate_handle = gate_producer.acquire_and_advance()
+                gate_handle = gate.acquire()
                 cute.copy(
                     atom=atom_gate,
                     src=gate_gmem[
@@ -812,138 +813,142 @@ class BlackwellDeltaAffineSummaryRev:
                     dst=gate_smem[None, gate_handle.index],
                     tma_bar_ptr=gate_handle.barrier,
                 )
+                gate_handle.commit()
 
-                k_handle = k_producer.acquire_and_advance()
+                k_handle = k.acquire()
                 cute.copy(
                     atom=atom_k,
                     src=k_gmem[None, reverse_chunk, 0],
                     dst=k_smem[None, k_handle.index],
                     tma_bar_ptr=k_handle.barrier,
                 )
-                w_handle = w_producer.acquire_and_advance()
+                k_handle.commit()
+                w_handle = w.acquire()
                 cute.copy(
                     atom=atom_w,
                     src=w_gmem[None, 0, reverse_chunk],
                     dst=w_smem[None, w_handle.index],
                     tma_bar_ptr=w_handle.barrier,
                 )
+                w_handle.commit()
 
                 if has_source:
-                    q_handle = q_producer.acquire_and_advance()
+                    q_handle = q.acquire()
                     cute.copy(
                         atom=atom_q,
                         src=q_gmem[None, 0, reverse_chunk],
                         dst=q_smem[None, q_handle.index],
                         tma_bar_ptr=q_handle.barrier,
                     )
-                    do_handle = do_producer.acquire_and_advance()
+                    q_handle.commit()
+                    do_handle = do.acquire()
                     cute.copy(
                         atom=atom_do,
                         src=do_gmem[None, column_tile, reverse_chunk],
                         dst=do_smem[None, do_handle.index],
                         tma_bar_ptr=do_handle.barrier,
                     )
-                    aqk_handle = aqk_producer.acquire_and_advance()
+                    do_handle.commit()
+                    aqk_handle = aqk.acquire()
                     cute.copy(
                         atom=atom_aqk,
                         src=aqk_gmem[None, 0, reverse_chunk],
                         dst=aqk_smem[None, aqk_handle.index],
                         tma_bar_ptr=aqk_handle.barrier,
                     )
+                    aqk_handle.commit()
 
-            tile_index = tile_index + 1
-            has_work = tile_index < iterations
+            work.advance()
 
+        return k, q, do, w, aqk, gate, work
+
+    @role(warps=5, regs=40)
     @cute.jit
     def run_gate(
         self,
-        block,
-        grid,
-        iterations,
-        work_table,
-        gate,
-        gate_exp,
-        gate_consumer,
-        gate_ready_producer,
+        params: ReverseSummaryParams,
+        *,
+        gate: Consumer,
+        gate_ready: Producer,
+        work: WorkCursor,
+        me: Local,
     ):
         """Transform cumulative log2 gate stages into multiplicative decays."""
-        cute.arch.setmaxregister_decrease(self.aux_regs)
-        tid, _, _ = cute.arch.thread_idx()
-        gate_tid = tid - WarpRole.GATE * self.WARP_SIZE
+        gate_exp = params.gate_exp
+        gate_tid = me.tid
 
-        tile_index = Int32(0)
-        has_work = tile_index < iterations
-        while has_work:
-            _, _, _, _, _, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, work_table
-            )
+        gate_data = params.gate
+        while work.valid:
+            _, _, _, _, _, chunk_begin, chunk_end = self._decode_work(work.item, params.work_table)
             for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
-                gate_handle = gate_consumer.wait_and_advance()
-                ready_handle = gate_ready_producer.acquire_and_advance()
+                gate_handle = gate.wait()
+                ready_handle = gate_ready.acquire()
                 for index in cutlass.range(4, unroll_full=True):
                     key = gate_tid * 4 + index
                     gate_exp[(key, ready_handle.index)] = cute.math.exp2(
-                        gate[(key, gate_handle.index)], fastmath=self.fastmath
+                        gate_data[(key, gate_handle.index)], fastmath=self.fastmath
                     )
                 gate_handle.release()
-                cute.arch.fence_view_async_shared()
                 ready_handle.commit()
 
-            tile_index = tile_index + 1
-            has_work = tile_index < iterations
+            work.advance()
 
+        return gate, gate_ready, work
+
+    @role(warps=6, regs=40)
     @cute.jit
     def run_mma(
         self,
-        block,
-        grid,
-        iterations,
-        work_table,
-        mmas,
-        t_dv_acc,
-        t_k,
-        t_state,
-        t_qdo_acc,
-        t_q,
-        t_do,
-        t_aqk,
-        t_do_aq,
-        t_wdv_acc,
-        t_w,
-        t_dv,
-        s_k,
-        s_q,
-        s_do,
-        s_aqk,
-        s_w,
-        state_consumer,
-        k_consumer,
-        dv_producer,
-        q_consumer,
-        do_consumer,
-        qdo_producer,
-        aqk_consumer,
-        dv_operand_consumer,
-        w_consumer,
-        wdv_producer,
+        params: ReverseSummaryParams,
+        *,
+        state_pipe: Consumer,
+        k: Consumer,
+        dv_pipe: Producer,
+        q: Consumer,
+        do: Consumer,
+        qdo_pipe: Producer,
+        aqk: Consumer,
+        dv_operand: Consumer,
+        w: Consumer,
+        wdv_pipe: Producer,
+        work: WorkCursor,
+        me: Local,
+        tmem: Tmem,
     ):
         """Issue the four UMMA operations for each reverse chunk.
+
+        The MMA warp alone patches each TMA stage after its full wait. ``zero_tail_tokens``
+        fences every writer and synchronizes the warp before the elected UMMA issuer reads it;
+        the handle's UMMA release completes those reads before the next TMA fill.
 
         MMA1 (``kg @ X``) and MMA4 (``w^T @ dv``) each run two accumulate passes over the
         hi/lo halves of their fp32-valued B operand. On a partial last chunk, ``kg``, ``qg^T``,
         ``dO``, ``Aqk^T``, and ``w^T`` are zeroed past the range boundary before UMMA reads them.
         Multiplying by a zero mask would retain NaN/Inf from uninitialized capacity slack.
         """
-        cute.arch.setmaxregister_decrease(self.aux_regs)
-        tid, _, _ = cute.arch.thread_idx()
-        mma_tid = tid - WarpRole.MMA * self.WARP_SIZE
+        mmas = params.mmas
+        s_k = params.s_k
+        s_q = params.s_q
+        s_do = params.s_do
+        s_aqk = params.s_aqk
+        s_w = params.s_w
+        t_dv_acc = cute.make_tensor(tmem.ptr("dv"), params.dv_layout)
+        t_qdo_acc = cute.make_tensor(tmem.ptr("qdo"), params.qdo_layout)
+        t_wdv_acc = cute.make_tensor(tmem.ptr("wdv"), params.wdv_layout)
         mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
+        t_k = mma_dv.make_fragment_A(params.s_k)
+        t_state = mma_dv.make_fragment_B(params.s_state)
+        t_q = mma_qdo.make_fragment_A(params.s_q)
+        t_do = mma_qdo.make_fragment_B(params.s_do)
+        t_aqk = mma_aqdo.make_fragment_A(params.s_aqk)
+        t_do_aq = mma_aqdo.make_fragment_B(params.s_do)
+        t_w = mma_wdv.make_fragment_A(params.s_w)
+        t_dv = mma_wdv.make_fragment_B(params.s_dv)
+        mma_tid = me.tid
 
-        tile_index = Int32(0)
-        has_work = tile_index < iterations
-        while has_work:
+        while work.valid:
             column_tile, _head, _work, _start, length, chunk_begin, chunk_end = self._decode_work(
-                block + tile_index * grid, work_table
+                work.item, params.work_table
             )
             has_source = column_tile < VAL_DIM // self.BN
             # The range's last chunk is the first one this range visits when it owns it.
@@ -956,11 +961,11 @@ class BlackwellDeltaAffineSummaryRev:
                 # The source products do not depend on the state, so they run while
                 # the state warps are still producing the X snapshot: Aqk^T dO seeds
                 # the dv accumulator and qg^T dO completes off the recurrence chain.
-                dv_handle = dv_producer.acquire_and_advance()
+                dv_handle = dv_pipe.acquire()
                 if has_source:
-                    q_handle = q_consumer.wait_and_advance()
-                    do_handle = do_consumer.wait_and_advance()
-                    aqk_handle = aqk_consumer.wait_and_advance()
+                    q_handle = q.wait()
+                    do_handle = do.wait()
+                    aqk_handle = aqk.wait()
                     if is_tail:
                         zero_tail_tokens(
                             s_do, do_handle.index, tail_valid_rows, mma_tid, self.io_type, 1
@@ -982,7 +987,7 @@ class BlackwellDeltaAffineSummaryRev:
                         )
                     aqk_handle.release()
 
-                    qdo_handle = qdo_producer.acquire_and_advance()
+                    qdo_handle = qdo_pipe.acquire()
                     for k_block in cutlass.range(cute.size(t_q, mode=[2]), unroll_full=True):
                         mma_qdo.set(tcgen05.Field.ACCUMULATE, cutlass.Boolean(k_block != 0))
                         cute.gemm(
@@ -996,14 +1001,15 @@ class BlackwellDeltaAffineSummaryRev:
                     q_handle.release()
                     do_handle.release()
 
-                k_handle = k_consumer.wait_and_advance()
+                k_handle = k.wait()
                 if is_tail:
                     zero_tail_tokens(
                         s_k, k_handle.index, tail_valid_rows, mma_tid, self.io_type, 0
                     )
                 for split in cutlass.range_constexpr(2):
                     # Each hi/lo half is one pipeline stage, published separately.
-                    state_handle = state_consumer.wait_and_advance()
+                    state_handle = state_pipe.wait()
+                    state_handle.access("State", read=True, by="umma")
                     for k_block in cutlass.range(cute.size(t_k, mode=[2]), unroll_full=True):
                         # The first pass overwrites unless Aqk^T dO already seeded dv.
                         mma_dv.set(
@@ -1021,14 +1027,15 @@ class BlackwellDeltaAffineSummaryRev:
                 k_handle.release()
                 dv_handle.commit()
 
-                w_handle = w_consumer.wait_and_advance()
+                w_handle = w.wait()
                 if is_tail:
                     zero_tail_tokens(
                         s_w, w_handle.index, tail_valid_rows, mma_tid, self.io_type, 1
                     )
-                wdv_handle = wdv_producer.acquire_and_advance()
+                wdv_handle = wdv_pipe.acquire()
                 for split in cutlass.range_constexpr(2):
-                    dv_operand_handle = dv_operand_consumer.wait_and_advance()
+                    dv_operand_handle = dv_operand.wait()
+                    dv_operand_handle.access("Dv", read=True, by="umma")
                     for k_block in cutlass.range(cute.size(t_w, mode=[2]), unroll_full=True):
                         mma_wdv.set(
                             tcgen05.Field.ACCUMULATE,
@@ -1045,8 +1052,9 @@ class BlackwellDeltaAffineSummaryRev:
                 wdv_handle.commit()
                 w_handle.release()
 
-            tile_index = tile_index + 1
-            has_work = tile_index < iterations
+            work.advance()
+
+        return state_pipe, k, dv_pipe, q, do, qdo_pipe, aqk, dv_operand, w, wdv_pipe, work
 
     @cute.kernel
     def kernel(
@@ -1057,293 +1065,62 @@ class BlackwellDeltaAffineSummaryRev:
         out: cute.Tensor,
         smem_layouts: SmemLayouts,
         scale: Float32,
+        bound,
     ):
-        """Dispatch the persistent state, TMA, gate, and MMA warp roles."""
-        mma_dv, mma_qdo, mma_aqdo, mma_wdv = mmas
-        (
-            s_k_layout,
-            s_state_layout,
-            s_state_store_layout,
-            s_q_layout,
-            s_do_layout,
-            s_w_layout,
-            s_dv_layout,
-            s_dv_store_layout,
-            s_aqk_layout,
-        ) = smem_layouts
-        warp_id = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-
-        if warp_id == WarpRole.LOAD:
-            cpasync.prefetch_descriptor(tma.k.atom)
-            cpasync.prefetch_descriptor(tma.q.atom)
-            cpasync.prefetch_descriptor(tma.do.atom)
-            cpasync.prefetch_descriptor(tma.w.atom)
-            cpasync.prefetch_descriptor(tma.aqk.atom)
-            cpasync.prefetch_descriptor(tma.gate.atom)
-
-        allocator = SmemAllocator()
-        storage = allocator.allocate(self.shared_type)
-
-        gate_3d = storage.sGate.get_tensor(
-            cute.make_layout(
-                (self.BK, 1, self.gate_depth),
-                stride=(1, self.BK, self.BK),
-            )
+        (s_k, s_state, s_state_store, s_q, s_do, s_w, s_dv, s_dv_store, s_aqk) = smem_layouts
+        gate_layout = cute.make_layout((self.BK, 1, self.gate_depth), stride=(1, self.BK, self.BK))
+        self.begin_roles(
+            work=bound,
+            layouts={
+                "K": s_k,
+                "State": s_state,
+                "StateStore": s_state_store,
+                "Q": s_q,
+                "Do": s_do,
+                "W": s_w,
+                "DvOperand": s_dv,
+                "DvStore": s_dv_store,
+                "Aqk": s_aqk,
+                "Gate": gate_layout,
+                "GateExp": cute.make_layout((self.BK, self.gate_depth)),
+            },
         )
-        gate = gate_3d[(None, 0, None)]
-        gate_exp = storage.sGateExp.get_tensor(cute.make_layout((self.BK, self.gate_depth)))
-
-        k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.k_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.k_bytes,
-            barrier_storage=storage.bar_k.data_ptr(),
-        ).make_participants()
-        # X snapshot → MMA1 (AsyncUmma, one stage per hi/lo half)
-        state_producer, state_consumer = pipeline.PipelineAsyncUmma.create(
-            num_stages=2,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.WARP_SIZE * len(self.STATE_WARP_IDS),
-            ),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            barrier_storage=storage.bar_state.data_ptr(),
-        ).make_participants()
-        dv_producer, dv_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.dv_acc_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.WARP_SIZE * len(self.STATE_WARP_IDS),
-            ),
-            barrier_storage=storage.bar_dv.data_ptr(),
-        ).make_participants()
-        q_producer, q_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.q_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.q_bytes,
-            barrier_storage=storage.bar_q.data_ptr(),
-        ).make_participants()
-        do_producer, do_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.do_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.do_bytes,
-            barrier_storage=storage.bar_do.data_ptr(),
-        ).make_participants()
-        qdo_producer, qdo_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.qdo_acc_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.WARP_SIZE * len(self.STATE_WARP_IDS),
-            ),
-            barrier_storage=storage.bar_qdo.data_ptr(),
-        ).make_participants()
-        w_producer, w_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.w_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.w_bytes,
-            barrier_storage=storage.bar_w.data_ptr(),
-        ).make_participants()
-        # dv snapshot → MMA4 (AsyncUmma, one stage per hi/lo half)
-        dv_operand_producer, dv_operand_consumer = pipeline.PipelineAsyncUmma.create(
-            num_stages=2,
-            producer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.WARP_SIZE * len(self.STATE_WARP_IDS),
-            ),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            barrier_storage=storage.bar_dv_operand.data_ptr(),
-        ).make_participants()
-        wdv_producer, wdv_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.wdv_acc_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.WARP_SIZE * len(self.STATE_WARP_IDS),
-            ),
-            barrier_storage=storage.bar_wdv.data_ptr(),
-        ).make_participants()
-        aqk_producer, aqk_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.aqk_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.aqk_bytes,
-            barrier_storage=storage.bar_aqk.data_ptr(),
-        ).make_participants()
-        gate_producer, gate_consumer = pipeline.PipelineTmaAsync.create(
-            num_stages=self.gate_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, 1),
-            tx_count=self.gate_bytes,
-            barrier_storage=storage.bar_gate.data_ptr(),
-        ).make_participants()
-        gate_ready_producer, gate_ready_consumer = pipeline.PipelineAsync.create(
-            num_stages=self.gate_depth,
-            producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.WARP_SIZE),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread,
-                self.WARP_SIZE * len(self.STATE_WARP_IDS),
-            ),
-            barrier_storage=storage.bar_gate_ready.data_ptr(),
-        ).make_participants()
-
-        tmem_barrier = pipeline.NamedBarrier(barrier_id=1, num_threads=self.CTA_THREADS)
-        tmem = TmemAllocator(
-            storage.tmem_buf,
-            barrier_for_retrieve=tmem_barrier,
-            allocator_warp_id=WarpRole.LOAD,
+        mma_dv, mma_qdo, _mma_aqdo, mma_wdv = mmas
+        dv_fragment = mma_dv.make_fragment_C(
+            cute.append(mma_dv.partition_shape_C(self.dv_tile[:2]), self.dv_acc_depth)
         )
-        tmem.allocate(self.tm_total)
-        # Relinquish the permit immediately: it only promises this CTA allocates no more TMEM,
-        # while the columns just allocated stay owned until ``tmem.free``. Holding it to exit
-        # blocks a co-resident CTA's allocation and serializes chains that would overlap.
-        tmem.relinquish_alloc_permit()
-        tmem.wait_for_alloc()
-        tmem_pointer = tmem.retrieve_ptr(self.acc_type)
-
-        s_k = storage.sK.get_tensor(s_k_layout.outer, swizzle=s_k_layout.inner)
-        s_state = storage.sState.get_tensor(
-            s_state_layout.outer,
-            swizzle=s_state_layout.inner,
+        assert tcgen05.find_tmem_tensor_col_offset(dv_fragment) <= self.BN * self.dv_acc_depth
+        qdo_fragment = mma_qdo.make_fragment_C(
+            cute.append(mma_qdo.partition_shape_C(self.qdo_tile[:2]), self.qdo_acc_depth)
         )
-        s_state_store = storage.sState.get_tensor(
-            s_state_store_layout.outer,
-            swizzle=s_state_store_layout.inner,
+        assert tcgen05.find_tmem_tensor_col_offset(qdo_fragment) <= self.BN * self.qdo_acc_depth
+        wdv_fragment = mma_wdv.make_fragment_C(
+            cute.append(mma_wdv.partition_shape_C(self.wdv_tile[:2]), self.wdv_acc_depth)
         )
-        s_q = storage.sQ.get_tensor(s_q_layout.outer, swizzle=s_q_layout.inner)
-        s_do = storage.sDo.get_tensor(s_do_layout.outer, swizzle=s_do_layout.inner)
-        s_w = storage.sW.get_tensor(s_w_layout.outer, swizzle=s_w_layout.inner)
-        s_dv = storage.sDv.get_tensor(s_dv_layout.outer, swizzle=s_dv_layout.inner)
-        s_dv_store = storage.sDv.get_tensor(
-            s_dv_store_layout.outer,
-            swizzle=s_dv_store_layout.inner,
+        assert tcgen05.find_tmem_tensor_col_offset(wdv_fragment) <= self.BN * self.wdv_acc_depth
+        params = ReverseSummaryParams(
+            work_table=work_table,
+            out=out,
+            mmas=mmas,
+            tma=tma,
+            scale=scale,
+            dv_layout=dv_fragment.layout,
+            qdo_layout=qdo_fragment.layout,
+            wdv_layout=wdv_fragment.layout,
+            s_k=self.buffer("K"),
+            s_state=self.buffer("State"),
+            s_state_store=self.buffer("StateStore"),
+            s_q=self.buffer("Q"),
+            s_do=self.buffer("Do"),
+            s_w=self.buffer("W"),
+            s_dv=self.buffer("DvOperand"),
+            s_dv_store=self.buffer("DvStore"),
+            s_aqk=self.buffer("Aqk"),
+            gate_3d=self.buffer("Gate"),
+            gate=self.buffer("Gate")[(None, 0, None)],
+            gate_exp=self.buffer("GateExp"),
         )
-        s_aqk = storage.sAqk.get_tensor(s_aqk_layout.outer, swizzle=s_aqk_layout.inner)
-
-        t_k = mma_dv.make_fragment_A(s_k)
-        t_state = mma_dv.make_fragment_B(s_state)
-        dv_shape = mma_dv.partition_shape_C(self.dv_tile[:2])
-        dv_fragment = mma_dv.make_fragment_C(cute.append(dv_shape, self.dv_acc_depth))
-        t_dv_acc = cute.make_tensor(tmem_pointer + self.tm_dv, dv_fragment.layout)
-
-        t_q = mma_qdo.make_fragment_A(s_q)
-        t_do = mma_qdo.make_fragment_B(s_do)
-        qdo_shape = mma_qdo.partition_shape_C(self.qdo_tile[:2])
-        qdo_fragment = mma_qdo.make_fragment_C(cute.append(qdo_shape, self.qdo_acc_depth))
-        t_qdo_acc = cute.make_tensor(tmem_pointer + self.tm_qdo, qdo_fragment.layout)
-
-        t_aqk = mma_aqdo.make_fragment_A(s_aqk)
-        t_do_aq = mma_aqdo.make_fragment_B(s_do)
-
-        t_w = mma_wdv.make_fragment_A(s_w)
-        t_dv = mma_wdv.make_fragment_B(s_dv)
-        wdv_shape = mma_wdv.partition_shape_C(self.wdv_tile[:2])
-        wdv_fragment = mma_wdv.make_fragment_C(cute.append(wdv_shape, self.wdv_acc_depth))
-        t_wdv_acc = cute.make_tensor(tmem_pointer + self.tm_wdv, wdv_fragment.layout)
-
-        block = cute.arch.block_idx()[0]
-        grid = cute.arch.grid_dim()[0]
-        work_items = self.num_heads * (SUMMARY_DIM // self.BN) * cute.size(out.shape[0])
-        iterations = (work_items - block + grid - 1) // grid
-
-        if warp_id in self.STATE_WARP_IDS:
-            self.run_state(
-                block,
-                grid,
-                iterations,
-                work_table,
-                out,
-                t_dv_acc,
-                t_qdo_acc,
-                t_wdv_acc,
-                s_state_store,
-                s_dv_store,
-                state_producer,
-                dv_consumer,
-                dv_operand_producer,
-                gate_ready_consumer,
-                qdo_consumer,
-                wdv_consumer,
-                gate_exp,
-                scale,
-            )
-        elif warp_id == WarpRole.LOAD:
-            self.run_load(
-                block,
-                grid,
-                iterations,
-                work_table,
-                mma_dv,
-                mma_qdo,
-                mma_aqdo,
-                mma_wdv,
-                tma,
-                s_k,
-                s_q,
-                s_do,
-                s_w,
-                s_aqk,
-                gate_3d,
-                k_producer,
-                q_producer,
-                do_producer,
-                w_producer,
-                aqk_producer,
-                gate_producer,
-            )
-        elif warp_id == WarpRole.GATE:
-            self.run_gate(
-                block,
-                grid,
-                iterations,
-                work_table,
-                gate,
-                gate_exp,
-                gate_consumer,
-                gate_ready_producer,
-            )
-        elif warp_id == WarpRole.MMA:
-            self.run_mma(
-                block,
-                grid,
-                iterations,
-                work_table,
-                mmas,
-                t_dv_acc,
-                t_k,
-                t_state,
-                t_qdo_acc,
-                t_q,
-                t_do,
-                t_aqk,
-                t_do_aq,
-                t_wdv_acc,
-                t_w,
-                t_dv,
-                s_k,
-                s_q,
-                s_do,
-                s_aqk,
-                s_w,
-                state_consumer,
-                k_consumer,
-                dv_producer,
-                q_consumer,
-                do_consumer,
-                qdo_producer,
-                aqk_consumer,
-                dv_operand_consumer,
-                w_consumer,
-                wdv_producer,
-            )
-
-        self.tmem_free_barrier.arrive_and_wait()
-        tmem.free(tmem_pointer)
+        self.run_roles(params)
 
     @cute.jit
     def _partition_a(self, atom, desc, smem, tile, mma, head):
@@ -1381,39 +1158,6 @@ class BlackwellDeltaAffineSummaryRev:
             cute.group_modes(smem, 0, 2),
             cute.group_modes(cute.flat_divide(gmem, tile), 0, 2),
         )
-
-    def _plan_tmem(self, mmas: Mmas):
-        """Assign disjoint TMEM column regions to the three accumulators."""
-        mma_dv, mma_qdo, _mma_aqdo, mma_wdv = mmas
-        dv_shape = mma_dv.partition_shape_C(self.dv_tile[:2])
-        dv_columns = tcgen05.find_tmem_tensor_col_offset(
-            mma_dv.make_fragment_C(cute.append(dv_shape, self.dv_acc_depth))
-        )
-        qdo_shape = mma_qdo.partition_shape_C(self.qdo_tile[:2])
-        qdo_columns = tcgen05.find_tmem_tensor_col_offset(
-            mma_qdo.make_fragment_C(cute.append(qdo_shape, self.qdo_acc_depth))
-        )
-        wdv_shape = mma_wdv.partition_shape_C(self.wdv_tile[:2])
-        wdv_columns = tcgen05.find_tmem_tensor_col_offset(
-            mma_wdv.make_fragment_C(cute.append(wdv_shape, self.wdv_acc_depth))
-        )
-        dv_offset = 0
-        qdo_offset = dv_columns
-        wdv_offset = qdo_offset + qdo_columns
-        required = wdv_offset + wdv_columns
-        total = 1
-        while total < required:
-            total *= 2
-        assert total <= 512, f"TMEM overflow: {total}>512"
-        return dv_offset, qdo_offset, wdv_offset, total
-
-    def _launch_grid(self, rows):
-        """Bound the persistent launch to the work-item count and SM count."""
-        sm_count = get_compile_target().sm_count
-        if sm_count is None:
-            raise RuntimeError("affine_summary_rev compilation requires an SM count")
-        work_items = self.num_heads * (SUMMARY_DIM // self.BN) * rows
-        return (cutlass.min(Int32(sm_count), work_items), 1, 1)
 
 
 @jit_cache
@@ -1460,6 +1204,8 @@ def _compile_affine_summary_rev(
         work,
         out,
         Float32(1.0),
+        make_fake_compact_tensor(Int32, (cute.sym_int(),)),
+        Int32(1),
     )
 
 
@@ -1610,6 +1356,7 @@ def build_state_grad_summaries(
             whole_ranges=range_ids is None,
             fastmath=fastmath,
         )
+        workspace, max_ctas = _LAUNCH_WORK.launch_args(qg.device)
         compiled(
             qg.detach(),
             kg.detach(),
@@ -1620,6 +1367,8 @@ def build_state_grad_summaries(
             work,
             partials,
             Float32(scale),
+            workspace,
+            max_ctas,
         )
     # The cotangent flows through the later item first.
     return compose_work_items(partials, range_ids, ranges, reverse=True)
