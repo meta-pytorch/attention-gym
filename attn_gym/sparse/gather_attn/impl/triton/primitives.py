@@ -419,7 +419,7 @@ def dense_tile_shape(
 
 @triton.jit
 def in_dense_tile(tile_spans_ptr, batch, query_position, S, DENSE_TILE_QUERIES: tl.constexpr):
-    """Whether ``plan_dense_tiles`` gave this query's tile to the dense kernel; always False
+    """Whether ``plan_dense_tiles`` gave this query's tile to the dense kernels; always False
     without dense tiles (DENSE_TILE_QUERIES == 0)."""
     dense = False
     if DENSE_TILE_QUERIES:
@@ -455,18 +455,19 @@ def head_block_heads(head_block, H: tl.constexpr, KV_HEADS: tl.constexpr, BLOCK_
 def dense_tile_rows(
     tile,
     kv_head,
+    first_row,
     S,
     GROUP: tl.constexpr,
     TILE_QUERIES: tl.constexpr,
     BLOCK_M: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
-    """``(positions, heads, row_mask)`` of a dense tile's BLOCK_M rows.
+    """``(positions, heads, row_mask)`` of a dense tile's rows ``first_row + [0, BLOCK_M)``.
 
     A dense tile's rows are the (query, head) pairs of its TILE_QUERIES consecutive queries
     and the GROUP query heads reading ``kv_head``, query-major.
     """
-    rows = tl.arange(0, BLOCK_M)
+    rows = first_row + tl.arange(0, BLOCK_M)
     positions = tile * TILE_QUERIES + rows // GROUP
     if USE_INT64_OFFSETS:
         positions = positions.to(tl.int64)
@@ -507,6 +508,7 @@ def _plan_dense_tiles(
     counts_ptr,
     spans_ptr,
     tile_spans_ptr,
+    bounds_ptr,
     cu_seqlens_ptr,
     num_documents,
     S,
@@ -520,7 +522,9 @@ def _plan_dense_tiles(
 
     A dense tile has every query in one document, bitmap-exact selections, and a span of at
     most SPAN_RATIO keys per selection, short enough that walking every key in it beats
-    gathering them.
+    gathering them. With ``bounds_ptr``, each document (batch row without
+    documents) also collects its first and last dense tile and the largest dense span end,
+    which bound the dense dK/dV kernel's work.
     """
     tile = tl.program_id(0)
     batch = tl.program_id(1).to(tl.int64)
@@ -539,11 +543,16 @@ def _plan_dense_tiles(
     dense = (
         exact & (selected > 0) & ((span_hi - span_lo + 1) * num_queries <= SPAN_RATIO * selected)
     )
+    document = batch
     if HAS_CU_SEQLENS:
         first = tile * TILE_QUERIES
         last = tl.minimum(first + TILE_QUERIES, S) - 1
         document = _document_ids(cu_seqlens_ptr, first, num_documents, False)
         dense &= document == _document_ids(cu_seqlens_ptr, last, num_documents, False)
+    if bounds_ptr is not None:
+        tl.atomic_min(bounds_ptr + document * 3, tile, mask=dense, sem="relaxed")
+        tl.atomic_max(bounds_ptr + document * 3 + 1, tile, mask=dense, sem="relaxed")
+        tl.atomic_max(bounds_ptr + document * 3 + 2, span_hi, mask=dense, sem="relaxed")
     tile_row = batch * NUM_TILES + tile
     tl.store(tile_spans_ptr + tile_row * 2, span_lo)
     tl.store(tile_spans_ptr + tile_row * 2 + 1, tl.where(dense, span_hi, -1))
@@ -554,19 +563,31 @@ def plan_dense_tiles(
     spans: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     tile_queries: int,
-) -> torch.Tensor:
-    """Return ``tile_spans`` [B, num_tiles, 2] for ``tile_queries``-query tiles.
+    *,
+    document_bounds: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Return ``(tile_spans, bounds)`` for ``tile_queries``-query tiles.
 
-    ``tile_spans`` holds int32 document-local ``[lo, hi]`` spans; ``hi`` is -1 for tiles left
-    to the gather kernels.
+    ``tile_spans`` [B, num_tiles, 2] int32 holds document-local ``[lo, hi]`` spans; ``hi`` is
+    -1 for tiles left to the gather kernels. With ``document_bounds``, ``bounds``
+    [documents (B without documents), 3] int32 holds each document's first and last dense
+    tile and largest dense span end (a document without dense tiles has ``last < first`` and
+    end -1) for the dense dK/dV kernel; otherwise it is None.
     """
     batch, seq_len = counts.shape
     num_tiles = triton.cdiv(seq_len, tile_queries)
     tile_spans = torch.empty((batch, num_tiles, 2), device=counts.device, dtype=torch.int32)
+    bounds = None
+    if document_bounds:
+        num_bounds = cu_seqlens.numel() - 1 if cu_seqlens is not None else batch
+        # Fill on the device: a host tensor would copy synchronously and stall the queue.
+        bounds = torch.full((num_bounds, 3), -1, device=counts.device, dtype=torch.int32)
+        bounds[:, 0] = num_tiles
     _plan_dense_tiles[(num_tiles, batch)](
         counts,
         spans,
         tile_spans,
+        bounds,
         cu_seqlens,
         cu_seqlens.numel() - 1 if cu_seqlens is not None else 0,
         seq_len,
@@ -577,4 +598,4 @@ def plan_dense_tiles(
         SPAN_RATIO=DENSE_SPAN_RATIO,
         num_warps=1,
     )
-    return tile_spans
+    return tile_spans, bounds

@@ -32,7 +32,7 @@ def _tile_map_keys(
     """Encode one query's selections as (key tile, query, key within tile) at its offset.
 
     ``offsets`` packs each batch row's selections query by query; queries with a zero count
-    write nothing, and the caller fills the unused tail with the sentinel.
+    (dense tiles) write nothing, and the caller fills the unused tail with the sentinel.
     """
     row = tl.program_id(0).to(tl.int64)
     batch = row // S
@@ -270,13 +270,18 @@ def _gather_attn_bwd_dsparse_kv_grouped(
     TILE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    grad_dense_kv_ptr=None,
+    grad_dense_v_ptr=None,
+    GRAD_DENSE_STRIDES=None,
+    ADD_DENSE: tl.constexpr = False,
 ):
     """Accumulate one key tile's dK and dV over the (query, head) rows that selected it.
 
     Rows enumerate (pair, query head of this KV head's group); their query and output-gradient
     rows are TMA-gathered from (batch * heads * seq_len, D) views. dK and dV are accumulated
     transposed, (D, TILE), so all four products run as head-dimension-major MMAs. With
-    V_IS_K the key and value gradients add into one dKV.
+    V_IS_K the key and value gradients add into one dKV. ADD_DENSE adds the dense tiles'
+    FP32 contributions (``_gather_attn_bwd_dsparse_kv_dense``) before rounding.
     """
     SPARSE_KV_STRIDES = offset_strides(SPARSE_KV_STRIDES, USE_INT64_OFFSETS)
     LSE_STRIDES = offset_strides(LSE_STRIDES, USE_INT64_OFFSETS)
@@ -354,6 +359,12 @@ def _gather_attn_bwd_dsparse_kv_grouped(
     grad_key *= SCALE
     if V_IS_K:
         grad_key += grad_value
+    if ADD_DENSE:
+        GRAD_DENSE_STRIDES = offset_strides(GRAD_DENSE_STRIDES, USE_INT64_OFFSETS)
+        dense_offsets = ptr_offset(store_offsets, GRAD_DENSE_STRIDES)
+        grad_key += tl.load(grad_dense_kv_ptr + dense_offsets, mask=store_mask, other=0.0)
+        if not V_IS_K:
+            grad_value += tl.load(grad_dense_v_ptr + dense_offsets, mask=store_mask, other=0.0)
     tl.store(
         grad_sparse_kv_ptr + ptr_offset(store_offsets, GRAD_SPARSE_KV_STRIDES),
         grad_key,

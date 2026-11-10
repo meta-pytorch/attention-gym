@@ -11,16 +11,20 @@ from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from ..routing import uses_grouped_schedule
+from .dense_backward import BWD_DQ_DENSE, BWD_DSPARSE_KV_DENSE, document_key_tiles
 from .forward import ROPE_REQUIREMENTS
 from .key_major_backward import _gather_attn_bwd_dsparse_kv_grouped, build_tile_query_map
 from .primitives import (
+    DENSE_TILE_ROWS,
     TileConfig,
     can_use_shared_kv_schedule,
     causal_window_mask,
+    dense_tile_shape,
     load_bhsd,
     load_document_bounds,
     offset_strides,
     optional_strides,
+    plan_dense_tiles,
     prune_wide_backward_configs,
     resolve_selected_rows,
     select_tiles,
@@ -1286,11 +1290,11 @@ def _launch_grouped_backward(
 
     dQ reuses each gathered KV row across a query-head group. Sparse dK/dV is key-major
     (see ``key_major_backward``) and deterministic, so it needs no query map from the forward.
-    Every selection runs on the gather kernels, including queries the forward handled in dense
-    tiles. Local gradients write one partial per query head, which is summed over each KV
-    head's group here instead of with atomics. Returns
-    ``(dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v)``; a gradient is None exactly when its
-    input is. Local tensors are not read without a window.
+    Dense tiles (see ``plan_dense_tiles``) take dQ and their dK/dV share from
+    ``dense_backward``, and the gather kernels skip their queries. Local gradients write one
+    partial per query head, which is summed over each KV head's group here instead of with
+    atomics. Returns ``(dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v)``; a gradient is
+    None exactly when its input is. Local tensors are not read without a window.
     """
     batch, heads, seq_len, head_dim = query.shape
     group = heads // kv_heads
@@ -1332,13 +1336,70 @@ def _launch_grouped_backward(
     )
     sparse_backward = topk > 0 and sparse_seq_len > 0
     tile = 32
-    # Recomputed rather than saved from the forward, which would hold the rows (hundreds of MB
-    # at 32k tokens) between passes.
-    selected_rows, selected_counts, _, _ = resolve_selected_rows(
-        kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k
+    dense_shape = dense_tile_shape(heads, kv_heads, topk, sliding_window_size)
+    tile_queries, mask_words = dense_shape or (0, 0)
+    # Recomputed rather than saved from the forward: about 2% of a QSA step against holding
+    # the rows, bitmaps, and spans (hundreds of MB at 32k tokens) between passes.
+    selected_rows, selected_counts, masks, spans = resolve_selected_rows(
+        kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k, mask_words=mask_words
     )
-    # rowsum(dO * O) for the key-major sparse pass, laid out like the LSE.
-    delta = torch.empty(lse.shape, dtype=lse.dtype, device=lse.device) if sparse_backward else None
+    # rowsum(dO * O) for the key-major and dense sparse passes, laid out like the LSE.
+    store_delta = sparse_backward or dense_shape is not None
+    delta = torch.empty(lse.shape, dtype=lse.dtype, device=lse.device) if store_delta else None
+    tile_spans = None
+    num_dense_tiles = 0
+    if dense_shape is not None:
+        tile_spans, dense_bounds = plan_dense_tiles(
+            selected_counts, spans, cu_seqlens, tile_queries, document_bounds=True
+        )
+        num_dense_tiles = tile_spans.shape[1]
+    if dense_shape is not None:
+        dense_rows = tile_queries * group
+        BWD_DQ_DENSE[
+            lambda meta: (
+                num_dense_tiles * triton.cdiv(dense_rows, meta["BLOCK_M"]),
+                batch,
+                kv_heads,
+            )
+        ](
+            query,
+            sparse_kv,
+            sparse_values,
+            masks,
+            tile_spans,
+            cu_seqlens,
+            cu_seqlens_k,
+            output,
+            grad_output,
+            lse,
+            attention_sink,
+            grad_query,
+            grad_sink_partials,
+            delta,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_values.stride(),
+            LSE_BATCH_STRIDE=lse.stride(0),
+            LSE_HEAD_STRIDE=lse.stride(1),
+            LSE_STRIDES=lse.stride()[2:],
+            GRAD_SINK_PARTIALS_BATCH_STRIDE=grad_sink_partials.stride(0),
+            GRAD_SINK_PARTIALS_HEAD_STRIDE=grad_sink_partials.stride(1),
+            GRAD_SINK_PARTIALS_STRIDES=grad_sink_partials.stride()[2:],
+            num_documents=num_documents,
+            num_tiles=num_dense_tiles,
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            STORE_DELTA=True,
+            S=seq_len,
+            D=head_dim,
+            MASK_WORDS=mask_words,
+            SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            USE_INT64_OFFSETS=use_int64_offsets,
+            TILE_QUERIES=tile_queries,
+            BLOCK_D=block_d,
+        )
     BWD_DQ_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
         query,
         sparse_kv,
@@ -1375,7 +1436,7 @@ def _launch_grouped_backward(
         H=heads,
         KV_HEADS=kv_heads,
         V_IS_K=v_is_k,
-        # Only the key-major pass reads the rowsum.
+        # Only the key-major pass reads gather queries' rowsum; dense rows come from BWD_DQ_DENSE.
         STORE_DELTA=sparse_backward,
         S=seq_len,
         D=head_dim,
@@ -1389,6 +1450,8 @@ def _launch_grouped_backward(
         BLOCK_H=block_h,
         BLOCK_D=block_d,
         RESOLVED_INDICES=True,
+        tile_spans_ptr=tile_spans,
+        DENSE_TILE_QUERIES=tile_queries,
     )
     grad_sink = grad_sink_partials.sum(dim=(0, 2)).to(attention_sink.dtype)
 
@@ -1459,6 +1522,57 @@ def _launch_grouped_backward(
         del partial_local_kv, partial_local_v
 
     sparse_shape = (batch, kv_heads, sparse_seq_len, head_dim)
+    grad_dense_kv = grad_dense_v = None
+    if dense_shape is not None:
+        # The dense tiles' FP32 dK/dV; the gather schedules below add theirs on top.
+        dense_block_n = 64
+        cu_key_tiles, key_tile_grid = document_key_tiles(
+            cu_seqlens_k, sparse_seq_len, dense_block_n
+        )
+        grad_dense_kv = torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
+        grad_dense_v = (
+            grad_dense_kv
+            if v_is_k
+            else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
+        )
+        BWD_DSPARSE_KV_DENSE[(key_tile_grid, kv_heads, batch)](
+            query,
+            sparse_kv,
+            sparse_values,
+            grad_output,
+            lse,
+            delta,
+            masks,
+            tile_spans,
+            dense_bounds,
+            cu_seqlens_k,
+            cu_key_tiles,
+            grad_dense_kv,
+            grad_dense_v,
+            QUERY_STRIDES=query.stride(),
+            SPARSE_KV_STRIDES=sparse_kv.stride(),
+            SPARSE_V_STRIDES=sparse_values.stride(),
+            LSE_BATCH_STRIDE=lse.stride(0),
+            LSE_HEAD_STRIDE=lse.stride(1),
+            LSE_STRIDES=lse.stride()[2:],
+            GRAD_STRIDES=grad_dense_kv.stride(),
+            num_documents=num_documents,
+            num_tiles=num_dense_tiles,
+            H=heads,
+            KV_HEADS=kv_heads,
+            V_IS_K=v_is_k,
+            S=seq_len,
+            SPARSE_SEQ_LEN=sparse_seq_len,
+            D=head_dim,
+            MASK_WORDS=mask_words,
+            SCALE=scale,
+            HAS_CU_SEQLENS=has_cu_seqlens,
+            USE_INT64_OFFSETS=use_int64_offsets or requires_int64_offsets(grad_dense_kv),
+            TILE_QUERIES=tile_queries,
+            BLOCK_M=DENSE_TILE_ROWS,
+            BLOCK_N=dense_block_n,
+            BLOCK_D=block_d,
+        )
     if not sparse_backward:
         grad_sparse_kv = torch.zeros(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
         grad_sparse_v = (
@@ -1468,8 +1582,13 @@ def _launch_grouped_backward(
         )
     else:
         # Each program owns its key tile's gradient rows, so this is deterministic.
+        gather_counts = selected_counts
+        if tile_spans is not None:
+            # The dense kernels cover their tiles' queries.
+            dense = (tile_spans[..., 1] >= 0).repeat_interleave(tile_queries, dim=1)
+            gather_counts = torch.where(dense[:, :seq_len], 0, selected_counts)
         pair_queries, pair_masks, tile_offsets = build_tile_query_map(
-            selected_rows, selected_counts, sparse_seq_len, tile
+            selected_rows, gather_counts, sparse_seq_len, tile
         )
         grad_sparse_kv = torch.empty(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
         grad_sparse_v = (
@@ -1521,6 +1640,10 @@ def _launch_grouped_backward(
             TILE=tile,
             BLOCK_M=64,
             BLOCK_D=block_d,
+            grad_dense_kv_ptr=grad_dense_kv,
+            grad_dense_v_ptr=grad_dense_v,
+            GRAD_DENSE_STRIDES=None if grad_dense_kv is None else grad_dense_kv.stride(),
+            ADD_DENSE=grad_dense_kv is not None,
             num_warps=4,
             num_stages=1,
         )

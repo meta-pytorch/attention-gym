@@ -13,6 +13,7 @@ from attn_gym._backends.triton.utils import ptr_offset
 
 from .primitives import (
     head_block_heads,
+    in_dense_tile,
     load_document_bounds,
     offset_strides,
     prune_wide_backward_configs,
@@ -137,6 +138,8 @@ def _gather_attn_bwd_dq_shared(
     BLOCK_D: tl.constexpr,
     SPARSE_STAGES: tl.constexpr,
     RESOLVED_INDICES: tl.constexpr,
+    tile_spans_ptr=None,
+    DENSE_TILE_QUERIES: tl.constexpr = 0,
 ):
     """Compute query gradients across the query heads that share one KV head.
 
@@ -144,6 +147,7 @@ def _gather_attn_bwd_dq_shared(
     as its value tile for the dP = dO V^T product. STORE_DELTA also writes rowsum(dO * O),
     laid out like the LSE, for the key-major sparse dK/dV pass. RESOLVED_INDICES reads
     ``resolve_selected_rows`` output (compacted rows and counts) as in the shared forward.
+    DENSE_TILE_QUERIES skips the queries ``_gather_attn_bwd_dq_dense`` already handled.
 
     With ROPE_DIM (shared-KV schedule only) the key-only query receives its own gradient,
     stored with the query RoPE strides. Local tensors are None when WINDOW is 0.
@@ -172,6 +176,8 @@ def _gather_attn_bwd_dq_shared(
     sequence = tl.program_id(0)
     batch = tl.program_id(1)
     head_block = tl.program_id(2)
+    if in_dense_tile(tile_spans_ptr, batch, sequence, S, DENSE_TILE_QUERIES):
+        return
 
     kv_head, offsets_h, head_mask = head_block_heads(head_block, H, KV_HEADS, BLOCK_H)
     offsets_d = tl.arange(0, BLOCK_D)
@@ -812,6 +818,7 @@ BWD_DQ_GROUPED = TritonTuner(
         "TOPK",
         "WINDOW",
         "HAS_CU_SEQLENS",
+        "DENSE_TILE_QUERIES",
     ),
     prune=prune_grouped_dq_configs,
 )

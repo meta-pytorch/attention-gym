@@ -597,7 +597,7 @@ def _gather_attn_fwd_dense(
     span_lo = tl.load(tile_spans_ptr + tile_row * 2)
 
     positions, heads, row_mask = dense_tile_rows(
-        tile, kv_head, S, H // KV_HEADS, TILE_QUERIES, BLOCK_M, USE_INT64_OFFSETS
+        tile, kv_head, 0, S, H // KV_HEADS, TILE_QUERIES, BLOCK_M, USE_INT64_OFFSETS
     )
     offsets_d = tl.arange(0, BLOCK_D)
     dimension_mask = offsets_d < D
@@ -986,7 +986,9 @@ def _launch_grouped_forward(
     )
     tile_spans = None
     if dense_shape is not None:
-        tile_spans = plan_dense_tiles(selected_counts, spans, cu_seqlens, tile_queries)
+        tile_spans, _ = plan_dense_tiles(
+            selected_counts, spans, cu_seqlens, tile_queries, document_bounds=False
+        )
         num_tiles = tile_spans.shape[1]
         _FWD_DENSE[(num_tiles, batch, kv_heads)](
             query,
