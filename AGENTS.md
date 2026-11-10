@@ -21,6 +21,7 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
 - `flex_attention/` — masks/score mods, notebooks, MLA, paged/ring attention, and runtime integration
 - `linear/` — KDA/GDN training, context parallelism, and decoding
 - `sparse/` — compressed sparse attention, VSA, and FastWan integration
+- `profiler/` — intra-kernel profiler recordings on small CuTeDSL kernels
 
 Keep variant-specific names in filenames rather than adding nested example directories.
 
@@ -144,8 +145,10 @@ Warpdrive kernels compile through `jit_cache` with two extra rules:
   public attribute assigned afterwards (other than `cluster`, work streams, and the IKET,
   tracing and alias settings) raises.
 - A cached kernel restores its trace results (`describe()`, TMA/alias reports, warnings) without
-  tracing. Only a test that asserts on tracing itself (IKET ranges, monkeypatched trace hooks)
-  takes the `traced_compiles` fixture (`test/conftest.py`) and calls `compile_fn.cache_clear()`.
+  tracing. Only a test that asserts on tracing itself (IKET ranges, monkeypatched trace hooks,
+  the PTX of a compile) bypasses the cache: it takes the `traced_compiles` fixture
+  (`test/conftest.py`) and calls `compile_fn.cache_clear()`, or calls
+  `compile_fn.__wrapped__(...)`, which compiles that one call without either cache.
 
 ### warpdrive Testing Tiers
 
@@ -153,8 +156,9 @@ Pick the smallest tier that covers the change; run bigger tiers only when asked 
 landing core synchronization/scheduling changes.
 
 - Every change (~45 s cold, ~22 s with a warm compile cache on a GB300):
-  `pytest -n 12 test/warpdrive test/profiler`. Fuzz tests are skipped by default (`addopts`
-  deselects the `fuzz` marker).
+  `pytest -n 12 test/warpdrive test/profiler test/warpdrive_fuzz`. Tests marked `fuzz` are
+  skipped by default (`addopts` deselects the marker); the unmarked regressions in
+  `test/warpdrive_fuzz/test_static.py` are compile-only and run here.
 - Quick fuzz (~2-3 min, on request or before landing layer changes):
   `pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz`. It includes the mutant check:
   each synthetic layer bug in `test/warpdrive_fuzz/runtime_mutants.py` must fail or hang its

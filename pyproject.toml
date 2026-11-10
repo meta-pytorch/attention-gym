@@ -96,12 +96,13 @@ packages = ["attn_gym"]
 testpaths = ["test"]
 norecursedirs = ["agent_space"]
 # `-n` honors `xdist_group` marks, so tests that pin specific GPUs never run concurrently.
-# Seeded warpdrive fuzz cases are skipped by default; run them with `pytest -m fuzz`.
+# Seeded warpdrive fuzz cases and the mutant check are skipped by default; run them with
+# `pytest -m fuzz`. The unmarked regressions in test/warpdrive_fuzz always run.
 addopts = "--dist loadgroup -m 'not fuzz'"
 markers = [
     "full_autotune: exercise every production Triton autotuning candidate",
     "tuner_config(index): pin every gather_attn Triton tuner to that valid candidate",
-    "fuzz: warpdrive fuzz cases and layer mutant check; long campaigns: tools/warpdrive/fuzz_warpdrive.py",
+    "fuzz: seeded warpdrive fuzz cases and layer mutant check; long campaigns: tools/warpdrive/fuzz_warpdrive.py",
 ]
 
 # ---------- RUFF ------------

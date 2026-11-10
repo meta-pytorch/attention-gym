@@ -234,10 +234,10 @@ def compile(config: MyConfig):
 ### Int64 offset specialization
 
 Keep ordinary layouts on the int32 address path. At the parent wrapper, call
-`attn_gym._backends.cute.requires_int64_abi` on every ABI-visible input, output, and optional tensor,
-then pass the result through `compile_call(...)` as a static `use_int64_offsets` argument. The CuTe
-predicate is intentionally stricter than reachable cosize: TVM-FFI must represent every declared
-stride, including a stride larger than `INT32_MAX` on a size-one mode that cannot reach it.
+`attn_gym._backends.cute.utils.requires_int64_abi` on every ABI-visible input, output, and optional
+tensor, then pass the result through `compile_call(...)` as a static `use_int64_offsets` argument.
+The CuTe predicate is intentionally stricter than reachable cosize: TVM-FFI must represent every
+declared stride, including a stride larger than `INT32_MAX` on a size-one mode that cannot reach it.
 
 The width bool must participate in the `jit_cache` key and profiler/artifact name. In the wide
 specialization, use `cute.sym_int64` for each dynamic fake-tensor dimension or stride involved in

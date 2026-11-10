@@ -5,8 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 # pyre-ignore-all-errors
-# NOTE: do NOT use `from __future__ import annotations` — cute.struct
-# requires eager-evaluated annotations.
 
 
 from collections.abc import Iterable
@@ -973,8 +971,7 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             valid = Int32(BT)
         if cutlass.const_expr(use_int64_offsets):
             row_start = cutlass.Int64(row_start)
-        # Match Triton's default safe-gate normalization reference
-        # (causal_gate_normref=False): use the middle row of this BC subchunk,
+        # Reference the in-subchunk terms at the middle row of this BC subchunk,
         # clamped for partial chunks. This keeps local diagonal dA scaling
         # finite for dense causal dA without relying on a near-diagonal dA
         # property.
@@ -1624,9 +1621,9 @@ def _chunk_kda_bwd_intra_hmma_grid_kernel(
             # 2^(g_r - g_mid) lies in [2^-59.7, 2^68.3] and 2^(g_mid - g_row0) in
             # [2^-68.3, 1], so both are normal, and their product leaves the normal range
             # only when the true 2^(g_r - g_row0) does, where every earlier-key term already
-            # has a decay below 2^-126. Deriving the diagonal factor from a flushed
-            # 2^(g_r - g_row0) instead dropped the last rows' in-subchunk terms at gates
-            # steeper than about -5.82 nats per token.
+            # has a decay below 2^-126. Deriving the diagonal factor from 2^(g_r - g_row0)
+            # instead would drop the last rows' in-subchunk terms once that factor flushes
+            # (gates steeper than about -5.82 nats per token).
             prev_from_qk0 = cute.math.exp2(gref_qk0 - gref_prev0, fastmath=fastmath)
             prev_from_qk1 = cute.math.exp2(gref_qk1 - gref_prev1, fastmath=fastmath)
             tref0 = cute.math.exp2(gref_t0 - gref_qk0, fastmath=fastmath)

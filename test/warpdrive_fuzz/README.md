@@ -31,12 +31,15 @@ distinguish layer bugs from harness bugs, toolchain limits and invalid programs.
 
 ## Run
 
-Use the [repository tiers](../../AGENTS.md#warpdrive-testing-tiers). The normal tier skips fuzz;
-quick fuzz (`-m fuzz`) is explicit and includes the mutant check, which needs a GPU reservation.
-Long campaigns require the scope described in those tiers; these commands are not an
-instruction to run every campaign.
+Use the [repository tiers](../../AGENTS.md#warpdrive-testing-tiers). The normal tier runs the
+unmarked regressions in `test_static.py` (compile-only, a few seconds) and skips every test
+marked `fuzz`. Quick fuzz (`-m fuzz`) is explicit: the seeded cases in `test_static.py` and the
+mutant check, which needs a GPU reservation. Long campaigns require the scope described in
+those tiers; these commands are not an instruction to run every campaign.
 
 ```bash
+# regressions (normal tier), then the seeded quick fuzz
+CUTE_DSL_ARCH=sm_100a .venv/bin/pytest -n 6 -q test/warpdrive_fuzz/test_static.py
 CUTE_DSL_ARCH=sm_100a .venv/bin/pytest -n 6 -q test/warpdrive_fuzz/test_static.py -m fuzz
 .venv/bin/python tools/warpdrive/fuzz_warpdrive.py static --seed 0 --budget 10000
 .venv/bin/python tools/warpdrive/fuzz_warpdrive.py mutate --seed 0 --budget 1000

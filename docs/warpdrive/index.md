@@ -7,7 +7,8 @@ warpdrive helps write warp-specialized CuTeDSL kernels, and is also the CuTeDSL 
 of attention-gym: its [compile cache](cache.md), CuTeDSL version shims, the intra-kernel
 [profiler](profiler.md) and work scheduling live here.
 
-Write the load, MMA and epilogue of a warp-specialized CuTeDSL kernel as separate methods.
+At a high level this provides nice utilities for the common mechanisms (channels) to communicate between warps. While also
+providing some syntactic sugar that helps guarantee correctness when you author your kernels in a certain way.
 Connect them with channels:
 
 ```python
@@ -15,18 +16,17 @@ self.ab = Ring(3, Tma((128 + 256) * 64 * 2), Umma)
 self.acc = Ring(1, Umma, Threads)
 ```
 
-You still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
-counts and phases, role dispatch and TMEM allocation/free. The math is ordinary CuTeDSL.
+You (your agent) still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
+counts and phases, role dispatch and TMEM allocation/free. The individual warps bodies are ordinary CuTeDSL.
 
-Experimental. Requires `nvidia-cutlass-dsl` 4.6.2 or newer (tested on 4.6, 4.7 and 4.8) and a
-Blackwell SM100/SM103 GPU.
+Requires `nvidia-cutlass-dsl` 4.6.2 or newer (tested on 4.6, 4.7 and 4.8).
 
 **Start with [Write a kernel](writing-kernels.md):** run the complete GEMM, define a work
 item, connect the roles, and validate the handoffs. The [safety contract](guarantees.md) explains
-what warpdrive handles and what you must establish. Compilation alone does not prove liveness.
-For agent-assisted implementation, use the repository's [authoring skill](https://github.com/meta-pytorch/attention-gym/blob/main/.agents/skills/authoring-warpdrive/SKILL.md).
+what warpdrive handles and what you must establish. You can still compile busted kernels, but its harder.
+We also got a skill boss: [authoring skill](https://github.com/meta-pytorch/attention-gym/blob/main/.agents/skills/authoring-warpdrive/SKILL.md).
 
-**To relearn the vocabulary,** read the [tour notebook](tour.ipynb): it builds from a
+**To learn the vocabulary,** read the [tour notebook](tour.ipynb): it builds from a
 two-warp producer/consumer kernel to the pipelined GEMM, then schedules, clusters, storage
 aliases and the checkers, with saved `describe()` output, PTX excerpts and checks against
 PyTorch.
@@ -159,13 +159,15 @@ budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the schedu
 From the repository root:
 
 ```bash
-pip install -e ".[linear,dev]"
-pytest -n 12 test/warpdrive test/profiler
+pip install -e ".[tests,linear,dev]"  # uv: add --prerelease allow
+pytest -n 12 test/warpdrive test/profiler test/warpdrive_fuzz
 pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz
 ```
 
-The first pytest command runs the normal suite; fuzz tests are skipped by default. The second
-opts into quick fuzzing (declaration and mutation fuzzing, and the check that synthetic layer
+The `tests` extra supplies `perfetto`, which the tracing and profiler tests import. The first
+pytest command runs the normal suite, including the fuzz regressions in
+`test/warpdrive_fuzz/test_static.py`; tests marked `fuzz` are skipped by default. The second
+opts into those (seeded declaration and mutation fuzzing, and the check that synthetic layer
 bugs fail the tests). Compiled kernels stay in the [compile cache](cache.md), so a second
 run mostly loads them. FA4 tests skip without `flash_attn.cute`. Long campaigns follow the
 [fuzz harness guide](https://github.com/meta-pytorch/attention-gym/blob/main/test/warpdrive_fuzz/README.md).
@@ -179,12 +181,14 @@ this checkout, and give it its own caches:
 
 ```bash
 uv venv /tmp/dsl-4.7 && source /tmp/dsl-4.7/bin/activate
-uv pip install -e ".[linear,dev]" "nvidia-cutlass-dsl[cu13]==4.7.1"
+uv pip install -e ".[linear,dev]" perfetto "nvidia-cutlass-dsl[cu13]==4.7.1"
 export CUTE_DSL_CACHE_DIR=/tmp/dsl-4.7/cute-dsl-cache
 export WARPDRIVE_CACHE_DIR=/tmp/dsl-4.7/warpdrive-cache
 pytest -n 12 test/warpdrive
 ```
 
-The FA4 examples also need `flash_attn.cute` and a `quack-kernels` release that supports that
-CuTeDSL version (quack 0.6.5 needs 4.7; 0.6.3 works with 4.6). Version-dependent CuTeDSL APIs
-are covered in [CuTeDSL versions](cache.md#cutedsl-versions).
+`perfetto` is installed by name because the `tests` extra also installs FlashAttention on
+x86_64, which pins its own CuTeDSL version. The FA4 examples need `flash_attn.cute` and a
+`quack-kernels` release that supports the CuTeDSL version under test (quack 0.6.5 needs 4.7;
+0.6.3 works with 4.6). Version-dependent CuTeDSL APIs are covered in
+[CuTeDSL versions](cache.md#cutedsl-versions).

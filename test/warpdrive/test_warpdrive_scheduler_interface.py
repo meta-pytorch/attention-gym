@@ -50,7 +50,13 @@ from attn_gym.warpdrive import (
     WorkStream,
     role,
 )
-from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive.cache import (
+    canonical_key,
+    compile_tvm_ffi,
+    jit_cache,
+    make_fake_compact_tensor,
+)
+from attn_gym.warpdrive.examples.gemm import Gemm
 from attn_gym.warpdrive.examples.packed_work import PackedWork
 from attn_gym.warpdrive.scheduling import tile_grid_dims
 
@@ -152,6 +158,20 @@ def test_custom_schedule_keys_and_launch_needs():
     assert ReverseStatic().uses_max_ctas and not ReverseStatic().uses_workspace
     with pytest.raises(ValueError, match="AtomicPersistent.*workspace"):
         WorkStream(schedule=AtomicPersistent()).bind((1, 1, 1))
+
+
+@pytest.mark.parametrize("schedule", [OneShot(), StaticPersistent(), ClusterLaunchControl()])
+def test_scheduler_warp_only_specializes_broadcast_schedules(schedule):
+    kernels = []
+    for warp in (None, 30, 31):
+        op = Gemm()
+        op.work = WorkStream(schedule=schedule, scheduler_warp=warp)
+        kernels.append(op)
+    keys = {canonical_key(op) for op in kernels}
+    assert len(keys) == (3 if schedule.broadcast else 1)
+    if not schedule.broadcast:
+        assert all(op.work.scheduler_warp is None for op in kernels)
+        assert kernels[0].describe() == kernels[1].describe() == kernels[2].describe()
 
 
 def test_single_item_rejects_persistent_schedules():
@@ -488,7 +508,7 @@ def test_oneshot_grid_is_a_static_choice():
         Raster().describe()
     )
     with pytest.raises(ValueError, match="'auto', '3d', '2d' or '1d'"):
-        OneShot(grid="tiles")
+        OneShot(grid="bogus")
 
     class Shifted(OneShot):
         def first_index(self, problem):
@@ -731,7 +751,9 @@ def test_static_grid_rejects_an_oversized_dynamic_space(requires_blackwell, grid
     assert _plain_hits(op, (5, 3, 2)).tolist() == [1] * 30
 
 
-def test_tiles_grid_reads_block_idx_without_a_fallback(requires_blackwell, tmp_path, monkeypatch):
+def test_static_3d_grid_reads_block_idx_without_a_fallback(
+    requires_blackwell, tmp_path, monkeypatch
+):
     """``grid="3d"`` takes the item from ``blockIdx`` alone: no branch on the launch shape
     and no division, where ``"auto"`` keeps both for its 1-D fallback. ``"2d"`` adds one
     division."""
@@ -892,7 +914,7 @@ def compile_limit_toy(op):
         (StaticPersistent(), "counted", True),
         (TilePersistent("n"), "counted", True),
     ],
-    ids=["static_roles", "static_plain", "auto_roles", "tiles_roles", "tiles_plain", "flat_plain",
+    ids=["static_roles", "static_plain", "auto_roles", "3d_roles", "3d_plain", "1d_plain",
          "2d_plain", "tile_n_roles", "tile_m_plain", "static_counted", "tile_n_counted"],
 )  # fmt: skip
 def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule, mode, plain):
@@ -958,19 +980,20 @@ def test_tile_persistent_cap_is_runtime(requires_blackwell):
 
 
 def test_tile_persistent_assignment_keeps_a_folded_grid_order():
-    """``TilePersistent("n")`` over ``(pairs, chunks, heads)`` launches the CTAs of a hand-built
-    ``(workers * pairs, heads)`` grid that folds the pair into x (KDA K3b), in the same order and
-    with the same items: CTA ``x + pairs * workers * head`` with ``x = worker * pairs + pair``."""
+    """``TilePersistent("n")`` over ``(pairs, chunks, heads)`` lists its CTAs with the pair
+    fastest, then the worker, then the head: CTA ``x + pairs * workers * head`` with
+    ``x = worker * pairs + pair`` runs chunks ``worker, worker + workers, ...`` of that pair and
+    head."""
     pairs, chunks, heads, workers = 6, 11, 3, 4
     rows = WorkStream(schedule=TilePersistent("n")).assignment(
         (pairs, chunks, heads), max_ctas=workers
     )
-    legacy = []
+    expected = []
     for head in range(heads):
         for x in range(workers * pairs):
             worker, pair = divmod(x, pairs)
-            legacy.append([(c, (pair, c, head)) for c in range(worker, chunks, workers)])
-    assert rows == legacy
+            expected.append([(c, (pair, c, head)) for c in range(worker, chunks, workers)])
+    assert rows == expected
 
 
 def test_limit_rejections():

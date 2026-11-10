@@ -3,8 +3,9 @@
     CUTE_DSL_ARCH=sm_100a python tools/warpdrive/warpdrive_sass.py dump agent_space/sass/before
     python tools/warpdrive/warpdrive_sass.py compare agent_space/sass/before agent_space/sass/after
 
-Dumping requires CuTeDSL, flash_attn.cute, nvdisasm and an empty output directory. Compare
-needs only Python. Persistent GEMM pins tile_n=256 so default-tile changes do not alter the gate.
+Dumping requires CuTeDSL, nvdisasm and an empty output directory; FA4 labels also require
+flash_attn.cute. Compare needs only Python. Persistent GEMM pins tile_n=256 so default-tile
+changes do not alter the gate.
 PTX and compiler options are the primary equivalence gate; SASS changes remain visible as
 assembler diagnostics. Use compare --strict-sass to require exact SASS too.
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import re
 import subprocess
@@ -36,45 +38,49 @@ def dump(output: Path, labels: list[str]) -> None:
         CtaPair,
         StaticPersistent,
     )
-    from attn_gym.warpdrive.examples.fa4_fwd import (
-        FlashAttentionForward,
-        compile_fa4_fwd,
-    )
     from attn_gym.warpdrive.examples.gemm import Gemm, compile_gemm
     from attn_gym.warpdrive.examples.persistent_gemm import (
         PersistentGemm,
         compile_persistent_gemm,
     )
 
+    def fa4_config(**kwargs):
+        from attn_gym.warpdrive.examples.fa4_fwd import (
+            FlashAttentionForward,
+            compile_fa4_fwd,
+        )
+
+        return compile_fa4_fwd, FlashAttentionForward(**kwargs)
+
     configs = {
-        "gemm_oneshot": (compile_gemm, Gemm()),
-        "pgemm_static_single": (
+        "gemm_oneshot": lambda: (compile_gemm, Gemm()),
+        "pgemm_static_single": lambda: (
             compile_persistent_gemm,
             PersistentGemm(schedule=StaticPersistent(), tile_n=256),
         ),
-        "pgemm_static_pair": (
+        "pgemm_static_pair": lambda: (
             compile_persistent_gemm,
             PersistentGemm(schedule=StaticPersistent(), cluster=CtaPair(), tile_n=256),
         ),
-        "pgemm_clc_pair": (
+        "pgemm_clc_pair": lambda: (
             compile_persistent_gemm,
             PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair(), tile_n=256),
         ),
-        "fa4_single": (compile_fa4_fwd, FlashAttentionForward()),
-        "fa4_clc_pair": (
-            compile_fa4_fwd,
-            FlashAttentionForward(schedule=ClusterLaunchControl(), cluster=CtaPair()),
-        ),
-        "fa4_clc_pair_splitp": (
-            compile_fa4_fwd,
-            FlashAttentionForward(
-                schedule=ClusterLaunchControl(), cluster=CtaPair(), split_p=True
-            ),
+        "fa4_single": fa4_config,
+        "fa4_clc_pair": lambda: fa4_config(schedule=ClusterLaunchControl(), cluster=CtaPair()),
+        "fa4_clc_pair_splitp": lambda: fa4_config(
+            schedule=ClusterLaunchControl(), cluster=CtaPair(), split_p=True
         ),
     }
     unknown = set(labels) - configs.keys()
     if unknown:
         raise ValueError(f"unknown configurations: {sorted(unknown)}; choose {list(configs)}")
+    # Fail before writing anything: a half-filled output directory refuses the rerun.
+    wants_fa4 = any(label.startswith("fa4_") for label in labels or configs)
+    if wants_fa4 and importlib.util.find_spec("flash_attn") is None:
+        raise ModuleNotFoundError(
+            "the fa4_* configurations need flash_attn.cute; name the GEMM labels to skip them"
+        )
     print(attn_gym.__file__, flush=True)
     compiler_identity = {
         "cutlass_version": cutlass.__version__,
@@ -113,7 +119,7 @@ def dump(output: Path, labels: list[str]) -> None:
         return compiled
 
     for label in labels or configs:
-        build, op = configs[label]
+        build, op = configs[label]()
         compiled = compile_with_ptx(build, op, label)
         obj = bytes(
             _aot_support.export_module_to_bytes(

@@ -4,6 +4,7 @@ Toys check edge direction, pair scope, role instances, junctions, raw-code sides
 hubs. Every example must produce a deterministic, well-formed graph.
 """
 
+import importlib
 import json
 import re
 import shutil
@@ -35,15 +36,7 @@ from attn_gym.warpdrive import (
     WarpSpecialized,
     role,
 )
-
-# fa4_bwd builds on FlashAttention's helpers and fa4_decode_swapab on quack.
-pytest.importorskip("flash_attn.cute")
-pytest.importorskip("quack")
-
 from attn_gym.warpdrive.examples import (
-    fa4_bwd,
-    fa4_decode_swapab,
-    fa4_fwd,
     gemm,
     grouped_gemm,
     persistent_gemm,
@@ -244,7 +237,9 @@ def test_broadcast_stream_reaches_roles_over_its_ring():
 def test_parallel_channels_share_an_edge_only_when_alike():
     """FA4's backward: k, kt, v and do differ only in their buffers, so they share one edge
     from load to mma, listing each buffer; q and qt carry fewer bytes and share another."""
-    g = Mermaid(fa4_bwd.FlashAttentionBackward2Cta().describe(format="mermaid"))
+    g = Mermaid(
+        optional_example("fa4_bwd", "FlashAttentionBackward2Cta").describe(format="mermaid")
+    )
     labels = [lab for _, lab in g.links(g.node("load"), g.node("mma"))]
     assert [lab[0] for lab in labels] == ["k, kt, v, do · Ring(1) each", "q, qt · Ring(1) each"]
     assert labels[0][-1] == "k: buffer K · kt: buffer Kt · v: buffer V · do: buffer dO, dOt"
@@ -366,6 +361,14 @@ def test_html_hubs_and_raw_code():
     assert g.ends(raw["inbox producer"], g.by_title("inbox"))
 
 
+def optional_example(module: str, name: str, *args):
+    pytest.importorskip("flash_attn.cute")
+    if module in ("fa4_fwd", "fa4_decode_swapab"):
+        pytest.importorskip("quack")
+    example = importlib.import_module(f"attn_gym.warpdrive.examples.{module}")
+    return getattr(example, name)(*args)
+
+
 EXAMPLES = {
     "gemm": gemm.Gemm,
     "persistent_gemm": persistent_gemm.PersistentGemm,
@@ -373,11 +376,11 @@ EXAMPLES = {
         schedule=ClusterLaunchControl(), cluster=CtaPair()
     ),
     "grouped_gemm": grouped_gemm.GroupedGemm,
-    "fa4_fwd": fa4_fwd.FlashAttentionForward,
-    "fa4_bwd": fa4_bwd.FlashAttentionBackward,
-    "fa4_bwd_2cta": fa4_bwd.FlashAttentionBackward2Cta,
-    "decode": lambda: fa4_decode_swapab.SwapABDecode(32),
-    "decode_shared_kv": lambda: fa4_decode_swapab.SharedKVDecode(8),
+    "fa4_fwd": lambda: optional_example("fa4_fwd", "FlashAttentionForward"),
+    "fa4_bwd": lambda: optional_example("fa4_bwd", "FlashAttentionBackward"),
+    "fa4_bwd_2cta": lambda: optional_example("fa4_bwd", "FlashAttentionBackward2Cta"),
+    "decode": lambda: optional_example("fa4_decode_swapab", "SwapABDecode", 32),
+    "decode_shared_kv": lambda: optional_example("fa4_decode_swapab", "SharedKVDecode", 8),
     "qwen_megakernel": qwen_megakernel.QwenDecodeMegakernel,
     "raw_interop": raw_interop.RawInterop,
 }

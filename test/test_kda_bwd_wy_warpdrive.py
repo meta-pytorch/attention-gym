@@ -75,7 +75,7 @@ NAMES = ("dq", "dk", "dv2", "dg", "db", "dA")
 
 @pytest.mark.parametrize("lengths", [None, [4096, 1000, 65, 0, 7]], ids=["dense", "packed"])
 def test_wy_persistent_units_match_across_grid_sizes(monkeypatch, lengths):
-    """Several units per CTA (rings and the raw accumulator phases carried across units) give
+    """Several units per CTA (managed ring and accumulator-span phases carried across units) give
     the same result for every persistent grid: a full wave, two waves, and three CTAs."""
     heads = 8
     tokens = 4096 if lengths is None else sum(lengths)

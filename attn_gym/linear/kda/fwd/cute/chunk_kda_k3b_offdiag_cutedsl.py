@@ -13,9 +13,8 @@ Matches NV C++ kernel_3b_offdiag_matmul.cu architecture:
 
 The grids come from a warpdrive work stream over the (pair, head, chunk) space: the exact grid is
 ``OneShot(grid="2d")`` (the chunk folded into x with the six pairs), the persistent one
-``TilePersistent("n")`` over (pair, chunk, head), which launches its CTAs in the order of the
-hand-built ``(chunk_workers * 6, H)`` grid and strides the chunk by the runtime worker count,
-bounded by the active chunk count ``chunk_offsets[-1]``.
+``TilePersistent("n")`` over (pair, chunk, head), which strides the chunk by the runtime worker
+count, bounded by the active chunk count ``chunk_offsets[-1]``.
   128 threads (4 warps):
       All warps: Phase 1 — fused gating into SMEM
       Warp 0:    Phase 2 — Aqk = sQg @ sKn^T  (MMA)
@@ -241,8 +240,7 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
 
         if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
             # unroll=2 interleaves two chunks' gating loads, restoring the
-            # load->use distance the scheduler achieves in the static body
-            # (median 46 vs 14 instructions; long_scoreboard 25 -> ~12 cyc/inst).
+            # load->use distance the scheduler achieves in the static body.
             # unroll=4 crosses a code-size/register cliff and loses it again.
             for k in cutlass.range(trips, unroll=2):
                 _, current_chunk, _ = chunks.item_at(k)

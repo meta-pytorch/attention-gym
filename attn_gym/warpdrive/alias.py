@@ -99,7 +99,7 @@ RULES = {
         "Warps of one role are ordered within a handle only by a barrier over the whole role "
         "between the two accesses (record it with named_barrier). Different warps are never "
         "pipelined; PTX also requires tcgen05.wait::ld/st and tcgen05.fence::before/"
-        "after_thread_sync around that sync, which phase 1 assumes rather than checks.",
+        "after_thread_sync around that sync, which the diagnostic assumes rather than checks.",
         f"PTX ISA 9.5 9.7.18.6.2 and 9.7.18.6.3 "
         f"({PTX}#tcgen05-memory-consistency-model-inter-thread-sync)",
     ),
@@ -1085,7 +1085,8 @@ def check(kernel, roles: list[RoleEvents]) -> AliasReport:
         results.append(res)
         if kernel.cluster.size > 1:
             res.unverified.append(
-                f"{type(kernel.cluster).__name__} kernels are not modeled (phase 1 is single-CTA)"
+                f"{type(kernel.cluster).__name__} kernels are not modeled: the diagnostic "
+                "covers single-CTA kernels"
             )
             continue
         mine = {n: [a for a in accesses if a.storage == (kind, n)] for n in (x, y)}

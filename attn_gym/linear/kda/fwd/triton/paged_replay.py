@@ -9,7 +9,7 @@
 Request counts, batch sizes, and token counts reach the kernels as runtime arguments so
 serving traffic does not recompile them. Element-count bounds keep Triton's default
 integer specialization: the ``% 16`` divisibility hint keeps the bound mask aligned so
-loads and stores stay vectorized (dropping it measured 1.3-1.5x slower), and the counts
+loads and stores stay vectorized (dropping it is slower), and the counts
 carry a factor of the 64-token window or of the head dimension, so they stay in one class.
 """
 

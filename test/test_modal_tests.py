@@ -121,6 +121,7 @@ def test_pytest_failure_budget_and_missing_report(
     assert "--maxfail=5" in command
     assert "--instafail" in command
     assert "-vra" in command
+    assert not any(option.startswith("--dist") for option in command)
     assert command[command.index("-n") + 1] == str(runner.PYTEST_WORKERS)
 
 
@@ -141,10 +142,30 @@ def test_dependency_preflight_gates_full_suite(
     assert first_call.args[0] == [
         "test/test_gather_attn_cute.py::test_cute_dependency_smoke[forced-sink]"
     ]
-    assert first_call.kwargs == {"workers": 0}
+    assert first_call.kwargs == {"workers": 0, "require_pass": True}
     assert execute.call_count == (1 if preflight_code else 2)
     if not preflight_code:
         assert "suite" in summary
+
+
+@pytest.mark.parametrize("testcase", ["<testcase/>", "<testcase><skipped/></testcase>", ""])
+def test_dependency_preflight_requires_a_passed_testcase(
+    runner: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, testcase: str
+):
+    """A successful pytest exit is not evidence that the required dependency ran."""
+    report = tmp_path / "preflight.xml"
+
+    def run(*args, **kwargs):
+        report.write_text(f"<testsuites><testsuite>{testcase}</testsuite></testsuites>")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runner.subprocess, "run", run)
+    return_code, summary = runner.execute_pytest(
+        ["smoke"], report, "Preflight", workers=0, require_pass=True
+    )
+    assert return_code == (0 if testcase == "<testcase/>" else 1)
+    if return_code:
+        assert "no passed testcase" in summary
 
 
 def test_compile_cache_round_trip_keeps_recent_entries(runner: ModuleType, tmp_path: Path):

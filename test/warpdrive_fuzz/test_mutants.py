@@ -16,7 +16,7 @@ pytestmark = pytest.mark.fuzz
 
 TEST_ROOT = Path(__file__).resolve().parents[1]
 # Allow cold compilation before classifying a timeout as a caught hang.
-# On GB300, failing children exit within ~15 s with 15 compiling concurrently.
+# On GB300, failing children exit within ~15 s while the others compile concurrently.
 HANG_TIMEOUT_S = 90.0
 
 

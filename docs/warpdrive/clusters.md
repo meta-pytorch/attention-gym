@@ -222,8 +222,8 @@ Storage is separate from that barrier ordering:
   matching offsets. `buffer=` leaves scope unchanged and derives a commit fence for
   `Threads`/`Warps` -> `Umma`, as `payload=` does
   ([Storage and fences](channels.md#storage-and-fences)).
-- The phase-1 alias diagnostic reports cluster aliases as `unverified`; it does not analyze
-  cross-CTA ordering.
+- The alias diagnostic reports cluster aliases as `unverified`; it does not analyze cross-CTA
+  ordering.
 
 ## Larger clusters
 

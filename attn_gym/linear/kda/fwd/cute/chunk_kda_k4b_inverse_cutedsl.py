@@ -12,7 +12,7 @@ Persistent grid: (chunk_workers, H, 1) — each CTA strides over chunks.
 Both come from a warpdrive work stream: ``OneShot(grid="2d")`` over (1, head, chunk) for the
 exact grid, ``TilePersistent("m", units=chunk_workers)`` over (chunk, head, 1) for the persistent
 one, bounded by the active chunk count ``chunk_offsets[-1]``. The worker count stays a compile-time
-stride: with a ``gridDim.x`` stride this register-heavy loop measured 2-11% slower.
+stride: with a ``gridDim.x`` stride this register-heavy loop is slower.
 128 threads (4 warps):
     Phase 1: Per-warp OD register load + preinverted diagonal-block load
     Phase 2a: Warps 0-2 parallel Schur L1 (Ai10, Ai21, Ai32), Warp 3 stores diags
@@ -230,7 +230,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
             trips = chunks.trip_count()
             _, head_idx, _ = chunks.item  # the first item: blockIdx, no decode
         else:
-            # Every capacity chunk runs, as in the exact grid: no ``valid`` test.
+            # The exact grid launches every capacity chunk: no ``valid`` test.
             _, (_, head_idx, chunk_idx) = work.single_item()
 
         # ── Shared memory, allocated once and reused across persistent iterations ──
@@ -262,8 +262,7 @@ class ChunkKDAFwdK4bInverseCuteDSL:
         )
 
         if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
-            # No unroll: K4b's register-heavy Schur body regresses under
-            # unroll=2 (0.97x -> 0.87x measured vs the static grid).
+            # No unroll: K4b's register-heavy Schur body regresses under unroll=2.
             for k in cutlass.range(trips):
                 current_chunk, _, _ = chunks.item_at(k)
                 self._process_chunk(

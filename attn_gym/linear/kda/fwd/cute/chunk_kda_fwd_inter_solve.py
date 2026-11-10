@@ -4,12 +4,10 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# CuTe DSL KDA forward inter-solve stage.
+# CuTe DSL KDA forward inter-solve stage (K3b + K4b).
 #
-# This is the isolated K3b+K4b replacement for Triton's
-# chunk_kda_fwd_kernel_inter_solve_fused_forloop. The caller supplies the
-# already-computed diagonal inverse blocks (Akkd); this helper only computes the
-# off-diagonal Aqk blocks and final solved Akk blocks.
+# The caller supplies the diagonal inverse blocks (Akkd); this stage computes the
+# off-diagonal Aqk blocks and the solved Akk blocks.
 
 from __future__ import annotations
 

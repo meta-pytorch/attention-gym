@@ -149,7 +149,12 @@ def verify_wheel_install() -> None:
 
 
 def execute_pytest(
-    test_paths: list[str], report_path: Path, title: str, *, workers: int = PYTEST_WORKERS
+    test_paths: list[str],
+    report_path: Path,
+    title: str,
+    *,
+    workers: int = PYTEST_WORKERS,
+    require_pass: bool = False,
 ) -> tuple[int, str]:
     """Run one isolated dependency-compatible pytest suite."""
     verify_wheel_install()
@@ -162,7 +167,6 @@ def execute_pytest(
             *test_paths,
             "-n",
             str(workers),
-            "--dist=worksteal",
             "-vra",
             "--tb=short",
             "--instafail",
@@ -178,6 +182,13 @@ def execute_pytest(
         if report_path.is_file()
         else f"## {title}\n\nPytest exited with code {result.returncode} before writing a report.\n"
     )
+    if require_pass and result.returncode == 0:
+        passed = report_path.is_file() and any(
+            all(test_case.find(tag) is None for tag in ("failure", "error", "skipped"))
+            for test_case in ET.parse(report_path).iter("testcase")
+        )
+        if not passed:
+            return 1, f"{summary}\nDependency preflight produced no passed testcase.\n"
     return result.returncode, summary
 
 
@@ -263,6 +274,7 @@ def run_pytest() -> tuple[int, str]:
             Path("/tmp/pytest-preflight.xml"),
             "B200 FA4 dependency preflight",
             workers=0,
+            require_pass=True,
         )
         if return_code:
             return return_code, preflight_summary

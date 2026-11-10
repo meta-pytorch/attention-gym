@@ -52,8 +52,10 @@ channel ends/work cursors, including inside loops; it does not prove freshness o
 snapshots, manually supplied raw state or turnstile seats, or all post-close accesses.
 
 **Drain the work loop.** Use `while work.valid:`, read `work.item` before advancing, and call
-`work.advance()` once directly at the end of the body. Return the cursor. The layer checks
-the traced loop structure, not matching runtime trip counts inside different roles.
+`work.advance()` once directly at the end of the body, or use the
+[counted form](scheduling.md#a-counted-loop) on a `StaticPersistent` or `TilePersistent`
+stream. Return the cursor. The layer checks the traced loop structure, not matching runtime
+trip counts inside different roles.
 
 **Own the memory ordering.** A channel's fences run before its managed signal: the declared ones,
 which default to `smem_async` on the release of a TMA-filled channel with thread consumers

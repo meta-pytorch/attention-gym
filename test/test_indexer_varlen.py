@@ -121,6 +121,51 @@ def test_packed_selection_matches_document_loop(backend, lengths, ratio, topk, c
     assert torch.all(actual[padding] == -1)
 
 
+@pytest.mark.parametrize("heads,dim", [(32, 128), (64, 128), (66, 96)])
+@pytest.mark.parametrize("wide", [False, True], ids=["int32", "int64"])
+def test_packed_mask_flags_reuse_score_and_topk_compiles(monkeypatch, heads, dim, wide):
+    """Bounds own the mask; changing its source flags must not specialize either kernel."""
+    device = _device("cute")
+    from attn_gym.sparse.indexer.impl import cute as impl
+    from attn_gym.sparse.indexer.impl.triton import prepare_candidate_bounds
+
+    monkeypatch.setattr(impl, "requires_int64_abi", lambda *args: wide)
+    compilers = (impl._compile_scores, impl._compile_topk)
+    for compiler in compilers:
+        compiler.cache_clear()
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    masks = ((False, 1), (True, 1), (True, 2), (True, 4))
+    try:
+        for causal, ratio in masks:
+            inputs = _inputs([3, 129, 65, 0, 7], ratio, device, heads=heads, dim=dim, capacity=3)
+            actual = _call("cute", inputs, 5, ratio, causal)
+            expected = _per_document(inputs, 5, ratio, causal)
+            # The reference ranks by score; deterministic CuTe returns ascending valid indices.
+            expected = expected.masked_fill(expected < 0, inputs[1].shape[1]).sort().values
+            expected = expected.masked_fill(expected == inputs[1].shape[1], -1)
+            assert torch.equal(actual, expected)
+        for compiler in compilers:
+            info = compiler.cache_info()
+            assert info.currsize == 1
+            assert info.hits + info.misses == len(masks)
+
+        q, k, weights, cu_q, cu_k = inputs
+        bounds = prepare_candidate_bounds(cu_q, cu_k, q.shape[1], True, 4)
+        for causal, ratio in masks:
+            replay = impl.launch(q, k, weights, 5, causal, ratio, True, bounds)
+            assert torch.equal(replay, actual)
+        for compiler in compilers:
+            info = compiler.cache_info()
+            assert info.currsize == 1
+            assert info.hits + info.misses == 2 * len(masks)
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        for compiler in compilers:
+            compiler.cache_clear()
+
+
 @pytest.mark.parametrize("backend", ["reference", "triton", "cute"])
 def test_dense_empty_pool_and_fixed_topk(backend):
     device = _device(backend)

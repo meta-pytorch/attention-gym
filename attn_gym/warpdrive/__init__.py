@@ -35,11 +35,11 @@ Channels support these handoffs (``channels.py``):
   flags between roles (``named.py``).
 
 Declare ``self.work = WorkStream(mapping=..., schedule=...)`` and bind ``work: WorkCursor``.
-Schedules are ``OneShot``, ``StaticPersistent``, ``AtomicPersistent``, ``ClusterLaunchControl``
-or an ``IndexSchedule`` subclass. Mappings are ``Raster`` or a ``WorkMap`` subclass.
-``self.cluster = CtaPair()`` or
-``Cluster(m, n, pair=...)`` supplies cluster scope and multicast TMA loads; pin MMA to
-``@role(..., cta="leader")``. See ``examples/`` for GEMM, persistent GEMM and FA4 forward.
+Schedules are ``OneShot``, ``StaticPersistent``, ``TilePersistent``, ``AtomicPersistent``,
+``ClusterLaunchControl`` or an ``IndexSchedule`` subclass. Mappings are ``Raster`` or a
+``WorkMap`` subclass. ``self.cluster = CtaPair()`` or ``Cluster(m, n, pair=...)`` supplies
+cluster scope and multicast TMA loads; pin MMA to ``@role(..., cta="leader")``. See
+``examples/`` for GEMM, persistent GEMM and FA4 forward.
 
 ``SmemPlan`` declares buffer dtype, alignment and stage axis; layouts bind at
 ``begin_roles(layouts=...)`` and channels bind buffers with ``buffer=``. ``h.data`` selects

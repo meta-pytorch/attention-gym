@@ -9,6 +9,7 @@ dependencies required by the example.
 | `flex_attention/` | FlexAttention masks/score mods, walkthroughs, MLA, paged attention, context-parallel styles (all-gather, Ulysses, ring), compilation, CUDA Graphs, and tuning |
 | `linear/` | KDA/GDN training, context parallelism, and recurrent decoding |
 | `sparse/` | Compressed sparse attention, VSA, and FastWan integration |
+| `profiler/` | Intra-kernel profiler recordings on small CuTeDSL kernels: buffering comparison, overhead measurement, per-role regions |
 
 Start with:
 

@@ -17,11 +17,12 @@ PyTorch or FA4 feature.
 | Split-KV items, per-sequence counts, round-robin softmax, named mailboxes, SMEM P | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
 | Whole-model persistent decode: host instruction table, static schedule, cooperative launch, epoch-tagged words between CTAs | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
 | Managed producer, raw `external="consumer"` with overridden count, native wait on a `NamedBarrier.id` | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
+| `WorkMap` subclasses that wrap CUTLASS's and FA4's tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
+| Per-CTA schedule pages from `WorkStream.assignment` | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
 
-Each kernel has a `bench_*.py` script beside it. Run benchmarks under a GPU reservation with
-`--output` to save versions, source hashes and every replay sample; compare only columns of
-one run. Headline numbers below are GB300 measurements from November 2026 (CuTeDSL 4.8.0,
-PyTorch 2.15 nightly cu132, FA4 `00807a02`); rerun them before relying on a difference under 5%.
+The larger examples have a `bench_*.py` script beside them. Run benchmarks under a GPU
+reservation with `--output` to save versions, source hashes and every replay sample; compare
+only columns of one run.
 
 ## GEMM
 
@@ -75,9 +76,8 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 ```
 
 Variants are `mm` (`torch.mm`), `single`/`pair` with optional `_late` (`early_release=False`),
-`_clc`/`_atomic` schedules, `_acc1` (`acc_stages=1`) and `_n<tile_n>`. The pair at 224 measured
-72.4 us against `torch.mm`'s 75.2 us at 4096^3; short-K shapes trail `torch.mm` by 10-25%
-from wave quantization and store bandwidth.
+`_clc`/`_atomic` schedules, `_acc1` (`acc_stages=1`) and `_n<tile_n>`. Short-K shapes trail
+`torch.mm`, from wave quantization and store bandwidth.
 
 ### Tile boundaries
 
@@ -91,8 +91,8 @@ early_release=True:   last tcgen05.ld -> wait::ld -> release TMEM -> SMEM/TMA st
 
 `early_release=True` is the default. It changes **when TMEM is reusable**, not when the
 output store finishes. It matters where the epilogue is long relative to the mainloop
-(short-K pairs, 0-3%); the second accumulator stage matters more (1-22%, most at
-4096x4096x512 on a pair, where the epilogue is as long as the 8-k-tile mainloop).
+(short-K pairs); the second accumulator stage matters more, most where the epilogue is as
+long as the mainloop.
 
 Work-ring scope is a tile-boundary cost too: cluster-scope thread arrivals emit a
 `MEMBAR.ALL.GPU` per receiving thread. Work payloads become ready from completed bytes and
@@ -145,9 +145,8 @@ space scattered dropped slots through static units' strided sequences and unbala
 view has shape `(2^30, N, 2^31 - 1)`: its row mode ends at TMA's clipping boundary, and its
 third coordinate selects the group's end row. A partial group tile is clipped like a tensor edge.
 
-**Choosing a cluster.** Small skewed groups waste rows in 128-row tiles (up to 1.5x the real
-rows at 64-128 groups); a pair's 256-row tiles waste about twice that, so `CtaPair()` pays only
-with few groups and large N.
+**Choosing a cluster.** Small skewed groups waste rows in 128-row tiles; a pair's 256-row
+tiles waste about twice as many, so `CtaPair()` pays only with few groups and large N.
 
 ```bash
 gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
@@ -157,7 +156,7 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 
 The bench uses skewed routing with 1/8 of the experts idle and compares `torch._grouped_mm`,
 a `torch.mm` loop, Inductor's Triton template and FlexGEMM's QUACK backend (`--help` lists
-variants). One-CTA static measured 0.83-1.06x `torch._grouped_mm`'s time on its six shapes.
+variants).
 
 ## Attention forward
 
@@ -189,8 +188,8 @@ lazy rescale; head dimension follows the tensors. See [configuration](configurat
 for all knobs and fixed choices.
 
 For short sequences prefer `StaticPersistent()` (FA4's default) over `ClusterLaunchControl()`:
-at 8x16x1024, CLC launches 512 CTAs where static launches 152, and static measured about 2-4%
-faster; on long sequences the two tie.
+at 8x16x1024, CLC launches 512 CTAs where static launches 152, and static is faster; on long
+sequences the two tie.
 
 K/V share channel-bound SMEM. The constructor-only `overlap_o_q=True` also reuses Q's bytes
 for epilogue SMEM; `fa4_fwd` does not expose it. This requires a non-persistent schedule
@@ -225,8 +224,8 @@ out, lse = fa4_fwd(
 - Tests compare O/LSE bitwise: ragged Q, nonuniform scales, repeated launches, persistent
   wraps, and subnormal rescale amplified by large finite V. SASS and wrapper kernel-name
   checks verify that the hardware path runs.
-- It cuts instructions, not traffic: SASS replaces 264 `FMNMX` with 10 plus
-  `LDTM.STAT.x32.MAX.F32` (12% fewer warp instructions at 4x16x4096), worth 0.9-2.0%.
+- It cuts instructions, not traffic: `LDTM.STAT.x32.MAX.F32` replaces most of the software
+  path's `FMNMX`, so the gain is small.
 
 ```bash
 gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 60s \
@@ -236,9 +235,8 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 60s \
 
 Shapes 0-2 are `(batch, heads, length)` `(4,16,4096)`, `(2,16,8192)` and `(8,16,1024)`, head
 dimension 128, non-causal; variants are CLC split-P with software and hardware max, static
-with hardware max, and FA4's default. With hardware max the port is within 0.4% of FA4 on the
-long shapes; static matches FA4 on the short one. `--profile` warms every variant and
-profiles one forward each between CUDA profiler start/stop (`ncu --profile-from-start off`).
+with hardware max, and FA4's default. `--profile` warms every variant and profiles one forward
+each between CUDA profiler start/stop (`ncu --profile-from-start off`).
 
 ## Attention backward
 
@@ -303,12 +301,12 @@ Design points worth reusing:
   the same way.
 - **Defer a commit past the loop's back edge** with `commit(signal=False)` and a raw arrival
   after S_{t+1}'s load (FA4's "dS_t is published once S_{t+1} is read"); a rotated loop that
-  closes the handle in its own iteration carries P_t in registers and was 1.5-2.4% slower causal.
+  closes the handle in its own iteration carries P_t in registers and is slower on causal runs.
 - **Arrive once per warp.** `Warps` sides replace per-thread arrivals; the other examples keep
-  `Threads`, where `Warps` measured -0.8% to +2.3%.
+  `Threads`, where `Warps` showed no consistent gain.
 - **Two Q stages are required:** with one, S_{t+1} waits for a load that needs Q_t's release.
 - **Write the peer's dS straight to SMEM** once the ds acquire guards it, and acquire ds only
-  after both dS stages are in TMEM; holding dS in registers or acquiring early cost 1-5%.
+  after both dS stages are in TMEM; holding dS in registers or acquiring early is slower.
 - dQ reduce and dK/dV epilogues order SMEM staging with declared `NamedBarrier`s and
   `bulk_commit_group`/`bulk_wait_group`, as in the persistent GEMM epilogue.
 - The pair's dS exchange is raw: compute thread 0 arms the peer's `xchg` mbarrier
@@ -322,8 +320,8 @@ Design points worth reusing:
 dK and dV are bit for bit FA4's results from the same kernel configuration (1-CTA against
 `disable_2cta`, the pair against FA4's default), non-causal and causal, including ragged
 lengths. dQ differs only by the order in which CTAs' TMA reduce-adds land in the fp32
-accumulator (max |diff| up to 9.8e-4 against values of order 1; FA4 is not bitwise
-reproducible there either). All three match an fp32 autograd reference within FA4's own error.
+accumulator (FA4 is not bitwise reproducible there either). All three match an fp32 autograd
+reference within FA4's own error.
 dK/dV are deterministic across launches; dQ is not, as in FA4.
 
 ```bash
@@ -333,8 +331,7 @@ gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=10s 1500s \
 ```
 
 The bench graph-replays one whole backward call (preprocess, main kernel, postprocess) per
-variant and times the main kernel with CUPTI. The 2-CTA port measured 1.4-3.1% faster than
-FA4's 2-CTA main kernel on every shape, both modes; the 1-CTA port is within 0.7% of FA4's.
+variant and times the main kernel with CUPTI.
 
 ## Single-token decode
 
@@ -369,8 +366,9 @@ kernel and returns BF16 O `(batch, 1, heads, d_v)` and fp32 LSE `(batch, heads, 
 The roles keep FA4's placement: QK and PV MMA warps, K/V-load plus split-LSE warp,
 Q-load/O-store warp, two alternating softmax warpgroups, and correction warpgroup.
 
-- `SplitKV` supplies `(split, kv_head, batch)` items. Per-sequence counts are read after
-  `PdlWait()`; indices past the count are dropped.
+- `SplitKV` supplies `(split, kv_head, batch, splits)` items; the fourth word is the sequence's
+  split count. Per-sequence counts are read after `PdlWait()`; indices past the count are
+  dropped.
 - `Sharing.ROUND_ROBIN` on S, P and row-max/row-sum mailboxes gives softmax[i] blocks
   i, i+2, … with one warpgroup's counts. **OneShot only:** after an odd block count, another
   item would start on softmax[1]'s epochs.
@@ -394,7 +392,7 @@ the table captured at its combine call.
 Tips for short decodes, where setup and tail dominate:
 
 - **Precompute divisors on the host.** `SplitKV.bind()` builds `FastDivmodDivisor` values once,
-  so roles avoid general integer division (-1.6% to -3.3% on small cases).
+  so roles avoid general integer division.
 - **Order the tail by dependency.** Correction runs the row-sum/1/L stats round trip before
   waiting for the final O slots.
 
@@ -406,7 +404,7 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 
 The bench runs FA4's prepare/decode/combine against the port's decode/combine on seven dense
 and ragged shapes, timing the decode kernel with CUPTI, and asserts bitwise partials. Long
-splits tie FA4; short and ragged ones measured within about 7%. For NCU source attribution add
+splits tie FA4; short and ragged ones trail it. For NCU source attribution add
 `--profile --shapes 0` under
 `CUTE_DSL_LINEINFO=1 ncu --profile-from-start off --cache-control none --import-source yes`,
 filtering kernels to `attn_kernel|warpdrive_fa4_decode`.
@@ -447,8 +445,7 @@ cannot cross those dynamic regions, unlike FA4's loader token.
 Why it helps: with split rings, V-stage reuse waits on the previous PV, so the loader stalls
 before the next K; in the shared ring V reuses K stages that QK already released. Split rings
 stay the default because the effect depends on the shape, and "ragged" alone does not predict
-it: shared measured 3.8% faster on 8x65536 ragged (8/1 heads) and 2.7% on 1x32768 (32/1), but
-5.9% slower on 2x131072 ragged and 1.5% slower on 8x32768 dense. Measure with `--shared-kv`.
+it: shared wins on some ragged shapes and loses on others. Measure with `--shared-kv`.
 
 ## Qwen3-0.6B decode megakernel
 
@@ -506,13 +503,13 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
   intermediate has its own buffer, so a launch has no write-after-read hazards.
 
 **What limits it** is latency between dependent phases, not bandwidth: a step has about 140
-dependent phases, a flag handoff between SMs costs about 0.5 us one way, and fetching
-already-published words costs an L2 round trip (about 0.47 us) plus bytes. Compute almost
-never waits for weights. Optimize the number and length of dependent phases, not cache hints.
+dependent phases, each pays a flag handoff between SMs, and fetching already-published words
+costs an L2 round trip plus bytes. Compute almost never waits for weights. Optimize the number
+and length of dependent phases, not cache hints.
 
 `QwenDecodeMegakernel(splits=19)` (passed through `QwenMegakernel(..., splits=19)`) gives one
-attention item per GB300 SM; it is faster from about ctx 6208 and slower below. The split count
-is static, so pick it for the contexts the runner decodes.
+attention item per GB300 SM; it is faster at long contexts and slower at short ones. The split
+count is static, so pick it for the contexts the runner decodes.
 
 Checkpoint tests skip unless Qwen3-0.6B is already in the local HF cache; they never download it
 (`hf download Qwen/Qwen3-0.6B` fetches it):
@@ -527,8 +524,7 @@ gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 2400s \
 ```
 
 The bench compares eager and `torch.compile` CUDA graphs and a logical-bytes read roofline at
-ctx 1024/4096/8192 (`--contexts`). At ctx 1024 the megakernel measured 453 us per step
-against 1365 us for `torch.compile` + graph, at 47% of the read roofline.
+ctx 1024/4096/8192 (`--contexts`).
 
 `QwenMegakernel(..., trace="globaltimer")` compiles the layer's
 [globaltimer ranges](tracing.md#globaltimer): every CTA records its compute and load work items
@@ -544,7 +540,7 @@ runner = QwenMegakernel(weights, max_len=1088, trace="globaltimer")
 runner(weights, token, pos, *caches)  # compile and warm up
 with mkt.trace_session(runner, trace_path="step.pftrace") as session:
     runner.launch(*caches)
-mkt.phase_spans(session.ranges, runner.table)  # {"QKV": 1.9, "ATTN": 3.8, ...} us per layer
+mkt.phase_spans(session.ranges, runner.table)  # {"QKV": us, "ATTN": us, ...} per layer
 mkt.input_waits(session.ranges, runner.table)  # median row start -> inputs ready, us
 ```
 
@@ -570,7 +566,7 @@ Pitfalls:
 - **Register budgets don't help a 9-warp CTA.** Three warps share one SM sub-partition, so
   ptxas caps every thread at 168 registers whatever `RoleConfig` asks for; pushing the compute
   role past 168 spills in hot loops. Check `cuobjdump --dump-resource-usage` before timing.
-- **Unroll GEMV k-loops fully;** the rolled loop kept a stack frame (about 2.6% per step).
+- **Unroll GEMV k-loops fully;** the rolled loop kept a stack frame.
 - A one-entry buffer dict makes `h.data` the bare tensor (use `h.view("W")`), and a rank-1
   SMEM layout needs a tuple shape (`cute.make_layout((3072,))`).
 - Bit-level helpers (fp32/int32 bitcasts, i64 packing, vector relaxed loads) need private MLIR

@@ -22,10 +22,9 @@ roles' seven warps to eight for the 192/56-register warpgroup split. Bias tiles 
 output-gradient sources; transition tiles skip those streams entirely. Only the final FP32
 partial is written to global memory.
 
-The chunk recurrence is a serial latency chain (~1.3 us per chunk at BN=32), so when
-``heads * tiles`` leaves SMs idle the wrapper cuts the ranges' chunks into work items that
-each scan from ``[0 | I]`` and ``compose_work_items`` folds the partials per range on the
-device.
+The chunk recurrence is a serial latency chain, so when ``heads * tiles`` leaves SMs idle the
+wrapper cuts the ranges' chunks into work items that each scan from ``[0 | I]`` and
+``compose_work_items`` folds the partials per range on the device.
 
 The fp32-valued MMA B operands (state ``X`` and the corrected write gradient
 ``dv``) are split into hi/lo halves of the I/O dtype and accumulated in two UMMA
@@ -49,7 +48,17 @@ from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.constants import is_sm100_kda_capability
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
+    _CUTE_IO_TYPES,
+    _IO_TYPE_NAMES,
+    BT,
+    DATA_ALIGN_BYTES,
+    KEY_DIM,
     MAX_RANGES,
+    SUMMARY_DIM,
+    VAL_DIM,
+    _aligned,
+    _feature_sequence_head_batch_view,
+    _sequence_feature_head_batch_view,
     decode_work_row,
     plan_work_budget,
     zero_tail_tokens,
@@ -78,36 +87,9 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, get_compile_target, jit_cache
 from attn_gym.warpdrive.compat import LayoutEnum
 
-BT = 64
-KEY_DIM = 128
-VAL_DIM = 128
-SUMMARY_DIM = VAL_DIM + KEY_DIM
-DATA_ALIGN_BYTES = 16
-
-_IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
-_CUTE_IO_TYPES = {"bf16": cutlass.BFloat16, "fp16": cutlass.Float16}
 # The flat compile cache builds the op internally. Keep host launch resources separate;
 # StaticPersistent reads only max_ctas, but carries the same workspace ABI as other schedules.
 _LAUNCH_WORK = WorkStream(schedule=StaticPersistent())
-
-
-def _aligned(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize the uncommon contiguous view that misses the TMA alignment."""
-    return tensor if tensor.data_ptr() % DATA_ALIGN_BYTES == 0 else tensor.clone()
-
-
-@cute.jit
-def _sequence_feature_head_batch_view(tensor):
-    """Re-rank ``[B,T,H,D]`` as ``[T,D,(H,B)]`` for a TMA operand."""
-    layout = cute.group_modes(cute.select(tensor.layout, mode=[1, 3, 2, 0]), 2, 4)
-    return cute.make_tensor(tensor.iterator, layout)
-
-
-@cute.jit
-def _feature_sequence_head_batch_view(tensor):
-    """Re-rank ``[B,T,H,D]`` as ``[D,T,(H,B)]`` for a TMA operand."""
-    layout = cute.group_modes(cute.select(tensor.layout, mode=[3, 1, 2, 0]), 2, 4)
-    return cute.make_tensor(tensor.iterator, layout)
 
 
 class TmaOp(NamedTuple):
@@ -180,8 +162,8 @@ class ReverseSummaryParams:
 class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
     """Compute reverse affine summaries with persistent TMA/UMMA state tiles."""
 
-    # Augmented-state columns per CTA. A BN=16 tile covered half the columns for only ~25% less
-    # time per chunk; work items fill idle SMs instead.
+    # Augmented-state columns per CTA. A BN=16 tile covers half the columns in only slightly
+    # less time per chunk; work items fill idle SMs instead.
     BN = 32
 
     def __init__(
@@ -505,8 +487,8 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         The item scans its chunks from ``[0 | I]`` into output row ``w``; see ``decode_work_row``
         for the row layout. An all-zero row stores the identity.
         """
-        # Raster decodes runtime extents, once per item in each role. Its m-fastest order
-        # is the previous flat layout: column tile, then head, then work-table row.
+        # Raster decodes runtime extents once per item in each role, m fastest: column tile,
+        # then head, then work-table row.
         column_tile, head, row = work_index
         start, length, chunk_begin, chunk_end = decode_work_row(work_table, row, self.whole_ranges)
         return column_tile, head, row, start, length, chunk_begin, chunk_end
@@ -1242,10 +1224,10 @@ def build_state_grad_summaries(
 
     The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
     across different ``bounds`` values of the same shape. The tokens right after a partial last
-    chunk are read and then cancelled (through zeroed ``dO`` rows and ``w`` columns), so they must
-    be finite. Supported scope: B=1, fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses
-    the native UMMA kernel; other capability 8.0+ targets use Triton. Both backends split long
-    ranges into work items when the static budget permits, then compose on the device.
+    chunk are read but dropped by selection, so they may hold anything. Supported scope: B=1,
+    fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
+    capability 8.0+ targets use Triton. Both backends split long ranges into work items when
+    the static budget permits, then compose on the device.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape

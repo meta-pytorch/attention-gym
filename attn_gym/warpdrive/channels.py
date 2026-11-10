@@ -252,7 +252,7 @@ class Channel:
     **Rule:** a pair-scoped channel whose signal publishes ordinary memory (SMEM read through
     DSMEM, or global memory) that the other CTA reads outside a layer payload must set
     ``remote_scope="cluster"``. The layer cannot detect this. Cluster scope is measurably
-    slower on hot channels (about 30% on FA4's S release).
+    slower on hot channels.
 
     ``override``: replace derived values of the channel's ``cluster.Scope``. The user value
     wins, and ``describe()`` prints it next to the derived one, flagging differences. Keys:

@@ -299,11 +299,12 @@ named barriers without known users and storage aliases are listed under the figu
 
 ### See which CTA runs what
 
-For a static schedule (`OneShot`, `StaticPersistent`) the host can list exactly which work
-items each CTA runs, in order: `WorkStream.assignment(space, max_ctas)` runs the schedule's
-own index sequence for every work unit and returns `[cta][slot] -> (index, item)`. A pure
-mapping such as `Raster` decodes the items itself; a mapping that reads tables or device
-data takes its host counterpart as `decode=`, which also tells it which items are dropped.
+For a local schedule (`OneShot`, `StaticPersistent`, `TilePersistent`) the host can list
+exactly which work items each CTA runs, in order: `WorkStream.assignment(space, max_ctas)` runs
+the schedule's own index sequence for every work unit and returns
+`[cta][slot] -> (index, item)`. A pure mapping such as `Raster` decodes the items itself; a
+mapping that reads tables or device data takes its host counterpart as `decode=`, which also
+tells it which items are dropped.
 
 ```python
 rows = PersistentGemm().work.assignment((32, 16, 1), max_ctas=148)
@@ -561,5 +562,5 @@ Within-item feedback that would form a cycle is modeled as next-item feedback, n
 per-stage causal model. Use explicit epochs and runtime waits for that finer question.
 The plan is not a liveness/race proof or a promised performance threshold.
 
-See the [pipeline profiler README](profiler.md#pipeline-analysis)
-for critical-path analysis, measured timelines and capture tooling.
+See the [profiler page](profiler.md#pipeline-analysis) for critical-path analysis, measured
+timelines and capture tooling.

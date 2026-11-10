@@ -322,16 +322,16 @@ when relative element offsets can exceed signed int32. Inventory every input, ou
 tensor, manually reconstructed view, and manual load/store offset; checking only the primary input
 or `numel()` is insufficient.
 
-For Triton, use `attn_gym._backends.triton.requires_int64_offsets` in a
+For Triton, use `attn_gym._backends.triton.utils.requires_int64_offsets` in a
 `@triton.heuristics` `USE_INT64_OFFSETS` constexpr. It checks reachable storage cosize for the
 project's nonnegative-strided layouts. In the wide branch, cast program IDs, loaded token/chunk
 origins, and other address indices to `tl.int64` before the first potentially overflowing multiply
 or addition. Casting a completed offset or pointer is too late. Bounded routing arrays may stay
 int32, but widen their loaded values before using them in wide pointer arithmetic.
 
-For CuTeDSL TVM-FFI, use `attn_gym._backends.cute.requires_int64_abi`. In addition to reachable
-cosize, it checks every declared ABI stride because a size-one dimension can carry an unreachable
-stride larger than `INT32_MAX` that the compiled signature must still represent. Carry
+For CuTeDSL TVM-FFI, use `attn_gym._backends.cute.utils.requires_int64_abi`. In addition to
+reachable cosize, it checks every declared ABI stride because a size-one dimension can carry an
+unreachable stride larger than `INT32_MAX` that the compiled signature must still represent. Carry
 `use_int64_offsets` through the op, compile-cache key, and stable kernel name; use matching
 `cute.sym_int64` fake-signature fields in the wide variant. Widen values before multiplication when
 constructing layouts or adding to iterators.

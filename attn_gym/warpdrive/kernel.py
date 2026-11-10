@@ -1061,7 +1061,7 @@ class WarpSpecialized(metaclass=_KernelType):
         profiler records into the buffer passed to ``run_roles(..., trace_buffer=...)``,
         decoded by ``trace_session.trace_session``; ``None`` emits no ranges and no IR.
         ``waits=False`` keeps only the role, work-item and ``trace_region`` ranges: wait ranges
-        are costly (about 35% on FA4 under ``run-iket``), role ranges nearly free.
+        are costly, role ranges nearly free.
         ``events_per_role``: globaltimer records per role instance and CTA; later ranges are
         dropped.
 

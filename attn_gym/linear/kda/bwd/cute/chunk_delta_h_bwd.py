@@ -360,8 +360,8 @@ class BlackwellDeltaHBwd(WarpSpecialized):
         self.wdv_tile = (self.BK, self.BV, self.BT)
 
         # The BV=32 dh state needs more registers in the state warps. The single-warp roles'
-        # budgets are measured, not derived from live state: 40 is 1-4% slower than these;
-        # 64 at BV=32 is 5% slower on long dense sequences, 56 at BV=16 1.5% slower on packs.
+        # budgets are measured, not derived from live state: 40 is slower than these, as are
+        # 64 at BV=32 (long dense sequences) and 56 at BV=16 (packs).
         if head_bv > 16:
             aux = {name: RoleConfig(warp, regs=56) for warp, name in enumerate(AUX_ROLES, 4)}
             self.roles = {"state": RoleConfig(range(4), regs=160), **aux}

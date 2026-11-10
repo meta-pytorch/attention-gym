@@ -243,6 +243,9 @@ def launch(
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(q.device.index))
+        # Packed bounds already contain both mask decisions; neither kernel reads these flags.
+        if candidate_bounds is not None:
+            causal, compress_ratio = False, 1
         # A unit head stride avoids the generic reducer's measured strided-load overhead.
         score_args = (
             q.dtype,
