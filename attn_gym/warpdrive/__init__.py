@@ -29,6 +29,8 @@ Channels support these handoffs (``channels.py``):
 * ``sync="named"`` uses CTA named barriers for Threads-to-Threads handoffs.
 * ``try_wait()``/``try_acquire()`` probe readiness; ``wait``/``acquire(token=...)`` skip the
   blocking wait when ready. ``peek()`` returns a read-only ``Preview`` of the next wait's epoch.
+* ``span()`` holds a stage across a counted loop: ``begin(i)`` waits in the first iteration,
+  ``commit(i)``/``release(i)`` signal in the last.
 * ``NamedBarrier(threads=N)`` allocates a named barrier for intra-role syncs or one-shot
   flags between roles (``named.py``).
 
@@ -102,6 +104,7 @@ _EXPORTS = {
         "Ring",
         "Sharing",
         "Slots",
+        "Span",
         "Threads",
         "Tma",
         "Token",
@@ -177,6 +180,7 @@ __all__ = [
     "Slots",
     "SmemBuffer",
     "SmemPlan",
+    "Span",
     "StageView",
     "StaticPersistent",
     "Threads",
