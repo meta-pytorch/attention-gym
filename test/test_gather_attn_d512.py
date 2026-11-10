@@ -1,6 +1,7 @@
-"""D=512 training coverage for portable and Blackwell shared-KV Triton schedules."""
+"""D=512 training coverage for portable and shared-KV Triton schedules."""
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import NamedTuple
 
 import pytest
@@ -39,8 +40,8 @@ def make_inputs(
 ) -> AttentionInputs:
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for Triton")
-    if heads >= 16 and torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("Blackwell required for the shared-KV schedule")
+    if heads >= 16 and torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("Ampere or newer required for the shared-KV schedule")
 
     generator = torch.Generator(device="cuda").manual_seed(2026)
     kv_heads = 1 if share_kv else heads
@@ -291,14 +292,15 @@ def test_d512_auto_fallback_training():
 @pytest.mark.parametrize("head_dim", [16, 64, 128, 144, 256, 496, 512, 528])
 def test_shared_schedule_head_dimensions(monkeypatch, head_dim):
     pytest.importorskip("triton")
-    from attn_gym.sparse.gather_attn.impl.triton.primitives import (
-        can_use_shared_kv_schedule,
-    )
+    from attn_gym.sparse.gather_attn.impl.triton import primitives
 
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        primitives, "get_device_properties", lambda device: SimpleNamespace(major=10)
+    )
     query = torch.empty(1, 16, 1, head_dim, dtype=torch.bfloat16, device="meta")
     kv = torch.empty(1, 1, 1, head_dim, dtype=query.dtype, device="meta").expand(-1, 16, -1, -1)
-    assert can_use_shared_kv_schedule(query, kv, kv, 128) == (head_dim in (16, 64, 128, 512))
+    eligible = primitives.can_use_shared_kv_schedule(query, kv, kv, 128)
+    assert eligible == (head_dim in (16, 64, 128, 512))
 
 
 @pytest.mark.full_autotune

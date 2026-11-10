@@ -56,8 +56,8 @@ def skip_unsupported(backend: str) -> None:
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("SM100 or SM103 required")
         pytest.importorskip("flash_attn.cute.interface")
-    elif torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("Blackwell required for paired Triton")
+    elif torch.cuda.get_device_capability()[0] < 8:
+        pytest.skip("Ampere or newer required for paired Triton")
 
 
 def make_inputs(

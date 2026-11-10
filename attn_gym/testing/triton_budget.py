@@ -17,6 +17,7 @@ from triton.backends.compiler import GPUTarget
 from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym.warpdrive.cache import get_compile_target
 
@@ -72,14 +73,19 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
             real_get_device_properties(device), capability, max_shared_mem
         )
 
-    with (
-        mock.patch.object(
-            triton.runtime.driver.active, "get_current_target", return_value=local_target
-        ),
-        mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
-        mock.patch.object(torch.cuda, "get_device_properties", device_properties),
-    ):
-        yield
+    # Host dispatch caches device properties: drop the real ones here and the emulated ones after.
+    get_device_properties.cache_clear()
+    try:
+        with (
+            mock.patch.object(
+                triton.runtime.driver.active, "get_current_target", return_value=local_target
+            ),
+            mock.patch.object(torch.cuda, "get_device_capability", return_value=capability),
+            mock.patch.object(torch.cuda, "get_device_properties", device_properties),
+        ):
+            yield
+    finally:
+        get_device_properties.cache_clear()
 
 
 @contextmanager

@@ -14,10 +14,18 @@ import pytest
 import torch
 
 from attn_gym.sparse.gather_attn import Impl, gather_attn
-from attn_gym.testing.triton_budget import compile_only_for_target, emulate_device_dispatch
+from attn_gym.testing.gather_attn import as_fp64, assert_numerics, skip_unsupported
+from attn_gym.testing.gather_attn import make_inputs as make_mla_inputs
+from attn_gym.testing.triton_budget import (
+    Launch,
+    compile_only_for_target,
+    emulate_device_dispatch,
+)
 
 SM86_CAPABILITY = (8, 6)
 SM86_MAX_SHARED_MEMORY = 101376
+# Consumer Blackwell has SM86's per-block limit, not datacenter Blackwell's.
+SM120_CAPABILITY = (12, 0)
 SM100_CAPABILITY = (10, 0)
 SM100_MAX_SHARED_MEMORY = 232448
 SM100_TENSOR_MEMORY_COLUMNS = 512
@@ -53,21 +61,30 @@ def make_inputs(
     }
 
 
-# (heads, head_dim, window, topk): torchtitan's DeepSeek-V4 debug model (CSA/HCA top-k and SWA
-# with an empty top-k), a pipelined local window, the flash model's D=512 (top-k reduced to
-# keep the fully unrolled top-k loop cheap to compile), and smaller heads.
+def over_shared_memory(launches: list[Launch], limit: int) -> dict[str, int]:
+    """Map kernels whose configs all exceed ``limit`` to their minimum shared-memory bytes."""
+    return {launch.kernel: min(launch.shared) for launch in launches if min(launch.shared) > limit}
+
+
+# (heads, head_dim, window, topk, forward kernel): torchtitan's DeepSeek-V4 debug model (CSA/HCA
+# top-k and SWA with an empty top-k), a pipelined local window, the flash model's D=512, and
+# smaller heads. BF16 with 16+ heads takes the shared-KV schedule unless D=256; fewer heads
+# keep the per-head kernels.
 BUDGET_CASES = [
-    (16, 256, 16, 16),
-    (16, 256, 16, 0),
-    (8, 256, 128, 16),
-    (32, 512, 128, 16),
-    (16, 128, 128, 64),
-    (16, 64, 128, 64),
+    (16, 256, 16, 16, "_gather_attn_fwd"),
+    (16, 256, 16, 0, "_gather_attn_fwd"),
+    (8, 256, 128, 16, "_gather_attn_fwd"),
+    (32, 512, 128, 16, "_gather_attn_fwd_shared"),
+    (16, 128, 128, 64, "_gather_attn_fwd_shared"),
+    (16, 64, 128, 64, "_gather_attn_fwd_shared"),
+    (8, 512, 128, 16, "_gather_attn_fwd"),
+    (8, 128, 128, 64, "_gather_attn_fwd"),
+    (8, 64, 128, 64, "_gather_attn_fwd"),
 ]
 
 
-@pytest.mark.parametrize("heads,head_dim,window,topk", BUDGET_CASES)
-def test_sm86_launches_fit_shared_memory(heads, head_dim, window, topk):
+@pytest.mark.parametrize("heads,head_dim,window,topk,forward_kernel", BUDGET_CASES)
+def test_sm86_launches_fit_shared_memory(heads, head_dim, window, topk, forward_kernel):
     """Every launch has a config within SM86's 101376-byte per-block limit."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for Triton")
@@ -79,14 +96,68 @@ def test_sm86_launches_fit_shared_memory(heads, head_dim, window, topk):
         output.sum().backward()
 
     kernels = {launch.kernel for launch in launches}
-    assert {"_gather_attn_fwd", "_gather_attn_bwd_dq", "_gather_attn_bwd_dlocal_kv"} <= kernels
-    assert ("_gather_attn_bwd_dsparse_kv" in kernels) == (topk > 0)
-    too_large = {
-        launch.kernel: min(launch.shared)
-        for launch in launches
-        if min(launch.shared) > SM86_MAX_SHARED_MEMORY
-    }
-    assert not too_large
+    assert forward_kernel in kernels
+    for stage in ("bwd_dq", "bwd_dlocal_kv"):
+        assert any(kernel.startswith(f"_gather_attn_{stage}") for kernel in kernels), stage
+    assert any("bwd_dsparse_kv" in kernel for kernel in kernels) == (topk > 0)
+    assert not over_shared_memory(launches, SM86_MAX_SHARED_MEMORY)
+
+
+@pytest.mark.parametrize(
+    "heads,latent_dim,rope_dim",
+    [(96, 512, 0), (96, 512, 64), (96, 512, 128), (128, 128, 128)],
+    ids=["mla-bare", "mla-paired", "mla-wide-rope", "widest-head-tile"],
+)
+@pytest.mark.parametrize("capability", [SM86_CAPABILITY, SM120_CAPABILITY], ids=["sm86", "sm120"])
+def test_shared_kv_launches_fit_99_kib_shared_memory(capability, heads, latent_dim, rope_dim):
+    """Each shared-KV forward/backward launch has a config within 99 KiB of shared memory.
+
+    The cases cover absorbed MLA (96 heads, latent 512, RoPE 64), the widest rows, and the
+    largest head tile. Previously, datacenter-sized key tiles needed 163840 bytes on SM120,
+    and other GPUs rejected RoPE pairs.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton")
+    inputs = make_mla_inputs(
+        heads=heads,
+        latent_dim=latent_dim,
+        rope_dim=rope_dim,
+        seq_len=64,
+        topk=64,
+        with_docs=False,
+    )
+    with compile_only_for_target(capability, SM86_MAX_SHARED_MEMORY) as launches:
+        output = gather_attn(
+            **inputs.kwargs(),
+            sliding_window_size=32,
+            scale=0.0625,
+            kernel_options={"backend": "triton"},
+        )
+        output.sum().backward()
+
+    assert "_gather_attn_fwd_shared" in {launch.kernel for launch in launches}
+    assert not over_shared_memory(launches, SM86_MAX_SHARED_MEMORY)
+
+
+@pytest.mark.parametrize("rope_dim", [0, 64], ids=["bare", "paired"])
+def test_absorbed_mla_small_key_tiles_match_reference(rope_dim):
+    """Key tiles selected for a 99 KiB budget match reference outputs and gradients."""
+    skip_unsupported("triton")
+    # 40 selections end in a partial tile for both the 16- and 32-key tiles.
+    inputs = make_mla_inputs(heads=96, rope_dim=rope_dim, topk=40)
+    reference_inputs = as_fp64(inputs)
+    options = {"sliding_window_size": 7, "scale": 0.0625}
+    expected = gather_attn(**reference_inputs.kwargs(), **options, impl=Impl.REFERENCE)
+    grad_output = torch.randn_like(expected)
+    expected_grads = torch.autograd.grad(expected, reference_inputs.differentiable(), grad_output)
+
+    with emulate_device_dispatch(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY):
+        output = gather_attn(**inputs.kwargs(), **options, kernel_options={"backend": "triton"})
+        grads = torch.autograd.grad(output, inputs.differentiable(), grad_output.to(output.dtype))
+
+    assert_numerics(output, expected, "output")
+    for index, (grad, expected_grad) in enumerate(zip(grads, expected_grads, strict=True)):
+        assert_numerics(grad, expected_grad, f"gradient {index}")
 
 
 @pytest.mark.parametrize(
@@ -106,7 +177,7 @@ def test_sm86_tiles_match_reference(head_dim, window, dtype):
     grad_output = torch.randn_like(expected)
     expected.backward(grad_output)
 
-    # Take the SM86 host path (no TMA, no Blackwell schedule) on the local GPU.
+    # Take the SM86 host path (no TMA; four heads keep the per-head kernels) on the local GPU.
     with emulate_device_dispatch(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY):
         output = gather_attn(
             **inputs, sliding_window_size=window, kernel_options={"backend": "triton"}

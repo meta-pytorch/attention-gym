@@ -30,7 +30,7 @@ IMPLEMENTATION_SCALE_CASES = [
 if torch.cuda.is_available():
     IMPLEMENTATION_SCALE_CASES.append((Impl.FUSED, {"backend": "triton"}, 0.25))
 
-BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+SHARED_KV_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
 
 pytestmark = pytest.mark.usefixtures("gather_attn_single_config")
 
@@ -41,7 +41,7 @@ def attention(impl, kernel_options):
 
 
 @pytest.fixture(params=["batched", "packed"])
-def shared_kv_blackwell_inputs(request):
+def shared_kv_schedule_inputs(request):
     """Create dense-batched or packed partial-head-tile inputs with a float32 sink."""
     torch.manual_seed(123)
     batch = 1 if request.param == "packed" else 2
@@ -557,16 +557,16 @@ def test_mixed_repeated_and_unique_indices_backends_match():
 
 
 # ---------------------------------------------------------------------------
-# 6. Shared-KV Blackwell schedules
+# 6. Shared-KV schedules
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+@pytest.mark.skipif(not SHARED_KV_AVAILABLE, reason="Ampere or newer GPU required")
 @pytest.mark.full_autotune
-def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
+def test_shared_kv_schedule_matches_eager(shared_kv_schedule_inputs):
     """The default atomic shared-KV path matches eager forward and gradients."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k = (
-        shared_kv_blackwell_inputs
+        shared_kv_schedule_inputs
     )
     kv_indices = kv_indices.to(torch.int32)
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
@@ -636,12 +636,12 @@ def test_shared_kv_blackwell_matches_eager(shared_kv_blackwell_inputs):
     )
 
 
-@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+@pytest.mark.skipif(not SHARED_KV_AVAILABLE, reason="Ampere or newer GPU required")
 @pytest.mark.full_autotune
-def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
+def test_shared_kv_schedule_deterministic_backward(shared_kv_schedule_inputs):
     """Deterministic mode retains the output-owned shared-KV backward schedule."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k = (
-        shared_kv_blackwell_inputs
+        shared_kv_schedule_inputs
     )
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
     was_enabled = torch.are_deterministic_algorithms_enabled()
@@ -686,7 +686,7 @@ def test_shared_kv_blackwell_deterministic_backward(shared_kv_blackwell_inputs):
         torch.testing.assert_close(repeated_grad, actual_grad, atol=0, rtol=0)
 
 
-@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+@pytest.mark.skipif(not SHARED_KV_AVAILABLE, reason="Ampere or newer GPU required")
 def test_zero_stride_unshared_kv_keeps_per_head_gradients():
     """Zero-stride shape-H KV inputs retain distinct per-head gradient semantics."""
     torch.manual_seed(456)
@@ -744,13 +744,13 @@ def test_zero_stride_unshared_kv_keeps_per_head_gradients():
         torch.testing.assert_close(actual_grad, expected_grad, atol=0.06, rtol=0.03)
 
 
-@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
+@pytest.mark.skipif(not SHARED_KV_AVAILABLE, reason="Ampere or newer GPU required")
 @pytest.mark.parametrize(
     "heads,seq_len,head_dim,topk,window",
     [(128, 17, 128, 16, 0), (16, 160, 64, 0, 136)],
     ids=["max-head-sparse-only", "min-head-multi-tile-window-only"],
 )
-def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, window):
+def test_shared_kv_schedule_single_branch(heads, seq_len, head_dim, topk, window):
     """Boundary head tiles handle either attention branch alone."""
     torch.manual_seed(321)
     batch = 1
@@ -834,8 +834,8 @@ def test_shared_kv_blackwell_single_branch(heads, seq_len, head_dim, topk, windo
         assert actual_grads[2].count_nonzero().item() == 0
 
 
-@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
-def test_shared_kv_blackwell_dsv4_forward():
+@pytest.mark.skipif(not SHARED_KV_AVAILABLE, reason="Ampere or newer GPU required")
+def test_shared_kv_schedule_dsv4_forward():
     """The tiled shared-KV forward handles DSV4's head dimension and sparse top-k."""
     torch.manual_seed(2026)
     batch, heads, seq_len, head_dim = 1, 64, 16, 512
@@ -893,11 +893,11 @@ def test_shared_kv_blackwell_dsv4_forward():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not BLACKWELL_AVAILABLE, reason="Blackwell GPU required")
-def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs):
+@pytest.mark.skipif(not SHARED_KV_AVAILABLE, reason="Ampere or newer GPU required")
+def test_shared_kv_schedule_torch_compile_fullgraph(shared_kv_schedule_inputs):
     """The shared-KV Triton forward and backward compile without graph breaks."""
     query, local_kv, sparse_kv, kv_indices, attention_sink, cu_seqlens, cu_seqlens_k = (
-        shared_kv_blackwell_inputs
+        shared_kv_schedule_inputs
     )
     differentiable_inputs = query, local_kv, sparse_kv, attention_sink
 
@@ -949,7 +949,7 @@ def test_shared_kv_blackwell_torch_compile_fullgraph(shared_kv_blackwell_inputs)
 def test_repeated_inputs_torch_compile_fullgraph(case, heads):
     """One tensor passed as several inputs compiles with gradients and matches eager bitwise:
     one pool for local and sparse keys, one offsets tensor for both packed partitions, or
-    both at once, as QSA calls it. 16 heads also reach the shared-KV Blackwell schedule.
+    both at once, as QSA calls it. 16 heads also reach the shared-KV schedule.
 
     The pool's gradient must also equal the sum of separate local and sparse leaves' gradients,
     which a gradient lost on the repeated input would break on both paths alike."""

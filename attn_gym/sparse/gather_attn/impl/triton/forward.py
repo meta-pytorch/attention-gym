@@ -27,6 +27,7 @@ from .primitives import (
     resolve_selected_rows,
     select_tiles,
     selection_bits,
+    shared_forward_tiles,
     store_bhsd,
     tuning_key,
 )
@@ -816,17 +817,22 @@ def _gather_attn_fwd_tma(
 
 
 def prune_shared_forward_configs(configs, args):
-    """Avoid local tiles that exceed shared memory for wide head dimensions."""
-    if args["D"] <= 128:
-        return configs
-    return [config for config in configs if config.kwargs["BLOCK_N"] == 64]
+    """Limit local tiles to those that fit the device's shared memory.
+
+    D <= 128 with a 64-key device tile tunes 64-, 128-, and 256-key local tiles; every other
+    case uses only the device's key tile.
+    """
+    _, key_rows = shared_forward_tiles(args["query_ptr"], args["ROPE_DIM"])
+    if key_rows == 64 and args["D"] <= 128:
+        return [config for config in configs if config.kwargs["BLOCK_N"] >= 64]
+    return [config for config in configs if config.kwargs["BLOCK_N"] == key_rows]
 
 
 _FWD_SHARED = TritonTuner(
     _gather_attn_fwd_shared,
     [
         triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
-        for block_n in (64, 128, 256)
+        for block_n in (64, 128, 256, 32, 16)
         for num_warps in (4, 8)
     ],
     key=tuning_key("query_ptr", "H", "D", "ROPE_DIM", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
@@ -845,14 +851,14 @@ _FWD_TMA = TritonTuner(
     ),
 )
 
-# Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256). On Blackwell,
-# FP32 D=256 skips the middle tile: it fits shared memory but needs 576 tensor-memory columns.
 ROPE_REQUIREMENTS = (
-    "Triton gather_attn supports key-only RoPE tensors only on the Blackwell shared-KV "
-    "schedule: BF16, shared KV, 16-128 heads, latent width <= 128 or 512, RoPE width 16, 32, "
-    "64, or 128, with sparse RoPE (and local RoPE under a window) broadcast across heads."
+    "Triton gather_attn supports key-only RoPE tensors only on the shared-KV schedule: "
+    "Ampere or newer, BF16, shared KV, 16-128 heads, latent width <= 128 or 512, RoPE width "
+    "16, 32, 64, or 128, with sparse RoPE (and local RoPE under a window) broadcast across heads."
 )
 
+# Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256). On Blackwell,
+# FP32 D=256 skips the middle tile: it fits shared memory but needs 576 tensor-memory columns.
 GENERIC_FORWARD_TILES = (
     TileConfig(64, 128, 8, 3, shared_rows=256, tmem_cols=512),
     TileConfig(64, 64, 8, 3, shared_rows=192, tmem_cols=576),
@@ -1159,15 +1165,11 @@ def _launch_forward(
         cu_seqlens_k,
     )
 
-    # This head-major schedule is tuned for shared KV on Blackwell.
+    # This head-major schedule shares each gathered key tile across the query heads.
     if schedule == "shared":
-        # A smaller head tile keeps D=512 accumulators within Blackwell's resources.
-        block_h = (
-            triton.next_power_of_2(heads)
-            if head_dim <= 128
-            else min(32, triton.next_power_of_2(heads))
-        )
-        block_k = max(16, min(64, triton.next_power_of_2(topk)))
+        rope_dim = 0 if query_rope is None else query_rope.shape[-1]
+        block_h, key_rows = shared_forward_tiles(query, rope_dim)
+        block_k = max(16, min(key_rows, triton.next_power_of_2(topk)))
         _FWD_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
@@ -1200,7 +1202,7 @@ def _launch_forward(
             V_IS_K=True,
             S=seq_len,
             D=head_dim,
-            ROPE_DIM=0 if query_rope is None else query_rope.shape[-1],
+            ROPE_DIM=rope_dim,
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             WINDOW=sliding_window_size,
@@ -1217,7 +1219,7 @@ def _launch_forward(
     if query_rope is not None:
         raise ValueError(ROPE_REQUIREMENTS)
 
-    # D=512 must also fit the generic path (non-Blackwell, FP16/FP32, or unshared KV).
+    # D=512 must also fit the generic path (FP16/FP32, unshared KV, or under 16 heads).
     block_m, block_n, num_warps, num_stages, *_ = (
         TileConfig(16, 16, 4, 1)
         if head_dim == 512
