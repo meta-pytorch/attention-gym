@@ -191,6 +191,55 @@ SCENARIOS = {
         "topk": 64,
         "attention_sink": True,
     },
+    # Up to 3 (row, KV head) programs take the small-batch tiles (16 keys, keys row-major).
+    "small_batch_qsa_mtp": {"seqlens": [3000], "query_lens": [3], "heads": 6, "kv_heads": 1},
+    "small_batch_partial_block": {
+        "seqlens": [3003],
+        "query_lens": [1],
+        "heads": 6,
+        "kv_heads": 1,
+    },
+    "small_batch_empty_row": {
+        "seqlens": [0],
+        "query_lens": [1],
+        "heads": 6,
+        "kv_heads": 1,
+        "attention_sink": True,
+    },
+    "small_batch_large_budget": {
+        "seqlens": [10003],
+        "query_lens": [1],
+        "heads": 6,
+        "kv_heads": 1,
+        "topk": 2048,
+    },
+    "small_batch_looped_budget": {
+        "seqlens": [40003],
+        "query_lens": [1],
+        "heads": 6,
+        "kv_heads": 1,
+        "head_dim": 32,
+        "topk": 8192,
+    },
+    "small_batch_shared_window_sink": {
+        "seqlens": [3000],
+        "query_lens": [1],
+        "window_size": 100,
+        "attention_sink": True,
+    },
+    "small_batch_dsv4_head_dim_512": {
+        "seqlens": [64000],
+        "query_lens": [1],
+        "index_block_size": 1,
+        "topk": 512,
+        "compress_ratio": 4,
+        "window_size": 128,
+        "attention_sink": True,
+        "heads": 8,
+        "kv_heads": 1,
+        "head_dim": 512,
+        "latent_values": True,
+    },
 }
 
 
@@ -228,9 +277,11 @@ def test_empty_batches_and_selections():
 
 
 @requires_cuda
-def test_cuda_graph_replay_tracks_new_inputs():
-    inputs = make_paged_sparse_decode_inputs([3000, 900, 64], [1, 1, 1], seed=3)
-    fresh = make_paged_sparse_decode_inputs([3000, 900, 64], [1, 1, 1], seed=4)
+@pytest.mark.parametrize("small", [False, True])
+def test_cuda_graph_replay_tracks_new_inputs(small):
+    kwargs = {"heads": 6, "kv_heads": 1} if small else {}
+    inputs = make_paged_sparse_decode_inputs([3003, 900, 64], [1, 1, 1], seed=3, **kwargs)
+    fresh = make_paged_sparse_decode_inputs([3003, 900, 64], [1, 1, 1], seed=4, **kwargs)
     paged_sparse_decode(**inputs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
@@ -245,20 +296,25 @@ def test_cuda_graph_replay_tracks_new_inputs():
 
 
 @requires_cuda
-def test_compiled_calls_reuse_kernels(triton_compiles):
-    """Batch, sequence count, and split count are runtime values: one compile serves them all."""
+@pytest.mark.parametrize("topk", [512, 1024, 2048])
+def test_compiled_calls_reuse_kernels(triton_compiles, topk):
+    """Batch, sequence count, and split count are runtime values: one compile per tile config."""
 
     def decode(inputs):
         return paged_sparse_decode(**inputs)
 
     compiled = torch.compile(decode, fullgraph=True, dynamic=True)
-    # Row counts cover 1, multiples of 16, and other values.
-    for rows in (1, 16, 17, 48, 5):
-        inputs = make_paged_sparse_decode_inputs([2100 + 7 * i for i in range(rows)], [1] * rows)
+    # Row counts cross the tile threshold, 1, multiples of 16, and other values.
+    for rows in (1, 2, 3, 4, 16, 17, 48, 5):
+        inputs = make_paged_sparse_decode_inputs(
+            [2100 + 7 * i for i in range(rows)], [1] * rows, heads=6, kv_heads=1, topk=topk
+        )
         out = compiled(inputs)
         expected = paged_sparse_decode(**inputs, impl="reference")
         assert_relative_rms_within(out, expected.double(), f"rows={rows}", max_eps=2.0)
-    assert triton_compiles["_paged_sparse_decode_kernel"] == 1
+    # Large budgets use eight warps up to two programs, four at three; all larger grids
+    # share the two-warp kernel. Exact batch sizes never enter the compilation key.
+    assert triton_compiles["_paged_sparse_decode_kernel"] == (2 if topk == 512 else 3)
     # The merge kernel specializes only on the power-of-two bucket of the split count.
     assert triton_compiles["_merge_splits_kernel"] <= 4
 

@@ -36,17 +36,28 @@ def _attend_tile(
     qk_scale,
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
+    K_ROWS: tl.constexpr,
 ):
     dims = tl.arange(0, HEAD_DIM)
     dims_v = tl.arange(0, HEAD_DIM_V)
     # Masked rows issue no memory traffic; page/offset are clamped to zero there.
     page = tl.where(valid, page, 0).to(tl.int64)
     offset = tl.where(valid, offset, 0)
-    k = tl.load(
-        K + page[None, :] * stride_k_page + offset[None, :] * stride_k_token + dims[:, None],
-        mask=valid[None, :],
-        other=0.0,
-    )
+    if K_ROWS:
+        # Keys in the values' [keys, dims] layout: the page and offset vectors then need no
+        # second layout, which saved 0.8-2 us per call on the many-warp small-batch tiles.
+        k = tl.load(
+            K + page[:, None] * stride_k_page + offset[:, None] * stride_k_token + dims[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        k = tl.trans(k)
+    else:
+        k = tl.load(
+            K + page[None, :] * stride_k_page + offset[None, :] * stride_k_token + dims[:, None],
+            mask=valid[None, :],
+            other=0.0,
+        )
     v = tl.load(
         V + page[:, None] * stride_v_page + offset[:, None] * stride_v_token + dims_v[None, :],
         mask=valid[:, None],
@@ -122,6 +133,8 @@ def _paged_sparse_decode_kernel(
     KV_HEADS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    K_ROWS: tl.constexpr,
+    SINGLE_TILE: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
     # The grid walks (sequence, query) pairs, so every metadata load issues at once instead of
@@ -183,7 +196,13 @@ def _paged_sparse_decode_kernel(
     window_tiles = tl.cdiv(num_window, BLOCK_N)
     if SHARED_WINDOW:
         # One loop over sparse then window tiles: a second loop costs latency even when empty.
-        for tile in range(split, sparse_tiles + window_tiles, num_splits):
+        # Tiny grids give each split one tile. Removing the loop also lets the compiler
+        # simplify the online softmax's first iteration. The masks cover unused splits.
+        tile_begin = 0 if SINGLE_TILE else split
+        tile_end = 1 if SINGLE_TILE else sparse_tiles + window_tiles
+        tile_step = 1 if SINGLE_TILE else num_splits
+        for tile_index in range(tile_begin, tile_end, tile_step):
+            tile = split if SINGLE_TILE else tile_index
             column = tile * BLOCK_N + columns
             is_sparse = tile < sparse_tiles
             block = tl.load(
@@ -217,6 +236,7 @@ def _paged_sparse_decode_kernel(
                 qk_scale,
                 HEAD_DIM,
                 HEAD_DIM_V,
+                K_ROWS,
             )
     else:
         for tile in range(split, sparse_tiles, num_splits):
@@ -246,6 +266,7 @@ def _paged_sparse_decode_kernel(
                 qk_scale,
                 HEAD_DIM,
                 HEAD_DIM_V,
+                K_ROWS,
             )
         if WINDOW > 0:
             w_table_row = WBlockTable + sequence.to(tl.int64) * stride_wtable
@@ -275,6 +296,7 @@ def _paged_sparse_decode_kernel(
                     qk_scale,
                     HEAD_DIM,
                     HEAD_DIM_V,
+                    K_ROWS,
                 )
 
     dims_v = tl.arange(0, HEAD_DIM_V)
@@ -328,15 +350,18 @@ def _merge_splits_kernel(
     NUM_HEADS: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
     USE_PDL: tl.constexpr,
 ):
+    # One program per (row, head, BLOCK_D value dims): with many splits a whole
+    # [splits, head_dim_v] tile in one 2-warp program spilled and serialized small batches.
     row = tl.program_id(0)
     head = tl.program_id(1)
     if USE_PDL:
         # Launched early; wait until the split kernel's partials are visible.
         tl.extra.cuda.gdc_wait()
     splits = tl.arange(0, BLOCK_SPLITS)
-    dims = tl.arange(0, HEAD_DIM_V)
+    dims = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
     partial_row = (splits.to(tl.int64) * num_rows + row) * NUM_HEADS + head
     maxima = tl.load(PartialStats + 2 * partial_row, mask=splits < num_splits, other=float("-inf"))
     sums = tl.load(PartialStats + 2 * partial_row + 1, mask=splits < num_splits, other=0.0)
@@ -360,7 +385,7 @@ def _merge_splits_kernel(
         Out + row.to(tl.int64) * stride_out_row + head * stride_out_head + dims,
         out.to(Out.dtype.element_ty),
     )
-    if RETURN_LSE:
+    if RETURN_LSE and tl.program_id(2) == 0:
         lse_out = tl.where(
             denominator > 0,
             (m_safe + tl.math.log2(denominator)) * 0.6931471805599453,
@@ -369,12 +394,23 @@ def _merge_splits_kernel(
         tl.store(Lse + row.to(tl.int64) * NUM_HEADS + head, lse_out)
 
 
-def _tile_config(head_dim: int, head_dim_v: int) -> tuple[int, int]:
-    """Return (block_n, num_warps): 64-key tiles on 2 warps won every QSA decode shape on B200.
+def _tile_config(
+    head_dim: int, head_dim_v: int, num_programs: int, sparse_entries: int
+) -> tuple[int, int, int, bool]:
+    """Return (block_n, num_warps, num_stages, k_rows) for ``num_programs`` (row, KV head) pairs.
 
-    Wider rows halve the tile to keep a prefetched stage of K and V in shared memory.
+    Measured on B200 with QSA decode shapes. Up to 3 programs, latency rules: target 128
+    sparse tiles, with widths bucketed to 16/32/64 keys. Wider tiles keep larger budgets on
+    the one-tile path (2048-block batch-1 decode: 9.2 vs 16.6 us with 16-key looped tiles).
+    From 4 programs on, 64-key tiles on 2 warps win; wider rows halve the tile to keep a
+    prefetched stage of K and V in shared memory.
     """
-    return (64 if head_dim + head_dim_v <= 512 else 32), 2
+    if num_programs <= 3:
+        if head_dim + head_dim_v <= 512 and sparse_entries > 2048:
+            block_n = 32 if sparse_entries <= 4096 else 64
+            return block_n, 8 if num_programs <= 2 else 4, 2, True
+        return 16, 4, 2, True
+    return (64 if head_dim + head_dim_v <= 512 else 32), 2, 2, False
 
 
 @functools.cache
@@ -463,14 +499,23 @@ def paged_sparse_decode(
     if num_rows == 0 or seqused_k.shape[0] == 0:
         return out, lse
 
-    block_n, num_warps = _tile_config(head_dim, head_dim_v)
-    smem_per_cta = query.element_size() * (block_m * head_dim + block_n * (head_dim + head_dim_v))
+    num_programs = num_rows * kv_heads
     topk = indices.shape[1]
+    block_n, num_warps, num_stages, k_rows = _tile_config(
+        head_dim, head_dim_v, num_programs, topk * index_block_size
+    )
+    smem_per_cta = query.element_size() * (block_m * head_dim + block_n * (head_dim + head_dim_v))
     max_window = window_size + (index_block_size - 1 if shared_window else 0)
     num_tiles = triton.cdiv(topk * index_block_size, block_n) + triton.cdiv(max_window, block_n)
-    num_splits = _choose_splits(
-        num_rows * kv_heads, max(num_tiles, 1), _cta_slots(query.device.index, smem_per_cta)
-    )
+    single_tile = shared_window and k_rows and num_tiles <= 256
+    if k_rows:
+        # Include the partial window tile: capping at 128 made one CTA process two tiles
+        # for a 512-block QSA budget, delaying the entire merge on incomplete blocks.
+        num_splits = max(num_tiles, 1) if single_tile else min(max(num_tiles, 1), 128)
+    else:
+        num_splits = _choose_splits(
+            num_programs, max(num_tiles, 1), _cta_slots(query.device.index, smem_per_cta)
+        )
     use_pdl = num_splits > 1 and torch.cuda.get_device_capability(query.device)[0] >= 9
     if num_splits > 1:
         partial_out = torch.empty(
@@ -539,12 +584,22 @@ def paged_sparse_decode(
         KV_HEADS=kv_heads,
         BLOCK_M=block_m,
         BLOCK_N=block_n,
+        K_ROWS=k_rows,
+        SINGLE_TILE=single_tile,
         USE_PDL=use_pdl,
         num_warps=num_warps,
-        num_stages=2,
+        num_stages=num_stages,
     )
     if num_splits > 1:
-        _merge_splits_kernel[(num_rows, num_heads)](
+        block_splits = triton.next_power_of_2(num_splits)
+        # A 2-warp program merges a whole [splits, head_dim_v] tile up to 8K elements (32 x 256);
+        # larger tiles spilled, so they are sliced to 4K elements per program.
+        block_d = (
+            head_dim_v
+            if block_splits * head_dim_v <= 8192
+            else min(head_dim_v, max(16, 4096 // block_splits))
+        )
+        _merge_splits_kernel[(num_rows, num_heads, head_dim_v // block_d)](
             partial_out,
             partial_stats,
             attention_sink if attention_sink is not None else query,
@@ -558,7 +613,8 @@ def paged_sparse_decode(
             RETURN_LSE=return_lse,
             NUM_HEADS=num_heads,
             HEAD_DIM_V=head_dim_v,
-            BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+            BLOCK_SPLITS=block_splits,
+            BLOCK_D=block_d,
             USE_PDL=use_pdl,
             num_warps=2,
             launch_pdl=use_pdl,
