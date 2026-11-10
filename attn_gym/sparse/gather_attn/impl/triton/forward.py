@@ -110,10 +110,14 @@ def _gather_attn_fwd(
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
     running_max = tl.full((BLOCK_M,), sink, tl.float32)
     running_sum = tl.full((BLOCK_M,), 1.0, tl.float32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+    # FP64 values promote the weighted sum, and a runtime loop cannot change its type.
+    accumulator = tl.zeros(
+        (BLOCK_M, BLOCK_D), tl.float64 if query.dtype == tl.float64 else tl.float32
+    )
 
     # Each query has its own set of selected sparse entries.
-    for selected_slot in tl.static_range(0, TOPK):
+    # Keep tl.range: unrolling makes compile time and code size grow with top-k.
+    for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
             kv_indices_ptr
             + batch * KV_INDICES_STRIDES[0]
@@ -741,9 +745,12 @@ def _gather_attn_fwd_tma(
     sink = tl.load(attention_sink_ptr + head).to(tl.float32)
     running_max = tl.full((BLOCK_M,), sink, tl.float32)
     running_sum = tl.full((BLOCK_M,), 1.0, tl.float32)
-    accumulator = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+    # FP64 values promote the weighted sum, and a runtime loop cannot change its type.
+    accumulator = tl.zeros(
+        (BLOCK_M, BLOCK_D), tl.float64 if query.dtype == tl.float64 else tl.float32
+    )
 
-    for selected_slot in tl.static_range(0, TOPK):
+    for selected_slot in tl.range(0, TOPK):
         selected_idx = tl.load(
             kv_indices_ptr
             + batch * KV_INDICES_STRIDES[0]
