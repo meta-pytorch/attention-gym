@@ -367,9 +367,9 @@ def _completion(a: Access, seq: list[int], pos_a: int, pos_e: int, other: str) -
     rec = close.data["handle"]
     chan = rec.chan
     side = "producer" if rec.producer else "consumer"
-    mech = chan.producer if rec.producer else chan.consumer
+    mech = chan.mechanism(side, rec.role)
     mech_name = getattr(mech, "__name__", type(mech).__name__)
-    fence = chan.commit_fence if rec.producer else chan.release_fence
+    fence = chan.fences(side, rec.role)
     where = f"{a.describe()} before {chan.name} {close.site}"
     if not close.data["signal"]:
         return Finding(UNVERIFIED, f"{where}: raw signal (signal=False) is not visible", "channel")

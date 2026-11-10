@@ -19,6 +19,10 @@ one signalling per epoch. ``Channel(override={...})`` replaces any derived value
 reserves mbarriers that user code drives directly, and ``external="consumer"`` (or
 ``"producer"``) leaves one side of a channel to raw code.
 
+A joining consumer side may give each role its own mechanism, ``{"mma": Umma, "cuda": Threads}``:
+the dict names the consumer roles, and each role's instances signal and fence with their own
+mechanism, so the count sums 1 for the MMA warp and every thread of the ``cuda`` role.
+
 Each side shares the channel's epochs among its role instances in one of three ways
 (``producer_sharing=``/``consumer_sharing=``, a ``Sharing``):
 
@@ -204,6 +208,15 @@ class Channel:
     ``producer_role``/``consumer_roles``: optional names of the roles allowed on each side,
     checked against the role annotations.
 
+    ``consumer`` may be a ``{role: mechanism}`` dict (``Threads``, ``Warps`` or ``Umma``) for a
+    joining consumer side whose roles signal differently, e.g. an MMA warp and CUDA threads
+    that both read each stage. The keys are the consumer roles (``consumer_roles`` is implied)
+    and each must bind a consumer end. Each instance contributes its own role's arrivals and
+    signals with its own mechanism; ``release_fence`` (derived or declared) applies to the
+    ``Threads``/``Warps`` roles, and ``Umma`` roles, which read through the async proxy, emit
+    none. The side must be an mbarrier ``JOIN`` side of a CTA-local channel; each ``Umma`` role
+    is a single-warp, single-instance role.
+
     ``payload=(dtype, shape)``: a per-slot SMEM buffer the layer owns, exposed as
     ``handle.data``. ``buffer=`` binds buffers of the kernel's ``SmemPlan`` instead (one
     ``SmemBuffer``, or a ``{name: SmemBuffer}`` dict): ``handle.data`` is then the stage's
@@ -304,18 +317,28 @@ class Channel:
             raise ValueError(f"channel stages must be a positive int, got {self.n!r}")
         if self.n <= 0:
             raise ValueError("channels need at least one stage")
-        for side, mech in (("producer", self.producer), ("consumer", self.consumer)):
-            if mech not in (Threads, Warps, Umma) and not isinstance(mech, Tma):
-                raise ValueError(
-                    f"channel {side} mechanism must be Threads, Warps, Umma, or Tma(bytes), "
-                    f"got {mech!r}"
-                )
-        if isinstance(self.consumer, Tma):
-            raise ValueError("TMA is a producer mechanism")  # noqa: TRY004
+        if isinstance(self.producer, dict):
+            raise ValueError(  # noqa: TRY004 (an invalid channel setting, like the rest)
+                "per-role mechanisms are consumer-only: a producer side takes one mechanism"
+            )
+        for side in SIDES:
+            for mech in self.mechanisms(side):
+                if mech not in (Threads, Warps, Umma) and not isinstance(mech, Tma):
+                    raise ValueError(
+                        f"channel {side} mechanism must be Threads, Warps, Umma, or Tma(bytes), "
+                        f"got {mech!r}"
+                    )
+        if any(isinstance(mech, Tma) for mech in self.mechanisms("consumer")):
+            raise ValueError("TMA is a producer mechanism")
         self.commit_fence_overridden = self.commit_fence is not None
         self.commit_fence = _fences("commit_fence", self.commit_fence)
         self.release_fence_overridden = self.release_fence is not None
         self.release_fence = _fences("release_fence", self.release_fence)
+        if self.per_role and self.release_fence and set(self.consumer.values()) == {Umma}:
+            raise ValueError(
+                "release_fence applies to the Threads/Warps roles of a per-role consumer, and "
+                "this one has none"
+            )
         if isinstance(self.producer, Tma) and self.commit_fence:
             raise ValueError("TMA producers do not arrive, so they have no commit to fence")
         if self.remote_scope not in (None, "cta", "cluster"):
@@ -349,6 +372,8 @@ class Channel:
                 )
         if self.sync not in SYNC_KINDS:
             raise ValueError(f"channel sync must be one of {SYNC_KINDS}, got {self.sync!r}")
+        if self.per_role:
+            self._check_per_role()
         if self.turnstile is not None and not (self.named and self.rotates):
             raise ValueError(
                 "turnstile= serializes round-robin instances of a named channel: it needs "
@@ -437,7 +462,10 @@ class Channel:
         # async-proxy write of the same bytes is ordered only by fence.proxy.async in the
         # reading thread: a proxy fence acts within one thread. TMA completion orders only the
         # opposite direction, its bytes before the consumers' reads.
-        refilled_by_tma = isinstance(self.producer, Tma) and self.consumer in (Threads, Warps)
+        consumers = self.mechanisms("consumer")
+        refilled_by_tma = isinstance(self.producer, Tma) and any(
+            m in (Threads, Warps) for m in consumers
+        )
         if refilled_by_tma and self.external != "consumer":
             self.derived_release_fence = ("smem_async",)
         if not self.release_fence_overridden:
@@ -445,12 +473,70 @@ class Channel:
         # Each SMEM writer needs fence.proxy.async before tcgen05.mma reads its stores.
         # Neither the arrival nor the MMA warp's wait fences proxies. TMEM handoffs need no
         # SMEM fence.
-        written_for_mma = self.producer in (Threads, Warps) and self.consumer is Umma
+        written_for_mma = self.producer in (Threads, Warps) and Umma in consumers
         smem_storage = self.payload is not None or bool(self.buffers)
         if written_for_mma and smem_storage and self.external != "producer":
             self.derived_commit_fence = ("smem_async",)
         if not self.commit_fence_overridden:
             self.commit_fence = self.derived_commit_fence
+
+    def _check_per_role(self):
+        """Check a ``{role: mechanism}`` consumer and set ``consumer_roles`` to its keys."""
+        roles = self.consumer
+        if not roles or any(not isinstance(k, str) for k in roles):
+            raise ValueError(
+                f"a per-role consumer must be a non-empty {{role name: mechanism}} dict, got "
+                f"{roles!r}"
+            )
+        if self.consumer_roles is not None:
+            raise ValueError(
+                "a per-role consumer dict names the consumer roles itself; drop consumer_roles="
+            )
+        if self.consumer_sharing is not Sharing.JOIN:
+            raise ValueError(
+                f"per-role consumer mechanisms need consumer_sharing=Sharing.JOIN, got "
+                f"{self.consumer_sharing}: every role takes every epoch and the counts sum"
+            )
+        if self.sync != "mbarrier":
+            raise ValueError(
+                "per-role consumer mechanisms need an mbarrier channel: a named barrier counts "
+                "threads on both sides"
+            )
+        if self.external == "consumer":
+            raise ValueError("external='consumer' takes no consumer mechanisms: raw code signals")
+        if isinstance(self.producer, Tma) and (self.producer.multicast or self.producer.fills):
+            raise ValueError(
+                "per-role consumer mechanisms are CTA-local only: the producer's TMA copies take "
+                "no multicast or fills"
+            )
+        self.consumer_roles = tuple(roles)
+
+    @property
+    def per_role(self) -> bool:
+        """The consumer side gives each role its own mechanism (``{role: mechanism}``)."""
+        return isinstance(self.consumer, dict)
+
+    def mechanisms(self, side: str) -> tuple:
+        """The distinct mechanisms declared on ``side``."""
+        mech = self.producer if side == "producer" else self.consumer
+        return tuple(dict.fromkeys(mech.values())) if isinstance(mech, dict) else (mech,)
+
+    def mechanism(self, side: str, role: str):
+        """The mechanism instances of ``role`` signal ``side`` with."""
+        mech = self.producer if side == "producer" else self.consumer
+        return mech[role] if isinstance(mech, dict) else mech
+
+    def fences(self, side: str, role: str) -> tuple[str, ...]:
+        """The fences ``role``'s managed signal on ``side`` emits.
+
+        ``Umma`` roles of a per-role consumer read through the async proxy and emit none;
+        ``release_fence`` is the thread roles'.
+        """
+        if side == "producer":
+            return self.commit_fence
+        if self.per_role and self.consumer[role] is Umma:
+            return ()
+        return self.release_fence
 
     @property
     def named(self) -> bool:
@@ -496,14 +582,16 @@ class Channel:
         return len(bound) if self.sharing(side) is Sharing.ROUND_ROBIN and bound else 1
 
     def slot_counts(self, side: str) -> list[int]:
-        mech = self.producer if side == "producer" else self.consumer
         bound = self.producers if side == "producer" else self.consumers
+
+        def contribution(ri):
+            return arrivals(self.mechanism(side, ri.role), ri.num_threads)
+
         if self.sharing(side) is not Sharing.JOIN and bound:
             # One instance signals each epoch (the layer checks that they contribute equally).
-            return [arrivals(mech, bound[0][0].num_threads)] * self.n
+            return [contribution(bound[0][0])] * self.n
         return [
-            sum(arrivals(mech, ri.num_threads) for ri, slot in bound if slot in (None, j))
-            for j in range(self.n)
+            sum(contribution(ri) for ri, slot in bound if slot in (None, j)) for j in range(self.n)
         ]
 
     def named_counts(self) -> list[int]:
@@ -595,6 +683,7 @@ class HandleRecord:
     chan: object = None  # the Channel
     slot: int | None = None  # the Slots slot; None for a Ring stage (dynamic)
     producer: bool = False
+    role: str = ""  # the role whose end opened it: its mechanism and fences close it
     order: int = 0  # how many acquires/waits of its end (and slot) were traced before it
 
 
@@ -706,6 +795,7 @@ class Handle(_Stage):
             chan=end._chan,
             slot=key,
             producer=is_producer,
+            role=end._role,
             order=end._rec.advances.get(key, 0) - 1,  # its own acquire/wait already counted
         )
         end._trace.opened(self.rec)
@@ -1030,7 +1120,8 @@ class _End:
     a ``PipelineState`` for rings, an Int32 phase-bit mask for slots.
 
     ``cta``: the owning role's placement. With the channel's derived scope it selects local or
-    remote arrivals and which CTA arms transaction barriers.
+    remote arrivals and which CTA arms transaction barriers. ``role``: the owning role's name,
+    which selects its mechanism and fences on a per-role consumer side.
     """
 
     def __init__(
@@ -1045,8 +1136,10 @@ class _End:
         rec=None,
         views=None,
         stride=1,
+        role="",
     ):
         self._chan = chan
+        self._role = role
         self._stride = stride  # round-robin: epochs between this end's turns
         self._bars = bars  # full barriers at [0, n), empty barriers at [n, 2n)
         self._buffers = buffers  # {name: StageBuffer}: the payload or the bound plan buffers
@@ -1084,6 +1177,7 @@ class _End:
             self._rec,
             views,
             self._stride,
+            self._role,
         )
 
     def _check_current(self, returned_by: str | None = None):
@@ -1615,7 +1709,12 @@ class ConsumerEnd(_End):
             _fence(chan.release_fence)
             self._named_arrive(chan.empty_barriers, index)
             return
-        self._arrive(chan.consumer, self._empty(index), chan.release_fence, chan.scope.empty_mask)
+        self._arrive(
+            chan.mechanism("consumer", self._role),
+            self._empty(index),
+            chan.fences("consumer", self._role),
+            chan.scope.empty_mask,
+        )
 
 
 def _region_op(block) -> str | None:

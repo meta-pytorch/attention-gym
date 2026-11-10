@@ -399,10 +399,11 @@ def derive_scope(chan, cluster) -> Scope:
         tx = tma.tx_bytes if tma is not None else None
         self_targets = {c: (c,) for c in ranks}
 
-        def local_mask(mech, signalers):
-            if mech is not Umma or not signalers:  # no signaller: an external side
+        def local_mask(side, signalers):
+            commits = [ri for ri, _ in signalers if chan.mechanism(side, ri.role) is Umma]
+            if not commits:  # no tcgen05.commit, or no signaller: an external side
                 return 1
-            return _masks({c: (c,) for ri, _ in signalers for c in placed[ri.name]})
+            return _masks({c: (c,) for ri in commits for c in placed[ri.name]})
 
         return Scope(
             False,
@@ -412,12 +413,17 @@ def derive_scope(chan, cluster) -> Scope:
             {c: empty for c in ranks},
             tx,
             tail=False,
-            full_mask=local_mask(chan.producer, chan.producers),
-            empty_mask=local_mask(chan.consumer, chan.consumers),
+            full_mask=local_mask("producer", chan.producers),
+            empty_mask=local_mask("consumer", chan.consumers),
             full_targets=self_targets,
             empty_targets=dict(self_targets),
         )
 
+    if chan.per_role:
+        raise ProtocolError(
+            f"channel {chan.name}: per-role consumer mechanisms are CTA-local only, but its "
+            "roles run in different CTAs; give both sides the same placement"
+        )
     if chan.payload is not None and not internal:
         raise ProtocolError(
             f"channel {chan.name}: its layer-owned payload is per-CTA SMEM, but the channel is "

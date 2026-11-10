@@ -1134,7 +1134,6 @@ class SwapABDecode(WarpSpecialized):
         ).launch(
             **self.launch_config(bound),
             stream=stream,
-            min_blocks_per_mp=1,
             use_pdl=self.per_sequence,  # overlap with the kernel that writes the split counts
         )
 

@@ -496,7 +496,6 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         self.kernel(mmas, tma_ops, work_table, out, smem_layouts, scale, bound).launch(
             **self.launch_config(bound),
             stream=stream,
-            min_blocks_per_mp=1,
         )
 
     @cute.jit

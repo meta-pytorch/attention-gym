@@ -671,7 +671,7 @@ class MixedGemm(Gemm):
     def get_name(self) -> str:
         return "warpdrive_mixed_gemm"
 
-    @role(warps=5, regs=40)
+    @role(warps=5, regs=48)
     @cute.jit
     def mma(self, ab: Consumer, tmem: Tmem, ctx: MixedGemmParams):
         tiled_mma = ctx.tiled_mma

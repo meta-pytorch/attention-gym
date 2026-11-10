@@ -133,7 +133,7 @@ You still own the layouts and must ensure each view refers to its named buffer. 
 The load role follows this structure:
 
 ```python
-@role(warps=4, regs=40)
+@role(warps=4, regs=48)
 @cute.jit
 def load(self, params: GemmParams, *, ab: Producer, work: WorkCursor):
     ab = ab.views(A=params.tAsA, B=params.tBsB)

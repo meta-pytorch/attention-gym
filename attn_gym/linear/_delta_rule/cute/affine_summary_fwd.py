@@ -493,9 +493,8 @@ class _AffineSummaryFwdOp(WarpSpecialized):
             ),
             bound,
         ).launch(
-            **self.launch_config(bound),
+            **self.launch_config(bound, min_blocks_per_mp=1),
             stream=stream,
-            min_blocks_per_mp=1,
         )
 
     # ------------------------------------------------------------------

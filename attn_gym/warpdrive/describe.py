@@ -195,6 +195,8 @@ def _roles(kernel) -> str:
 
 
 def _mech(mech) -> str:
+    if isinstance(mech, dict):  # a per-role consumer side
+        return "{" + ", ".join(f"{role}: {_mech(m)}" for role, m in mech.items()) + "}"
     return f"Tma({mech.tx_bytes} B)" if isinstance(mech, Tma) else mech.__name__
 
 
@@ -268,7 +270,7 @@ def channel_scope(ch, cluster) -> list[str]:
         scope.append(f"commit_mask {fmt_mask(sc.full_mask, cluster)}")
     if ch.consumer is Umma:
         scope.append(f"release_mask {fmt_mask(sc.empty_mask, cluster)}")
-    if {Threads, Warps} & {ch.producer, ch.consumer}:
+    if {Threads, Warps} & {ch.producer, *ch.mechanisms("consumer")}:
         scope.append(f"remote_scope {ch.remote_scope}")
     if sc.tail:
         scope.append("tail")
@@ -287,7 +289,10 @@ def channel_storage(ch) -> list[str]:
     if ch.commit_fence:
         extra.append(f"commit_fence {'+'.join(ch.commit_fence)}")
     if ch.release_fence:
-        extra.append(f"release_fence {'+'.join(ch.release_fence)}")
+        fence = f"release_fence {'+'.join(ch.release_fence)}"
+        if ch.per_role:  # the thread roles' fence; Umma roles emit none
+            fence += f" ({', '.join(r for r, m in ch.consumer.items() if m is not Umma)})"
+        extra.append(fence)
     return extra
 
 

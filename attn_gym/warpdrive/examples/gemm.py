@@ -101,7 +101,7 @@ class Gemm(WarpSpecialized):
         n = "" if self.tile[1] == 256 else f"_n{self.tile[1]}"
         return f"warpdrive_gemm_ab{self.ab.n}_acc{self.acc_stages}{n}{self.trace_key()}"
 
-    @role(warps=4, regs=40)
+    @role(warps=4, regs=48)
     @cute.jit
     def load(self, params: GemmParams, *, ab: Producer, work: WorkCursor):
         ab = ab.views(A=params.tAsA, B=params.tBsB)
@@ -118,7 +118,7 @@ class Gemm(WarpSpecialized):
             work.advance()
         return ab, work
 
-    @role(warps=5, regs=40)
+    @role(warps=5, regs=48)
     @cute.jit
     def mma(
         self, params: GemmParams, *, ab: Consumer, acc: Producer, work: WorkCursor, tmem: Tmem

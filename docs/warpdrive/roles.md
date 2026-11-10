@@ -9,7 +9,7 @@ updated protocol state.
 This partial load role runs on **warp 4**:
 
 ```python
-@role(warps=4, regs=40)
+@role(warps=4, regs=48)
 @cute.jit
 def load(self, params: GemmParams, *, ab: Producer):
     for k in cutlass.range(params.num_k_tiles, unroll=1):
@@ -32,13 +32,16 @@ warp holes run no user role.
 
 ### Registers belong to warpgroups
 
-`regs=40` requests a per-thread `setmaxnreg` budget for the role's warpgroup (four warps).
+`regs=48` requests a per-thread `setmaxnreg` budget for the role's warpgroup (four warps).
 `None`, the default, leaves the budget unchanged—it does not request automatic tuning.
 
 - All roles in one warpgroup must agree, including `None` versus a number.
 - Numeric budgets are multiples of 8 in `[24, 256]`.
 - Any numeric budget pads the launch to complete warpgroups. Padding warps take their
   group's budget; a wholly idle group takes 24.
+- Launch with `launch_config()`: with any budget it sets `min_blocks_per_mp=1`. CuTeDSL's
+  launch emits no other entry bound, and without one ptxas silently drops `setmaxnreg` and
+  compiles every warp at one register count.
 - Budget adjustment runs in a warpgroup-uniform branch before dispatch, including in a
   pair's peer CTA. Adjacent warpgroups with one budget share a branch; non-adjacent ones
   never do (see [configuration](configuration.md#placement-and-registers)).
@@ -173,7 +176,7 @@ types at module level.
 A role returns the current endpoints, work cursor and turnstile seats it received:
 
 ```python
-@role(warps=5, regs=40)
+@role(warps=5, regs=48)
 @cute.jit
 def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, work: WorkCursor, tmem: Tmem):
     while work.valid:
