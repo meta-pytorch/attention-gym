@@ -77,21 +77,6 @@ def compile_test_variant(config: CompileConfig) -> FakeCompiled:
     return FakeCompiled(config.variant)
 
 
-def wait_for_processes(processes, timeout: float = 15.0) -> None:
-    """Join child processes and fail without leaving a process behind."""
-    deadline = time.monotonic() + timeout
-    try:
-        for process in processes:
-            process.join(timeout=max(0.0, deadline - time.monotonic()))
-        failures = [(process.pid, process.exitcode) for process in processes if process.exitcode]
-        assert failures == []
-    finally:
-        for process in processes:
-            if process.is_alive():
-                process.terminate()
-                process.join(timeout=5)
-
-
 @pytest.fixture(autouse=True)
 def reset_compile_target():
     cute_target.set_compile_target(None)

@@ -23,9 +23,6 @@ os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
 
 import torch
 
-# Shared assertion helpers get pytest's rewritten (introspecting) asserts.
-pytest.register_assert_rewrite("attn_gym.testing.warpdrive")
-
 
 def _configure_worker_parallelism(config: pytest.Config) -> None:
     if sys.platform != "linux" or not hasattr(config, "workerinput"):

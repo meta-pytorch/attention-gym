@@ -18,6 +18,7 @@ except ImportError:
     pytest.skip("CUTE not available", allow_module_level=True)
 
 from attn_gym.testing.perfetto_trace import read_slices
+from attn_gym.warpdrive.compat import SmemAllocator
 from attn_gym.warpdrive.profiler import (
     compact_anchor_init,
     compact_event_stop,
@@ -167,7 +168,7 @@ def _kernel_compact_smem(prof_gmem: cute.Tensor, max_events: cutlass.Int32):
     class S:
         prof_smem: cute.struct.MemRange[cutlass.Int64, PROF_SMEM_SLOTS]
 
-    smem = cutlass.utils.SmemAllocator()
+    smem = SmemAllocator()
     storage = smem.allocate(S)
     smem_tensor = storage.prof_smem.get_tensor(cute.make_layout((PROF_SMEM_SLOTS,)))
 
@@ -252,7 +253,7 @@ def _kernel_compact_smem_slot(prof_gmem: cute.Tensor, out: cute.Tensor):
         prof_smem: cute.struct.MemRange[cutlass.Int64, 2]
         neighbor: cute.struct.MemRange[cutlass.Int64, 1]
 
-    storage = cutlass.utils.SmemAllocator().allocate(S)
+    storage = SmemAllocator().allocate(S)
     smem_tensor = storage.prof_smem.get_tensor(cute.make_layout((2,)))
     neighbor = storage.neighbor.get_tensor(cute.make_layout((1,)))
     if cute.arch.thread_idx()[0] == 0:
