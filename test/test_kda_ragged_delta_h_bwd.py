@@ -420,3 +420,60 @@ def test_delta_h_scalar_gate_matches_broadcast_vector_gate(lengths: list[int] | 
     )
     torch.testing.assert_close(actual_dh0, expected_dh0, rtol=0, atol=0)
     torch.testing.assert_close(actual_dv[:, :tokens], expected_dv[:, :tokens], rtol=0, atol=0)
+
+
+def test_delta_h_shapes_reuse_compiled_kernels():
+    """Token, sequence and chunk counts across the integer classes share one kernel per entry.
+
+    The dense entry takes B = 1 and whole chunks, so its classes are 1, 16 and 17 chunks.
+    """
+    dense_fn = delta_h_module._compile_delta_h_bwd
+    packed_fn = delta_h_module._compile_delta_h_bwd_packed
+    dense_fn.cache_clear()
+    packed_fn.cache_clear()
+    for tokens in (64, 1024, 1088):
+        q, k, w, do, aqk, gk, h0, dht = _inputs(tokens, 1, heads=2)
+        delta_h_module.blackwell_delta_h_bwd_dhu_dv_fused(
+            q, k, w, do, aqk, gk=gk, h0=h0, dht=dht, scale=128**-0.5, bv=16
+        )
+    for lengths in ([1], [64, 0] * 8, [65, 3, 0]):
+        _run_ragged(_inputs(sum(lengths), len(lengths), heads=2, lengths=lengths), lengths, bv=16)
+    for compile_fn in (dense_fn, packed_fn):
+        info = compile_fn.cache_info()
+        assert (info.currsize, info.hits + info.misses) == (1, 3)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_delta_h_kernel_verifies_tma(monkeypatch, packed):
+    """Tracing verifies every TMA ring's copies against its armed bytes and completion scope."""
+    import cutlass
+
+    from attn_gym.warpdrive.cache import (
+        detect_compile_target,
+        get_compile_target,
+        set_compile_target,
+    )
+
+    entries = []
+    compile_tvm_ffi = delta_h_module.compile_tvm_ffi
+
+    def compile_and_keep(entry, *args, **kwargs):
+        entries.append(entry)
+        return compile_tvm_ffi(entry, *args, **kwargs)
+
+    monkeypatch.setattr(delta_h_module, "compile_tvm_ffi", compile_and_keep)
+    compile_fn = (
+        delta_h_module._compile_delta_h_bwd_packed
+        if packed
+        else delta_h_module._compile_delta_h_bwd
+    )
+    previous = get_compile_target()
+    try:
+        set_compile_target(detect_compile_target(torch.cuda.current_device()))
+        compile_fn.__wrapped__(4, 16, cutlass.BFloat16, False, False)
+    finally:
+        set_compile_target(previous)
+    (op,) = entries
+    tma = {name: c.tma for name, c in op.checks().channels.items() if c.tma is not None}
+    # k, q, dO, w and Aqk feed the MMA warp; gk feeds the gate warp.
+    assert tma == dict.fromkeys(("k", "q", "do", "w", "aqk", "gk"), "verified"), op.describe()
