@@ -363,6 +363,62 @@ class PdlWait(Readiness):
 
 
 # --------------------------------------------------------------------------- #
+# Device-read limits
+# --------------------------------------------------------------------------- #
+
+
+class Limit:
+    """Public protocol for ``WorkStream.bind(..., limit=...)``: an item bound read on the device.
+
+    A launch sized on the host for a capacity (a CUDA graph captured for the most chunks or
+    sequences a replay may hold) can end its stream at a count only the device knows, such as
+    the last entry of a prefix-sum table. ``read()`` runs on the device once per decoding site
+    (each role of a local schedule, ``single_item``, a plain kernel's cursor), after the
+    readiness hook and before the first decode, and returns an Int32. Every site ends its
+    stream at ``min(total, max(read(), 0))`` in the schedule's index order: indices at or past it
+    are terminal, are never decoded, and ``single_item()`` reports them invalid. A limit of 0 (or
+    below) runs no item; one at or past ``total`` changes nothing.
+
+    Roles read the limit separately, so ``read()`` must return the same value in every role
+    and CTA: it may read only memory written before the launch, or before ``ready`` returns,
+    and not written during the launch. It must not depend on the role or thread.
+
+    A limit is a DSL value passed into the kernel with the bound stream: implement
+    ``__extract_mlir_values__``/``__new_from_mlir_values__`` for the tensors or scalars it holds
+    (``LastEntry`` shows the pattern). It is bound in the jit entry point, so it is not part of
+    ``WorkStream.get_key()``: a kernel that binds a limit only for some configurations must name
+    them in its own compile key, as it does for any other choice of its entry point. Only local schedules take a limit: a broadcast schedule's
+    scheduler warp claims indices for every role, so it has no per-role bound to apply.
+    ``WorkStream.assignment`` lists the host-side sequence and ignores limits.
+    """
+
+    def read(self):
+        raise NotImplementedError
+
+
+class LastEntry(Limit):
+    """``Limit`` reading ``scale * table[size - 1]``: the terminal entry of a prefix-sum table
+    (``chunk_offsets[-1]``, the active chunk count; ``cu_seqlens[-1]``, the active token count).
+    ``scale``: static items per counted unit. The table is Int32 with at least one entry, and
+    ``scale * table[-1]`` must fit Int32."""
+
+    def __init__(self, table: cute.Tensor, scale: int = 1):
+        if type(scale) is not int or scale < 1:
+            raise ValueError(f"LastEntry.scale must be a positive int, got {scale!r}")
+        self.table, self.scale = table, scale
+
+    def read(self):
+        last = self.table[Int32(cute.size(self.table)) - 1]
+        return Int32(last) * self.scale
+
+    def __extract_mlir_values__(self):
+        return cutlass.extract_mlir_values(self.table)
+
+    def __new_from_mlir_values__(self, values):
+        return LastEntry(cutlass.new_from_mlir_values(self.table, values), self.scale)
+
+
+# --------------------------------------------------------------------------- #
 # Index schedules: how a CTA gets its next linear index
 # --------------------------------------------------------------------------- #
 
@@ -743,16 +799,26 @@ class WorkStream:
 
     # ---- host, inside the @cute.jit entry point ---------------------------- #
 
-    def bind(self, space, workspace=None, max_ctas=None) -> BoundWork:
+    def bind(self, space, workspace=None, max_ctas=None, limit: Limit | None = None) -> BoundWork:
         """Bind the runtime space (``Raster``: ``(m_tiles, n_tiles, l)``). ``workspace``: the
         int32 tensor from ``launch_args``, holding ``AtomicPersistent``'s counters and the
         ``record`` log.
-        ``max_ctas``: the runtime persistent grid cap, typically the SM count."""
+        ``max_ctas``: the runtime persistent grid cap, typically the SM count.
+        ``limit``: a ``Limit`` read on the device that ends the stream early (local schedules)."""
         if workspace is None and self.schedule.uses_workspace:
             raise ValueError(f"{self.schedule.describe()} needs a workspace tensor")
         if workspace is None and self.record:
             raise ValueError("WorkStream(record=...) needs a workspace tensor")
-        return BoundWork(self, self.mapping.bind(space), workspace, max_ctas)
+        if limit is not None and not isinstance(limit, Limit):
+            raise TypeError(
+                f"WorkStream.bind(limit=...) takes a Limit, got {type(limit).__name__}"
+            )
+        if limit is not None and self.schedule.broadcast:
+            raise ValueError(
+                f"{self.schedule.describe()} claims indices on a scheduler warp; a Limit bounds "
+                "local schedules only"
+            )
+        return BoundWork(self, self.mapping.bind(space), workspace, max_ctas, limit=limit)
 
     # ---- device, inside a raw role ------------------------------------------ #
 
@@ -942,12 +1008,13 @@ class BoundWork:
     DSL value: the mapping's space, the Int32 item count ``total`` and, for ``AtomicPersistent``,
     the workspace. ``count64`` (the mapping's Int64 count) and ``max_ctas`` stay on the host."""
 
-    def __init__(self, stream: WorkStream, space, workspace, max_ctas, total=None):
+    def __init__(self, stream: WorkStream, space, workspace, max_ctas, total=None, limit=None):
         self.stream, self.space, self.workspace, self.max_ctas = stream, space, workspace, max_ctas
         if total is None:  # host: count once; the kernel's copies carry the narrowed count
             self.count64 = stream.mapping.count64(space)
             total = _narrow(self.count64)
         self.total = total
+        self.limit = limit  # a Limit, read per decoding site (``_limited``)
         self.cs = stream.cluster_size  # CTAs per work unit
 
     def _in_units(self, ctas):
@@ -1017,6 +1084,18 @@ class BoundWork:
         self.start()
         return WorkCursor.create(self.stream, self, None, RoleTrace("kernel", None))
 
+    def _limited(self):
+        """Device, at a decoding site after the readiness hook: this work with ``total`` cut
+        to ``min(total, limit.read())``, or itself without a limit. The read dominates the
+        site's whole stream, so the copy serves its loops without being carried."""
+        if self.limit is None:
+            return self
+        new = BoundWork(self.stream, self.space, self.workspace, None, total=self.total)
+        limit = cutlass.max(Int32(self.limit.read()), Int32(0))
+        new.total = cutlass.min(Int32(self.total), limit)
+        new.first_words = getattr(self, "first_words", None)
+        return new
+
     def _uses_workspace(self) -> bool:
         return self.stream.schedule.uses_workspace or bool(self.stream.record)
 
@@ -1026,6 +1105,8 @@ class BoundWork:
             values += cutlass.extract_mlir_values(self.total)
         if self._uses_workspace():
             values += cutlass.extract_mlir_values(self.workspace)
+        if self.limit is not None:
+            values += cutlass.extract_mlir_values(self.limit)
         return values
 
     def __new_from_mlir_values__(self, values):
@@ -1036,8 +1117,12 @@ class BoundWork:
             total, n = Int32(values[n]), n + 1
         ws = None
         if self._uses_workspace():
-            ws = cutlass.new_from_mlir_values(self.workspace, values[n:])
-        new = BoundWork(self.stream, space, ws, None, total)
+            k = len(cutlass.extract_mlir_values(self.workspace))
+            ws, n = cutlass.new_from_mlir_values(self.workspace, values[n : n + k]), n + k
+        limit = None
+        if self.limit is not None:
+            limit = cutlass.new_from_mlir_values(self.limit, values[n:])
+        new = BoundWork(self.stream, space, ws, None, total, limit)
         # Prologue values (begin_roles) dominate every later region, so they carry as is.
         new.first_words = getattr(self, "first_words", None)
         return new
@@ -1201,18 +1286,20 @@ def _local_item(stream, index, problem, state):
 
 
 def _local_start(stream, first, problem):
-    """``(index, words, state)`` a local-mode role starts with, from the unit's first index.
-    The readiness hook runs before ``start`` and any decode, and a tile-grid stream takes the
-    prologue's words. The cursor and ``single_item`` share this, so a raw role sees what a
-    managed role would."""
+    """``(problem, index, words, state)`` a local-mode role starts with, from the unit's first
+    index. The readiness hook runs before the limit read, ``start`` and any decode; the returned
+    problem carries the limited total. A tile-grid stream takes the prologue's words. The cursor
+    and ``single_item`` share this, so a raw role sees what a managed role would."""
     if stream.ready is not None:
         stream.ready.wait()
+    problem = problem._limited()
     state = _start(stream.mapping, problem.space)
     if _tile_grid(stream):
-        return first, problem.first_words, state
+        return problem, first, problem.first_words, state
     if _flat_raster(stream):
-        return first, _unsigned_raster_words(stream.mapping, first, problem.space), state
-    return _local_item(stream, first, problem, state)
+        words = _unsigned_raster_words(stream.mapping, first, problem.space)
+        return problem, first, words, state
+    return problem, *_local_item(stream, first, problem, state)
 
 
 def _flat_raster(stream) -> bool:
@@ -1264,9 +1351,10 @@ def _check_plain(stream, method: str):
 def _single_item(stream, problem):
     """``(valid, item)`` of a ``OneShot`` unit, decoded as a local cursor would."""
     first = Int32(stream.schedule.first_index(problem))
-    index, words, _ = _local_start(stream, first, problem)
+    limited = problem.limit is not None
+    problem, index, words, _ = _local_start(stream, first, problem)
     valid = index < problem.total
-    if _tile_grid(stream) and stream.schedule.grid != "auto":
+    if _tile_grid(stream) and stream.schedule.grid != "auto" and not limited:
         # The grid holds one CTA per item, so only an empty space's one CTA has no item: a test
         # of the count alone, with no index to compute.
         valid = problem.total > 0
@@ -1469,7 +1557,7 @@ class WorkCursor:
         first = Int32(stream.schedule.first_index(problem))
         cur = WorkCursor(stream, problem, end, first, (), rec, count, slot)
         if end is None:
-            cur.index, cur._words, cur._state = _local_start(stream, first, problem)
+            cur._problem, cur.index, cur._words, cur._state = _local_start(stream, first, problem)
         elif not _publishes_first(stream):
             cur._words, state = _decode(
                 stream, first, problem, _start(stream.mapping, problem.space)

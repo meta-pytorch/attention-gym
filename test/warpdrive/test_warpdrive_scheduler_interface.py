@@ -35,6 +35,8 @@ from attn_gym.warpdrive import (
     ClusterLaunchControl,
     CtaPair,
     IndexSchedule,
+    LastEntry,
+    Limit,
     OneShot,
     PdlWait,
     ProtocolError,
@@ -745,6 +747,138 @@ def test_plain_kernel_access_rejections():
             bound.single_item()
     with pytest.raises(ProtocolError, match="non-persistent local schedule"):
         WorkStream(schedule=StaticPersistent()).bind((2, 2, 1), None, 4).single_item()
+
+
+# Device-read limits: WorkStream.bind(..., limit=...).
+
+
+class LimitToy(StreamToy):
+    """Managed roles ``a`` and ``b`` and, for ``mode="item"``, raw role ``c`` reading
+    ``single_item()`` count each item of a stream bound with ``limit=LastEntry(table)`` in
+    ``hits[role, tile]``."""
+
+    def __init__(self, schedule, mode: str = "cursor"):
+        super().__init__(schedule)
+        self.mode = mode
+
+    def get_name(self) -> str:
+        return f"{super().get_name()}_{self.mode}"
+
+    @cute.jit
+    def visit(self, r: int, index, item, k, ctx):
+        _hit(r, item, ctx)
+
+    @role(warps=3, raw=True)
+    @cute.jit
+    def c(self, ctx):
+        if cutlass.const_expr(self.mode == "item"):
+            valid, item = self.work.single_item()
+            if valid and cute.arch.lane_idx() == 0:
+                _hit(2, item, ctx)
+
+    @cute.kernel
+    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(hits=hits, em=em, en=en))
+
+    @cute.jit
+    def __call__(
+        self,
+        hits: cute.Tensor,
+        table: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas, limit=LastEntry(table))
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+class LimitPlainToy(PlainToy):
+    """``PlainToy`` (a kernel without roles) with ``limit=LastEntry(table)``."""
+
+    def get_name(self) -> str:
+        return super().get_name().replace("plaintoy", "limitplaintoy")
+
+    @cute.jit
+    def __call__(
+        self,
+        hits: cute.Tensor,
+        table: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas, limit=LastEntry(table))
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(grid=bound.grid(), block=(64, 1, 1), stream=stream)
+
+
+@jit_cache
+def compile_limit_toy(op):
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(cutlass.Int32, (3, cute.sym_int())),
+        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=op.get_name(),
+    )
+
+
+@pytest.mark.parametrize(
+    "schedule, mode, plain",
+    [
+        (StaticPersistent(), "cursor", False),
+        (StaticPersistent(), "cursor", True),
+        (OneShot(), "item", False),
+        (OneShot(grid="3d"), "item", False),
+        (OneShot(grid="3d"), "item", True),
+        (OneShot(grid="1d"), "cursor", True),
+    ],
+    ids=["static_roles", "static_plain", "auto_roles", "tiles_roles", "tiles_plain", "flat_plain"],
+)
+def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule, mode, plain):
+    """Every decoding site reads the limit once and ends at ``min(total, limit)``: the first
+    ``limit`` indices run, once, in every role; 0 runs nothing; a limit at or past the total
+    changes nothing. One compile serves every limit."""
+    op = LimitPlainToy(schedule, mode=mode) if plain else LimitToy(schedule, mode)
+    fn = compile_limit_toy(op)
+    em, en, el = 5, 3, 2
+    total = em * en * el
+    for limit in (0, 7, total, total + 9):
+        hits = torch.zeros(3, total, dtype=torch.int32, device="cuda")
+        # A prefix-sum table: only its last entry is read.
+        table = torch.tensor([0, 3, limit], dtype=torch.int32, device="cuda")
+        fn(hits, table, em, en, el, 4)
+        torch.cuda.synchronize()
+        expect = torch.zeros(total, dtype=torch.int32)
+        expect[: min(limit, total)] = 1  # plain Raster: the linear index is the tile id
+        rows = [0] if plain else [0, 1, 2] if mode == "item" else [0, 1]
+        for r in range(3):
+            assert torch.equal(hits[r].cpu(), expect if r in rows else 0 * expect), (limit, r)
+
+
+def test_limit_rejections():
+    table = object()  # never read: the checks run first
+
+    class Bad:
+        pass
+
+    with pytest.raises(TypeError, match="takes a Limit"):
+        WorkStream(schedule=StaticPersistent()).bind((2, 2, 1), None, 4, limit=Bad())
+    for schedule in (AtomicPersistent(), ClusterLaunchControl()):
+        with pytest.raises(ValueError, match="local schedules only"):
+            WorkStream(schedule=schedule).bind((2, 2, 1), table, 4, limit=Limit())
+    with pytest.raises(ValueError, match="positive int"):
+        LastEntry(table, scale=0)
 
 
 # The persistent GEMM: one argument swaps the schedule.

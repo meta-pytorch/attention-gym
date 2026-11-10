@@ -357,6 +357,28 @@ bound = self.work.bind((table, length), workspace, max_ctas)
 and passes `state=None` through. Even a dropped row read stays within capacity; its words
 are ignored. The schedule visits all capacity, so avoid excessive padding.
 
+### A device-read limit
+
+When the live items are a prefix of the stream, end it there instead of dropping the rest
+one decode at a time: bind a `Limit`, which every decoding site reads once, after the
+readiness hook, and which ends the stream at `min(total, limit)` in the schedule's index
+order.
+
+```python
+from attn_gym.warpdrive import LastEntry
+
+# In the entry point: chunk_offsets is the int32 prefix sum whose last entry counts live chunks.
+bound = self.work.bind((chunk_capacity, 1, 1), None, max_ctas, limit=LastEntry(chunk_offsets))
+```
+
+Indices at or past the limit are terminal: no role decodes them, `single_item()` reports them
+invalid, and a limit of 0 runs nothing. Each role reads the limit itself, so `read()` must give
+every role and CTA the same value: it may read only memory written before the launch (or
+before `ready` returns) and not written during it. `LastEntry(table, scale)` reads
+`scale * table[size - 1]`; a custom `Limit` implements `read()` and the DSL-value protocol
+(`__extract_mlir_values__`/`__new_from_mlir_values__`). Only local schedules take a limit, and
+`assignment()` ignores it.
+
 `PdlWait()` issues `griddepcontrol.wait` once per decoding site: each local role, or the
 broadcast scheduler. It supplies only the wait, not the producer or dependent-launch setup.
 See the PDL tests in
