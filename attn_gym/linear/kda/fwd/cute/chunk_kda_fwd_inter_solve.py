@@ -95,6 +95,12 @@ def _resolve_ragged_execution(
     return resolved
 
 
+def _chunk_workers(resolved: ResolvedSchedule) -> int:
+    """K3b's persistent chunk-axis cap: a runtime launch argument, not a compile key (K4b keeps
+    it as a compile-time stride). The exact grid ignores it."""
+    return resolved.workers if resolved.kind is ScheduleKind.PERSISTENT else 1
+
+
 def _make_fake_chunk_index(
     chunk_schedule: ChunkSchedule,
     sequences: int,
@@ -120,7 +126,6 @@ def _compile_k3b(
     io_name: str,
     chunk_schedule: ChunkSchedule,
     schedule_kind: ScheduleKind,
-    chunk_workers: int = 0,
     use_int64_offsets: bool = False,
     fastmath: bool = True,
 ):
@@ -135,7 +140,6 @@ def _compile_k3b(
         num_subchunks=num_subchunks,
         chunk_schedule=chunk_schedule,
         schedule_kind=schedule_kind,
-        chunk_workers=chunk_workers,
         use_int64_offsets=use_int64_offsets,
         fastmath=fastmath,
     )
@@ -192,10 +196,11 @@ def _compile_k3b(
         1,
         cu_seqlens,
         chunk_offsets,
+        cutlass.Int32(1),
         name=(
             f"kda_fwd_k3b_h{heads}_d{head_dim}_c{chunk_size}_sc{subchunk_size}_{io_name}"
             f"_layout_{chunk_schedule.value}_execution_{schedule_kind.value}"
-            f"_cw{chunk_workers}_i64{int(use_int64_offsets)}_fm{int(fastmath)}"
+            f"_i64{int(use_int64_offsets)}_fm{int(fastmath)}"
         ),
     )
 
@@ -213,7 +218,9 @@ def _compile_k4b(
     chunk_workers: int = 0,
     use_int64_offsets: bool = False,
 ):
-    """Compile K4b for independent layout and execution schedules."""
+    """Compile K4b for independent layout and execution schedules. The persistent grid's
+    ``chunk_workers`` is a compile-time stride (``GridScheduler.num_chunk_workers`` buckets it to
+    a power of two capped at the SM count)."""
     _check_compile_target()
     offdiag_blocks = _validate_specialization(head_dim, chunk_size, subchunk_size)
     num_subchunks = chunk_size // subchunk_size
@@ -309,7 +316,6 @@ def _chunk_kda_fwd_k3b_ragged_impl(
     g_flat = gk.reshape(tokens, heads * head_dim).contiguous()
     beta_flat = beta.reshape(tokens, heads).contiguous()
     Aqk_flat = Aqk.reshape(tokens, heads * chunk_size)
-    chunk_workers = resolved.workers if resolved.kind is ScheduleKind.PERSISTENT else 0
     k3b = _compile_k3b(
         heads,
         head_dim,
@@ -319,7 +325,6 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         io_name,
         ChunkSchedule.RAGGED,
         resolved.kind,
-        chunk_workers,
         use_int64_offsets=requires_int64_abi(q_flat, k_flat, g_flat, beta_flat, Aqk_flat, AkkOD),
         fastmath=fastmath,
     )
@@ -335,6 +340,7 @@ def _chunk_kda_fwd_k3b_ragged_impl(
         metadata.capacity,
         metadata.cu_seqlens,
         metadata.chunk_offsets,
+        _chunk_workers(resolved),
     )
     return Aqk, AkkOD
 
@@ -399,7 +405,6 @@ def _chunk_kda_fwd_k4b_ragged_impl(
     if isinstance(Akkd, FakeTensor) or metadata.capacity == 0:
         return Akk
 
-    chunk_workers = resolved.workers if resolved.kind is ScheduleKind.PERSISTENT else 0
     akkd_flat = Akkd.reshape(tokens, heads * subchunk_size).contiguous()
     akk_flat = Akk.reshape(tokens, heads * chunk_size)
     k4b = _compile_k4b(
@@ -411,7 +416,7 @@ def _chunk_kda_fwd_k4b_ragged_impl(
         io_name,
         ChunkSchedule.RAGGED,
         resolved.kind,
-        chunk_workers,
+        resolved.workers if resolved.kind is ScheduleKind.PERSISTENT else 0,
         use_int64_offsets=requires_int64_abi(AkkOD, akkd_flat, akk_flat),
     )
     k4b(
@@ -553,7 +558,8 @@ def chunk_kda_fwd_inter_solve_cute(
     if Aqk.dtype != q.dtype:
         raise TypeError("Aqk must match the Q/K dtype")
     io_type, io_name = cute_dtype(q.dtype)
-    if isinstance(k, FakeTensor):
+    # The exact grids run one CTA per chunk and do not test for an empty space.
+    if isinstance(k, FakeTensor) or NT == 0:
         return Aqk, Akk
 
     # Q/K heads are compact, but token rows may retain a packed-projection pitch.
@@ -591,6 +597,7 @@ def chunk_kda_fwd_inter_solve_cute(
             NT,
             None,
             None,
+            1,
         )
     with profiler_range("kda/cute/k4b_inverse"):
         k4b = _compile_k4b(

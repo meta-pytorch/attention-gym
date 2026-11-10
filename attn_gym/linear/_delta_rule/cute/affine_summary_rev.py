@@ -18,7 +18,7 @@ grid-strided sequence of flat tile indices, decodes each into (column tile, head
 reads the item's token range from the device ``work`` table, so nothing about the layout is baked
 into the launch. Four CUDA warps hold the FP32 state in registers, one warp issues TMA loads, one
 computes gate exponentials, and one issues the four UMMA operations. Warpdrive pads the four
-roles' seven warps to eight for the 160/40-register warpgroup split. Bias tiles load the local
+roles' seven warps to eight for the 192/56-register warpgroup split. Bias tiles load the local
 output-gradient sources; transition tiles skip those streams entirely. Only the final FP32
 partial is written to global memory.
 
@@ -519,7 +519,7 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
             rows = Int32(0)
         return rows
 
-    @role(warps=range(4), regs=160)
+    @role(warps=range(4), regs=192)
     @cute.jit
     def run_state(
         self,
@@ -710,7 +710,7 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
 
         return state_pipe, dv_pipe, dv_operand, gate_ready, qdo_pipe, wdv_pipe, work
 
-    @role(warps=4, regs=40)
+    @role(warps=4, regs=56)
     @cute.jit
     def run_load(
         self,
@@ -861,7 +861,7 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
 
         return k, q, do, w, aqk, gate, work
 
-    @role(warps=5, regs=40)
+    @role(warps=5, regs=56)
     @cute.jit
     def run_gate(
         self,
@@ -894,7 +894,7 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
 
         return gate, gate_ready, work
 
-    @role(warps=6, regs=40)
+    @role(warps=6, regs=56)
     @cute.jit
     def run_mma(
         self,

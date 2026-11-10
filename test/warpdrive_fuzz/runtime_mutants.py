@@ -16,6 +16,7 @@ from attn_gym.warpdrive.channels import (
     Channel,
     ConsumerEnd,
     Handle,
+    Span,
     Threads,
     Warps,
     _End,
@@ -105,6 +106,22 @@ def turn_no_wait():
             e._trace.record(e._ts.name, "turn", e._seat)
 
     channels._TurnScope.__enter__ = __enter__
+
+
+def span_no_wait():
+    """A span's ``begin()`` does not wait: the consumer reads a stage before it is filled."""
+
+    def begin(self, i):
+        self._progress.begin_site = "mutant"
+        self._progress.loop = channels.current_block()
+        self._open(once="first")
+
+    Span.begin = begin
+
+
+def span_signal_first():
+    """A span signals in its loop's first iteration: the stage is published half filled."""
+    Span._trips = lambda self, i, op: 1
 
 
 def per_role_join_short():
@@ -256,6 +273,16 @@ MUTANTS = {
         "test_concurrent_launches_use_one_workspace_per_stream",
     ),
     "turn_no_wait": (turn_no_wait, "test_warpdrive.py", "test_turnstile_alternates_seats"),
+    "span_no_wait": (
+        span_no_wait,
+        "test_warpdrive_spans.py",
+        "test_span_waits_in_the_first_iteration_and_signals_in_the_last[producer-2-loop-span]",
+    ),
+    "span_signal_first": (
+        span_signal_first,
+        "test_warpdrive_spans.py",
+        "test_span_waits_in_the_first_iteration_and_signals_in_the_last[producer-1-loop-handle]",
+    ),
     "per_role_join_short": (
         per_role_join_short,
         "test_warpdrive_per_role.py",

@@ -533,10 +533,65 @@ for i in cutlass.range(n_blocks - 1, unroll=1):
 
 - Close each handle exactly once, in the dynamic loop/branch region that opened it.
   Missing, double or cross-region closes raise `ProtocolError` with source locations.
+  A [span](#spans) holds a stage from a loop's first iteration to its last.
 - Return the updated endpoint, not handles, at role exit.
 - `h.retire()` closes a final unused producer acquire without publication; no consumer may
   need it. Automatically tailed pair channels reject it.
 - Do not use payloads/pointers after close. The checker is not an ownership system.
+
+## Spans
+
+Use a span when a stage is filled, or read, across the iterations of a counted loop: the wait
+belongs in the first iteration and the signal in the last, which a handle cannot do because it
+closes in the region that opened it. KDA's WY backward accumulates dq over its V tiles this
+way:
+
+```python
+dq_span = dq.span()  # takes the stage and advances the end; no wait yet
+for v in cutlass.range(self.num_v_tiles):  # a Python int: 0, 1, ..., n - 1
+    ...
+    dq_span.begin(v)  # if v == 0: wait until the stage is empty
+    mma(dq_span.index, accumulate=v != 0)
+    dq_span.commit(v)  # if v == n - 1: tcgen05.commit
+```
+
+```text
+              v = 0                 v = 1 ... n - 2        v = n - 1
+span()   begin: wait EMPTY          begin: nothing         begin: nothing
+         commit: nothing            commit: nothing        commit: signal FULL
+```
+
+`mma` stands for the kernel's MMA code. `commit()` without an index publishes after the loop
+instead, in the region that opened the span (WY's dA gets one more MMA after its V loop). A
+consumer's span waits for FULL in the first iteration and takes `release(v)` or `release()`.
+Both closes accept `signal=False`, and a span is otherwise a handle: `index`, `phase`,
+`view()`, `data` and the barrier pointers.
+
+Acquiring before the loop is the simpler form when the role has nothing else to do first;
+unrolling the loop with `cutlass.range_constexpr` and an ordinary handle is another. A span
+keeps the loop dynamic and the wait late: in WY, taking the four accumulators before the V
+loop measured 6-12% slower, and unrolling it 27-37% slower (the MMA warp spilled).
+
+Tracing checks, and raises `ProtocolError` otherwise:
+
+- `begin(i)`, `commit(i)` and `release(i)` run directly in the body of one
+  `for i in cutlass.range(n)` loop with a Python int `n >= 1`, start 0 and step 1; `i` is
+  that loop's index; and the loop sits in the region that opened the span. A branch, a nested
+  or constexpr loop, dynamic bounds or another loop's index are rejected. The trip count comes
+  from the loop, so the two guards cannot disagree with it.
+- `begin` is traced once, before the close. `commit()`/`release()` without an index is in
+  the opening region.
+- The span is closed exactly once; `retire()` is rejected.
+- Named-barrier channels and `Tma` producers cannot hold a span: a named wait is an arrival,
+  and a `Tma` producer arms its stage when it acquires. Use an ordinary handle there.
+
+`span()` counts as the end's acquire/wait for the [ownership check](#static-ownership-check),
+[try tokens](#try-tokens) (outstanding ones go stale) and [previews](#previews) (the span owns
+a previewed epoch). The [alias diagnostic](storage.md#check-declared-aliases) places a span's
+wait in its loop's first repetition and an in-loop signal in the last.
+
+Not checked: using the stage in iteration 0 before `begin`, or before the loop. The stage is
+the role's only between that wait and the signal.
 
 ## Try tokens
 

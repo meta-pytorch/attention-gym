@@ -9,7 +9,13 @@ CuTe DSL K3b: Off-diagonal gated matmul, one pair per CTA, 4 warps.
 
 Matches NV C++ kernel_3b_offdiag_matmul.cu architecture:
   Exact grid: (total_chunks * 6, H, 1) — one CTA per (chunk, pair, head)
-  Persistent grid: (chunk_workers * 6, H, 1) — each CTA strides over chunks
+  Persistent grid: (6, chunk_workers, H) — each CTA strides over chunks
+
+The grids come from a warpdrive work stream over the (pair, head, chunk) space: the exact grid is
+``OneShot(grid="2d")`` (the chunk folded into x with the six pairs), the persistent one
+``TilePersistent("n")`` over (pair, chunk, head), which launches its CTAs in the order of the
+hand-built ``(chunk_workers * 6, H)`` grid and strides the chunk by the runtime worker count,
+bounded by the active chunk count ``chunk_offsets[-1]``.
   128 threads (4 warps):
       All warps: Phase 1 — fused gating into SMEM
       Warp 0:    Phase 2 — Aqk = sQg @ sKn^T  (MMA)
@@ -37,6 +43,13 @@ from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_work,
 )
 from attn_gym.warpdrive.compat import SmemAllocator
+from attn_gym.warpdrive.scheduling import (
+    BoundWork,
+    LastEntry,
+    OneShot,
+    TilePersistent,
+    WorkStream,
+)
 
 
 class ChunkKDAFwdK3bOffdiagCuteDSL:
@@ -50,7 +63,6 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         num_subchunks: int = 4,
         chunk_schedule: ChunkSchedule = ChunkSchedule.DENSE,
         schedule_kind: ScheduleKind = ScheduleKind.STATIC,
-        chunk_workers: int = 0,
         use_int64_offsets: bool = False,
         fastmath: bool = True,
     ):
@@ -61,14 +73,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             f"chunk_size must equal num_subchunks * BC, got {chunk_size} and "
             f"{num_subchunks} * {BC}"
         )
-        if schedule_kind is ScheduleKind.PERSISTENT:
-            assert chunk_schedule is ChunkSchedule.RAGGED and chunk_workers > 0, (
-                "persistent execution requires a positive ragged chunk-worker grid"
-            )
-        else:
-            assert chunk_workers == 0, "static execution does not use chunk workers"
+        persistent = schedule_kind is ScheduleKind.PERSISTENT
+        assert not persistent or chunk_schedule is ChunkSchedule.RAGGED, (
+            "persistent execution requires the ragged chunk layout"
+        )
         self.schedule_kind = schedule_kind
-        self.chunk_workers = chunk_workers
+        self.work = WorkStream(schedule=TilePersistent("n") if persistent else OneShot(grid="2d"))
         self.use_int64_offsets = use_int64_offsets
         self.fastmath = fastmath
         self.BC = BC
@@ -99,15 +109,19 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         total_chunks: int,
         cu_seqlens: cute.Tensor | None,
         chunk_offsets: cute.Tensor | None,
+        chunk_workers: Int32,
         stream,
     ):
         self._dtype: type[cutlass.Numeric] = mQ.element_type
-        chunk_axis = (
-            self.chunk_workers
-            if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT)
-            else total_chunks
-        )
-        grid = (chunk_axis * self.num_offdiag_blocks, H, 1)
+        if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
+            work = self.work.bind(
+                (self.num_offdiag_blocks, total_chunks, H),
+                None,
+                chunk_workers,
+                limit=LastEntry(chunk_offsets),
+            )
+        else:
+            work = self.work.bind((self.num_offdiag_blocks, H, total_chunks))
 
         smem_k_block_size = 64
         swizzle_bits = 3
@@ -175,7 +189,8 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
             smem_copy_B,
             tiled_mma,
             SharedStorage,
-        ).launch(grid=grid, block=[self.num_threads, 1, 1], stream=stream)
+            work,
+        ).launch(grid=work.grid(), block=[self.num_threads, 1, 1], stream=stream)
 
     @cute.kernel
     def kernel(
@@ -196,12 +211,17 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         smem_copy_B: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
+        work: BoundWork,
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        block_idx, head_idx, _ = cute.arch.block_idx()
-
-        chunk_idx = block_idx // self.num_offdiag_blocks
-        pair_idx = block_idx % self.num_offdiag_blocks
+        if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
+            chunks = work.cursor()
+            trips = chunks.trip_count()
+            pair_idx, _, head_idx = chunks.item  # the first item: blockIdx, no decode
+        else:
+            # The exact grid launches every capacity chunk: a chunk past the active count still
+            # runs, writing its deterministic zero rows, so ``valid`` is not needed.
+            _, (pair_idx, head_idx, chunk_idx) = work.single_item()
 
         ri = 1
         if pair_idx >= 1:
@@ -220,14 +240,12 @@ class ChunkKDAFwdK3bOffdiagCuteDSL:
         sBeta = storage.sBeta.get_tensor(sBeta_layout)
 
         if cutlass.const_expr(self.schedule_kind is ScheduleKind.PERSISTENT):
-            active_chunks = load_ragged_chunk_count(chunk_offsets)
             # unroll=2 interleaves two chunks' gating loads, restoring the
             # load->use distance the scheduler achieves in the static body
             # (median 46 vs 14 instructions; long_scoreboard 25 -> ~12 cyc/inst).
             # unroll=4 crosses a code-size/register cliff and loses it again.
-            for current_chunk in cutlass.range(
-                chunk_idx, active_chunks, self.chunk_workers, unroll=2
-            ):
+            for k in cutlass.range(trips, unroll=2):
+                _, current_chunk, _ = chunks.item_at(k)
                 self._process_chunk(
                     mQ,
                     mK,

@@ -570,7 +570,9 @@ def _unroll(role: RoleEvents, items: int) -> list[tuple[int, int]]:
     """Return ``(event index, item)`` pairs in program order.
 
     Dynamic loops repeat twice, the work loop ``items`` times, and branches once.
-    Prologue events use item -1; epilogue events use item ``items``.
+    Prologue events use item -1; epilogue events use item ``items``. A span's open
+    (``once="first"``) and in-loop close (``once="last"``) appear only in their loop's first
+    and last repetition.
     """
     root: list = []
     stack: list = [(None, root)]
@@ -587,18 +589,21 @@ def _unroll(role: RoleEvents, items: int) -> list[tuple[int, int]]:
         stack[-1][1].append(i)
     out: list = []
 
-    def emit(children, item):
+    def emit(children, item, first=True, last=True):
         for c in children:
             if len(out) > UNROLL_LIMIT:
                 raise _TooLarge(f"role {role.name} unrolls past {UNROLL_LIMIT} events")
             if isinstance(c, int):
-                out.append((c, item))
+                once = role.events[c].data.get("once")
+                if once is None or (first if once == "first" else last):
+                    out.append((c, item))
             elif c[0] == role.item_key:
                 for it in range(items):
-                    emit(c[2], it)
+                    emit(c[2], it, it == 0, it == items - 1)
             else:
-                for _ in range(2 if c[1] == "loop" else 1):
-                    emit(c[2], item)
+                repetitions = 2 if c[1] == "loop" else 1
+                for r in range(repetitions):
+                    emit(c[2], item, r == 0, r == repetitions - 1)
 
     item = -1
     for c in root:

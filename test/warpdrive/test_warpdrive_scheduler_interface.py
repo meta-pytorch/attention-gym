@@ -35,6 +35,8 @@ from attn_gym.warpdrive import (
     ClusterLaunchControl,
     CtaPair,
     IndexSchedule,
+    LastEntry,
+    Limit,
     OneShot,
     PdlWait,
     ProtocolError,
@@ -42,6 +44,8 @@ from attn_gym.warpdrive import (
     Readiness,
     SingleCta,
     StaticPersistent,
+    TilePersistent,
+    WorkCursor,
     WorkMap,
     WorkStream,
     role,
@@ -556,14 +560,17 @@ def test_static_grid_rejects_an_oversized_static_space(grid, space):
 
 class PlainToy:
     """A kernel without roles: every CTA counts its items in ``hits[tile]``, read with
-    ``bound.single_item()`` (``mode="item"``) or a ``bound.cursor()`` loop."""
+    ``bound.single_item()`` (``mode="item"``) or a ``bound.cursor()`` loop. ``static`` gives
+    ``(m_tiles, n_tiles)`` compile-time values (None: the runtime argument)."""
 
-    def __init__(self, schedule, mapping=None, mode: str = "item"):
+    def __init__(self, schedule, mapping=None, mode: str = "item", static=(None, None)):
         self.work = WorkStream(mapping=mapping or Raster(), schedule=schedule)
         self.mode = mode
+        self.static = static
 
     def get_name(self) -> str:
-        return f"warpdrive_plaintoy_{self.work.get_key()}_{self.mode}"
+        static = "".join("r" if e is None else str(e) for e in self.static)
+        return f"warpdrive_plaintoy_{self.work.get_key()}_{self.mode}_{static}"
 
     def __cute_cache_key__(self) -> str:
         return self.get_name()
@@ -576,12 +583,32 @@ class PlainToy:
             valid, item = bound.single_item()
             if valid and first_thread:
                 _hit(0, item, ctx)
+        elif cutlass.const_expr(self.mode.startswith("count")):
+            work = bound.cursor()
+            trips = work.trip_count()
+            if cutlass.const_expr(self.mode == "count_twice"):
+                trips = work.trip_count()
+            if cutlass.const_expr(self.mode == "count_item_before_loop"):
+                _hit(0, work.item_at(0), ctx)
+            if cutlass.const_expr(self.mode != "count_no_loop"):
+                for k in cutlass.range(trips, unroll=2):
+                    if cutlass.const_expr(self.mode == "count_item_in_branch"):
+                        if first_thread:
+                            _hit(0, work.item_at(k), ctx)
+                    else:
+                        item = work.item_at(k)
+                        if first_thread:
+                            _hit(0, item, ctx)
+            if cutlass.const_expr(self.mode == "count_then_advance"):
+                work.advance()
         else:
             work = bound.cursor()
             while work.valid:
                 if first_thread:
                     _hit(0, work.item, ctx)
                 work.advance()
+            if cutlass.const_expr(self.mode == "advance_then_count"):
+                work.trip_count()
 
     @cute.jit
     def __call__(
@@ -593,7 +620,8 @@ class PlainToy:
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        bound = self.work.bind((em, en, el), None, max_ctas)
+        tiles = (e if s is None else s for e, s in zip((em, en), self.static, strict=True))
+        bound = self.work.bind((*tiles, el), None, max_ctas)
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(hits, em, en, bound).launch(grid=bound.grid(), block=(64, 1, 1), stream=stream)
 
@@ -605,11 +633,14 @@ def compile_plain_toy(op: PlainToy):
 
 
 def _plain_hits(op, ext, max_ctas=148):
-    """Counts per tile; one zero for an empty space, whose idle CTA must count nothing."""
-    hits = torch.zeros(1, max(math.prod(ext), 1), dtype=torch.int32, device="cuda")
+    """Counts per tile; one zero for an empty space, whose idle CTA must count nothing. An item
+    past the space would count in the checked padding."""
+    size, pad = max(math.prod(ext), 1), 64
+    hits = torch.zeros(1, size + pad, dtype=torch.int32, device="cuda")
     compile_plain_toy(op)(hits, *ext, max_ctas)
     torch.cuda.synchronize()
-    return hits[0].cpu()
+    assert not hits[0, size:].any(), "an item past the space ran"
+    return hits[0, :size].cpu()
 
 
 @pytest.mark.parametrize(
@@ -636,13 +667,45 @@ def _plain_hits(op, ext, max_ctas=148):
         (StaticPersistent(), None, "cursor", (9, 7, 2)),  # 4 CTAs run 126 items
         (StaticPersistent(), SkipOdd(swizzle=2), "cursor", (9, 7, 2)),
         (StaticPersistent(), None, "cursor", (0, 7, 2)),
+        # Static tile extents (Python ints) beside runtime ones; l carries emptiness.
+        (OneShot(grid="2d"), None, "static_m", (3, 2, 65537)),
+        (OneShot(grid="2d"), None, "static_m", (3, 2, 0)),
+        (OneShot(grid="3d"), None, "static_mn", (5, 3, 2)),
+        (OneShot(), None, "static_mn", (2, 3, 2)),
+        (OneShot(), None, "static_mn", (5, 3, 0)),
+        (OneShot(grid="1d"), Raster(swizzle=2, reverse="m"), "static_mn", (5, 3, 2)),
+        (StaticPersistent(), None, "static_mn", (9, 7, 2)),
+        (StaticPersistent(), Raster(along="n", swizzle=3), "static_m", (9, 7, 2)),
+        # One axis walked per CTA (max_ctas=4 units along it), the others from blockIdx.
+        (TilePersistent("m"), None, "cursor", (9, 3, 2)),
+        (TilePersistent("n"), None, "cursor", (3, 9, 2)),
+        (TilePersistent("l"), None, "cursor", (3, 2, 9)),
+        (TilePersistent("n"), None, "static_mn", (3, 2, 2)),
+        (TilePersistent("m"), None, "cursor", (0, 3, 2)),
+        (TilePersistent("n"), None, "cursor", (3, 9, 0)),
+        # A compile-time stride: the grid's axis is exactly `units`, idle CTAs run nothing.
+        (TilePersistent("m", units=4), None, "cursor", (9, 3, 2)),
+        (TilePersistent("n", units=16), None, "cursor", (3, 9, 2)),
+        (TilePersistent("l", units=3), None, "cursor", (2, 3, 7)),
+        # Counted loops (unroll=2): 126 items over 4 CTAs, not a multiple; empty spaces.
+        (StaticPersistent(), None, "counted", (9, 7, 2)),
+        (StaticPersistent(), None, "counted", (3, 1, 1)),  # fewer items than max_ctas
+        (StaticPersistent(), None, "counted", (0, 7, 2)),
+        (TilePersistent("n"), None, "counted", (3, 9, 2)),
+        (TilePersistent("l"), None, "counted", (2, 3, 2)),  # stride 4 past the extent of 2
+        (TilePersistent("m"), None, "counted", (0, 3, 2)),
+        (TilePersistent("l", units=3), None, "counted", (2, 3, 7)),  # constant stride
     ],
     ids=lambda v: v if isinstance(v, str) else None,
 )
 def test_plain_kernel_reads_its_work(requires_blackwell, schedule, mapping, mode, ext):
     """A kernel without roles covers the space once, on every static grid and through a
-    persistent cursor loop."""
-    op = PlainToy(schedule, mapping, mode)
+    persistent cursor loop, also with static tile extents."""
+    em, en, _ = ext
+    static = {"static_m": (em, None), "static_mn": (em, en)}.get(mode, (None, None))
+    if mode.startswith("static"):
+        mode = "cursor" if schedule.persistent else "item"
+    op = PlainToy(schedule, mapping, mode, static)
     em, en, el = ext
     kept = [
         int(mapping is None or not mapping.skips or mapping.kept((m, n, li)))
@@ -676,16 +739,19 @@ def test_tiles_grid_reads_block_idx_without_a_fallback(requires_blackwell, tmp_p
 
     compile_fn = Compiler.compile
 
-    def ptx_of(grid: str) -> str:
+    def ptx_of(grid: str, static=(None, None)) -> str:
+        label = grid + "".join(f"_{e}" for e in static if e is not None)
+        (tmp_path / label).mkdir()
+
         def dump_ptx(self, module, pipeline, *args, **kwargs):
-            option = f"dump-ptx-path='{tmp_path / grid}' "
+            option = f"dump-ptx-path='{tmp_path / label / 'kernel'}' "
             pipeline = pipeline.replace("cute-to-nvvm{", "cute-to-nvvm{" + option, 1)
             return compile_fn(self, module, pipeline, *args, **kwargs)
 
         monkeypatch.setattr(Compiler, "compile", dump_ptx)
         # Bypass the cache: the PTX needs a compile.
-        compile_plain_toy.__wrapped__(PlainToy(OneShot(grid=grid)))
-        (ptx,) = tmp_path.glob(f"{grid}*.ptx")
+        compile_plain_toy.__wrapped__(PlainToy(OneShot(grid=grid), static=static))
+        (ptx,) = (tmp_path / label).glob("*.ptx")
         return ptx.read_text(errors="ignore")
 
     decodes = re.compile(r"^\s*(div|rem)\.", re.MULTILINE)
@@ -698,6 +764,9 @@ def test_tiles_grid_reads_block_idx_without_a_fallback(requires_blackwell, tmp_p
     assert "%ctaid.y" in fold and "%ctaid.z" not in fold and "%nctaid" not in fold
     assert [m.group(0).strip() for m in decodes.finditer(fold)] == ["div."]
     assert "div.u32" in fold
+    # A static m_tiles stays a constant: the unfold multiplies instead of dividing.
+    fold_static = ptx_of("2d", static=(3, None))
+    assert "%ctaid.x" in fold_static and not decodes.search(fold_static)
     flat = ptx_of("1d")  # the 1-D index, decoded unsigned
     assert "%ctaid.y" not in flat and "%nctaid" not in flat
     assert "div.u32" in flat and "div.s32" not in flat and "div.s32" in auto
@@ -722,6 +791,201 @@ def test_plain_kernel_access_rejections():
             bound.single_item()
     with pytest.raises(ProtocolError, match="non-persistent local schedule"):
         WorkStream(schedule=StaticPersistent()).bind((2, 2, 1), None, 4).single_item()
+
+
+# Device-read limits: WorkStream.bind(..., limit=...).
+
+
+class LimitToy(StreamToy):
+    """Managed roles ``a`` and ``b`` and, for ``mode="item"``, raw role ``c`` reading
+    ``single_item()`` count each item of a stream bound with ``limit=LastEntry(table)`` in
+    ``hits[role, tile]``."""
+
+    def __init__(self, schedule, mode: str = "cursor"):
+        super().__init__(schedule)
+        self.mode = mode
+
+    def get_name(self) -> str:
+        return f"{super().get_name()}_{self.mode}"
+
+    @cute.jit
+    def visit(self, r: int, index, item, k, ctx):
+        _hit(r, item, ctx)
+
+    @role(warps=3, raw=True)
+    @cute.jit
+    def c(self, ctx):
+        if cutlass.const_expr(self.mode == "item"):
+            valid, item = self.work.single_item()
+            if valid and cute.arch.lane_idx() == 0:
+                _hit(2, item, ctx)
+
+    @cute.kernel
+    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(hits=hits, em=em, en=en))
+
+    @cute.jit
+    def __call__(
+        self,
+        hits: cute.Tensor,
+        table: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas, limit=LastEntry(table))
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+class LimitPlainToy(PlainToy):
+    """``PlainToy`` (a kernel without roles) with ``limit=LastEntry(table)``."""
+
+    def get_name(self) -> str:
+        return super().get_name().replace("plaintoy", "limitplaintoy")
+
+    @cute.jit
+    def __call__(
+        self,
+        hits: cute.Tensor,
+        table: cute.Tensor,
+        em: Int32,
+        en: Int32,
+        el: Int32,
+        max_ctas: Int32,
+        stream: cuda.CUstream,
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas, limit=LastEntry(table))
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(grid=bound.grid(), block=(64, 1, 1), stream=stream)
+
+
+@jit_cache
+def compile_limit_toy(op):
+    return compile_tvm_ffi(
+        op,
+        make_fake_compact_tensor(cutlass.Int32, (3, cute.sym_int())),
+        make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),)),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=op.get_name(),
+    )
+
+
+@pytest.mark.parametrize(
+    "schedule, mode, plain",
+    [
+        (StaticPersistent(), "cursor", False),
+        (StaticPersistent(), "cursor", True),
+        (OneShot(), "item", False),
+        (OneShot(grid="3d"), "item", False),
+        (OneShot(grid="3d"), "item", True),
+        (OneShot(grid="1d"), "cursor", True),
+        (OneShot(grid="2d"), "item", True),
+        (TilePersistent("n"), "cursor", False),
+        (TilePersistent("m"), "cursor", True),
+        (StaticPersistent(), "counted", True),
+        (TilePersistent("n"), "counted", True),
+    ],
+    ids=["static_roles", "static_plain", "auto_roles", "tiles_roles", "tiles_plain", "flat_plain",
+         "2d_plain", "tile_n_roles", "tile_m_plain", "static_counted", "tile_n_counted"],
+)  # fmt: skip
+def test_limit_ends_every_role_at_the_device_count(requires_blackwell, schedule, mode, plain):
+    """Every decoding site reads the limit once and ends at ``min(total, limit)``: the first
+    ``limit`` indices run, once, in every role; 0 or below runs nothing; a limit at or past the total
+    changes nothing. ``TilePersistent``'s index is its axis coordinate. One compile serves every
+    limit."""
+    op = LimitPlainToy(schedule, mode=mode) if plain else LimitToy(schedule, mode)
+    fn = compile_limit_toy(op)
+    em, en, el = 5, 3, 2
+    total = em * en * el
+    for limit in (-3, 0, 7, total, total + 9):
+        pad = 64  # an item past the stream's end would count in the padding
+        hits = torch.zeros(3, total + pad, dtype=torch.int32, device="cuda")
+        # A prefix-sum table: only its last entry is read.
+        table = torch.tensor([0, 3, limit], dtype=torch.int32, device="cuda")
+        fn(hits, table, em, en, el, 4)
+        torch.cuda.synchronize()
+        # Plain Raster: the linear index is the tile id ((l * en + n) * em + m).
+        tiles = itertools.product(range(el), range(en), range(em))
+        index = {
+            TilePersistent: lambda li, n, m: (m, n, li)["mnl".index(schedule.axis)],
+        }.get(type(schedule), lambda li, n, m: (li * en + n) * em + m)
+        expect = torch.tensor([int(index(*t) < limit) for t in tiles] + [0] * pad)
+        rows = [0] if plain else [0, 1, 2] if mode == "item" else [0, 1]
+        for r in range(3):
+            assert torch.equal(hits[r].cpu(), expect.int() if r in rows else 0 * expect.int()), (
+                limit,
+                r,
+            )
+
+
+def test_tile_persistent_reads_without_division(requires_blackwell, tmp_path, monkeypatch):
+    """``TilePersistent`` reads two coordinates from ``blockIdx`` and steps the third by
+    ``gridDim``: no division anywhere, and ``max_ctas`` is a runtime value."""
+    from cutlass.base_dsl.compiler import Compiler
+
+    compile_fn = Compiler.compile
+
+    def dump_ptx(self, module, pipeline, *args, **kwargs):
+        option = f"dump-ptx-path='{tmp_path / 'kernel'}' "
+        pipeline = pipeline.replace("cute-to-nvvm{", "cute-to-nvvm{" + option, 1)
+        return compile_fn(self, module, pipeline, *args, **kwargs)
+
+    monkeypatch.setattr(Compiler, "compile", dump_ptx)
+    compile_plain_toy.__wrapped__(PlainToy(TilePersistent("n"), mode="cursor"))
+    (ptx,) = tmp_path.glob("*.ptx")
+    text = ptx.read_text(errors="ignore")
+    assert "%nctaid.y" in text and all(f"%ctaid.{a}" in text for a in "xyz")
+    assert not re.search(r"^\s*(div|rem)\.", text, re.MULTILINE)
+
+
+def test_tile_persistent_cap_is_runtime(requires_blackwell):
+    """One compile serves every ``max_ctas`` (here, the SM count's stand-in) and every space."""
+    op = PlainToy(TilePersistent("n"), mode="cursor")
+    _plain_hits(op, (3, 9, 2), max_ctas=4)
+    before = compile_plain_toy.cache_info()
+    for max_ctas, ext in [(1, (3, 9, 2)), (3, (2, 17, 3)), (148, (3, 9, 2)), (7, (1, 1, 1))]:
+        expect = torch.ones(math.prod(ext), dtype=torch.int32)
+        assert torch.equal(_plain_hits(op, ext, max_ctas=max_ctas), expect), (max_ctas, ext)
+    after = compile_plain_toy.cache_info()
+    assert after.currsize == before.currsize and after.misses == before.misses
+
+
+def test_tile_persistent_assignment_keeps_a_folded_grid_order():
+    """``TilePersistent("n")`` over ``(pairs, chunks, heads)`` launches the CTAs of a hand-built
+    ``(workers * pairs, heads)`` grid that folds the pair into x (KDA K3b), in the same order and
+    with the same items: CTA ``x + pairs * workers * head`` with ``x = worker * pairs + pair``."""
+    pairs, chunks, heads, workers = 6, 11, 3, 4
+    rows = WorkStream(schedule=TilePersistent("n")).assignment(
+        (pairs, chunks, heads), max_ctas=workers
+    )
+    legacy = []
+    for head in range(heads):
+        for x in range(workers * pairs):
+            worker, pair = divmod(x, pairs)
+            legacy.append([(c, (pair, c, head)) for c in range(worker, chunks, workers)])
+    assert rows == legacy
+
+
+def test_limit_rejections():
+    table = object()  # never read: the checks run first
+
+    class Bad:
+        pass
+
+    with pytest.raises(TypeError, match="takes a Limit"):
+        WorkStream(schedule=StaticPersistent()).bind((2, 2, 1), None, 4, limit=Bad())
+    for schedule in (AtomicPersistent(), ClusterLaunchControl()):
+        with pytest.raises(ValueError, match="local schedules only"):
+            WorkStream(schedule=schedule).bind((2, 2, 1), table, 4, limit=Limit())
+    with pytest.raises(ValueError, match="positive int"):
+        LastEntry(table, scale=0)
 
 
 # The persistent GEMM: one argument swaps the schedule.
@@ -1042,3 +1306,142 @@ def test_split_k_partials_reduce_on_the_host(requires_blackwell, schedule, clust
         reduced = torch.where(written, partial.cpu(), 0).sum(0)
         assert torch.equal(reduced, x.cpu().sum(1, dtype=torch.int32))
         assert ws[:2].tolist() == [0, 0]
+
+
+def test_tile_persistent_units_fix_the_grid_and_stride():
+    """``units`` launches exactly that many CTAs along the axis, reads no ``max_ctas`` and
+    names itself in the compile key."""
+    schedule = TilePersistent("n", units=4)
+    assert not schedule.uses_max_ctas and schedule.get_key().endswith("_units4")
+    rows = WorkStream(schedule=schedule).assignment((2, 3, 1))
+    assert len(rows) == 2 * 4 * 1
+    assert rows[:2] == [[(0, (0, 0, 0))], [(0, (1, 0, 0))]]  # CTA (x, y=0): chunk 0 only
+    assert rows[-1] == []  # y=3 is past the 3 chunks
+    for units in (0, -1, 2.0):
+        with pytest.raises(ValueError, match="units must be a positive int"):
+            TilePersistent("m", units=units)
+
+
+def test_tile_persistent_rejections():
+    with pytest.raises(ValueError, match="axis must be one of"):
+        TilePersistent("k")
+    for mapping in (Raster(swizzle=2), Raster(along="n"), SkipOdd()):
+        with pytest.raises(ValueError, match="plain Raster"):
+            WorkStream(mapping=mapping, schedule=TilePersistent("m"))
+    with pytest.raises(ValueError, match="no record"):
+        WorkStream(schedule=TilePersistent("m"), record=2)
+    for max_ctas in (4, Int32(4)):  # a static l past gridDim.z raises with any cap
+        bound = WorkStream(schedule=TilePersistent("n")).bind((2, 3, 70000), None, max_ctas)
+        with pytest.raises(ValueError, match="gridDim.y/z are limited"):
+            bound.grid()
+    with pytest.raises(ValueError, match="units on gridDim.y/z"):
+        TilePersistent("n", units=70000)
+    with pytest.raises(ValueError, match="drop decode"):
+        WorkStream(schedule=TilePersistent("m")).assignment((2, 2, 1), 2, decode=lambda i: i)
+
+
+def test_tile_persistent_launch_bounds_the_axis_not_the_space():
+    """The Int32 launch check bounds the axis coordinate: a space of 3e9 items whose
+    coordinates all fit launches."""
+    bound = WorkStream(schedule=TilePersistent("n")).bind((16, 3_000_000, 64), None, 152)
+    assert bound.grid() == (16, 152, 64)
+
+
+@pytest.mark.parametrize(
+    "mode, message",
+    [
+        ("count_then_advance", r"advance\(\) at .* on a cursor counted by trip_count\(\)"),
+        ("advance_then_count", r"trip_count\(\) on .*: it already advances"),
+        ("count_twice", r"trip_count\(\) on .*: it is already counted"),
+        ("count_item_before_loop", r"item_at\(\) at .* must run directly in the body"),
+        ("count_item_in_branch", r"item_at\(\) at .* must run directly in the body"),
+    ],
+)
+def test_counted_loop_rejects_misuse(mode, message):
+    """A cursor loops either with advance() or over one trip_count(), reading items with
+    item_at() directly in that loop's body; anything else raises when traced."""
+    with pytest.raises(ProtocolError, match=message):
+        compile_plain_toy.__wrapped__(PlainToy(StaticPersistent(), mode=mode))
+
+
+def test_counted_loop_rejections():
+    """trip_count() needs a fixed stride and an unguarded, stateless decode."""
+    for schedule, mapping, why in [
+        (OneShot(grid="1d"), None, "has no fixed stride"),
+        (StaticPersistent(), SkipOdd(), "does not decode every index unguarded"),
+    ]:
+        with pytest.raises(ProtocolError, match=why):
+            compile_plain_toy.__wrapped__(PlainToy(schedule, mapping, mode="counted"))
+
+
+class CountedRoleToy(StreamToy):
+    """Roles ``a`` (warp 0) and ``b`` (warps 1-2) each loop over ``trip_count()`` and count every
+    item in ``hits[role, tile]``."""
+
+    def __init__(self, schedule, mode: str = "ok"):
+        super().__init__(schedule)
+        self.mode = mode
+
+    @cute.jit
+    def _counted(self, r: int, work, ctx):
+        trips = work.trip_count()
+        if cutlass.const_expr(self.mode == "no_loop" and r == 1):
+            return work
+        for k in cutlass.range(trips, unroll=2):
+            item = work.item_at(k)
+            if cute.arch.lane_idx() == 0 and cute.arch.warp_idx() == r:
+                _hit(r, item, ctx)
+        return work
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, work: WorkCursor, ctx):
+        return self._counted(0, work, ctx)
+
+    @role(warps=range(1, 3))
+    @cute.jit
+    def b(self, work: WorkCursor, ctx):
+        return self._counted(1, work, ctx)
+
+    @cute.kernel
+    def kernel(self, hits: cute.Tensor, em: Int32, en: Int32, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace(hits=hits, em=em, en=en))
+
+    @cute.jit
+    def __call__(
+        self, hits: cute.Tensor, em: Int32, en: Int32, el: Int32, max_ctas: Int32, stream
+    ):
+        bound = self.work.bind((em, en, el), None, max_ctas)
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(hits, em, en, bound).launch(**self.launch_config(bound), stream=stream)
+
+
+@pytest.mark.parametrize(
+    "schedule", [StaticPersistent(), TilePersistent("n"), TilePersistent("m", units=3)]
+)
+def test_counted_loop_in_roles(requires_blackwell, schedule):
+    """Every role of a warp-specialized kernel runs each item once through a counted loop."""
+    fn = compile_tvm_ffi(
+        CountedRoleToy(schedule),
+        make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int())),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        Int32(1),
+        name=CountedRoleToy(schedule).get_name(),
+    )
+    ext = (5, 7, 2)
+    hits = torch.zeros(2, math.prod(ext) + 64, dtype=torch.int32, device="cuda")
+    fn(hits, *ext, 4)
+    torch.cuda.synchronize()
+    expect = torch.tensor([1] * math.prod(ext) + [0] * 64, dtype=torch.int32)
+    assert torch.equal(hits[0].cpu(), expect) and torch.equal(hits[1].cpu(), expect)
+
+
+def test_counted_role_must_loop(requires_blackwell):
+    """A role's counted cursor whose items are never read with item_at() raises at role exit."""
+    op = CountedRoleToy(StaticPersistent(), mode="no_loop")
+    hits = make_fake_compact_tensor(cutlass.Int32, (2, cute.sym_int()))
+    with pytest.raises(ProtocolError, match=r"trip_count\(\) at .* is never looped over"):
+        compile_tvm_ffi(op, hits, Int32(1), Int32(1), Int32(1), Int32(1), name=op.get_name())

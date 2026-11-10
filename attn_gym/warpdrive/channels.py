@@ -64,6 +64,7 @@ from enum import Enum
 
 import cutlass
 from cutlass import Int32, cute, pipeline
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import nvvm as _nvvm
 from cutlass.cutlass_dsl import if_generate
 
@@ -780,7 +781,7 @@ class Handle(_Stage):
     the handle for the checker while the caller signals the barrier itself.
     """
 
-    def __init__(self, end, index, phase, label, is_producer: bool):
+    def __init__(self, end, index, phase, label, is_producer: bool, opened: bool = True):
         self._end = end
         self.index = index
         self.phase = phase
@@ -798,8 +799,14 @@ class Handle(_Stage):
             role=end._role,
             order=end._rec.advances.get(key, 0) - 1,  # its own acquire/wait already counted
         )
-        end._trace.opened(self.rec)
-        end._trace.event("open", handle=self.rec)
+        if opened:
+            self._open()
+
+    def _open(self, once: str | None = None):
+        """Register the handle as open. ``once`` ("first"/"last") marks a span's event that
+        runs in one iteration of its loop only, here and in ``_close``."""
+        self._end._trace.opened(self.rec)
+        self._end._trace.event("open", handle=self.rec, once=once)
 
     # The preprocessor carries every name a loop or branch reassigns, so reusing a handle name
     # across a dynamic region boundary (``with kv.produce() as h`` before and inside a loop)
@@ -809,7 +816,7 @@ class Handle(_Stage):
         return [v.ir_value() for v in (self.index, self.phase) if not isinstance(v, int)]
 
     def __new_from_mlir_values__(self, values):
-        new = object.__new__(Handle)
+        new = object.__new__(type(self))
         new.__dict__.update(self.__dict__)
         values = list(values)
         if not isinstance(self.index, int):
@@ -898,17 +905,23 @@ class Handle(_Stage):
         if signal:
             self._end._signal(self.index)
 
-    def _close(self, producer: bool, op: str):
+    def _close(
+        self, producer: bool, op: str, region_checked: bool = False, once: str | None = None
+    ):
         trace = self._end._trace
         if producer != self._is_producer:
             raise ProtocolError(
                 f"{trace.role_name}: {op}() on a {self.describe()} handle; producer handles "
                 "commit or retire, consumer handles release"
             )
-        trace.closed(self.rec, op)
+        trace.closed(self.rec, op, region_checked)
         trace.record(self._end._chan.name, op, self._label, order=self.rec.order)
         trace.event(
-            "close", handle=self.rec, signal=op in ("commit", "release"), retire=op == "retire"
+            "close",
+            handle=self.rec,
+            signal=op in ("commit", "release"),
+            retire=op == "retire",
+            once=once,
         )
         if producer and isinstance(self._end._chan.producer, Tma):
             stage_closed(trace, self.rec)
@@ -920,6 +933,131 @@ class Handle(_Stage):
         if exc_type is None:
             self.commit() if self._is_producer else self.release()
         return False
+
+
+@dataclass(eq=False)
+class _SpanProgress:
+    """Trace-time progress of a span, shared by its loop-carried copies."""
+
+    begin_site: str | None = None
+    loop: object = None  # the loop body ``begin()`` was traced in
+
+
+class Span(Handle):
+    """One stage held across the iterations of a counted loop (``end.span()``).
+
+    ``span()`` takes the stage and advances the end without waiting. ``begin(i)`` waits for
+    the stage in the loop's first iteration, and ``commit(i)``/``release(i)`` signal in its
+    last; ``commit()``/``release()`` without an index signal after the loop, in the region
+    that opened the span. ``i`` is the index of ``for i in cutlass.range(n)`` with a Python
+    int ``n``. The stage is this role's only between that wait and the signal.
+    """
+
+    def __init__(self, end, index, phase, label, is_producer: bool):
+        super().__init__(end, index, phase, label, is_producer, opened=False)
+        self._progress = _SpanProgress()
+        end._trace.checks.append(self._check_begun)
+
+    def describe(self) -> str:
+        return f"{self._end._chan.name}[{self._label}] span"
+
+    def _where(self, op: str) -> str:
+        return (
+            f"{self._end._trace.role_name}: {self.describe()} opened at {self.rec.site}: "
+            f"{op} at {user_site()}"
+        )
+
+    def _check_begun(self):
+        if self._progress.begin_site is None:
+            raise ProtocolError(
+                f"{self._end._trace.role_name}: {self.describe()} opened at {self.rec.site} took "
+                "an epoch but never waited for it; call begin(i) in its loop"
+            )
+
+    def _trips(self, i, op: str) -> int:
+        """Check that ``op(i)`` runs directly in a counted loop of the span's opening region
+        and that ``i`` is the loop's index; returns the trip count."""
+        block = current_block()
+        loop = _counted_loop(block)
+        if loop is None or _parent_block(block) != self.rec.block:
+            raise ProtocolError(
+                f"{self._where(f'{op}(i)')} must run directly in the body of a "
+                "`for i in cutlass.range(n)` loop with a Python int n >= 1 (start 0, step 1) "
+                "placed in the region that opened the span: not in a branch, a nested loop, a "
+                "constexpr loop or a loop with dynamic bounds"
+            )
+        index, trips = loop
+        if not isinstance(i, Int32) or not ir.Value.__eq__(i.ir_value(), index):
+            raise ProtocolError(f"{self._where(f'{op}(i)')}: `i` must be that loop's index")
+        return trips
+
+    def begin(self, i):
+        """Wait for the stage (producer: empty, consumer: full) when ``i == 0``."""
+        progress = self._progress
+        if progress.begin_site is not None:
+            raise ProtocolError(
+                f"{self._where('begin()')} after begin() at {progress.begin_site}; a span "
+                "waits once"
+            )
+        self._trips(i, "begin")
+        progress.begin_site, progress.loop = user_site(), current_block()
+        self._open(once="first")
+        end, op = self._end, "acquire" if self._is_producer else "wait"
+
+        def wait():
+            bar = end._empty(self.index) if self._is_producer else end._full(self.index)
+            with wait_range(end._trace, f"{end._chan.name}.{op}"):
+                cute.arch.mbarrier_wait(bar, self.phase)
+
+        if_generate(i == 0, wait)
+
+    def commit(self, i=None, *, signal: bool = True):
+        """Producer: publish the stage, in the last iteration of ``begin``'s loop when given
+        its index ``i``, else here, after that loop. ``signal=False`` as for ``Handle``."""
+        self._finish(True, "commit", i, signal)
+
+    def release(self, i=None, *, signal: bool = True):
+        """Consumer: hand the stage back, in the last iteration of ``begin``'s loop when given
+        its index ``i``, else here, after that loop. ``signal=False`` as for ``Handle``."""
+        self._finish(False, "release", i, signal)
+
+    def retire(self):
+        raise ProtocolError(f"{self._where('retire()')}: a span cannot be retired; commit it")
+
+    def _finish(self, producer: bool, op: str, i, signal: bool):
+        if isinstance(i, bool):  # Handle's positional `signal`, which Span takes by keyword
+            raise ProtocolError(
+                f"{self._where(f'{op}({i})')}: a span's {op}() takes the loop index (or "
+                f"nothing after the loop); pass signal={i} by keyword"
+            )
+        progress = self._progress
+        if progress.begin_site is None:
+            raise ProtocolError(f"{self._where(f'{op}()')} before begin(i) waited for the stage")
+        if i is None:
+            if current_block() != self.rec.block:
+                raise ProtocolError(
+                    f"{self._where(f'{op}()')} is not in the region that opened the span; "
+                    f"inside the loop of begin() pass the loop index, {op}(i)"
+                )
+        else:
+            trips = self._trips(i, op)
+            if current_block() != progress.loop:
+                raise ProtocolError(
+                    f"{self._where(f'{op}(i)')} is in another loop than begin() at "
+                    f"{progress.begin_site}"
+                )
+        self._close(
+            producer,
+            op if signal else f"{op}(raw signal)",
+            region_checked=True,
+            once=None if i is None else "last",
+        )
+        if not signal:
+            return
+        if i is None:
+            self._end._signal(self.index)
+        else:
+            if_generate(i == trips - 1, lambda: self._end._signal(self.index))
 
 
 class Preview(_Stage):
@@ -1525,6 +1663,20 @@ class _End:
             self._trace.checks.append(check_back_edge)
         return token.ready
 
+    def _span(self, slot, op: str) -> Span:
+        """Take the next stage for ``span``, without waiting for it."""
+        chan, producer = self._chan, isinstance(self, ProducerEnd)
+        if chan.named or (producer and isinstance(chan.producer, Tma)):
+            kind = "a named-barrier channel" if chan.named else "a Tma producer"
+            raise ProtocolError(
+                f"{self._trace.role_name}: {chan.name}.span() at {user_site()}: {kind} cannot "
+                "hold a span (a named wait is an arrival, and a Tma producer arms its stage "
+                "when it acquires); use an ordinary handle"
+            )
+        index, phase, label = self._next(slot, op)
+        self._trace.record(chan.name, op, label)
+        return Span(self, index, phase, label, producer)
+
     def _take(self, slot, token, op: str):
         """Take the next stage for ``acquire``/``wait``: check ``token`` before advancing, then
         wait for empty (producer) or full (consumer). Only an mbarrier wait may be skipped when
@@ -1559,6 +1711,12 @@ class ProducerEnd(_End):
         return Handle(self, index, phase, label, True)
 
     produce = acquire  # ``with end.produce(...) as h:`` reads better for nested scopes
+
+    def span(self, slot=None) -> Span:
+        """Take the next stage without waiting, to fill it across the iterations of a counted
+        loop: ``begin(i)`` waits until it is empty in the first iteration, ``commit(i)``
+        publishes it in the last (``commit()`` after the loop)."""
+        return self._span(slot, "acquire")
 
     def _arm(self, full):
         """Expect the stage's transaction bytes on every waited full barrier. In a cross-CTA
@@ -1635,6 +1793,15 @@ class ConsumerEnd(_End):
         return handle
 
     consume = wait
+
+    def span(self, slot=None) -> Span:
+        """Take the next stage without waiting, to read it across the iterations of a counted
+        loop: ``begin(i)`` waits until it is full in the first iteration, ``release(i)`` hands
+        it back in the last (``release()`` after the loop)."""
+        span = self._span(slot, "wait")
+        if self._rec.previews:
+            self._adopt(slot, span.rec)
+        return span
 
     def skip(self, n: int | Int32 = 1):
         """Exclusive ring: advance past ``n`` epochs other consumers own, without waiting or
@@ -1722,6 +1889,25 @@ def _region_op(block) -> str | None:
         return block.owner.operation.name
     except (AttributeError, ValueError, RuntimeError):
         return None
+
+
+def _counted_loop(block) -> tuple[ir.Value, int] | None:
+    """``(index, trips)`` if ``block`` is the body of an ``scf.for`` over the constants
+    ``0, 1, ..., trips - 1`` with at least one trip; None for any other region or bounds."""
+    try:
+        loop = block.owner.operation
+        if loop.name != "scf.for":
+            return None
+        bounds = []
+        for bound in list(loop.operands)[:3]:  # lower, upper, step; then carried values
+            constant = bound.owner  # the defining op, or the block of a block argument
+            if isinstance(constant, ir.Block) or constant.name != "arith.constant":
+                return None
+            bounds.append(constant.attributes["value"].value)
+    except (AttributeError, ValueError, RuntimeError):
+        return None
+    lower, upper, step = bounds
+    return (block.arguments[0], upper) if lower == 0 and step == 1 and upper >= 1 else None
 
 
 def _parent_block(block):
