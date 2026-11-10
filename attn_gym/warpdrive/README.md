@@ -7,7 +7,8 @@ warpdrive helps write warp-specialized CuTeDSL kernels, and is also the CuTeDSL 
 of attention-gym: its [compile cache](../../docs/warpdrive/cache.md), CuTeDSL version shims, the intra-kernel
 [profiler](../../docs/warpdrive/profiler.md) and work scheduling live here.
 
-Write the load, MMA and epilogue of a warp-specialized CuTeDSL kernel as separate methods.
+At a high level this provides nice utilities for the common mechanisms (channels) to communicate between warps. While also
+providing some syntactic sugar that helps guarantee correctness when you author your kernels in a certain way.
 Connect them with channels:
 
 ```python
@@ -15,18 +16,17 @@ self.ab = Ring(3, Tma((128 + 256) * 64 * 2), Umma)
 self.acc = Ring(1, Umma, Threads)
 ```
 
-You still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
-counts and phases, role dispatch and TMEM allocation/free. The math is ordinary CuTeDSL.
+You (your agent) still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
+counts and phases, role dispatch and TMEM allocation/free. The individual warps bodies are ordinary CuTeDSL.
 
-Experimental. Requires `nvidia-cutlass-dsl` 4.6.2 or newer (tested on 4.6, 4.7 and 4.8) and a
-Blackwell SM100/SM103 GPU.
+Requires `nvidia-cutlass-dsl` 4.6.2 or newer (tested on 4.6, 4.7 and 4.8).
 
 **Start with [Write a kernel](../../docs/warpdrive/writing-kernels.md):** run the complete GEMM, define a work
 item, connect the roles, and validate the handoffs. The [safety contract](../../docs/warpdrive/guarantees.md) explains
-what warpdrive handles and what you must establish. Compilation alone does not prove liveness.
-For agent-assisted implementation, use the repository's [authoring skill](../../.agents/skills/authoring-warpdrive/SKILL.md).
+what warpdrive handles and what you must establish. You can still compile busted kernels, but its harder.
+We also got a skill boss: [authoring skill](../../.agents/skills/authoring-warpdrive/SKILL.md).
 
-**To relearn the vocabulary,** read the [tour notebook](../../docs/warpdrive/tour.ipynb): it builds from a
+**To learn the vocabulary,** read the [tour notebook](../../docs/warpdrive/tour.ipynb): it builds from a
 two-warp producer/consumer kernel to the pipelined GEMM, then schedules, clusters, storage
 aliases and the checkers, with saved `describe()` output, PTX excerpts and checks against
 PyTorch.
