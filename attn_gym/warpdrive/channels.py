@@ -70,7 +70,6 @@ from cutlass.cutlass_dsl import if_generate
 
 from attn_gym.warpdrive.cluster import (
     ALL,
-    FILLS,
     MULTICAST_MODES,
     SCOPE_OVERRIDES,
     rank_in,
@@ -91,23 +90,16 @@ from attn_gym.warpdrive.tracing import wait_range
 @dataclass(frozen=True)
 class Tma:
     """Producer side filled by TMA, with ``tx_bytes`` per stage: the bytes landing in each
-    producing CTA's SMEM, whichever CTA issued the copies.
+    producing CTA's SMEM.
 
     ``multicast``: the cluster modes ("m", "n", or both, as a string or tuple) along which the
     copies are multicast (``Cluster.multicast``). A copy multicast along N lands in every CTA
     with this CTA's coordinates except along N, and the consumers there must also release this
     CTA's stage; the layer derives that from the declaration.
-
-    ``fills``: ``"pair"`` or ``"cluster"`` when one CTA issues other CTAs' copies: a producer on
-    each pair leader fills both CTAs of its pair, or a ``rank0`` producer fills every CTA
-    (``Cluster.fill``). The producing CTA arms the full barriers its copies complete on: each
-    filled CTA's own, or, with pair-leader consumers, the leader's for both CTAs of the pair.
-    The consumers there release it. ``tx_bytes`` is still what lands in each CTA.
     """
 
     tx_bytes: int
     multicast: tuple[str, ...] | str = ()
-    fills: str | None = None
 
     def __post_init__(self):
         if type(self.tx_bytes) is not int or self.tx_bytes <= 0:
@@ -120,8 +112,6 @@ class Tma:
                 f"Tma.multicast must name cluster modes from {MULTICAST_MODES}, got {modes!r}"
             )
         object.__setattr__(self, "multicast", tuple(sorted(set(modes))))
-        if self.fills not in FILLS:
-            raise ValueError(f"Tma.fills must be one of {FILLS}, got {self.fills!r}")
 
 
 class Umma:
@@ -271,7 +261,7 @@ class Channel:
     ``override`` must give its counts (``full_counts`` for an external producer,
     ``empty_counts`` for an external consumer; ``derived_scope`` has 0 there), and it takes no
     role names or fences. The layer checks nothing the external side does. The channel stays
-    CTA-local: no TMA multicast or fills, and one placement for the managed side's roles.
+    CTA-local: no TMA multicast, and one placement for the managed side's roles.
     """
 
     n: int
@@ -416,10 +406,10 @@ class Channel:
                     f"external={self.external!r} takes Sharing.JOIN on both sides: the layer "
                     "cannot share epochs with raw code"
                 )
-            if isinstance(self.producer, Tma) and (self.producer.multicast or self.producer.fills):
+            if isinstance(self.producer, Tma) and self.producer.multicast:
                 raise ValueError(
                     f"external={self.external!r} needs a CTA-local channel: raw code drives the "
-                    "external side in each CTA, so its TMA copies take no multicast or fills"
+                    "external side in each CTA, so its TMA copies take no multicast"
                 )
             settings = {
                 "producer": ("producer_role", "commit_fence"),
@@ -505,10 +495,10 @@ class Channel:
             )
         if self.external == "consumer":
             raise ValueError("external='consumer' takes no consumer mechanisms: raw code signals")
-        if isinstance(self.producer, Tma) and (self.producer.multicast or self.producer.fills):
+        if isinstance(self.producer, Tma) and self.producer.multicast:
             raise ValueError(
                 "per-role consumer mechanisms are CTA-local only: the producer's TMA copies take "
-                "no multicast or fills"
+                "no multicast"
             )
         self.consumer_roles = tuple(roles)
 
@@ -1808,19 +1798,9 @@ class ProducerEnd(_End):
         arms = {r: cs for r, cs in self.targets.items() if cs}
         if all(cs == (r,) for r, cs in arms.items()):
             targets = (None,)  # each arming CTA arms its own barrier
-        elif len(arms) == 1:  # one CTA arms the barriers of its targets
+        else:  # one CTA arms the barriers of its targets (rank 0's work-ring publication)
             ((rank, targets),) = arms.items()
             targets = tuple(None if c == rank else c for c in targets)
-        else:  # each arming CTA arms its own group (Tma(fills="pair")): targets by rank
-            order = {r: sorted(cs, key=lambda c: c != r) for r, cs in arms.items()}
-            widths = {len(cs) for cs in order.values()}
-            assert len(widths) == 1, arms
-            targets = tuple(
-                None
-                if all(order[r][k] == r for r in order)
-                else tuple((r, order[r][k]) for r in order)
-                for k in range(widths.pop())
-            )
         if len(arms) == len(self.ctas):
             _arm_targets(full, scope.tx, targets)
         else:
@@ -2056,15 +2036,12 @@ def cluster_rank():
 
 
 def _arm_targets(full, tx: int, targets):
-    """Arm each target: None (this CTA), a rank, or ``((arming rank, target), ...)``
-    for a target that depends on the arming CTA's rank."""
+    """Arm each target: None (this CTA) or a rank."""
     with cute.arch.elect_one():
         for cta in targets:
             if cta is None:
                 cute.arch.mbarrier_arrive_and_expect_tx(full, tx)
             else:
-                if isinstance(cta, tuple):
-                    cta = rank_value(dict(cta), cluster_rank)
                 cute.arch.mbarrier_arrive_and_expect_tx(full, tx, cta)
 
 

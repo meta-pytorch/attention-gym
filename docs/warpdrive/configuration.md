@@ -191,7 +191,7 @@ one role's pressure cause spills in another. See
 
 | Choice | Where / constraint |
 |---|---|
-| Mechanisms and ordering | `Tma(bytes, multicast=, fills=)`, `Umma`, `Threads`, `Warps`, `commit_fence=`, `release_fence=`: declared per channel |
+| Mechanisms and ordering | `Tma(bytes, multicast=)`, `Umma`, `Threads`, `Warps`, `commit_fence=`, `release_fence=`: declared per channel |
 | Round-robin depth | An mbarrier round-robin ring needs a stage count divisible by its instance count, so each instance sees the previous epoch of stages it waits on |
 | Exclusive consumers | `consumer_sharing=Sharing.EXCLUSIVE`: CTA-local mbarrier `Ring`, one producer, equal consumer contributions. The author supplies any rendezvous needed after more than a ring lap of skips ([exclusive consumers](channels.md#exclusive-consumers)) |
 | TMEM allocation | Plan columns round up to a power of two, minimum 32: hardware `tcgen05.alloc` granularity |

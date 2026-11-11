@@ -473,7 +473,7 @@ handle's opening region. You still supply `Tma(tx_bytes)`.
 |---|---|
 | Tensor TMA load, `tma_bar_ptr=` | Directly in the handle's region, or its `elect_one()` block |
 | Bulk `cp.async.bulk` load, `mbar_ptr=` | Directly inside an `elect_one()` block of that region |
-| Multicast | Recognized `Cluster.multicast` mask, or `Cluster.fill` for fills |
+| Multicast | Recognized `Cluster.multicast` mask |
 
 Bulk atoms `CopyBulkG2SOp` and `CopyBulkG2SMulticastOp` are recognized by type; multicast
 masks get the tensor-multicast check. Bulk loads complete on the issuing CTA's barrier,
@@ -490,8 +490,7 @@ Read the result literally:
   partition this equals the issuer's delivery across its mask's CTAs.
 - **`unverified`:** inspection was incomplete; compilation continues with a warning and
   reasons. Causes include unknown atoms, opaque pointers, nested/dynamic/conditional copies
-  other than `elect_one()`, unrecognized masks and unsupported IR. Fills also need enough
-  distinct target masks; see [fills](clusters.md#one-cta-loads-for-others).
+  other than `elect_one()`, unrecognized masks and unsupported IR.
 
 `verified` does **not** prove descriptor legality, disjoint writes or all async ordering.
 Nor does it certify a bulk copy's per-instruction transfer size: bulk copies move whole

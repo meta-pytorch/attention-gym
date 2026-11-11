@@ -86,6 +86,8 @@ def test_cluster_geometry():
         (lambda: Tma(64, multicast="k"), "Tma.multicast must name cluster modes"),
         (lambda: Tma(64, multicast=1), "Tma.multicast must name cluster modes"),
         (lambda: role(warps=0, cta="peer"), "role cta must be one of"),
+        # rank0 is the broadcast scheduler's placement; roles declare all or leader.
+        (lambda: role(warps=0, cta="rank0"), r"role cta must be one of \('all', 'leader'\)"),
         # Three-way partitions do not divide these tile extents; they compile but fault at runtime.
         (lambda: PersistentGemm(cluster=Cluster(1, 3)), "power-of-two count of MMA tiles"),
         (lambda: PersistentGemm(cluster=Cluster(3, 1)), "power-of-two count of MMA tiles"),
@@ -270,23 +272,8 @@ class _LeaderOnlyTmem(WarpSpecialized):
                              "leader", [(1, "all")]),
          "layer-owned payload is per-CTA SMEM"),
         (lambda: _LeaderOnlyTmem(), "every Tmem role .* is leader-only"),
-        # A rank0 consumer alone leaves the other pair's multicast copies with no waiter.
-        (lambda: _channel_op(PAIRS_2X2, Ring(2, Tma(1024, multicast="n"), Threads), "all",
-                             [(1, "rank0")]),
-         r"complete on leaders \[2\], where no consumer"),
-        # 2-CTA copies of the second pair would complete on rank 2's barrier, which nobody
-        # waits on.
-        (lambda: _channel_op(PAIRS_2X2, Ring(2, Tma(1024), Threads), "all", [(1, "rank0")]),
-         "can only feed leader-only consumers"),
-        # Ranks 2 and 3 would read an accumulator no MMA of their pair wrote.
-        (lambda: _channel_op(PAIRS_2X2, Ring(2, Umma, Threads), "rank0", [(1, "all")]),
-         r"needs the MMAs of CTAs \[0, 2\].*cta='leader'"),
-        # Rank 1's epilogue would read TMEM no MMA of its own wrote.
-        (lambda: _channel_op(Cluster(1, 2), Ring(2, Umma, Threads), "rank0", [(1, "all")]),
-         r"needs the MMAs of CTAs \[0, 1\]"),
     ],
-    ids=["unpinned_mma", "leader_tma_to_both", "pair_payload", "leader_only_tmem",
-         "multicast_rank0", "pair_tma_rank0", "rank0_mma_pairs", "rank0_mma_flat"],
+    ids=["unpinned_mma", "leader_tma_to_both", "pair_payload", "leader_only_tmem"],
 )  # fmt: skip
 def test_placement_errors(make, message):
     with pytest.raises(ProtocolError, match=message):

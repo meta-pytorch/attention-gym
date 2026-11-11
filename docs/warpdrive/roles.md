@@ -195,9 +195,8 @@ fits 65536, it exceeds the launch's starting pool and its increase would wait fo
 |---|---|
 | `"all"` (default) | Every CTA |
 | `"leader"` | Rank 0 of each MMA pair in the [cluster](clusters.md) |
-| `"rank0"` | Once per cluster, on cluster rank 0 |
 
-All three are equivalent for one CTA. Without MMA pairs, every CTA is a leader.
+Both are equivalent for one CTA. Without MMA pairs, every CTA is a leader.
 
 Call `begin_roles()` and `run_roles()` in converged CTA/cluster code with the declared launch
 shape. One lane of warp 0 initializes each managed mbarrier; the common initialization

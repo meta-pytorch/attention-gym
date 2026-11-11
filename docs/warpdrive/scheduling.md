@@ -46,7 +46,7 @@ sequence before launch ([drawn per CTA](tracing.md#see-which-cta-runs-what)).
 
 A correctly launched and drained stream assigns each kept index to exactly one unit.
 Within that unit, roles see the same sequence wherever they run: every CTA for `all`,
-pair leaders for `leader`, rank 0 for `rank0`.
+pair leaders for `leader`.
 
 ### The role loop
 
