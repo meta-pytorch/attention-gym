@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from ..routing import require_grouped_schedule, uses_grouped_schedule
@@ -29,7 +29,6 @@ from .primitives import (
     selection_bits,
     shared_forward_tiles,
     store_bhsd,
-    tuning_key,
 )
 
 # Counts drop only the multiple-of-16 hint; == 1 folds the single-document search.

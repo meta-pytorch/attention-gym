@@ -17,6 +17,8 @@ import triton
 from triton.compiler.errors import CompileTimeAssertionFailure
 from triton.runtime.autotuner import Autotuner, Heuristics
 from triton.runtime.errors import OutOfResources, PTXASError
+from triton.runtime.jit import JITFunction
+from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.cute import run_tunable
 
@@ -39,7 +41,8 @@ class TritonTuner:
     reads the winner cache, so its choice is the same in every process on one GPU model.
 
     Args:
-        kernel: The ``@triton.jit`` function, without autotune or heuristics decorators.
+        kernel: The ``@triton.jit`` function, optionally under ``triton.heuristics``, whose
+            constexprs are computed per launch and are not visible to ``key`` or ``prune``.
         configs: Candidates to benchmark, the heuristic default first.
         key: Maps the launch arguments to the host-static values that decide the winner, like
             ``triton.autotune(key=...)``. It must also decide what ``prune`` keeps: the tuned
@@ -64,8 +67,11 @@ class TritonTuner:
         def compile_kernel(*_static_args: Any) -> Any:
             return kernel  # Triton compiles on first launch and caches the binary itself.
 
+        self.jit_function = kernel
+        while not isinstance(self.jit_function, JITFunction):
+            self.jit_function = self.jit_function.fn
         # Winners are namespaced by the kernel source and its @triton.jit dependencies.
-        compile_kernel.cache_namespace = lambda: kernel.cache_key  # type: ignore[attr-defined]
+        compile_kernel.cache_namespace = lambda: self.jit_function.cache_key  # type: ignore[attr-defined]
         self.compile = compile_kernel
         self._kernel = kernel
         self._arg_names = kernel.arg_names
@@ -128,6 +134,20 @@ class TritonTuner:
         kernel[grid](**args, **meta)
 
 
+def tuning_key(tensor: str, *names: str) -> Callable[[dict[str, Any]], tuple[Any, ...]]:
+    """Key a ``TritonTuner`` by the dtype of argument ``tensor`` and the arguments ``names``.
+
+    Unlike ``triton.autotune``'s implicit dtype key, this also sees through TMA descriptors.
+    """
+
+    def key(args: dict[str, Any]) -> tuple[Any, ...]:
+        value = args[tensor]
+        dtype = (value.base if isinstance(value, TensorDescriptor) else value).dtype
+        return (dtype, *(args[name] for name in names))
+
+    return key
+
+
 class PinnedConfigKernel:
     """Launch a tuned kernel's heuristic default without benchmarking or reading winner caches.
 
@@ -161,4 +181,4 @@ class PinnedConfigKernel:
         return lambda *args, **kwargs: self._launch(grid, args, kwargs)
 
 
-__all__ = ["PinnedConfigKernel", "TritonTuner"]
+__all__ = ["PinnedConfigKernel", "TritonTuner", "tuning_key"]

@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from ..routing import uses_grouped_schedule
@@ -29,7 +29,6 @@ from .primitives import (
     resolve_selected_rows,
     select_tiles,
     store_bhsd,
-    tuning_key,
 )
 from .shared_backward import (
     BWD_DQ_GROUPED,

@@ -133,7 +133,7 @@ def compile_only_for_target(
 
     def launch_candidates(self, grid, bound):
         kernel = self.compile()
-        launch = Launch(kernel.__name__)
+        launch = Launch(self.jit_function.__name__)
         active_autotune.append(launch)
         try:
             for candidate in self.configs(grid, bound):
