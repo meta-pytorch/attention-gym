@@ -220,7 +220,7 @@ class GroupedGemm(WarpSpecialized):
             raise ValueError(f"GroupedGemm runs on one CTA or a CTA pair, got {self.cluster}")
         if epi_tile_n not in EPI_TILE_NS:
             raise ValueError(f"epi_tile_n must be one of {EPI_TILE_NS}, got {epi_tile_n}")
-        if tile_n % epi_tile_n or not 0 < tile_n <= 256 or tile_n // cs % 8:
+        if tile_n % epi_tile_n or not 0 < tile_n <= 256:
             raise ValueError(
                 f"tile_n must be a multiple of epi_tile_n={epi_tile_n} in (0, 256], got {tile_n}"
             )

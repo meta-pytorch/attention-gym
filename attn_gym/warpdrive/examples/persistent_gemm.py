@@ -140,7 +140,7 @@ class PersistentGemm(WarpSpecialized):
             tile_n = default_tile_n(self.cluster)
         if epi_tile_n not in EPI_TILE_NS:
             raise ValueError(f"epi_tile_n must be one of {EPI_TILE_NS}, got {epi_tile_n}")
-        if tile_n % epi_tile_n or not 0 < tile_n <= 256 or tile_n // cs % 8:
+        if tile_n % epi_tile_n or not 0 < tile_n <= 256:
             raise ValueError(
                 f"tile_n must be a multiple of epi_tile_n={epi_tile_n} in (0, 256], got {tile_n}"
             )
@@ -358,7 +358,7 @@ class PersistentGemm(WarpSpecialized):
         loads = self.load_partitions(tiled_mma, mma_rank, tma_a, tma_b, sA, sB, gA, gB)
         acc_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
         acc_staged = tiled_mma.make_fragment_C(cute.append(acc_shape, self.acc_stages))
-        params = self.params_type(
+        params = PersistentGemmParams(
             tiled_mma=tiled_mma,
             tma_a=tma_a,
             tma_b=tma_b,
@@ -375,8 +375,6 @@ class PersistentGemm(WarpSpecialized):
             sC=sC,
         )
         self.run_roles(params)
-
-    params_type = PersistentGemmParams  # a subclass may extend the prologue's values
 
     def load_partitions(self, tiled_mma, mma_rank, tma_a, tma_b, sA, sB, gA, gB) -> dict:
         """Return this CTA's A/B TMA partitions and multicast masks.
