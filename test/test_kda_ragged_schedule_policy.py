@@ -115,7 +115,7 @@ def test_public_chunk_kda_schedule_option_selects_kernels(monkeypatch):
 
     persistent_kernels = {
         output_module: "chunk_gla_fwd_kernel_o_ragged_tma_persistent",
-        recompute_module: "recompute_w_u_fwd_kernel_persistent",
+        recompute_module: "_w_u_persistent",
     }
     for module, name in persistent_kernels.items():
         monkeypatch.setattr(module, name, RecordingKernel(name, getattr(module, name)))
@@ -136,7 +136,7 @@ def test_public_chunk_kda_schedule_option_selects_kernels(monkeypatch):
         results[schedule] = (output, *grads)
         if schedule == "persistent":
             assert set(forward_launches) == set(persistent_kernels.values())
-            assert "recompute_w_u_fwd_kernel_persistent" in backward_launches
+            assert "_w_u_persistent" in backward_launches
         else:
             assert not launches
     for schedule in ("static", "persistent"):

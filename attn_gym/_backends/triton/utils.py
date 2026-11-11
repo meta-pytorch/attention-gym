@@ -1,6 +1,5 @@
 """Small utilities shared by hand-written Triton kernels."""
 
-import inspect
 import math
 from collections.abc import Sequence
 
@@ -13,9 +12,6 @@ from triton.language.extra import libdevice
 # Wrapped as a constexpr so ``@triton.jit`` functions can reference it as a module global.
 LOG2_E = tl.constexpr(math.log2(math.e))
 LN_2 = tl.constexpr(math.log(2.0))
-
-SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
-autotune_cache_kwargs = {"cache_results": True} if SUPPORTS_AUTOTUNE_CACHE else {}
 
 
 def configure_triton_allocator() -> None:

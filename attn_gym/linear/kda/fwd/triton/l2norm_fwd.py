@@ -194,10 +194,7 @@ def _l2norm_bwd_cuda(
     autotune: bool = True,
 ) -> torch.Tensor:
     """Launch L2Norm backward behind the same opaque stride boundary."""
-    from attn_gym.linear.kda.bwd.triton.l2norm_bwd import (
-        PINNED_L2NORM_BWD_KERNEL,
-        l2norm_bwd_kernel,
-    )
+    from attn_gym.linear.kda.bwd.triton.l2norm_bwd import L2NORM_BWD
 
     _, tokens, heads, head_dim = x.shape
     rows = x.numel() // head_dim
@@ -206,8 +203,7 @@ def _l2norm_bwd_cuda(
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
     row_stride = _l2norm_row_stride(x)
     dy_row_stride = _l2norm_row_stride(d_output)
-    kernel = l2norm_bwd_kernel if autotune else PINNED_L2NORM_BWD_KERNEL
-    kernel[grid](
+    (L2NORM_BWD if autotune else L2NORM_BWD.pinned)[grid](
         x,
         rstd,
         d_output,

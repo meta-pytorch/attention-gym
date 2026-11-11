@@ -14,7 +14,6 @@ from unittest import mock
 import torch
 import triton
 from triton.backends.compiler import GPUTarget
-from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
 from attn_gym._backends.cute.utils import get_device_properties
@@ -96,9 +95,8 @@ def compile_only_for_target(
 
     Host dispatch is emulated as in ``emulate_device_dispatch``, but kernels compile for the
     emulated target and never run: outputs stay unwritten and only the recorded shared memory
-    is meaningful. ``triton.autotune`` and tuned or pinned ``TritonTuner`` launches record
-    every candidate left after pruning. A pinned ``triton.autotune`` kernel records only its
-    first config.
+    is meaningful. Tuned and pinned ``TritonTuner`` launches record every candidate left
+    after pruning.
     """
     target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
     launches: list[Launch] = []
@@ -119,18 +117,6 @@ def compile_only_for_target(
             launches.append(launch)
         return kernel
 
-    def autotune_run(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
-        launch = Launch(self.base_fn.__name__)
-        active_autotune.append(launch)
-        try:
-            for config in self.prune_configs(kwargs):
-                self.fn.run(*args, **kwargs, **config.all_kwargs())
-        finally:
-            active_autotune.clear()
-            self.nargs = None
-        launches.append(launch)
-
     def launch_candidates(self, grid, bound):
         kernel = self.compile()
         launch = Launch(self.jit_function.__name__)
@@ -149,7 +135,6 @@ def compile_only_for_target(
         with (
             emulate_device_dispatch(capability, max_shared_mem),
             mock.patch.object(JITFunction, "run", jit_run),
-            mock.patch.object(Autotuner, "run", autotune_run),
             mock.patch.object(TritonTuner, "__getitem__", tuner_getitem),
             mock.patch.object(TritonTuner, "launch_pinned", launch_candidates),
             mock.patch.object(

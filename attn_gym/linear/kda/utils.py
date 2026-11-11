@@ -22,8 +22,6 @@ import triton.language as tl
 from attn_gym._backends.triton import utils as triton_utils
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
-autotune_cache_kwargs = triton_utils.autotune_cache_kwargs
-
 IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
 
 

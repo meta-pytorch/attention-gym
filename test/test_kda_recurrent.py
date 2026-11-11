@@ -131,9 +131,7 @@ def test_recurrent_paged_skips_autotune(monkeypatch):
 
     from attn_gym.linear._delta_rule import recurrent as delta_rule_recurrent
 
-    monkeypatch.setattr(
-        delta_rule_recurrent, "recurrent_delta_rule_fwd_kernel", UnexpectedAutotune()
-    )
+    monkeypatch.setattr(delta_rule_recurrent, "_recurrent_scan", UnexpectedAutotune())
     recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots, autotune=True)
 
 

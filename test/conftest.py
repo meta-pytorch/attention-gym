@@ -130,12 +130,10 @@ def isolated_winners(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def no_benchmarking(
     isolated_winners: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Reject ``run_tunable`` tuning and multi-config ``triton.autotune`` launches.
+    """Reject ``run_tunable`` tuning.
 
     Drop ``run_tunable`` winners so cached results cannot hide a tuned launch.
     """
-    from triton.runtime.autotuner import Autotuner
-
     tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     monkeypatch.setattr(tune_module, "get_cache_path", lambda: tmp_path / "no_benchmarking")
     tune_module._WINNERS.clear()
@@ -144,15 +142,7 @@ def no_benchmarking(
     def fail(*_args, **_kwargs):
         raise AssertionError("a pinned launch must not benchmark")
 
-    def autotune_run(self, *args, **kwargs):
-        # Triton replays a winner cached on disk without timing anything.
-        if len(self.configs) > 1:
-            fail()
-        return run(self, *args, **kwargs)
-
-    run = Autotuner.run
     monkeypatch.setattr(tune_module, "tune", fail)
-    monkeypatch.setattr(Autotuner, "run", autotune_run)
 
 
 @pytest.fixture
@@ -177,14 +167,14 @@ def triton_compiles(monkeypatch: pytest.MonkeyPatch) -> Counter[str]:
     otherwise a specialization an earlier test built in the same worker would go uncounted.
     """
     import triton
-    from triton.runtime.autotuner import Autotuner, Heuristics
+    from triton.runtime.autotuner import Heuristics
     from triton.runtime.jit import JITFunction
 
     for name, module in list(sys.modules.items()):
         if module is None or name.partition(".")[0] != "attn_gym":
             continue
         for kernel in list(vars(module).values()):
-            while isinstance(kernel, Autotuner | Heuristics):
+            while isinstance(kernel, Heuristics):
                 kernel = kernel.fn
             if isinstance(kernel, JITFunction):
                 kernel.device_caches.clear()

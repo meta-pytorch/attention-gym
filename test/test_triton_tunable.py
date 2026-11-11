@@ -6,7 +6,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.autotune import should_autotune
-from attn_gym._backends.triton.tune import PinnedConfigKernel, TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -123,15 +123,6 @@ def test_pinned_launch_skips_candidates_exceeding_device_resources(no_benchmarki
     torch.testing.assert_close(out, torch.full_like(out, 64 * 64))
     with pytest.raises(triton.OutOfResources):
         launch([oversized])
-
-
-def test_pinned_autotune_kernel_launches_its_first_config():
-    autotuned = triton.autotune(
-        [triton.Config({"BLOCK": block}) for block in (128, 256)], key=["n"]
-    )(_write_block_kernel)
-    assert _launched_block(PinnedConfigKernel(autotuned)) == 128
-    with pytest.raises(TypeError, match="expected a tuned kernel"):
-        PinnedConfigKernel(_write_block_kernel)
 
 
 def test_autotuning_follows_the_request_without_deterministic_algorithms():

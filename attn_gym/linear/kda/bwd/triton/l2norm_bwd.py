@@ -23,20 +23,10 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import PinnedConfigKernel
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.utils import autotune_cache_kwargs
-
-_BT_LIST = [8, 16, 32, 64, 128]
 
 
-@triton.autotune(
-    # The first config is the pinned autotune=False schedule: BT=8 with two warps.
-    configs=[triton.Config({"BT": bt}, num_warps=w) for w in [2, 1, 4, 8, 16] for bt in _BT_LIST],
-    # ROW_BUCKET selects a tuned schedule per power-of-two row count, not a binary per shape.
-    key=["D", "ROW_BUCKET"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(
     do_not_specialize=[
         "N_ROWS",
@@ -112,4 +102,15 @@ def l2norm_bwd_kernel(
     )
 
 
-PINNED_L2NORM_BWD_KERNEL = PinnedConfigKernel(l2norm_bwd_kernel)
+# Each launch overwrites dx from x, rstd and dy, so benchmarking needs no reset.
+L2NORM_BWD = TritonTuner(
+    l2norm_bwd_kernel,
+    # The first config is the pinned autotune=False schedule: BT=8 with two warps.
+    [
+        triton.Config({"BT": bt}, num_warps=num_warps)
+        for num_warps in (2, 1, 4, 8, 16)
+        for bt in (8, 16, 32, 64, 128)
+    ],
+    # ROW_BUCKET selects a tuned schedule per power-of-two row count, not a binary per shape.
+    key=tuning_key("x", "D", "ROW_BUCKET", "IS_VARLEN"),
+)

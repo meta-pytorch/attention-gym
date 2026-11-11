@@ -13,11 +13,10 @@ import torch
 pytest.importorskip("cutlass")
 triton = pytest.importorskip("triton")
 
-from triton.runtime.autotuner import Autotuner, Heuristics
+from triton.runtime.autotuner import Heuristics
 from triton.runtime.jit import JITFunction
 
 from attn_gym.linear import causal_conv1d, chunk_gdn, chunk_kda, gate_transform, l2norm
-from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
 from attn_gym.linear.kda.masking import active_token_mask, mask_inactive_tokens
 
 pytestmark = pytest.mark.skipif(
@@ -105,7 +104,7 @@ def _backends() -> dict[str, JITFunction | FunctionType]:
         if module is None or not name.startswith("attn_gym.linear."):
             continue
         for kernel in tuple(vars(module).values()):
-            while isinstance(kernel, (Autotuner, Heuristics)):
+            while isinstance(kernel, Heuristics):
                 kernel = kernel.fn
             if isinstance(kernel, JITFunction):
                 kernels[f"{kernel.fn.__module__}.{kernel.fn.__qualname__}"] = kernel
@@ -129,12 +128,10 @@ def _backend_entries() -> dict[str, int]:
 
 
 @pytest.mark.parametrize("variant", ["kda", "gdn"])
-def test_training_pipeline_reuses_backend_specializations(variant: str, monkeypatch):
+def test_training_pipeline_reuses_backend_specializations(variant: str, isolated_winners):
     """Changing T/N in one metadata/config class must not compile new training leaves."""
-    # Different cached tuning winners may load different pre-existing tile variants.
-    # Freeze that choice here; the graph tests below exercise the default tuner.
-    monkeypatch.setattr(l2norm_bwd_kernel, "configs", [triton.Config({"BT": 16}, num_warps=4)])
-    monkeypatch.setattr(l2norm_bwd_kernel, "cache", {})
+    # Cached tuning winners may load different pre-existing tile variants per tuning key.
+    # With empty winner caches the first shape tunes, which loads every candidate.
     torch.cuda.synchronize()
     for kernel in _backends().values():
         if isinstance(kernel, JITFunction):

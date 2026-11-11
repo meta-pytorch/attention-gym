@@ -108,14 +108,12 @@ Candidates of one kernel usually differ in floating-point order (tile sizes, `nu
 timing-picked winner changes output bits between processes, ranks, and cold winner caches
 (issue #777). Every operation that tunes must also run pinned:
 
-- Tune Triton kernels with `TritonTuner` (`attn_gym/_backends/triton/tune.py`) rather than
+- Tune Triton kernels with `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never
   `triton.autotune`. List the heuristic default first: pinning selects the first candidate
   left by `prune` that the device can run. The tuning `key` must determine what `prune` keeps.
   Tune CuTeDSL kernels with `run_tunable`; pinning selects `default_config`.
-- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. For a remaining `triton.autotune`
-  kernel, keep a module-level `PinnedConfigKernel(kernel)` beside it and select the same way;
-  it launches the first config as listed, which must be valid for every accepted input.
-  A pinned launch never benchmarks and never reads the winner cache.
+- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. A pinned launch never benchmarks
+  and never reads the winner cache.
 - Tuners do not read deterministic mode. Operations resolve `autotune=`
   (`kernel_options={"autotune": ...}` for `gather_attn`) with `should_autotune`
   (`attn_gym/_backends/autotune.py`), then pass the bool through every launch and custom-op

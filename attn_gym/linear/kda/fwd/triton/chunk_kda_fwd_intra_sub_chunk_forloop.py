@@ -25,7 +25,6 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 )
 from attn_gym.linear.kda.utils import (
     IS_GATHER_SUPPORTED,
-    autotune_cache_kwargs,
     exp2,
     gather,
 )
@@ -45,13 +44,6 @@ from attn_gym.linear.kda.utils import (
             args["chunk_offsets"],
         ),
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({}, num_warps=1, num_stages=3),
-    ],
-    key=["BT", "BC"],
-    **autotune_cache_kwargs,
 )
 @triton.jit(
     do_not_specialize=[
@@ -299,6 +291,8 @@ def chunk_kda_fwd_intra_diagonal(
         MAX_NT=capacity,
         FASTMATH=fastmath,
         enable_reflect_ftz=fastmath,
+        num_warps=1,
+        num_stages=3,
     )
     return Aqk, Akkd
 

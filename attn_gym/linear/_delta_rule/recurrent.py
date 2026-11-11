@@ -23,14 +23,15 @@ registers per (sequence, head, value tile). Forward-only; training uses the chun
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import (
     LOG2_E,
-    autotune_cache_kwargs,
     configure_triton_allocator,
     fixed_tree_sum,
     ptr_offset,
@@ -44,6 +45,21 @@ configure_triton_allocator()
 # (GB200, H=16, K=V=128) and differed only among shorter scans.
 _TOKENS_BUCKET_LIMIT = 64
 
+_RECURRENT_TUNING_ARGS = (
+    "tokens_bucket",
+    "N",
+    "H",
+    "HK",
+    "K",
+    "V",
+    "USE_INITIAL_STATE",
+    "STORE_FINAL_STATE",
+    "IS_VARLEN",
+    "SCALAR_GATE",
+    "PREFETCH",
+    "BATCH_INVARIANT",
+)
+
 
 class GateKind(Enum):
     """Gate layout consumed by the scan."""
@@ -52,10 +68,26 @@ class GateKind(Enum):
     VECTOR = "vector"  # one natural-log decay per key channel, shaped [B, T, H, K]
 
 
-def _prune_recurrent_configs(configs, _named_args, V, **_):
+def _prune_recurrent_configs(
+    configs: list[triton.Config], args: dict[str, Any]
+) -> list[triton.Config]:
     """Drop value tiles wider than the padded value dimension."""
-    max_block_v = max(8, triton.next_power_of_2(V))
+    max_block_v = max(8, triton.next_power_of_2(args["V"]))
     return [config for config in configs if config.kwargs["BV"] <= max_block_v]
+
+
+def _recurrent_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
+    """Key winners by grid fill, bucketed scan length, specialization, and operand dtypes.
+
+    The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
+    ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; ``tokens_bucket`` collapses the exact
+    token count to that information so new lengths do not re-benchmark.
+    """
+    operands = ("q", "k", "v", "gate", "beta", "h0", "cu_seqlens")
+    return (
+        *(args[name] for name in _RECURRENT_TUNING_ARGS),
+        *(None if args[name] is None else args[name].dtype for name in operands),
+    )
 
 
 @triton.jit
@@ -234,32 +266,18 @@ def _recurrent_delta_rule_fwd_kernel(
         tl.store(ht + p_state, b_state, mask=m_kv)
 
 
-recurrent_delta_rule_fwd_kernel = triton.autotune(
-    configs=[
+# Unpaged launches write a fresh output and final state, so benchmarking candidates back to back
+# needs no reset; paged launches advance the pool in place and never reach the tuner.
+_recurrent_scan = TritonTuner(
+    _recurrent_delta_rule_fwd_kernel,
+    [
         triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
         for block_v in (32, 16, 8, 4, 2)
         for num_warps in (1, 2, 4)
     ],
-    # The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
-    # ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; ``tokens_bucket`` collapses the exact
-    # token count to that information so new lengths do not re-benchmark.
-    key=[
-        "tokens_bucket",
-        "N",
-        "H",
-        "HK",
-        "K",
-        "V",
-        "USE_INITIAL_STATE",
-        "STORE_FINAL_STATE",
-        "IS_VARLEN",
-        "SCALAR_GATE",
-        "PREFETCH",
-        "BATCH_INVARIANT",
-    ],
-    prune_configs_by={"early_config_prune": _prune_recurrent_configs},
-    **autotune_cache_kwargs,
-)(_recurrent_delta_rule_fwd_kernel)
+    key=_recurrent_tuning_key,
+    prune=_prune_recurrent_configs,
+)
 
 
 def launch_recurrent_delta_rule_fwd(
@@ -356,7 +374,7 @@ def launch_recurrent_delta_rule_fwd(
     # Prefetch was slower for K > 128.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
     use_autotune = autotune and state_indices is None
-    kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
+    kernel = _recurrent_scan if use_autotune else _recurrent_delta_rule_fwd_kernel
     launch_options = {}
     if not use_autotune:
         # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.

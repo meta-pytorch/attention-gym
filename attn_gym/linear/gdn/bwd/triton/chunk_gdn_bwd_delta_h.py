@@ -13,8 +13,8 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import PinnedConfigKernel
-from attn_gym._backends.triton.utils import autotune_cache_kwargs, ptr_offset
+from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
@@ -24,21 +24,6 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 
 
 @triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
-    ],
-    key=["H", "HK", "K", "V", "IS_VARLEN"],
-    prune_configs_by={
-        "early_config_prune": lambda configs, _named_args, K, V, **_: [
-            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
-        ]
-    },
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gdn_bwd_dv_local_kernel(
     q,
@@ -130,32 +115,6 @@ def chunk_gdn_bwd_dv_local_kernel(
         "STORE_INITIAL_STATE_GRADIENT": lambda args: args["d_initial_state"] is not None,
         "USE_FINAL_STATE_GRADIENT": lambda args: args["d_final_state"] is not None,
     }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=2),
-    ],
-    # The value tile only flips with grid fill (``num_sequences * H`` programs against the SM
-    # count), not with the token count (measured), so ``T`` stays out of the key.
-    key=[
-        "num_sequences",
-        "H",
-        "HK",
-        "K",
-        "V",
-        "IS_VARLEN",
-        "STORE_INITIAL_STATE_GRADIENT",
-        "USE_FINAL_STATE_GRADIENT",
-    ],
-    prune_configs_by={
-        "early_config_prune": lambda configs, _named_args, K, V, **_: [
-            config
-            for config in configs
-            if config.kwargs["BK"] <= K <= 2 * config.kwargs["BK"] and config.kwargs["BV"] <= V
-        ]
-    },
-    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_delta_h_kernel(
@@ -323,8 +282,50 @@ def chunk_gdn_bwd_delta_h_kernel(
             )
 
 
-_PINNED_DV_LOCAL = PinnedConfigKernel(chunk_gdn_bwd_dv_local_kernel)
-_PINNED_DELTA_H = PinnedConfigKernel(chunk_gdn_bwd_delta_h_kernel)
+_dv_local = TritonTuner(
+    chunk_gdn_bwd_dv_local_kernel,
+    [
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=lambda a: (a["H"], a["HK"], a["K"], a["V"], a["q"].dtype, a["cu_seqlens"] is not None),
+    prune=lambda configs, a: [
+        config
+        for config in configs
+        if config.kwargs["BK"] <= a["K"] and config.kwargs["BV"] <= a["V"]
+    ],
+)
+
+_delta_h = TritonTuner(
+    chunk_gdn_bwd_delta_h_kernel,
+    [
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=2),
+    ],
+    # The value tile only flips with grid fill (``num_sequences * H`` programs against the SM
+    # count), not with the token count (measured), so ``T`` stays out of the key and the
+    # sequence count is bucketed. ``dh`` may be bfloat16 for float16 inputs, but only when
+    # packed, which the key already holds.
+    key=lambda a: (
+        triton.next_power_of_2(a["num_sequences"]),
+        a["H"],
+        a["HK"],
+        a["K"],
+        a["V"],
+        a["q"].dtype,
+        a["cu_seqlens"] is not None,
+        a["d_initial_state"] is not None,
+        a["d_final_state"] is not None,
+    ),
+    prune=lambda configs, a: [
+        config
+        for config in configs
+        if config.kwargs["BK"] <= a["K"] <= 2 * config.kwargs["BK"]
+        and config.kwargs["BV"] <= a["V"]
+    ],
+)
 
 
 def chunk_gdn_bwd_delta_h(
@@ -432,8 +433,7 @@ def chunk_gdn_bwd_delta_h(
 
     groups = value_heads // key_heads
     if chunk_slots:
-        dv_local_kernel = chunk_gdn_bwd_dv_local_kernel if autotune else _PINNED_DV_LOCAL
-        dv_local_kernel[(chunk_slots, value_heads)](
+        (_dv_local if autotune else _dv_local.pinned)[(chunk_slots, value_heads)](
             q,
             k,
             q.stride(1),
@@ -456,8 +456,7 @@ def chunk_gdn_bwd_delta_h(
     def grid(meta):
         return (num_sequences * value_heads, triton.cdiv(value_dim, meta["BV"]))
 
-    delta_h_kernel = chunk_gdn_bwd_delta_h_kernel if autotune else _PINNED_DELTA_H
-    delta_h_kernel[grid](
+    (_delta_h if autotune else _delta_h.pinned)[grid](
         q,
         k,
         q.stride(1),

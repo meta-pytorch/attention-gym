@@ -3,9 +3,9 @@
 ``triton.autotune`` and ``triton.heuristics`` rebuild argument dictionaries on every launch;
 ``TritonTuner`` memoizes the winner under an explicit key and launches the kernel directly.
 
-Every tuned kernel also has a pinned launch that never benchmarks, for callers that need the
-same configuration in every process: ``PinnedConfigKernel`` (``tuner.pinned`` for a
-``TritonTuner``). The caller chooses between the two; see ``attn_gym._backends.autotune``.
+Every tuner also has a pinned launch, ``tuner.pinned``, that never benchmarks, for callers that
+need the same configuration in every process. The caller chooses between the two; see
+``attn_gym._backends.autotune``.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ from typing import Any
 
 import triton
 from triton.compiler.errors import CompileTimeAssertionFailure
-from triton.runtime.autotuner import Autotuner, Heuristics
 from triton.runtime.errors import OutOfResources, PTXASError
 from triton.runtime.jit import JITFunction
 from triton.tools.tensor_descriptor import TensorDescriptor
@@ -149,36 +148,18 @@ def tuning_key(tensor: str, *names: str) -> Callable[[dict[str, Any]], tuple[Any
 
 
 class PinnedConfigKernel:
-    """Launch a tuned kernel's heuristic default without benchmarking or reading winner caches.
+    """Launch a ``TritonTuner``'s heuristic default without benchmarking or reading winner caches.
 
-    A ``TritonTuner`` uses the first candidate left by ``prune`` that the device can run.
-    A ``triton.autotune`` kernel uses its first config as listed, without pruning or fallback;
-    that config must be valid for every accepted input. Outer ``triton.heuristics`` still
-    apply to the autotuned kernel. Launch with ``pinned[grid](*args, **kwargs)``.
+    The default is the first candidate left by ``prune`` that the device can run. Launch with
+    ``pinned[grid](*args, **kwargs)``, as with the tuner.
     """
 
-    def __init__(self, kernel: Any):
-        if isinstance(kernel, TritonTuner):
-            self._launch = lambda grid, args, kwargs: kernel.launch_pinned(
-                grid, kernel.bind(args, kwargs)
-            )
-            return
-        heuristic_values = None
-        if isinstance(kernel, Heuristics):
-            heuristic_values = kernel.values
-            kernel = kernel.fn
-        if not isinstance(kernel, Autotuner):
-            raise TypeError(f"expected a tuned kernel, got {type(kernel).__name__}")
-        config_kwargs = kernel.configs[0].all_kwargs()
-        jit_kernel = (
-            triton.heuristics(heuristic_values)(kernel.fn) if heuristic_values else kernel.fn
-        )
-        self._launch = lambda grid, args, kwargs: jit_kernel[grid](
-            *args, **kwargs, **config_kwargs
-        )
+    def __init__(self, tuner: TritonTuner):
+        self._tuner = tuner
 
-    def __getitem__(self, grid: Any) -> Callable[..., None]:
-        return lambda *args, **kwargs: self._launch(grid, args, kwargs)
+    def __getitem__(self, grid: Grid) -> Callable[..., None]:
+        tuner = self._tuner
+        return lambda *args, **kwargs: tuner.launch_pinned(grid, tuner.bind(args, kwargs))
 
 
 __all__ = ["PinnedConfigKernel", "TritonTuner", "tuning_key"]

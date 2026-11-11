@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1237,59 +1238,50 @@ def test_backward_cuda_graph_replay(head_dim: int, portable: bool, monkeypatch):
 
 def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, triton_compiles):
     """New token and sequence counts launch the Triton backward compiled for an earlier shape."""
-    from triton.runtime.jit import JITFunction
-
-    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_wy as wy_module
-
     force_portable_backward(monkeypatch)
-    # Autotuning may compile every candidate config once; nothing else may compile.
-    config_counts: dict[str, int] = {}
-    for kernel in (
-        wy_module.chunk_gdn_bwd_dqkwg_kernel,
-        wy_module.chunk_gdn_bwd_wy_kernel,
-        wy_module.chunk_gdn_bwd_gate_cumsum_kernel,
-    ):
-        configs = 1
-        while not isinstance(kernel, JITFunction):
-            configs = len(kernel.configs)
-            kernel = kernel.fn
-        config_counts[kernel.fn.__name__] = configs
+    kernels = (
+        "chunk_gdn_bwd_dqkwg_kernel",
+        "chunk_gdn_bwd_wy_kernel",
+        "chunk_gdn_bwd_gate_cumsum_kernel",
+    )
+    # The first shape may compile every candidate config while tuning; nothing compiles after.
+    first_shape: dict[str, int] = {}
     # Sequence and token counts cover Triton's integer classes: one, a multiple of 16, other.
     for lengths in ((70, 58), (64,), (1,), (37, 43, 65), (9,) * 16, (16,) * 16):
         *inputs, cu_seqlens = make_gdn_test_inputs(
             lengths, key_heads=1, value_heads=2, key_dim=64, requires_grad=True
         )
         run_with_gradients(tuple(inputs), "fused", cu_seqlens)
-    torch.cuda.synchronize()
-    compiled = {name: triton_compiles[name] for name in config_counts}
-    assert all(1 <= compiled[name] <= config_counts[name] for name in compiled), compiled
+        torch.cuda.synchronize()
+        first_shape = first_shape or {name: triton_compiles[name] for name in kernels}
+    assert all(first_shape.values()), first_shape
+    assert {name: triton_compiles[name] for name in kernels} == first_shape
 
 
-def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch):
-    """New token counts reuse the autotuning result of an earlier packed shape."""
-    from triton.runtime.autotuner import Autotuner
-
-    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_delta_h as delta_h_module
-    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_wy as wy_module
-
+def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch, isolated_winners):
+    """New token counts and a sequence count in the same bucket reuse an earlier tuning."""
     force_portable_backward(monkeypatch)
-    tuners = []
-    for kernel in (
-        delta_h_module.chunk_gdn_bwd_delta_h_kernel,
-        wy_module.chunk_gdn_bwd_dqkwg_kernel,
-    ):
-        while not isinstance(kernel, Autotuner):
-            kernel = kernel.fn
-        tuners.append(kernel)
-        monkeypatch.setattr(kernel, "cache", {})
-    # The same sequence count with new token counts, aligned and unaligned to 16.
-    for lengths in ((37, 43, 65), (64, 64, 64), (100, 20, 57)):
+    # The cute package re-exports tune(), shadowing the tune module.
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    tune = tune_module.tune
+    tunes_per_shape: list[int] = []
+
+    def count_tune(*args, **kwargs):
+        tunes_per_shape[-1] += 1
+        return tune(*args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", count_tune)
+    # New token counts, aligned and unaligned to 16, then four sequences instead of three.
+    for lengths in ((37, 43, 65), (64, 64, 64), (100, 20, 57), (30, 40, 50, 60)):
         *inputs, cu_seqlens = make_gdn_test_inputs(
             lengths, key_heads=1, value_heads=2, key_dim=64, requires_grad=True
         )
+        tunes_per_shape.append(0)
         run_with_gradients(tuple(inputs), "fused", cu_seqlens)
     torch.cuda.synchronize()
-    assert [len(tuner.cache) for tuner in tuners] == [1, 1]
+    # The portable backward alone tunes four kernels.
+    assert tunes_per_shape[0] >= 4
+    assert tunes_per_shape[1:] == [0, 0, 0]
 
 
 def test_packed_cuda_graph_replays_boundaries():

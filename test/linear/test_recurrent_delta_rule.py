@@ -6,6 +6,7 @@
 
 """Correctness tests for the shared recurrent delta-rule scan."""
 
+import importlib
 import itertools
 
 import pytest
@@ -255,21 +256,27 @@ def test_recurrent_reuses_kernel_across_token_counts(triton_compiles):
     assert triton_compiles["_recurrent_delta_rule_fwd_kernel"] == 1
 
 
-def test_recurrent_reuses_tuning_across_token_counts(monkeypatch):
+def test_recurrent_reuses_tuning_across_token_counts(isolated_winners, monkeypatch):
     """Scans of 64 or more tokens at one sequence count share one autotuning result, which a
     single-token scan does not reuse."""
-    from attn_gym.linear._delta_rule import recurrent as recurrent_module
+    # The cute package re-exports tune(), shadowing the tune module.
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    tune = tune_module.tune
+    sweeps = []
 
-    tuner = recurrent_module.recurrent_delta_rule_fwd_kernel
-    monkeypatch.setattr(tuner, "cache", {})
+    def counting_tune(*args, **kwargs):
+        sweeps.append(None)
+        return tune(*args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", counting_tune)
     for tokens in (64, 91, 160):
         inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
         recurrent_gdn(*inputs[:5], autotune=True)
     torch.cuda.synchronize()
-    assert len(tuner.cache) == 1
+    assert len(sweeps) == 1
     inputs = _make_inputs(tokens=1, dtype=torch.bfloat16, initial_state=False)
     recurrent_gdn(*inputs[:5], autotune=True)
-    assert len(tuner.cache) == 2
+    assert len(sweeps) == 2
 
 
 def _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fresh):

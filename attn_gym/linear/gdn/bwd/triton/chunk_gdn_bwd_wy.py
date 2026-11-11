@@ -17,8 +17,8 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import PinnedConfigKernel
-from attn_gym._backends.triton.utils import autotune_cache_kwargs, ptr_offset
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
+from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     load_ragged_chunk_count,
@@ -58,19 +58,6 @@ def _load_last_gate(gate, valid_tokens, stride, BT: tl.constexpr):
     )
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BV": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BV": 64}, num_warps=8, num_stages=2),
-    ],
-    key=["H", "HK", "K", "V", "IS_VARLEN"],
-    prune_configs_by={
-        "early_config_prune": lambda configs, _named_args, V, **_: [
-            config for config in configs if config.kwargs["BV"] <= V
-        ]
-    },
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_dqkwg_kernel(
     q,
@@ -209,20 +196,6 @@ def chunk_gdn_bwd_dqkwg_kernel(
     tl.store(d_gate_direct + d_gate_offset, b_dg, mask=token_mask)
 
 
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
-        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
-    ],
-    key=["H", "HK", "K", "V", "IS_VARLEN"],
-    prune_configs_by={
-        "early_config_prune": lambda configs, _named_args, K, V, **_: [
-            config for config in configs if config.kwargs["BK"] <= K and config.kwargs["BV"] <= V
-        ]
-    },
-    **autotune_cache_kwargs,
-)
 @triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gdn_bwd_wy_kernel(
     k,
@@ -412,8 +385,30 @@ def chunk_gdn_bwd_gate_cumsum_kernel(
     tl.store(d_gate + scalar_offsets, b_dgate, mask=token_mask)
 
 
-_PINNED_DQKWG = PinnedConfigKernel(chunk_gdn_bwd_dqkwg_kernel)
-_PINNED_WY = PinnedConfigKernel(chunk_gdn_bwd_wy_kernel)
+_dqkwg = TritonTuner(
+    chunk_gdn_bwd_dqkwg_kernel,
+    [
+        triton.Config({"BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=tuning_key("q", "H", "HK", "K", "V", "IS_VARLEN"),
+    prune=lambda configs, a: [config for config in configs if config.kwargs["BV"] <= a["V"]],
+)
+
+_wy = TritonTuner(
+    chunk_gdn_bwd_wy_kernel,
+    [
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
+    ],
+    key=tuning_key("k", "H", "HK", "K", "V", "IS_VARLEN"),
+    prune=lambda configs, a: [
+        config
+        for config in configs
+        if config.kwargs["BK"] <= a["K"] and config.kwargs["BV"] <= a["V"]
+    ],
+)
 
 
 def chunk_gdn_bwd_wy(
@@ -540,8 +535,7 @@ def chunk_gdn_bwd_wy(
 
     if chunk_slots:
         direct_grid = (key_tiles, chunk_slots, value_heads)
-        dqkwg_kernel = chunk_gdn_bwd_dqkwg_kernel if autotune else _PINNED_DQKWG
-        dqkwg_kernel[direct_grid](
+        (_dqkwg if autotune else _dqkwg.pinned)[direct_grid](
             q,
             k,
             q.stride(1),
@@ -570,8 +564,7 @@ def chunk_gdn_bwd_wy(
             SCALE=scale,
             IS_VARLEN=metadata is not None,
         )
-        wy_kernel = chunk_gdn_bwd_wy_kernel if autotune else _PINNED_WY
-        wy_kernel[(chunk_slots, value_heads)](
+        (_wy if autotune else _wy.pinned)[(chunk_slots, value_heads)](
             k,
             v,
             k.stride(1),
