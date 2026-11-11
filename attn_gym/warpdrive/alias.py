@@ -194,6 +194,24 @@ class Access:
     site: str
     handle: object = None  # owns the SMEM stage view
 
+    @classmethod
+    def from_event(cls, kernel, role: RoleEvents, index: int) -> Access:
+        ev = role.events[index]
+        d = ev.data
+        return cls(
+            role,
+            index,
+            d["storage"],
+            d["slot"],
+            d["read"],
+            d["write"],
+            d["agent"],
+            _parts(kernel, ev, role),
+            ev.open,
+            ev.site,
+            d.get("handle"),
+        )
+
     def describe(self) -> str:
         mode = "read/write" if self.read and self.write else "write" if self.write else "read"
         slot = "" if self.slot is None else f"[{self.slot}]"
@@ -263,7 +281,7 @@ def _overlap(a: range | None, b: range | None) -> bool:
     return a is None or b is None or (a.start < b.stop and b.start < a.stop)
 
 
-def _declared_pairs(kernel) -> list[tuple[str, tuple[str, str]]]:
+def declared_pairs(kernel) -> list[tuple[str, tuple[str, str]]]:
     pairs = []
     plan = kernel.tmem_plan
     if plan is not None:
@@ -1047,29 +1065,14 @@ def _stage_alignment(kernel, x: str, y: str) -> Finding | str | None:
 def check(kernel, roles: list[RoleEvents]) -> AliasReport:
     """Run the diagnostic over the roles traced in one compile."""
     results = []
-    pairs = _declared_pairs(kernel)
+    pairs = declared_pairs(kernel)
     if not pairs:
         return AliasReport(results)
     accesses: list[Access] = []
     for role in roles:
         for i, ev in enumerate(role.events):
             if ev.kind == "access" and not ev.opted_out:
-                d = ev.data
-                accesses.append(
-                    Access(
-                        role,
-                        i,
-                        d["storage"],
-                        d["slot"],
-                        d["read"],
-                        d["write"],
-                        d["agent"],
-                        _parts(kernel, ev, role),
-                        ev.open,
-                        ev.site,
-                        d.get("handle"),
-                    )
-                )
+                accesses.append(Access.from_event(kernel, role, i))
     streams = getattr(kernel, "_ws_streams", {})
     items = 2 if any(st.schedule.persistent for st in streams.values()) else 1
 
