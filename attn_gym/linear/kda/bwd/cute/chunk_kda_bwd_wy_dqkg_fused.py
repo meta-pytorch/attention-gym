@@ -1701,14 +1701,8 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     for i in cutlass.range_constexpr(bv_num_cols_per_wg // 8):
                         col_base = bv_col_base + i * 8
                         vals = smem_load_f16x8_sw128(sV_raw_ptr_cur, row, col_base, self.io_dtype)
-                        rV_io[i * 8 + 0] = vals[0]
-                        rV_io[i * 8 + 1] = vals[1]
-                        rV_io[i * 8 + 2] = vals[2]
-                        rV_io[i * 8 + 3] = vals[3]
-                        rV_io[i * 8 + 4] = vals[4]
-                        rV_io[i * 8 + 5] = vals[5]
-                        rV_io[i * 8 + 6] = vals[6]
-                        rV_io[i * 8 + 7] = vals[7]
+                        for j in cutlass.range_constexpr(8):
+                            rV_io[i * 8 + j] = vals[j]
                 else:
                     rV_io.fill(self.io_dtype(0.0))
                 rV_fp32 = cute.make_rmem_tensor((bv_num_cols_per_wg,), Float32)
@@ -1838,14 +1832,8 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 for i in cutlass.range_constexpr(self.BK // 4 // 8):
                     col_base = bk_col_base + i * 8
                     vals = smem_load_f16x8_sw128(sK_raw_ptr, row, col_base, self.io_dtype)
-                    rK[i * 8 + 0] = vals[0]
-                    rK[i * 8 + 1] = vals[1]
-                    rK[i * 8 + 2] = vals[2]
-                    rK[i * 8 + 3] = vals[3]
-                    rK[i * 8 + 4] = vals[4]
-                    rK[i * 8 + 5] = vals[5]
-                    rK[i * 8 + 6] = vals[6]
-                    rK[i * 8 + 7] = vals[7]
+                    for j in cutlass.range_constexpr(8):
+                        rK[i * 8 + j] = vals[j]
             else:
                 rK.fill(self.io_dtype(0.0))
             rK_fp32 = cute.make_rmem_tensor((self.BK // 4,), Float32)
@@ -1982,14 +1970,8 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 for i in cutlass.range_constexpr(self.BK // 4 // 8):
                     col_base = bk_col_base + i * 8
                     vals = smem_load_f16x8_sw128(sQ_raw_ptr, row, col_base, self.io_dtype)
-                    rQ[i * 8 + 0] = vals[0]
-                    rQ[i * 8 + 1] = vals[1]
-                    rQ[i * 8 + 2] = vals[2]
-                    rQ[i * 8 + 3] = vals[3]
-                    rQ[i * 8 + 4] = vals[4]
-                    rQ[i * 8 + 5] = vals[5]
-                    rQ[i * 8 + 6] = vals[6]
-                    rQ[i * 8 + 7] = vals[7]
+                    for j in cutlass.range_constexpr(8):
+                        rQ[i * 8 + j] = vals[j]
             else:
                 rQ.fill(self.io_dtype(0.0))
             dq_scaled_i32 = tcgen05_ld_32x32b(
@@ -2355,6 +2337,18 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 )
         return a, h, do, dv, v, vnew, g, k, q
 
+    @cute.jit
+    def _neutralize_vloop_tail(
+        self, smem_ptr: cute.Pointer, zeros: cute.Tensor, valid_rows: Int32, lane_idx: Int32
+    ):
+        if valid_rows < self.BT:
+            for i in cutlass.range_constexpr(self.BT // 32):
+                row = i * 32 + lane_idx
+                if row >= valid_rows:
+                    for col in cutlass.range_constexpr(self.BV // 8):
+                        smem_store_f16x8_sw128(smem_ptr, row, col * 8, zeros, self.io_dtype)
+            cute.arch.fence_proxy("async.shared", space="cta")
+
     @role(warps=8, regs=56)
     @cute.jit
     def mma(
@@ -2436,16 +2430,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     smem.sDo_ptr_base + do_h.index * smem.vloop_opA_bytes_per_stage,
                     cute.AddressSpace.smem,
                 )
-                if sub_seq_len < self.BT:
-                    for i in cutlass.range_constexpr(self.BT // 32):
-                        row = i * 32 + lane_idx
-                        if row >= sub_seq_len:
-                            for col in cutlass.range_constexpr(self.BV // 8):
-                                # dv tile uses the same Swizzle<3,4,3> physical mapping.
-                                smem_store_f16x8_sw128(
-                                    sDo_raw_ptr, row, col * 8, zeros8, self.io_dtype
-                                )
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                self._neutralize_vloop_tail(sDo_raw_ptr, zeros8, sub_seq_len, lane_idx)
 
                 dq_span.begin(v_iter)
                 # dq+=do@h
@@ -2470,16 +2455,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     smem.sDv_ptr_base + dv_h.index * smem.vloop_opA_bytes_per_stage,
                     cute.AddressSpace.smem,
                 )
-                if sub_seq_len < self.BT:
-                    for i in cutlass.range_constexpr(self.BT // 32):
-                        row = i * 32 + lane_idx
-                        if row >= sub_seq_len:
-                            for col in cutlass.range_constexpr(self.BV // 8):
-                                # dv tile uses the same Swizzle<3,4,3> physical mapping.
-                                smem_store_f16x8_sw128(
-                                    sDv_raw, row, col * 8, zeros8, self.io_dtype
-                                )
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                self._neutralize_vloop_tail(sDv_raw, zeros8, sub_seq_len, lane_idx)
 
                 with dvb.produce():
                     sDv_mn_cur = smem.sDv_mn[(None, None, None, dv_h.index)]
@@ -2514,14 +2490,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     smem.sV_ptr_base + v_h.index * smem.v_opB_bytes_per_stage,
                     cute.AddressSpace.smem,
                 )
-                if sub_seq_len < self.BT:
-                    for i in cutlass.range_constexpr(self.BT // 32):
-                        row = i * 32 + lane_idx
-                        if row >= sub_seq_len:
-                            for col in cutlass.range_constexpr(self.BV // 8):
-                                # dv tile uses the same Swizzle<3,4,3> physical mapping.
-                                smem_store_f16x8_sw128(sV_raw, row, col * 8, zeros8, self.io_dtype)
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                self._neutralize_vloop_tail(sV_raw, zeros8, sub_seq_len, lane_idx)
 
                 dA_span.begin(v_iter)
                 sV_k_cur = smem.sV_k[(None, None, None, v_h.index)]
@@ -2548,16 +2517,7 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                     smem.sVnew_ptr_base + vnew_h.index * smem.vloop_opA_bytes_per_stage,
                     cute.AddressSpace.smem,
                 )
-                if sub_seq_len < self.BT:
-                    for i in cutlass.range_constexpr(self.BT // 32):
-                        row = i * 32 + lane_idx
-                        if row >= sub_seq_len:
-                            for col in cutlass.range_constexpr(self.BV // 8):
-                                # dv tile uses the same Swizzle<3,4,3> physical mapping.
-                                smem_store_f16x8_sw128(
-                                    sDvnew_raw_ptr, row, col * 8, zeros8, self.io_dtype
-                                )
-                    cute.arch.fence_proxy("async.shared", space="cta")
+                self._neutralize_vloop_tail(sDvnew_raw_ptr, zeros8, sub_seq_len, lane_idx)
 
                 dk_span.begin(v_iter)
                 sVnew_k_cur = smem.sVnew_k[(None, None, None, vnew_h.index)]
