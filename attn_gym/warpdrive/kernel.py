@@ -1431,12 +1431,6 @@ class WarpSpecialized(metaclass=_KernelType):
                 cute.arch.sync_threads()  # publishes the TMEM base address
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         rank = self.cluster.rank()
-        roles = self._ws_roles
-        # Threads of the TMEM users in each CTA rank (leader-only roles skip a pair's peer).
-        tmem_threads = {
-            c: sum(r.num_threads for r in roles if r.uses_tmem and c in self.cluster.ctas(r.cta))
-            for c in range(self.cluster.size)
-        }
         # setmaxnreg is .sync.aligned over a warpgroup: every warp of a group must execute the
         # same instruction. Branch once per run of adjacent warpgroups with one budget (a
         # warpgroup-uniform condition), adjust there, then split into roles inside that branch
@@ -1444,7 +1438,7 @@ class WarpSpecialized(metaclass=_KernelType):
         groups = self._ws_budget_groups
         for gi in cutlass.range_constexpr(len(groups)):
             if _in_warpgroups(warp_idx, groups[gi][1]):
-                self._dispatch_group(groups[gi], params, tmem_threads, warp_idx, rank)
+                self._dispatch_group(groups[gi], params, warp_idx, rank)
         if cutlass.const_expr(clustered):
             # Remote arrivals into a CTA must land before it exits. Each thread-issued remote
             # arrive precedes that thread's cluster arrive (a release), and producers whose
@@ -1793,7 +1787,7 @@ class WarpSpecialized(metaclass=_KernelType):
             )
 
     @cute.jit
-    def _dispatch_group(self, group, ctx, tmem_threads, warp_idx, rank):
+    def _dispatch_group(self, group, ctx, warp_idx, rank):
         regs, _, role_ids = group
         self._set_regs(regs)
         size = self.cluster.size
@@ -1806,9 +1800,9 @@ class WarpSpecialized(metaclass=_KernelType):
             # Only a call on `self` inside the dynamic `if`: an assignment through `self`
             # would make the preprocessor carry `self` as an if-result.
             if here:
-                self._dispatch(r, ctx, tmem_threads)
+                self._dispatch(r, ctx)
 
-    def _dispatch(self, r: RoleInstance, ctx, tmem_threads: dict[int, int]):
+    def _dispatch(self, r: RoleInstance, ctx):
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
         ranges = None
         if self._ws_trace is not None:
@@ -1836,17 +1830,23 @@ class WarpSpecialized(metaclass=_KernelType):
             ]
             final = _returned_state(r, result, state_args)
             if ranges is not None:
-                for _, arg in state_args:
-                    if isinstance(arg, WorkCursor):
-                        cur = final[_state_identity(arg)]
+                for cur in final:
+                    if isinstance(cur, WorkCursor):
                         pop_if(ranges, cur.index < cur._problem.total, r.name, cur.index)
-            for _, arg in state_args:
-                if isinstance(arg, ProducerEnd) and arg.scope.tail:
-                    final[_state_identity(arg)].tail()
+            for end in final:
+                if isinstance(end, ProducerEnd) and end.scope.tail:
+                    end.tail()
         if whole_range:
             ranges.pop(r.name)
         if ranges is not None and ranges.names:
             raise ProtocolError(f"{r.name}: trace ranges {ranges.names} left open at role exit")
+        self._record_role(r, trace)
+        if r.uses_tmem:
+            self._tmem_teardown(r)
+
+    def _record_role(self, r: RoleInstance, trace: RoleTrace):
+        """Check a traced role and keep its results for ``_finish_trace``'s kernel-wide checks.
+        Host only: it emits no device code."""
         if not r.raw:
             check_tma(trace, self.cluster, self._ws_tma)
             trace.finish()
@@ -1859,20 +1859,25 @@ class WarpSpecialized(metaclass=_KernelType):
                 self._ws_epoch_seqs[(name, r.name)] = (
                     "raw role: its waits are not visible" if r.raw else trace.epoch_sequence(name)
                 )
-        role = RoleEvents.from_trace(trace, r)
-        self._ws_role_events.append(role)
-        if r.uses_tmem:
-            # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
-            # peer has no leader-only TMEM roles, so its count is smaller).
-            ctas = self.cluster.ctas(r.cta)
-            count = rank_value({c: tmem_threads[c] for c in ctas}, self.cluster.rank)
-            # Roles reach this from different code sites after per-lane mbarrier spins, so use
-            # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
-            _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
-            if r is self._ws_tmem_alloc_role:
-                ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-                # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
-                self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
+        self._ws_role_events.append(RoleEvents.from_trace(trace, r))
+
+    def _tmem_teardown(self, r: RoleInstance):
+        """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp."""
+        # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
+        # peer has no leader-only TMEM roles, so its count is smaller).
+        users = [u for u in self._ws_roles if u.uses_tmem]
+        threads = {
+            c: sum(u.num_threads for u in users if c in self.cluster.ctas(u.cta))
+            for c in self.cluster.ctas(r.cta)
+        }
+        count = rank_value(threads, self.cluster.rank)
+        # Roles reach this from different code sites after per-lane mbarrier spins, so use
+        # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
+        _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
+        if r is self._ws_tmem_alloc_role:
+            ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
+            # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
+            self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
 
     def _set_regs(self, regs):
         if regs is None:
@@ -1999,9 +2004,9 @@ def _state_identity(state):
     return id(state._rec)
 
 
-def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]]) -> dict:
-    """Match a role's returned state to its state arguments, independent of names and tuple
-    order.
+def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]]) -> list:
+    """Return each state argument's final value in argument order, matching the role's returned
+    state independently of names and tuple order.
 
     Rebuilt ends and cursors share a record; turnstile copies share a role, turnstile and seat.
     A returned end or cursor must be current: not a snapshot saved before a loop or branch that
@@ -2033,7 +2038,7 @@ def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]
             f"{role_name}: return all warpdrive state arguments; missing {', '.join(missing)} "
             f"(for example, return {names})"
         )
-    return final
+    return [final[_state_identity(arg)] for _, arg in state_args]
 
 
 def _check_signal_once(name: str, side: str, chan, bound):
