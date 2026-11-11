@@ -162,6 +162,7 @@ class _Copy:
     site: str
     function: str | None  # the user function that made it
     callee: str | None  # its bound or standalone spelling, for schematic reassignment advice
+    block: object = None  # the region it was made in: a region that does not carry it ends here
 
 
 class Lineage:
@@ -194,8 +195,29 @@ class Lineage:
                 callee = f"self.{function}"
                 break
             caller = _user_frame(caller.f_back) if caller.f_back is not None else None
-        self._copies.append(_Copy(self._advances, _frame_site(frame), function, callee))
+        try:
+            block = current_block()
+        except ValueError:  # made outside a trace
+            block = None
+        copy = _Copy(self._advances, _frame_site(frame), function, callee, block)
+        self._copies.append(copy)
         return len(self._copies) - 1
+
+    def check_carried(self, copy: int, trace: RoleTrace, name: str, kind: str) -> None:
+        """Raise if ``copy`` advances inside a loop or branch that did not carry it in.
+
+        CuTeDSL carries a value through a region only when the region reassigns it or calls a
+        method on it. A helper that advances an end in place, called without reassigning its
+        result, leaves the region with the end's old phase."""
+        made = self._copies[copy]
+        if made.block is None or made.block == current_block():
+            return
+        raise ProtocolError(
+            f"{trace.role_name}: the {name} {kind} advances at {user_site()} inside a loop or "
+            f"branch that does not carry it (it was made at {made.site}), so its phase does not "
+            f"reach the region's next run; assign the {kind} a helper returns "
+            f"(schematically: `{name} = helper({name}, ...)`)"
+        )
 
     def advanced(self, copy: int) -> None:
         """Record an advance, raw-state access or phase assignment by ``copy``."""
