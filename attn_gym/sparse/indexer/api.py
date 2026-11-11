@@ -4,9 +4,11 @@ import torch
 from torch import Tensor
 
 from attn_gym._cu_seqlens import validate_cu_seqlens_pair
-from attn_gym.types import Impl, resolve_impl
+from attn_gym.types import Impl, KernelOptionSpec, resolve_impl, validate_kernel_options
 
 from .ops import _indexer_op
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), "auto")}
 
 
 def _validate_inputs(
@@ -199,8 +201,9 @@ def lightning_indexer(
 
     selected_impl = resolve_impl(impl)
     _validate_inputs(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
-    if kernel_options not in (None, {}, {"backend": "cute"}, {"backend": "triton"}):
-        raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
+    backend = validate_kernel_options(
+        kernel_options, KERNEL_OPTION_SPEC, op_name="lightning_indexer"
+    )["backend"]
     match selected_impl:
         case Impl.REFERENCE:
             from .impl import reference
@@ -211,7 +214,6 @@ def lightning_indexer(
         case Impl.FUSED:
             if not q.is_cuda:
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
-            backend = (kernel_options or {}).get("backend", "auto")
             return _indexer_op(
                 q, k, weights, topk, causal, compress_ratio, backend, cu_seqlens, cu_seqlens_k
             )

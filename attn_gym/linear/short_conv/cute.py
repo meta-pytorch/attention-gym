@@ -19,7 +19,7 @@ gradients and FP32 weight-gradient partials followed by a Torch reduction.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import ClassVar, TypedDict
 
@@ -41,6 +41,7 @@ from attn_gym._backends.cute.utils import (
 )
 from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
+from attn_gym.types import KernelOptionSpec, validate_kernel_options
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import SmemAllocator
@@ -148,6 +149,15 @@ class ShortConvKernelOptions(ShortConvDecodeKernelOptions, total=False):
     Defaults to ``False`` because it favors overcaptured replays and can regress full-capacity
     backward. Requires ``x``'s base and outer strides to be 16-byte aligned; backward raises
     otherwise."""
+
+
+DECODE_KERNEL_OPTION_SPEC: KernelOptionSpec = {"forward_config": (ShortConvConfig, None)}
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    **DECODE_KERNEL_OPTION_SPEC,
+    "input_grad_config": (ShortConvConfig, None),
+    "weight_grad_config": (ShortConvConfig, None),
+    "persistent_tma_input_gradient": (bool, False),
+}
 
 
 @cute.jit
@@ -4375,29 +4385,6 @@ def _validate_config(config: ShortConvConfig, channels: int, name: str) -> None:
         raise ValueError(f"{name}.times_per_block must be positive")
 
 
-def _validate_kernel_options(
-    kernel_options: Mapping[str, object] | None,
-    *,
-    op_name: str,
-    configs: tuple[str, ...],
-    flags: tuple[str, ...] = (),
-) -> Mapping[str, object]:
-    """Reject unknown keys and wrongly typed values; ``None`` means no options."""
-    if kernel_options is None:
-        return {}
-    unknown = kernel_options.keys() - {*configs, *flags}
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unsupported {op_name} kernel options: {names}")
-    for name in configs:
-        if name in kernel_options and not isinstance(kernel_options[name], ShortConvConfig):
-            raise TypeError(f"kernel_options['{name}'] must be a ShortConvConfig")
-    for name in flags:
-        if name in kernel_options and not isinstance(kernel_options[name], bool):
-            raise TypeError(f"kernel_options['{name}'] must be a bool")
-    return kernel_options
-
-
 def dense_final_conv_state(
     x: torch.Tensor,
     initial_state: torch.Tensor | None,
@@ -4504,13 +4491,8 @@ def causal_conv1d(
         defined; parameter, state, and final-state values exclude the inactive suffix. When
         ``return_final_state`` is true, also returns ``[N, W - 1, C]`` history.
     """
-    options = _validate_kernel_options(
-        kernel_options,
-        op_name="causal_conv1d",
-        configs=("forward_config", "input_grad_config", "weight_grad_config"),
-        flags=("persistent_tma_input_gradient",),
-    )
-    persistent_tma_input_gradient = options.get("persistent_tma_input_gradient", False)
+    options = validate_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name="causal_conv1d")
+    persistent_tma_input_gradient = options["persistent_tma_input_gradient"]
     resolve_activation(activation)
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     channels = x.shape[2]
@@ -4522,9 +4504,9 @@ def causal_conv1d(
     default_forward = defaults.forward
     default_input_grad = defaults.input_gradient
     default_weight_grad = defaults.weight_gradient
-    forward_config = options.get("forward_config")
-    input_grad_config = options.get("input_grad_config")
-    weight_grad_config = options.get("weight_grad_config")
+    forward_config = options["forward_config"]
+    input_grad_config = options["input_grad_config"]
+    weight_grad_config = options["weight_grad_config"]
     forward = forward_config or _compatible_config(default_forward, channels)
     input_grad = input_grad_config or _compatible_config(default_input_grad, channels)
     weight_grad = weight_grad_config or _compatible_config(default_weight_grad, channels)
@@ -4708,8 +4690,8 @@ def causal_conv1d_decode(
     Inference-only: the single-token step has no backward, so gradient-tracking inputs
     are rejected when autograd is enabled.
     """
-    options = _validate_kernel_options(
-        kernel_options, op_name="causal_conv1d_decode", configs=("forward_config",)
+    options = validate_kernel_options(
+        kernel_options, DECODE_KERNEL_OPTION_SPEC, op_name="causal_conv1d_decode"
     )
     resolve_activation(activation)
     _validate_decode_inputs(x, weight, state, state_indices, has_initial_state)
@@ -4718,7 +4700,7 @@ def causal_conv1d_decode(
             "causal_conv1d_decode is inference-only and has no backward; use "
             "causal_conv1d for training or call under torch.no_grad()"
         )
-    forward_config = options.get("forward_config")
+    forward_config = options["forward_config"]
     if forward_config is None:
         return short_conv_ops.short_conv_decode_op(
             x,

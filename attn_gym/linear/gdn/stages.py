@@ -20,7 +20,7 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym._backends.autotune import resolve_tuning_options, should_autotune
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
@@ -42,7 +42,7 @@ from attn_gym.linear.gdn.impl.chunk import (
 )
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
-from attn_gym.types import TuningOptions
+from attn_gym.types import TUNING_OPTION_SPEC, TuningOptions, validate_kernel_options
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
@@ -135,7 +135,9 @@ def chunk_gdn_prepare(
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
     one packed stream. ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
-    autotune = resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare")
+    autotune = validate_kernel_options(
+        kernel_options, TUNING_OPTION_SPEC, op_name="chunk_gdn_prepare"
+    )["autotune"]
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
@@ -251,7 +253,9 @@ def chunk_gdn_prepare_backward(
     handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
     ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
-    autotune = resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare_backward")
+    autotune = validate_kernel_options(
+        kernel_options, TUNING_OPTION_SPEC, op_name="chunk_gdn_prepare_backward"
+    )["autotune"]
     metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     scale = float(scale)
     if d_output is None:

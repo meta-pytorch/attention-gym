@@ -274,7 +274,7 @@ def chunk_kda_prepare(
     ``chunk_kda``.
     """
     backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
-        kernel_options
+        kernel_options, op_name="chunk_kda_prepare"
     )
     if backend == "cudnn":
         validate_cudnn_fastmath(fastmath)
@@ -489,7 +489,7 @@ def chunk_kda_prepare_backward(
     else:
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
-    options = resolve_kernel_options(kernel_options)
+    options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare_backward")
     if isinstance(saved, ChunkKDACudnnSaved):
         validate_cudnn_fastmath(fastmath)
         return ChunkKDACudnnBackward(saved, d_output, _normalize_cudnn_state(initial_state), scale)

@@ -6,10 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.autotune import resolve_tuning_options, should_autotune
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import fixed_tree_sum, ptr_offset
-from attn_gym.types import TuningOptions
+from attn_gym.types import TUNING_OPTION_SPEC, TuningOptions, validate_kernel_options
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
@@ -297,7 +297,9 @@ def l2norm(
     order, so a row's output bits do not depend on the token count, head count, or
     ``cu_seqlens`` shape that select its launch config.
     """
-    autotune = resolve_tuning_options(kernel_options, op_name="l2norm")
+    autotune = validate_kernel_options(kernel_options, TUNING_OPTION_SPEC, op_name="l2norm")[
+        "autotune"
+    ]
     if not x.is_cuda:
         raise ValueError("l2norm requires a CUDA tensor")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):

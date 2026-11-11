@@ -11,7 +11,7 @@ from typing import Literal, NamedTuple
 
 import torch
 
-from attn_gym.types import Impl, TuningOptions, resolve_impl
+from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOptions, resolve_impl
 
 
 class ReplayState(NamedTuple):
@@ -70,6 +70,20 @@ class RecurrentKernelOptions(TuningOptions, total=False):
     Autotuning and prefetching remain available. The fused ``recurrent_gdn_decode`` and
     ``recurrent_kda_decode`` ops do not support this option.
     See ``docs/determinism.md`` for the full contract and performance costs."""
+
+
+# Accepted values and defaults of the option dicts above; see ``KernelOptionSpec``.
+SPLIT_OPTION_SPEC: KernelOptionSpec = {
+    **TUNING_OPTION_SPEC,
+    "backend": (("fused", "cudnn"), "fused"),
+    "split_backward": (bool, False),
+    "split_forward": (bool, False),
+}
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    **SPLIT_OPTION_SPEC,
+    "schedule": (("auto", "static", "persistent"), "auto"),
+}
+RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
 
 
 class GateTransform(str, Enum):

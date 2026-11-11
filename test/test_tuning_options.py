@@ -1,21 +1,42 @@
-"""``autotune`` is a kernel option of every tuned operation, not a keyword argument."""
+"""Operations share option validation; ``autotune`` belongs in ``kernel_options``."""
+
+from typing import Literal, get_args, get_origin, get_type_hints
 
 import pytest
 import torch
 
 from attn_gym import linear, mla, sparse
-from attn_gym._backends.autotune import resolve_tuning_options
 from attn_gym.linear import gdn, kda
-from attn_gym.linear._delta_rule.validation import resolve_recurrent_kernel_options
-from attn_gym.linear.gdn.validation import resolve_kernel_options as resolve_gdn_options
-from attn_gym.linear.kda.validation import resolve_kernel_options as resolve_kda_options
+from attn_gym.linear import types as linear_types
 from attn_gym.mla import paged_mla_decode
+from attn_gym.sparse.gather_attn import api as gather_attn_api
+from attn_gym.sparse.indexer import api as indexer_api
+from attn_gym.types import TUNING_OPTION_SPEC, TuningOptions, validate_kernel_options
 
-RESOLVERS = {
-    "chunk_kda": resolve_kda_options,
-    "chunk_gdn": resolve_gdn_options,
-    "recurrent": lambda options: resolve_recurrent_kernel_options(options, op_name="recurrent"),
-    "tuning_only": lambda options: resolve_tuning_options(options, op_name="tuning_only"),
+
+def short_conv_specs(decode: bool) -> tuple[dict, type]:
+    cute = pytest.importorskip("attn_gym.linear.short_conv.cute")
+    if decode:
+        return cute.DECODE_KERNEL_OPTION_SPEC, cute.ShortConvDecodeKernelOptions
+    return cute.KERNEL_OPTION_SPEC, cute.ShortConvKernelOptions
+
+
+# Each specification with the TypedDict that documents it; ``None`` where there is none.
+OPTION_SPECS = {
+    "tuning": lambda: (TUNING_OPTION_SPEC, TuningOptions),
+    "chunk_gdn": lambda: (linear_types.SPLIT_OPTION_SPEC, linear_types.SplitOptions),
+    "chunk_kda": lambda: (linear_types.KERNEL_OPTION_SPEC, linear_types.KernelOptions),
+    "recurrent": lambda: (
+        linear_types.RECURRENT_OPTION_SPEC,
+        linear_types.RecurrentKernelOptions,
+    ),
+    "gather_attn": lambda: (
+        gather_attn_api.KERNEL_OPTION_SPEC,
+        gather_attn_api.GatherAttnKernelOptions,
+    ),
+    "lightning_indexer": lambda: (indexer_api.KERNEL_OPTION_SPEC, None),
+    "causal_conv1d": lambda: short_conv_specs(decode=False),
+    "causal_conv1d_decode": lambda: short_conv_specs(decode=True),
 }
 # Module and name, because the staged and context-parallel operations load lazily.
 TUNED_OPERATIONS = [
@@ -42,21 +63,37 @@ def delta_rule_inputs() -> tuple[torch.Tensor, ...]:
     return q, q, q, -torch.rand(1, 4, 1), torch.rand(1, 4, 1)
 
 
-@pytest.mark.parametrize("resolve", RESOLVERS.values(), ids=RESOLVERS)
-def test_resolvers_validate_the_autotune_option(resolve):
-    assert resolve(None) == resolve({}) == resolve({"autotune": True})
-    assert resolve({"autotune": False}) != resolve(None)
-    for value in (0, 1, "False", None):
-        with pytest.raises(TypeError, match=r"kernel_options\['autotune'\] must be a bool"):
-            resolve({"autotune": value})
-    with pytest.raises(ValueError, match="unsupported .* kernel options: tune"):
-        resolve({"tune": False})
+@pytest.mark.parametrize("make_spec", OPTION_SPECS.values(), ids=OPTION_SPECS)
+def test_kernel_options_follow_one_contract(make_spec):
+    spec, typed_dict = make_spec()
 
+    def resolve(options):
+        return validate_kernel_options(options, spec, op_name="some_op")
 
-def test_cudnn_accepts_the_autotune_option():
-    for resolve in (resolve_kda_options, resolve_gdn_options):
-        options = resolve({"backend": "cudnn", "autotune": False})
-        assert (options.backend, options.autotune) == ("cudnn", False)
+    defaults = {name: default for name, (_, default) in spec.items()}
+    assert resolve(None) == resolve({}) == defaults
+    with pytest.raises(ValueError, match="unsupported some_op kernel options: alpha, zeta$"):
+        resolve({"zeta": True, "alpha": True})
+    for name, (accepted, _) in spec.items():
+        if accepted is bool:
+            valid, wrong, error, expected = (True, False), (0, 1, "False", None), TypeError, "bool"
+        elif isinstance(accepted, tuple):
+            valid, wrong, error, expected = accepted, ("other", None), ValueError, accepted[-1]
+        else:  # ShortConvConfig is the only class-typed option.
+            valid, wrong, error = (accepted(64, 2, 8),), (None, (64, 2, 8)), TypeError
+            expected = accepted.__name__
+        for value in valid:
+            assert resolve({name: value}) == {**defaults, name: value}
+        for value in wrong:
+            with pytest.raises(error, match=rf"kernel_options\['{name}'\] must be .*{expected}"):
+                resolve({name: value})
+
+    if typed_dict is not None:
+        documented = {
+            name: get_args(hint) if get_origin(hint) is Literal else hint
+            for name, hint in get_type_hints(typed_dict).items()
+        }
+        assert documented == {name: accepted for name, (accepted, _) in spec.items()}
 
 
 @pytest.mark.parametrize("operation", [linear.chunk_gdn, linear.recurrent_gdn])

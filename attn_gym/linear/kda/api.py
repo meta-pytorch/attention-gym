@@ -24,7 +24,6 @@ from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
-    resolve_recurrent_kernel_options,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
@@ -39,12 +38,14 @@ from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
 from attn_gym.linear.types import (
+    RECURRENT_OPTION_SPEC,
     Impl,
     KernelOptions,
     RecurrentKernelOptions,
     ReplayState,
     resolve_impl,
 )
+from attn_gym.types import validate_kernel_options
 
 _CHUNK_SIZE = 64
 _DECODE_GATE_TRANSFORMS = {
@@ -280,7 +281,7 @@ def paged_chunk_kda(
         state_indices,
         has_initial_state=has_initial_state,
     )
-    options = resolve_kernel_options(kernel_options)
+    options = resolve_kernel_options(kernel_options, op_name="paged_chunk_kda")
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     if replay_state is not None:
@@ -441,7 +442,9 @@ def recurrent_kda(
     separate launches, and speculative-decoding rollback is unsupported.
     """
     selected_impl = resolve_impl(impl)
-    options = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_kda")
+    options = validate_kernel_options(
+        kernel_options, RECURRENT_OPTION_SPEC, op_name="recurrent_kda"
+    )
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(
@@ -480,8 +483,8 @@ def recurrent_kda(
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            autotune=should_autotune(options.autotune),
-            batch_invariant=options.batch_invariant,
+            autotune=should_autotune(options["autotune"]),
+            batch_invariant=options["batch_invariant"],
         )
     return reference_delta_rule(
         naive_recurrent_kda,

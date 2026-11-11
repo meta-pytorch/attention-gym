@@ -19,9 +19,10 @@ import torch
 
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
 from attn_gym.linear._delta_rule.validation import (
-    resolve_backend_options,
+    resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
+from attn_gym.linear.types import KERNEL_OPTION_SPEC
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -38,22 +39,14 @@ class ResolvedKernelOptions(NamedTuple):
 
 
 def resolve_kernel_options(
-    kernel_options: Mapping[str, object] | None,
+    kernel_options: Mapping[str, object] | None, *, op_name: str = "chunk_kda"
 ) -> ResolvedKernelOptions:
     """Validate chunk backend options and resolve their defaults."""
-    if kernel_options is None:
-        return ResolvedKernelOptions("fused", False, False)
-    backend, split_backward, split_forward, autotune = resolve_backend_options(
-        kernel_options, op_name="chunk_kda", fields=ResolvedKernelOptions._fields
-    )
-    schedule = kernel_options.get("schedule", "auto")
-    if schedule not in ("auto", "static", "persistent"):
-        raise ValueError("kernel_options['schedule'] must be 'auto', 'static', or 'persistent'")
-    if schedule != "auto" and backend != "fused":
+    options = resolve_chunk_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name=op_name)
+    schedule = ScheduleRequest(options.pop("schedule"))
+    if schedule is not ScheduleRequest.AUTO and options["backend"] != "fused":
         raise ValueError("schedule requires kernel_options['backend']='fused'")
-    return ResolvedKernelOptions(
-        backend, split_backward, split_forward, autotune, ScheduleRequest(schedule)
-    )
+    return ResolvedKernelOptions(**options, schedule=schedule)
 
 
 def validate_cudnn_fastmath(fastmath: bool) -> None:

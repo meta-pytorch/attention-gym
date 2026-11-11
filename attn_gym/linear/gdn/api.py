@@ -7,8 +7,8 @@ import torch
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_kernel_options,
     resolve_decode_out,
-    resolve_recurrent_kernel_options,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
@@ -20,9 +20,16 @@ from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
-from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
-from attn_gym.linear.types import Impl, RecurrentKernelOptions, resolve_impl
+from attn_gym.linear.gdn.validation import validate_gdn_inputs
+from attn_gym.linear.types import (
+    RECURRENT_OPTION_SPEC,
+    SPLIT_OPTION_SPEC,
+    Impl,
+    RecurrentKernelOptions,
+    resolve_impl,
+)
 from attn_gym.linear.types import SplitOptions as KernelOptions
+from attn_gym.types import validate_kernel_options
 
 
 def chunk_gdn(
@@ -80,11 +87,11 @@ def chunk_gdn(
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    options = resolve_kernel_options(kernel_options)
+    options = resolve_chunk_kernel_options(kernel_options, SPLIT_OPTION_SPEC, op_name="chunk_gdn")
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if options.backend == "cudnn":
+        if options["backend"] == "cudnn":
             return cudnn_chunk_forward(
                 q,
                 k,
@@ -95,8 +102,8 @@ def chunk_gdn(
                 cu_seqlens=cu_seqlens,
                 scale=scale,
                 output_final_state=output_final_state,
-                split_backward=options.split_backward,
-                split_forward=options.split_forward,
+                split_backward=options["split_backward"],
+                split_forward=options["split_forward"],
             )
         return fused_chunk_forward(
             q,
@@ -108,7 +115,7 @@ def chunk_gdn(
             cu_seqlens=cu_seqlens,
             scale=scale,
             output_final_state=output_final_state,
-            autotune=should_autotune(options.autotune),
+            autotune=should_autotune(options["autotune"]),
         )
 
     return reference_delta_rule(
@@ -175,8 +182,10 @@ def paged_chunk_gdn(
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
-    options = resolve_kernel_options(kernel_options)
-    if options.split_backward or options.split_forward:
+    options = resolve_chunk_kernel_options(
+        kernel_options, SPLIT_OPTION_SPEC, op_name="paged_chunk_gdn"
+    )
+    if options["split_backward"] or options["split_forward"]:
         raise ValueError("split schedules are not supported by paged_chunk_gdn")
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     validate_paged_state(
@@ -188,7 +197,7 @@ def paged_chunk_gdn(
         has_initial_state,
     )
     scale = resolve_scale(scale, q.shape[-1])
-    if options.backend == "cudnn":
+    if options["backend"] == "cudnn":
         return cudnn_paged_chunk_forward(
             q,
             k,
@@ -212,7 +221,7 @@ def paged_chunk_gdn(
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
         scale=scale,
-        autotune=should_autotune(options.autotune),
+        autotune=should_autotune(options["autotune"]),
     )
 
 
@@ -278,7 +287,9 @@ def recurrent_gdn(
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    options = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_gdn")
+    options = validate_kernel_options(
+        kernel_options, RECURRENT_OPTION_SPEC, op_name="recurrent_gdn"
+    )
     validate_gdn_inputs(
         q,
         k,
@@ -313,8 +324,8 @@ def recurrent_gdn(
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            autotune=should_autotune(options.autotune),
-            batch_invariant=options.batch_invariant,
+            autotune=should_autotune(options["autotune"]),
+            batch_invariant=options["batch_invariant"],
         )
 
     return reference_delta_rule(

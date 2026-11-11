@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 import sys
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from numbers import Real
-from typing import NamedTuple
+from typing import Any
 
 import torch
 
-from attn_gym._backends.autotune import resolve_autotune
 from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
+from attn_gym.types import KernelOptionSpec, validate_kernel_options
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -79,56 +79,18 @@ def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str)
         raise RuntimeError(message)
 
 
-def resolve_backend_options(
-    kernel_options: Mapping[str, object],
-    *,
-    op_name: str,
-    fields: Collection[str],
-) -> tuple[str, bool, bool, bool]:
-    """Validate the shared chunk ``backend``/``split_*``/``autotune`` options.
+def resolve_chunk_kernel_options(
+    kernel_options: Mapping[str, object] | None, spec: KernelOptionSpec, *, op_name: str
+) -> dict[str, Any]:
+    """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
-    Returns ``(backend, split_backward, split_forward, autotune)``; ``fields`` lists every key the
-    caller accepts, so family-specific keys are validated by the caller.
+    Split schedules require ``backend="cudnn"``.
     """
-    unknown = kernel_options.keys() - fields
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unsupported {op_name} kernel options: {names}")
-    backend = kernel_options.get("backend", "fused")
-    if backend not in ("fused", "cudnn"):
-        raise ValueError("kernel_options['backend'] must be 'fused' or 'cudnn'")
-    splits = []
+    options = validate_kernel_options(kernel_options, spec, op_name=op_name)
     for name in ("split_backward", "split_forward"):
-        value = kernel_options.get(name, False)
-        if not isinstance(value, bool):
-            raise TypeError(f"kernel_options['{name}'] must be a bool")
-        if value and backend != "cudnn":
+        if options[name] and options["backend"] != "cudnn":
             raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
-        splits.append(value)
-    return backend, *splits, resolve_autotune(kernel_options)
-
-
-class ResolvedRecurrentKernelOptions(NamedTuple):
-    """Validated recurrent-scan options with their defaults."""
-
-    batch_invariant: bool = False
-    autotune: bool = True
-
-
-def resolve_recurrent_kernel_options(
-    kernel_options: Mapping[str, object] | None, *, op_name: str
-) -> ResolvedRecurrentKernelOptions:
-    """Validate recurrent-scan ``kernel_options`` and resolve their defaults."""
-    if kernel_options is None:
-        return ResolvedRecurrentKernelOptions()
-    unknown = kernel_options.keys() - set(ResolvedRecurrentKernelOptions._fields)
-    if unknown:
-        names = ", ".join(sorted(unknown))
-        raise ValueError(f"unsupported {op_name} kernel options: {names}")
-    batch_invariant = kernel_options.get("batch_invariant", False)
-    if not isinstance(batch_invariant, bool):
-        raise TypeError("kernel_options['batch_invariant'] must be a bool")
-    return ResolvedRecurrentKernelOptions(batch_invariant, resolve_autotune(kernel_options))
+    return options
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -249,11 +211,9 @@ def validate_paged_state(
 
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
-    "ResolvedRecurrentKernelOptions",
     "require_inference_only",
-    "resolve_backend_options",
+    "resolve_chunk_kernel_options",
     "resolve_decode_out",
-    "resolve_recurrent_kernel_options",
     "resolve_scale",
     "validate_decode_inputs",
     "validate_delta_rule_inputs",

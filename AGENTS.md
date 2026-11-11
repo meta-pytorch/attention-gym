@@ -110,7 +110,9 @@ performance:
   short-convolution schedule configs) in the operation's typed `kernel_options` dict, not keyword
   arguments: `attn_gym/types.py`, `attn_gym/linear/types.py`,
   `attn_gym/linear/short_conv/cute.py`. Every implementation must reject unknown keys and wrongly
-  typed values; `impl="reference"` then ignores the options, so one dict serves both.
+  typed values through `validate_kernel_options` (`attn_gym/types.py`), with a `KernelOptionSpec`
+  beside the options' `TypedDict`; `impl="reference"` then ignores the options, so one dict
+  serves both.
 - Use one spelling per option across operations. Breaking a public signature to restore this is
   acceptable; disclose it in the PR.
 
@@ -126,8 +128,8 @@ tuned kernel in forward and backward under `kernel_options={"autotune": False}` 
   can run. The tuning `key` must determine what `prune` keeps. Use `run_tunable` for CuTeDSL;
   pinning selects `default_config`.
 - Launch `tuner[grid](..., autotune=autotune)`; the keyword is required, and `False` launches
-  the pinned candidate. Keep the recurrent scan's host shape heuristic when untuned. Neither
-  untuned path may benchmark or read the winner cache.
+  the pinned candidate, which may not benchmark or read the winner cache. A heuristic that
+  depends on the shape belongs in `prune`, which lists its choice first (the recurrent scan).
 - Keep deterministic-mode policy out of tuners. Resolve the `kernel_options["autotune"]` request
   with `should_autotune` (`attn_gym/_backends/autotune.py`) and pass the bool through every launch
   and custom-op schema. Resolve the stored request again in autograd backward and staged handles'

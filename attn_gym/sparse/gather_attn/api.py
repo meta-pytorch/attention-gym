@@ -6,9 +6,16 @@ from typing import Literal, NamedTuple, overload
 import torch
 from torch import Tensor
 
-from attn_gym._backends.autotune import resolve_autotune
 from attn_gym._cu_seqlens import validate_cu_seqlens_pair
-from attn_gym.types import AuxRequest, Impl, TuningOptions, resolve_impl
+from attn_gym.types import (
+    TUNING_OPTION_SPEC,
+    AuxRequest,
+    Impl,
+    KernelOptionSpec,
+    TuningOptions,
+    resolve_impl,
+    validate_kernel_options,
+)
 
 from .impl import gather_attn as fused_gather_attn
 from .impl.routing import require_grouped_schedule, uses_grouped_schedule
@@ -40,6 +47,13 @@ class GatherAttnKernelOptions(TuningOptions, total=False):
     """Defaults to ``True``: CuTe backward recomputes attention probabilities. ``False`` saves
     them in forward instead (BF16, tokens x heads x keys, with backend padding). Triton always
     recomputes and ignores this option."""
+
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    **TUNING_OPTION_SPEC,
+    "backend": (("cute", "triton"), None),
+    "bwd_recompute_p": (bool, True),
+}
 
 
 def _split_input(value: AttentionInput, name: str) -> tuple[Tensor, Tensor | None]:
@@ -202,17 +216,6 @@ def _validate_inputs(
             )
 
     validate_cu_seqlens_pair(cu_seqlens, cu_seqlens_k, batch=batch, device=query.device)
-
-
-def _resolve_kernel_options(kernel_options: GatherAttnKernelOptions) -> bool:
-    """Validate ``kernel_options`` and return the ``autotune`` request."""
-    if (
-        kernel_options.keys() - {"autotune", "backend", "bwd_recompute_p"}
-        or kernel_options.get("backend", "cute") not in ("cute", "triton")
-        or type(kernel_options.get("bwd_recompute_p", False)) is not bool
-    ):
-        raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
-    return resolve_autotune(kernel_options)
 
 
 def _select_backend(
@@ -444,8 +447,7 @@ def gather_attn(
         contributions to all inputs are zero. Inactive packed tails remain undefined.
     """
     selected_impl = resolve_impl(impl)
-    options = kernel_options or {}
-    autotune = _resolve_kernel_options(options)
+    options = validate_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name="gather_attn")
 
     query_latent, query_rope = _split_input(query, "query")
     paired = query_rope is not None
@@ -531,7 +533,7 @@ def gather_attn(
             raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
         if paired and query_rope.shape[-1] > 0 and not share_kv:
             raise ValueError("Fused paired attention requires a single shared KV head.")
-        backend = options.get("backend")
+        backend = options["backend"]
         grouped = uses_grouped_schedule(query_latent.shape[1], kv_heads, sparse_v is not None)
         if grouped and backend == "cute":
             raise ValueError(
@@ -572,8 +574,8 @@ def gather_attn(
             sparse_rope=sparse_rope,
             local_rope=local_rope,
             backend=backend,
-            bwd_recompute_p=options.get("bwd_recompute_p", True),
-            autotune=autotune,
+            bwd_recompute_p=options["bwd_recompute_p"],
+            autotune=options["autotune"],
             local_v=local_v,
             sparse_v=sparse_v,
         )

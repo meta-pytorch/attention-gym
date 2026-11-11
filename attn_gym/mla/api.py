@@ -6,8 +6,14 @@ from typing import overload
 import torch
 from torch import Tensor
 
-from attn_gym._backends.autotune import resolve_tuning_options, should_autotune
-from attn_gym.types import AuxRequest, Impl, TuningOptions, resolve_impl
+from attn_gym._backends.autotune import should_autotune
+from attn_gym.types import (
+    AuxRequest,
+    Impl,
+    TuningOptions,
+    resolve_impl,
+    validate_kernel_options,
+)
 
 from . import ops  # noqa: F401  # registers the attn_gym::paged_mla_decode ops
 from .impl import reference
@@ -246,7 +252,9 @@ def paged_mla_decode(
         the output and ``PagedMLADecodeAux``. Rows past ``cu_seqlens_q[-1]`` are undefined.
     """
     selected_impl = resolve_impl(impl)
-    autotune = resolve_tuning_options(kernel_options, op_name="paged_mla_decode", default=False)
+    autotune = validate_kernel_options(
+        kernel_options, {"autotune": (bool, False)}, op_name="paged_mla_decode"
+    )["autotune"]
     _validate_inputs(
         q_latent,
         q_rope,
