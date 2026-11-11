@@ -330,9 +330,6 @@ class RoundRobinHold(Toy):
         return ch
 
 
-HELD = {}
-
-
 class Arms(Toy):
     """``mode`` places a held handle and a later wait where they never run together, or holds
     one slot while waiting on another."""
@@ -363,15 +360,11 @@ class Arms(Toy):
         mode = self.mode
         if cutlass.const_expr(mode == "arms"):
             if ctx.n > 1:
-                with unchecked("unclosed", reason="released in the matching branch below"):
-                    HELD["arms"] = ch.wait()  # a staged branch cannot carry a handle out
+                ch.wait()  # held past its arm
             else:
                 for _ in cutlass.range_constexpr(2):
                     with ch.consume():
                         pass
-            if ctx.n > 1:
-                with unchecked("cross_region", reason="opened in the matching branch above"):
-                    HELD["arms"].release()
         elif cutlass.const_expr(mode == "other_slot"):
             held = ch.wait(0)
             for _ in cutlass.range_constexpr(2):
@@ -495,7 +488,6 @@ def test_holds_of_other_shapes_raise(make, key, error):
     [
         (lambda: RoundRobinHold(4), "rr"),  # each instance's next epoch is two stages on
         (lambda: HoldAndWait("lap_in_loop", 3, 3), "lap_in_loop"),  # a later trip: not checked
-        (lambda: Arms("arms"), "arms"),  # the hold and the waits never run together
         (lambda: Arms("other_slot"), "other_slot"),
         (ExternalHold, "external"),  # raw code may never wait for the hand-back
         (DynamicSkipHold, "dynamic_skip"),  # skip(0) keeps the next wait one stage on
@@ -510,6 +502,13 @@ def test_holds_of_other_shapes_raise(make, key, error):
 )
 def test_holds_that_may_be_free_compile(make, key):
     compile_toy(make(), f"free2_{key}")
+
+
+def test_a_handle_held_past_its_arm_is_a_lifetime_error_not_a_deadlock():
+    """The other arm's waits never run with the hold; the leak is what is wrong."""
+    raises_protocol(
+        r"handles never closed: ch\[i\] wait", lambda: compile_toy(Arms("arms"), "arms")
+    )
 
 
 def test_a_dynamic_slot_still_names_the_slot_rule():

@@ -246,8 +246,7 @@ the check does not establish which epochs those channels pair.
 Missing annotations, raw roles and raw signals can leave requirements unverified. An
 `external=` opposite side is always `unverified`, even with a fully fenced override. A required
 `"tmem_store"` or `"tmem_load"` fence absent from the trace is `unverified`, not `missing fence`:
-manual `tcgen05.wait` calls are invisible. So is a handle that is never closed in the trace. Accesses inside
-`unchecked("fence", reason=...)` are skipped.
+manual `tcgen05.wait` calls are invisible. Accesses inside `unchecked("fence", reason=...)` are skipped.
 
 Missing fences warn, or raise under `alias_check="strict"`; `"off"` skips the check.
 Explicit values always replace defaults. The check never inserts fences.
@@ -794,10 +793,8 @@ The back-edge check runs at role exit and names the probe on failure. After the 
 last probe remains usable (the entering probe for zero trips). A token merged by an `if`
 reassignment does not; probe after the branch.
 
-If the checker cannot follow your protocol, use a raw readiness `Boolean` (an
-`mbarrier_try_wait` result or manually carried `token.ready`) inside
-`with unchecked("token", reason=...)`. It trusts any Token/Boolean passed there;
-`describe()` records the opt-out and sites.
+`token=` takes only a `Token`. If the checker cannot follow your protocol, wait on the
+end's barriers with [raw code](dropping-down.md#drive-a-channel-end-by-state-and-pointer).
 
 Named channels reject probes and `token=`: their wait is itself an arrival. Probing is not
 automatically faster; measure before keeping it.

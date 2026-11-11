@@ -205,8 +205,7 @@ choose an available ID with the correct participant count.
 - Managed signals and declared fences are recorded automatically. Raw instructions remain
   legal but add no modeled ordering edge.
 - `signal=False` records the managed close, not your manual signal. An ordering supplied only
-  by that signal is `unverified`. So is one that might depend on a handle opened under
-  `unchecked("unclosed")` and never closed.
+  by that signal is `unverified`.
 
 ### Read the result
 
@@ -263,13 +262,7 @@ Other assumptions and limits:
 - A role's SMEM accesses are treated as one thread set: no cross-warp SMEM check.
 - Annotations are trusted to cover the role's uses of each annotated region.
 
-For an intentionally unmodeled access:
-
-```python
-with unchecked("alias", reason="access is ordered by the raw protocol below"):
-    tmem.access("P", stage, write=True, by="threads")
-```
-
-Only annotations inside the block are excluded. It adds no fence and certifies no safety.
+To leave an access unmodeled, do not annotate it; `alias_check="off"` skips the whole
+diagnostic. Neither adds a fence or certifies safety.
 See [alias.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/alias.py) for modeled rules/PTX references and
 the [safety contract](guarantees.md) for the synchronization rules beyond aliasing.

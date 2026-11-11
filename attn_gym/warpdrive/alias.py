@@ -20,8 +20,8 @@ Reports distinguish:
 
 ``alias_check="warn"`` adds the report to ``describe()`` and warns once about findings.
 ``"strict"`` raises on potential hazards; ``"off"`` skips analysis.
-``unchecked("alias", reason=...)`` excludes enclosed annotations. Annotations emit no
-IR; ordering wrappers emit only the wrapped instruction. See ``docs/warpdrive/storage.md``.
+Leave an access unannotated to exclude it. Annotations emit no IR;
+ordering wrappers emit only the wrapped instruction. See ``docs/warpdrive/storage.md``.
 """
 
 from __future__ import annotations
@@ -891,41 +891,16 @@ def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
                     found = failures[0]
             else:
                 items = (graph.seq[id(a.role)][pa][1], graph.seq[id(b.role)][pb][1])
-                # A never-closed handle's own signal might be the missing edge.
-                found = (
-                    _unclosed(graph, a, b)
-                    or found
-                    or Finding(
-                        HAZARD,
-                        f"{a.describe()} (work item {items[0]}) and {b.describe()} (work item "
-                        f"{items[1]}): no channel path orders them",
-                        "channel",
-                    )
+                found = found or Finding(
+                    HAZARD,
+                    f"{a.describe()} (work item {items[0]}) and {b.describe()} (work item "
+                    f"{items[1]}): no channel path orders them",
+                    "channel",
                 )
                 if found.severity == HAZARD:
                     return found
                 first = _prefer(first, found)
     return first
-
-
-def _unclosed(graph: _Graph, a: Access, b: Access) -> Finding | None:
-    """Find an unclosed handle that could supply the missing channel edge.
-
-    ``unchecked("unclosed")`` leaves any replacement signal invisible, making the pair
-    unverified. Slots match by slot; dynamic ring stages match any handle on that ring.
-    """
-    stages = {(x.handle.chan.name, x.handle.slot) for x in (a, b) if x.handle is not None}
-    for role in graph.roles:
-        for ev in role.events:
-            rec = ev.data.get("handle") if ev.kind == "open" else None
-            if rec is not None and rec.closed_at is None and (rec.chan.name, rec.slot) in stages:
-                return Finding(
-                    UNVERIFIED,
-                    f"{a.describe()} and {b.describe()}: {rec.chan.name} handle opened at "
-                    f"{ev.site} never closes, so what signals it is not visible",
-                    "channel",
-                )
-    return None
 
 
 def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple:
@@ -1024,8 +999,6 @@ def _same_role(graph: _Graph, a: Access, b: Access, warp_pairs) -> Finding | Non
                 soft = failures and (RAW_ONLY in failures[0].text or failures[0].rule == EPOCHS)
                 found = failures[0] if failures and (found.severity != HAZARD or soft) else found
                 if found.severity == HAZARD:
-                    found = _unclosed(graph, a, b) or found
-                if found.severity == HAZARD:
                     return found
                 first = _prefer(first, found)
     return first
@@ -1056,7 +1029,7 @@ def check(kernel, roles: list[RoleEvents]) -> AliasReport:
     accesses: list[Access] = []
     for role in roles:
         for i, ev in enumerate(role.events):
-            if ev.kind == "access" and not ev.opted_out:
+            if ev.kind == "access":
                 accesses.append(Access.from_event(kernel, role, i))
     streams = getattr(kernel, "_ws_streams", {})
     items = 2 if any(st.schedule.persistent for st in streams.values()) else 1
