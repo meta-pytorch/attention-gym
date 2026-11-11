@@ -34,6 +34,7 @@ from itertools import combinations
 
 from cutlass import cute
 
+from attn_gym.warpdrive.events import RoleEvents
 from attn_gym.warpdrive.protocol import ProtocolError, current_trace
 
 MODES = ("warn", "strict", "off")
@@ -162,22 +163,6 @@ def named_barrier(barrier_id: int, number_of_threads: int):
 
 
 # Per-role trace data
-
-
-@dataclass
-class RoleEvents:
-    """One role instance's trace events without MLIR objects."""
-
-    name: str
-    warps: tuple[int, ...]
-    raw: bool
-    events: list
-    item_key: int | None
-
-    @classmethod
-    def from_trace(cls, trace, ri) -> RoleEvents:
-        item = trace.block_key(trace.item_block) if trace.item_block is not None else None
-        return cls(ri.name, tuple(ri.warps), ri.raw, list(trace.events), item)
 
 
 @dataclass

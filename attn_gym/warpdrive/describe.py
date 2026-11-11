@@ -49,6 +49,7 @@ class KernelChecks:
     channels: dict[str, ChannelChecks]
     aliases: dict[tuple[str, str], AliasStatus]
     fences: dict[tuple[str, str], FenceStatus]
+    liveness: str | None = None  # Liveness.verdict; None before compilation or when off
 
 
 def kernel_checks(kernel) -> KernelChecks:
@@ -65,7 +66,8 @@ def kernel_checks(kernel) -> KernelChecks:
     aliases = {} if rep is None else {r.names: r.status for r in rep.results}
     fence_rep = kernel._ws_fences
     fences = {} if fence_rep is None else {(r.channel, r.key): r.status for r in fence_rep.results}
-    return KernelChecks(channels, aliases, fences)
+    live = kernel._ws_liveness
+    return KernelChecks(channels, aliases, fences, None if live is None else live.verdict)
 
 
 def ownership_verdict(ownership: str) -> str:
@@ -178,6 +180,8 @@ def _header(kernel) -> str:
         ["cluster", kernel.cluster.describe()],
         ["params", ctx.__name__ if ctx is not None else "unannotated (any object)"],
     ]
+    if kernel._ws_liveness is not None:
+        lines.append(kernel._ws_liveness.line())
     return "\n".join(lines + _table(rows))
 
 

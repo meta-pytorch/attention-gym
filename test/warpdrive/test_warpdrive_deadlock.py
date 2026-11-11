@@ -8,22 +8,31 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 from cutlass import cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import arith
 
 from attn_gym.testing.warpdrive import raises_protocol
 from attn_gym.warpdrive import (
     Consumer,
     Instance,
+    NamedBarrier,
     Producer,
     Ring,
     Sharing,
     Slots,
+    StaticPersistent,
     Threads,
     Tma,
+    Umma,
     WarpSpecialized,
+    WorkCursor,
+    WorkStream,
+    events,
     role,
     unchecked,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive.expr import Reader
 
 
 class Toy(WarpSpecialized):
@@ -413,6 +422,7 @@ class SpanLifetime(Toy):
 
     def __init__(self, mode: str, producer: bool = False, trips: int = 2):
         self.mode, self.producer, self.trips = mode, producer, trips
+        self.epochs = 1 + (trips if mode == "last_trip" else 1)  # the span's and the waits'
         self.ch = Ring(1, Threads, Threads)
 
     @cute.jit
@@ -447,7 +457,7 @@ class SpanLifetime(Toy):
     def prod(self, ctx, *, ch: Producer):
         if cutlass.const_expr(self.producer):
             return self.spanned(ctx, ch, lambda c: c.acquire().commit())
-        for _ in cutlass.range_constexpr(4):
+        for _ in cutlass.range_constexpr(self.epochs):
             with ch.produce():
                 pass
         return ch
@@ -457,7 +467,7 @@ class SpanLifetime(Toy):
     def cons(self, ctx, *, ch: Consumer):
         if cutlass.const_expr(not self.producer):
             return self.spanned(ctx, ch, lambda c: c.wait().release())
-        for _ in cutlass.range_constexpr(4):
+        for _ in cutlass.range_constexpr(self.epochs):
             with ch.consume():
                 pass
         return ch
@@ -504,3 +514,618 @@ def test_holds_that_may_be_free_compile(make, key):
 
 def test_a_dynamic_slot_still_names_the_slot_rule():
     raises_protocol(r"needs a Python int slot", lambda: compile_toy(Arms("dynamic_slot"), "dyn"))
+
+
+# The event graph: deadlock and balance across roles
+
+
+class Graph(Toy):
+    """``mode`` selects a protocol over ``a`` (p -> q) and ``b`` (q -> p)."""
+
+    def __init__(self, mode: str, liveness_check: str = "strict"):
+        self.mode, self.liveness_check = mode, liveness_check
+        self.a = Ring(1, Threads, Threads)
+        self.b = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer, b: Consumer):
+        mode = self.mode
+        if cutlass.const_expr(mode == "cross"):  # each waits for what the other sends after
+            with b.consume(), a.produce():
+                pass
+        elif cutlass.const_expr(mode in ("static", "unchecked", "state", "unbalanced")):
+            with a.produce():
+                pass
+            with b.consume():
+                pass
+            if cutlass.const_expr(mode == "unbalanced"):
+                with a.produce():
+                    pass
+        else:
+            for _ in cutlass.range(ctx.n, unroll=1):
+                with a.produce():
+                    pass
+                with b.consume():
+                    pass
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, b: Producer):
+        mode = self.mode
+        if cutlass.const_expr(mode in ("cross", "static", "unchecked", "state", "unbalanced")):
+            if cutlass.const_expr(mode == "unchecked"):
+                with unchecked("liveness", reason="raw code orders this handoff"), a.consume():
+                    pass
+            else:
+                with a.consume():
+                    pass
+            if cutlass.const_expr(mode == "state"):
+                b.state = b.state
+            with b.produce():
+                pass
+        else:
+            for _ in cutlass.range(ctx.n, unroll=1):
+                if cutlass.const_expr(mode == "lane"):
+                    if cute.arch.lane_idx() == 0:
+                        with a.consume():
+                            pass
+                else:
+                    with a.consume():
+                        pass
+                with b.produce():
+                    pass
+        return a, b
+
+
+def test_a_dependency_cycle_names_its_sites_and_the_override():
+    raises_protocol(
+        r"Graph: deadlock: p: b\.wait\(\) of epoch 0 at test_warpdrive_deadlock\.py:\d+ waits "
+        r"for q: b\.commit\(\) of epoch 0 at .* waits for q: a\.wait\(\) of epoch 0 at .* waits "
+        r"for p: a\.commit\(\) .*\. Override with unchecked\(\"liveness\", reason=\.\.\.\) around "
+        r"the ops, or liveness_check=\"warn\" or \"off\" on the kernel\.",
+        lambda: compile_toy(Graph("cross"), "graph_cross"),
+    )
+
+
+@pytest.mark.parametrize(
+    "mode, error",
+    [
+        ("unbalanced", r"unbalanced epochs: q takes \d+ epochs of a, \d+ filled"),
+        ("lane", r"q: a branch that depends on the lane encloses channel or barrier ops"),
+    ],
+)
+def test_epochs_and_participants_must_balance(mode, error):
+    raises_protocol(error, lambda: compile_toy(Graph(mode), f"graph_{mode}"))
+
+
+@pytest.mark.parametrize(
+    "mode, line",
+    [
+        ("static", "liveness: verified"),
+        ("loop", "liveness: no deadlock found (assumes loop bounds and conditions of 1 runtime"),
+        ("unchecked", 'liveness: unverified (unchecked("liveness") at test_warpdrive_deadlock'),
+        ("state", "liveness: unverified (q reads or assigns b.state at test_warpdrive_deadlock"),
+    ],
+)
+def test_the_verdict_says_what_it_proves(mode, line):
+    op = Graph(mode)
+    compile_toy(op, f"graph_ok_{mode}")
+    assert line in op.describe()
+    assert op.checks().liveness == line.split(": ")[1].split(" (")[0]
+
+
+def test_warn_reports_and_off_skips_a_finding():
+    warned = Graph("cross", liveness_check="warn")
+    with pytest.warns(UserWarning, match="warpdrive: Graph: deadlock"):
+        compile_toy(warned, "graph_warn")
+    off = Graph("cross", liveness_check="off")
+    compile_toy(off, "graph_off")
+    assert off.checks().liveness is None
+
+
+def test_an_analysis_failure_is_unverified_not_an_error(monkeypatch):
+    from attn_gym.warpdrive import liveness
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("unexpected IR")
+
+    monkeypatch.setattr(liveness, "DEBUG", False)
+    monkeypatch.setattr(liveness, "unroll", broken)
+    op = Graph("static")
+    compile_toy.__wrapped__(op, "graph_broken")
+    assert "liveness: unverified (analysis failed: RuntimeError: unexpected IR)" in op.describe()
+
+
+def test_the_graph_finds_fa4_backward_with_one_q_stage(monkeypatch):
+    """Without the hold check, the cycle through load's refill of Q still rejects it."""
+    pytest.importorskip("flash_attn.cute")
+    from attn_gym.warpdrive import channels
+    from attn_gym.warpdrive.examples import fa4_bwd
+
+    monkeypatch.setattr(fa4_bwd, "Q_STAGE", 1)
+    monkeypatch.setattr(channels._End, "_check_hold", lambda self, *args, **kwargs: None)
+    op = fa4_bwd.FlashAttentionBackward(causal=False)
+    raises_protocol(
+        r"deadlock \(with runtime values \[2\]\): .*mma: q\.peek\(\) of epoch 1 at fa4_bwd\.py:\d+ "
+        r"waits for load: q\.acquire\(\) of epoch 1 at fa4_bwd\.py:\d+ waits for mma: "
+        r"q\.release\(\) of epoch 0",
+        lambda: fa4_bwd.compile_fa4_bwd.__wrapped__(op),
+    )
+
+
+# Shapes that once read as findings but cannot hang (and one that can).
+
+
+class Quotient(Toy):
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for i in cutlass.range(ctx.n, unroll=1):
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        for i in cutlass.range(ctx.n // 2, unroll=1):
+            with a.consume():
+                pass
+            with a.consume():
+                pass
+        for i in cutlass.range(ctx.n % 2, unroll=1):
+            with a.consume():
+                pass
+        return a
+
+
+class Rotating(Toy):
+    def __init__(self):
+        self.a = Ring(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for i in cutlass.range(4, unroll=1):
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=[range(1, 3), range(3, 5)])
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, stage: Instance):
+        for i in cutlass.range(stage, 4, 2, unroll=1):
+            if i >= 0:
+                with a.consume():
+                    pass
+        return a
+
+
+class NamedCommit(Toy):
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads, sync="named")
+        self.b = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer, b: Producer):
+        a.acquire().commit(wait=True)
+        with b.produce():
+            pass
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, b: Consumer):
+        with b.consume():
+            pass
+        with a.consume():
+            pass
+        return a, b
+
+
+class RawSlots(Toy):
+    def __init__(self):
+        self.a = Slots(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        with a.produce(0):
+            pass
+        with a.produce(0):
+            pass
+        with a.produce(1):
+            pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        h = a.wait(0)
+        cute.arch.mbarrier_arrive(h.empty_barrier)
+        j = a.wait(1)
+        h.release(signal=False)
+        j.release()
+        with a.consume(0):
+            pass
+        return a
+
+
+class LaneProbe(Toy):
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        with a.produce():
+            pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        if cute.arch.lane_idx() == 0:
+            a.try_wait()
+        with a.consume():
+            pass
+        return a
+
+
+class Unsigned(Toy):
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for i in cutlass.range(2, unroll=1):
+            if cutlass.Uint32(i - 1) < cutlass.Uint32(1):
+                with a.produce():
+                    pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        with a.consume():
+            pass
+        return a
+
+
+@pytest.mark.parametrize(
+    "make",
+    [Quotient, Rotating, RawSlots, LaneProbe, Unsigned],
+    ids=["related_counts", "warp_split_round_robin", "raw_slot_release", "lane_probe", "unsigned"],
+)
+def test_runnable_shapes_are_not_findings(make):
+    """n // 2 and n % 2 trips, a round-robin role split by warp, a raw release of one slot, a
+    probe by one lane and an unsigned loop test all complete when run."""
+    op = make()
+    compile_toy(op, f"runnable_{make.__name__.lower()}")
+    assert "liveness: error" not in op.describe()
+
+
+def test_a_waiting_commit_is_a_rendezvous():
+    """commit(wait=True) waits for the consumer, which first waits for b, published after it."""
+    raises_protocol(
+        r"deadlock: .*a\.commit\(wait=True\)",
+        lambda: compile_toy(NamedCommit(), "named_commit"),
+    )
+
+
+class Related(Toy):
+    """The producer fills ``n`` epochs and the consumer takes 4: balanced for a caller that
+    passes ``n == 4``, a value the samples miss."""
+
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        for _ in cutlass.range_constexpr(4):
+            with a.consume():
+                pass
+        return a
+
+
+class Casts(Toy):
+    """Integer semantics the device has: the zero extension of -1 is not below 1, and -1 // 2
+    floors to -1, so each loop produces in one trip."""
+
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for i in cutlass.range(2, unroll=1):
+            if cutlass.Int64(cutlass.Uint32(i - 1)) < 1:
+                with a.produce():
+                    pass
+        for i in cutlass.range(2, unroll=1):
+            if cutlass.Int32(i - 1) // 2 == -1:
+                with a.produce():
+                    pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        for _ in cutlass.range_constexpr(2):
+            with a.consume():
+                pass
+        return a
+
+
+class ElectedLane(Toy):
+    """Lane 0 fills an Umma stage: its commit is one elected arrive, which the branch keeps."""
+
+    def __init__(self):
+        self.a = Ring(1, Umma, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        if cute.arch.lane_idx() == 0:
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        with a.consume():
+            pass
+        return a
+
+
+class LaneSkip(Toy):
+    """r takes epoch 0; lane 0 of q skips it: per-lane channel state, not an arrival."""
+
+    def __init__(self):
+        self.a = Ring(
+            2, Threads, Threads, consumer_sharing=Sharing.EXCLUSIVE, consumer_roles=("q", "r")
+        )
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for _ in cutlass.range_constexpr(2):
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        if cute.arch.lane_idx() == 0:
+            a.skip(1)
+        with a.consume():
+            pass
+        return a
+
+    @role(warps=2)
+    @cute.jit
+    def r(self, ctx, *, a: Consumer):
+        with a.consume():
+            pass
+        return a
+
+
+class LaneBarrierId(Toy):
+    """Lane 0 reads a named barrier's id, which may feed raw code the check does not see."""
+
+    def __init__(self):
+        self.x = NamedBarrier(threads=64)
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, ctx):
+        if cute.arch.lane_idx() == 0:
+            ctx.out[0] = self.x.id
+        self.x.sync()
+
+    @role(warps=1)
+    @cute.jit
+    def b(self, ctx):
+        self.x.sync()
+
+
+class PerItem(WarpSpecialized):
+    """One epoch filled per work item, four taken: balanced for a CTA that runs four items."""
+
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+        self.work = WorkStream(schedule=StaticPersistent())
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer, work: WorkCursor):
+        while work.valid:
+            with a.produce():
+                pass
+            work.advance()
+        return a, work
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, work: WorkCursor):
+        for _ in cutlass.range_constexpr(4):
+            with a.consume():
+                pass
+        while work.valid:
+            work.advance()
+        return a, work
+
+    @cute.kernel
+    def kernel(self, bound):
+        self.begin_roles(work=bound)
+        self.run_roles(SimpleNamespace())
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream):
+        bound = self.work.bind((n, 1, 1), max_ctas=cutlass.Int32(1))
+        self.kernel.set_name_prefix("warpdrive_deadlock_per_item")
+        self.kernel(bound).launch(**self.launch_config(bound), stream=stream)
+
+
+class Overridden(Toy):
+    """The full barrier expects 64 arrivals from a 32-thread producer."""
+
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads, override={"full_counts": 64})
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        with a.produce():
+            pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        with a.consume():
+            pass
+        return a
+
+
+class Long(Toy):
+    def __init__(self):
+        self.a = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for _ in cutlass.range(20_000, unroll=1):
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        for _ in cutlass.range(20_000, unroll=1):
+            with a.consume():
+                pass
+        return a
+
+
+@pytest.mark.parametrize(
+    ("make", "why"),
+    [
+        (Related, "no checked value balances"),
+        (ElectedLane, "encloses an elected signal"),
+        (LaneSkip, "per-lane channel state"),
+        (LaneBarrierId, "per-lane channel state"),
+        (PerItem, "no checked value balances"),
+        (Overridden, "a overrides its full_counts"),
+        (Long, "p runs over"),
+    ],
+    ids=[
+        "sampled_counts",
+        "elected_lane",
+        "lane_skip",
+        "lane_barrier_id",
+        "per_item",
+        "overridden_counts",
+        "long",
+    ],
+)
+def test_what_the_model_cannot_decide_is_unverified(make, why):
+    op = make()
+    compile_toy(op, f"unverified_{make.__name__.lower()}")
+    line = next(x for x in op.describe().splitlines() if x.startswith("liveness:"))
+    assert line.startswith("liveness: unverified (") and why in line
+
+
+def test_integer_ops_keep_their_device_semantics():
+    op = Casts()
+    compile_toy(op, "casts")
+    assert "liveness: verified" in op.describe()
+
+
+@pytest.mark.parametrize(
+    ("expr", "value"),
+    [
+        (("div", ("c", -1), ("c", 2)), 0),  # arith.divsi truncates
+        (("floordiv", ("c", -1), ("c", 2)), -1),
+        (("rem", ("c", -1), ("c", 2)), -1),
+    ],
+)
+def test_integer_expressions_evaluate_as_on_the_device(expr, value):
+    assert events.evaluate(expr, {}) == value
+
+
+def test_casts_read_from_mlir_keep_their_width():
+    """Narrowing index casts wrap, and an i1 true sign-extends to -1."""
+    with ir.Context(), ir.Location.unknown(), ir.InsertionPoint(ir.Module.create().body):
+        i32, i1, index = (
+            ir.IntegerType.get_signless(32),
+            ir.IntegerType.get_signless(1),
+            ir.IndexType.get(),
+        )
+        big = arith.constant(index, 2**32)
+        values = {
+            arith.index_castui(i32, big): 0,
+            arith.index_cast(i32, big): 0,
+            arith.extsi(i32, arith.trunci(i1, arith.constant(i32, 3))): -1,
+            arith.extui(ir.IntegerType.get_signless(64), arith.constant(i32, -1)): 2**32 - 1,
+        }
+        reader = Reader(lambda block: None, [])
+        for value, device in values.items():
+            assert events.evaluate(reader.read(value), {}) == device
+
+
+class Absent(Toy):
+    """commit(wait=True) syncs with a consumer that never takes the epoch."""
+
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads, sync="named")
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        a.acquire().commit(wait=True)
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        return a
+
+
+def test_a_rendezvous_needs_every_consumer():
+    raises_protocol(
+        r"deadlock: p: a\.commit\(wait=True\) .* waits forever: 0 of 1 consumers reach epoch 0",
+        lambda: compile_toy(Absent(), "absent_consumer"),
+    )
+
+
+def test_a_failed_region_read_is_unverified(monkeypatch):
+    def fail(*args):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(events, "DEBUG", False)
+    monkeypatch.setattr(events, "_regions", fail)
+    op = Quotient()
+    compile_toy.__wrapped__(op, "failed_read")
+    assert "liveness: unverified (reading the loops of p failed: RuntimeError('boom'))" in (
+        op.describe()
+    )

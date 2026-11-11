@@ -30,7 +30,9 @@ class ProtocolError(Exception):
 #   token         wait/acquire(token=...) inside the block trust the readiness they are given: a
 #                 Token of any epoch or region, or a raw Boolean (an mbarrier try_wait result)
 #   fence         accesses annotated inside the block are left out of the fence check (fences.py)
-CHECKS = ("unclosed", "cross_region", "tma", "alias", "token", "fence")
+#   liveness      channel and barrier ops inside the block are invisible to the liveness check,
+#                 which reports the kernel unverified instead of checking them
+CHECKS = ("unclosed", "cross_region", "tma", "alias", "token", "fence", "liveness")
 
 
 @dataclass
@@ -234,12 +236,12 @@ class Lineage:
 
 @dataclass
 class Event:
-    """A handle, access or ordering event for the alias diagnostic.
+    """A channel, handle, access or ordering event shared by the trace checks.
 
     ``where`` lists enclosing dynamic regions outermost first as ``(block key, kind)``:
     ``loop`` for ``scf.for``/``scf.while``, ``if`` or ``other``. ``open`` holds the active
-    handle records. ``opted_out`` marks accesses inside ``unchecked("alias")``,
-    ``fence_opted_out`` those inside ``unchecked("fence")``.
+    handles. ``opted_out`` marks unchecked alias accesses or liveness ops;
+    ``fence_opted_out`` marks unchecked fence accesses.
     """
 
     kind: str
@@ -296,7 +298,7 @@ class ProtocolLog:
 
 
 class RoleTrace:
-    """Open-handle bookkeeping for one traced role instance."""
+    """Events and handle lifetimes for one traced role instance."""
 
     def __init__(self, role_name: str, log: ProtocolLog | None, ranges=None, waits: bool = True):
         self.role_name = role_name
@@ -310,6 +312,9 @@ class RoleTrace:
         # Everything the trace checks read, in trace order: channel ops ("op"), handle opens and
         # closes, storage accesses, barrier and ordering operations.
         self.events: list[Event] = []
+        # (value, expression) of the work cursor's item values carried into the work loop: the
+        # same expression in every role, which relates loop bounds computed from the item.
+        self.item_values: list = []
         self.open_turns: set[str] = set()  # turnstiles whose turn this role holds here
         self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
@@ -336,6 +341,9 @@ class RoleTrace:
             what = f"{data['storage'][1]} access at {site}"
             opted_out = self.opt_out("alias", what)
             fence_opted_out = self.opt_out("fence", what)
+        elif kind in ("op", "barrier", "barrier_arrive"):
+            what = data.get("chan") or getattr(data.get("barrier"), "name", "named barrier")
+            opted_out = self.opt_out("liveness", f"{what} at {site}")
         ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out, fence_opted_out)
         self.events.append(ev)
         return ev
@@ -353,10 +361,20 @@ class RoleTrace:
         """The current block and its enclosing blocks up to the role body, innermost first."""
         return _ancestors(current_block(), self.root)
 
-    def record(self, chan, op, slot, count: int | None = 1, order: int | None = None):
+    def record(
+        self,
+        chan,
+        op,
+        slot,
+        count: int | None = 1,
+        order: int | None = None,
+        span: bool = False,
+    ):
         """Record a channel op. ``count``: a skip's epochs (None if dynamic), else 1;
-        ``order``: the closing handle's order."""
-        self.event("op", chan=chan, op=op, slot=slot, count=count, order=order)
+        ``order``: the end's acquires, waits and skips before it (an acquire or wait), or the
+        closing handle's (a close); ``span``: an acquire or wait that takes a span's epoch
+        without waiting."""
+        self.event("op", chan=chan, op=op, slot=slot, count=count, order=order, span=span)
 
     def channel_ops(self) -> list[Event]:
         return [ev for ev in self.events if ev.kind == "op"]

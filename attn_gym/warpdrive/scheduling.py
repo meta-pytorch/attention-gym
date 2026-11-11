@@ -1677,6 +1677,10 @@ class WorkCursor:
             k = len(cutlass.extract_mlir_values(self._state))
             state, n = cutlass.new_from_mlir_values(self._state, values[n : n + k]), n + k
         end = None if self._end is None else self._end.__new_from_mlir_values__(values[n:])
+        stream = self._stream.name or "work"  # the same item in every role: see expr.py
+        items = [(values[0], ("item", stream, "index"))]
+        items += [(v, ("item", stream, k)) for k, v in enumerate(values[1 : 1 + len(words)])]
+        self._rec.trace.item_values += items
         return WorkCursor(
             self._stream,
             self._problem,

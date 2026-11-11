@@ -39,8 +39,8 @@ with acc.consume() as h:
 ```
 
 A lane-dependent condition around the whole `with` changes arrivals without changing the
-count. Producing n+1 stages while consuming n can also compile. Balanced counts alone do not
-ensure progress: two roles may each wait for the other's first value.
+count. The [liveness check](#what-a-successful-check-means) rejects that, unbalanced epochs and
+two roles each waiting for the other's value, where it can read the loops and branches.
 
 On an [exclusive-consumer ring](channels.md#exclusive-consumers), every epoch needs exactly
 one owner. This is checked only for static waits and skips. A wait after more than one ring
@@ -99,8 +99,13 @@ resource use.
   It rejects a wait for a stage the same role still holds
   ([overlapping handles](channels.md#overlapping-handles)).
   Exclusive/round-robin epoch ownership is checked when all acquires, waits and skips are
-  static. It does not prove balanced epochs across arbitrary role bodies or a live dependency
-  graph.
+  static.
+- **Liveness `verified`:** the roles' channel and barrier ops, unrolled for their static trip
+  counts, balance and form no dependency cycle. With runtime trip counts or several work items
+  per CTA, `no deadlock found` names the counts it checked. Raw roles, raw `end.state`,
+  data-dependent loops and `unchecked("liveness")` leave it `unverified`. A cycle, unbalanced
+  epochs or a lane-dependent handoff raises under `liveness_check="strict"` (the default);
+  `"warn"` warns and `"off"` skips it.
 - **TMA `verified`:** recognized group and byte accounting, not descriptor legality, disjoint
   writes or async safety. Inspect the reasons for any `unverified` use.
 - **Alias `no hazard found`:** no conflicting annotated pair under the diagnostic's rules,

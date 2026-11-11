@@ -20,6 +20,8 @@ os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(4 << 30))
 # FA4 otherwise recompiles every specialization in every process; its disk cache is keyed by
 # the FA4 source fingerprint, so editing a flash-attention checkout still invalidates it.
 os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
+# A gap in the liveness analysis reports a kernel unverified in normal use; fail tests instead.
+os.environ.setdefault("WARPDRIVE_LIVENESS_DEBUG", "1")
 
 import torch
 
