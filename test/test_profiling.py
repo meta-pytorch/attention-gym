@@ -68,13 +68,20 @@ def test_disabled_range_does_not_enter_profiler(monkeypatch):
         pass
 
 
-def test_record_function_labels_cpu_trace():
-    with (
-        torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as active,
-        record_function(True, "example/forward"),
-    ):
-        torch.arange(8).square()
-    assert "example/forward" in [event.key for event in active.key_averages()]
+def test_enabled_range_enters_the_profiler_with_its_label(monkeypatch):
+    # No profiler session here: the first one in a process fixes Kineto's activities, and a
+    # CPU-only one leaves later CUDA sessions in the same process recording nothing.
+    labels = []
+
+    @contextmanager
+    def record(name):
+        labels.append(name)
+        yield
+
+    monkeypatch.setattr(torch.profiler, "record_function", record)
+    with record_function(True, "example/forward"):
+        pass
+    assert labels == ["example/forward"]
 
 
 def test_native_trace_reports_missing_dependency(monkeypatch, tmp_path):
