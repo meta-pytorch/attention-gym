@@ -1061,6 +1061,7 @@ class BoundWork:
         self.total = total
         self.limit = limit  # a Limit, read per decoding site (``_limited``)
         self.cs = stream.cluster_size  # CTAs per work unit
+        self.first_words = None  # item words from blockIdx, set by ``start`` in the prologue
 
     def _in_units(self, ctas):
         """A CTA count or index along x in work units (clusters of ``cs`` CTAs)."""
@@ -1086,7 +1087,6 @@ class BoundWork:
         """Device-side, in the kernel prologue (``begin_roles``): the first item's words of a
         ``_tile_grid`` stream. Every role shares them, which keeps the 1-D fallback branch of
         ``OneShot(grid="auto")`` off the roles' paths."""
-        self.first_words = None
         if _tile_persistent(self.stream):
             _check_single_cta(self.stream, self.cs)
             self.first_words = tuple(Int32(b) for b in cute.arch.block_idx())
@@ -1138,10 +1138,10 @@ class BoundWork:
         site's whole stream, so the copy serves its loops without being carried."""
         if self.limit is None:
             return self
-        new = BoundWork(self.stream, self.space, self.workspace, None, total=self.total)
         limit = cutlass.max(Int32(self.limit.read()), Int32(0))
-        new.total = cutlass.min(Int32(self.total), limit)
-        new.first_words = getattr(self, "first_words", None)
+        total = cutlass.min(Int32(self.total), limit)
+        new = BoundWork(self.stream, self.space, self.workspace, None, total=total)
+        new.first_words = self.first_words
         return new
 
     def __extract_mlir_values__(self):
@@ -1169,7 +1169,7 @@ class BoundWork:
             limit = cutlass.new_from_mlir_values(self.limit, values[n:])
         new = BoundWork(self.stream, space, ws, None, total, limit)
         # Prologue values (begin_roles) dominate every later region, so they carry as is.
-        new.first_words = getattr(self, "first_words", None)
+        new.first_words = self.first_words
         return new
 
     def grid(self):
