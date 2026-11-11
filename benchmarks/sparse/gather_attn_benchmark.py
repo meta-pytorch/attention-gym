@@ -4,6 +4,8 @@ Usage:
     python benchmarks/sparse/gather_attn_benchmark.py
     python benchmarks/sparse/gather_attn_benchmark.py --impl fused --backend triton
     python benchmarks/sparse/gather_attn_benchmark.py --impl reference --batch 4
+    python benchmarks/sparse/gather_attn_benchmark.py --kv-heads 2 --separate-values \
+        --batch 1 --heads 24 --head-dim 256 --backend cute
 """
 
 from functools import partial
@@ -32,6 +34,8 @@ def main(
     window: int = 512,
     dtype: Annotated[str, typer.Option(help="One of: " + ", ".join(DTYPES))] = "bfloat16",
     share_kv: bool = True,
+    kv_heads: Annotated[int | None, typer.Option(help="KV heads; overrides --share-kv.")] = None,
+    separate_values: bool = False,
     impl: Impl = Impl.FUSED,
     backend: Annotated[
         list[str] | None,
@@ -50,14 +54,21 @@ def main(
         raise typer.BadParameter("Use triton or cute with --impl fused", param_hint="--backend")
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA GPU.")
+    num_kv_heads = kv_heads if kv_heads is not None else (1 if share_kv else heads)
+    if num_kv_heads <= 0 or heads % num_kv_heads:
+        raise typer.BadParameter(
+            "KV heads must be positive and divide heads", param_hint="--kv-heads"
+        )
 
     print(f"device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
     print(f"shape: B={batch} H={heads} S={sequence_length} D={head_dim} sparse_S={sparse_seq_len}")
-    print(f"sparsity: topk={topk} window={window} share_kv={share_kv} dtype={dtype}")
+    print(
+        f"sparsity: topk={topk} window={window} kv_heads={num_kv_heads} "
+        f"separate_values={separate_values} dtype={dtype}"
+    )
 
     def make_inputs(requires_grad: bool):
         generator = torch.Generator(device="cuda").manual_seed(seed)
-        kv_heads = 1 if share_kv else heads
 
         def randn(*shape):
             return torch.randn(
@@ -69,13 +80,22 @@ def main(
             )
 
         query = randn(batch, heads, sequence_length, head_dim)
-        local_kv = randn(batch, kv_heads, sequence_length, head_dim)
-        sparse_kv = randn(batch, kv_heads, sparse_seq_len, head_dim)
+        local_kv = randn(batch, num_kv_heads, sequence_length, head_dim)
+        sparse_kv = randn(batch, num_kv_heads, sparse_seq_len, head_dim)
         scores = torch.randn(
             batch, sequence_length, sparse_seq_len, device="cuda", generator=generator
         )
         kv_indices = scores.topk(min(topk, sparse_seq_len), dim=-1).indices
-        return query, local_kv, sparse_kv, kv_indices
+        inputs = {
+            "query": query,
+            "local_kv": local_kv,
+            "sparse_kv": sparse_kv,
+            "kv_indices": kv_indices,
+        }
+        if separate_values:
+            inputs["local_v"] = randn(batch, num_kv_heads, sequence_length, head_dim)
+            inputs["sparse_v"] = randn(batch, num_kv_heads, sparse_seq_len, head_dim)
+        return inputs
 
     # Estimated QK/PV FLOPs, ignoring softmax and the shorter initial causal windows.
     # Assumes every selected index is valid and no document boundaries shorten the window.
@@ -91,19 +111,19 @@ def main(
             kernel_options={"backend": name} if name is not None else None,
         )
         # Pure forward compute without autograd graph construction.
-        fwd = partial(attention, *make_inputs(requires_grad=False))
+        fwd = partial(attention, **make_inputs(requires_grad=False))
         fwd()
         fwd_ms = triton.testing.do_bench(fwd, warmup=warmup, rep=rep, return_mode="median")
         print(f"[{label}] forward: {fwd_ms:.3f} ms  ({fwd_flops / (fwd_ms * 1e9):.2f} TFLOP/s)")
 
         if calculate_bwd:
             inputs = make_inputs(requires_grad=True)
-            out = attention(*inputs)
+            out = attention(**inputs)
             grad_output = torch.randn_like(out)
             bwd = partial(
                 torch.autograd.grad,
                 out,
-                inputs[:3],
+                tuple(tensor for tensor in inputs.values() if tensor.is_floating_point()),
                 grad_output,
                 retain_graph=True,
                 allow_unused=True,

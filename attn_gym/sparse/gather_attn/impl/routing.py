@@ -1,4 +1,4 @@
-"""Routing to the Triton grouped schedule, shared by the public API and the Triton backend."""
+"""Grouped-input routing shared by the public API and the fused backends."""
 
 from collections.abc import Sequence
 
@@ -15,7 +15,11 @@ def uses_grouped_schedule(heads: int, kv_heads: int, separate_values: bool) -> b
 
 
 def require_grouped_schedule(
-    query: torch.Tensor, kv_tensors: Sequence[torch.Tensor], *, sliding_window_size: int
+    query: torch.Tensor,
+    kv_tensors: Sequence[torch.Tensor],
+    *,
+    sliding_window_size: int,
+    backend: str = "triton",
 ) -> None:
     """Raise unless the grouped Blackwell schedule can run these inputs.
 
@@ -28,7 +32,7 @@ def require_grouped_schedule(
     head_dim = query.shape[-1]
     major, minor = torch.cuda.get_device_capability(query.device)
     violation = None
-    if major != 10:
+    if major != 10 or (backend == "cute" and (major, minor) not in ((10, 0), (10, 3))):
         violation = f"SM100 or SM103, got SM{major}{minor}"
     elif query.dtype != torch.bfloat16:
         violation = f"bfloat16 inputs, got {query.dtype}"
@@ -40,6 +44,7 @@ def require_grouped_schedule(
         violation = f"sliding_window_size <= 2048, got {sliding_window_size}"
     if violation is not None:
         raise ValueError(
-            "Triton gather_attn supports separate values and grouped KV heads only with "
+            f"{'CuTe' if backend == 'cute' else 'Triton'} gather_attn supports separate values "
+            "and grouped KV heads only with "
             f"{violation}; use impl='reference'"
         )

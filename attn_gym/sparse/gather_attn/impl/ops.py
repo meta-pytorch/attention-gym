@@ -82,7 +82,26 @@ def _gather_attn_fwd_cuda(
                 )
             return output, lse, []
         state = ()
-        if backend == "cute":
+        grouped_cute = backend == "cute" and uses_grouped_schedule(
+            query.shape[1], sparse_kv.shape[1], sparse_v is not None
+        )
+        if grouped_cute:
+            from .cute_grouped import _launch
+
+            output, lse, state = _launch(
+                query,
+                local_kv,
+                sparse_kv,
+                kv_indices,
+                attention_sink,
+                cu_seqlens,
+                cu_seqlens_k,
+                sliding_window_size,
+                scale,
+                sparse_v=sparse_v,
+                local_v=local_v,
+            )
+        elif backend == "cute":
             from . import cute
 
             output, lse, state = cute._launch_forward(
@@ -198,6 +217,35 @@ def _gather_attn_bwd_cuda(
                 )
             )
         # Autograd passes the forward's concrete choice, even if determinism changes.
+        if backend == "cute" and uses_grouped_schedule(
+            query.shape[1], sparse_kv.shape[1], sparse_v is not None
+        ):
+            from .cute_grouped import _launch
+
+            grads = list(
+                _launch(
+                    query,
+                    local_kv,
+                    sparse_kv,
+                    kv_indices,
+                    attention_sink,
+                    cu_seqlens,
+                    cu_seqlens_k,
+                    sliding_window_size,
+                    scale,
+                    sparse_v=sparse_v,
+                    local_v=local_v,
+                    output=output,
+                    lse=lse,
+                    grad_output=grad_output,
+                )
+            )
+            # Zero-width paired inputs have no RoPE work, but still return their empty
+            # gradient tensors, just like the reference and Triton paths.
+            for i, tensor in enumerate((query_rope, sparse_rope, local_rope), start=3):
+                if tensor is not None:
+                    grads[i] = tensor.new_empty(tensor.shape)
+            return tuple(grads)
         if backend == "cute":
             from . import cute
 
@@ -306,10 +354,8 @@ def _gather_attn_fwd_fake(
     output = _output_buffer(query, backend)
     state = []
     if needs_backward and (sliding_window_size != 0 or kv_indices.shape[-1] != 0):
-        if backend == "triton" and uses_grouped_schedule(
-            heads, sparse_kv.shape[1], sparse_v is not None
-        ):
-            state = [None, None]
+        if uses_grouped_schedule(heads, sparse_kv.shape[1], sparse_v is not None):
+            state = [None, None] if backend == "triton" else []
         elif backend == "triton":
             state = (
                 [

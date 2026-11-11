@@ -318,9 +318,9 @@ def gather_attn(
             (batch_size, kv_heads, sparse_sequence_length, latent_dim); the paired
             RoPE shape has the same leading dimensions and query's rope_dim.
             sparse_sequence_length may be zero. Fused paired inputs with nonzero
-            rope_dim require kv_heads=1; fused zero-width pairs also allow
-            kv_heads=num_heads, and the reference allows any kv_heads dividing
-            num_heads. Backend-specific dtype, shape, and layout limits are
+            rope_dim require kv_heads=1; zero-width pairs use the bare-tensor
+            KV-head rules, and the reference allows any kv_heads dividing num_heads.
+            Backend-specific dtype, shape, and layout limits are
             described in docs/sparse.md.
 
         kv_indices: int32 or int64 selections on query.device, shaped
@@ -364,10 +364,11 @@ def gather_attn(
 
         kernel_options: Fused backend options. "backend": "cute" or "triton"
             overrides the backend; omit it to prefer eligible CuTe calls, otherwise
-            Triton. "bwd_recompute_p" (default True): CuTe backward recomputes
+            Triton. "bwd_recompute_p" (default True): FA4 CuTe backward recomputes
             attention probabilities; False saves them in forward instead (BF16,
-            tokens x heads x keys, with backend padding). Triton always recomputes
-            and ignores this option. Deterministic mode selects Triton automatically,
+            tokens x heads x keys, with backend padding). Triton and the warpdrive
+            grouped path always recompute and ignore this option.
+            Deterministic mode selects Triton automatically,
             but nonempty paired RoPE has no strict deterministic backward there.
             Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with
@@ -389,15 +390,17 @@ def gather_attn(
 
         sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to
             reuse sparse_kv as the values. Separate values and 1 < kv_heads < num_heads
-            run on Impl.REFERENCE, or on the Triton backend with SM100 or SM103,
+            run on Impl.REFERENCE, or on the Triton and CuTe backends with SM100 or SM103,
             bfloat16 inputs, head_dim <= 256 and divisible by 16, unit inner strides,
-            and sliding_window_size <= 2048; other inputs raise. The CuTe backend
-            requires shared values and one KV head. Passing the key tensor objects
-            themselves as both values (local_v is local_kv and sparse_v is sparse_kv)
+            and sliding_window_size <= 2048; other inputs raise. Triton remains the
+            automatic choice for these inputs. Explicit backend="cute" uses warpdrive
+            with FP32 softmax and atomic backward, always recomputing probabilities.
+            Passing the key tensor objects themselves as both values
+            (local_v is local_kv and sparse_v is sparse_kv)
             runs them as shared values; other aliases, such as views, count as separate
             values. With kv_heads == num_heads, separate values run one query head per
             grouped-schedule tile, slower than the shared-value MHA kernels. With
-            sliding_window_size=0, the grouped schedule reads every pool row in the
+            sliding_window_size=0, the Triton grouped schedule reads every pool row in the
             selection span of a run of nearby queries, selected or not, so a NaN or Inf
             in an unselected row near selected ones can make those queries' outputs and
             gradients NaN. Keep unused pool capacity finite, for example zero-filled.
@@ -511,17 +514,13 @@ def gather_attn(
             raise ValueError("Fused paired attention requires a single shared KV head.")
         backend = options.get("backend")
         grouped = uses_grouped_schedule(query_latent.shape[1], kv_heads, sparse_v is not None)
-        if grouped and backend == "cute":
-            raise ValueError(
-                "the CuTe gather_attn backend requires keys that are also the values and "
-                "one KV head; use kernel_options={'backend': 'triton'} or impl='reference'"
-            )
         if grouped:
             kv_tensors = (sparse_latent, local_latent, sparse_v, local_v)
             require_grouped_schedule(
                 query_latent,
                 [tensor for tensor in kv_tensors if tensor is not None],
                 sliding_window_size=sliding_window_size,
+                backend=backend or "triton",
             )
         if backend is None:
             backend = (
