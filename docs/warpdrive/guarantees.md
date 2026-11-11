@@ -44,7 +44,8 @@ two roles each waiting for the other's value, where it can read the loops and br
 
 On an [exclusive-consumer ring](channels.md#exclusive-consumers), every epoch needs exactly
 one owner. This is checked only for static waits and skips. A wait after more than one ring
-lap of skips needs a rendezvous with that epoch's previous owner.
+lap of skips needs a rendezvous with that epoch's previous owner; the liveness check rejects
+one without it.
 
 **Carry current state.** Return every managed endpoint, work cursor and turnstile seat from
 its role. Helpers return updated state; callers reassign it. Close each handle once, in its
@@ -101,7 +102,9 @@ resource use.
   Exclusive/round-robin epoch ownership is checked when all acquires, waits and skips are
   static.
 - **Liveness `verified`:** the roles' channel and barrier ops, unrolled for their static trip
-  counts, balance and form no dependency cycle. With runtime trip counts or several work items
+  counts, balance, form no dependency cycle, and keep every barrier within one generation of
+  its waiters (a parity wait follows its stage's previous phase; no arrival reaches the next
+  generation early). With runtime trip counts or several work items
   per CTA, `no deadlock found` names the counts it checked. Raw roles, raw `end.state`,
   data-dependent loops and `unchecked("liveness")` leave it `unverified`. A cycle, unbalanced
   epochs or a lane-dependent handoff raises under `liveness_check="strict"` (the default);

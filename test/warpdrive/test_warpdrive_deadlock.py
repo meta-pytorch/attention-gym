@@ -1179,6 +1179,151 @@ def test_a_failed_region_read_is_unverified(monkeypatch):
     )
 
 
+class Reuse(Toy):
+    """``a`` arrives on ``x`` twice while ``b`` syncs twice; ``ordered`` makes a sync on ``y``,
+    which b arrives on after its first sync, between a's arrivals."""
+
+    def __init__(self, ordered: bool):
+        self.ordered = ordered
+        self.x = NamedBarrier(threads=64)
+        self.y = NamedBarrier(threads=64)
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, ctx):
+        self.x.arrive()
+        if cutlass.const_expr(self.ordered):
+            self.y.sync()
+        self.x.arrive()
+
+    @role(warps=1)
+    @cute.jit
+    def b(self, ctx):
+        self.x.sync()
+        if cutlass.const_expr(self.ordered):
+            self.y.arrive()
+        self.x.sync()
+
+
+def test_an_arrival_must_not_reach_the_next_generation_early():
+    raises_protocol(
+        r"barrier overrun: a: x\.arrive\(\) at .* can arrive before b: x\.sync\(\) at .*, an "
+        r"arrival of the previous generation",
+        lambda: compile_toy(Reuse(False), "reuse_overrun"),
+    )
+    op = Reuse(True)
+    compile_toy(op, "reuse_ordered")
+    assert "liveness: verified" in op.describe()
+
+
+class AsyncThenSync(Toy):
+    """The Umma commit of epoch 0 completes after p reaches ``x``, so b's sync does not order
+    it before b's wait of epoch 1, whose parity is exact only after it."""
+
+    def __init__(self):
+        self.a = Ring(
+            1, Umma, Threads, consumer_sharing=Sharing.EXCLUSIVE, consumer_roles=("q", "r")
+        )
+        self.x = NamedBarrier(threads=64)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        with a.produce():
+            pass
+        self.x.sync()
+        with a.produce():
+            pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        a.wait().release()
+        a.skip(1)
+        return a
+
+    @role(warps=2)
+    @cute.jit
+    def r(self, ctx, *, a: Consumer):
+        self.x.sync()
+        a.skip(1)
+        a.wait().release()
+        return a
+
+
+class TwoRendezvous(Toy):
+    def __init__(self):
+        self.x = NamedBarrier(threads=64)
+
+    @role(warps=0)
+    @cute.jit
+    def a(self, ctx):
+        self.x.sync()
+        self.x.sync()
+
+    @role(warps=1)
+    @cute.jit
+    def b(self, ctx):
+        self.x.sync()
+        self.x.sync()
+
+
+class EarlyRawSignal(Toy):
+    """p signals epoch 0 with raw code before arriving on ``x``, which r syncs on before its
+    wait of epoch 1: exact, but the trace only sees the close after the arrival."""
+
+    def __init__(self):
+        self.a = Ring(
+            1, Threads, Threads, consumer_sharing=Sharing.EXCLUSIVE, consumer_roles=("q", "r")
+        )
+        self.x = NamedBarrier(threads=64)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        h = a.acquire()
+        cute.arch.mbarrier_arrive(h.full_barrier)
+        self.x.arrive()
+        h.commit(signal=False)
+        a.acquire().commit()
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        a.wait().release()
+        a.skip(1)
+        return a
+
+    @role(warps=2)
+    @cute.jit
+    def r(self, ctx, *, a: Consumer):
+        self.x.sync()
+        a.skip(1)
+        a.wait().release()
+        return a
+
+
+def test_an_async_signal_is_not_ordered_by_a_later_sync():
+    raises_protocol(
+        r"parity wait: r: a\.wait\(\) of epoch 1 at .* is exact only after p: a\.commit\(\) of "
+        r"epoch 0",
+        lambda: compile_toy(AsyncThenSync(), "async_then_sync"),
+    )
+
+
+def test_generations_accept_what_runs():
+    """Repeated rendezvous are ordered by their arrivals at the role's start; a raw signal that
+    may come before the arrival leaves the check unverified, not an error."""
+    op = TwoRendezvous()
+    compile_toy(op, "two_rendezvous")
+    assert "liveness: verified" in op.describe()
+    op = EarlyRawSignal()
+    compile_toy(op, "early_raw_signal")
+    assert "liveness: unverified (r: a.wait() of epoch 1" in op.describe()
+
+
 def _publish(end):  # advances ``end`` in place and returns nothing
     end.acquire().commit()
 

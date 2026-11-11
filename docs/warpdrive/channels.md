@@ -479,8 +479,10 @@ An exclusive consumer may skip it and need a rendezvous:
   another consumer must rendezvous before this wait
 ```
 
-The ownership report names the first wait needing this rendezvous, but inserts no handshake.
-Dynamic schedules leave the check to you; a consumer that skips the rendezvous can hang.
+The ownership report names the first wait needing this rendezvous, and the liveness check
+rejects a wait that nothing orders after the stage's previous fill; neither inserts a
+handshake. Where the check cannot read the loops it is yours; a consumer that skips the
+rendezvous can hang.
 
 The alias diagnostic checks an exclusive ring's same-stage release/reuse edge: its consumers
 are not an unordered fan-out. It cannot match owners across channels, so paths through this

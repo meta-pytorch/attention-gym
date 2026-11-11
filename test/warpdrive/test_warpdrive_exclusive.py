@@ -304,10 +304,12 @@ class Static(Toy):
 
 class Wide(Static):
     """Static ownership ``a a a a a b`` on three stages: b's only wait (epoch 5) comes a ring
-    lap after launch, so the check names it as needing a rendezvous (compiled only)."""
+    lap after launch, so the check names it as needing a rendezvous (compiled only), and the
+    liveness check rejects it: nothing orders epoch 2's fill before that wait."""
 
-    def __init__(self):
+    def __init__(self, liveness_check: str = "strict"):
         super().__init__("wide")
+        self.liveness_check = liveness_check
 
     @role(warps=1)
     @cute.jit
@@ -501,7 +503,7 @@ def test_misuse_raises_while_tracing(make, error):
         (lambda: Static("dynamic_count"), "unverified (a's skip count is dynamic)"),
         (lambda: Static("raw_state"), "unverified (b reads or assigns end.state)"),
         (
-            Wide,
+            lambda: Wide("off"),
             (
                 "verified: 6 epochs per launch (a 5, b 1); b's wait of epoch 5 is exact only "
                 "after epoch 2 was filled, which it did not observe: order it with a rendezvous"
@@ -525,6 +527,15 @@ def test_static_ownership_described(make, epochs):
     op = make()
     _compile(op)
     assert f"epochs    {epochs}" in op.describe()
+
+
+def test_a_wait_more_than_a_lap_after_the_last_needs_a_rendezvous():
+    """b's wait of epoch 5 is exact only once epoch 2, which a owns, was filled."""
+    _raises_protocol(
+        r"parity wait: b: kv\.wait\(\) of epoch 5 at .* is exact only after prod: "
+        r"kv\.commit\(\) of epoch 2",
+        lambda: _compile(Wide()),
+    )
 
 
 def test_static_ownership_is_verified_and_described(requires_blackwell):

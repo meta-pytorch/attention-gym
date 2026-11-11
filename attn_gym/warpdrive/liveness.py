@@ -29,6 +29,7 @@ from functools import reduce
 from attn_gym.warpdrive.events import (
     DEBUG,
     MAX_NODES,
+    TAKES,
     ChannelView,
     LaneDivergent,
     Unit,
@@ -154,6 +155,9 @@ def _check(kernel, roles: list) -> Liveness:
         try:
             graph = link(ops, chans, bars, turnstiles, early=False)
             if find_cycle(graph) is None and not graph.starved:
+                finding = _generations(graph, chans, _counts(m, vals))
+                if finding:
+                    return _found(finding, related)
                 continue
             early = link(ops, chans, bars, turnstiles, early=True)
         except Unknown as e:
@@ -337,6 +341,157 @@ def _balance(ops: dict, chans: dict) -> str | None:
         if sorted(taken) != sorted(filled):
             return f"the consumers of {label} take {len(taken)} epochs, {len(filled)} filled"
     return None
+
+
+def _generations(graph, chans: dict, where: str) -> str | None:
+    """Check that every barrier stays within one generation of its waiters.
+
+    A parity wait for generation g is exact only once generation g - 1 completed, and an
+    arrival counts toward the generation in progress. So every arrival of generation g - 1
+    must happen before each wait of generation g (mbarrier rings) and before each arrival of
+    generation g (any barrier). This one rule is what round-robin stage counts, exclusive-ring
+    rendezvous, turnstiles over named stages and reused named barriers each guarantee.
+    """
+    nodes = graph.nodes
+    index = {n: i for i, n in enumerate(nodes)}
+    before, deferred = _happens_before(graph, chans)
+    signals: dict = {}  # (chan, slot, kind, epoch, rank) -> node indices
+    for i, n in enumerate(nodes):
+        if n.kind in ("commit", "release") and n.chan in chans:
+            for t in chans[n.chan].targets(n.unit, n.kind == "commit"):
+                signals.setdefault((n.chan, n.slot, n.kind, n.epoch, t), []).append(i)
+
+    def ordered(i, j) -> bool:
+        return bool(before[j] >> i & 1)
+
+    def entry(j):
+        """Where a sync or blocking take arrives: after its last program-order predecessor
+        that is not an asynchronous signal (at least its unit's start)."""
+        j = graph.prev[j]
+        while j in deferred:
+            j = graph.prev[j]
+        return j
+
+    def precedes(a, b) -> bool:
+        return a == b or ordered(a, b)
+
+    def unsure(i, point) -> bool:
+        """Whether signal ``i`` may precede ``point`` at a placement the trace does not see: a
+        TMA or raw signal can arrive any time after its take."""
+        early = nodes[i].early
+        return early is not None and precedes(index[early], point)
+
+    gens: dict = {}  # barrier -> generation -> [(node, its arrival point)]
+
+    def join(barrier, g, node, point):
+        gens.setdefault(barrier, {}).setdefault(g, []).append((node, point))
+
+    for j, n in enumerate(nodes):
+        chan = chans.get(n.chan)
+        if chan is None:
+            if n.kind in ("sync", "arrive"):  # a NamedBarrier generation: each user's g-th use
+                join((n.chan, n.unit.rank), n.epoch, j, j if n.kind == "arrive" else entry(j))
+            continue
+        lap = 1 if chan.fixed else chan.n
+        stage = (n.chan, n.slot, n.unit.rank)
+        if chan.named:  # a full and an empty bar.sync per stage: arrivals and syncs both count
+            if n.kind in ("commit", "wait"):
+                join((*stage, "full"), n.epoch, j, j if n.kind == "commit" else entry(j))
+            elif n.kind in ("release", "acquire"):
+                g = n.epoch + lap if n.kind == "release" else n.epoch
+                join((*stage, "empty"), g, j, j if n.kind == "release" else entry(j))
+            continue
+        if n.kind not in ("acquire", "wait", "peek"):
+            continue
+        # Only what happens before the wait starts counts: its own wait edges assume it exact.
+        acquire = n.kind == "acquire"
+        kind, prev = ("release", n.epoch - 2 * lap) if acquire else ("commit", n.epoch - lap)
+        at = entry(j)
+        for i in signals.get((n.chan, n.slot, kind, prev, n.unit.rank), []):
+            if not precedes(i, at):
+                if unsure(i, at):
+                    raise Unknown(f"{_node(n)} is exact only if a TMA or raw signal comes early")
+                return (
+                    f"parity wait{where}: {_node(n)} is exact only after {_node(nodes[i])}, "
+                    "the stage's previous phase, but nothing orders that before the wait, so it "
+                    "can pass on the old phase. Order it (a NamedBarrier rendezvous, more stages "
+                    "or fewer round-robin instances)."
+                )
+    for barrier, by_gen in gens.items():
+        named = chans.get(barrier[0])
+        step = 1 if named is None else 1 if named.fixed else named.n
+        for g, members in by_gen.items():
+            for old, before_point in by_gen.get(g - step, []):
+                for new, point in members:
+                    if not precedes(before_point, point):
+                        if unsure(old, point):
+                            raise Unknown(
+                                f"{_node(nodes[new])} is ordered only if a TMA or raw signal "
+                                "comes early"
+                            )
+                        return _overrun(nodes[old], nodes[new], where)
+    return None
+
+
+def _overrun(old, new, where: str) -> str:
+    return (
+        f"barrier overrun{where}: {_node(new)} can arrive before {_node(old)}, an arrival of the "
+        "previous generation, so the barrier may complete without its other side. Order them "
+        "(a Turnstile, a sync between arrivals, or a stage per instance)."
+    )
+
+
+def _happens_before(graph, chans: dict) -> tuple[list[int], set]:
+    """Bitsets: ``before[j]`` has bit ``i`` when node ``i`` happens before node ``j``; and the
+    asynchronous signals.
+
+    Program order does not run past an asynchronous signal (a TMA fill or a tcgen05.commit
+    completes later), so its successors are not ordered after it."""
+    nodes, preds = graph.nodes, graph.preds
+    deferred = {
+        i
+        for i, n in enumerate(nodes)
+        if n.kind in ("commit", "release")
+        and n.chan in chans
+        and (n.kind == "commit", n.unit.role.name) in chans[n.chan].deferred
+    }
+
+    def settle(i):  # the last op of i's unit at or before i that is not asynchronous
+        while i in deferred:
+            i = graph.prev[i]
+        return i
+
+    # Only a wait for an asynchronous signal is ordered after it; program order and barrier
+    # arrivals run on from the op before it.
+    edges = [
+        [
+            i
+            if i not in deferred
+            or (nodes[j].chan == nodes[i].chan and nodes[j].kind in (*TAKES, "peek", "tail"))
+            else settle(i)
+            for i in ps
+        ]
+        for j, ps in enumerate(preds)
+    ]
+    before = [0] * len(nodes)
+    done = [False] * len(nodes)
+    for start in range(len(nodes)):
+        stack = [start]
+        while stack:
+            j = stack[-1]
+            if done[j]:
+                stack.pop()
+                continue
+            todo = [i for i in edges[j] if not done[i]]
+            if todo:
+                stack.extend(todo)
+                continue
+            bits = 0
+            for i in edges[j]:
+                bits |= before[i] | (1 << i)
+            before[j], done[j] = bits, True
+            stack.pop()
+    return before, deferred
 
 
 def _node(n) -> str:

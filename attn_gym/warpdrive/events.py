@@ -567,21 +567,26 @@ class ChannelView:
 class Graph:
     nodes: list
     preds: list  # node index -> predecessor node indices
+    prev: list  # node index -> its program-order predecessor, or None
     starved: list  # (node index, why) of waits whose signals never run
 
 
 def link(units: dict, chans: dict, bars: dict, turnstiles: dict, early: bool) -> Graph:
     """Join each unit's ops (``units``: Unit -> nodes). ``early`` links a TMA or raw signal at
-    its take instead of its close."""
+    its take instead of its close. Each unit's program starts with a ``start`` node: where its
+    first op arrives at a barrier."""
+    units = {u: [Node(u, "start", "", None, 0, "start"), *ns] for u, ns in units.items()}
     nodes = [n for ns in units.values() for n in ns]
     index = {n: i for i, n in enumerate(nodes)}
     counts: dict = {}  # (role, rank) -> its units (more than one when split by warp)
     for u in units:
         counts[(u.role.name, u.rank)] = counts.get((u.role.name, u.rank), 0) + 1
     preds = [[] for _ in nodes]
+    prev = [None] * len(nodes)
     starved = []
     for ns in units.values():
         for a, b in itertools.pairwise(ns):
+            prev[index[b]] = index[a]
             preds[index[b]].append(index[a])
 
     def at(n):
@@ -638,7 +643,7 @@ def link(units: dict, chans: dict, bars: dict, turnstiles: dict, early: bool) ->
             preds[i] += [at(s) for s in signals.get((n.chan, n.slot, "commit", n.epoch, rank), [])]
     _barriers(nodes, index, preds, starved, bars)
     _turnstiles(nodes, index, preds, starved, turnstiles)
-    return Graph(nodes, preds, starved)
+    return Graph(nodes, preds, prev, starved)
 
 
 def _barriers(nodes, index, preds, starved, bars) -> None:
@@ -668,9 +673,9 @@ def _barriers(nodes, index, preds, starved, bars) -> None:
 
 
 def _entry(nodes, n, index) -> list:
-    """A sync has arrived once its unit reaches it: its program predecessor."""
-    i = index[n]
-    return [i - 1] if i and nodes[i - 1].unit == n.unit else []
+    """A sync has arrived once its unit reaches it: its program predecessor (at least the
+    unit's start)."""
+    return [index[n] - 1]
 
 
 def _turnstiles(nodes, index, preds, starved, turnstiles) -> None:
