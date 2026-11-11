@@ -1449,6 +1449,25 @@ class _End:
         table = sc.full_targets if isinstance(self, ProducerEnd) else sc.empty_targets
         return {r: table.get(r, ()) for r in self.ctas}
 
+    def _signal(self, index):
+        chan = self._chan
+        producer = isinstance(self, ProducerEnd)
+        side = "producer" if producer else "consumer"
+        mech = chan.mechanism(side, self._role)
+        if isinstance(mech, Tma):
+            return  # completed by the TMA transaction count
+        fence = chan.fences(side, self._role)
+        if chan.named:
+            _fence(fence)
+            self._named_arrive(chan.full_barriers if producer else chan.empty_barriers, index)
+            return
+        self._arrive(
+            mech,
+            self._full(index) if producer else self._empty(index),
+            fence,
+            chan.scope.full_mask if producer else chan.scope.empty_mask,
+        )
+
     def _arrive(self, mech, bar, fence, mask):
         """Signal ``bar`` in each CTA of ``self.targets``; ``mask``: the ``tcgen05.commit``
         multicast mask (an int, or ``{rank: mask}``)."""
@@ -1764,16 +1783,6 @@ class ProducerEnd(_End):
         else:
             _arm_if(full, scope.tx, targets, tuple(arms), self._chan.cluster.size)
 
-    def _signal(self, index):
-        if isinstance(self._chan.producer, Tma):
-            return  # completed by the TMA transaction count
-        chan = self._chan
-        if chan.named:
-            _fence(chan.commit_fence)
-            self._named_arrive(chan.full_barriers, index)
-            return
-        self._arrive(chan.producer, self._full(index), chan.commit_fence, chan.scope.full_mask)
-
     def tail(self):
         """Wait until every stage this end filled has been released. The layer emits this at
         role exit on pair-scoped channels whose consumer signals from another CTA."""
@@ -1875,19 +1884,6 @@ class ConsumerEnd(_End):
             preview._adopt(rec)
             self._rec.previews.remove(preview)
             self._trace.closed(preview._life, "adopted")
-
-    def _signal(self, index):
-        chan = self._chan
-        if chan.named:
-            _fence(chan.release_fence)
-            self._named_arrive(chan.empty_barriers, index)
-            return
-        self._arrive(
-            chan.mechanism("consumer", self._role),
-            self._empty(index),
-            chan.fences("consumer", self._role),
-            chan.scope.empty_mask,
-        )
 
 
 def _region_op(block) -> str | None:
