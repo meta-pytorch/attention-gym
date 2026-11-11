@@ -277,6 +277,29 @@ def _resolve_param(role_name: str, pname: str, ann, fn) -> tuple[object, type | 
     )
 
 
+def _context_type(ctx_types: dict) -> tuple[type | None, str | None]:
+    """Return ``(context type, first "role.param" annotated with it)`` from
+    ``{annotated type: first "role.param" using it}``, or ``(None, None)`` when no role
+    annotates its context."""
+    for t, site in ctx_types.items():
+        if not (is_dataclass(t) and t.__dataclass_params__.frozen):
+            raise ProtocolError(
+                f"{site} is annotated {t.__name__}, which is not a frozen dataclass; an "
+                "annotated context reaches the roles as itself, which the layer supports "
+                "for frozen dataclasses (leave a SimpleNamespace context unannotated)"
+            )
+    # The context type is the most derived annotation; the others must be its bases.
+    derived = [t for t in ctx_types if all(issubclass(t, u) for u in ctx_types)]
+    if ctx_types and not derived:
+        sites = ", ".join(f"{site}: {t.__name__}" for t, site in ctx_types.items())
+        raise ProtocolError(
+            f"roles annotate the context with unrelated types ({sites}); {_CTX_RULE}"
+        )
+    if not derived:
+        return None, None
+    return derived[0], ctx_types[derived[0]]
+
+
 @dataclass
 class RoleInstance:
     name: str  # "softmax[0]", or the method name for single-instance roles
@@ -287,7 +310,6 @@ class RoleInstance:
     regs: int | None
     fn: object
     params: list
-    uses_tmem: bool = False
     # "all": every CTA of the cluster; "leader": the leader of each MMA pair; "rank0": rank 0
     # (the broadcast scheduler only)
     cta: str = ALL
@@ -301,6 +323,10 @@ class RoleInstance:
     @property
     def num_threads(self) -> int:
         return self.num_warps * WARP_SIZE
+
+    @property
+    def uses_tmem(self) -> bool:
+        return any(ann is Tmem for _, ann in self.params)
 
 
 @dataclass(frozen=True)
@@ -567,15 +593,12 @@ class WarpSpecialized(metaclass=_KernelType):
         roles = []
         ctx_types = {}  # annotated context type -> first "role.param" using it
         declared = {
-            name: meta
+            name: config
             for name in dir(type(self))
-            if (meta := getattr(getattr(type(self), name), "_warpdrive", None)) is not None
+            if (config := getattr(getattr(type(self), name), "_warpdrive", None)) is not None
         }
-        overrides = _role_overrides(self.roles, declared)
-        for name, meta in declared.items():
+        for name, config in _role_configs(self.roles, declared).items():
             fn = getattr(type(self), name)
-            resolved = overrides.get(name, meta)
-            ranges, regs, cta, raw = resolved.warps, resolved.regs, resolved.cta, resolved.raw
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
             signature = inspect.signature(fn)
@@ -593,7 +616,7 @@ class WarpSpecialized(metaclass=_KernelType):
             params = []
             for pname, p in list(signature.parameters.items())[1:]:
                 ann, ctx_type = _resolve_param(name, pname, p.annotation, fn)
-                if raw and ann not in _RAW_ANNOTATIONS:
+                if config.raw and ann not in _RAW_ANNOTATIONS:
                     raise ProtocolError(
                         f"raw role {name}: parameter {pname} is {getattr(ann, '__name__', ann)}; "
                         "raw roles take Instance, Local, Tmem, Barriers, and the context only "
@@ -612,41 +635,24 @@ class WarpSpecialized(metaclass=_KernelType):
                     f"role {name}: parameters {ctx_params} would all receive the context; "
                     f"{_CTX_RULE}"
                 )
-            uses_tmem = any(a is Tmem for _, a in params)
-            for idx, wr in enumerate(ranges):
-                inst = f"{name}[{idx}]" if len(ranges) > 1 else name
+            for idx, wr in enumerate(config.warps):
+                inst = f"{name}[{idx}]" if len(config.warps) > 1 else name
                 ri = RoleInstance(
                     inst,
                     name,
                     idx,
                     wr.start,
                     len(wr),
-                    regs,
+                    config.regs,
                     fn,
                     params,
-                    uses_tmem=uses_tmem,
-                    cta=cta,
-                    raw=raw,
+                    cta=config.cta,
+                    raw=config.raw,
                     keyword_only=keyword_only,
                 )
                 roles.append(ri)
                 self._bind(ri, chans, turns)
-        for t, site in ctx_types.items():
-            if not (is_dataclass(t) and t.__dataclass_params__.frozen):
-                raise ProtocolError(
-                    f"{site} is annotated {t.__name__}, which is not a frozen dataclass; an "
-                    "annotated context reaches the roles as itself, which the layer supports "
-                    "for frozen dataclasses (leave a SimpleNamespace context unannotated)"
-                )
-        # The context type is the most derived annotation; the others must be its bases.
-        derived = [t for t in ctx_types if all(issubclass(t, u) for u in ctx_types)]
-        if ctx_types and not derived:
-            sites = ", ".join(f"{site}: {t.__name__}" for t, site in ctx_types.items())
-            raise ProtocolError(
-                f"roles annotate the context with unrelated types ({sites}); {_CTX_RULE}"
-            )
-        self._ws_ctx_type = derived[0] if derived else None
-        self._ws_ctx_site = ctx_types.get(self._ws_ctx_type)
+        self._ws_ctx_type, self._ws_ctx_site = _context_type(ctx_types)
         for name, st in streams.items():
             self._bind_stream(name, st, roles, chans, cluster)
         roles.sort(key=lambda r: r.first_warp)
@@ -789,7 +795,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 if len({cluster.ctas(r.cta) for r in ts.parties}) != 1:
                     raise ProtocolError(f"turnstile {name}: seats run in different CTAs")
             tmem_roles = [r for r in roles if r.uses_tmem]
-            everywhere = tuple(range(cluster.size))
+            everywhere = cluster.ctas(ALL)
             if tmem_roles and not any(cluster.ctas(r.cta) == everywhere for r in tmem_roles):
                 raise ProtocolError(
                     "TMEM is allocated by one warp in each CTA of the cluster (2-CTA TMEM: of "
@@ -1322,7 +1328,7 @@ class WarpSpecialized(metaclass=_KernelType):
         role's lowest warp other than 0 (FA4 allocates from warp 1) and falls back to warp 0. A
         cluster allocates after the cluster sync, where any warp works, so it takes the first.
         """
-        everywhere = tuple(range(self.cluster.size))
+        everywhere = self.cluster.ctas(ALL)
         roles = [
             r for r in self._ws_roles if r.uses_tmem and self.cluster.ctas(r.cta) == everywhere
         ]
@@ -2116,10 +2122,11 @@ def _check_named_turns(name: str, chan, turns: dict):
             )
 
 
-def _role_overrides(roles, declared: dict) -> dict:
-    """Check a kernel's ``roles`` mapping against its declared role names."""
+def _role_configs(roles, declared: dict) -> dict:
+    """Each role's config: its ``@role`` declaration, replaced by the kernel's ``roles`` entry
+    when it has one. Checks ``roles`` against the declared role names."""
     if roles is None:
-        return {}
+        return declared
     if not isinstance(roles, Mapping):
         raise ProtocolError(
             f"roles must be a mapping from role name to RoleConfig, got {type(roles).__name__}"
@@ -2132,7 +2139,7 @@ def _role_overrides(roles, declared: dict) -> dict:
             raise ProtocolError(
                 f"roles[{name!r}] must be a RoleConfig, got {type(config).__name__}"
             )
-    return dict(roles)
+    return {**declared, **roles}
 
 
 def _allocate_named(chans: dict, named_bars: dict) -> dict:
