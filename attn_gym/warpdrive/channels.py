@@ -1647,23 +1647,17 @@ class _End:
 
     def _take_token(self, token, slot, op: str):
         """Check that ``token`` is this end's probe of the epoch ``op`` is about to take, and
-        return its readiness. Inside ``unchecked("token")`` any Token or raw Boolean is
-        trusted instead."""
+        return its readiness."""
         chan, who, site = self._chan, self._trace.role_name, user_site()
         probe = "try_acquire" if isinstance(self, ProducerEnd) else "try_wait"
         where = f"{who}: {chan.name}.{op}(token=...) at {site}"
         if chan.named:
             raise ProtocolError(f"{where}: a named-barrier channel has no tokens")
-        trusted = isinstance(token, (Token, cutlass.Boolean)) and self._trace.opt_out(
-            "token", f"{chan.name}.{op}(token={type(token).__name__}) at {site}"
-        )
-        if trusted:
-            return token.ready if isinstance(token, Token) else token
         if not isinstance(token, Token):
             raise ProtocolError(
                 f"{where} takes the Token returned by {chan.name}.{probe}(), got "
-                f"{type(token).__name__} (a raw readiness Boolean needs "
-                '`with unchecked("token", reason=...)`)'
+                f"{type(token).__name__} (carry the Token itself through a loop, or wait on "
+                "the end's barrier with raw code)"
             )
         if token._rec is not self._rec:
             raise ProtocolError(

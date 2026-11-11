@@ -193,9 +193,9 @@ If neither side is managed, use `Barriers` instead.
 
 ### Tokens and previews
 
-- Loop-carried `Token`s are checked normally. If the checker cannot follow your protocol,
-  pass a raw Boolean (`cute.arch.mbarrier_try_wait(bar, phase)` or `token.ready`) inside
-  `with unchecked("token", reason=...)`. This skips the end, epoch and dynamic-region checks.
+- Loop-carried `Token`s are checked normally; `token=` takes no raw Boolean. If the checker
+  cannot follow your protocol, probe and wait on the end's barriers yourself
+  (`cute.arch.mbarrier_try_wait(bar, phase)`), then `end.state = st`.
 - A `peek()` preview exposes `preview.index` and `preview.phase` for raw tensor indexing.
   The next wait on the end owns the epoch; raw accesses through those indices are outside
   the alias diagnostic.
@@ -242,10 +242,19 @@ body instead.
 
 ### Suppress one check
 
-`unchecked(check, reason=...)` supports `unclosed`, `cross_region`, `tma`, `alias`, `token`,
-`fence` and `liveness`.
-It suppresses only that check inside the block and records the opt-out in `describe()`.
-It changes diagnostics, not device synchronization.
+`with unchecked(check, reason=...):` is the one per-site opt-out. It suppresses only that
+check inside the block and records the reason, line and suppressed findings in `describe()`.
+It changes diagnostics, not device synchronization. Three checks take it:
+
+- `"tma"`: TMA copies into barriers taken inside the block skip the atom and byte checks.
+- `"fence"`: accesses annotated inside the block are left out of the
+  [fence check](channels.md#checking-explicit-fences).
+- `"liveness"`: channel and barrier ops inside the block are invisible to the liveness check,
+  which then reports the kernel `unverified`.
+
+Other checks have their own hatch: `signal=False` or a [span](channels.md#spans) for a
+handle held past its region, an unannotated access or `alias_check="off"` for the alias
+diagnostic, a carried `Token` for try tokens, and raw barriers for any protocol.
 
 ## Compiler pitfall: saved indices across loops
 
@@ -289,6 +298,6 @@ There is no universal layer-level thread-index guard for arbitrary role bodies.
 - **Opt-outs add no ordering.** Document raw counts, completion waits and memory ordering at
   the call site. Opt-out bookkeeping is tracing-global, not thread-safe; compile in isolated
   processes rather than concurrent threads.
-- **Alias opt-outs certify nothing.** `unchecked("alias")` excludes only annotations inside
-  its block from the [alias diagnostic](storage.md#check-declared-aliases). A TMA opt-out is
-  separate from a copy the checker could not recognize.
+- **Opt-outs certify nothing.** An access left unannotated is outside the
+  [alias diagnostic](storage.md#check-declared-aliases). A TMA opt-out is separate from a
+  copy the checker could not recognize.

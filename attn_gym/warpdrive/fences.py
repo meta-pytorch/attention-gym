@@ -181,7 +181,7 @@ def _seen(kernel, roles: list[alias.RoleEvents], chan, producer: bool) -> list[a
     out = []
     for role in roles:
         for i, ev in enumerate(role.events):
-            if ev.kind != "access" or ev.fence_opted_out:
+            if ev.kind != "access" or ev.opted_out:
                 continue
             held = (ev.data["handle"],) if ev.data.get("handle") is not None else ev.open
             if any(h.chan is chan and h.producer == producer for h in held):

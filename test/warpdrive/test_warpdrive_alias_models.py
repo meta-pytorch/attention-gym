@@ -32,7 +32,6 @@ from attn_gym.warpdrive import (
     fence_async_shared,
     named_barrier,
     role,
-    unchecked,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 
@@ -776,13 +775,13 @@ class RawCommitBesideTma(Model):
         return c, t
 
 
-class UnclosedBesideUmma(RawReleaseOverlap):
-    """An unclosed raw-signaled handle leaves read publication unverified.
+class RawReleaseBesideUmma(RawReleaseOverlap):
+    """A raw-signaled release leaves read publication unverified.
 
-    The consumer opens under ``unchecked("unclosed")`` and arrives on the empty barrier
-    instead of releasing. Around the read it also holds ``d``, a single-warp Umma-consumer
-    channel. Releasing ``d`` cannot publish the thread read, but that failed edge must not
-    override the untraced close that might.
+    The consumer closes with ``release(signal=False)`` and arrives on the empty barrier itself.
+    Around the read it also holds ``d``, a single-warp Umma-consumer channel. Releasing ``d``
+    cannot publish the thread read, but that failed edge must not override the raw signal
+    that might.
     """
 
     def __init__(self):
@@ -806,9 +805,9 @@ class UnclosedBesideUmma(RawReleaseOverlap):
         for _ in cutlass.range(ctx.n, unroll=1):
             g = d.wait(0)
             for s in cutlass.range_constexpr(2):
-                with unchecked("unclosed", reason="released by the arrival below"):
-                    h = c.wait(s)
+                h = c.wait(s)
                 h.access("P", read=True)
+                h.release(signal=False)
                 cute.arch.mbarrier_arrive(h.empty_barrier)
             g.release()
         return c, d
@@ -924,7 +923,7 @@ VERDICTS = {  # id: (model, pair, status, evidence regex in the alias section)
         r"only a raw signal \(signal=False\) would order them",
     ),
     "raw_commit_beside_tma": (RawCommitBesideTma, "Q ~ P", UNVERIFIED, ""),
-    "unclosed_beside_umma": (UnclosedBesideUmma, "Q ~ P", UNVERIFIED, "never closes"),
+    "raw_release_beside_umma": (RawReleaseBesideUmma, "Q ~ P", UNVERIFIED, "only a raw signal"),
     # The write -> read pair, ordered only through the raw release, is unverified. Reporting it
     # must not end the scan before the read -> next-write pair, a potential hazard.
     "unverified_then_hazard": (
