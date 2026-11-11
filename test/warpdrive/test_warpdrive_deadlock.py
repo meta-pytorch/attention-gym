@@ -409,6 +409,18 @@ class DynamicSkipHold(SkipHold):
         return ch
 
 
+@cute.jit
+def _acquired(end):
+    end.acquire().commit()
+    return end
+
+
+@cute.jit
+def _waited(end):
+    end.wait().release()
+    return end
+
+
 class SpanLifetime(Toy):
     """``mode`` places a wait on ``ch`` around a span of the consumer (``producer=True``: the
     producer, acquires) over a ``trips``-trip loop."""
@@ -423,7 +435,7 @@ class SpanLifetime(Toy):
         mode = self.mode
         s = ch.span()
         if cutlass.const_expr(mode == "before_begin"):
-            take(ch)
+            ch = take(ch)
         for i in cutlass.range(self.trips):
             s.begin(i)
             if cutlass.const_expr(mode == "after_loop"):
@@ -433,23 +445,23 @@ class SpanLifetime(Toy):
             else:
                 s.release(i)
             if cutlass.const_expr(mode == "last_trip"):
-                take(ch)
+                ch = take(ch)
             elif cutlass.const_expr(mode == "branch"):  # runs after the last-trip signal
                 if i == self.trips - 1:
-                    take(ch)
+                    ch = take(ch)
         if cutlass.const_expr(mode == "after_loop"):
             if cutlass.const_expr(self.producer):
                 s.commit()
             else:
                 s.release()
-            take(ch)
+            ch = take(ch)
         return ch
 
     @role(warps=0)
     @cute.jit
     def prod(self, ctx, *, ch: Producer):
         if cutlass.const_expr(self.producer):
-            return self.spanned(ctx, ch, lambda c: c.acquire().commit())
+            return self.spanned(ctx, ch, _acquired)
         for _ in cutlass.range_constexpr(self.epochs):
             with ch.produce():
                 pass
@@ -459,7 +471,7 @@ class SpanLifetime(Toy):
     @cute.jit
     def cons(self, ctx, *, ch: Consumer):
         if cutlass.const_expr(not self.producer):
-            return self.spanned(ctx, ch, lambda c: c.wait().release())
+            return self.spanned(ctx, ch, _waited)
         for _ in cutlass.range_constexpr(self.epochs):
             with ch.consume():
                 pass
@@ -1126,4 +1138,37 @@ def test_a_failed_region_read_is_unverified(monkeypatch):
     compile_toy.__wrapped__(op, "failed_read")
     assert "liveness: unverified (reading the loops of p failed: RuntimeError('boom'))" in (
         op.describe()
+    )
+
+
+def _publish(end):  # advances ``end`` in place and returns nothing
+    end.acquire().commit()
+
+
+class InPlaceHelper(Toy):
+    """Without reassignment, the loop reuses the end's initial stage and phase every trip."""
+
+    def __init__(self):
+        self.ch = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ch: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            _publish(ch)
+        return ch
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ch: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ch.consume():
+                pass
+        return ch
+
+
+def test_an_end_advanced_where_no_region_carries_it_raises():
+    raises_protocol(
+        r"prod: the ch end advances at .* inside a loop or branch that does not carry it",
+        lambda: compile_toy(InPlaceHelper(), "inplace_helper"),
     )
