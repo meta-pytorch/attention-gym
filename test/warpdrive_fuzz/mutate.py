@@ -236,14 +236,13 @@ def mutations() -> list[Mutation]:
             "U1",
             valid.replace("ctx.n,", "ctx.n + 1,"),
             error=None,
-            obligation=True,
+            obligation=True,  # sampled counts are unverified: a caller could pass other values
         ),
         Mutation(
             "lane_predicated_pair",
             "U1",
             "if cute.arch.lane_idx() == 0:\n" + textwrap.indent(valid, "    "),
-            error=None,
-            obligation=True,
+            message="depends on the lane",
         ),
         Mutation(
             "unchecked_no_reason",
