@@ -142,6 +142,11 @@ for i in cutlass.range(n_blocks - 1, unroll=1):
 - Close each handle exactly once, in the dynamic loop/branch region that opened it.
   Missing, double or cross-region closes raise `ProtocolError` with source locations.
   A [span](#spans) holds a stage from a loop's first iteration to its last.
+- Do not wait for a stage you still hold. An acquire, wait, `peek()` or span `begin()` a ring
+  lap or more past a handle of the same end (one epoch on a `Slots` slot) never returns; the
+  handle's close raises. A span is held from `span()` to its signal. Steps on a later loop trip
+  are not counted. Closes that may hand the stage back earlier pass: `signal=False`, a `Tma`
+  commit and `external=` sides.
 - Return the updated endpoint, not handles, at role exit.
 - `h.retire()` closes a final unused producer acquire without publication; no consumer may
   need it. Automatically tailed pair channels reject it.

@@ -685,7 +685,13 @@ class HandleRecord:
     slot: int | None = None  # the Slots slot; None for a Ring stage (dynamic)
     producer: bool = False
     role: str = ""  # the role whose end opened it: its mechanism and fences close it
-    order: int = 0  # how many acquires/waits of its end (and slot) were traced before it
+    order: int = 0  # how many acquires/waits/skips of its end (and slot) were traced before it
+    resets: int = 0  # its end's raw state accesses before it opened
+    # (op, site, epochs apart) of the first later wait on its own end (and slot) whose epoch is
+    # ready only after this handle closes (``_End._check_hold``), or None.
+    held_across: tuple | None = None
+    # A span's loop body when it signals in that loop's last trip: it is held until the loop ends.
+    held_in: object = None
 
 
 @dataclass(frozen=True)
@@ -797,7 +803,8 @@ class Handle(_Stage):
             slot=key,
             producer=is_producer,
             role=end._role,
-            order=end._rec.advances.get(key, 0) - 1,  # its own acquire/wait already counted
+            order=end._rec.taken(key) - 1,  # its own acquire/wait already counted
+            resets=end._rec.resets,
         )
         if opened:
             self._open()
@@ -915,6 +922,8 @@ class Handle(_Stage):
                 "commit or retire, consumer handles release"
             )
         trace.closed(self.rec, op, region_checked)
+        if op in ("commit", "release") and self.rec.held_across is not None:
+            self._end._hold_error(self.rec, *self.rec.held_across)
         trace.record(self._end._chan.name, op, self._label, order=self.rec.order)
         trace.event(
             "close",
@@ -955,6 +964,7 @@ class Span(Handle):
 
     def __init__(self, end, index, phase, label, is_producer: bool):
         super().__init__(end, index, phase, label, is_producer, opened=False)
+        end._rec.spans.append(self.rec)  # held from here, not only from begin()
         self._progress = _SpanProgress()
         end._trace.checks.append(self._check_begun)
 
@@ -1001,6 +1011,7 @@ class Span(Handle):
             )
         self._trips(i, "begin")
         progress.begin_site, progress.loop = user_site(), current_block()
+        self._end._check_hold(self.rec.slot, "span begin", self.rec.order)
         self._open(once="first")
         end, op = self._end, "acquire" if self._is_producer else "wait"
 
@@ -1046,6 +1057,8 @@ class Span(Handle):
                     f"{self._where(f'{op}(i)')} is in another loop than begin() at "
                     f"{progress.begin_site}"
                 )
+            if trips > 1:
+                self.rec.held_in = progress.loop  # signals only in the loop's last trip
         self._close(
             producer,
             op if signal else f"{op}(raw signal)",
@@ -1191,7 +1204,7 @@ class Token:
     def _why_stale(self) -> str | None:
         if self._stale is not None:
             return self._stale
-        current = (self._rec.resets, self._rec.advances.get(self._key, 0))
+        current = (self._rec.resets, self._rec.taken(self._key))
         if not self._minted or self._epoch != current:
             return (
                 "an acquire/wait on this end (or raw end.state access) follows the probe, or it "
@@ -1213,7 +1226,7 @@ class Token:
         copy.__dict__.update(self.__dict__)
         copy.ready = cutlass.Boolean(values[0])
         copy._block = block
-        copy._epoch = (self._rec.resets, self._rec.advances.get(self._key, 0))
+        copy._epoch = (self._rec.resets, self._rec.taken(self._key))
         copy._bodies, copy._carried_in, copy._crossed = [], None, []
         loops = [(b, entry) for b, entry in self._bodies if _parent_block(b) == block]
         if loops:  # out of a loop: the last iteration's value, or (no trips) the entering one
@@ -1237,20 +1250,26 @@ class Token:
 class _EndRecord:
     """Trace-time record shared by loop-carried copies of one end.
 
-    ``slots``: the fixed slots it used; a tail drains only those. ``advances``: acquires/waits
-    traced per slot (``None`` for a ring). With ``resets``, the count of raw ``end.state``
-    accesses, it identifies a token's epoch. ``previews``: previews no wait has adopted yet.
-    ``lineage``: which copies hold out-of-date phases.
+    ``slots``: the fixed slots it used; a tail drains only those. ``taken(slot)``: acquires,
+    waits and skips traced per slot (``None`` for a ring). With ``resets``, the count of raw
+    ``end.state`` accesses, it identifies a token's epoch. ``previews``: previews no wait has
+    adopted yet. ``lineage``: which copies hold out-of-date phases.
     """
 
     slots: set = field(default_factory=set)
-    advances: dict = field(default_factory=dict)
     resets: int = 0
+    # Per slot (None for a ring), each traced acquire/wait/skip in order: (epochs it advances
+    # the end, 0 if dynamic; the block it ran in). ``HandleRecord.order`` indexes it.
+    steps: dict = field(default_factory=dict)
+    spans: list = field(default_factory=list)  # HandleRecords of the spans this end took
     previews: list = field(default_factory=list)
     # (block, slot, why stale or None, probe site) of each token crossing a region boundary.
     token_exports: list = field(default_factory=list)
     checked: bool = False  # the role-exit check of unadopted previews is registered
     lineage: Lineage = field(default_factory=Lineage)
+
+    def taken(self, key) -> int:
+        return len(self.steps.get(key, ()))
 
 
 class _End:
@@ -1545,13 +1564,70 @@ class _End:
             self._rec.slots.add(slot)
         else:
             advance_state(self._state, self._stride)
-        self._advanced(slot)
+        self._advanced(slot, 1 if self._chan.fixed else self._stride)
         return index, phase, label
 
-    def _advanced(self, key):
-        """Count this copy's move to the next epoch of ``key`` (a slot, None for a ring)."""
-        self._rec.advances[key] = self._rec.advances.get(key, 0) + 1
+    def _advanced(self, key, epochs: int):
+        """Count this copy's move ``epochs`` (0 if dynamic) past the next epoch of ``key`` (a
+        slot, None for a ring)."""
+        self._rec.steps.setdefault(key, []).append((epochs, current_block()))
         self._rec.lineage.advanced(self._copy)
+
+    def _check_hold(self, key, op: str, step: int | None = None):
+        """Note each open handle of this end that the wait for step ``step`` of ``key`` (default:
+        the next) needs back. An epoch is ready only after every epoch a ring lap (on a slot,
+        one epoch) or more before it was handed back, so a wait that far past a handle its own
+        role holds never returns. The handle's close raises if it signals; a raw signal or a
+        TMA fill (complete without the commit) may hand the stage back earlier, so those pass.
+
+        Distances count only the steps that run before every run of the wait: those in its own
+        block or an enclosing one, at their static epoch counts."""
+        chan, trace = self._chan, self._trace
+        producer = isinstance(self, ProducerEnd)
+        # Raw code drives the other side of an external channel, so it may not wait for the
+        # hand-back at all.
+        if (producer and isinstance(chan.producer, Tma)) or chan.external is not None:
+            return
+        steps = self._rec.steps.get(key, [])
+        step = len(steps) if step is None else step
+        enclosing = trace.blocks()
+        lap = 1 if chan.fixed else chan.n
+        for held in dict.fromkeys([*trace.open, *self._rec.spans]):
+            same_end = held.chan is chan and held.producer == producer and held.slot == key
+            if not same_end or held.order >= step or held.resets != self._rec.resets:
+                continue
+            # A handle opened in a branch arm or loop that does not enclose the wait is not held
+            # when the wait runs. A span closed in its loop's last trip is held until then.
+            if held.block not in enclosing:
+                continue
+            # Only a wait that runs in every trip of the span's loop provably runs before its
+            # last-trip signal.
+            if held.closed_at is not None and (
+                held.held_in is None or current_block() != held.held_in
+            ):
+                continue
+            apart = sum(n for n, block in steps[held.order : step] if block in enclosing)
+            if apart < lap:
+                continue
+            where = (op, user_site(), apart)
+            if held.closed_at is not None:  # it signals in a later trip of this loop
+                if not held.closed_op.endswith("(raw signal)"):
+                    self._hold_error(held, *where, close=f"{held.closed_op} in the last trip")
+            elif held.held_across is None:
+                held.held_across = where
+
+    def _hold_error(self, held, op: str, site: str, apart: int, close: str | None = None):
+        chan = self._chan
+        lap = "slot" if chan.fixed else f"{chan.n}-stage ring"
+        stages = -(-(apart + 1) // self._stride) * self._stride  # round-robin: a multiple of k
+        fix = "" if chan.fixed or close else f", or give {chan.name} at least {stages} stages"
+        close = close or f"{held.closed_op} at {held.closed_at}"
+        raise ProtocolError(
+            f"{self._trace.role_name}: {chan.name}.{op}() at {site} takes an epoch at least "
+            f"{apart} after {held.what} opened at {held.site}, which this role holds until "
+            f"{close}. On a {lap} that epoch is ready only after the held one is handed back, "
+            f"so the wait never returns (deadlock). Hand it back first{fix}"
+        )
 
     def _current(self, slot, op):
         """(index, phase, label) of the next use, without advancing."""
@@ -1583,7 +1659,7 @@ class _End:
     def _epoch(self, key):
         """Trace-time identity of the epoch the end's next use of ``key`` (a slot, None for a
         ring) takes, within one dynamic region."""
-        return self._rec.resets, self._rec.advances.get(key, 0)
+        return self._rec.resets, self._rec.taken(key)
 
     def _probeable(self, op: str):
         if self._chan.named:
@@ -1682,6 +1758,8 @@ class _End:
         wait for empty (producer) or full (consumer). Only an mbarrier wait may be skipped when
         the token's probe found it ready. Returns (index, phase, label)."""
         ready = None if token is None else self._take_token(token, slot, op)
+        self._check_slot(slot, op)
+        self._check_hold(slot, op)
         index, phase, label = self._next(slot, op)
         chan, producer = self._chan, isinstance(self, ProducerEnd)
         self._trace.record(chan.name, op, label)
@@ -1831,13 +1909,14 @@ class ConsumerEnd(_End):
         self._check_current()
         self._trace.record(chan.name, "skip", None, count=None if dynamic else n)
         advance_state(self._state, n)
-        self._advanced(None)
+        self._advanced(None, 0 if dynamic else n)
 
     def peek(self, slot=None) -> Preview:
         """Wait until the stage the next ``wait`` takes is full and return a read-only
         ``Preview`` of it, without advancing, arriving or opening a handle."""
         self._probeable("peek")
         index, phase, label = self._current(slot, "peek")
+        self._check_hold(slot, "peek")
         self._trace.record(self._chan.name, "peek", label)
         with wait_range(self._trace, f"{self._chan.name}.peek"):
             cute.arch.mbarrier_wait(self._full(index), phase)
