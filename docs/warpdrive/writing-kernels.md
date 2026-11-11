@@ -78,7 +78,7 @@ warp 4: load A/B -- ab: 3 SMEM stages --> warp 5: MMA
 | `ab` | TMA load → MMA | `ceil(K / 64)` | MMA completion releases the input stage |
 | `acc` | MMA → epilogue threads | 1 | Every epilogue thread releases the accumulator stage |
 
-An **epoch** is one exchanged value. A **stage** is a reusable storage slot:
+The [channel vocabulary](channels.md#stages-and-phases) separates epochs from reusable stages:
 
 ```text
 epoch:  0  1  2  3  4  5 ...
@@ -89,7 +89,7 @@ More stages let the producer get further ahead; they do not change how many valu
 exchanges. Producer and consumer epoch counts must match. With joined consumers, all readers
 must release before reuse. See [channels](channels.md) for other sharing policies.
 
-Include feedback in the diagram. What value or free slot lets the first role proceed?
+Include feedback in the diagram. What value or free stage lets the first role proceed?
 Balanced counts are not enough if every role starts by waiting for another.
 
 ## Declare storage and connect the roles
@@ -160,16 +160,9 @@ Predicate the data access, not the handoff. For a ragged output, every epilogue 
 and releases its handle; only in-bounds lanes store. Otherwise the barrier may wait forever
 for the lanes you excluded.
 
-Carry state and respect handle lifetimes:
-
-- Return every endpoint, cursor and turnstile seat from each role. An advancing helper must
-  also return its updated state, and its caller must reassign it.
-- Do not return handles, params or TMEM views.
-- Close a handle exactly once, within its opening dynamic region. Do not keep using its
-  pointers after release.
-- For non-nested lifetimes, use explicit `acquire/wait/commit/release`; see
-  [overlapping handles](channels.md#overlapping-handles). To hold a stage from a counted
-  loop's first iteration to its last, use a [span](channels.md#spans).
+Follow the [lifetime rule](guarantees.md#lifetimes). Use explicit
+[`acquire/wait/commit/release`](channels.md#overlapping-handles) for non-nested lifetimes,
+or a [span](channels.md#spans) across a counted loop.
 
 ## Wire the prologue, launch and cache
 
@@ -199,11 +192,10 @@ Test the cases that can expose lifetime or state errors:
 - Repeated launches and changed runtime shapes through one compiled entry point.
 - Every advertised cluster/schedule path; separate workspaces for concurrent launches.
 
-Use `op.describe()` before compilation for declaration checks, then after tracing for
-TMA/alias findings. Explain and test every `unverified` site. `no hazard found` is not a
-proof. For a new raw async handoff or overlapping storage, independently validate completion
-and ordering, including appropriate sanitizer checks. Investigate a timeout as a failure;
-do not extend the run until it passes.
+Use `op.describe()` before and after compilation, and read each result against the
+[safety contract](guarantees.md). Test unverified handoffs and overlapping storage independently,
+including appropriate sanitizer checks. Investigate a timeout as a failure; do not extend
+the run until it passes.
 
 Run the [repository testing tiers](https://github.com/meta-pytorch/attention-gym/blob/main/AGENTS.md#warpdrive-testing-tiers) before
 tuning stages, warps, registers, layouts or schedules. Hold workload and numerical checks

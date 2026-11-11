@@ -83,12 +83,9 @@ done: arrive by consumer; native id by watcher;
 A handle exposes `h.index`, `h.phase`, `h.full_barrier` (also `h.barrier`),
 `h.empty_barrier`, `h.data` and `h.view(...)`.
 
-`h.commit(signal=False)` or `h.release(signal=False)` closes the handle but emits
-**neither its signal nor its fences**. Supply both, with the effective count. This includes
-the derived `smem_async` fences: every ordinary reader of a TMA-filled stage, or writer of
-an MMA-consumed SMEM stage, runs `fence_async_shared()` before the raw arrival. See
-[Storage and fences](channels.md#storage-and-fences) for `release_fence` and `commit_fence`.
-The alias diagnostic marks ordering supplied only by a raw signal as `unverified`.
+`h.commit(signal=False)` or `h.release(signal=False)` closes the handle without signaling.
+Supply the signal, effective count and [fences](channels.md#storage-and-fences). See
+[raw code and opt-outs](guarantees.md#opt-outs) for which checks remain.
 
 Changing a count does not make a one-lane release safe. Conceptually:
 
@@ -123,11 +120,11 @@ The override does not select the arriving lane.
 
 | Override key | Replaces | Accepted values |
 |---|---|---|
-| `full_counts`, `empty_counts` | Expected arrivals | Positive int, per-slot list, or rank map of either form |
+| `full_counts`, `empty_counts` | Expected arrivals | Positive int, per-stage list, or rank map of either form |
 | `tx` | Bytes armed on FULL | Nonnegative int; requires a TMA channel |
 | `full_mask`, `empty_mask` | UMMA completion masks | Nonnegative int |
 
-Count lists need one entry per slot; rank maps must cover every CTA rank. Inspect:
+Count lists need one entry per stage; rank maps must cover every CTA rank. Inspect:
 
 - `end.scope`: effective counts, masks and transaction bytes, after overrides.
 - `end.channel.derived_scope`: values before overrides.
@@ -146,7 +143,7 @@ Managed ends expose:
 | `end.full_barrier(i)`, `end.empty_barrier(i)` | This CTA's mbarrier pointers |
 | `end.state` | Ring `PipelineState`, or Slots `Int32` phase mask |
 | `end.index` | Ring's next stage |
-| `end.phase(slot)` | Next wait parity; omit `slot` for a Ring |
+| `end.phase(slot)` | Next wait phase; omit `slot` for a Ring |
 | `self.barrier_ptr(name)` | Base pointer after `begin_roles()`, also available in roles |
 
 For `n` stages, FULL is `[0, n)` and EMPTY `[n, 2*n)` from the base. Raw code can wait with
@@ -154,9 +151,8 @@ For `n` stages, FULL is `[0, n)` and EMPTY `[n, 2*n)` from the base. Raw code ca
 `cute.arch.mbarrier_arrive(end.empty_barrier(st.index))`. Advance the state you read and
 restore it with `end.state = st` before the next managed call.
 
-Raw waits bypass handle-lifetime and alias-ordering checks. Reading **or** assigning
-`end.state` invalidates outstanding try tokens and unadopted previews. Even a read exposes
-live state that raw code may advance.
+Reading **or** assigning `end.state` invalidates outstanding try tokens and unadopted
+previews: even a read exposes live state that raw code may advance.
 
 Sharing changes the state contract:
 
@@ -188,7 +184,7 @@ The managed producer still uses `ring.produce()`.
 - Only CTA-local mbarrier channels with `Sharing.JOIN` on both sides are supported. There is
   no TMA multicast; raw code drives the side in each CTA.
 
-Alternatively, bind a managed role and use raw code through its endpoint state/accessors.
+Alternatively, bind a managed role and use raw code through its end's state/accessors.
 If neither side is managed, use `Barriers` instead.
 
 ### Tokens and previews
@@ -202,23 +198,21 @@ If neither side is managed, use `Barriers` instead.
 
 ### Named barriers and named channels
 
-For a declared `NamedBarrier`, `.id` and `.threads` let native code join the same generation
+For a declared `NamedBarrier`, `.id` and `.threads` let native code join the same epoch
 as managed `sync()`/`arrive()`:
 
 ```python
 cute.arch.barrier(barrier_id=nb.id, number_of_threads=nb.threads)
 ```
 
-Reading `.id` records `native id by ...`; the checker cannot see the native calls. Missing
-arrivals in a CTA with a native caller become `unverified`, not an error. Counts beyond that
-CTA's available role threads still raise. An ID read outside roles allows the whole block.
+Reading `.id` records `native id by ...`; see the
+[named-barrier boundary](guarantees.md#named-barriers) for native participation.
 
-A `sync="named"` channel exposes one `NamedBarrier` per slot through
+A `sync="named"` channel exposes one `NamedBarrier` per stage through
 `end.channel.full_barriers[s]` and `end.channel.empty_barriers[s]`.
 `op.named_barrier_ids` lists the allocated consecutive IDs. Use the objects' `.sync()` and
 `.arrive()`, or native `cute.arch.barrier`/`barrier_arrive` with their ID/count. Named channels
-have no mbarrier pointers and take no count overrides. Per-generation participation is
-never verified.
+have no mbarrier pointers and take no count overrides.
 
 `alias.named_barrier(id, n)` is for an ID no declaration owns. It checks collisions with
 layer, channel and `NamedBarrier` IDs; native `cute.arch` calls do not. See
@@ -242,19 +236,10 @@ body instead.
 
 ### Suppress one check
 
-`with unchecked(check, reason=...):` is the one per-site opt-out. It suppresses only that
-check inside the block and records the reason, line and suppressed findings in `describe()`.
-It changes diagnostics, not device synchronization. Three checks take it:
-
-- `"tma"`: copies through barrier pointers obtained inside the block skip the atom and byte checks.
-- `"fence"`: accesses annotated inside the block are left out of the
-  [fence check](channels.md#checking-explicit-fences).
-- `"liveness"`: channel and barrier ops inside the block are invisible to the liveness check,
-  which then reports the kernel `unverified`.
-
-Use a [span](channels.md#spans) to hold a stage across a counted loop; `signal=False`
-replaces signaling, not the handle's lifetime. Leave alias accesses unannotated or set
-`alias_check="off"`, carry a fresh `Token`, or use raw barriers.
+Use `with unchecked(check, reason=...):` only when you can justify skipping that check.
+See [raw code and opt-outs](guarantees.md#opt-outs) for accepted kinds and scope.
+A [span](channels.md#spans), a [carried token](channels.md#try-tokens) or raw barriers may
+express the protocol without suppressing a check.
 
 ## Compiler pitfall: saved indices across loops
 
@@ -287,17 +272,6 @@ There is no universal layer-level thread-index guard for arbitrary role bodies.
 
 ## Rules that still apply
 
-- **Counts are not identities.** An mbarrier count does not elect a lane or order other
-  threads' accesses before its arrival.
-- **Pointers are local.** Peer CTAs have barriers at the same offsets, but a pointer alone
-  is not a remote arrival. Raw signals must honor effective counts, target CTAs
-  (`end.targets`) and masks.
-- **Raw state is not checked ownership.** Accessors do not validate bounds or ownership:
-  `Slots.phase(slot)` checks for a Python int, not range or instance binding. Restoring old
-  `end.state` can silently break the protocol.
-- **Opt-outs add no ordering.** Document raw counts, completion waits and memory ordering at
-  the call site. Opt-out bookkeeping is tracing-global, not thread-safe; compile in isolated
-  processes rather than concurrent threads.
-- **Opt-outs certify nothing.** An access left unannotated is outside the
-  [alias diagnostic](storage.md#check-declared-aliases). A TMA opt-out is separate from a
-  copy the checker could not recognize.
+The [safety contract](guarantees.md) still applies to mixed managed/raw kernels. Document raw
+counts, completion waits, target CTAs and memory ordering at the call site; local pointers
+alone do not select a peer CTA.

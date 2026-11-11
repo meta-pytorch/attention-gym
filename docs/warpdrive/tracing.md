@@ -12,7 +12,7 @@ when its roles run. The built-in examples support both without changes to their 
 | When does a role work or wait? | [Tracing backends](#tracing-backends) | Instrumented runtime ranges |
 | How do those ranges relate to channels? | [Pipeline plan](#join-a-capture-to-the-pipeline-plan) | A per-CTA, work-item model |
 
-These views help diagnose a kernel; they do not prove correctness or performance.
+These views help diagnose a kernel; see the [limits of each check](guarantees.md).
 
 ## Inspect the kernel
 
@@ -100,9 +100,9 @@ Read one channel at a time:
   stage modes, overlaps and channel bindings after layouts are traced, plus the
   [alias diagnostic](storage.md#check-declared-aliases) for declared overlaps.
 
-`describe()` returns a string, **not a runtime history**. Counts alone do not establish
-progress: two roles can still wait for each other's first publication. For a timeout, locate
-the stuck wait's CTA, role and epoch before assigning a cause.
+`describe()` returns a string, not a runtime history. Its [liveness report](guarantees.md#liveness)
+names the counts and assumptions checked. For a timeout, locate the stuck wait's CTA, role
+and epoch before assigning a cause.
 
 ### Read check results as data
 
@@ -121,6 +121,8 @@ checks.aliases  # {("P", "S"): "no hazard found", ...} for declared overlaps
 | `channels[name].epochs` | `"verified"`, `"unverified"`, `"not checked yet"`; `None` without round-robin or exclusive sharing | `epochs` |
 | `aliases[(name, overlapped)]` | `"no hazard found"`, `"unverified"`, `"potential hazard"`; empty before a compile or with `alias_check="off"` | `name ~ overlapped` in the alias diagnostic |
 | `fences[(channel, "commit_fence" or "release_fence")]` | `"covered"`, `"unverified"`, `"missing fence"` per explicit fence; empty before a compile or with `alias_check="off"` | the [fence check](channels.md#checking-explicit-fences) |
+| `liveness` | `"verified"`, `"no deadlock found"`, `"unverified"`, `"error"` with a finding; `None` before a compile or with `liveness_check="off"` | `liveness` |
+| `min_stages[ring]` | eligible rings' minima for the [checked runs](guarantees.md#liveness); empty unless liveness passes | `min stages for liveness` |
 
 `describe()` supplies the evidence: copy sites, byte counts, epoch shares and findings.
 `"not checked yet"` means the instance has neither compiled nor restored a report.
@@ -200,14 +202,6 @@ from attn_gym.warpdrive.profiler import parse_iket
 from attn_gym.warpdrive.trace_session import role_summary
 
 print(role_summary(parse_iket("traces/gemm/capture.trace.json")))
-```
-
-```text
-role                 warp  items    p50 ns    p90 ns     wait     work
-epilogue                0    512   19312.0   22976.0    88.1%    11.9%
-...
-load                    4    512   19040.0   20160.0    86.4%    13.6%
-mma                     5    512   19392.0   20320.0    38.2%    61.8%
 ```
 
 Wait time needs `waits=True`; otherwise 0% means unrecorded, not wait-free. Without `op`,
@@ -466,41 +460,14 @@ would skip the trace. Other saved reports are restored on a hit; see
 
 ### TMA checks
 
-The check asks: **do recognized copies complete on the barrier and byte count you declared?**
-It follows direct SSA uses of channel barrier pointers and counts static copy boxes in the
-handle's opening region. You still supply `Tma(tx_bytes)`.
+Pass `h.barrier` as `tma_bar_ptr=` for tensor loads or `mbar_ptr=` for bulk
+`CopyBulkG2SOp` / `CopyBulkG2SMulticastOp` loads. Use `Cluster.multicast` for masks so the
+checker can relate the copy to the channel declaration. The report names copy sites,
+CTA groups and counted bytes per stage per CTA; bulk copies appear as `cp.async.bulk`.
 
-| Recognized operation | Accounting requirement |
-|---|---|
-| Tensor TMA load, `tma_bar_ptr=` | Directly in the handle's region, or its `elect_one()` block |
-| Bulk `cp.async.bulk` load, `mbar_ptr=` | Directly inside an `elect_one()` block of that region |
-| Multicast | Recognized `Cluster.multicast` mask |
-
-Bulk atoms `CopyBulkG2SOp` and `CopyBulkG2SMulticastOp` are recognized by type; multicast
-masks get the tensor-multicast check. Bulk loads complete on the issuing CTA's barrier,
-like group ONE, and **do not elect a lane themselves**. A direct, unelected bulk copy is
-issued by every active lane and leaves byte accounting `unverified`.
-
-Read the result literally:
-
-- **`ProtocolError`:** positively wrong CTA group, undeclared multicast, or a complete
-  byte-count mismatch. A bulk copy cannot satisfy a channel requiring group TWO. Wrong-group
-  and undeclared-multicast evidence rejects even if the byte total is incomplete.
-- **`verified`:** recognized group, bytes per stage per CTA, and source sites match.
-  Bulk reports say `cp.async.bulk`. Multicast counts the SMEM destination box; in a symmetric
-  partition this equals the issuer's delivery across its mask's CTAs.
-- **`unverified`:** inspection was incomplete; compilation continues with a warning and
-  reasons. Causes include unknown atoms, opaque pointers, nested/dynamic/conditional copies
-  other than `elect_one()`, unrecognized masks and unsupported IR.
-
-`verified` does **not** prove descriptor legality, disjoint writes or all async ordering.
-Nor does it certify a bulk copy's per-instruction transfer size: bulk copies move whole
-contiguous vectors, so give them flat views. Validate raw, unverified and opted-out uses
-independently.
-
-A separate context check inspects **direct fields** for MMA CTA span and unsupported
-group-TWO/multicast G2S atoms. It neither walks nested objects nor turns off for a per-use
-`unchecked("tma")`.
+Bulk copies do not elect a lane themselves: issue them inside `elect_one()` and give them
+flat contiguous views. See [TMA checks](guarantees.md#tma) for recognized mismatches,
+unverified uses and the separate context check.
 
 ## Join a capture to the pipeline plan
 
@@ -547,7 +514,7 @@ Reuse distances use traced per-item counts (restored by `jit_cache`); before com
 each channel is assumed used once per item. Inner K-loop occupancy is therefore coarse.
 Within-item feedback that would form a cycle is modeled as next-item feedback, not a
 per-stage causal model. Use explicit epochs and runtime waits for that finer question.
-The plan is not a liveness/race proof or a promised performance threshold.
+The plan's [coverage differs from compile-time checks](guarantees.md#what-a-successful-check-means).
 
 See [Pipeline analysis](profiler.md#pipeline-analysis) for the workflow, or the
 [pipeline reference](profiler-reference.md#pipeline-matching-and-analysis) for matching rules

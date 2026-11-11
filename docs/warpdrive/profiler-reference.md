@@ -178,7 +178,7 @@ stay nested; crossing ranges move to sibling overlap tracks. The writer and pipe
   (`wait_source="measured"`). Otherwise, waiting is estimated from the latest predecessor's
   end (`wait_source="inferred"`).
 - Analysis includes critical paths and slack, latest-arriving blockers, wait/busy time, buffer
-  occupancy and producer run-ahead. A ring slot becomes free after its last reader releases it.
+  occupancy and producer run-ahead. A ring stage becomes free after its last reader releases it.
 - RecMII (maximum cycle ratio) and per-role ResMII describe steady-state limits in the plan's
   logical weight units, not nanoseconds. Recurrences and rings come from symbolic dependencies,
   independent of the displayed iteration count.
