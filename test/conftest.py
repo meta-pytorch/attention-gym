@@ -1,5 +1,7 @@
 """Shared pytest fixtures."""
 
+import importlib
+import importlib.util
 import os
 import sys
 from collections import Counter
@@ -80,6 +82,27 @@ def _reset_shared_compile_wrapper() -> Iterator[None]:
     from torch._dynamo.external_utils import wrap_inline
 
     reset_code(wrap_inline(len).__code__)
+
+
+@pytest.fixture(autouse=True)
+def _check_real_kernel_fences(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject missing-fence verdicts in shipped kernels traced or restored during the test.
+
+    A cache hit whose compile function builds its kernel itself runs no trace and restores no
+    report, so this sees such a kernel only when it compiles cold.
+    """
+    if importlib.util.find_spec("cutlass") is None:
+        return
+    # Import now: a backend loaded lazily inside the test would otherwise escape the patch.
+    module = importlib.import_module("attn_gym.warpdrive.kernel")
+    original = module.WarpSpecialized._report_trace
+
+    def report(op):
+        original(op)
+        if type(op).__module__.startswith("attn_gym."):
+            assert "missing fence" not in op.checks().fences.values(), op.describe()
+
+    monkeypatch.setattr(module.WarpSpecialized, "_report_trace", report)
 
 
 @pytest.fixture

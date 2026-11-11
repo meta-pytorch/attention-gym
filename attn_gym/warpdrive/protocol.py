@@ -29,7 +29,8 @@ class ProtocolError(Exception):
 #   alias         accesses annotated inside the block are left out of the alias diagnostic
 #   token         wait/acquire(token=...) inside the block trust the readiness they are given: a
 #                 Token of any epoch or region, or a raw Boolean (an mbarrier try_wait result)
-CHECKS = ("unclosed", "cross_region", "tma", "alias", "token")
+#   fence         accesses annotated inside the block are left out of the fence check (fences.py)
+CHECKS = ("unclosed", "cross_region", "tma", "alias", "token", "fence")
 
 
 @dataclass
@@ -237,7 +238,8 @@ class Event:
 
     ``where`` lists enclosing dynamic regions outermost first as ``(block key, kind)``:
     ``loop`` for ``scf.for``/``scf.while``, ``if`` or ``other``. ``open`` holds the active
-    handle records. ``opted_out`` marks accesses inside ``unchecked("alias")``.
+    handle records. ``opted_out`` marks accesses inside ``unchecked("alias")``,
+    ``fence_opted_out`` those inside ``unchecked("fence")``.
     """
 
     kind: str
@@ -246,6 +248,7 @@ class Event:
     where: tuple
     open: tuple
     opted_out: bool = False
+    fence_opted_out: bool = False
 
 
 def _region_kind(block) -> str:
@@ -323,10 +326,12 @@ class RoleTrace:
 
     def event(self, kind: str, /, **data):  # positional: an event may carry a "kind" field
         site = user_site()
-        opted_out = False
+        opted_out = fence_opted_out = False
         if kind == "access":
-            opted_out = self.opt_out("alias", f"{data['storage'][1]} access at {site}")
-        ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out)
+            what = f"{data['storage'][1]} access at {site}"
+            opted_out = self.opt_out("alias", what)
+            fence_opted_out = self.opt_out("fence", what)
+        ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out, fence_opted_out)
         self.events.append(ev)
         return ev
 
