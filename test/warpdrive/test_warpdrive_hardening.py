@@ -435,6 +435,8 @@ def test_raw_state_and_raw_signal(requires_blackwell):
 class OptOutToy(WarpSpecialized):
     """Compiled only: ``mode`` leaves a handle open or closes it in another region."""
 
+    liveness_check = "off"
+
     def __init__(self, mode: str, opt_out: bool):
         self.mode, self.opt_out = mode, opt_out
         self.ch = Slots(1, Threads, Threads)

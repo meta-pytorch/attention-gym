@@ -39,8 +39,8 @@ with acc.consume() as h:
 ```
 
 A lane-dependent condition around the whole `with` changes arrivals without changing the
-count. Producing n+1 stages while consuming n can also compile. Balanced counts alone do not
-ensure progress: two roles may each wait for the other's first value.
+count. The [liveness check](#what-a-successful-check-means) leaves runtime branches
+unverified; predicate data accesses rather than synchronization.
 
 On an [exclusive-consumer ring](channels.md#exclusive-consumers), every epoch needs exactly
 one owner. This is checked only for static waits and skips. A wait after more than one ring
@@ -91,7 +91,7 @@ resource use.
 ## What a successful check means
 
 - **`describe()`:** checks declarations and reports derived roles, counts, masks, storage and
-  budgets. Body checks appear only after compilation. `jit_cache` restores saved TMA/alias
+  budgets. Body checks appear only after compilation. `jit_cache` restores saved TMA/alias/fence
   reports and warnings; the examples compile protocol-traced builds uncached.
 - **Compilation:** checks local handle lifetimes, returned state and recognizable work loops.
   It checks attributable TMA operations and binds try tokens/previews to their end, epoch and
@@ -99,13 +99,23 @@ resource use.
   It rejects a wait for a stage the same role still holds
   ([overlapping handles](channels.md#overlapping-handles)).
   Exclusive/round-robin epoch ownership is checked when all acquires, waits and skips are
-  static. It does not prove balanced epochs across arbitrary role bodies or a live dependency
-  graph.
+  static.
+- **Liveness:** `verified` means balanced, acyclic straight-line managed channel ops in one
+  CTA, including already-expanded compile-time loops, ring reuse, acquired-slot tails and
+  named-channel rendezvous on both sides. Runtime regions, raw roles/state/barriers/signals,
+  external sides, overrides, TMA/async completion, cross-CTA placement, spans, retire, skips,
+  turnstiles, standalone named barriers and unknown epochs are `unverified`. Node/edge budgets,
+  opt-outs and analysis failures are unverified too; no runtime inputs are sampled.
+  Supported cycles, starved waits and imbalances are `error`: `liveness_check="strict"` raises
+  with sites and an override, `"warn"` warns and `"off"` skips this independent pass.
 - **TMA `verified`:** recognized group and byte accounting, not descriptor legality, disjoint
   writes or async safety. Inspect the reasons for any `unverified` use.
 - **Alias `no hazard found`:** no conflicting annotated pair under the diagnostic's rules,
   not proof of safe aliasing. Clusters, raw accesses, round-robin channels and orderings
   through exclusive-ring epochs have [limited or no coverage](storage.md#read-the-result).
+- **Fence `covered`:** no missing or unverified fence requirement was found for the accesses
+  examined by the [fence check](channels.md#checking-explicit-fences). Unannotated accesses
+  are not checked.
 - **Passing tests:** evidence for the shapes, schedules and toolchain tested. Profiling plans
   and protocol logs prove neither liveness nor performance.
 
@@ -113,6 +123,33 @@ Invalid configurations generally raise `ValueError`; invalid bindings and traced
 raise `ProtocolError`. Read the message and any nested compiler cause. **There is no public
 numbered error-code API.** E/R/U/G labels in fuzz reports name test cases and contract clauses,
 not exception attributes or message prefixes.
+
+## Hardware assumptions
+
+The layer relies on three ordering assumptions:
+
+- **`tcgen05` completion orders the MMA's SMEM reads before later generic writes.** PTX states
+  this implicit proxy fence for `cp.async.bulk` and `wgmma`, not for `tcgen05`. A `Threads`
+  producer refilling a stage that an `Umma` consumer released relies on it.
+- **CTA-scope releases order reads before a remote refill.** When a thread releases another
+  CTA's barrier with `remote_scope="cta"`, the layer assumes its reads precede that CTA's
+  next fill ([Memory scope](clusters.md#memory-scope)).
+- **Ordering is preserved without the `tcgen05` thread-sync fences.** PTX's cross-thread
+  `tcgen05` pattern puts `tcgen05.fence::after_thread_sync` after a wait and
+  `::before_thread_sync` before an arrive. These are also
+  [compiler code-motion fences](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-special-sync-operations-fence).
+  Channels emit neither: omitting them assumes both execution and compiler ordering hold.
+  Emit them by hand in the role, as the KDA WY backward kernel does:
+
+```python
+from cutlass._mlir.dialects import nvvm
+
+h = acc.wait()
+nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
+...  # TMEM work and its required completion waits
+nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
+h.release()
+```
 
 ## Dropping down
 

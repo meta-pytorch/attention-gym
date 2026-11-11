@@ -413,6 +413,7 @@ class SpanLifetime(Toy):
 
     def __init__(self, mode: str, producer: bool = False, trips: int = 2):
         self.mode, self.producer, self.trips = mode, producer, trips
+        self.epochs = 1 + (trips if mode == "last_trip" else 1)  # the span's and the waits'
         self.ch = Ring(1, Threads, Threads)
 
     @cute.jit
@@ -447,7 +448,7 @@ class SpanLifetime(Toy):
     def prod(self, ctx, *, ch: Producer):
         if cutlass.const_expr(self.producer):
             return self.spanned(ctx, ch, lambda c: c.acquire().commit())
-        for _ in cutlass.range_constexpr(4):
+        for _ in cutlass.range_constexpr(self.epochs):
             with ch.produce():
                 pass
         return ch
@@ -457,7 +458,7 @@ class SpanLifetime(Toy):
     def cons(self, ctx, *, ch: Consumer):
         if cutlass.const_expr(not self.producer):
             return self.spanned(ctx, ch, lambda c: c.wait().release())
-        for _ in cutlass.range_constexpr(4):
+        for _ in cutlass.range_constexpr(self.epochs):
             with ch.consume():
                 pass
         return ch
@@ -504,3 +505,203 @@ def test_holds_that_may_be_free_compile(make, key):
 
 def test_a_dynamic_slot_still_names_the_slot_rule():
     raises_protocol(r"needs a Python int slot", lambda: compile_toy(Arms("dynamic_slot"), "dyn"))
+
+
+class Graph(Toy):
+    """``mode`` selects a protocol over ``a`` (p -> q) and ``b`` (q -> p)."""
+
+    def __init__(self, mode: str, liveness_check: str = "strict"):
+        self.mode, self.liveness_check = mode, liveness_check
+        self.a = Ring(1, Threads, Threads)
+        self.b = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer, b: Consumer):
+        mode = self.mode
+        if cutlass.const_expr(mode == "cross"):  # each waits for what the other sends after
+            with b.consume(), a.produce():
+                pass
+        elif cutlass.const_expr(mode in ("static", "unchecked", "state", "unbalanced")):
+            with a.produce():
+                pass
+            with b.consume():
+                pass
+            if cutlass.const_expr(mode == "unbalanced"):
+                with a.produce():
+                    pass
+        else:
+            for _ in cutlass.range(ctx.n, unroll=1):
+                with a.produce():
+                    pass
+                with b.consume():
+                    pass
+            if cutlass.const_expr(mode == "unbalanced_n"):  # one fill more than the n taken
+                with a.produce():
+                    pass
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, b: Producer):
+        mode = self.mode
+        if cutlass.const_expr(mode in ("cross", "static", "unchecked", "state", "unbalanced")):
+            if cutlass.const_expr(mode == "unchecked"):
+                with unchecked("liveness", reason="raw code orders this handoff"), a.consume():
+                    pass
+            else:
+                with a.consume():
+                    pass
+            if cutlass.const_expr(mode == "state"):
+                b.state = b.state
+            with b.produce():
+                pass
+        else:
+            for _ in cutlass.range(ctx.n, unroll=1):
+                if cutlass.const_expr(mode == "lane"):
+                    if cute.arch.lane_idx() == 0:
+                        with a.consume():
+                            pass
+                else:
+                    with a.consume():
+                        pass
+                with b.produce():
+                    pass
+        return a, b
+
+
+def test_straight_line_cross_wait_reports_sites_and_override():
+    raises_protocol(
+        r"deadlock:.*test_warpdrive_deadlock.*Override with unchecked",
+        lambda: compile_toy(Graph("cross"), "small_cross"),
+    )
+
+
+@pytest.mark.parametrize(
+    "mode, prefix",
+    [
+        ("static", "liveness: verified"),
+        ("loop", "liveness: unverified (runtime loop/branch or unknown region: p at test_"),
+        ("unbalanced_n", "liveness: unverified (runtime loop/branch"),
+        ("lane", "liveness: unverified (runtime loop/branch"),
+        ("unchecked", 'liveness: unverified (unchecked("liveness")'),
+        ("state", "liveness: unverified (b.state"),
+    ],
+)
+def test_extracted_coverage_is_explicit(mode, prefix):
+    op = Graph(mode)
+    compile_toy(op, f"small_{mode}")
+    assert prefix in op.describe()
+    assert op.checks().liveness == prefix.split(": ")[1].split(" (")[0]
+    restored = Graph(mode)
+    compile_toy(restored, f"small_{mode}")
+    assert restored.describe() == op.describe()
+
+
+def test_static_imbalance_is_an_error():
+    raises_protocol("unbalanced epochs", lambda: compile_toy(Graph("unbalanced"), "imbalance"))
+
+
+def test_warn_and_off_modes():
+    op = Graph("cross", "warn")
+    with pytest.warns(UserWarning, match="deadlock"):
+        compile_toy(op, "small_warn")
+    assert op.checks().liveness == "error"
+    assert "liveness: error (see the reported finding)" in op.describe()
+    op = Graph("cross", "off")
+    compile_toy(op, "small_off")
+    assert op.checks().liveness is None
+
+
+class NamedJoin(Toy):
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads, sync="named")
+        self.b = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p1(self, ctx, *, a: Producer, b: Producer):
+        a.acquire().commit()
+        b.acquire().commit()
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def p2(self, ctx, *, a: Producer, b: Consumer):
+        b.wait().release()
+        a.acquire().commit()
+        return a, b
+
+    @role(warps=2)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        a.wait().release()
+        return a
+
+
+class NamedCommit(Toy):
+    def __init__(self, absent=False):
+        self.absent = absent
+        self.a = Ring(1, Threads, Threads, sync="named")
+        self.b = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer, b: Producer):
+        a.acquire().commit(wait=True)
+        b.acquire().commit()
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, b: Consumer):
+        b.wait().release()
+        if cutlass.const_expr(not self.absent):
+            a.wait().release()
+        return a, b
+
+
+@pytest.mark.parametrize(
+    "make, finding",
+    [
+        (NamedJoin, "deadlock"),
+        (NamedCommit, "deadlock"),
+        (lambda: NamedCommit(True), "unbalanced epochs"),
+    ],
+)
+def test_named_channel_extraction(make, finding):
+    raises_protocol(finding, lambda: compile_toy(make(), "named_extraction"))
+
+
+class RawBarrier(Toy):
+    def __init__(self, mode):
+        self.mode = mode
+        self.a = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        a.acquire().commit()
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        h = a.wait()
+        if cutlass.const_expr(self.mode == "handle"):
+            ptr = h.empty_barrier
+        elif cutlass.const_expr(self.mode == "kernel"):
+            ptr = self.barrier_ptr("a")
+        else:
+            ptr = a.full_barrier(1)
+        h.release()
+        cute.arch.mbarrier_wait(ptr, 0)
+        return a
+
+
+@pytest.mark.parametrize("mode", ["end", "handle", "kernel"])
+def test_raw_barrier_pointer_extraction_is_unverified(mode):
+    op = RawBarrier(mode)
+    compile_toy(op, f"raw_barrier_{mode}")
+    assert op.checks().liveness == "unverified"
+    assert "barrier" in op._ws_liveness.detail
