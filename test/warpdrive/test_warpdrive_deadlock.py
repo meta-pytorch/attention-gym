@@ -321,9 +321,6 @@ class RoundRobinHold(Toy):
         return ch
 
 
-HELD = {}
-
-
 class Arms(Toy):
     """``mode`` places a held handle and a later wait where they never run together, or holds
     one slot while waiting on another."""
@@ -354,15 +351,11 @@ class Arms(Toy):
         mode = self.mode
         if cutlass.const_expr(mode == "arms"):
             if ctx.n > 1:
-                with unchecked("unclosed", reason="released in the matching branch below"):
-                    HELD["arms"] = ch.wait()  # a staged branch cannot carry a handle out
+                ch.wait()  # held past its arm
             else:
                 for _ in cutlass.range_constexpr(2):
                     with ch.consume():
                         pass
-            if ctx.n > 1:
-                with unchecked("cross_region", reason="opened in the matching branch above"):
-                    HELD["arms"].release()
         elif cutlass.const_expr(mode == "other_slot"):
             held = ch.wait(0)
             for _ in cutlass.range_constexpr(2):
@@ -407,6 +400,18 @@ class DynamicSkipHold(SkipHold):
         return ch
 
 
+@cute.jit
+def _acquired(end):
+    end.acquire().commit()
+    return end
+
+
+@cute.jit
+def _waited(end):
+    end.wait().release()
+    return end
+
+
 class SpanLifetime(Toy):
     """``mode`` places a wait on ``ch`` around a span of the consumer (``producer=True``: the
     producer, acquires) over a ``trips``-trip loop."""
@@ -421,7 +426,7 @@ class SpanLifetime(Toy):
         mode = self.mode
         s = ch.span()
         if cutlass.const_expr(mode == "before_begin"):
-            take(ch)
+            ch = take(ch)
         for i in cutlass.range(self.trips):
             s.begin(i)
             if cutlass.const_expr(mode == "after_loop"):
@@ -431,23 +436,23 @@ class SpanLifetime(Toy):
             else:
                 s.release(i)
             if cutlass.const_expr(mode == "last_trip"):
-                take(ch)
+                ch = take(ch)
             elif cutlass.const_expr(mode == "branch"):  # runs after the last-trip signal
                 if i == self.trips - 1:
-                    take(ch)
+                    ch = take(ch)
         if cutlass.const_expr(mode == "after_loop"):
             if cutlass.const_expr(self.producer):
                 s.commit()
             else:
                 s.release()
-            take(ch)
+            ch = take(ch)
         return ch
 
     @role(warps=0)
     @cute.jit
     def prod(self, ctx, *, ch: Producer):
         if cutlass.const_expr(self.producer):
-            return self.spanned(ctx, ch, lambda c: c.acquire().commit())
+            return self.spanned(ctx, ch, _acquired)
         for _ in cutlass.range_constexpr(self.epochs):
             with ch.produce():
                 pass
@@ -457,7 +462,7 @@ class SpanLifetime(Toy):
     @cute.jit
     def cons(self, ctx, *, ch: Consumer):
         if cutlass.const_expr(not self.producer):
-            return self.spanned(ctx, ch, lambda c: c.wait().release())
+            return self.spanned(ctx, ch, _waited)
         for _ in cutlass.range_constexpr(self.epochs):
             with ch.consume():
                 pass
@@ -486,7 +491,6 @@ def test_holds_of_other_shapes_raise(make, key, error):
     [
         (lambda: RoundRobinHold(4), "rr"),  # each instance's next epoch is two stages on
         (lambda: HoldAndWait("lap_in_loop", 3, 3), "lap_in_loop"),  # a later trip: not checked
-        (lambda: Arms("arms"), "arms"),  # the hold and the waits never run together
         (lambda: Arms("other_slot"), "other_slot"),
         (ExternalHold, "external"),  # raw code may never wait for the hand-back
         (DynamicSkipHold, "dynamic_skip"),  # skip(0) keeps the next wait one stage on
@@ -501,6 +505,13 @@ def test_holds_of_other_shapes_raise(make, key, error):
 )
 def test_holds_that_may_be_free_compile(make, key):
     compile_toy(make(), f"free2_{key}")
+
+
+def test_a_handle_held_past_its_arm_is_a_lifetime_error_not_a_deadlock():
+    """The other arm's waits never run with the hold; the leak is what is wrong."""
+    raises_protocol(
+        r"handles never closed: ch\[i\] wait", lambda: compile_toy(Arms("arms"), "arms")
+    )
 
 
 def test_a_dynamic_slot_still_names_the_slot_rule():
@@ -613,6 +624,10 @@ def test_warn_and_off_modes():
     assert op.checks().liveness is None
 
 
+def _publish(end):  # advances ``end`` in place and returns nothing
+    end.acquire().commit()
+
+
 class NamedJoin(Toy):
     def __init__(self):
         self.a = Ring(1, Threads, Threads, sync="named")
@@ -705,3 +720,32 @@ def test_raw_barrier_pointer_extraction_is_unverified(mode):
     compile_toy(op, f"raw_barrier_{mode}")
     assert op.checks().liveness == "unverified"
     assert "barrier" in op._ws_liveness.detail
+
+
+class InPlaceHelper(Toy):
+    """Without reassignment, the loop reuses the end's initial stage and phase every trip."""
+
+    def __init__(self):
+        self.ch = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, ch: Producer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            _publish(ch)
+        return ch
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, ch: Consumer):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ch.consume():
+                pass
+        return ch
+
+
+def test_an_end_advanced_where_no_region_carries_it_raises():
+    raises_protocol(
+        r"prod: the ch end advances at .* inside a loop or branch that does not carry it",
+        lambda: compile_toy(InPlaceHelper(), "inplace_helper"),
+    )

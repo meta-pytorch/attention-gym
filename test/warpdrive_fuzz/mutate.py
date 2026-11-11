@@ -229,7 +229,7 @@ def mutations() -> list[Mutation]:
             message="only consumers of an exclusive ring",
         ),
         Mutation(
-            "helper_discards_end", "U10", loop + "    self.step(ch)", error=None, obligation=True
+            "helper_discards_end", "U10", loop + "    self.step(ch)", message="does not carry it"
         ),
         Mutation(
             "unbalanced_epochs",
@@ -248,7 +248,7 @@ def mutations() -> list[Mutation]:
         Mutation(
             "unchecked_no_reason",
             "E77",
-            'with unchecked("unclosed", reason=""):\n    ch.acquire(SLOT)',
+            'with unchecked("tma", reason=""):\n    ch.acquire(SLOT)',
             error=ValueError,
             message="non-empty reason",
         ),

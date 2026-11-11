@@ -26,7 +26,7 @@ producer acquires EMPTY stage
 The stage count is capacity, not a consumer count. FULL/EMPTY barriers hold protocol state,
 not data. A channel without `payload=` or `buffer=` allocates no payload storage.
 
-Roles receive [producer and consumer endpoints](roles.md#arguments) by parameter name.
+Roles receive [producer and consumer ends](roles.md#arguments) by parameter name.
 Use a handle to hold one stage while working on it:
 
 ```python
@@ -37,14 +37,21 @@ with ab.consume() as h:
     ...  # read stage h.index; release on exit
 ```
 
-These are separate producer and consumer excerpts. The endpoint tracks the next stage;
-the handle owns the current one. Return the updated endpoint from the role.
+These are separate producer and consumer excerpts. Return the updated end from the role.
 
 ## Stages and phases
 
-`Ring` selects stages in order; `Slots` lets you select one explicitly. An **epoch** is one
-use of a stage. A **phase** is the parity bit that distinguishes successive uses of the
-same mbarrier; it is not a full epoch counter.
+A **stage** is one unit of reusable channel capacity. `Ring` selects stages in order;
+a **slot** is an explicitly selected stage of `Slots`. An **epoch** is one exchange,
+numbered in ring order or per slot; for a standalone named barrier, one use of that barrier.
+A **phase** is the mbarrier wait's parity bit, not an epoch counter. It repeats every two
+uses of the same barrier. Named barriers have no phase bit.
+
+An **end** is a role's advancing channel state; a **handle** holds one taken stage while the
+end moves on. **Acquire** takes an empty stage; **wait** takes a full one. A producer
+**commits** to publish it; a consumer **releases** it for reuse. A **signal** is the mechanism
+that completes either handoff; an **arrival** contributes to a barrier's count. A commit or
+release need not complete synchronously, and a TMA commit emits no arrival.
 
 For zero-based operation `k` on an `n`-stage ring end without round-robin rotation:
 
@@ -67,8 +74,8 @@ The opposite initial phases let producers acquire empty stages while consumers w
 first publication. Matching epochs preserve publication order and prevent reuse until all
 declared consumers release.
 
-**Acquire/wait advances the endpoint; commit/release does not.** A handle keeps its index
-and phase after the endpoint moves on. In each CTA, full mbarriers occupy `[0, n)` and empty
+**Acquire/wait advances the end; commit/release does not.** A handle keeps its index
+and phase after the end moves on. In each CTA, full mbarriers occupy `[0, n)` and empty
 mbarriers `[n, 2*n)` from the channel's base.
 
 The mechanisms choose what completes the handoff:
@@ -87,9 +94,31 @@ SMEM, whichever CTA issues the copies. See [multicast](clusters.md#multicast) fo
 A single-mechanism TMA or UMMA side binds to one single-warp role: one active instance per
 epoch for round-robin, or one owner per epoch for [exclusive consumers](#exclusive-consumers).
 
+## CUTLASS crosswalk
+
+CUTLASS's state-taking calls leave advancement to the caller. Warpdrive's `acquire()`/`wait()`
+advance the end and return a handle for the taken stage; the APIs are not interchangeable.
+
+| CUTLASS Python API | warpdrive counterpart |
+|---|---|
+| `PipelineAsync` with async-thread sides | `Ring(n, Threads, Threads)` |
+| `PipelineTmaUmma` | `Ring(n, Tma(bytes_per_cta), Umma)`; acquire arms bytes, TMA completes FULL, UMMA releases EMPTY |
+| `producer_acquire(state)` / `consumer_wait(state)` | `end.acquire()` / `end.wait()` |
+| `producer_commit(state)` / `consumer_release(state)` | `h.commit()` / `h.release()` |
+| `producer_try_acquire(state)` / `consumer_try_wait(state)` | `end.try_acquire()` / `end.try_wait()`; a checked `Token`, not a raw Boolean |
+| `NamedBarrier.arrive_unaligned()` | `NamedBarrier.arrive()`; warpdrive allocates the ID |
+| `NamedBarrier.arrive_and_wait()` | `NamedBarrier.sync(aligned=True)`; warpdrive defaults to unaligned sync |
+
+The definitions are in CUTLASS's `cutlass/pipeline/sm90.py`, `sm100.py` and `helpers.py`,
+and warpdrive's
+[`channels.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/channels.py)
+and [`named.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/named.py).
+Cluster byte counts and targets follow [placement](clusters.md#placement-rules), not a direct
+copy of CUTLASS constructor arguments.
+
 ## Counts come from the roles
 
-For CTA-local mbarriers, each slot's count sums its bound roles' contributions:
+For CTA-local mbarriers, each stage's count sums its bound roles' contributions:
 
 | Mechanism | Contribution per role instance |
 |---|---|
@@ -102,18 +131,9 @@ Thus the four-warp consumer above supplies 4 EMPTY arrivals with `Warps`, or 128
 targets follow the [placement rules](clusters.md#placement-rules); `Warps` counts one arrival
 per warp of each signalling CTA.
 
-For both `Threads` and `Warps`, **predicate data accesses, not the handoff**:
-
-```python
-with acc.consume() as h:
-    if output_in_bounds:
-        ...  # only valid lanes store; every role thread releases
-```
-
-Putting the whole `with` under `if output_in_bounds` changes participation, not the count.
-With `Warps`, every lane runs the declared fence and `bar.warp.sync` before the elected
-arrival. That sync orders the lanes' accesses; a missing lane can strand its warp.
-Compilation does not prove participation or matching producer/consumer loop counts.
+For both `Threads` and `Warps`, predicate data accesses, not the handoff. A missing lane
+can strand its warp. See [participation](guarantees.md#participation) and the
+[liveness check](guarantees.md#liveness) for what tracing establishes.
 
 `Warps` requires mbarriers; named channels count threads and reject it. Prefer it for
 multi-warp releases: FA4 and CUTLASS signal per warp.
@@ -138,18 +158,10 @@ for i in cutlass.range(n_blocks - 1, unroll=1):
 
 `pv`/`qk` stand for the kernel's MMA code. Nested `with` blocks would release K first.
 
-- Close each handle exactly once, in the dynamic loop/branch region that opened it.
-  Missing, double or cross-region closes raise `ProtocolError` with source locations.
-  A [span](#spans) holds a stage from a loop's first iteration to its last.
-- Do not wait for a stage you still hold. An acquire, wait, `peek()` or span `begin()` a ring
-  lap or more past a handle of the same end (one epoch on a `Slots` slot) never returns; the
-  handle's close raises. A span is held from `span()` to its signal. Steps on a later loop trip
-  are not counted. Closes that may hand the stage back earlier pass: `signal=False`, a `Tma`
-  commit and `external=` sides.
-- Return the updated endpoint, not handles, at role exit.
-- `h.retire()` closes a final unused producer acquire without publication; no consumer may
-  need it. Automatically tailed pair channels reject it.
-- Do not use payloads/pointers after close. The checker is not an ownership system.
+Follow the [lifetime rule](guarantees.md#lifetimes) and
+[held-stage check](guarantees.md#participation). A [span](#spans) holds a stage from a loop's
+first iteration to its last. `h.retire()` closes a final unused producer acquire without
+publication; automatically tailed pair channels reject it because that stage cannot drain.
 
 ## Storage and fences
 
@@ -226,31 +238,11 @@ Explicit values **replace**, not extend, defaults. Include `"smem_async"` when a
 including defaults. Other async work, including TMA stores and TMEM aliases, still needs
 its own completion waits and proxy fences.
 
-On declared overlaps, the alias diagnostic leaves TMEM-store handoffs without `"tmem_store"`
-and SMEM-store-to-async-reader handoffs without `"smem_async"` unverified.
-
 ### Checking explicit fences
 
-The fence check compares explicit `commit_fence`/`release_fence` values with
-[access annotations](storage.md#check-declared-aliases) recorded while the channel's handles
-were open. SMEM annotations require `buffer=` storage; `payload=` accesses are not recorded.
-A `Tma` producer implies a fill of the channel's SMEM; an `Umma` consumer implies a read.
-This catches `release_fence=()` on a TMA-filled buffer with annotated generic reads.
-
-`describe()` and `checks().fences` report `covered`, `unverified` or `missing fence`.
-A `fence_async_shared()` or another channel's managed fence after the access and before the
-signal counts when the trace establishes that it executes on that path. Uncertain conditional
-coverage is `unverified`. A TMEM handoff through another open channel can also be unverified:
-the check does not establish which epochs those channels pair.
-
-Missing annotations, raw roles and raw signals can leave requirements unverified. An
-`external=` opposite side is always `unverified`, even with a fully fenced override. A required
-`"tmem_store"` or `"tmem_load"` fence absent from the trace is `unverified`, not `missing fence`:
-manual `tcgen05.wait` calls are invisible. So is a handle that is never closed in the trace. Accesses inside
-`unchecked("fence", reason=...)` are skipped.
-
-Missing fences warn, or raise under `alias_check="strict"`; `"off"` skips the check.
-Explicit values always replace defaults. The check never inserts fences.
+Annotate accesses with [`view` or `access`](storage.md#check-declared-aliases), then inspect
+`describe()` or `checks().fences` after compilation. See [fence checks](guarantees.md#fences)
+for the verdicts and limits of manual fences and cross-channel ordering.
 
 ## TMEM
 
@@ -272,11 +264,11 @@ S uses 256 columns, O another 256, and P uses no additional allocation.
 ```
 
 - `tmem.ptr("S", stage)` returns an fp32 TMEM pointer; `tmem.cols("S", stage)` its column
-  offset. Here `stage` is a **Python int plan slot**, not a dynamic ring index.
-- To select a ring stage dynamically, build a tensor spanning the region's slots and index
+  offset. Here `stage` is a **Python int plan index**, not a dynamic ring index.
+- To select a ring stage dynamically, build a tensor spanning the region's entries and index
   it with `h.index`, as GEMM does. Reinterpret packed BF16 yourself.
 - Nonaliases occupy declaration-order intervals of `cols * slots`; each alias stays inside
-  its parent slot. Allocation rounds up to a power of two, 32–512 columns. Capacity,
+  its parent entry. Allocation rounds up to a power of two, 32–512 columns. Capacity,
   duplicate names and alias bounds are checked.
 
 **Every TMEM-using role, including raw roles, must take `tmem: Tmem`.** All declared users
@@ -287,8 +279,8 @@ or warp 0 if it is the only user. This overlaps warp 0's barrier initialization.
 warp frees. Clusters allocate after the cluster sync in `run_roles()`
 ([work and exit](clusters.md#work-and-exit)).
 
-Order S/P alias accesses yourself. The [alias diagnostic](storage.md#check-declared-aliases)
-can inspect annotated overlaps, not prove safety.
+See [alias annotations](storage.md#check-declared-aliases) and
+[alias checks](guarantees.md#aliases) before overlapping S/P accesses.
 
 ## Slots and instances
 
@@ -342,7 +334,7 @@ self.h = Ring(2, Tma(stage_bytes), {"mma": Umma, "cuda": Threads}, buffer=h_buf)
 ```
 
 The dict names every consumer role and its mechanism; it implies `consumer_roles`.
-Every key must bind a consumer endpoint, and no consumer role may be omitted. Both roles
+Every key must bind a consumer end, and no consumer role may be omitted. Both roles
 take every epoch. Each instance contributes its role's [count](#counts-come-from-the-roles).
 With a one-warp `mma` and an eight-warp `cuda`:
 
@@ -396,9 +388,9 @@ Constraints:
 - At least two instances of one role, with equal width. Either or both sides may rotate.
 - Loops must visit the instance's own epochs. Static trip-count mismatches raise; dynamic
   counts remain `unverified` by the [ownership check](#static-ownership-check).
-- Rotation continues across work items; a new item does not reset the endpoint.
+- Rotation continues across work items; a new item does not reset the end.
 - CTA-local only, with no multicast. On mbarrier rings, `n` must be a multiple of `k`.
-  The layer adds no turn-taking: parity is exact only if the waiter saw that stage's previous
+  The layer adds no turn-taking: a phase wait is exact only if the waiter saw that stage's previous
   epoch. With three instances on two stages, instance 2's first wait could pass before any fill.
 
 The [decode example](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) alternates KV blocks this way.
@@ -447,25 +439,14 @@ or assigning `end.state`, make ownership `unverified`. Skips stale outstanding
 
 ### Static ownership check
 
-This check needs static acquires, waits and skips, with no dynamic loop/branch except the
-work-item loop. Roles must use the channel consistently per item or per launch, with one
-joining instance opposite the shared side. Both sides round-robin, several joining instances,
-raw state or dynamic sequences remain `unverified`, with a reason.
+Use static acquires, waits and skips consistently per item or per launch, with one joining
+instance opposite the shared side. For round-robin instance `j` to resume at `j` next item,
+`k` must divide the item's epoch count. `describe()` reports `epochs  verified: ...` or
+`unverified (...)`; see [ownership coverage](guarantees.md#participation).
 
-For a checkable sequence, collection verifies:
-
-- Exactly one producer acquires each epoch, and exactly one consumer waits for each published
-  epoch. A final acquire closed with `retire()` has no consumer.
-- Consumers do not run past the producers.
-- Under a persistent schedule, each instance advances through every epoch of an item. For
-  round-robin instance `j` to resume at `j` next item, `k` must divide the item's epoch count.
-
-Violations raise. `describe()` reports `epochs  verified: ...` or `unverified (...)`.
-Unverified ownership is your obligation.
-
-**Ownership does not make a skipped-to parity wait exact.** Epoch `e` waits for
+**Ownership does not make a skipped-to phase wait exact.** Epoch `e` waits for
 `(e // n) % 2` at stage `e % n`. That wait is exact once epoch `e-n` was filled. Before
-then, an older generation can make it pass immediately.
+then, an older epoch can make it pass immediately.
 
 A consumer has enough history if its first wait is below `n` and each later wait follows
 a wait for epoch `e-n` or later. Join/valid round-robin consumers observe this themselves.
@@ -481,9 +462,8 @@ An exclusive consumer may skip it and need a rendezvous:
 The ownership report names the first wait needing this rendezvous, but inserts no handshake.
 Dynamic schedules leave the check to you; a consumer that skips the rendezvous can hang.
 
-The alias diagnostic checks an exclusive ring's same-stage release/reuse edge: its consumers
-are not an unordered fan-out. It cannot match owners across channels, so paths through this
-ring and another channel are `unverified` ("exclusive ring, epoch owners follow runtime skips").
+[Alias checks](guarantees.md#aliases) distinguish same-stage reuse from paths through
+another channel.
 
 ### Rendezvous recipe: FA4's QKIssued/PVIssued
 
@@ -519,7 +499,7 @@ self.qk_issued.sync()
 - Before QK waits for K(j), `j >= 3`, PV has issued V(j-3), the group just before it.
 
 Thus all earlier epochs were filled and both waits are exact at any ring depth. Each side
-syncs on one barrier between arrivals on the other; neither can arrive twice in a generation
+syncs on one barrier between arrivals on the other; neither can arrive twice in an epoch
 ([reusable rendezvous](#reusable-rendezvous)). PV's final `pv_issued` arrival is unmatched,
 as in FA4. That is sound for this `OneShot` decode, one item per CTA; a persistent version
 must balance it. These barriers also pace the two MMA warps.
@@ -560,13 +540,13 @@ an mbarrier channel. FA4's decode uses it for the shared running max.
 
 Initialization and reuse:
 
-- At role start, every consumer instance arrives once on its slots' EMPTY barriers: its
-  bound slot, all slots for an unbound nonrotating end, or slots `s % k == j` for round-robin
+- At role start, every consumer instance arrives once on its stages' EMPTY barriers: its
+  bound slot, all stages for an unbound nonrotating end, or stages `s % k == j` for round-robin
   instance `j` of `k`. This supplies the initial empty capacity.
 - Consumer work before its first explicit wait cannot publish data that the producer's
   first acquire depends on: the startup arrival already happened.
 - Final release is unmatched at exit. Keep participation balanced each epoch; a fast side
-  must not arrive twice in one generation.
+  must not arrive twice in one epoch.
 - If round-robin instances share a stage's barriers (`n % k != 0`), they could complete the
   barrier between themselves. Name an enabled turnstile over exactly those instances and
   acquire/wait inside its turn; tracing checks this.
@@ -596,7 +576,7 @@ self.max_done.arrive()  # correction: arrive and continue
 self.max_done.sync()  # load: arrive and wait
 ```
 
-Declare it in `__init__` and use `self.<name>` in managed or raw roles. A generation
+Declare it in `__init__` and use `self.<name>` in managed or raw roles. An epoch
 completes after `threads` arrivals through `sync()` or `arrive()`.
 
 - Default calls are unaligned, so participants can reach them from different code sites.
@@ -611,21 +591,9 @@ completes after `threads` arrivals through `sync()` or `arrive()`.
 - `describe()` lists IDs, counts and traced callers. Trace wait ranges wrap `sync()` in
   `<name>.sync`; [pipeline plans](tracing.md) model channels, not standalone named barriers.
 
-Checks and limits:
-
-- Count: a multiple of 32, at most 1024 and at most the kernel's thread count.
-- Observed users in a CTA must have enough threads to supply the count. If a role there (or
-  kernel code) read `.id`, native calls may supply missing arrivals: participation becomes
-  `unverified`. A count exceeding all available participating-CTA role threads still raises
-  (kernel code outside roles can use the whole block).
-- More observed threads than the count is allowed: a role may use only some warps, as in
-  FA4 backward's per-warpgroup epilogues.
-- `alias.named_barrier` rejects IDs outside 0–15 or owned by the layer, channels or declarations.
-- The layer does **not** check per-generation participation, balance or progress.
-
-For the alias diagnostic, `sync()` records the same event as `alias.named_barrier`. A sync
-counting exactly the calling role's threads orders its warps. `arrive()` does not provide
-that within-role edge: it does not wait before the arriving thread continues.
+The count is a multiple of 32, at most 1024 and at most the kernel's thread count. A role
+may use only some warps. See the [named-barrier contract](guarantees.md#named-barriers) for
+participation, liveness and alias checks.
 
 ### One-shot done flag
 
@@ -661,13 +629,13 @@ and fences.
 
 Use this once per launch, or once per item with at most one item per CTA (the `OneShot`
 [decode](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py)).
-Otherwise a fast publisher can add its next arrival to the current generation. Add an
+Otherwise a fast publisher can add its next arrival to the current epoch. Add an
 acknowledgement edge, or use a named channel's EMPTY barrier.
 
 **Racecheck can flag this pattern.** compute-sanitizer racecheck reports stores published
 by `arrive()` against reads after `sync()` on the same barrier (swap-AB decode's row sums are
 a known false positive). That is not a blanket suppression: for every new finding, recheck
-the accesses, participants, generations and emitted instructions.
+the accesses, participants, epochs and emitted instructions.
 
 ### Reusable rendezvous
 
@@ -680,12 +648,12 @@ for t in cutlass.range(n_tiles, unroll=1):
     ...  # read the other half
 ```
 
-Exactly `threads` participants must sync each generation. None can leave generation `g`
-until all arrive, so none arrives early for `g+1`. This does not protect data overwritten
+Exactly `threads` participants must sync each epoch. None can leave epoch `e`
+until all arrive, so none arrives early for `e+1`. This does not protect data overwritten
 after the sync from readers still using it.
 
 With arrive-only participants, your protocol must prevent a second arrival before the current
-generation completes. A wait on another edge can do that; the named channel's EMPTY wait is
+epoch completes. A wait on another edge can do that; the named channel's EMPTY wait is
 one example. `NamedBarrier` itself supplies no such edge.
 
 ## Spans
@@ -715,10 +683,8 @@ A consumer span waits for FULL in the first iteration, then closes with `release
 `release()`. Both closes accept `signal=False`. A span also exposes `index`, `phase`,
 `view()`, `data` and barrier pointers.
 
-Prefer acquiring before the loop when the role has no work to do first. You can also use an
-ordinary handle with `cutlass.range_constexpr`. A span keeps the loop dynamic and delays the
-wait. In WY, acquiring all four accumulators before the V loop is slower; unrolling spills
-the MMA warp.
+Prefer acquiring before the loop when the role has no work to do first. An ordinary handle
+also works with `cutlass.range_constexpr`; a span keeps the loop dynamic and delays the wait.
 
 Tracing checks, and raises `ProtocolError` otherwise:
 
@@ -738,8 +704,7 @@ Tracing checks, and raises `ProtocolError` otherwise:
 a previewed epoch). The [alias diagnostic](storage.md#check-declared-aliases) places a span's
 wait in its loop's first repetition and an in-loop signal in the last.
 
-Use the stage only between the wait and signal. Tracing does not catch accesses before
-`begin` in iteration 0 or before the loop.
+Use the stage only between the wait and signal; see [lifetime coverage](guarantees.md#lifetimes).
 
 ## Try tokens
 
@@ -763,14 +728,9 @@ A probe may suspend for a hardware-dependent time. **It is not a nonblocking pol
 no latency bound.** A token records readiness, not a stage index. It cannot arm, commit or
 release a stage; leaving it unused is harmless.
 
-Tracing rejects a token that:
-
-- Was built by hand or came from another end/channel/side.
-- Names a different slot.
-- Is stale: that end acquired/waited since the probe (that slot only for `Slots`), or raw
-  code read/assigned `end.state`. Even the same stage and parity a later lap is a new epoch.
-- Crosses a dynamic loop/branch region without a valid carry. A pre-loop token used unchanged
-  each iteration would be reused after the first iteration.
+A token belongs to its probing end's next epoch (the same slot for `Slots`). Acquiring,
+waiting or reading/assigning `end.state` makes it stale. Probe inside a dynamic region or
+carry a fresh token into each iteration; see [token checks](guarantees.md#lifetimes).
 
 Probe in the consuming region, as FA4 does inside an unrolled K-step loop, or carry the DSL
 value. CUTLASS mainloops use this pattern:
@@ -794,10 +754,8 @@ The back-edge check runs at role exit and names the probe on failure. After the 
 last probe remains usable (the entering probe for zero trips). A token merged by an `if`
 reassignment does not; probe after the branch.
 
-If the checker cannot follow your protocol, use a raw readiness `Boolean` (an
-`mbarrier_try_wait` result or manually carried `token.ready`) inside
-`with unchecked("token", reason=...)`. It trusts any Token/Boolean passed there;
-`describe()` records the opt-out and sites.
+`token=` takes only a `Token`. If the checker cannot follow your protocol, wait on the
+end's barriers with [raw code](dropping-down.md#drive-a-channel-end-by-state-and-pointer).
 
 Named channels reject probes and `token=`: their wait is itself an arrival. Probing is not
 automatically faster; measure before keeping it.
@@ -816,7 +774,7 @@ h.release()
 ```
 
 `peek()` waits for FULL and returns a read-only `Preview`, without arrival, handle or state
-advance. It is consumer-only and mbarrier-only. `preview.index`/`phase` identify the stage and parity;
+advance. It is consumer-only and mbarrier-only. `preview.index`/`phase` identify the stage and phase;
 `view(name, *coords, by=...)` and `access(name, by=...)` record reads. `write=True`, `commit`,
 `release` and `retire` raise. FA4 backward previews Q(t+1) for S(t+1) while Q(t)'s handle
 remains open for dK(t).
@@ -834,9 +792,7 @@ although at runtime the next iteration owns all but the final preview. Peel the 
 iteration, as backward does, so a peeled wait owns that final preview. CuTeDSL also refuses
 to carry a preview through a dynamic loop/branch that calls its methods.
 
-These checks do not prove runtime epoch matching, completion of asynchronous preview reads
-before release, or eventual producer publication. A preview is not a carried handle;
-handles still close in their opening region.
+See [preview lifetime limits](guarantees.md#lifetimes).
 
 ## Turnstiles
 

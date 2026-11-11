@@ -225,6 +225,7 @@ class TmaSpan(Toy):
 
 
 COUNTED = r"must run directly in the body of a `for i in cutlass\.range\(n\)` loop"
+CROSS = r"is in a different dynamic region .*inside the loop of begin\(\) pass the loop index"
 
 
 @pytest.mark.parametrize(
@@ -247,8 +248,8 @@ COUNTED = r"must run directly in the body of a `for i in cutlass\.range\(n\)` lo
         ("unclosed", r"handles never closed: ch\[i\] span opened at"),
         ("closed_twice", r"ch\[i\] span closed twice: commit at .*, then commit at"),
         ("other_loop", r"commit\(i\) at .* is in another loop than begin\(\) at"),
-        ("unguarded_in_loop", r"commit\(\) at .* is not in the region that opened the span"),
-        ("after_in_branch", r"commit\(\) at .* is not in the region that opened the span"),
+        ("unguarded_in_loop", rf"span opened at .* but commit at .* {CROSS}"),
+        ("after_in_branch", rf"span opened at .* but commit at .* {CROSS}"),
         ("retire", r"retire\(\) at .*: a span cannot be retired"),
         ("release", r"release\(\) on a ch\[i\] span handle; producer handles commit"),
         ("positional_signal", r"commit\(False\) at .*: a span's commit\(\) takes the loop index"),

@@ -432,71 +432,11 @@ def test_raw_state_and_raw_signal(requires_blackwell):
 # Per-site opt-outs
 
 
-class OptOutToy(WarpSpecialized):
-    """Compiled only: ``mode`` leaves a handle open or closes it in another region."""
-
-    liveness_check = "off"
-
-    def __init__(self, mode: str, opt_out: bool):
-        self.mode, self.opt_out = mode, opt_out
-        self.ch = Slots(1, Threads, Threads)
-
-    @role(warps=0)
-    @cute.jit
-    def prod(self, ch: Producer, ctx):
-        check = "unclosed" if self.mode == "leak" else "cross_region"
-        if cutlass.const_expr(self.mode == "leak"):
-            if cutlass.const_expr(self.opt_out):
-                with unchecked(check, reason="toy: left open on purpose"):
-                    ch.acquire(0)
-            else:
-                ch.acquire(0)
-        else:
-            h = ch.acquire(0)
-            for _ in cutlass.range(ctx.n, unroll=1):
-                if cutlass.const_expr(self.opt_out):
-                    with unchecked(check, reason="toy: closed in the loop on purpose"):
-                        h.commit()
-                else:
-                    h.commit()
-        return ch
-
-    @role(warps=1)
-    @cute.jit
-    def cons(self, ch: Consumer, ctx):
-        return ch
-
-    @cute.kernel
-    def kernel(self, out: cute.Tensor, n: cutlass.Int32):
-        self.begin_roles()
-        self.run_roles(SimpleNamespace(out=out, n=n))
-
-    @cute.jit
-    def __call__(self, out: cute.Tensor, n: cutlass.Int32, stream: cuda.CUstream):
-        self.kernel(out, n).launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
-
-
-@jit_cache
-def _compile_opt_out_toy(op):
-    fake = make_fake_compact_tensor(cutlass.Int32, (cute.sym_int(),), assumed_align=4)
-    name = f"warpdrive_opt_out_{op.mode}_{int(op.opt_out)}"
-    return compile_tvm_ffi(op, fake, cutlass.Int32(1), name=name)
-
-
-@pytest.mark.parametrize(
-    "mode, error, listed",
-    [
-        ("leak", r"handles never closed: ch\[0\] acquire", r"left open"),
-        ("cross", r"different dynamic region", r"ch\[0\] acquire commit at"),
-    ],
-)
-def test_opt_out_scopes_one_site(mode, error, listed):
-    raises_protocol(error, lambda: _compile_opt_out_toy(OptOutToy(mode, False)))
-    op = OptOutToy(mode, True)
-    _compile_opt_out_toy(op)
-    text = op.describe()
-    assert "unchecked " in text and "test_warpdrive_hardening.py:" in text
-    assert re.search(listed, text), text
+@pytest.mark.parametrize("check", ["unclosed", "cross_region", "alias", "token"])
+def test_checks_with_another_hatch_take_no_opt_out(check):
+    """Handles, the alias diagnostic and tokens have their own hatches (dropping-down.md)."""
+    with pytest.raises(ValueError, match=f"unknown check '{check}'"):
+        unchecked(check, reason="x").__enter__()
 
 
 # Host-side declarations: raw roles, Barriers, overrides
@@ -634,7 +574,7 @@ def test_pair_mask_override_wins():
         (lambda: Barriers(2, counts=[1]), ValueError, "Barriers counts must be 2 positive ints"),
         (lambda: Ring(2, Threads, Threads, override={"x": 1}), ValueError, "unknown override"),
         (lambda: _Overrides(full_counts=[1, 2, 3]).describe(), ProtocolError, "2 positive cou"),
-        (lambda: unchecked("unclosed", reason=" ").__enter__(), ValueError, "non-empty reason"),
+        (lambda: unchecked("tma", reason=" ").__enter__(), ValueError, "non-empty reason"),
         (lambda: unchecked("arrivals", reason="x").__enter__(), ValueError, "unknown check"),
     ],
     ids=["raw_role_end", "barrier_counts", "override_key", "override_counts", "reason", "check"],

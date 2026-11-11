@@ -4,7 +4,7 @@
 
 Use `attn_gym.warpdrive.cache` to compile a CuTeDSL kernel once and reuse the compiled result.
 It keeps results in memory for repeated calls and on disk for later processes. Every CuTeDSL
-kernel in this repository uses it, including kernels that do not use warpdrive's warpspec features.
+kernel in this repository uses it, including kernels without warp-specialized roles.
 
 You normally need just two pieces: a function that describes how to compile your kernel, and
 `@jit_cache` on that function. The cache handles saving and loading the result. Importing the
@@ -167,7 +167,7 @@ in with two methods:
 - `__cute_restore_trace__(record)` restores it onto the object receiving a cache hit.
 
 Normal memory and disk hits restore these records. Warpdrive uses them to restore `describe()`,
-TMA and alias reports, and warnings. The advanced `by_static_key` and `by_args` lookup paths
+check reports and warnings. The advanced `by_static_key` and `by_args` lookup paths
 below do not restore records on their fast-path hits.
 
 ### Force a new trace
@@ -176,7 +176,7 @@ Sometimes you need tracing to run again, rather than restoring a saved report. T
 hook lets you select those calls without disabling caching for everything else.
 
 For example, warpdrive's [protocol tracing](tracing.md#trace-the-protocol) records where a
-kernel acquires, commits, waits on and releases channel slots. These are source locations
+kernel acquires, commits, waits on and releases channel stages. These are source locations
 collected during compilation, not a timeline of GPU execution. The examples use this hook to
 get a fresh protocol log when `op.trace_protocol` is enabled:
 

@@ -369,7 +369,7 @@ def declaration_cases(seed: int) -> list[DeclarationCase]:
     reject("missing Barriers", "E11", lambda: collect_one(("bars", Barriers)), "no Barriers named")
 
     def enter_unchecked(reason):
-        with unchecked("unclosed", reason=reason):
+        with unchecked("tma", reason=reason):
             pass
 
     for value in ("", "   ", None, 1):
