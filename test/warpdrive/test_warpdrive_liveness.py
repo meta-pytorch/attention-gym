@@ -1,5 +1,6 @@
 """Finite protocol graphs, independent of CuTe tracing and compilation."""
 
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -142,11 +143,11 @@ def test_internal_exception_never_fails_compilation(monkeypatch):
 
     monkeypatch.setattr(liveness, "_analyze", broken)
     assert "analysis failed" in analyze({}, []).detail
-    monkeypatch.setattr(liveness, "_extract", broken)
+    monkeypatch.setattr(liveness, "_channels", broken)
     assert "analysis failed" in check(None, []).detail
 
 
-def fixture_trace(events=(), **changes):
+def fixture_trace(events=(), peer_events=None, tma_verdict="verified", **changes):
     role = SimpleNamespace(name="p", role=object())
     peer = SimpleNamespace(name="q", role=object())
     chan = SimpleNamespace(
@@ -159,6 +160,7 @@ def fixture_trace(events=(), **changes):
         consumers=[(peer, None)],
         fixed=False,
         named=False,
+        internal=False,
         mechanism=lambda *args: Threads,
         sharing=lambda *args: Sharing.JOIN,
         turns=lambda *args: 1,
@@ -169,8 +171,11 @@ def fixture_trace(events=(), **changes):
         _ws_chans={"a": chan},
         _ws_raw_bars={},
         _ws_raw_barrier_access="",
+        _ws_tma={"a": SimpleNamespace(verdict=tma_verdict)},
     )
     roles = [RoleEvents("p", (0,), False, list(events), None)]
+    if peer_events is not None:
+        roles.append(RoleEvents("q", (1,), False, list(peer_events), None))
     return kernel, roles
 
 
@@ -186,27 +191,46 @@ def close(producer=True, slot=None, order=0, **kwargs):
     return take("commit" if producer else "release", slot, order, **kwargs)
 
 
+def barrier(threads=32, native=False):
+    return SimpleNamespace(threads=threads, _native_outside_roles=native)
+
+
+LOOP = ((0, "loop"),)
+
+
+def extracted(kernel, roles, trips=1):
+    channels = liveness._channels(kernel)
+    events = {r.name: liveness._events(r, channels, defaultdict(set)) for r in roles}
+    return channels, liveness._ops(channels, events, trips)
+
+
 @pytest.mark.parametrize(
     "changes, events, why",
     [
         ({"external": "raw"}, [], "external"),
         ({"override": {"tx": 32}}, [], "overridden"),
-        ({"producer": Tma(32)}, [], "TMA/async"),
         ({"turnstile": "turn"}, [], "unknown epoch"),
         ({"sharing": lambda *args: Sharing.EXCLUSIVE}, [], "unknown epoch"),
-        ({"mechanism": lambda *args: Umma}, [], "TMA/async"),
         ({"named": True}, [take("tail")], "named or rotating tail"),
         ({}, [take("barrier pointer")], "barrier pointer"),
-        ({}, [take(where=((0, "loop"),))], "runtime loop/branch"),
-        ({}, [take(where=((0, "if"),))], "runtime loop/branch"),
+        ({"producer": object()}, [], "signal mechanism"),
+        ({"internal": True}, [], "scheduler channel"),
+        ({}, [take(where=((0, "if"),))], "runtime branch"),
+        ({}, [take(where=((0, "loop"), (1, "if")))], "runtime branch"),
+        ({"producer": Tma(32)}, [take(), close()], "committed without reading its barrier"),
+        ({"producer": Tma(32)}, [take("barrier pointer")], "barrier pointer"),
+        ({}, [take("tma pointer")], "tma pointer"),
+        ({}, [event("barrier", where=((0, "if"),), barrier=barrier())], "runtime branch"),
         ({}, [take(where=((0, "other"),))], "unknown region"),
         ({}, [take(opted_out=True)], 'unchecked("liveness")'),
         ({}, [take("state")], "state"),
         ({}, [take("skip")], "skip"),
         ({}, [take(span=True)], "span"),
         ({}, [take(), take("retire")], "retire"),
-        ({}, [event("barrier")], "standalone named barrier"),
-        ({}, [event("barrier_native")], "standalone named barrier"),
+        ({}, [event("barrier")], "named barrier shared between roles"),
+        ({}, [event("barrier", barrier=barrier(64))], "named barrier shared between roles"),
+        ({}, [event("barrier_arrive", barrier=barrier())], "named barrier shared between roles"),
+        ({}, [event("barrier_native")], "named barrier shared between roles"),
         ({}, [take("turn")], "turn"),
     ],
 )
@@ -230,7 +254,7 @@ def test_raw_role_cross_cta_and_raw_signal_are_unverified():
 
 def test_slots_tail_expands_only_acquired_slots_at_their_epoch():
     kernel, roles = fixture_trace([take(slot=0), close(slot=0), take("tail")], fixed=True)
-    channels, ops = liveness._extract(kernel, roles)
+    channels, ops = extracted(kernel, roles)
     tails = [o for o in ops if o.kind == "tail"]
     assert [(o.slot, o.epoch) for o in tails] == [(0, 0)]
     ops += publish("p", "b")
@@ -238,3 +262,131 @@ def test_slots_tail_expands_only_acquired_slots_at_their_epoch():
     channels["b"] = channel()
     assert analyze(channels, ops).verdict == "error"
     assert analyze(channels, [o for o in ops if o.kind != "tail"]).verdict == "verified"
+
+
+def looped(p_events, q_events, **changes):
+    return check(*fixture_trace(p_events, q_events, **changes))
+
+
+TMA = {"producer": Tma(32), "mechanism": lambda *args: Umma}
+DRAIN = [take("wait"), close(False)]
+
+
+def test_a_tma_fill_is_placed_where_its_barrier_is_read():
+    """The commit issues nothing: a tail before it still sees the stage filled and drained."""
+    fill = [take(), take("tma pointer"), take("tail"), close()]
+    result = looped(fill, DRAIN, **TMA)
+    assert result.verdict == "no deadlock found"
+    assert result.detail == "TMA copy at barrier read"
+    # Without a copy to fill the stage the same tail waits on a release that never comes.
+    late = [take(), take("tail"), take("tma pointer"), close()]
+    result = looped(late, DRAIN, **TMA)
+    assert result.verdict == "possible deadlock"  # where the copy really is issued is assumed
+
+
+def test_tma_needs_its_copies_verified():
+    fill = [take(), take("tma pointer"), close()]
+    result = looped(fill, DRAIN, tma_verdict="unverified", **TMA)
+    assert result.verdict == "unverified" and "TMA copies of a" in result.detail
+
+
+def test_runtime_loops_are_repeated_and_report_what_was_assumed():
+    fill = [take(where=LOOP), close(where=LOOP)]
+    drain = [take("wait", where=LOOP), close(False, where=LOOP)]
+    result = looped(fill, drain)
+    assert result.verdict == "no deadlock found"
+    assert result.detail == "1, 2 and 3 loop trips, matched counts"
+    nested = ((0, "loop"), (1, "loop"))
+    twice = [retag(ev, nested) for ev in drain]  # a loop inside the loop: counts differ
+    assert looped(fill, twice).verdict == "unverified"
+
+
+def retag(ev, where):
+    return Event(ev.kind, ev.data, ev.site, where, ev.open, ev.opted_out)
+
+
+def test_a_cycle_that_needs_one_trip_more_than_the_ring_is_deep_is_found():
+    """p fills a (two stages) in a loop, then b; q takes b first. Two trips fit; three do not."""
+    kernel, roles = fixture_trace(
+        [take(where=LOOP), close(where=LOOP), on("b", take()), on("b", close())],
+        [on("b", take("wait")), on("b", close(False)), *(retag(ev, LOOP) for ev in DRAIN)],
+    )
+    kernel._ws_chans["b"] = SimpleNamespace(**{**vars(kernel._ws_chans["a"]), "n": 1})
+    result = check(kernel, roles)
+    assert result.verdict == "possible deadlock"
+    assert "every runtime loop running 3 times" in result.findings[0]
+
+
+def on(chan, ev):
+    return Event(ev.kind, {**ev.data, "chan": chan}, ev.site, ev.where, ev.open, ev.opted_out)
+
+
+def test_loop_counts_that_do_not_line_up_are_unverified():
+    fill = [take(where=LOOP), close(where=LOOP), take(order=1), close(order=1)]  # n + 1 fills
+    drain = [take("wait", where=LOOP), close(False, where=LOOP)]  # n takes
+    result = looped(fill, drain)
+    assert result.verdict == "unverified"
+    assert "loop counts on a do not line up" in result.detail
+
+
+def test_a_named_barrier_only_one_role_syncs_on_is_ignored():
+    sync = event("barrier", barrier=barrier())
+    assert looped([sync, take(), close()], DRAIN).verdict == "verified"
+    # In a loop the role's threads may not all reach it the same number of times.
+    result = looped([retag(sync, LOOP), take(), close()], DRAIN)
+    assert result.verdict == "no deadlock found"
+    other = [event("barrier", barrier=sync.data["barrier"]), *DRAIN]
+    assert "shared between roles" in looped([sync, take(), close()], other).detail
+    native = event("barrier", barrier=barrier(native=True))
+    assert "shared between roles" in looped([native, take(), close()], DRAIN).detail
+
+
+def test_ignored_syncs_are_not_repeated(monkeypatch):
+    """Only channel ops are unrolled, so the node budget bounds the work."""
+    deep = tuple((key, "loop") for key in range(1, 7))
+    fill = [take(where=LOOP), close(where=LOOP), event("barrier", where=deep, barrier=barrier())]
+    seen = []
+    unroll = liveness._unroll
+    monkeypatch.setattr(
+        liveness, "_unroll", lambda events, *a: seen.append(events) or unroll(events, *a)
+    )
+    assert looped(fill, [retag(ev, LOOP) for ev in DRAIN]).verdict == "no deadlock found"
+    assert all(ev.kind == "op" for events in seen for ev in events)
+
+
+def test_events_that_add_no_node_still_use_the_budget(monkeypatch):
+    """A tail before any acquire waits nothing; repeating it must not run unbounded."""
+    deep = tuple((key, "loop") for key in range(4))
+    monkeypatch.setattr(liveness, "MAX_NODES", 100)
+    result = looped([take("tail", where=deep)], [], n=16)
+    assert result.verdict == "unverified" and "budget exceeded" in result.detail
+
+
+def test_a_close_is_matched_to_its_own_handle_not_to_the_oldest():
+    """p commits its second stage of a, waits for b, then commits the first; q needs the first
+    before it sends b."""
+    p = [
+        take(),
+        take(order=1),
+        close(order=1),
+        on("b", take("wait")),
+        on("b", close(False)),
+        close(),
+    ]
+    q = [take("wait"), on("b", take()), on("b", close()), close(False)]
+    q += [take("wait", order=1), close(False, order=1)]
+    kernel, roles = fixture_trace(p, q)
+    b = SimpleNamespace(**{**vars(kernel._ws_chans["a"]), "n": 1})
+    b.producers, b.consumers = kernel._ws_chans["a"].consumers, kernel._ws_chans["a"].producers
+    kernel._ws_chans["b"] = b
+    result = check(kernel, roles)
+    assert result.verdict == "error" and "deadlock" in result.findings[0]
+
+
+def test_only_a_proven_finding_raises_in_strict_mode():
+    proven = liveness.Liveness("error", findings=["deadlock: a waits for b."])
+    with pytest.raises(liveness.ProtocolError, match="Override with unchecked"):
+        liveness.report(proven, "strict", "Toy")
+    possible = liveness.Liveness("possible deadlock", findings=["deadlock: a waits for b."])
+    with pytest.warns(UserWarning, match="deadlock"):
+        liveness.report(possible, "strict", "Toy")
