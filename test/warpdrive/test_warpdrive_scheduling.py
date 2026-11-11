@@ -59,9 +59,8 @@ MAPPINGS = [
     Raster(swizzle=2),
     Raster(swizzle=8),
     Raster(along="n", swizzle=3),
-    Raster(swizzle=8, reverse=("m",)),
-    Raster(along="n", swizzle=5, reverse=("m", "n", "l")),
-    Raster(swizzle=12, reverse=("n",)),
+    Raster(along="n", swizzle=5),
+    Raster(swizzle=12),
 ]
 
 
@@ -102,21 +101,11 @@ def test_raster_swizzle_bands(swizzle, ext):
                 assert (m, n) == (j // width, start + j % width)
 
 
-def test_raster_lpt_reverses_m():
-    ext = (6, 4, 2)
-    plain = _all_coords(Raster(swizzle=2), ext)
-    lpt = _all_coords(Raster(swizzle=2, reverse="m"), ext)
-    assert [(ext[0] - 1 - m, n, li) for m, n, li in plain] == lpt
-    assert lpt[0][0] == ext[0] - 1  # the longest query block goes first
-
-
 def test_raster_validation():
     with pytest.raises(ValueError):
         Raster(along="k")
     with pytest.raises(ValueError):
         Raster(swizzle=0)
-    with pytest.raises(ValueError):
-        Raster(reverse=("k",))
 
 
 # Empty work spaces: a zero extent, or a negative one (treated as empty).
@@ -234,7 +223,7 @@ class SkipOdd(Raster):
         return "skipodd_" + super().get_key()
 
 
-SWIZZLED = Raster(along="n", swizzle=3, reverse=("m", "l"))
+SWIZZLED = Raster(along="n", swizzle=3)
 
 
 @cute.jit
@@ -889,12 +878,6 @@ def test_placeholder_is_per_resolved_device(monkeypatch):
     assert on0.kind == on1.kind == "zeros" and current[0] == 0
 
 
-def test_record_needs_a_bound_stream(requires_blackwell):
-    stream = WorkStream(schedule=StaticPersistent(), record=4)
-    with pytest.raises(ValueError, match="before launch_args"):
-        stream.launch_args("cuda")
-
-
 def test_describe_places_scheduler_and_counts():
     text = ScheduleToy(ClusterLaunchControl(stages=3)).describe()
     assert "  3      work.scheduler     -  all\n" in text
@@ -1022,7 +1005,7 @@ def test_persistent_gemm_capped_grid(requires_blackwell, schedule, max_ctas):
     check_gemm(SCHEDULES[schedule], 1100, 1032, 200, max_ctas=max_ctas)
 
 
-@pytest.mark.parametrize("mapping", [Raster(), Raster(along="n", swizzle=3, reverse=("m", "n"))])
+@pytest.mark.parametrize("mapping", [Raster(), Raster(along="n", swizzle=3)])
 def test_persistent_gemm_mappings(requires_blackwell, mapping):
     check_gemm(SCHEDULES["atomic"], 1500, 1800, 64, mapping=mapping)
 

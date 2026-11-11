@@ -44,20 +44,14 @@ KINDS = {
 }
 
 
-# Masks from Cluster.multicast/fill: SSA hash or ("const", bits) ->
-# (mode, CTAs reached, fill targets). Tracing is single-threaded; begin_roles clears this.
+# Masks from Cluster.multicast: SSA hash or ("const", bits) -> multicast mode. Tracing is
+# single-threaded; begin_roles clears this.
 _MASKS: dict = {}
 
 
-def record_multicast_mask(mask, mode: str, ctas: int, target=None) -> None:
-    """Record a mask and the CTA ranks it was built to fill.
-
-    ``target`` is a Python int or device rank from ``Cluster.fill``. CTAs on the same
-    multicast line can share a constant mask, so each mask retains all its targets.
-    """
-    _, _, targets = _MASKS.setdefault(_mask_key(mask.ir_value()), (mode, ctas, set()))
-    if target is not None:
-        targets.add(target if isinstance(target, int) else ("rank", hash(target.ir_value())))
+def record_multicast_mask(mask, mode: str) -> None:
+    """Record a mask ``Cluster.multicast`` built for ``mode``."""
+    _MASKS.setdefault(_mask_key(mask.ir_value()), mode)
 
 
 def _mask_key(value) -> int | tuple[str, int | None]:
@@ -138,10 +132,8 @@ class _Copy:
     in_stage_region: bool  # issued in the region that acquired the stage (runs once per stage)
     bulk: bool = False  # a cp.async.bulk (non-tensor) load
     unelected: bool = False  # a bulk copy outside elect_one(): issued by every active lane
-    # Mask mode: "fill" for Cluster.fill, "?" if unknown, None if not multicast.
+    # Mask mode: "m" or "n" from Cluster.multicast, "?" if unknown, None if not multicast.
     multicast: str | None = None
-    # The copy's key in _MASKS; None when not multicast (it lands in the issuing CTA).
-    mask_key: object = None
 
 
 @dataclass
@@ -164,10 +156,6 @@ def required_group(chan, cluster) -> str | None:
     if all(set(cluster.ctas(ri.cta)) <= leaders for ri, _ in [*chan.producers, *chan.consumers]):
         return None  # leader-only on both sides: a 2-CTA load also lands on the leader
     return "ONE"
-
-
-def _fill_count(chan) -> int:
-    return len(chan.cluster.filled(0, chan.producer.fills))
 
 
 def stage_closed(trace, handle) -> None:
@@ -212,22 +200,16 @@ def check_role(trace, cluster, reports: dict) -> None:
                 partial_chans.setdefault(use.chan.name, problem)
             continue
         need = required_group(use.chan, cluster)
-        tma = use.chan.producer
-        # Fill channels also accept Cluster.fill's single-CTA mask.
-        modes = (*tma.multicast, "fill") if tma.fills else tma.multicast
+        modes = use.chan.producer.multicast
         for cp in copies:
             if need is not None and cp.group != need:
                 raise ProtocolError(_group_message(trace.role_name, use, cp, need, cluster))
             if cp.multicast is not None and (not modes or cp.multicast not in (*modes, "?")):
                 raise ProtocolError(_multicast_message(trace.role_name, use, cp))
             if cp.multicast == "?":
-                what = "Cluster.fill" if tma.fills else "Cluster.multicast"
                 report.unverified.append(
-                    f"multicast copy at {cp.site} takes a mask not from {what}"
+                    f"multicast copy at {cp.site} takes a mask not from Cluster.multicast"
                 )
-                if tma.fills and stage is not None:
-                    # Unknown destinations prevent per-CTA byte accounting.
-                    stage.incomplete.append(f"multicast copy at {cp.site} has an unknown mask")
             report.groups.add("bulk" if cp.bulk else cp.group)
             report.copies.add(cp.site)
         if stage is not None:
@@ -250,20 +232,16 @@ def check_role(trace, cluster, reports: dict) -> None:
                 )
         if any(cp.nbytes is None or not cp.in_stage_region for cp in stage.copies):
             why.append("a copy sits in a nested loop/branch or has a dynamic layout")
-        filled = _fill_count(use.chan)
-        if filled > 1 and _fill_targets(stage.copies) < filled:
-            # Copies that land twice in one CTA can total the right bytes yet starve another.
-            why.append(f"its copies take fewer distinct masks than the {filled} CTAs it fills")
         if why:
             report.unverified.append(f"bytes of {rec.what} at {rec.site}: {why[0]}")
         if why or stage.opted_out or use.chan.name in opted_out_chans:
             continue
         got = sum(cp.nbytes for cp in stage.copies)
-        # One producing CTA's share of the armed bytes, for each CTA it fills.
-        want = use.chan.scope.tx // use.chan.derived_scope.tx_ctas * filled
+        # One producing CTA's share of the armed bytes.
+        want = use.chan.scope.tx // use.chan.derived_scope.tx_ctas
         if got != want:
             raise ProtocolError(_bytes_message(trace.role_name, use, stage.copies, got, want))
-        report.stage_bytes.add(got // filled)  # per CTA, like Tma.tx_bytes
+        report.stage_bytes.add(got)  # per CTA, like Tma.tx_bytes
 
 
 def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
@@ -289,31 +267,11 @@ def _copies(use: TmaUse) -> tuple[list[_Copy], list, str | None]:
                     direct and not bulk
                 )
                 unelected = bulk and direct
-                mode, key = _mask_mode(copy_op) if multicast else (None, None)
-                copies.append(_Copy(use.site, group, nbytes, in_stage, bulk, unelected, mode, key))
+                mode = _mask_mode(copy_op) if multicast else None
+                copies.append(_Copy(use.site, group, nbytes, in_stage, bulk, unelected, mode))
     except (AttributeError, KeyError, IndexError, ValueError, RuntimeError) as e:
         return [], ops, f"cannot inspect the IR at {use.site}: {type(e).__name__}: {e}"
     return copies, ops, None
-
-
-def _fill_targets(copies) -> int:
-    """Bound the number of CTAs a stage's copies could fill.
-
-    Count each ``Cluster.fill`` target once, using a mask at most once per target.
-    Other masks count once each; unmasked copies count as the issuing CTA.
-    """
-    uses = {}
-    for cp in copies:
-        uses[cp.mask_key] = uses.get(cp.mask_key, 0) + 1
-    filled, uses_of_filled, other = set(), 0, 0
-    for key, n in uses.items():
-        targets = _MASKS.get(key, (None, 0, set()))[2] if key is not None else ()
-        if targets:
-            filled |= targets
-            uses_of_filled += min(n, len(targets))
-        else:
-            other += 1
-    return min(uses_of_filled, len(filled)) + other
 
 
 def _is_tma_bar(op) -> bool:
@@ -376,15 +334,14 @@ def _elect_parent(copy_op):
     return None
 
 
-def _mask_mode(copy_op) -> tuple[str, object]:
-    """Return a multicast mask's ``(mode, _MASKS key)``; mode is '?' for unknown masks."""
+def _mask_mode(copy_op) -> str:
+    """A multicast copy's mask mode from ``Cluster.multicast``, or '?' for an unknown mask."""
     op = copy_op.operands[0].owner.operation
     while op.name == SET_VALUE:
         if "<mcast_mask>" in str(op.attributes["field"]):
-            key = _mask_key(op.operands[1])
-            return _MASKS.get(key, ("?",))[0], key
+            return _MASKS.get(_mask_key(op.operands[1]), "?")
         op = op.operands[0].owner.operation
-    return "?", None
+    return "?"
 
 
 def _copy_ops(set_value) -> list:
@@ -481,12 +438,6 @@ def _group_message(role: str, use: TmaUse, cp: _Copy, need: str, cluster) -> str
 def _multicast_message(role: str, use: TmaUse, cp: _Copy) -> str:
     chan = use.chan
     modes = chan.producer.multicast
-    if cp.multicast == "fill":
-        return (
-            f"{role}: the TMA copy at {cp.site} into channel {chan.name} takes a Cluster.fill "
-            "mask, but its Tma declares no fills: the CTA the copy lands in would not release "
-            "this CTA's stage, and nobody arms its barrier; declare Tma(..., fills=...)"
-        )
     along = "" if cp.multicast == "?" else f" along {cp.multicast}"
     declared = f"declares multicast={modes}" if modes else "declares no multicast"
     return (
@@ -501,13 +452,10 @@ def _bytes_message(role: str, use: TmaUse, copies: list, got: int, want: int) ->
     chan, rec = use.chan, use.handle
     sites = ", ".join(dict.fromkeys(cp.site for cp in copies))
     effect = "never completes (hang)" if got < want else "completes before every copy lands"
-    filled = _fill_count(chan)
     per_cta = " per CTA" if chan.scope.pair else ""
-    if filled > 1:
-        per_cta = f" for the {filled} CTAs it fills"
     return (
         f"{role}: {rec.what} opened at {rec.site}: the TMA copies at {sites} deliver {got} "
         f"bytes{per_cta}, but the layer arms {want}{per_cta} (channel {chan.name}, "
         f"Tma({chan.producer.tx_bytes})), so the stage's full barrier {effect}; declare "
-        f"Tma({got // filled}) or fix the copies"
+        f"Tma({got}) or fix the copies"
     )

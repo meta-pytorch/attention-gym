@@ -17,7 +17,7 @@ DependencyKind = Literal["data", "state", "reuse"]
 
 @dataclass(frozen=True)
 class SourceLocation:
-    """A source span associated with an annotated role or region."""
+    """A source span of a role or region of an explicit plan."""
 
     path: str
     line: int

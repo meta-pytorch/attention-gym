@@ -389,7 +389,7 @@ def test_persistent_gemm_swaps_external_maps(requires_blackwell, case, cluster):
 def fa4_example_cases():
     """name -> (schedule, mapping factory, cluster) for the FA4 example's ``mapping=``."""
     return {
-        "lpt_static": (StaticPersistent(), lambda ts: Raster(reverse="m"), SingleCta()),
+        "swizzled_static": (StaticPersistent(), lambda ts: Raster(swizzle=2), SingleCta()),
         "fa4_static": (
             StaticPersistent(),
             lambda ts: Fa4Mapping(ts.StaticPersistentTileScheduler),

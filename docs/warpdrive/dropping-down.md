@@ -186,7 +186,7 @@ The managed producer still uses `ring.produce()`.
   of TMA-filled stages: ordinary readers must run `fence_async_shared()` before release.
   No commit fence is derived for external producers of SMEM stages read by MMA, either.
 - Only CTA-local mbarrier channels with `Sharing.JOIN` on both sides are supported. There is
-  no TMA multicast or `fills`; raw code drives the side in each CTA.
+  no TMA multicast; raw code drives the side in each CTA.
 
 Alternatively, bind a managed role and use raw code through its endpoint state/accessors.
 If neither side is managed, use `Barriers` instead.

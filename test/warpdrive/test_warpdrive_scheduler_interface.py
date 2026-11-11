@@ -447,7 +447,7 @@ def compile_raw_item_toy(op: RawItemToy):
         (Raster(), "grid", (2, 65536, 1), SingleCta(), OneShot()),  # n_tiles past gridDim.y: 1-D fallback
         (Raster(), "1d", (5, 3, 2), SingleCta(), OneShot()),
         (Raster(), "grid", (3, 70000, 1), CtaPair(), OneShot()),
-        (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair(), OneShot()),
+        (Raster(swizzle=3), "grid", (7, 5, 2), CtaPair(), OneShot()),
         (SkipOdd(swizzle=2), "grid", (9, 7, 2), SingleCta(), OneShot()),
         (Raster(), "grid", (0, 3, 1), SingleCta(), OneShot()),  # empty: one unit, no valid item
         # A default WorkMap traps if decoded past the end: one CTA per item, plus drops.
@@ -462,7 +462,7 @@ def compile_raw_item_toy(op: RawItemToy):
         (Raster(), "grid", (3, 2, 65537), CtaPair(), OneShot(grid="2d")),
         (Raster(), "grid", (5, 3, 0), SingleCta(), OneShot(grid="2d")),
         (Raster(), "grid", (2, 65536, 1), CtaPair(), OneShot(grid="1d")),
-        (Raster(swizzle=3, reverse="m"), "grid", (7, 5, 2), CtaPair(), OneShot(grid="1d")),
+        (Raster(swizzle=3), "grid", (7, 5, 2), CtaPair(), OneShot(grid="1d")),
         (Raster(), "grid", (4, 0, 2), SingleCta(), OneShot(grid="1d")),
     ],
     ids=["tile_grid", "fallback", "hand_1d", "pair_fallback", "pair_swizzle", "skip",
@@ -519,9 +519,7 @@ def test_oneshot_grid_is_a_static_choice():
         for kwargs in (
             {"mapping": Raster(swizzle=2)},
             {"mapping": Raster(along="n")},
-            {"mapping": Raster(reverse="m")},
             {"mapping": SkipOdd()},
-            {"record": 2},
             {"schedule": Shifted(grid=grid)},
         ):
             with pytest.raises(ValueError, match=rf"OneShot\(grid='{grid}'\) reads the item"):
@@ -682,8 +680,8 @@ def _plain_hits(op, ext, max_ctas=148):
         (OneShot(grid="1d"), None, "item", (5, 0, 2)),
         (OneShot(), SkipOdd(swizzle=2), "item", (9, 7, 2)),
         (OneShot(grid="3d"), None, "cursor", (5, 3, 2)),
-        (OneShot(grid="1d"), Raster(swizzle=3, reverse="m"), "cursor", (7, 5, 2)),
-        (OneShot(grid="1d"), Raster(along="n", reverse=("n", "l")), "item", (7, 5, 3)),
+        (OneShot(grid="1d"), Raster(swizzle=3), "cursor", (7, 5, 2)),
+        (OneShot(grid="1d"), Raster(along="n"), "item", (7, 5, 3)),
         (StaticPersistent(), None, "cursor", (9, 7, 2)),  # 4 CTAs run 126 items
         (StaticPersistent(), SkipOdd(swizzle=2), "cursor", (9, 7, 2)),
         (StaticPersistent(), None, "cursor", (0, 7, 2)),
@@ -693,7 +691,7 @@ def _plain_hits(op, ext, max_ctas=148):
         (OneShot(grid="3d"), None, "static_mn", (5, 3, 2)),
         (OneShot(), None, "static_mn", (2, 3, 2)),
         (OneShot(), None, "static_mn", (5, 3, 0)),
-        (OneShot(grid="1d"), Raster(swizzle=2, reverse="m"), "static_mn", (5, 3, 2)),
+        (OneShot(grid="1d"), Raster(swizzle=2), "static_mn", (5, 3, 2)),
         (StaticPersistent(), None, "static_mn", (9, 7, 2)),
         (StaticPersistent(), Raster(along="n", swizzle=3), "static_m", (9, 7, 2)),
         # One axis walked per CTA (max_ctas=4 units along it), the others from blockIdx.
@@ -801,10 +799,6 @@ def test_plain_kernel_access_rejections():
         with pytest.raises(ProtocolError, match="is for kernels without roles"):
             method()
     workspace = object()  # never read: the checks run first
-    recorded = WorkStream(schedule=OneShot(), record=2).bind((2, 2, 1), workspace)
-    for method in (recorded.single_item, recorded.cursor):
-        with pytest.raises(ProtocolError, match=r"record=\.\.\.\) logs per role"):
-            method()
     for schedule in (AtomicPersistent(), ClusterLaunchControl()):
         bound = WorkStream(schedule=schedule).bind((2, 2, 1), workspace, 4)
         with pytest.raises(ProtocolError, match="cursor\\(\\) needs a local schedule"):
@@ -1351,8 +1345,6 @@ def test_tile_persistent_rejections():
     for mapping in (Raster(swizzle=2), Raster(along="n"), SkipOdd()):
         with pytest.raises(ValueError, match="plain Raster"):
             WorkStream(mapping=mapping, schedule=TilePersistent("m"))
-    with pytest.raises(ValueError, match="no record"):
-        WorkStream(schedule=TilePersistent("m"), record=2)
     for max_ctas in (4, Int32(4)):  # a static l past gridDim.z raises with any cap
         bound = WorkStream(schedule=TilePersistent("n")).bind((2, 3, 70000), None, max_ctas)
         with pytest.raises(ValueError, match="gridDim.y/z are limited"):

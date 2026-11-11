@@ -10,12 +10,11 @@ the accumulator into that CTA's TMEM. ``CtaPair()`` is ``Cluster(2, 1, pair=True
 CTAs share loads through TMA multicast. The copies of a ``Tma(bytes, multicast="n")`` producer
 land in every CTA with this CTA's coordinates except along N, the CTAs that need the same rows of
 A; ``"m"`` does the same along M for B. ``Cluster.multicast(mode)`` gives one mode's partition
-coordinate and copy mask. A ``Tma(bytes, fills="pair")`` producer runs on each pair leader and
-issues the copies of both CTAs in its pair; with ``fills="cluster"`` it runs on rank 0 and issues
-every CTA's copies. ``Cluster.fill`` gives their masks.
+coordinate and copy mask.
 
 Roles run in every CTA of the cluster unless pinned: ``cta="leader"`` runs in each pair's leader
-(every CTA when the cluster has no pairs), ``cta="rank0"`` in cluster rank 0 only. From that
+(every CTA when the cluster has no pairs). The broadcast scheduler of a cluster larger than a pair
+runs in cluster rank 0 only (placement ``"rank0"``, which roles cannot declare). From that
 placement the layer derives each channel's *scope*:
 
 * **local**: every participant runs in the same CTAs and no copy lands in another CTA. Each CTA
@@ -23,7 +22,7 @@ placement the layer derives each channel's *scope*:
 * **cross-CTA** (*pair-scoped* in a CTA pair): participants run in different CTAs, or copies land
   in other CTAs. A barrier lives in every CTA where a role waits on it. Each signal reaches the
   barrier of every target CTA: a remote ``mbarrier.arrive``, a ``tcgen05.commit`` multicast, a
-  TMA transaction completing on the pair leader's barrier, or a filling CTA's remote arm. Arrival
+  TMA transaction completing on the pair leader's barrier, or the scheduler's remote arm. Arrival
   counts and transaction bytes sum over the signalling CTAs. A channel spans each MMA pair (each
   CTA without pairs), widened to the CTAs its copies reach; a ``rank0`` participant widens it to
   the whole cluster.
@@ -42,10 +41,10 @@ from attn_gym.warpdrive.protocol import ProtocolError
 
 ALL = "all"
 LEADER = "leader"
-RANK0 = "rank0"
+RANK0 = "rank0"  # the broadcast scheduler's placement in a cluster larger than a pair
 PLACEMENTS = (ALL, LEADER, RANK0)
+ROLE_PLACEMENTS = (ALL, LEADER)  # what @role(cta=...) declares
 MULTICAST_MODES = ("m", "n")
-FILLS = (None, "pair", "cluster")  # Tma(fills=...): which CTAs one producer issues copies for
 MAX_CLUSTER_CTAS = 8  # portable cluster size limit
 # Derived ``Scope`` fields a channel may override (``Channel(override={...})``).
 SCOPE_OVERRIDES = ("full_counts", "empty_counts", "tx", "full_mask", "empty_mask")
@@ -134,7 +133,7 @@ class Cluster:
                 return tuple(range(0, self.size, self.pair_size))
             case "rank0":
                 return (0,)
-        raise ValueError(f"role cta must be one of {PLACEMENTS}, got {placement!r}")
+        raise ValueError(f"placement must be one of {PLACEMENTS}, got {placement!r}")
 
     def group(self, rank: int) -> tuple[int, ...]:
         """The MMA pair of ``rank`` (``rank`` alone without pairs)."""
@@ -212,29 +211,8 @@ class Cluster:
             return TmaMulticast(0, cute.make_layout(1), None, 1)
         return self._line_copy(self.coord_vmnk(), mode)
 
-    def fill(self, rank, mode: str | None = None) -> TmaMulticast:
-        """Partition coordinate, layout and copy mask of the copy a ``Tma(fills=...)`` producer
-        issues for CTA ``rank``, a Python int or a device rank.
-
-        Without ``mode`` the copy lands in ``rank`` alone; with it, the copy is multicast along
-        ``mode`` as ``rank``'s own ``multicast(mode)`` copy would be. Build the atom with a
-        multicast op: even a copy into the issuing CTA needs a mask. Call after ``begin_roles``,
-        like ``multicast``.
-        """
-        from attn_gym.warpdrive.tma import record_multicast_mask
-
-        if mode is not None:
-            _check_mode(mode)
-            if len(self.line(0, mode)) > 1:
-                return self._line_copy(self.layout_vmnk().get_flat_coord(rank), mode, rank)
-        bit = 1 << rank if isinstance(rank, int) else Int32(1) << rank
-        mask = cutlass.Int16(bit)
-        record_multicast_mask(mask, "fill", 1, target=rank)
-        return TmaMulticast(0, cute.make_layout(1), mask, 1)
-
-    def _line_copy(self, coord, mode: str, target=None) -> TmaMulticast:
-        """Multicast partition and mask of the CTA at ``coord`` along ``mode``. ``target`` is that
-        CTA's rank when a filling CTA issues the copy."""
+    def _line_copy(self, coord, mode: str) -> TmaMulticast:
+        """Multicast partition and mask of the CTA at ``coord`` along ``mode``."""
         from attn_gym.warpdrive.tma import record_multicast_mask
 
         axis = 1 if mode == "m" else 2
@@ -244,17 +222,8 @@ class Cluster:
             cute.slice_(vmnk, (0, None, 0, 0) if axis == 1 else (0, 0, None, 0)).shape
         )
         mask = cpasync.create_tma_multicast_mask(vmnk, coord, mcast_mode=axis)
-        record_multicast_mask(mask, mode, ctas, target)
+        record_multicast_mask(mask, mode)
         return TmaMulticast(coord[axis], layout, mask, ctas)
-
-    def filled(self, rank: int, fills: str | None) -> tuple[int, ...]:
-        """CTAs whose copies ``rank`` issues under ``Tma(fills=fills)``: its MMA pair
-        (``"pair"``), the whole cluster (``"cluster"``), or itself."""
-        if fills == "pair":
-            return self.group(rank)
-        if fills == "cluster":
-            return tuple(range(self.size))
-        return (rank,)
 
 
 def _check_mode(mode):
@@ -381,17 +350,8 @@ def derive_scope(chan, cluster) -> Scope:
     ranks = range(cluster.size)
     placed = {ri.name: cluster.ctas(ri.cta) for ri, _ in bound}
     tma = chan.producer if isinstance(chan.producer, Tma) else None
-    if tma is not None and tma.fills == "pair" and not cluster.pair:
-        raise ProtocolError(
-            f"channel {chan.name}: Tma(fills='pair') fills both CTAs of an MMA pair, but "
-            f"{type(cluster).__name__} has no pairs; use fills='cluster' from a rank0 producer"
-        )
-    # A copy lands in another CTA when it is multicast or issued for other CTAs (fills).
-    crosses = tma is not None and any(
-        len(cluster.reach(d, tma.multicast)) > 1 or len(cluster.filled(r, tma.fills)) > 1
-        for r in ranks
-        for d in cluster.filled(r, tma.fills)
-    )
+    # A copy lands in another CTA when it is multicast.
+    crosses = tma is not None and any(len(cluster.reach(r, tma.multicast)) > 1 for r in ranks)
     same = len(set(placed.values())) == 1
     if same and not crosses:
         full = chan.slot_counts("producer")
@@ -492,12 +452,11 @@ def derive_scope(chan, cluster) -> Scope:
 def _tma_targets(chan, cluster, consumers: tuple, producers: tuple, unit: dict):
     """``(full_targets, empty_targets, tx_ctas)`` of a cross-CTA TMA channel.
 
-    Producing CTA p issues the copies of ``filled(p)`` (just p without ``fills``). Each copy
-    lands in its CTA and the CTAs its multicast reaches: those are the CTAs p *writes*. Bytes
-    landing in CTA d complete on d's own barrier (``CtaGroup.ONE``) when every written CTA has a
-    consumer, else on d's pair leader's barrier (``CtaGroup.TWO``) when the consumers are pair
-    leaders. Exactly one CTA arms each such barrier, for every CTA completing there: the
-    barrier's own CTA, or with ``fills`` the CTA that fills it.
+    Producing CTA p issues its own copies. Each copy lands in p and the CTAs its multicast
+    reaches: those are the CTAs p *writes*. Bytes landing in CTA d complete on d's own barrier
+    (``CtaGroup.ONE``) when every written CTA has a consumer, else on d's pair leader's barrier
+    (``CtaGroup.TWO``) when the consumers are pair leaders. The barrier's own CTA arms it, once,
+    for every CTA completing there.
 
     Consumer CTA c releases every producing CTA that writes a CTA completing on c's barrier or
     a CTA in c's signal ``unit``. The ``unit`` term keeps this a superset of the non-TMA rule,
@@ -506,19 +465,7 @@ def _tma_targets(chan, cluster, consumers: tuple, producers: tuple, unit: dict):
     tma, name = chan.producer, chan.name
     consumer_names = [ri.name + "@" + ri.cta for ri, _ in chan.consumers]
     leaders = cluster.ctas(LEADER)
-    if tma.fills is not None:
-        want = leaders if tma.fills == "pair" else (0,)
-        if producers != want:
-            where = "on each pair leader (cta='leader')" if tma.fills == "pair" else "on rank0"
-            raise ProtocolError(
-                f"channel {name}: a Tma(fills={tma.fills!r}) producer runs once per CTA group "
-                f"it fills, {where}, but runs in CTAs {list(producers)}"
-            )
-    filler = {d: p for p in producers for d in cluster.filled(p, tma.fills)}
-    writes = {
-        p: {w for d in cluster.filled(p, tma.fills) for w in cluster.reach(d, tma.multicast)}
-        for p in producers
-    }
+    writes = {p: set(cluster.reach(p, tma.multicast)) for p in producers}
     written = sorted(set().union(*writes.values()))
     if set(written) <= set(consumers):
         # A pair pins UMMA consumers to the leader (_validate_placement), so none reads a
@@ -526,54 +473,25 @@ def _tma_targets(chan, cluster, consumers: tuple, producers: tuple, unit: dict):
         bar = {d: d for d in written}
     elif cluster.pair and set(consumers) <= set(leaders):
         bar = {d: d - d % cluster.pair_size for d in written}  # 2-CTA copies
-        idle = sorted({b for b in bar.values()} - set(consumers))
-        if idle:
-            raise ProtocolError(
-                f"channel {name}: TMA producers in both CTAs can only feed leader-only "
-                "consumers (2-CTA operands complete on the leader's barrier), and copies into "
-                f"CTAs {[d for d in written if bar[d] in idle]} would complete on leaders {idle}, "
-                f"where no consumer waits; consumers are {consumer_names}"
-            )
-    elif cluster.pair:
-        raise ProtocolError(
-            f"channel {name}: TMA producers in both CTAs can only feed leader-only consumers "
-            "(2-CTA operands complete on the leader's barrier) or consumers in every CTA they "
-            f"write; copies land in CTAs {written}, consumers are {consumer_names}"
-        )
     else:
         raise ProtocolError(
-            f"channel {name}: a TMA copy completes on the barrier of the CTA it lands in, but "
-            f"copies land in CTAs {[d for d in written if d not in consumers]}, which run no "
+            f"channel {name}: copies land in CTAs {written}, but a TMA copy completes on the "
+            "barrier of a consumer in the CTA it lands in or, with pairs, of a leader-only "
             f"consumer; consumers are {consumer_names}"
         )
     starved = sorted(set(consumers) - set(bar.values()))
     if starved:
-        if cluster.pair and producers == leaders:
-            fix = "declare Tma(..., fills='pair') so each leader issues and arms its pair's copies"
-        elif producers == (0,):
-            fix = "declare Tma(..., fills='cluster') so rank 0 issues and arms every CTA's copies"
-        else:
-            fix = "run the producer in those CTAs"
         raise ProtocolError(
             f"channel {name}: consumers in CTAs {starved} wait on stages no TMA copy fills "
-            f"(producers run in CTAs {list(producers)}); {fix}"
+            f"(producers run in CTAs {list(producers)}); run the producer in those CTAs"
         )
-    arm = {}
-    for b in sorted(set(bar.values())):
-        arm[b] = filler.get(b)
-        if arm[b] is None:
-            raise ProtocolError(
-                f"channel {name}: multicast copies land in CTA {b}, but no producer runs there to "
-                "arm its full barrier; declare Tma(..., fills=...) for a producer that issues "
-                "other CTAs' copies"
-            )
-    widths = {sum(1 for d in written if bar[d] == b) for b in arm}
-    if len(widths) != 1:
-        raise ProtocolError(f"channel {name}: its barriers would complete uneven byte counts")
-    full_targets = {p: tuple(b for b in arm if arm[b] == p) for p in producers}
+    # Roles run in every CTA or on pair leaders, so each barrier's own CTA runs a producer to
+    # arm it, and every barrier completes the same number of CTAs' bytes.
+    armed = sorted(set(bar.values()))
+    full_targets = {b: (b,) for b in armed}
     read = {c: {d for d in written if bar[d] == c}.union(unit[c]) for c in consumers}
     empty_targets = {c: tuple(p for p in producers if writes[p] & read[c]) for c in consumers}
-    return {p: bs for p, bs in full_targets.items() if bs}, empty_targets, widths.pop()
+    return full_targets, empty_targets, sum(1 for d in written if bar[d] == armed[0])
 
 
 def apply_overrides(chan, scope: Scope, cluster) -> Scope:

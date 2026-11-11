@@ -302,7 +302,7 @@ def test_an_external_tma_producer_is_not_tma_checked():
 
 
 def test_external_channels_stay_cta_local():
-    with pytest.raises(ValueError, match="its TMA copies take no multicast or fills"):
+    with pytest.raises(ValueError, match="its TMA copies take no multicast"):
         Ring(2, Tma(128, multicast="m"), external="producer", override={"full_counts": 1})
 
     @role(warps=2, cta="leader")

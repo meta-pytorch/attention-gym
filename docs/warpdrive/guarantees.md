@@ -96,6 +96,8 @@ resource use.
 - **Compilation:** checks local handle lifetimes, returned state and recognizable work loops.
   It checks attributable TMA operations and binds try tokens/previews to their end, epoch and
   dynamic region, including loop carries whose entry and back-edge still name that epoch.
+  It rejects a wait for a stage the same role still holds
+  ([overlapping handles](channels.md#overlapping-handles)).
   Exclusive/round-robin epoch ownership is checked when all acquires, waits and skips are
   static. It does not prove balanced epochs across arbitrary role bodies or a live dependency
   graph.
