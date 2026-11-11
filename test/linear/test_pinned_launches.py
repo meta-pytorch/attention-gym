@@ -13,7 +13,15 @@ pytest.importorskip("cutlass")
 
 import attn_gym.linear.gdn.context_parallel as gdn_context_parallel
 import attn_gym.linear.kda.context_parallel as kda_context_parallel
-from attn_gym.linear import TuningOptions, chunk_gdn, l2norm, recurrent_gdn, recurrent_kda
+from attn_gym.linear import (
+    TuningOptions,
+    chunk_gdn,
+    l2norm,
+    paged_chunk_gdn,
+    paged_chunk_kda,
+    recurrent_gdn,
+    recurrent_kda,
+)
 from attn_gym.linear.context_parallel import StagedOp
 from attn_gym.linear.gdn import context_parallel_gdn
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
@@ -43,6 +51,17 @@ def gdn_inputs() -> Tensors:
 
 def recurrent_scan(scan: Callable, inputs: Callable[[], Tensors], options) -> Tensors:
     return scan(*inputs(), output_final_state=True, kernel_options=options)
+
+
+def paged_chunk(operation: Callable, inputs: Callable[[], Tensors], options) -> Tensors:
+    """Return the output and the state pool the call advanced in place."""
+    q, k, v, gate, beta = inputs()
+    # Slot zero is the padding slot; the sequence starts from the zero state in slot one.
+    state_cache = torch.zeros(2, v.shape[2], v.shape[3], q.shape[3], device=q.device)
+    state_indices = torch.tensor([1], device=q.device, dtype=torch.int32)
+    with torch.no_grad():
+        output = operation(q, k, v, gate, beta, state_cache, state_indices, kernel_options=options)
+    return output, state_cache
 
 
 def l2norm_output_and_gradient(options: TuningOptions | None) -> Tensors:
@@ -107,6 +126,8 @@ STAGES = {
 OPERATIONS = {
     "recurrent_kda": partial(recurrent_scan, recurrent_kda, kda_inputs),
     "recurrent_gdn": partial(recurrent_scan, recurrent_gdn, gdn_inputs),
+    "paged_chunk_kda": partial(paged_chunk, paged_chunk_kda, kda_inputs),
+    "paged_chunk_gdn": partial(paged_chunk, paged_chunk_gdn, gdn_inputs),
     "l2norm": l2norm_output_and_gradient,
     **{name: partial(staged_step, *case) for name, case in STAGES.items()},
 }

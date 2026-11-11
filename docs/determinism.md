@@ -152,8 +152,8 @@ given a fixed configuration. The guarantees, strongest first:
   afterwards; `{"autotune": False}` pins every stage to its fixed heuristic
   configuration instead, so kernel selection is repeatable across processes and
   cache states. With the same option, `recurrent_kda` uses its host shape heuristic without
-  tuning. `causal_conv1d` has a single fixed schedule and
-  needs no flag.
+  tuning. `causal_conv1d` never benchmarks: it launches fixed default schedules
+  unless `kernel_options` names others, so it has no `autotune` key.
 - **`recurrent_kda` and `recurrent_gdn` with `kernel_options={"batch_invariant": True}`:
   bitwise across batches.** On one GPU model and software stack, a sequence gets
   the same output and final-state bits alone, among empty slots, or decoded one

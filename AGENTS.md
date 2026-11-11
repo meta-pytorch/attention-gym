@@ -109,10 +109,12 @@ Keep the math in keyword arguments and the kernel in `kernel_options`:
 - An option that changes what is computed (`scale`, `fastmath`, gate transforms, masks) is a
   keyword argument, and the reference implementation honors or documents it.
 - An option that only chooses how a fused kernel runs (`backend`, `schedule`, `autotune`,
-  `bwd_recompute_p`, `batch_invariant`) is a key of the operation's typed `kernel_options`
-  dict (`attn_gym/types.py`, `attn_gym/linear/types.py`). New kernel knobs are added there, not
-  as keyword arguments. Every implementation validates the options: unknown keys and wrongly
-  typed values raise. `impl="reference"` then ignores them, so one dict serves both.
+  `bwd_recompute_p`, `batch_invariant`, the short-convolution schedule configs) is a key of
+  the operation's typed `kernel_options` dict (`attn_gym/types.py`,
+  `attn_gym/linear/types.py`, `attn_gym/linear/short_conv/cute.py`). New kernel knobs are
+  added there, not as keyword arguments. Every implementation validates the options: unknown
+  keys and wrongly typed values raise. `impl="reference"` then ignores them, so one dict
+  serves both.
 - One option has one spelling across operations. Breaking a public signature to restore that is
   acceptable; say so in the PR.
 

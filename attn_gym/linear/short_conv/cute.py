@@ -19,9 +19,9 @@ gradients and FP32 weight-gradient partials followed by a Torch reduction.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import ClassVar
+from typing import ClassVar, TypedDict
 
 import cutlass
 import torch
@@ -112,6 +112,42 @@ class ShortConvTunedConfig:
             case _:
                 raise ValueError(f"unsupported short-convolution dtype {dtype}")
         return cls(forward, *gradients)
+
+    def kernel_options(self) -> ShortConvKernelOptions:
+        """Return these specializations as ``kernel_options`` for :func:`causal_conv1d`."""
+        return {
+            "forward_config": self.forward,
+            "input_grad_config": self.input_gradient,
+            "weight_grad_config": self.weight_gradient,
+        }
+
+
+class ShortConvDecodeKernelOptions(TypedDict, total=False):
+    """Kernel options of :func:`causal_conv1d_decode`."""
+
+    forward_config: ShortConvConfig
+    """Forward schedule specialization. Defaults to a measured schedule for the inputs and device."""
+
+
+class ShortConvKernelOptions(ShortConvDecodeKernelOptions, total=False):
+    """Kernel options of :func:`causal_conv1d`.
+
+    An absent schedule uses the measured default for the dtype and layout. The operation never
+    benchmarks on its own, so there is no ``autotune`` key; :func:`tune_causal_conv1d` selects
+    schedules explicitly.
+    """
+
+    input_grad_config: ShortConvConfig
+    """Input-gradient schedule specialization."""
+
+    weight_grad_config: ShortConvConfig
+    """Weight-gradient schedule specialization."""
+
+    persistent_tma_input_gradient: bool
+    """Use an explicit machine-bounded persistent worker grid for packed TMA input gradients.
+    Defaults to ``False`` because it favors overcaptured replays and can regress full-capacity
+    backward. Requires ``x``'s base and outer strides to be 16-byte aligned; backward raises
+    otherwise."""
 
 
 @cute.jit
@@ -3315,7 +3351,8 @@ def tune_causal_conv1d(
 
     Width is an operation parameter and is specialized but not autotuned. Packed
     offsets, activation, and initial state use the same inputs accepted by the public
-    operation. The returned configs can be passed directly to :func:`causal_conv1d`.
+    operation. Pass the result to :func:`causal_conv1d` as
+    ``kernel_options=tuned.kernel_options()``.
     Tuning uses the shared CuTeDSL ``tune`` flow: cached variants compile in
     parallel and execute sequentially under the vetted Inductor GPU benchmarker.
     """
@@ -4338,6 +4375,29 @@ def _validate_config(config: ShortConvConfig, channels: int, name: str) -> None:
         raise ValueError(f"{name}.times_per_block must be positive")
 
 
+def _validate_kernel_options(
+    kernel_options: Mapping[str, object] | None,
+    *,
+    op_name: str,
+    configs: tuple[str, ...],
+    flags: tuple[str, ...] = (),
+) -> Mapping[str, object]:
+    """Reject unknown keys and wrongly typed values; ``None`` means no options."""
+    if kernel_options is None:
+        return {}
+    unknown = kernel_options.keys() - {*configs, *flags}
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(f"unsupported {op_name} kernel options: {names}")
+    for name in configs:
+        if name in kernel_options and not isinstance(kernel_options[name], ShortConvConfig):
+            raise TypeError(f"kernel_options['{name}'] must be a ShortConvConfig")
+    for name in flags:
+        if name in kernel_options and not isinstance(kernel_options[name], bool):
+            raise TypeError(f"kernel_options['{name}'] must be a bool")
+    return kernel_options
+
+
 def dense_final_conv_state(
     x: torch.Tensor,
     initial_state: torch.Tensor | None,
@@ -4405,10 +4465,7 @@ def causal_conv1d(
     cu_seqlens: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     return_final_state: bool = False,
-    forward_config: ShortConvConfig | None = None,
-    input_grad_config: ShortConvConfig | None = None,
-    weight_grad_config: ShortConvConfig | None = None,
-    persistent_tma_input_gradient: bool = False,
+    kernel_options: ShortConvKernelOptions | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Apply causal depthwise convolution with an optional fused activation.
 
@@ -4437,13 +4494,8 @@ def causal_conv1d(
             ``N`` is the dense batch size or the number of packed sequences. Absence
             is equivalent to an all-zero history.
         return_final_state: Return the final ``W - 1`` input positions with the output.
-        forward_config: Optional forward schedule specialization.
-        input_grad_config: Optional input-gradient schedule specialization.
-        weight_grad_config: Optional weight-gradient schedule specialization.
-        persistent_tma_input_gradient: Use an explicit machine-bounded persistent
-            worker grid for packed TMA input gradients. Disabled by default because it
-            favors overcaptured replays and can regress full-capacity backward. Requires
-            ``x``'s base and outer strides to be 16-byte aligned; backward raises otherwise.
+        kernel_options: Optional :class:`ShortConvKernelOptions` selecting the forward and
+            gradient schedules. There is no ``autotune`` key: this operation never benchmarks.
 
     Returns:
         A contiguous tensor with the same shape, dtype, and device as ``x``. The input
@@ -4452,6 +4504,13 @@ def causal_conv1d(
         defined; parameter, state, and final-state values exclude the inactive suffix. When
         ``return_final_state`` is true, also returns ``[N, W - 1, C]`` history.
     """
+    options = _validate_kernel_options(
+        kernel_options,
+        op_name="causal_conv1d",
+        configs=("forward_config", "input_grad_config", "weight_grad_config"),
+        flags=("persistent_tma_input_gradient",),
+    )
+    persistent_tma_input_gradient = options.get("persistent_tma_input_gradient", False)
     resolve_activation(activation)
     _validate_inputs(x, weight, cu_seqlens, initial_state)
     channels = x.shape[2]
@@ -4463,6 +4522,9 @@ def causal_conv1d(
     default_forward = defaults.forward
     default_input_grad = defaults.input_gradient
     default_weight_grad = defaults.weight_gradient
+    forward_config = options.get("forward_config")
+    input_grad_config = options.get("input_grad_config")
+    weight_grad_config = options.get("weight_grad_config")
     forward = forward_config or _compatible_config(default_forward, channels)
     input_grad = input_grad_config or _compatible_config(default_input_grad, channels)
     weight_grad = weight_grad_config or _compatible_config(default_weight_grad, channels)
@@ -4608,7 +4670,7 @@ def causal_conv1d_decode(
     activation: str | None = None,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    forward_config: ShortConvConfig | None = None,
+    kernel_options: ShortConvDecodeKernelOptions | None = None,
 ) -> torch.Tensor:
     """Advance the convolution by one token per sequence over a paged history.
 
@@ -4638,7 +4700,7 @@ def causal_conv1d_decode(
             reading that slot, even if it contains NaNs. ``None`` resumes every live
             slot. Non-positive explicit indices remain inactive regardless of this mask;
             without ``state_indices``, slot zero is a valid sequence slot.
-        forward_config: Optional schedule specialization.
+        kernel_options: Optional :class:`ShortConvDecodeKernelOptions` selecting the schedule.
 
     Returns:
         The activated contiguous output ``[num_sequences, C]``, same dtype as ``x``.
@@ -4646,6 +4708,9 @@ def causal_conv1d_decode(
     Inference-only: the single-token step has no backward, so gradient-tracking inputs
     are rejected when autograd is enabled.
     """
+    options = _validate_kernel_options(
+        kernel_options, op_name="causal_conv1d_decode", configs=("forward_config",)
+    )
     resolve_activation(activation)
     _validate_decode_inputs(x, weight, state, state_indices, has_initial_state)
     if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (x, weight, state)):
@@ -4653,6 +4718,7 @@ def causal_conv1d_decode(
             "causal_conv1d_decode is inference-only and has no backward; use "
             "causal_conv1d for training or call under torch.no_grad()"
         )
+    forward_config = options.get("forward_config")
     if forward_config is None:
         return short_conv_ops.short_conv_decode_op(
             x,
@@ -4678,6 +4744,8 @@ def causal_conv1d_decode(
 
 __all__ = [
     "ShortConvConfig",
+    "ShortConvDecodeKernelOptions",
+    "ShortConvKernelOptions",
     "ShortConvTunedConfig",
     "causal_conv1d",
     "causal_conv1d_decode",

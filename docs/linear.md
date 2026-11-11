@@ -184,11 +184,23 @@ Positive `state_indices` must be unique and within the pool; non-positive routes
 touching it. `has_initial_state=False` gives paged prefill a zero history before it overwrites a
 fresh slot.
 
+`causal_conv1d` and `causal_conv1d_decode` never benchmark; `kernel_options` can override their
+default schedules. To tune `causal_conv1d` explicitly, call `tune_causal_conv1d` and pass its
+result as `kernel_options=tuned.kernel_options()`.
+
 ::: attn_gym.linear.causal_conv1d
 
 ::: attn_gym.linear.paged_causal_conv1d
 
 ::: attn_gym.linear.causal_conv1d_decode
+
+::: attn_gym.linear.short_conv.ShortConvKernelOptions
+
+::: attn_gym.linear.short_conv.ShortConvDecodeKernelOptions
+
+::: attn_gym.linear.short_conv.ShortConvConfig
+
+::: attn_gym.linear.short_conv.tune_causal_conv1d
 
 ## Kimi Delta Attention
 
