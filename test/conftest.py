@@ -88,8 +88,8 @@ def _reset_shared_compile_wrapper() -> Iterator[None]:
 def _check_real_kernel_fences(monkeypatch: pytest.MonkeyPatch) -> None:
     """Reject missing-fence verdicts in shipped kernels traced or restored during the test.
 
-    A cache hit whose compile function builds its kernel itself runs no trace and restores no
-    report, so this sees such a kernel only when it compiles cold.
+    Kernels built inside the compile function restore no report on a cache hit;
+    this checks them only on a cold compile.
     """
     if importlib.util.find_spec("cutlass") is None:
         return

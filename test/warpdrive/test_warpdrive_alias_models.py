@@ -947,8 +947,7 @@ def test_alias_verdicts(case):
     """Each model's pair gets its verdict; only a potential hazard raises under ``strict``."""
     make, pair, expected, evidence = VERDICTS[case]
     op = make()
-    # no_proxy_fence's commit_fence=() also drops a fence the fence check finds missing, which
-    # strict mode raises on (test_warpdrive_fences.py).
+    # no_proxy_fence also has a missing fence, which raises in strict mode.
     if expected != HAZARD and case != "no_proxy_fence":
         op.alias_check = "strict"
     compile_quietly(op, case)
