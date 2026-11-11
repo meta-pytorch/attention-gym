@@ -2,9 +2,9 @@
 
 [Back to warpdrive](index.md)
 
-Use raw CuTeDSL where a managed handoff does not express your protocol. You can take over
-one signal, one channel side, or an entire barrier set. The layer still allocates resources;
-**the synchronization you take over becomes your responsibility**.
+Keep managed handoffs where they fit. Use raw CuTeDSL for the part they cannot express: one
+signal, one channel side, or a whole barrier set. The layer still allocates resources;
+**you own the synchronization you replace**.
 
 ```text
 managed handle + signal=False   you replace one signal and its fences
@@ -12,192 +12,13 @@ channel + external=            you drive an entire unbound side
 Barriers                       you drive the whole protocol
 ```
 
-[`raw_interop.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) demonstrates the middle option: a managed
-producer, a raw consumer on the same ring, and a raw watcher using a `NamedBarrier`'s native
-ID. Start with that [example](#example-managed-and-raw-on-one-ring), then use the reference
-below for finer-grained mixing.
-
-## Escape hatches by feature
-
-### Replace a handle's signal
-
-A handle exposes `h.index`, `h.phase`, `h.full_barrier` (also `h.barrier`),
-`h.empty_barrier`, `h.data` and `h.view(...)`.
-
-`h.commit(signal=False)` or `h.release(signal=False)` closes the managed handle but emits
-**neither its signal nor its fences**. Raw code must supply both, with the effective count.
-That includes a TMA ring's derived `release_fence="smem_async"`: each thread that read the
-stage with ordinary loads runs `fence_async_shared()` before the raw arrival
-([Storage and fences](channels.md#storage-and-fences)). For a thread-written SMEM stage read
-by MMA, raw code must also supply the derived `commit_fence="smem_async"`: each writer runs
-`fence_async_shared()` before arrival.
-The alias diagnostic reports an ordering supplied only by the raw signal as `unverified`.
-
-Changing a count does not make a one-lane release safe. Conceptually:
-
-```text
-all reader threads finish their accesses
-  -> synchronize those readers
-  -> selected thread(s) perform required fences/arrivals
-  -> producer may reuse the stage
-```
-
-For one arrival per warp, use `Warps` rather than a custom count. Its managed signal runs the
-side's fence in all lanes, then performs `cute.arch.sync_warp()` and an elected arrival.
-The raw warp-local arrival sequence is:
-
-```python
-cute.arch.sync_warp()
-with cute.arch.elect_one():
-    cute.arch.mbarrier_arrive(bar)
-```
-
-This excerpt is **only** the local arrival portion: it does not supply your side's declared
-fences or remote targets. `Threads` instead arrives from every bound thread. Other sparse
-counts need an override and your own participation/ordering argument.
-
-### Override counts, bytes or masks
-
-```python
-self.ring = Ring(2, override={"empty_counts": 1})
-```
-
-Here a managed consumer still binds the channel, but must release with one raw arrival and
-close via `release(signal=False)`. The override does not select the arriving lane.
-
-| Override key | Replaces | Accepted values |
-|---|---|---|
-| `full_counts`, `empty_counts` | Expected arrivals | Positive int, per-slot list, or rank map of either form |
-| `tx` | Bytes armed on FULL | Nonnegative int; requires a TMA channel |
-| `full_mask`, `empty_mask` | UMMA completion masks | Nonnegative int |
-
-Count lists need one entry per slot; rank maps must cover every CTA rank. Inspect:
-
-- `end.scope`: effective counts, masks and transaction bytes, after overrides.
-- `end.channel.derived_scope`: values before overrides.
-- `end.targets`: target CTAs for the end's signals.
-
-`describe()` prints overrides beside derived values. It does not validate the raw protocol:
-`tx=0` and a well-typed mask naming a nonexistent rank are accepted. Overrides do not apply
-to named-barrier channels.
-
-### Drive a channel end by state and pointer
-
-Managed ends expose:
-
-| Accessor | Meaning |
-|---|---|
-| `end.full_barrier(i)`, `end.empty_barrier(i)` | This CTA's mbarrier pointers |
-| `end.state` | Ring `PipelineState`, or Slots `Int32` phase mask |
-| `end.index` | Ring's next stage |
-| `end.phase(slot)` | Next wait parity; omit `slot` for a Ring |
-| `self.barrier_ptr(name)` | Base pointer after `begin_roles()`, also available in roles |
-
-For `n` stages, FULL is `[0, n)` and EMPTY `[n, 2*n)` from the base. Raw code can wait with
-`cute.arch.mbarrier_wait(end.full_barrier(st.index), st.phase)` and signal with
-`cute.arch.mbarrier_arrive(end.empty_barrier(st.index))`. Advance the state you read and
-restore it with `end.state = st` before the next managed call.
-
-Raw waits have no managed handle lifetime or alias-ordering checks. Reading **or** assigning
-`end.state` invalidates outstanding try tokens and unadopted previews: a read exposes live
-state that raw code may advance.
-
-Sharing changes the state contract:
-
-- **Exclusive consumers:** `skip(n)` is `advance_state(end.state, n)` plus trace bookkeeping
-  (`advance_state` is CuTeDSL 4.8's `state.advance(n)`, on every supported version). Use a
-  positive Python int or dynamic `Int32` with `n >= 0`. Raw state or dynamic skips make
-  ownership unverified. `override={"empty_counts": ...}` lifts equal consumer contributions;
-  each owner must supply the replacement count.
-- **Round-robin sides:** instance `j` of `k` starts at epoch `j`; each managed acquire/wait
-  steps `k`, exposed by `end.channel.turns(side)`. Raw advancement must also step `k`.
-  Raw state makes trip-count ownership unverified; alias orderings through the ring are
-  already unverified.
-
-### Leave one side external
-
-```python
-self.ring = Ring(2, external="consumer", override={"empty_counts": 1})
-```
-
-Unlike replacing a signal on a managed end, **no role binds the external side**. A raw role
-or kernel code drives its pointers and keeps its own state. The managed producer continues
-using `ring.produce()` normally.
-
-- `external="consumer"` requires `empty_counts`; `external="producer"` requires `full_counts`.
-  With no bound role there, those counts cannot be derived. `describe()` marks them as the
-  override's and unverified.
-- The external side takes no managed end binding, role names or fences; those declarations
-  raise. Raw code supplies every wait, completion, fence and signal on that side. An external
-  consumer of a TMA-filled ring gets no derived release fence. Threads that read the ring with
-  ordinary loads must run `fence_async_shared()` before releasing. External producers of SMEM
-  stages read by MMA get no derived commit fence.
-- Only CTA-local mbarrier channels with `Sharing.JOIN` on both sides are supported: no TMA
-  multicast or `fills`. Raw code drives the side in each CTA.
-
-Alternatively, bind a managed role and use raw code through its endpoint state/accessors.
-If neither side is managed, use `Barriers` instead.
-
-### Tokens and previews
-
-- A loop-carried `Token` is checked normally. For a protocol the checker cannot follow,
-  pass a raw Boolean, such as `cute.arch.mbarrier_try_wait(bar, phase)` or `token.ready`,
-  inside `with unchecked("token", reason=...)`. That block stops checking the supplied
-  token's end, epoch and dynamic region.
-- A `peek()` preview exposes `preview.index` and `preview.phase` for raw tensor indexing.
-  The next wait on the end owns the epoch; raw accesses through those indices are outside
-  the alias diagnostic.
-
-### Named barriers and named channels
-
-For a declared `NamedBarrier`, `.id` and `.threads` let native code join the same generation
-as managed `sync()`/`arrive()`:
-
-```python
-cute.arch.barrier(barrier_id=nb.id, number_of_threads=nb.threads)
-```
-
-Reading `.id` while tracing records the role as `native id by ...`. Native calls themselves
-are invisible. Missing observed arrivals in a CTA with such a caller (or a kernel-code ID
-read) become `unverified`, not an error; impossible counts beyond that CTA's available role
-threads still raise. Kernel code outside roles may use the whole block.
-
-A `sync="named"` channel exposes one `NamedBarrier` per slot through
-`end.channel.full_barriers[s]` and `end.channel.empty_barriers[s]`.
-`op.named_barrier_ids` lists the allocated consecutive IDs. Use the objects' `.sync()` and
-`.arrive()`, or native `cute.arch.barrier`/`barrier_arrive` with their ID/count. Named channels
-have no mbarrier pointers and take no count overrides. Per-generation participation is
-never verified.
-
-`alias.named_barrier(id, n)` is for an ID no declaration owns. It checks collisions with
-layer, channel and `NamedBarrier` IDs; native `cute.arch` calls do not. See
-[named barriers](channels.md#named-barriers) for allocation and reuse rules.
-
-### Own the whole protocol
-
-`Barriers(n, counts=...)` reserves mbarriers initialized and fenced with the layer's barriers.
-Access them through a `name: Barriers` role parameter or `self.barrier_ptr(name)`.
-There are no protocol checks.
-
-With `counts=None`, initialize them yourself **between `begin_roles()` and `run_roles()`**.
-For example, a CUTLASS pipeline can take the storage with
-`cutlass.pipeline.PipelineUmmaAsync.create(barrier_storage=self.barrier_ptr(name), defer_sync=True)`.
-
-A `@role(raw=True)` role receives context and may take `Instance`, `Local`, `Tmem` and
-`Barriers` or use `self.<NamedBarrier>`. It cannot take managed ends, work cursors or turnstile
-seats; return values are ignored. It has no managed handle checks or persistent-stream drain
-check. For a nonpersistent local schedule, get the item from `self.work.single_item()`. For a
-persistent kernel, use a managed role with a raw body instead.
-
-### Suppress one check
-
-`unchecked(check, reason=...)` supports `unclosed`, `cross_region`, `tma`, `alias` and `token`.
-It suppresses only that check inside the block and records the opt-out in `describe()`.
-It changes diagnostics, not device synchronization.
+Start with [`raw_interop.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py):
+a managed producer and raw consumer share a ring. A raw watcher joins a `NamedBarrier`
+through its native ID.
 
 ## Example: managed and raw on one ring
 
-Protocol:
+The example keeps the producer managed and replaces the consumer side:
 
 ```text
 managed producer: acquire EMPTY -> write -> commit FULL
@@ -206,7 +27,7 @@ raw completion:   64 consumers publish results and arrive on done
                   32 watchers sync natively on done.id -> read results
 ```
 
-This excerpt omits the example's math/prologue, not its participation. The full runnable
+This excerpt keeps all participants but omits the math and prologue. The full runnable
 version is [`raw_interop.py`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py).
 
 ```python
@@ -241,9 +62,8 @@ def watcher(self, ctx):
     ...  # read the results published before the consumers' arrival
 ```
 
-The managed producer uses `ring.produce()` unchanged. The override expects one EMPTY arrival
-per stage. `read.sync()` orders all consumer reads before that arrival—**the count alone
-would not**.
+The producer uses `ring.produce()` unchanged. `read.sync()` orders all 64 readers before the
+single EMPTY arrival. **The count alone would not.**
 
 `describe()` makes both raw boundaries visible:
 
@@ -255,6 +75,176 @@ done: arrive by consumer; native id by watcher;
 ```
 
 `test/warpdrive/test_warpdrive_hardening.py` exercises several stage counts and epoch counts.
+
+## Escape hatches by feature
+
+### Replace a handle's signal
+
+A handle exposes `h.index`, `h.phase`, `h.full_barrier` (also `h.barrier`),
+`h.empty_barrier`, `h.data` and `h.view(...)`.
+
+`h.commit(signal=False)` or `h.release(signal=False)` closes the handle but emits
+**neither its signal nor its fences**. Supply both, with the effective count. This includes
+the derived `smem_async` fences: every ordinary reader of a TMA-filled stage, or writer of
+an MMA-consumed SMEM stage, runs `fence_async_shared()` before the raw arrival. See
+[Storage and fences](channels.md#storage-and-fences) for `release_fence` and `commit_fence`.
+The alias diagnostic marks ordering supplied only by a raw signal as `unverified`.
+
+Changing a count does not make a one-lane release safe. Conceptually:
+
+```text
+all reader threads finish their accesses and required fences
+  -> synchronize those readers
+  -> selected thread(s) arrive
+  -> producer may reuse the stage
+```
+
+For one arrival per warp, use `Warps`, not a custom count. It runs the side's fence in all
+lanes, then synchronizes the warp and elects one lane to arrive. The raw local arrival is:
+
+```python
+cute.arch.sync_warp()
+with cute.arch.elect_one():
+    cute.arch.mbarrier_arrive(bar)
+```
+
+This supplies **only** the local arrival, not fences or remote targets. `Threads` arrives
+from every bound thread. Other sparse counts need an override and your own participation
+and ordering argument.
+
+### Override counts, bytes or masks
+
+```python
+self.ring = Ring(2, override={"empty_counts": 1})
+```
+
+The managed consumer must now supply one raw arrival and close with `release(signal=False)`.
+The override does not select the arriving lane.
+
+| Override key | Replaces | Accepted values |
+|---|---|---|
+| `full_counts`, `empty_counts` | Expected arrivals | Positive int, per-slot list, or rank map of either form |
+| `tx` | Bytes armed on FULL | Nonnegative int; requires a TMA channel |
+| `full_mask`, `empty_mask` | UMMA completion masks | Nonnegative int |
+
+Count lists need one entry per slot; rank maps must cover every CTA rank. Inspect:
+
+- `end.scope`: effective counts, masks and transaction bytes, after overrides.
+- `end.channel.derived_scope`: values before overrides.
+- `end.targets`: target CTAs for the end's signals.
+
+`describe()` shows overrides beside derived values; it does not validate the raw protocol.
+For example, `tx=0` and a well-typed mask naming a nonexistent rank are accepted.
+Named-barrier channels do not accept overrides.
+
+### Drive a channel end by state and pointer
+
+Managed ends expose:
+
+| Accessor | Meaning |
+|---|---|
+| `end.full_barrier(i)`, `end.empty_barrier(i)` | This CTA's mbarrier pointers |
+| `end.state` | Ring `PipelineState`, or Slots `Int32` phase mask |
+| `end.index` | Ring's next stage |
+| `end.phase(slot)` | Next wait parity; omit `slot` for a Ring |
+| `self.barrier_ptr(name)` | Base pointer after `begin_roles()`, also available in roles |
+
+For `n` stages, FULL is `[0, n)` and EMPTY `[n, 2*n)` from the base. Raw code can wait with
+`cute.arch.mbarrier_wait(end.full_barrier(st.index), st.phase)` and signal with
+`cute.arch.mbarrier_arrive(end.empty_barrier(st.index))`. Advance the state you read and
+restore it with `end.state = st` before the next managed call.
+
+Raw waits bypass handle-lifetime and alias-ordering checks. Reading **or** assigning
+`end.state` invalidates outstanding try tokens and unadopted previews. Even a read exposes
+live state that raw code may advance.
+
+Sharing changes the state contract:
+
+- **Exclusive consumers:** `skip(n)` is `advance_state(end.state, n)` plus trace bookkeeping
+  (`advance_state` is CuTeDSL 4.8's `state.advance(n)`, on every supported version). Use a
+  positive Python int or dynamic `Int32` with `n >= 0`. Raw state or dynamic skips make
+  ownership unverified. `override={"empty_counts": ...}` lifts equal consumer contributions;
+  each owner must supply the replacement count.
+- **Round-robin sides:** instance `j` of `k` starts at epoch `j`; each managed acquire/wait
+  steps `k`, exposed by `end.channel.turns(side)`. Raw advancement must also step `k`.
+  Raw state makes trip-count ownership unverified; alias orderings through the ring are
+  already unverified.
+
+### Leave one side external
+
+```python
+self.ring = Ring(2, external="consumer", override={"empty_counts": 1})
+```
+
+**No role binds the external side.** Raw code drives its pointers and keeps its own state.
+The managed producer still uses `ring.produce()`.
+
+- `external="consumer"` requires `empty_counts`; `external="producer"` requires `full_counts`.
+  Without bound roles, the layer cannot derive these counts. `describe()` marks them unverified.
+- Managed end bindings, role names and fences on the external side raise. Supply every wait,
+  completion, fence and signal yourself. No release fence is derived for external consumers
+  of TMA-filled stages: ordinary readers must run `fence_async_shared()` before release.
+  No commit fence is derived for external producers of SMEM stages read by MMA, either.
+- Only CTA-local mbarrier channels with `Sharing.JOIN` on both sides are supported. There is
+  no TMA multicast or `fills`; raw code drives the side in each CTA.
+
+Alternatively, bind a managed role and use raw code through its endpoint state/accessors.
+If neither side is managed, use `Barriers` instead.
+
+### Tokens and previews
+
+- Loop-carried `Token`s are checked normally. If the checker cannot follow your protocol,
+  pass a raw Boolean (`cute.arch.mbarrier_try_wait(bar, phase)` or `token.ready`) inside
+  `with unchecked("token", reason=...)`. This skips the end, epoch and dynamic-region checks.
+- A `peek()` preview exposes `preview.index` and `preview.phase` for raw tensor indexing.
+  The next wait on the end owns the epoch; raw accesses through those indices are outside
+  the alias diagnostic.
+
+### Named barriers and named channels
+
+For a declared `NamedBarrier`, `.id` and `.threads` let native code join the same generation
+as managed `sync()`/`arrive()`:
+
+```python
+cute.arch.barrier(barrier_id=nb.id, number_of_threads=nb.threads)
+```
+
+Reading `.id` records `native id by ...`; the checker cannot see the native calls. Missing
+arrivals in a CTA with a native caller become `unverified`, not an error. Counts beyond that
+CTA's available role threads still raise. An ID read outside roles allows the whole block.
+
+A `sync="named"` channel exposes one `NamedBarrier` per slot through
+`end.channel.full_barriers[s]` and `end.channel.empty_barriers[s]`.
+`op.named_barrier_ids` lists the allocated consecutive IDs. Use the objects' `.sync()` and
+`.arrive()`, or native `cute.arch.barrier`/`barrier_arrive` with their ID/count. Named channels
+have no mbarrier pointers and take no count overrides. Per-generation participation is
+never verified.
+
+`alias.named_barrier(id, n)` is for an ID no declaration owns. It checks collisions with
+layer, channel and `NamedBarrier` IDs; native `cute.arch` calls do not. See
+[named barriers](channels.md#named-barriers) for allocation and reuse rules.
+
+### Own the whole protocol
+
+`Barriers(n, counts=...)` reserves mbarriers initialized and fenced with the layer's barriers.
+Access them through a `name: Barriers` role parameter or `self.barrier_ptr(name)`.
+There are no protocol checks.
+
+With `counts=None`, initialize them yourself **between `begin_roles()` and `run_roles()`**.
+For example, a CUTLASS pipeline can take the storage with
+`cutlass.pipeline.PipelineUmmaAsync.create(barrier_storage=self.barrier_ptr(name), defer_sync=True)`.
+
+A `@role(raw=True)` role receives context and may take `Instance`, `Local`, `Tmem` and
+`Barriers`, or use `self.<NamedBarrier>`. It cannot take managed ends, work cursors or turnstile
+seats. Returns are ignored; handle and stream-drain checks do not run. For a nonpersistent
+local schedule, use `self.work.single_item()`. For persistence, use a managed role with a raw
+body instead.
+
+### Suppress one check
+
+`unchecked(check, reason=...)` supports `unclosed`, `cross_region`, `tma`, `alias` and `token`.
+It suppresses only that check inside the block and records the opt-out in `describe()`.
+It changes diagnostics, not device synchronization.
 
 ## Compiler pitfall: saved indices across loops
 

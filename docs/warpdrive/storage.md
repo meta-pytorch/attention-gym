@@ -2,9 +2,10 @@
 
 [Back to warpdrive](index.md)
 
-Channels control **when** a stage is usable. `SmemPlan` declares **where** its data lives.
-You can instead allocate tensors yourself and index them with `h.index`; neither approach
-chooses your layout or changes the channel's synchronization.
+Use `SmemPlan` to declare the shared-memory buffers behind a channel, as in the built-in
+[GEMM](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py).
+The plan allocates storage; channel handles select the stage you can use. You still supply
+the layouts and TMA/MMA partitions.
 
 ```python
 self.smem_plan = SmemPlan()
@@ -19,6 +20,8 @@ begin_roles   binds layouts and allocates the whole buffers
 handle        selects A/B at its own h.index
 channel       orders publication and reuse; stores no A/B data in its barriers
 ```
+
+You can also allocate tensors yourself and index them with `h.index`.
 
 ## Allocate in the prologue
 
@@ -56,9 +59,8 @@ with ab.produce() as h:
     ...  # A and B at h.index, each with its stage mode removed
 ```
 
-That is the **canonical view**: the original layout with the stage mode selected. TMA/MMA
-usually need a partitioned view instead. Build the partition as usual, then register its
-stage axis with `StageView`:
+This **canonical view** selects the stage in the original layout. For TMA/MMA, build a
+partitioned view and register its stage axis with `StageView`:
 
 ```python
 ab = ab.views(A=StageView(tAsA, axis=1), B=StageView(tBsB, axis=1))
@@ -72,12 +74,12 @@ h.data["A"]  -> canonical A at h.index
 h.view("A")  -> registered tAsA at h.index (canonical A if none registered)
 ```
 
-Rebind the result of `views()` and return the endpoint from the role. It retains the same
-state and checks the partition's stage extent, **not** that the tensor addresses the declared
-buffer. A view registered in a loop holds that loop's values; use it in that region only.
+Reassign the result of `views()` and return that endpoint from the role. It keeps the same
+state and checks the stage extent, **not** whether the tensor addresses the named buffer.
+Use a view registered in a loop only in that region; it holds the loop's values.
 
-`h.view()` always uses the handle's snapshot, never the endpoint's next stage. Omit the name
-only for a single buffer. Registering partitions does not change `h.data`.
+`h.view()` selects the handle's stage, never the endpoint's next one. Omit the name only
+for a single buffer. Registered partitions do not change `h.data`.
 
 To select other modes too, supply one coordinate per nonstage mode (`None` keeps a mode):
 
@@ -100,31 +102,28 @@ v = self.smem_plan.buffer("V", cutlass.BFloat16, align=1024, overlaps=k)
 self.kv = Ring(kv_stages, Tma(stage_bytes), Umma, buffer={"K": k, "V": v})
 ```
 
-V starts at the root allocation's first byte, recast to V's dtype/swizzle/layout, and adds no
-storage. It must fit and cannot demand stricter alignment. Allocation checks static byte
-sizes; dynamic sizes get no static bounds check. Multiple channels can bind one buffer
-without allocating again.
+V reuses the root allocation from its first byte, with V's dtype, swizzle and layout.
+It adds no storage, must fit, and cannot require stricter alignment. Allocation checks
+static byte sizes, not dynamic ones. Multiple channels can bind a buffer without reallocating.
 
-**Overlapping bytes does not order accesses.** Channel epochs must keep K readers from
-racing V writers. If the layouts overlap across different stage numbers, ordinary ring
-reuse is insufficient:
+**Sharing bytes does not order accesses.** Keep K reads separate from V writes through
+channel epochs. Ordinary ring reuse is not enough when different stages overlap:
 
 ```text
 ring orders:       read stage 0 -> release stage 0 -> overwrite stage 0
 ring does not add: read stage 0 -> overwrite overlapping bytes in stage 1
 ```
 
-In a cluster, each CTA allocates its own copy at the same offset. Bound buffers are allowed
-on pair-scoped channels, unlike layer-owned `payload`s. Binding adds no DSMEM publication;
-`remote_scope` still defaults to `"cta"`. On a `Threads`/`Warps` channel to `Umma` it
-derives `commit_fence="smem_async"` ([Storage and fences](channels.md#storage-and-fences)).
-For ordinary memory read by a peer,
-follow the [pair memory-scope rules](clusters.md#memory-scope).
+Each CTA in a cluster allocates its own copy at the same offset. Pair-scoped channels can
+bind buffers, but cannot own `payload`s. Binding derives `commit_fence="smem_async"` for
+`Threads`/`Warps` → `Umma` ([Storage and fences](channels.md#storage-and-fences)); it adds
+no DSMEM publication. `remote_scope` still defaults to `"cta"`. For ordinary memory read
+by a peer, follow the [pair memory-scope rules](clusters.md#memory-scope).
 
 ## Check declared aliases
 
-The alias diagnostic looks for conflicting accesses to declared SMEM overlaps and
-`TmemPlan.alias` regions. **It checks annotations, not all kernel memory accesses.**
+The alias diagnostic checks declared SMEM overlaps and `TmemPlan.alias` regions for
+conflicting accesses. **It reads your annotations, not all kernel memory accesses.**
 
 ```python
 op.alias_check = "warn"  # default; set before compiling
@@ -138,9 +137,9 @@ print(op.describe())
 | `"strict"` | Raise `ProtocolError` for a potential hazard, not an unverified case |
 | `"off"` | Skip analysis |
 
-Analysis runs while tracing. `jit_cache` keys `alias_check` through
-`op.__cute_cache_key__()`: warn/off builds cannot satisfy strict requests. Cache loads restore
-reports and warnings ([compile keys](roles.md#compile-keys)).
+Analysis runs during tracing. `alias_check` is part of `op.__cute_cache_key__()`, so
+`jit_cache` cannot reuse warn/off builds for strict requests. Cache hits restore reports
+and warnings ([compile keys](roles.md#compile-keys)).
 
 Annotate **at the operation**, not merely when obtaining a pointer:
 
@@ -150,9 +149,9 @@ with kv.produce() as h:
     cute.copy(tma_k, src, dst, tma_bar_ptr=h.barrier)
 ```
 
-If a helper already holds the tensor, use `h.access("K", write=True, by="tma")` to record the
-access without returning a view. Set `read=True`, `write=True`, or both. SMEM agents are
-`"threads"` (ordinary loads/stores), `"tma"`, and `"umma"` (MMA operand reads).
+If a helper already has the tensor, `h.access("K", write=True, by="tma")` records the access
+without returning a view. Set `read=True`, `write=True`, or both. `by=` names the agent:
+`"threads"` for ordinary SMEM loads/stores, `"tma"` for TMA, or `"umma"` for MMA operand reads.
 
 TMEM offers the same two forms:
 
@@ -165,9 +164,9 @@ s_ptr = tmem.view("S", stage, write=True, by="umma")
 tmem.access("P", stage, read=True, by="umma")
 ```
 
-`tmem.view()` returns an fp32 pointer, **not a CuTe tensor**; `tmem.access()` only records.
-Its slot is a Python int [TMEM plan slot](channels.md#tmem), not a dynamic ring index. Agents
-are `"threads"` for `tcgen05.ld/st` and `"umma"` for MMA.
+`tmem.view()` returns an fp32 pointer, **not a CuTe tensor**. `tmem.access()` only records.
+The slot is a Python int [TMEM plan slot](channels.md#tmem), not a dynamic ring index.
+Use `"threads"` for `tcgen05.ld/st` and `"umma"` for MMA.
 
 For a narrower TMEM footprint, declare `warps`, `lanes` and `cols`:
 
@@ -217,14 +216,12 @@ choose an available ID with the correct participant count.
 | `unverified` | Not enough modeled information to decide |
 | `no hazard found` | No hazard among the annotated conflicting pairs; **not proof of safety** |
 
-Inspect the report even without a warning. Warn mode reports findings, but some unverified
-cases appear only in `describe()`.
+Inspect `describe()` even without a warning: some unverified cases appear only there.
 
-**Model boundary.** The diagnostic models single-CTA kernels, whole-region/stage
-footprints, same-channel handoffs and cross-channel paths. Its bounded trace runs loops twice
-and persistent work items twice. Clusters, raw/unannotated accesses and unmatched epochs can
-remain unverified. `h.data`, `tmem.ptr`, `tmem.cols` and `tmem.base` are unannotated acquisitions,
-not descriptions of later accesses. Cross-role convergence is not proved.
+The model covers single-CTA kernels, whole-region/stage footprints, same-channel handoffs
+and cross-channel paths. It runs loops and persistent work items twice. Clusters,
+raw/unannotated accesses and unmatched epochs can remain unverified. `h.data`, `tmem.ptr`,
+`tmem.cols` and `tmem.base` do not annotate later accesses. Cross-role convergence is not proved.
 
 **Which handoffs order storage?**
 
@@ -240,23 +237,21 @@ not descriptions of later accesses. Cross-role convergence is not proved.
 - Round-robin epoch matching is not modeled. An ordering through that channel is unverified;
   a pair no possible epoch pairing could order remains a potential hazard.
 
-**Unequal traced counts mean unknown epoch correspondence.** Prologues, peeled final tiles
-or differently shaped loops can give two roles different per-item counts. The model then
-keeps only these definite cross-role links:
+**Unequal traced counts leave epoch matching unknown.** Prologues, peeled tiles or different
+loops can give roles different per-item counts. Only these cross-role links remain definite:
 
 ```text
 item's commits -> consumer's last wait for that item
 Slots release  -> next item's first acquire
 ```
 
-Other pairings within the item and the next are guesses. If only a guess orders a pair,
-the report says `unverified` with the channel, both counts and "unknown epoch correspondence",
-without warning. If no pairing could order it, the result stays `potential hazard`.
+Other pairings within this item and the next are guesses. If only a guess orders a pair,
+the report says `unverified`, naming the channel, both counts and "unknown epoch correspondence",
+without warning. If no pairing could order it, the result remains `potential hazard`.
 
-Those guesses over-approximate: an unbalanced channel can downgrade a real hazard to
-unverified. Treat such entries as unchecked; balance traced counts or inspect the overlap
-by hand. The diagnostic does not choose loop counts to balance channels, which could hide a
-missing publication/release.
+An unbalanced channel can therefore downgrade a real hazard to unverified. Treat these
+entries as unchecked: balance traced counts or inspect the overlap by hand. The diagnostic
+does not choose loop counts to balance channels; that could hide a missing publication/release.
 
 Other assumptions and limits:
 

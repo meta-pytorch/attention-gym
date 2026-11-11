@@ -6,19 +6,19 @@ Start with GEMM for the basic handoff; use the other examples for the feature yo
 These are teaching kernels with the input limits below, not drop-in replacements for every
 PyTorch or FA4 feature.
 
-| Learn | Source | Guide |
+| Start here to… | Source | Guide |
 |---|---|---|
-| Three roles, two rings, one CTA per tile; `WorkStream(schedule=OneShot())` | [gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py) | [GEMM](#gemm) |
-| Four schedules, double-buffered accumulators, TMA stores, pairs, multicast clusters, `tile_n` | [persistent_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/persistent_gemm.py) | [GEMM](#gemm), [tile boundaries](#tile-boundaries) |
-| Device offsets, stateful `WorkMap`, one descriptor per operand, ragged stores | [grouped_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/grouped_gemm.py) | [Grouped GEMM](#grouped-gemm) |
-| Two softmax instances, correction, slots, fan-out/join, turnstiles, S/P alias, split-P, persistence and pairs | [fa4_fwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_fwd.py) | [Forward](#attention-forward) |
-| Overlapping handles, `Warps` arrivals, TMEM/SMEM aliases, a 2-CTA pair with a DSMEM exchange and relay warp | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
-| Device-built work table: host capacity, device length | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
-| Split-KV items, per-sequence counts, round-robin softmax, named mailboxes, SMEM P | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
-| Whole-model persistent decode: host instruction table, static schedule, cooperative launch, epoch-tagged words between CTAs | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
-| Managed producer, raw `external="consumer"` with overridden count, native wait on a `NamedBarrier.id` | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
-| `WorkMap` subclasses that wrap CUTLASS's and FA4's tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
-| Per-CTA schedule pages from `WorkStream.assignment` | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
+| Write a basic GEMM | [gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py) | [GEMM](#gemm) |
+| Add persistent scheduling and CTA clusters | [persistent_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/persistent_gemm.py) | [GEMM](#gemm), [tile boundaries](#tile-boundaries) |
+| Handle grouped GEMM and ragged groups | [grouped_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/grouped_gemm.py) | [Grouped GEMM](#grouped-gemm) |
+| Build attention with multiple consumers | [fa4_fwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_fwd.py) | [Forward](#attention-forward) |
+| Study attention backward and overlapping lifetimes | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
+| Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
+| Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
+| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
+| Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
+| Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
+| Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
 
 The larger examples have a `bench_*.py` script beside them. Run benchmarks under a GPU
 reservation with `--output` to save versions, source hashes and every replay sample; compare
@@ -57,6 +57,9 @@ Both wrappers require:
 
 `PersistentGemm` defaults to two accumulator stages: the next mainloop can use one while
 the epilogue drains the other. All stage choices must fit SMEM and TMEM.
+
+<details markdown="1">
+<summary>Tile choices, benchmarks and buffer reuse</summary>
 
 For two pairs sharing A along N, pass `cluster=Cluster(2, 2, pair=True)`; see
 [clusters](clusters.md#larger-clusters). At `tile_n=224`, this matches the cuBLAS 256x224 2x2
@@ -100,6 +103,8 @@ their releases publish nothing, so the layer derives `remote_scope="cta"` for th
 ([scheduling](scheduling.md)); avoid forcing cluster scope on a ring whose release publishes
 no data.
 
+</details>
+
 ## Grouped GEMM
 
 ```python
@@ -118,7 +123,7 @@ offsets = [700, 700, 1500, ...]
 group 0: rows [0, 700)      group 1: empty      group 2: rows [700, 1500)
 ```
 
-Contract:
+**Inputs and limits:**
 
 - `a: (total_M, K)`, `b: (G, N, K)`, BF16; GEMM's device, contiguity, alignment and
   K/N-multiple-of-8 limits apply.
@@ -132,7 +137,10 @@ One compiled kernel handles dynamic `G`, `total_M`, `N`, `K` and routing. Option
 `schedule` (default `StaticPersistent()`), `cluster` (`SingleCta()` or `CtaPair()`),
 `max_ctas`, `tile_n`, `ab_stages`, `acc_stages`, `c_stages`, `epi_tile_n` and `roles`.
 
-**How work is found:** the host reserves an upper bound of
+<details markdown="1">
+<summary>How grouped work and ragged stores are handled</summary>
+
+**Finding work.** The host reserves an upper bound of
 `ceil(total_M / tile_m) + G` m-tiles, since each ragged group adds at most one. `GroupedTiles`
 numbers real tiles back to back, dropping only indices after the last tile. Its
 [decode state](scheduling.md#decode-state) carries the prefix-sum walk between items,
@@ -140,10 +148,12 @@ testing eight groups per round trip instead of restarting. Exact numbering is wh
 static schedule tie atomic/CLC without a scheduler warp: a binary search over a padded tile
 space scattered dropped slots through static units' strided sequences and unbalanced them.
 
-**How stores stop at a group boundary:** A/out each use one descriptor plus
+**Stopping stores at a group boundary.** A/out each use one descriptor plus
 `cute.domain_offset`; B is `(N, K, G)`, with group as a TMA coordinate. The output's ragged
 view has shape `(2^30, N, 2^31 - 1)`: its row mode ends at TMA's clipping boundary, and its
 third coordinate selects the group's end row. A partial group tile is clipped like a tensor edge.
+
+</details>
 
 **Choosing a cluster.** Small skewed groups waste rows in 128-row tiles; a pair's 256-row
 tiles waste about twice as many, so `CtaPair()` pays only with few groups and large N.
@@ -181,11 +191,13 @@ The tiling needs `2 * (tile_n + head_dim) <= 512` TMEM columns. Wrapper checks a
 complete validator of rank, head dimension or device requirements; enforce the full contract
 in another wrapper.
 
-Choose [schedule and mapping](scheduling.md) with `schedule=`/`mapping=` (`Raster` or a
-custom `WorkMap`, including the [external tile orders](scheduling.md#external-tile-orders-subclass-workmap)), and [role placement/register budgets](roles.md#choose-placement-in-the-constructor)
-with `roles={...}`. `tile_n=64` halves the K/V tile; `rescale_threshold` controls FA4's
-lazy rescale; head dimension follows the tensors. See [configuration](configuration.md)
-for all knobs and fixed choices.
+Use `schedule=` to choose a schedule and `mapping=` to choose the tile order: `Raster` or a
+custom `WorkMap`, including [external tile orders](scheduling.md#external-tile-orders-subclass-workmap).
+Override warp placement and register budgets with
+[`roles={...}`](roles.md#choose-placement-in-the-constructor).
+
+`tile_n=64` halves the K/V tile; `rescale_threshold` controls FA4's lazy rescale. Head dimension
+comes from the tensors. See [configuration](configuration.md) for all options and fixed choices.
 
 For short sequences prefer `StaticPersistent()` (FA4's default) over `ClusterLaunchControl()`:
 at 8x16x1024, CLC launches 512 CTAs where static launches 152, and static is faster; on long
@@ -248,9 +260,9 @@ dq, dk, dv = fa4_bwd(q, k, v, out, dout, lse, causal=False)  # FA4's 1-CTA kerne
 dq, dk, dv = fa4_bwd(q, k, v, out, dout, lse, causal=False, cluster=CtaPair())  # FA4's default
 ```
 
-This ports both head-dimension-128 main kernels of FA4's `flash_bwd_sm100.py`: its 1-CTA
-kernel (`FlashAttentionBackward`, which FA4 selects with `disable_2cta`) and its default
-pipelined 2-CTA kernel (`FlashAttentionBackward2Cta`, `cluster=CtaPair()`).
+This example ports both head-dimension-128 kernels from FA4's `flash_bwd_sm100.py`. The
+1-CTA path is `FlashAttentionBackward` (FA4's `disable_2cta` option); `cluster=CtaPair()`
+selects `FlashAttentionBackward2Cta`, FA4's default.
 
 ```text
 FA4 preprocess -> warpdrive main kernel -> FA4 dQ postprocess
@@ -259,13 +271,16 @@ FA4 preprocess -> warpdrive main kernel -> FA4 dQ postprocess
   zero fp32 dQ accumulator
 ```
 
-Contract:
+**Inputs and limits:**
 
 - BF16 `(batch, seqlen, heads, 128)` inputs, contiguous, 16-byte aligned, one CUDA device;
   matching batch/head counts, no GQA. Forward LSE: fp32 `(batch, heads, seqlen_q)`.
 - Arbitrary sequence lengths: TMA zero-fills partial loads, keys past `seqlen_k` are masked,
   and dK/dV stores are clipped. `causal=True` is bottom-right aligned.
 - No varlen, paging, block sparsity, score mods, softcap or deterministic mode.
+
+<details markdown="1">
+<summary>Role layout, cross-CTA exchange and design notes</summary>
 
 **1-CTA.** Each `OneShot()` item is a 128-key tile. `Raster()` over `(n_blocks, heads, batch)`
 matches FA4's `SingleTileScheduler` order. Four roles use 14 warps: reduce 0–3, two compute
@@ -315,6 +330,8 @@ Design points worth reusing:
 - The alias report marks P~S, dS~dP, dQ~dP and dQ~dS `unverified` (unknown epoch
   correspondence, not hazards), and every alias in the pair (pairs are not modeled).
 
+</details>
+
 ### Correctness
 
 dK and dV are bit for bit FA4's results from the same kernel configuration (1-CTA against
@@ -363,6 +380,9 @@ S^T = K Q^T -> softmax -> P^T -> O^T = V^T P^T
 unwritten; kept splits with no KV blocks write O=0, LSE=-inf. `fa4_decode` uses FA4's combine
 kernel and returns BF16 O `(batch, 1, heads, d_v)` and fp32 LSE `(batch, heads, 1)`.
 
+<details markdown="1">
+<summary>Decode roles and handoffs</summary>
+
 The roles keep FA4's placement: QK and PV MMA warps, K/V-load plus split-LSE warp,
 Q-load/O-store warp, two alternating softmax warpgroups, and correction warpgroup.
 
@@ -376,6 +396,8 @@ Q-load/O-store warp, two alternating softmax warpgroups, and correction warpgrou
   exchange. Three one-shot `NamedBarrier` flags finish split statistics; one-shot flags
   instead of ring channels free named-barrier IDs (12 to 9 of 13 here).
 - P occupies a 4-stage SMEM ring as PV's B operand, with no TMEM alias.
+
+</details>
 
 `SwapABDecode` configures `tile_n` (default 256), `tile_k` (64), S/P depths (4/4), head
 dimensions and role registers; wrappers forward these keywords. See
@@ -483,6 +505,9 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 | GPU | SM100 family; one CTA per SM, cooperative launch |
 | Not supported | Batch > 1, prefill, paging, other model shapes |
 
+<details markdown="1">
+<summary>How the megakernel runs the model</summary>
+
 - **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
   assigns rows to CTAs with a row-latency model and `assign_static` lays the table out
   `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
@@ -495,8 +520,8 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 - **Dependencies between CTAs** are raw code: every activation is a 64-bit word
   `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
   (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL
-  protocol). The last CTA to finish advances the epoch. Split-K partials are summed by their consumers, except
-  down's: its last split (last because its GATEUP rows run in a second wave) fetches the other
+  protocol). The last CTA to finish advances the epoch. Consumers sum their Split-K partials,
+  except down's: its last split (last because its GATEUP rows run in a second wave) fetches the other
   partials and publishes the finished residual, so QKV and the LM head read one word per
   element instead of five.
 - **Numerics** follow HF's bf16 rounding boundaries with fp32 accumulation; every per-step
@@ -510,6 +535,8 @@ and length of dependent phases, not cache hints.
 `QwenDecodeMegakernel(splits=19)` (passed through `QwenMegakernel(..., splits=19)`) gives one
 attention item per GB300 SM; it is faster at long contexts and slower at short ones. The split
 count is static, so pick it for the contexts the runner decodes.
+
+</details>
 
 Checkpoint tests skip unless Qwen3-0.6B is already in the local HF cache; they never download it
 (`hf download Qwen/Qwen3-0.6B` fetches it):
@@ -552,7 +579,8 @@ reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
 [Tracing](tracing.md#iket)), and `waits=True` adds the layer's wait ranges with either backend.
 Disabled, both emit no instructions.
 
-Pitfalls:
+<details markdown="1">
+<summary>Implementation pitfalls and current limits</summary>
 
 - **Co-residency.** A static schedule over spinning CTAs needs every CTA resident;
   `launch_args()`'s SM-count cap is only a capacity estimate. Launch with `cooperative=True`
@@ -576,6 +604,8 @@ Pitfalls:
 Known layer limits: there is no channel kind between CTAs (the tagged words are raw code),
 `Tma(tx_bytes)` fixes a ring's bytes per stage, and `plan_from_warpdrive` models only the
 CTA-local ring, so it cannot see this kernel's cross-CTA critical path.
+
+</details>
 
 ## Known limits
 

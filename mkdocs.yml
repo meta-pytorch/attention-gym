@@ -89,7 +89,9 @@ nav:
       - Clusters: warpdrive/clusters.md
       - Dropping down: warpdrive/dropping-down.md
       - Tracing: warpdrive/tracing.md
-      - Profiler: warpdrive/profiler.md
+      - Profiler:
+          - Guide: warpdrive/profiler.md
+          - Reference: warpdrive/profiler-reference.md
       - Compile cache: warpdrive/cache.md
       - Configuration: warpdrive/configuration.md
       - Examples: warpdrive/examples.md

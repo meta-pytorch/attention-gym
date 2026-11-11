@@ -2,102 +2,25 @@
 
 [Back to warpdrive](index.md)
 
-Put choices you want to vary between kernel instances in constructor arguments:
+Start with an example's defaults. Pass the choices you want to change to its constructor:
 
 ```python
 small = Gemm(tile_n=128, ab_stages=2)
 wide = Gemm(tile_n=256, ab_stages=3)
 ```
 
-Each configuration gets its own [compile key](roles.md#compile-keys). A fixed module constant
-can express an instruction or algorithm constraint; editing its tracked source invalidates
-the cache, but mutating a Python global is not a supported way to select a specialization.
-
-This page separates **constructor choices**, **hardware limits** and **choices fixed by the
-current implementation**. Start with defaults. A legal configuration is not necessarily
-faster, and changing a fixed algorithm choice may require a different role graph.
-
-## The layer
-
-You declare roles, channels, stage counts, mechanisms, fences, storage plans, work stream and
-cluster. The layer derives their synchronization and launch resources; it does not autotune
-them.
-
-### Placement and registers
-
-| Choice | Where / constraint |
-|---|---|
-| Warps and budgets | `@role(warps=, regs=)`; constructor overrides in `self.roles` ([roles](roles.md#choose-placement-in-the-constructor)) |
-| Numeric budget | Multiple of 8 in `[24, 256]`; one budget per warpgroup; all budgets must fit the launch's starting register pool |
-| Idle warps | Any numeric budget pads to whole warpgroups. Holes take their group's budget; a wholly idle group takes the hardware floor, 24 |
-| Scheduler warp | Lowest unclaimed warp by default; choose explicitly with `WorkStream(scheduler_warp=...)`. It uses its group's budget |
-
-An override moves a role's code with it. Code that must survive `roles=` takes its indices from
-[`Local`](roles.md#index-the-role-not-the-hardware): raw `thread_idx()`/`warp_idx()` values
-depend on placement. Where an example's math fixes a role's size, an override that changes it
-is rejected at construction or trace time: the GEMM epilogues, FA4 softmax/correction, decode
-softmax/correction and backward reduce need 4 warps, the backward compute 8, and the Qwen
-megakernel's compute one instance of 8.
-
-Register dispatch is fixed by the implementation: one warpgroup-uniform branch per run of
-adjacent warpgroups with one budget, then role branches inside it. `setmaxnreg` is
-`.sync.aligned` over a warpgroup; putting the adjustment before role branches lets `ptxas`
-allocate each role's code under its budget, as in CUTLASS. Non-adjacent warpgroups with the
-same budget get separate branches: `ptxas` allocates a merged branch jointly and can spill
-one role under the other's pressure. See
-[register accounting](roles.md#registers-belong-to-warpgroups).
-
-### Channels and storage
-
-| Choice | Where / constraint |
-|---|---|
-| Mechanisms and ordering | `Tma(bytes, multicast=, fills=)`, `Umma`, `Threads`, `Warps`, `commit_fence=`, `release_fence=`: declared per channel |
-| Round-robin depth | An mbarrier round-robin ring needs a stage count divisible by its instance count, so each instance sees the previous epoch of stages it waits on |
-| Exclusive consumers | `consumer_sharing=Sharing.EXCLUSIVE`: CTA-local mbarrier `Ring`, one producer, equal consumer contributions. The author supplies any rendezvous needed after more than a ring lap of skips ([exclusive consumers](channels.md#exclusive-consumers)) |
-| TMEM allocation | Plan columns round up to a power of two, minimum 32: hardware `tcgen05.alloc` granularity |
-
-Named barrier IDs are allocation details, not tuning knobs:
-
-```text
-0          CTA bar.sync 0
-1, 2       TMEM base exchange, TMEM teardown
-3 upward   declared NamedBarrier objects
-15 downward  named-channel FULL/EMPTY barriers
-```
-
-Hardware provides 16 IDs. Declare `NamedBarrier` instead of picking an ID; tracing rejects
-an `alias.named_barrier` call using an allocated ID. Which free ID is chosen has no
-performance effect.
-
-### Fixed lifecycle and waits
-
-The current implementation orders setup and teardown as follows:
-
-1. Warp 0 initializes mbarriers.
-2. For a single CTA, the lowest nonzero warp belonging to a TMEM role allocates TMEM before
-   CTA sync (warp 0 if no other candidate). For a cluster, allocation follows cluster sync,
-   from the first warp of the first eligible TMEM role.
-3. `SmemPlan` buffers are allocated last in `begin_roles`; `run_roles` performs the common
-   fences/sync, register adjustments and dispatch. Cluster TMEM allocation occurs there
-   after its sync.
-4. TMEM users arrive on barrier 2 after their roles. The allocator waits and frees TMEM;
-   a cluster then arrives and waits before exit.
-
-Setup order is an implementation choice. Teardown must satisfy hardware: every TMEM reader
-must finish before `tcgen05.dealloc`, and remote arrivals must land before a CTA exits.
-
-Mbarrier waits use retrying `mbarrier.try_wait.parity` with CuTeDSL's 10 ms suspend hint.
-Named channels use unaligned `bar.sync` / `bar.arrive`. A role can choose a per-wait initial
-probe with [try tokens](channels.md#try-tokens).
+Constructor choices identify the [compiled variant](roles.md#compile-keys). Keep runtime
+shapes out of them. A legal configuration is not necessarily faster; changing a fixed
+algorithm choice may need a different role graph.
 
 ## The examples
 
-The tables cover five examples, not every possible kernel. Parenthesized numbers are
-defaults, not recommendations for all workloads.
+These five examples expose different choices. Parenthesized numbers are defaults,
+not recommendations for every workload.
 
 ### gemm.py
 
-This teaching kernel keeps one layout family while exposing tile width and buffering.
+Vary tile width and buffering within one layout family.
 
 | Constructor choice | Range / purpose |
 |---|---|
@@ -108,8 +31,8 @@ This teaching kernel keeps one layout family while exposing tile width and buffe
 Fixed choices:
 
 - `TILE_M=128`: epilogue maps one `tcgen05.ld 32x32b` lane to each output row.
-- `TILE_K=64`: 128-byte K-major BF16 rows use the SW128 layout atom. Smaller steps are
-  possible—the decode exposes `tile_k`—but this example keeps one readable layout.
+- `TILE_K=64`: 128-byte K-major BF16 rows use SW128. Smaller steps are possible, as in
+  decode's `tile_k`, but GEMM keeps one layout.
 - `EPI_COLS=32`: the epilogue uses the TMEM load's x32 repetition.
 
 ### persistent_gemm.py
@@ -179,11 +102,10 @@ The decode exposes tile sizes and ring depths, but keeps FA4's two-softmax-group
 | `kv_stages` | FA4's total capacity split about 7:5 between K and V; with `shared_kv`, one ring uses their sum |
 | `roles=` | Computed defaults: 64 / 120 / 208 for 32-head tiles, no adjustment otherwise |
 
-The wrappers `fa4_decode` / `decode_partials` take `shared_kv=False`. True selects
-`SharedKVDecode`: one K/V ring, two exclusive MMA consumers, and FA4's QKIssued/PVIssued
-named-barrier rendezvous ([shared K/V ring](examples.md#shared-kv-ring)). It wins on some
-ragged shapes and loses on others, so split rings remain the default; benchmark your shapes
-before switching.
+`fa4_decode` / `decode_partials` default to split K/V rings. `shared_kv=True` selects
+`SharedKVDecode`: one ring, two exclusive MMA consumers, and FA4's QKIssued/PVIssued
+named-barrier rendezvous ([shared K/V ring](examples.md#shared-kv-ring)). Results vary on
+ragged shapes; benchmark yours before switching.
 
 Fixed choices:
 
@@ -201,8 +123,7 @@ load waits for free K -> QK waits for free P -> PV waits for V
         +---------- load has not issued V -----+
 ```
 
-The layer does not prove that this cycle is absent. Changing issue order needs new reasoning,
-not just a larger integer.
+The layer does not rule out this cycle. Recheck dependencies when changing issue order.
 
 ### fa4_bwd.py
 
@@ -232,3 +153,78 @@ or default K/V stage budget (`ValueError`), first collection for role checks
 (`ProtocolError` / `ValueError`), or compilation for excessive explicit SMEM staging.
 SMEM is not fully budgeted at construction; explicit `kv_stages`, `ab_stages` or `c_stages`
 can still exceed capacity at compile time.
+
+## The layer
+
+The layer derives synchronization and launch resources from your roles, channels, storage,
+work stream and cluster. It does not autotune them.
+
+Static algorithm choices belong in constructor arguments. A fixed module constant can
+express an instruction or algorithm constraint: editing tracked source invalidates the
+cache, but mutating a Python global does not select a specialization. Create a new kernel
+instance instead of changing its declarations. The [compile-key contract](roles.md#compile-keys)
+lists the few settings that may change after construction and when they become frozen.
+
+### Placement and registers
+
+| Choice | Where / constraint |
+|---|---|
+| Warps and budgets | `@role(warps=, regs=)`; constructor overrides in `self.roles` ([roles](roles.md#choose-placement-in-the-constructor)) |
+| Numeric budget | Multiple of 8 in `[24, 256]`; one budget per warpgroup; all budgets must fit the launch's starting register pool |
+| Idle warps | Any numeric budget pads to whole warpgroups. Holes take their group's budget; a wholly idle group takes the hardware floor, 24 |
+| Scheduler warp | Lowest unclaimed warp by default; choose explicitly with `WorkStream(scheduler_warp=...)`. It uses its group's budget |
+
+Use [`Local`](roles.md#index-the-role-not-the-hardware) indices so `roles=` can move a role
+without changing its math. Raw `thread_idx()`/`warp_idx()` depend on placement.
+Some role sizes are fixed and checked at construction or trace time: GEMM epilogues,
+FA4 and decode softmax/correction, and backward reduce need 4 warps; backward compute
+needs 8; Qwen megakernel compute needs one instance of 8.
+
+Register dispatch uses one warpgroup-uniform branch per run of adjacent warpgroups with
+the same budget, then branches by role. `setmaxnreg` is `.sync.aligned` over a warpgroup;
+adjusting before the role branches lets `ptxas` allocate each role under its budget.
+Non-adjacent groups get separate branches even if their budgets match: merging them lets
+one role's pressure cause spills in another. See
+[register accounting](roles.md#registers-belong-to-warpgroups).
+
+### Channels and storage
+
+| Choice | Where / constraint |
+|---|---|
+| Mechanisms and ordering | `Tma(bytes, multicast=, fills=)`, `Umma`, `Threads`, `Warps`, `commit_fence=`, `release_fence=`: declared per channel |
+| Round-robin depth | An mbarrier round-robin ring needs a stage count divisible by its instance count, so each instance sees the previous epoch of stages it waits on |
+| Exclusive consumers | `consumer_sharing=Sharing.EXCLUSIVE`: CTA-local mbarrier `Ring`, one producer, equal consumer contributions. The author supplies any rendezvous needed after more than a ring lap of skips ([exclusive consumers](channels.md#exclusive-consumers)) |
+| TMEM allocation | Plan columns round up to a power of two, minimum 32: hardware `tcgen05.alloc` granularity |
+
+Named barrier IDs are allocation details, not tuning knobs:
+
+```text
+0          CTA bar.sync 0
+1, 2       TMEM base exchange, TMEM teardown
+3 upward   declared NamedBarrier objects
+15 downward  named-channel FULL/EMPTY barriers
+```
+
+Hardware provides 16 IDs. Declare `NamedBarrier` rather than picking one. Tracing rejects
+`alias.named_barrier` calls that use allocated IDs. The choice of free ID does not affect speed.
+
+### Fixed lifecycle and waits
+
+Setup and teardown run in this order:
+
+1. Warp 0 initializes mbarriers.
+2. For a single CTA, the lowest nonzero warp belonging to a TMEM role allocates TMEM before
+   CTA sync (warp 0 if no other candidate). For a cluster, allocation follows cluster sync,
+   from the first warp of the first eligible TMEM role.
+3. `SmemPlan` buffers are allocated last in `begin_roles`; `run_roles` performs the common
+   fences/sync, register adjustments and dispatch. Cluster TMEM allocation occurs there
+   after its sync.
+4. TMEM users arrive on barrier 2 after their roles. The allocator waits and frees TMEM;
+   a cluster then arrives and waits before exit.
+
+Setup order is an implementation choice. Teardown has hardware requirements: all TMEM
+readers finish before `tcgen05.dealloc`, and remote arrivals land before a CTA exits.
+
+Mbarrier waits use retrying `mbarrier.try_wait.parity` with CuTeDSL's 10 ms suspend hint.
+Named channels use unaligned `bar.sync` / `bar.arrive`. A role can choose a per-wait initial
+probe with [try tokens](channels.md#try-tokens).
