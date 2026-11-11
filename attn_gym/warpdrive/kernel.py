@@ -1833,6 +1833,8 @@ class WarpSpecialized(metaclass=_KernelType):
         if not r.raw:
             check_tma(trace, self.cluster, self._ws_tma)
             trace.finish()
+            if self._ws_log is not None:
+                self._ws_log.add(trace)
         for chan, n in trace.uses_per_item().items():
             self._ws_uses[(r.name, chan)] = n
         for name, ch in self._ws_chans.items():
