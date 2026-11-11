@@ -559,6 +559,9 @@ class Graph(Toy):
                     pass
                 with b.consume():
                     pass
+            if cutlass.const_expr(mode == "unbalanced_n"):  # one fill more than the n taken
+                with a.produce():
+                    pass
         return a, b
 
     @role(warps=1)
@@ -604,6 +607,10 @@ def test_a_dependency_cycle_names_its_sites_and_the_override():
     "mode, error",
     [
         ("unbalanced", r"unbalanced epochs: q takes \d+ epochs of a, \d+ filled"),
+        (
+            "unbalanced_n",
+            r"unbalanced epochs: the fills and takes of a differ by 1 for every input",
+        ),
         ("lane", r"q: a branch that depends on the lane encloses channel or barrier ops"),
     ],
 )
@@ -996,6 +1003,34 @@ class PerItem(WarpSpecialized):
         self.kernel(bound).launch(**self.launch_config(bound), stream=stream)
 
 
+class Clamped(Toy):
+    """``range(n, 4)`` fills and ``range(n, 5)`` takes, each plus one: balanced at ``n >= 5``,
+    where both loops are empty."""
+
+    def __init__(self):
+        self.a = Ring(1, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer):
+        for _ in cutlass.range(ctx.n, 4, unroll=1):
+            with a.produce():
+                pass
+        with a.produce():
+            pass
+        return a
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer):
+        for _ in cutlass.range(ctx.n, 5, unroll=1):
+            with a.consume():
+                pass
+        with a.consume():
+            pass
+        return a
+
+
 class Overridden(Toy):
     """The full barrier expects 64 arrivals from a 32-thread producer."""
 
@@ -1046,6 +1081,7 @@ class Long(Toy):
         (LaneSkip, "per-lane channel state"),
         (LaneBarrierId, "per-lane channel state"),
         (PerItem, "no checked value balances"),
+        (Clamped, "no checked value balances"),
         (Overridden, "a overrides its full_counts"),
         (Long, "p runs over"),
     ],
@@ -1055,6 +1091,7 @@ class Long(Toy):
         "lane_skip",
         "lane_barrier_id",
         "per_item",
+        "clamped",
         "overridden_counts",
         "long",
     ],

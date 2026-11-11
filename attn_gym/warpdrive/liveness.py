@@ -24,6 +24,7 @@ from __future__ import annotations
 import itertools
 import warnings
 from dataclasses import dataclass, field
+from functools import reduce
 
 from attn_gym.warpdrive.events import (
     DEBUG,
@@ -36,6 +37,7 @@ from attn_gym.warpdrive.events import (
     find_cycle,
     leaves,
     link,
+    program,
     tid_dependent,
     unroll,
 )
@@ -168,6 +170,9 @@ def _check(kernel, roles: list) -> Liveness:
     if not balanced and unbalanced:
         problem, where = unbalanced
         if names or persistent:  # the kernel may only run counts the samples miss
+            finding = _imbalance(roles, chans)
+            if finding:
+                return Liveness("unverified", findings=[finding])
             return Liveness("unverified", f"no checked value balances: {problem}{where}")
         return _found(f"unbalanced epochs: {problem}{where}.", related)
     if late:
@@ -184,6 +189,92 @@ def _check(kernel, roles: list) -> Liveness:
     if unbalanced:
         assumed.append("values that unbalance a channel never occur")
     return Liveness("no deadlock found", "; ".join(assumed))
+
+
+class _Opaque(Exception):
+    """A count that is not affine in the leaves."""
+
+
+def _times(a: dict, b: dict) -> dict:
+    if set(a) - {1} and set(b) - {1}:
+        raise _Opaque  # a product of two runtime values
+    c, x = (a.get(1, 0), b) if not set(a) - {1} else (b.get(1, 0), a)
+    return {k: c * v for k, v in x.items() if c * v}
+
+
+def _trips(lower, upper) -> dict:
+    """A counted loop's trip count: exact for constant bounds, else one symbol per pair of
+    bounds, so only loops with the same bounds cancel. A bound must be a constant or a kernel
+    argument, which every role reads alike: arithmetic may wrap at a width the expression does
+    not record, and special registers, loads and loop indices differ between roles."""
+    if lower[0] == upper[0] == "c":
+        return {1: max(0, upper[1] - lower[1])}
+    if not {lower[0], upper[0]} <= {"c", "arg"}:
+        raise _Opaque
+    return {("trips", lower, upper): 1}
+
+
+def _plus(a: dict, b: dict, sign: int = 1) -> dict:
+    out = {k: a.get(k, 0) + sign * b.get(k, 0) for k in {*a, *b}}
+    return {k: v for k, v in out.items() if v}
+
+
+def _imbalance(roles: list, chans: dict) -> str | None:
+    """A channel whose fills and takes differ by the same nonzero count for every input: both
+    counts are sums of trip counts of the same counted loops (step 1) and differ only in the
+    constant. Anything else is left to sampling."""
+    for name, chan in chans.items():
+        remote = any(tuple(ts) != (r,) for r, ts in (*chan.full.items(), *chan.empty.items()))
+        if chan.fixed or remote or len({r.ctas for r in roles}) > 1:
+            continue
+        totals: dict = {}  # (producer side?, role) -> count
+        try:
+            for role in roles:
+                _count(role, program(role), {1: 1}, name, totals)
+            sides = []
+            for producer in (True, False):
+                counts = [totals.get((producer, r), {}) for r, _ in chan.bound[producer]]
+                if chan.join[producer] and any(x != counts[0] for x in counts):
+                    raise _Opaque
+                sides.append(counts[0] if chan.join[producer] else reduce(_plus, counts, {}))
+        except _Opaque:
+            continue
+        diff = _plus(*sides, -1)
+        if set(diff) == {1}:
+            return (
+                f"unbalanced epochs: the fills and takes of {name} differ by {abs(diff[1])} for "
+                "every input (both counts are affine in the same runtime values)."
+            )
+    return None
+
+
+def _count(role, body, scale: dict | None, name: str, totals: dict) -> None:
+    """Add the fills and takes of channel ``name`` in ``body``, each run ``scale`` times (None:
+    a region the counts do not model)."""
+    for c in body:
+        if isinstance(c, tuple):
+            r = role.regions.get(c[0])
+            inner = None
+            if scale is not None and r is not None and (r.bounds or ())[2:] == (("c", 1),):
+                try:
+                    inner = _times(scale, _trips(*r.bounds[:2]))
+                except _Opaque:
+                    pass
+            _count(role, c[1], inner, name, totals)
+            continue
+        d = c.data
+        if c.kind in ("open", "close") and d["handle"].chan.name == name:
+            if not d["handle"].producer or (c.kind == "open" and not d.get("once")):
+                continue
+            opaque = c.kind == "open" or d.get("once") or d.get("retire") or not d["signal"]
+        elif c.kind == "op" and d["chan"] == name and d["op"] in ("wait", "skip", "state"):
+            opaque = d["op"] != "wait" or d.get("span") or d.get("count") != 1
+        else:
+            continue
+        if opaque or scale is None:
+            raise _Opaque
+        key = (c.kind != "op", role.name)
+        totals[key] = _plus(totals.get(key, {}), scale)
 
 
 def _related(names: list) -> bool:
