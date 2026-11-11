@@ -113,7 +113,7 @@ _EXPORTS = {
         "Warps",
         "advance_state",
     ),
-    "attn_gym.warpdrive.cluster": ("Cluster", "CtaPair", "SingleCta", "TmaMulticast"),
+    "attn_gym.warpdrive.cluster": ("Cluster", "CtaPair", "SingleCta"),
     "attn_gym.warpdrive.kernel": (
         "Consumer",
         "Instance",
@@ -126,7 +126,7 @@ _EXPORTS = {
         "role",
     ),
     "attn_gym.warpdrive.named": ("NamedBarrier",),
-    "attn_gym.warpdrive.protocol": ("ProtocolError", "ProtocolLog", "unchecked"),
+    "attn_gym.warpdrive.protocol": ("ProtocolError", "unchecked"),
     "attn_gym.warpdrive.scheduling": (
         "AtomicPersistent",
         "BoundWork",
@@ -144,8 +144,8 @@ _EXPORTS = {
         "WorkMap",
         "WorkStream",
     ),
-    "attn_gym.warpdrive.storage": ("SmemBuffer", "SmemPlan", "StageView"),
-    "attn_gym.warpdrive.tmem": ("TmemPlan", "TmemView"),
+    "attn_gym.warpdrive.storage": ("SmemPlan", "StageView"),
+    "attn_gym.warpdrive.tmem": ("TmemPlan",),
 }
 _MODULE_OF = {name: module for module, names in _EXPORTS.items() for name in names}
 
@@ -170,7 +170,6 @@ __all__ = [
     "Preview",
     "Producer",
     "ProtocolError",
-    "ProtocolLog",
     "Raster",
     "Readiness",
     "Ring",
@@ -178,7 +177,6 @@ __all__ = [
     "Sharing",
     "SingleCta",
     "Slots",
-    "SmemBuffer",
     "SmemPlan",
     "Span",
     "StageView",
@@ -186,10 +184,8 @@ __all__ = [
     "Threads",
     "TilePersistent",
     "Tma",
-    "TmaMulticast",
     "Tmem",
     "TmemPlan",
-    "TmemView",
     "Token",
     "Turn",
     "Turnstile",
