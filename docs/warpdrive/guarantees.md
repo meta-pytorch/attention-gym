@@ -104,8 +104,9 @@ resource use.
   trip counts and one work item per CTA. Otherwise `no deadlock found` names sampled counts
   and assumptions, not proof for all inputs. Raw roles/state, unreadable loops and opt-outs
   leave it `unverified`. Definite deadlocks, established imbalances and recognized divergent
-  thread arrivals raise under `liveness_check="strict"` (default); `"warn"` warns and `"off"`
-  skips analysis.
+  thread arrivals raise under `liveness_check="strict"` (default);
+  `"warn"` warns and `"off"` skips it. `min stages for liveness` lists eligible rings' minima
+  for the checked runs, holding other depths fixed; extra stages may add overlap.
 - **TMA `verified`:** recognized group and byte accounting, not descriptor legality, disjoint
   writes or async safety. Inspect the reasons for any `unverified` use.
 - **Alias `no hazard found`:** no conflicting annotated pair under the diagnostic's rules,

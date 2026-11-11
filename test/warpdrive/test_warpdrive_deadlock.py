@@ -634,13 +634,87 @@ def test_the_verdict_says_what_it_proves(mode, line):
     assert op.checks().liveness == line.split(": ")[1].split(" (")[0]
 
 
+class HoldsTwo(Toy):
+    """The consumer holds two epochs of ``a`` at once, so ``a`` needs two of its three stages;
+    ``b`` is taken one epoch at a time."""
+
+    def __init__(self):
+        self.a = Ring(3, Threads, Threads)
+        self.b = Ring(2, Threads, Threads)
+
+    @role(warps=0)
+    @cute.jit
+    def p(self, ctx, *, a: Producer, b: Producer):
+        for _ in cutlass.range_constexpr(2):
+            with a.produce():
+                pass
+            with b.produce():
+                pass
+        return a, b
+
+    @role(warps=1)
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, b: Consumer):
+        first = a.wait()
+        with b.consume():
+            pass
+        second = a.wait()
+        first.release()
+        second.release()
+        with b.consume():
+            pass
+        return a, b
+
+
+class BothRotate(Toy):
+    """Two round-robin producers and three round-robin consumers: a stage count must be a
+    multiple of both."""
+
+    def __init__(self):
+        self.a = Ring(
+            6,
+            Threads,
+            Threads,
+            producer_sharing=Sharing.ROUND_ROBIN,
+            consumer_sharing=Sharing.ROUND_ROBIN,
+        )
+
+    @role(warps=[range(1), range(1, 2)])
+    @cute.jit
+    def p(self, ctx, *, a: Producer, stage: Instance):
+        for _ in cutlass.range(stage, 6, 2, unroll=1):
+            with a.produce():
+                pass
+        return a
+
+    @role(warps=[range(2, 3), range(3, 4), range(4, 5)])
+    @cute.jit
+    def q(self, ctx, *, a: Consumer, stage: Instance):
+        for _ in cutlass.range(stage, 6, 3, unroll=1):
+            with a.consume():
+                pass
+        return a
+
+
+def test_min_stages_names_the_fewest_that_still_pass():
+    op = HoldsTwo()
+    compile_toy(op, "min_stages")
+    assert "min stages for liveness: a 2 (declared 3), b 1 (declared 2)" in op.describe()
+    assert op.checks().min_stages == {"a": 2, "b": 1}
+    op = BothRotate()
+    compile_toy(op, "min_stages_rotating")
+    assert "min stages for liveness: a 6 (declared 6)" in op.describe()
+
+
 def test_warn_reports_and_off_skips_a_finding():
     warned = Graph("cross", liveness_check="warn")
     with pytest.warns(UserWarning, match="warpdrive: Graph: deadlock"):
         compile_toy(warned, "graph_warn")
+    assert warned.checks().liveness == "error"
+    assert "liveness: error (see the reported finding)" in warned.describe()
     off = Graph("cross", liveness_check="off")
     compile_toy(off, "graph_off")
-    assert off.checks().liveness is None
+    assert off.checks().liveness is None and off.checks().min_stages == {}
 
 
 def test_an_analysis_failure_is_unverified_not_an_error(monkeypatch):

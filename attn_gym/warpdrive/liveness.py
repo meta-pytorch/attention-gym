@@ -19,7 +19,9 @@ Unreadable protocols and analysis failures are ``unverified``, not errors.
 
 from __future__ import annotations
 
+import dataclasses
 import itertools
+import math
 import warnings
 from dataclasses import dataclass, field
 from functools import reduce
@@ -52,19 +54,23 @@ OVERRIDE = (
 @dataclass
 class Liveness:
     """``verdict``: "verified", "no deadlock found" (``detail``: the counts it assumes) or
-    "unverified" (``detail``: why); ``findings``: definite errors."""
+    "unverified" (``detail``: why); ``findings``: definite errors; ``min_stages``: ring ->
+    (fewest stages with which the same checks pass, declared stages)."""
 
     verdict: str
     detail: str = ""
     findings: list = field(default_factory=list)
+    min_stages: dict = field(default_factory=dict)
 
     def line(self) -> str:
         if self.findings:
             return "liveness: error (see the reported finding)"
-        if self.verdict == "verified":
-            return "liveness: verified"
         word = "assumes " if self.verdict == "no deadlock found" else ""
-        return f"liveness: {self.verdict} ({word}{self.detail})"
+        line = f"liveness: {self.verdict}" + (f" ({word}{self.detail})" if self.detail else "")
+        if self.min_stages:
+            stages = ", ".join(f"{n} {k} (declared {d})" for n, (k, d) in self.min_stages.items())
+            line += f"\n  min stages for liveness: {stages}"
+        return line
 
 
 def check(kernel, roles: list) -> Liveness:
@@ -133,7 +139,7 @@ def _check(kernel, roles: list) -> Liveness:
         combos = itertools.product(items, *([values] * len(names)))
     else:  # every leaf equal, at each value and item count
         combos = ((m, *[v] * len(names)) for m in items for v in values)
-    balanced, unbalanced, late = False, None, False
+    balanced, unbalanced, late, runs = False, None, False, []
     for m, *vals in combos:
         env = dict(zip(names, vals))
         try:
@@ -152,6 +158,7 @@ def _check(kernel, roles: list) -> Liveness:
         try:
             graph = link(ops, chans, bars, turnstiles, early=False)
             if find_cycle(graph) is None and not graph.starved:
+                runs.append(ops)
                 continue
             early = link(ops, chans, bars, turnstiles, early=True)
         except Unknown as e:
@@ -177,8 +184,9 @@ def _check(kernel, roles: list) -> Liveness:
         return Liveness(
             "unverified", "progress depends on TMA fills or raw signals preceding the handle close"
         )
+    stages = _min_stages(runs, chans, bars, turnstiles)
     if not names and not persistent:
-        return Liveness("verified")
+        return Liveness("verified", min_stages=stages)
     assumed = []
     if persistent:
         assumed.append(f"{', '.join(map(str, items))} work items per CTA")
@@ -186,7 +194,45 @@ def _check(kernel, roles: list) -> Liveness:
         assumed.append(f"loop/branch inputs: count {len(names)}, samples {values}")
     if unbalanced:
         assumed.append("values that unbalance a channel never occur")
-    return Liveness("no deadlock found", "; ".join(assumed))
+    return Liveness("no deadlock found", "; ".join(assumed), min_stages=stages)
+
+
+def _min_stages(runs: list, chans: dict, bars: dict, turnstiles: dict) -> dict:
+    """Find each eligible ring's minimum for the checked runs, holding other depths fixed.
+
+    Depths must be multiples of both sides' round-robin counts. More stages cannot block
+    progress in this graph, so try all minima together before searching rings separately.
+    """
+    # A rotating named ring's depth follows its turnstile, not a multiple of its instances.
+    rings = {
+        n: c
+        for n, c in chans.items()
+        if not c.fixed and c.n > 1 and not (c.named and max(c.turns.values()) > 1)
+    }
+    if not rings:
+        return {}
+    least = {n: math.lcm(*c.turns.values()) for n, c in rings.items()}
+
+    def passes(stages: dict) -> bool:
+        trial = {**chans, **{n: dataclasses.replace(chans[n], n=k) for n, k in stages.items()}}
+        return all(_passes(ops, trial, bars, turnstiles) for ops in runs)
+
+    if passes(least):
+        return {n: (least[n], c.n) for n, c in rings.items()}
+    out = {}
+    for name, chan in rings.items():
+        k = least[name]
+        n = next((n for n in range(k, chan.n, k) if passes({name: n})), chan.n)
+        out[name] = (n, chan.n)
+    return out
+
+
+def _passes(ops: dict, chans: dict, bars: dict, turnstiles: dict) -> bool:
+    try:
+        graph = link(ops, chans, bars, turnstiles, early=False)
+        return find_cycle(graph) is None and not graph.starved
+    except Unknown:
+        return False
 
 
 class _Opaque(Exception):

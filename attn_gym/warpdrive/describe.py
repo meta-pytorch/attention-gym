@@ -8,7 +8,7 @@ it also shows check reports, opt-outs and the traced protocol.
 from __future__ import annotations
 
 import textwrap
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from attn_gym.warpdrive.channels import Threads, Tma, Umma, Warps
@@ -44,12 +44,17 @@ class KernelChecks:
     keyed by ``(name, overlapped name)`` (``name ~ overlapped name`` in ``describe()``).
     ``fences`` maps each explicit fence to its status, keyed by ``(channel, "commit_fence"``
     or ``"release_fence")``. Both are empty before compilation or with ``alias_check="off"``.
+    ``liveness`` is ``"error"`` with a finding, None before compilation or with
+    ``liveness_check="off"``.
+    ``min_stages`` holds eligible rings' minima for the checked runs; it is empty unless
+    liveness passes.
     """
 
     channels: dict[str, ChannelChecks]
     aliases: dict[tuple[str, str], AliasStatus]
     fences: dict[tuple[str, str], FenceStatus]
-    liveness: str | None = None  # Liveness.verdict; None before compilation or when off
+    liveness: str | None = None
+    min_stages: dict[str, int] = field(default_factory=dict)  # ring -> fewest stages for liveness
 
 
 def kernel_checks(kernel) -> KernelChecks:
@@ -67,7 +72,13 @@ def kernel_checks(kernel) -> KernelChecks:
     fence_rep = kernel._ws_fences
     fences = {} if fence_rep is None else {(r.channel, r.key): r.status for r in fence_rep.results}
     live = kernel._ws_liveness
-    return KernelChecks(channels, aliases, fences, None if live is None else live.verdict)
+    if live is None:
+        return KernelChecks(channels, aliases, fences)
+    stages = {name: least for name, (least, _) in live.min_stages.items()}
+    # A proven finding outranks the verdict of what could not be read.
+    return KernelChecks(
+        channels, aliases, fences, "error" if live.findings else live.verdict, stages
+    )
 
 
 def ownership_verdict(ownership: str) -> str:
