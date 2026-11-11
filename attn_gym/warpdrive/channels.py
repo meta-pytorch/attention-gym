@@ -1214,13 +1214,12 @@ class Token:
 class _EndRecord:
     """Trace-time record shared by loop-carried copies of one end.
 
-    ``slots``: the fixed slots it used; a tail drains only those. ``taken(slot)``: acquires,
-    waits and skips traced per slot (``None`` for a ring). With ``resets``, the count of raw
-    ``end.state`` accesses, it identifies a token's epoch. ``previews``: previews no wait has
-    adopted yet. ``lineage``: which copies hold out-of-date phases.
+    ``taken(slot)`` counts traced acquires, waits and skips per slot (``None`` for a ring).
+    Together with ``resets``, the count of raw ``end.state`` accesses, it identifies a token's
+    epoch. A fixed-slot tail drains only slots recorded in ``steps``. ``previews``: previews
+    no wait has adopted yet. ``lineage``: which copies hold out-of-date phases.
     """
 
-    slots: set = field(default_factory=set)
     resets: int = 0
     # Per slot (None for a ring), each traced acquire/wait/skip in order: (epochs it advances
     # the end, 0 if dynamic; the block it ran in). ``HandleRecord.order`` indexes it.
@@ -1244,20 +1243,7 @@ class _End:
     which selects its mechanism and fences on a per-role consumer side.
     """
 
-    def __init__(
-        self,
-        chan,
-        bars,
-        buffers,
-        trace,
-        bound_slot,
-        state,
-        cta=ALL,
-        rec=None,
-        views=None,
-        stride=1,
-        role="",
-    ):
+    def __init__(self, chan, bars, buffers, trace, bound_slot, state, cta=ALL, stride=1, role=""):
         self._chan = chan
         self._role = role
         self._stride = stride  # round-robin: epochs between this end's turns
@@ -1267,8 +1253,8 @@ class _End:
         self._bound = bound_slot
         self._state = state
         self._cta = cta
-        self._rec = rec if rec is not None else _EndRecord()
-        self._views = views or {}  # {buffer name: StageView} registered with views()
+        self._rec = _EndRecord()
+        self._views = {}  # {buffer name: StageView} registered with views()
         self._copy = self._rec.lineage.add()
 
     def __extract_mlir_values__(self):
@@ -1286,19 +1272,12 @@ class _End:
     def _rebuilt(self, state, views):
         """A new copy of this end with ``state`` and ``views``, registered in the shared
         record's lineage."""
-        return type(self)(
-            self._chan,
-            self._bars,
-            self._buffers,
-            self._trace,
-            self._bound,
-            state,
-            self._cta,
-            self._rec,
-            views,
-            self._stride,
-            self._role,
-        )
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        new._state = state
+        new._views = views or {}
+        new._copy = self._rec.lineage.add()
+        return new
 
     def _check_current(self, returned_by: str | None = None):
         """Reject this copy if a newer copy advanced past it (``Lineage``)."""
@@ -1470,6 +1449,25 @@ class _End:
         table = sc.full_targets if isinstance(self, ProducerEnd) else sc.empty_targets
         return {r: table.get(r, ()) for r in self.ctas}
 
+    def _signal(self, index):
+        chan = self._chan
+        producer = isinstance(self, ProducerEnd)
+        side = "producer" if producer else "consumer"
+        mech = chan.mechanism(side, self._role)
+        if isinstance(mech, Tma):
+            return  # completed by the TMA transaction count
+        fence = chan.fences(side, self._role)
+        if chan.named:
+            _fence(fence)
+            self._named_arrive(chan.full_barriers if producer else chan.empty_barriers, index)
+            return
+        self._arrive(
+            mech,
+            self._full(index) if producer else self._empty(index),
+            fence,
+            chan.scope.full_mask if producer else chan.scope.empty_mask,
+        )
+
     def _arrive(self, mech, bar, fence, mask):
         """Signal ``bar`` in each CTA of ``self.targets``; ``mask``: the ``tcgen05.commit``
         multicast mask (an int, or ``{rank: mask}``)."""
@@ -1536,7 +1534,6 @@ class _End:
         index, phase, label = self._current(slot, op)
         if self._chan.fixed:
             self._state = self._state ^ (1 << slot)
-            self._rec.slots.add(slot)
         else:
             advance_state(self._state, self._stride)
         self._advanced(slot, 1 if self._chan.fixed else self._stride)
@@ -1786,16 +1783,6 @@ class ProducerEnd(_End):
         else:
             _arm_if(full, scope.tx, targets, tuple(arms), self._chan.cluster.size)
 
-    def _signal(self, index):
-        if isinstance(self._chan.producer, Tma):
-            return  # completed by the TMA transaction count
-        chan = self._chan
-        if chan.named:
-            _fence(chan.commit_fence)
-            self._named_arrive(chan.full_barriers, index)
-            return
-        self._arrive(chan.producer, self._full(index), chan.commit_fence, chan.scope.full_mask)
-
     def tail(self):
         """Wait until every stage this end filled has been released. The layer emits this at
         role exit on pair-scoped channels whose consumer signals from another CTA."""
@@ -1805,7 +1792,7 @@ class ProducerEnd(_End):
         with wait_range(self._trace, f"{self._chan.name}.tail"):
             if self._chan.fixed:
                 # Only slots this end acquired: another instance's slot keeps its own parity.
-                for j in sorted(self._rec.slots):
+                for j in sorted(self._rec.steps):
                     cute.arch.mbarrier_wait(self._empty(j), (self._state >> j) & 1)
             else:
                 st = self._state.clone()
@@ -1897,19 +1884,6 @@ class ConsumerEnd(_End):
             preview._adopt(rec)
             self._rec.previews.remove(preview)
             self._trace.closed(preview._life, "adopted")
-
-    def _signal(self, index):
-        chan = self._chan
-        if chan.named:
-            _fence(chan.release_fence)
-            self._named_arrive(chan.empty_barriers, index)
-            return
-        self._arrive(
-            chan.mechanism("consumer", self._role),
-            self._empty(index),
-            chan.fences("consumer", self._role),
-            chan.scope.empty_mask,
-        )
 
 
 def _region_op(block) -> str | None:
