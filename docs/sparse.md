@@ -266,3 +266,48 @@ PyTorch does not allow changing
 deterministic mode between a compiled forward and its backward.
 
 ::: attn_gym.sparse.gather_attn.gather_attn
+
+
+## Paged sparse decode
+
+`paged_sparse_decode` is the serving-side counterpart: decode queries attend to indexer-selected
+entries of a paged KV cache plus an optional causal window, in one softmax with an optional
+attention sink. Indices stay **logical** (positions within each request, `-1` padded); the
+operation translates them through the block table itself, so no expanded token list or physical
+slot list is built per step.
+
+```python
+from attn_gym.sparse import PagedKV, paged_sparse_decode
+
+kv = PagedKV(key_cache, value_cache, block_table)
+# key_cache/value_cache: [num_pages, page_size, kv_heads, head_dim]; block_table: int32
+out = paged_sparse_decode(
+    query,              # [tokens, heads, head_dim]
+    kv,
+    indices,            # int32 [tokens, topk] logical block ids
+    cu_seqlens_q,       # int32 [num_sequences + 1]
+    seqused_k,          # int32 [num_sequences], keys including the current queries
+    max_seqlen_q=1,
+    topk_length=topk_length,  # optional int32 [tokens]: valid prefix of each row
+    index_block_size=4,
+)
+```
+
+Each index selects `index_block_size` consecutive entries. The window holds the last
+`window_size` positions of `window_kv` (a separate cache) or, by default, of `kv` itself. With
+a shared source the window start rounds down to a block boundary and selections inside the
+window are skipped, so each key is attended once and the incomplete block holding the query
+(which an indexer over complete blocks cannot select) is always included.
+
+| Model | Mapping |
+|---|---|
+| Qwen QSA | compressed-block ids, `index_block_size=4`, `window_size=0`, separate K/V, GQA |
+| DeepSeek V3.2 DSA | token ids, `index_block_size=1`, values as `key_cache[..., :512]` |
+| DeepSeek V4 / V4.1 | compressed-entry ids into `kv`, raw cache as `window_kv`, `window_size=128`, `attention_sink` |
+
+### Implementations
+
+`impl="reference"` (default) builds each row's key set explicitly in eager PyTorch on CPU or
+CUDA. It supports the complete API and serves as the correctness oracle for optimized backends.
+
+::: attn_gym.sparse.paged_decode.paged_sparse_decode
