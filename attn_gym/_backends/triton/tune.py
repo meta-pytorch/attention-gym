@@ -19,7 +19,7 @@ from triton.runtime.errors import OutOfResources, PTXASError
 from triton.runtime.jit import JITFunction
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.cute import run_tunable
+from attn_gym._backends.tune import run_tunable
 
 # ``Config.all_kwargs()`` as sorted items: hashable and picklable for winner caching.
 TritonCandidate = tuple[tuple[str, Any], ...]
@@ -46,7 +46,7 @@ class TritonTuner:
         configs: Candidates to benchmark, the heuristic default first.
         key: Maps the launch arguments to the host-static values that decide the winner, like
             ``triton.autotune(key=...)``. It must also determine what ``prune`` keeps: winners
-            are remembered per key, pinned candidates per ``(device, key)``.
+            are remembered per GPU model and key, pinned candidates per ``(device, key)``.
         prune: Optional ``prune(configs, args)`` dropping candidates invalid for these arguments.
         reset: Optional ``reset(grid, args) -> restore`` for kernels that mutate their inputs;
             see ``run_tunable``'s ``benchmark_reset``.

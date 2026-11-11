@@ -1,14 +1,14 @@
 """Tests for paged MLA decode over a compressed latent cache."""
 
 import functools
-import importlib
 import math
 
 import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
 
-from attn_gym._backends.cute import run_tunable
+from attn_gym._backends import tune as tune_module
+from attn_gym._backends.tune import run_tunable
 from attn_gym.mla import AuxRequest, Impl, paged_mla_decode
 from attn_gym.mla.impl import cute, fa3
 from attn_gym.testing import cumulative_sequence_offsets
@@ -380,7 +380,6 @@ def test_autotune_matches_reference_and_reuses_winner(
     """The winner is correct and serves other batches in its bucket, with or without LSE,
     while a shorter ``max_seqlen_k`` bucket re-tunes."""
     pytest.importorskip("flash_attn.cute")
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tune_module, "_WINNERS", {})
     monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})

@@ -10,7 +10,7 @@ Use this after `cutedsl-kernel-template` establishes the core kernel. This skill
 The canonical Attention Gym helpers are:
 
 ```python
-from attn_gym._backends.cute import benchmark_gpu, run_tunable, tune
+from attn_gym._backends.tune import benchmark_gpu, run_tunable, tune
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 ```
 
@@ -281,8 +281,10 @@ call `tune(...)` directly, restore all inputs and outputs after it returns, then
 through the ordinary explicit-config path. A benchmark callback that restores only between samples is
 insufficient because it cannot prepare state for the final launch.
 
-Winners are memoized by `tuning_key`, so a key that holds an exact varlen size (token count, chunk
-capacity, document count) re-benchmarks every candidate on nearly every training step. Key on a
+Winners are shared by GPU model (the current CUDA device's name and compute capability), not
+by device index. Within a model they are memoized by `tuning_key`, so a key that holds an exact
+varlen size (token count, chunk capacity, document count) re-benchmarks every candidate on nearly
+every training step. Key on a
 bucket of the quantity that changes the candidate set or the winner, such as
 `min(pow2_ceil(capacity), 2 * sm_count)` or work waves per SM, and check that the bucket winner
 stays within noise of exact-size tuning across the bucket.

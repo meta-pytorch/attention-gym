@@ -1,6 +1,5 @@
 """Shared pytest fixtures."""
 
-import importlib
 import os
 import sys
 from collections import Counter
@@ -118,8 +117,8 @@ def fresh_compile_cache() -> Iterator[None]:
 @pytest.fixture
 def isolated_winners(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Use empty ``run_tunable`` winner caches in memory and on disk."""
-    # The cute package re-exports tune(), shadowing the tune module.
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    from attn_gym._backends import tune as tune_module
+
     # Only winners move: compiled kernels stay in the shared cache.
     monkeypatch.setattr(tune_module, "get_cache_path", lambda: tmp_path)
     monkeypatch.setattr(tune_module, "_WINNERS", {})
@@ -134,7 +133,8 @@ def no_benchmarking(
 
     Drop ``run_tunable`` winners so cached results cannot hide a tuned launch.
     """
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    from attn_gym._backends import tune as tune_module
+
     monkeypatch.setattr(tune_module, "get_cache_path", lambda: tmp_path / "no_benchmarking")
     tune_module._WINNERS.clear()
     tune_module._WINNERS_FAST.clear()
@@ -229,8 +229,7 @@ def gather_attn_single_config(
     marker = request.node.get_closest_marker("tuner_config")
     index = marker.args[0] if marker else 0
 
-    import importlib
-
+    from attn_gym._backends import tune as tune_module
     from attn_gym._backends.triton.tune import TritonTuner
     from attn_gym.sparse.gather_attn.impl.triton import backward, forward, shared_backward
 
@@ -251,7 +250,6 @@ def gather_attn_single_config(
         monkeypatch.setattr(tuner, "_prune", pinned_config)
     # The single-candidate winner would otherwise stay in the in-process memo, which is not
     # keyed by the candidate set, and skip tuning for later callers.
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     monkeypatch.setattr(tune_module, "_WINNERS", dict(tune_module._WINNERS))
     monkeypatch.setattr(tune_module, "_WINNERS_FAST", dict(tune_module._WINNERS_FAST))
     yield

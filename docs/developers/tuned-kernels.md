@@ -49,6 +49,11 @@ would sacrifice most tuning.
   second pinning path that used the first listed config without pruning or fallback. Pinned
   results stayed bit-identical; matching configurations had unchanged speed
   ([measurements](#migration-measurements)). Two exact-size keys became bucketed.
+- **Scope winners to the launch device's model.** `run_tunable` scopes in-memory and disk
+  winners by the current CUDA device's name and compute capability (`device_identity` in
+  `attn_gym/_backends/tune.py`), not its index. Matching devices can reuse a winner across
+  processes. The process-wide compile target does not follow device switches. The lookup,
+  cached per device index, adds about 0.5 µs of host time to a warm tuned launch (GB200).
 - **Make `autotune` a kernel option.** Unifying linear operations' keyword argument with
   `gather_attn`'s typed `kernel_options` key deliberately broke the keyword. `fastmath` remains
   a keyword because it changes the result, not just the kernel.

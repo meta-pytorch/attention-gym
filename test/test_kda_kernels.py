@@ -8,14 +8,13 @@
 
 from __future__ import annotations
 
-import importlib
-
 import pytest
 import torch
 
 triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
+from attn_gym._backends import tune as tune_module
 from attn_gym._backends.triton.utils import can_use_tma
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
@@ -1011,8 +1010,6 @@ def test_recompute_w_u_fwd_triton():
 def test_output_and_recompute_reuse_tuning_across_token_counts(isolated_winners, monkeypatch):
     """Token counts tune the output kernel once per power of two of the chunk count and the
     W/U recompute once."""
-    # The cute package re-exports tune(), shadowing the tune module.
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     tune = tune_module.tune
     sweeps = []
 

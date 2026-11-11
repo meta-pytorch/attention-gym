@@ -29,7 +29,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute, pipeline
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym._backends.cute import get_device_properties, tune
+from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.device import upper_bound
 from attn_gym._backends.cute.ragged import load_ragged_token_count
 from attn_gym._backends.cute.utils import (
@@ -39,6 +39,7 @@ from attn_gym._backends.cute.utils import (
     requires_int64_abi,
     tensor_supports_contiguous_dim,
 )
+from attn_gym._backends.tune import tune
 from attn_gym.linear.short_conv import ops as short_conv_ops
 from attn_gym.linear.short_conv.activations import Activation, resolve_activation
 from attn_gym.types import KernelOptionSpec, validate_kernel_options

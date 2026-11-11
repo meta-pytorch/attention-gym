@@ -1,10 +1,9 @@
-import importlib  # the cute package re-exports tune(), shadowing the tune module
-
 import pytest
 import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends import tune as tune_module
 from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.triton.tune import TritonTuner
 
@@ -109,7 +108,6 @@ def test_pinned_launch_uses_the_first_candidate_that_survives_pruning(no_benchma
 
 
 def test_pinned_launch_ignores_a_cached_winner(isolated_winners, monkeypatch):
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     tuner = TritonTuner(
         _write_block_kernel,
         [triton.Config({"BLOCK": block}) for block in (128, 256)],

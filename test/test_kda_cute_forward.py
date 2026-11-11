@@ -13,6 +13,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
 
@@ -862,7 +863,6 @@ def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
 
 def test_backward_tuning_reuses_winner_across_packed_document_counts(monkeypatch):
     """Packs with a fixed token count but new document counts must not re-benchmark."""
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     benchmarked = collections.Counter()
 
     def count_benchmark(fn) -> float:

@@ -6,7 +6,6 @@
 
 """Correctness tests for the shared recurrent delta-rule scan."""
 
-import importlib
 import itertools
 
 import pytest
@@ -15,6 +14,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.linear import recurrent_gdn, recurrent_kda
 from attn_gym.linear._delta_rule import recurrent as recurrent_module
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
@@ -259,8 +259,6 @@ def test_recurrent_reuses_kernel_across_token_counts(triton_compiles):
 def test_recurrent_reuses_tuning_across_token_counts(isolated_winners, monkeypatch):
     """Scans of 64 or more tokens at one sequence count share one autotuning result, which a
     single-token scan does not reuse."""
-    # The cute package re-exports tune(), shadowing the tune module.
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     tune = tune_module.tune
     sweeps = []
 

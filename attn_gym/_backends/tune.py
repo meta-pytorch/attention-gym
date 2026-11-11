@@ -1,4 +1,8 @@
-"""Explicit compile-and-benchmark tuning for cached CuTeDSL variants."""
+"""Benchmark a kernel's candidate configurations and remember the winner.
+
+CuTeDSL adapters implement :class:`TunableKernel` with ``jit_cache``; ``TritonTuner`` adapts
+``@triton.jit`` kernels to the same convention.
+"""
 
 from __future__ import annotations
 
@@ -37,7 +41,14 @@ CompiledT = TypeVar("CompiledT")
 
 
 class TunableKernel(Protocol[ConfigT, CompiledT]):
-    """Convention consumed by :func:`run_tunable`."""
+    """Convention consumed by :func:`run_tunable`.
+
+    ``compile(*compile_call(config, *runtime_args))`` returns what ``launch`` runs.
+    ``compile`` must provide ``cache_namespace()``, returning a source-dependent string for
+    winner caching. It may also provide ``precompile`` for parallel cold compilation;
+    ``jit_cache`` provides both. Backends that compile on first launch, such as Triton,
+    return the kernel from ``compile`` and supply ``cache_namespace`` themselves.
+    """
 
     def default_config(
         self,
@@ -229,6 +240,22 @@ def tune(
     return candidates[min(range(len(candidates)), key=timings.__getitem__)]
 
 
+@functools.cache
+def device_identity(index: int) -> tuple[str, tuple[int, int]]:
+    """Return the model name and compute capability of CUDA device ``index``.
+
+    Model identity lets identical GPUs share winners across processes; indices are process-local.
+    """
+    return torch.cuda.get_device_name(index), torch.cuda.get_device_capability(index)
+
+
+def current_device_identity() -> tuple[str, tuple[int, int]] | None:
+    """Return the current CUDA device's model identity, or ``None`` before CUDA initialization."""
+    if not torch.cuda.is_initialized():
+        return None
+    return device_identity(torch.cuda.current_device())
+
+
 def _winner_key(
     kernel: Any,
     candidates: list[Any],
@@ -238,10 +265,11 @@ def _winner_key(
     """Identify one tuning decision independently from codegen specialization."""
     name = getattr(kernel, "__qualname__", type(kernel).__qualname__)
     payload = (
-        # Source and target namespace: editing the kernel or moving to another
-        # GPU model must re-tune rather than reuse a stale winner.
+        # The process-wide compile target does not follow device switches; include the launch
+        # device's model so mixed-GPU hosts do not share winners across models.
         kernel.compile.cache_namespace(),
         _canonicalize(get_compile_target()),
+        current_device_identity(),
         getattr(kernel, "__module__", type(kernel).__module__),
         name,
         # Launch-only configs may share a binary while having different timings.
@@ -317,9 +345,9 @@ def run_tunable(
     The return value is ``(launch_result, selected_config)``. Autotuning
     compiles candidates in parallel, benchmarks launches sequentially, then
     performs one final launch with the winner. Winners are cached in memory and
-    under ``<cache>/winners`` keyed by the kernel, candidate configs, and compile-relevant
-    arguments, so repeat invocations skip benchmarking; changing the kernel
-    source, candidate set, static dimensions, or ``tuning_key`` re-tunes.
+    under ``<cache>/winners`` by kernel source, compile target, candidate configs,
+    compile-relevant arguments, ``tuning_key``, and the current CUDA device's model
+    (:func:`device_identity`). Matching invocations reuse the winner without benchmarking.
     ``tuning_key`` must distinguish runtime metadata that changes generated candidates
     or their intended winner: the default-config fast memo skips candidate generation.
     It may use host-visible tensor metadata and target facts, but must not read device
@@ -346,7 +374,7 @@ def run_tunable(
     compile_fn = kernel.compile
     if not callable(getattr(compile_fn, "cache_namespace", None)):
         raise TypeError(
-            "run_tunable() requires kernel.compile decorated with jit_cache or TritonTuner"
+            "run_tunable() requires kernel.compile to define cache_namespace(), as jit_cache does"
         )
     restore = None
     if target is not None:
@@ -369,6 +397,7 @@ def run_tunable(
                 fast_key = (
                     id(kernel),
                     resolved_target,
+                    current_device_identity(),
                     tuning_key,
                     kernel.compile_call(default, *runtime_args),
                 )

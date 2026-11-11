@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 import math
 
 import pytest
@@ -11,6 +10,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.linear import gate_transform
 from attn_gym.linear._delta_rule.gate import _softplus_uses_cute
 from attn_gym.linear._delta_rule.triton import softplus_gate as softplus_backend
@@ -175,8 +175,6 @@ def test_pointwise_reuses_backend_cache(kind, layout):
 
 def count_tuning_sweeps(monkeypatch: pytest.MonkeyPatch) -> list[None]:
     """Return a list that grows by one entry per benchmarked tuning decision."""
-    # The cute package re-exports tune(), shadowing the tune module.
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     tune = tune_module.tune
     sweeps = []
 

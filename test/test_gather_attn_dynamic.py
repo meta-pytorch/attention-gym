@@ -5,6 +5,7 @@ from collections import Counter
 import pytest
 import torch
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.sparse.gather_attn import gather_attn
 
 
@@ -258,9 +259,6 @@ def test_batch_sizes_reuse_shared_schedule(
 ):
     """New batch sizes launch the shared-KV kernels and tuned configs of an earlier one."""
     _cuda()
-    import importlib
-
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     # Start without in-process or on-disk winners so every tuning decision is observed.
     monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tune_module, "_WINNERS", {})

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from attn_gym._backends import tune as tune_module
 from attn_gym._backends.cute import normalize_tma_rows
 from attn_gym.linear import (
     active_token_mask,
@@ -1261,8 +1261,6 @@ def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, trit
 def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch, isolated_winners):
     """New token counts and a sequence count in the same bucket reuse an earlier tuning."""
     force_portable_backward(monkeypatch)
-    # The cute package re-exports tune(), shadowing the tune module.
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     tune = tune_module.tune
     tunes_per_shape: list[int] = []
 

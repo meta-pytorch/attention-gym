@@ -17,7 +17,7 @@ import cutlass
 import torch
 from cutlass import cute
 
-from attn_gym._backends.cute import benchmark_gpu, run_tunable
+from attn_gym._backends.tune import benchmark_gpu, run_tunable
 from attn_gym.warpdrive.cache import CompileTarget, compile_tvm_ffi, get_cache_path, jit_cache
 
 # A 256 MiB source keeps the fixed-buffer benchmark larger than modern GPU L2 caches.

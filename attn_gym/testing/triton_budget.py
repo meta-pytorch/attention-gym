@@ -18,6 +18,7 @@ from triton.runtime.jit import JITFunction
 
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.tune import device_identity
 from attn_gym.warpdrive.cache import get_compile_target
 
 
@@ -59,7 +60,7 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
 
     ``torch.cuda.get_device_capability`` and ``get_device_properties`` report the emulated
     device. Triton derives its compile target from the capability, so it is pinned to the
-    local GPU; kernels still run here.
+    local GPU; kernels still run here. Winner keys use the emulated capability.
     """
     local_target = triton.runtime.driver.active.get_current_target()
     # TritonTuner keys winners by the process-wide compile target, discovered once from the
@@ -72,8 +73,9 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
             real_get_device_properties(device), capability, max_shared_mem
         )
 
-    # Host dispatch caches device properties: drop the real ones here and the emulated ones after.
+    # Clear cached device facts before and after emulation to keep them from leaking across modes.
     get_device_properties.cache_clear()
+    device_identity.cache_clear()
     try:
         with (
             mock.patch.object(
@@ -85,6 +87,7 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
             yield
     finally:
         get_device_properties.cache_clear()
+        device_identity.cache_clear()
 
 
 @contextmanager

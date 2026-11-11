@@ -125,8 +125,8 @@ tuned kernel in forward and backward under `kernel_options={"autotune": False}` 
 
 - Use `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never `triton.autotune`. List the
   heuristic default first: pinning selects the first candidate left by `prune` that the device
-  can run. The tuning `key` must determine what `prune` keeps. Use `run_tunable` for CuTeDSL;
-  pinning selects `default_config`.
+  can run. The tuning `key` must determine what `prune` keeps. Use `run_tunable`
+  (`attn_gym/_backends/tune.py`) for CuTeDSL; pinning selects `default_config`.
 - Launch `tuner[grid](..., autotune=autotune)`; the keyword is required, and `False` launches
   the pinned candidate, which may not benchmark or read the winner cache. A heuristic that
   depends on the shape belongs in `prune`, which lists its choice first (the recurrent scan).
