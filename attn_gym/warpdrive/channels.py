@@ -1214,13 +1214,12 @@ class Token:
 class _EndRecord:
     """Trace-time record shared by loop-carried copies of one end.
 
-    ``slots``: the fixed slots it used; a tail drains only those. ``taken(slot)``: acquires,
-    waits and skips traced per slot (``None`` for a ring). With ``resets``, the count of raw
-    ``end.state`` accesses, it identifies a token's epoch. ``previews``: previews no wait has
-    adopted yet. ``lineage``: which copies hold out-of-date phases.
+    ``taken(slot)`` counts traced acquires, waits and skips per slot (``None`` for a ring).
+    Together with ``resets``, the count of raw ``end.state`` accesses, it identifies a token's
+    epoch. A fixed-slot tail drains only slots recorded in ``steps``. ``previews``: previews
+    no wait has adopted yet. ``lineage``: which copies hold out-of-date phases.
     """
 
-    slots: set = field(default_factory=set)
     resets: int = 0
     # Per slot (None for a ring), each traced acquire/wait/skip in order: (epochs it advances
     # the end, 0 if dynamic; the block it ran in). ``HandleRecord.order`` indexes it.
@@ -1244,20 +1243,7 @@ class _End:
     which selects its mechanism and fences on a per-role consumer side.
     """
 
-    def __init__(
-        self,
-        chan,
-        bars,
-        buffers,
-        trace,
-        bound_slot,
-        state,
-        cta=ALL,
-        rec=None,
-        views=None,
-        stride=1,
-        role="",
-    ):
+    def __init__(self, chan, bars, buffers, trace, bound_slot, state, cta=ALL, stride=1, role=""):
         self._chan = chan
         self._role = role
         self._stride = stride  # round-robin: epochs between this end's turns
@@ -1267,8 +1253,8 @@ class _End:
         self._bound = bound_slot
         self._state = state
         self._cta = cta
-        self._rec = rec if rec is not None else _EndRecord()
-        self._views = views or {}  # {buffer name: StageView} registered with views()
+        self._rec = _EndRecord()
+        self._views = {}  # {buffer name: StageView} registered with views()
         self._copy = self._rec.lineage.add()
 
     def __extract_mlir_values__(self):
@@ -1286,19 +1272,12 @@ class _End:
     def _rebuilt(self, state, views):
         """A new copy of this end with ``state`` and ``views``, registered in the shared
         record's lineage."""
-        return type(self)(
-            self._chan,
-            self._bars,
-            self._buffers,
-            self._trace,
-            self._bound,
-            state,
-            self._cta,
-            self._rec,
-            views,
-            self._stride,
-            self._role,
-        )
+        new = object.__new__(type(self))
+        new.__dict__.update(self.__dict__)
+        new._state = state
+        new._views = views or {}
+        new._copy = self._rec.lineage.add()
+        return new
 
     def _check_current(self, returned_by: str | None = None):
         """Reject this copy if a newer copy advanced past it (``Lineage``)."""
@@ -1536,7 +1515,6 @@ class _End:
         index, phase, label = self._current(slot, op)
         if self._chan.fixed:
             self._state = self._state ^ (1 << slot)
-            self._rec.slots.add(slot)
         else:
             advance_state(self._state, self._stride)
         self._advanced(slot, 1 if self._chan.fixed else self._stride)
@@ -1805,7 +1783,7 @@ class ProducerEnd(_End):
         with wait_range(self._trace, f"{self._chan.name}.tail"):
             if self._chan.fixed:
                 # Only slots this end acquired: another instance's slot keeps its own parity.
-                for j in sorted(self._rec.slots):
+                for j in sorted(self._rec.steps):
                     cute.arch.mbarrier_wait(self._empty(j), (self._state >> j) & 1)
             else:
                 st = self._state.clone()
