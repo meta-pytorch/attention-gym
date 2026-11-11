@@ -16,8 +16,8 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.triton.tune import PinnedConfigKernel
 from attn_gym._backends.triton.utils import (
-    PinnedConfigKernel,
     can_use_tensor_descriptors,
     ptr_offset,
     requires_int64_offsets,

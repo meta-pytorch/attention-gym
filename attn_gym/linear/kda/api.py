@@ -20,6 +20,7 @@ from typing import Literal
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
@@ -131,6 +132,7 @@ def chunk_kda(
         The output in ``q.dtype`` and either an FP32 final state with one entry
         per logical sequence or ``None``.
     """
+    autotune = should_autotune(autotune)
     selected_impl = resolve_impl(impl)
     options = resolve_kernel_options(kernel_options)
     if selected_impl is Impl.REFERENCE and kernel_options:
@@ -262,6 +264,7 @@ def paged_chunk_kda(
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
+    autotune = should_autotune(autotune)
     validate_kda_inputs(
         q,
         k,
@@ -443,6 +446,7 @@ def recurrent_kda(
     sequences and final states are written out of place, decode preprocessing and scan are
     separate launches, and speculative-decoding rollback is unsupported.
     """
+    autotune = should_autotune(autotune)
     selected_impl = resolve_impl(impl)
     batch_invariant = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_kda")
     if selected_impl is Impl.REFERENCE and kernel_options:

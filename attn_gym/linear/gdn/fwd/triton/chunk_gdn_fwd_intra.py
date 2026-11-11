@@ -459,6 +459,8 @@ def chunk_gdn_fwd_intra_dense(
     v: torch.Tensor,
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense GQA-capable BT64 scalar KKT/solve and W/U/kg."""
     batch, tokens, key_heads, key_dim = k.shape
@@ -478,7 +480,7 @@ def chunk_gdn_fwd_intra_dense(
         raise ValueError("cumulative_gate and beta must follow value heads")
     chunks = tokens // 64
     inverse = torch.zeros(batch, tokens, value_heads, 64, dtype=k.dtype, device=k.device)
-    _kkt_solve[(chunks, batch * value_heads)](
+    (_kkt_solve if autotune else _kkt_solve.pinned)[(chunks, batch * value_heads)](
         k=k,
         k_stride_t=k.stride(1),
         g=cumulative_gate,
@@ -499,7 +501,7 @@ def chunk_gdn_fwd_intra_dense(
     w = k.new_empty(batch, tokens, value_heads, key_dim)
     u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     restored_k = torch.empty_like(w)
-    _recompute_w_u_kg[(chunks, batch * value_heads)](
+    (_recompute_w_u_kg if autotune else _recompute_w_u_kg.pinned)[(chunks, batch * value_heads)](
         q=None,
         k=k,
         v=v,
@@ -534,6 +536,8 @@ def chunk_gdn_fwd_intra_packed(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     metadata: RaggedChunkMetadata,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run fixed-capacity packed scalar KKT/solve and W/U/kg."""
     metadata.validate_chunk_size(64)
@@ -553,7 +557,7 @@ def chunk_gdn_fwd_intra_packed(
         raise ValueError("cumulative_gate and beta must follow value heads")
 
     inverse = torch.zeros(batch, tokens, value_heads, 64, dtype=k.dtype, device=k.device)
-    _kkt_solve[(metadata.capacity, value_heads)](
+    (_kkt_solve if autotune else _kkt_solve.pinned)[(metadata.capacity, value_heads)](
         k=k,
         k_stride_t=k.stride(1),
         g=cumulative_gate,
@@ -576,7 +580,9 @@ def chunk_gdn_fwd_intra_packed(
     w = k.new_empty(batch, tokens, value_heads, key_dim)
     u = torch.empty(v.shape, dtype=v.dtype, device=v.device)
     restored_k = torch.empty_like(w)
-    _recompute_w_u_kg[(metadata.capacity, value_heads)](
+    (_recompute_w_u_kg if autotune else _recompute_w_u_kg.pinned)[
+        (metadata.capacity, value_heads)
+    ](
         q=None,
         k=k,
         v=v,
@@ -613,6 +619,8 @@ def chunk_gdn_recompute_w_u_qg_kg(
     beta: torch.Tensor,
     inverse: torch.Tensor,
     metadata: RaggedChunkMetadata | None,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Recompute scalar W/U/qg/kg from the saved inverse without rebuilding KKT."""
     batch, tokens, key_heads, key_dim = q.shape
@@ -639,7 +647,7 @@ def chunk_gdn_recompute_w_u_qg_kg(
     cu_seqlens = None if metadata is None else metadata.cu_seqlens
     chunk_offsets = None if metadata is None else metadata.chunk_offsets
     num_sequences = 0 if metadata is None else metadata.cu_seqlens.shape[0] - 1
-    _recompute_w_u_kg[(chunks, batch * value_heads)](
+    (_recompute_w_u_kg if autotune else _recompute_w_u_kg.pinned)[(chunks, batch * value_heads)](
         q=q,
         k=k,
         v=v,

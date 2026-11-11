@@ -31,13 +31,17 @@ def context_parallel_gdn(
     routing: ContextParallelRouting,
     group: dist.ProcessGroup,
     scale: float | None = None,
+    autotune: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fused ``chunk_gdn`` over this rank's span with state exchanged by all-gather.
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
-    ``scale`` follows ``chunk_gdn``.
+    ``scale`` and ``autotune`` follow ``chunk_gdn``.
     """
-    stages = StagedOp(partial(chunk_gdn_prepare, scale=scale), chunk_gdn_prepare_backward)
+    stages = StagedOp(
+        partial(chunk_gdn_prepare, scale=scale, autotune=autotune),
+        partial(chunk_gdn_prepare_backward, autotune=autotune),
+    )
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 

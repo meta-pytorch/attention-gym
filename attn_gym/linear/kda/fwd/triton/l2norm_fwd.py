@@ -6,8 +6,9 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import PinnedConfigKernel, fixed_tree_sum, ptr_offset
+from attn_gym._backends.triton.utils import fixed_tree_sum, ptr_offset
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
@@ -193,7 +194,10 @@ def _l2norm_bwd_cuda(
     autotune: bool = True,
 ) -> torch.Tensor:
     """Launch L2Norm backward behind the same opaque stride boundary."""
-    from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
+    from attn_gym.linear.kda.bwd.triton.l2norm_bwd import (
+        PINNED_L2NORM_BWD_KERNEL,
+        l2norm_bwd_kernel,
+    )
 
     _, tokens, heads, head_dim = x.shape
     rows = x.numel() // head_dim
@@ -202,7 +206,7 @@ def _l2norm_bwd_cuda(
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
     row_stride = _l2norm_row_stride(x)
     dy_row_stride = _l2norm_row_stride(d_output)
-    kernel = l2norm_bwd_kernel if autotune else PinnedConfigKernel(l2norm_bwd_kernel)
+    kernel = l2norm_bwd_kernel if autotune else PINNED_L2NORM_BWD_KERNEL
     kernel[grid](
         x,
         rstd,
@@ -271,7 +275,9 @@ class _L2Norm(torch.autograd.Function):
     def backward(ctx, d_output: torch.Tensor):
         x, rstd, *metadata = ctx.saved_tensors
         cu_seqlens = metadata[0] if ctx.is_ragged else None
-        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, ctx.autotune), None, None, None
+        # The mode can change between an eager forward and its backward.
+        autotune = should_autotune(ctx.autotune)
+        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, autotune), None, None, None
 
 
 def l2norm(
@@ -312,7 +318,7 @@ def l2norm(
             raise ValueError("cu_seqlens must be contiguous int32")
         if cu_seqlens.device != x.device:
             raise ValueError("cu_seqlens must be on the same device as x")
-    return _L2Norm.apply(x, eps, cu_seqlens, autotune)
+    return _L2Norm.apply(x, eps, cu_seqlens, should_autotune(autotune))
 
 
 __all__ = ["l2norm"]

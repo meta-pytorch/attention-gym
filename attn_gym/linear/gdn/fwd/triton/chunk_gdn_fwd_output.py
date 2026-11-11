@@ -144,6 +144,8 @@ def chunk_gdn_fwd_output_dense(
     h: torch.Tensor,
     cumulative_gate: torch.Tensor,
     scale: float,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Compose dense GQA-capable BT64 output without materializing Aqk."""
     batch, tokens, key_heads, key_dim = q.shape
@@ -163,7 +165,7 @@ def chunk_gdn_fwd_output_dense(
     def grid(meta):
         return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * value_heads)
 
-    _chunk_fwd_o[grid](
+    (_chunk_fwd_o if autotune else _chunk_fwd_o.pinned)[grid](
         q=q,
         k=k,
         v=v,
@@ -196,6 +198,8 @@ def chunk_gdn_fwd_output_packed(
     cumulative_gate: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Compose fixed-capacity packed GQA output without materializing Aqk."""
     metadata.validate_chunk_size(64)
@@ -213,7 +217,7 @@ def chunk_gdn_fwd_output_packed(
     def grid(meta):
         return (triton.cdiv(value_dim, meta["BV"]), metadata.capacity, value_heads)
 
-    _chunk_fwd_o[grid](
+    (_chunk_fwd_o if autotune else _chunk_fwd_o.pinned)[grid](
         q=q,
         k=k,
         v=v,

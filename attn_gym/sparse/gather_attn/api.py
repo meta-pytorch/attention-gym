@@ -188,9 +188,10 @@ def _validate_inputs(
 def _validate_kernel_options(kernel_options: dict[str, str | bool] | None) -> None:
     options = kernel_options or {}
     if (
-        options.keys() - {"backend", "bwd_recompute_p"}
+        options.keys() - {"autotune", "backend", "bwd_recompute_p"}
         or options.get("backend", "cute") not in ("cute", "triton")
         or type(options.get("bwd_recompute_p", False)) is not bool
+        or type(options.get("autotune", True)) is not bool
     ):
         raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
 
@@ -367,8 +368,14 @@ def gather_attn(
             Triton. "bwd_recompute_p" (default True): CuTe backward recomputes
             attention probabilities; False saves them in forward instead (BF16,
             tokens x heads x keys, with backend padding). Triton always recomputes
-            and ignores this option. Deterministic mode selects Triton automatically,
-            but nonempty paired RoPE has no strict deterministic backward there.
+            and ignores this option. "autotune" (default True): Triton kernels
+            benchmark candidate configurations on first use and reuse the cached
+            winner. Candidates differ in floating-point order; False selects each
+            kernel's pinned configuration independently of timing and winner-cache
+            state. Deterministic mode implies False. CuTe has one schedule and
+            ignores this option. Deterministic mode selects
+            Triton automatically, but nonempty paired RoPE has no strict
+            deterministic backward there.
             Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with
             Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward, and
@@ -551,6 +558,7 @@ def gather_attn(
             local_rope=local_rope,
             backend=backend,
             bwd_recompute_p=options.get("bwd_recompute_p", True),
+            autotune=options.get("autotune", True),
             local_v=local_v,
             sparse_v=sparse_v,
         )

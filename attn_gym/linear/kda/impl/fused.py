@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import (
@@ -179,7 +180,8 @@ class _ChunkKDA(torch.autograd.Function):
             initial_state,
             ctx.scale,
             ctx.fastmath,
-            ctx.autotune,
+            # The mode can change between an eager forward and its backward.
+            should_autotune(ctx.autotune),
             ctx.schedule,
         )
         if initial_state is not None:

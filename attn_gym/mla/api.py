@@ -6,6 +6,7 @@ from typing import overload
 import torch
 from torch import Tensor
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym.types import AuxRequest, Impl, resolve_impl
 
 from . import ops  # noqa: F401  # registers the attn_gym::paged_mla_decode ops
@@ -284,7 +285,7 @@ def paged_mla_decode(
                 max_seqlen_q,
                 max_seqlen_k,
                 scale,
-                autotune,
+                should_autotune(autotune),
             )
             if return_lse:
                 out, lse = torch.ops.attn_gym.paged_mla_decode_with_lse.default(*args)

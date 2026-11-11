@@ -451,6 +451,7 @@ def test_paged_chunk_raw_operator_registration(state_dtype: torch.dtype):
             metadata.chunk_offsets,
             metadata.capacity,
             128**-0.5,
+            True,
         ),
     )
 
@@ -848,7 +849,7 @@ def test_misaligned_contiguous_inputs_and_cotangent():
         args[5],
         None,
         None,
-        args[6],
+        *args[6:],
     )
     outputs = chunk_bwd_with_state_grad_op(*backward_args)
     assert all(torch.isfinite(result).all() for result in outputs)
@@ -1001,7 +1002,7 @@ def test_raw_ops_reject_non_fp32_gate_beta_and_state(argument: int):
     """The fakes advertise FP32 state and gate/beta gradients, so the kernels must not see BF16."""
     q, k, v, gate, beta, state = make_inputs()
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
-    args = [q, k, v, cumulative, beta, state, q.shape[-1] ** -0.5]
+    args = [q, k, v, cumulative, beta, state, q.shape[-1] ** -0.5, True]
     args[argument] = args[argument].bfloat16()
     with pytest.raises(TypeError, match="requires float32"):
         chunk_fwd_with_state_op(*args)
@@ -1018,7 +1019,7 @@ def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128, token_innerm
     if token_innermost:
         q, k, v, beta = (token_innermost_like(tensor) for tensor in (q, k, v, beta))
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
-    args = (q, k, v, cumulative, beta, state, head_dim**-0.5)
+    args = (q, k, v, cumulative, beta, state, head_dim**-0.5, True)
     with torch.no_grad():
         output, final_state, inverse = chunk_fwd_with_state_op(*args)
     return args, output, final_state, inverse
@@ -1044,7 +1045,7 @@ def test_dense_raw_operator_registration(head_dim: int, token_innermost: bool):
         args[5],
         None,
         None,
-        args[6],
+        *args[6:],
     )
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(chunk_bwd_op, backward_args, test_utils=utilities)
@@ -1078,6 +1079,7 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
         metadata.chunk_offsets,
         metadata.capacity,
         head_dim**-0.5,
+        True,
     )
     torch.library.opcheck(chunk_fwd_packed_op, args)
     torch.library.opcheck(chunk_fwd_packed_with_state_op, args)
@@ -1092,6 +1094,7 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
         cu_seqlens,
         metadata.chunk_offsets,
         head_dim**-0.5,
+        True,
     )
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(chunk_bwd_op, backward_args, test_utils=utilities)

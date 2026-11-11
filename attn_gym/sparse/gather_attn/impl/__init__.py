@@ -27,6 +27,7 @@ class _GatherAttnFunction(torch.autograd.Function):
         local_rope: Tensor | None,
         sparse_v: Tensor | None,
         local_v: Tensor | None,
+        autotune: bool,
     ) -> tuple[Tensor, Tensor]:
         output, lse, state = _gather_attn_fwd_op(
             query,
@@ -47,6 +48,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             local_rope,
             sparse_v,
             local_v,
+            autotune,
         )
         ctx.save_for_backward(
             query,
@@ -66,6 +68,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             *state,
         )
         ctx.options = (sliding_window_size, share_kv, scale, backend, bwd_recompute_p)
+        ctx.autotune = autotune
         ctx.mark_non_differentiable(lse)
         return output, lse
 
@@ -107,10 +110,12 @@ class _GatherAttnFunction(torch.autograd.Function):
             local_rope,
             sparse_v,
             local_v,
+            ctx.autotune,
         )
         return (
             *(dq, ds, dl, None, dsink, None, None, None, None, None, None, None),
             *(dqr, dsr, dlr, dsv, dlv),
+            None,
         )
 
 
@@ -128,6 +133,7 @@ def gather_attn(
     scale: float,
     backend: str,
     bwd_recompute_p: bool = True,
+    autotune: bool = True,
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
@@ -137,7 +143,8 @@ def gather_attn(
     """Flatten independent operands into one common opaque operator contract.
 
     ``local_v``/``sparse_v`` are separate values; with them, or with 1 < kv_heads < heads,
-    the inputs run on the Triton grouped schedule.
+    the inputs run on the Triton grouped schedule. ``autotune`` lets Triton kernels benchmark
+    candidate configurations; the CuTe backend has one schedule and ignores it.
     """
     if backend == "triton" and (sliding_window_size or kv_indices.shape[-1]):
         query = query.contiguous()
@@ -158,7 +165,7 @@ def gather_attn(
         value_inputs = tuple(
             None if tensor is None else tensor.view_as(tensor) for tensor in values
         )
-        return _GatherAttnFunction.apply(*inputs, *options, *rope_inputs, *value_inputs)
+        return _GatherAttnFunction.apply(*inputs, *options, *rope_inputs, *value_inputs, autotune)
     output, lse, _ = _gather_attn_fwd_op(
         *tensors,
         sliding_window_size,
@@ -169,5 +176,6 @@ def gather_attn(
         bwd_recompute_p,
         *ropes,
         *values,
+        autotune,
     )
     return output, lse

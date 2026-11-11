@@ -824,6 +824,7 @@ def _launch_backward(
     query_rope: torch.Tensor | None = None,
     sparse_rope: torch.Tensor | None = None,
     local_rope: torch.Tensor | None = None,
+    autotune: bool,
 ) -> tuple[torch.Tensor | None, ...]:
     """Launch backward kernels for gather attention.
 
@@ -832,7 +833,7 @@ def _launch_backward(
     count before the op broadcasts a single shared head; separate values or
     1 < kv_heads < heads run on the grouped schedule. Key-only RoPE runs only on the
     shared-KV schedule, whose sparse gradients are atomic, so the reverse query map may be
-    None.
+    None. Without ``autotune`` every kernel launches its pinned configuration.
     """
     if uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None):
         dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v = _launch_grouped_backward(
@@ -851,6 +852,7 @@ def _launch_backward(
             kv_heads=kv_heads,
             sparse_v=sparse_v,
             local_v=local_v,
+            autotune=autotune,
         )
         # Zero-width RoPE pairs add nothing to the scores; their gradients are empty.
         rope_grads = (
@@ -881,6 +883,7 @@ def _launch_backward(
             share_kv,
             scale,
             kv_heads=kv_heads,
+            autotune=autotune,
         )
         kv_heads = 1 if share_kv else query.shape[1]
         rope_grads = (
@@ -961,7 +964,9 @@ def _launch_backward(
         grad_sink_partials = torch.empty(
             batch, heads, seq_len, device=query.device, dtype=torch.float32
         )
-        BWD_DQ_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
+        (BWD_DQ_SHARED if autotune else BWD_DQ_SHARED.pinned)[
+            (seq_len, batch, triton.cdiv(heads, block_h))
+        ](
             query,
             sparse_kv,
             kernel_local_kv,
@@ -1084,7 +1089,7 @@ def _launch_backward(
             output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
             grad_output_desc = TensorDescriptor.from_tensor(grad_output, [1, 1, block_m, block_d])
             grad_local_desc = TensorDescriptor.from_tensor(grad_local_kv, [1, 1, block_n, block_d])
-            _BWD_DLOCAL_KV_TMA[local_grid](
+            (_BWD_DLOCAL_KV_TMA if autotune else _BWD_DLOCAL_KV_TMA.pinned)[local_grid](
                 query_desc,
                 local_desc,
                 cu_seqlens,
@@ -1173,7 +1178,9 @@ def _launch_backward(
             batch,
             triton.cdiv(heads, meta["BLOCK_H"]) * triton.cdiv(topk, meta["BLOCK_K"]),
         )
-        BWD_DSPARSE_KV_SHARED_ATOMIC[sparse_grid](
+        (BWD_DSPARSE_KV_SHARED_ATOMIC if autotune else BWD_DSPARSE_KV_SHARED_ATOMIC.pinned)[
+            sparse_grid
+        ](
             query,
             sparse_kv,
             sparse_kv,
@@ -1244,7 +1251,7 @@ def _launch_backward(
             sparse_kernel = _BWD_DSPARSE_KV
             sparse_grid = (sparse_seq_len, batch * heads)
 
-        sparse_kernel[sparse_grid](
+        (sparse_kernel if autotune else sparse_kernel.pinned)[sparse_grid](
             query,
             sparse_kv,
             selected_queries,
@@ -1329,6 +1336,7 @@ def _launch_grouped_backward(
     kv_heads: int,
     sparse_v: torch.Tensor | None,
     local_v: torch.Tensor | None,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Backward for separate values or grouped KV heads, mirroring the grouped forward.
 
@@ -1412,7 +1420,7 @@ def _launch_grouped_backward(
         num_dense_tiles = tile_spans.shape[1]
     if dense_shape is not None:
         dense_rows = tile_queries * group
-        BWD_DQ_DENSE[
+        (BWD_DQ_DENSE if autotune else BWD_DQ_DENSE.pinned)[
             lambda meta: (
                 num_dense_tiles * triton.cdiv(dense_rows, meta["BLOCK_M"]),
                 batch,
@@ -1457,7 +1465,9 @@ def _launch_grouped_backward(
             TILE_QUERIES=tile_queries,
             BLOCK_D=block_d,
         )
-    BWD_DQ_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
+    (BWD_DQ_GROUPED if autotune else BWD_DQ_GROUPED.pinned)[
+        (seq_len, batch, kv_heads * triton.cdiv(group, block_h))
+    ](
         query,
         sparse_kv,
         kernel_local_kv,
@@ -1594,7 +1604,9 @@ def _launch_grouped_backward(
             if v_is_k
             else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
         )
-        BWD_DSPARSE_KV_DENSE[(key_tile_grid, kv_heads, batch)](
+        (BWD_DSPARSE_KV_DENSE if autotune else BWD_DSPARSE_KV_DENSE.pinned)[
+            (key_tile_grid, kv_heads, batch)
+        ](
             query,
             sparse_kv,
             sparse_values,
@@ -1651,7 +1663,7 @@ def _launch_grouped_backward(
                 if v_is_k
                 else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
             )
-        BWD_DSPARSE_KV_SHARED_ATOMIC[
+        (BWD_DSPARSE_KV_SHARED_ATOMIC if autotune else BWD_DSPARSE_KV_SHARED_ATOMIC.pinned)[
             lambda meta: (
                 seq_len,
                 batch,

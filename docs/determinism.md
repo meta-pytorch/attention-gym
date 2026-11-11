@@ -107,6 +107,27 @@ python examples/flex_attention/flex_determinism.py
 
 The script resets compiler state and uses fresh Inductor caches between runs so that it tests repeatability across independent compilations rather than repeatedly executing one cached kernel.
 
+## Autotuned kernels
+
+Autotuned kernels benchmark candidates on a winner-cache miss and reuse the winner.
+Candidates differ in floating-point order (tile sizes, warps per block), so timing noise can
+change the selected configuration and output bits across processes, ranks, and winner-cache
+states.
+
+Every operation that tunes can also launch pinned configurations chosen without timing:
+
+- `torch.use_deterministic_algorithms(True)` disables autotuning. Operations resolve the flag;
+  autograd backward resolves it again because eager code can change the mode after forward.
+  `gather_attn` resolves it inside its CUDA op implementations at launch.
+- `autotune=False` pins one call of `chunk_kda`, `paged_chunk_kda`, `recurrent_kda`,
+  `chunk_gdn`, `paged_chunk_gdn`, `recurrent_gdn`, `l2norm`, or the context-parallel and
+  staged chunk operations; `gather_attn` takes
+  `kernel_options={"autotune": False}`. `paged_mla_decode` tunes only with `autotune=True`.
+
+The pinned configuration follows the input shapes and GPU model. For otherwise deterministic
+kernels, bits repeat across processes and cache states on one GPU model and software stack,
+not across GPU architectures.
+
 ## KDA determinism
 
 The KDA operations contain no atomics, so every kernel is bitwise-deterministic
@@ -116,12 +137,13 @@ given a fixed configuration. The guarantees, strongest first:
   that resolves to the same kernel configurations — across runs and processes —
   reproduces identical bits for outputs and gradients. Under the default
   ``autotune=True`` a cold winner cache re-benchmarks and timing noise may
-  select a different configuration; the next bullet removes that variable.
+  select a different configuration; the next bullet removes that variable, as do
+  deterministic algorithms (see [Autotuned kernels](#autotuned-kernels)).
 - **`chunk_kda(..., autotune=False)`: bitwise by construction.** The default
   (`autotune=True`) benchmarks candidate configurations — Triton and CuTeDSL
   stages alike — the first time a shape is seen and reuses the cached winner
   afterwards; `autotune=False` pins every stage to its fixed heuristic
-  configuration instead, so kernel selection is repeatable across machines and
+  configuration instead, so kernel selection is repeatable across processes and
   cache states. `recurrent_kda(..., autotune=False)` pins its heuristic
   configuration the same way. `causal_conv1d` has a single fixed schedule and
   needs no flag.

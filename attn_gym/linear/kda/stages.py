@@ -36,6 +36,7 @@ from typing import NamedTuple
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata, ScheduleRequest
@@ -293,6 +294,7 @@ def chunk_kda_prepare(
             # cuDNN's with-state kernels are packed-only, so it always gets explicit boundaries;
             # arange keeps the launch capture-safe.
             cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
+    autotune = should_autotune(autotune)
     q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
         q, k, v, beta, cu_seqlens=cu_seqlens, scale=scale
     )
@@ -491,6 +493,7 @@ def chunk_kda_prepare_backward(
     else:
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
+    autotune = should_autotune(autotune)
     if isinstance(saved, ChunkKDACudnnSaved):
         validate_cudnn_fastmath(fastmath)
         return ChunkKDACudnnBackward(

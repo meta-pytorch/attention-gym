@@ -17,6 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import PinnedConfigKernel
 from attn_gym._backends.triton.utils import autotune_cache_kwargs, ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
@@ -411,6 +412,10 @@ def chunk_gdn_bwd_gate_cumsum_kernel(
     tl.store(d_gate + scalar_offsets, b_dgate, mask=token_mask)
 
 
+_PINNED_DQKWG = PinnedConfigKernel(chunk_gdn_bwd_dqkwg_kernel)
+_PINNED_WY = PinnedConfigKernel(chunk_gdn_bwd_wy_kernel)
+
+
 def chunk_gdn_bwd_wy(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -426,6 +431,8 @@ def chunk_gdn_bwd_wy(
     dv: torch.Tensor,
     metadata: RaggedChunkMetadata | None,
     scale: float,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Differentiate scalar-GDN's chunk output and WY representation.
 
@@ -533,7 +540,8 @@ def chunk_gdn_bwd_wy(
 
     if chunk_slots:
         direct_grid = (key_tiles, chunk_slots, value_heads)
-        chunk_gdn_bwd_dqkwg_kernel[direct_grid](
+        dqkwg_kernel = chunk_gdn_bwd_dqkwg_kernel if autotune else _PINNED_DQKWG
+        dqkwg_kernel[direct_grid](
             q,
             k,
             q.stride(1),
@@ -562,7 +570,8 @@ def chunk_gdn_bwd_wy(
             SCALE=scale,
             IS_VARLEN=metadata is not None,
         )
-        chunk_gdn_bwd_wy_kernel[(chunk_slots, value_heads)](
+        wy_kernel = chunk_gdn_bwd_wy_kernel if autotune else _PINNED_WY
+        wy_kernel[(chunk_slots, value_heads)](
             k,
             v,
             k.stride(1),

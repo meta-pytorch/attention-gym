@@ -1,5 +1,6 @@
 """Shared pytest fixtures."""
 
+import importlib
 import os
 import sys
 from collections import Counter
@@ -112,6 +113,58 @@ def fresh_compile_cache() -> Iterator[None]:
         yield
     finally:
         torch.compiler.reset()
+
+
+@pytest.fixture
+def isolated_winners(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Use empty ``run_tunable`` winner caches in memory and on disk."""
+    # The cute package re-exports tune(), shadowing the tune module.
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    # Only winners move: compiled kernels stay in the shared cache.
+    monkeypatch.setattr(tune_module, "get_cache_path", lambda: tmp_path)
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+
+
+@pytest.fixture
+def no_benchmarking(
+    isolated_winners: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reject ``run_tunable`` tuning and multi-config ``triton.autotune`` launches.
+
+    Drop ``run_tunable`` winners so cached results cannot hide a tuned launch.
+    """
+    from triton.runtime.autotuner import Autotuner
+
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    monkeypatch.setattr(tune_module, "get_cache_path", lambda: tmp_path / "no_benchmarking")
+    tune_module._WINNERS.clear()
+    tune_module._WINNERS_FAST.clear()
+
+    def fail(*_args, **_kwargs):
+        raise AssertionError("a pinned launch must not benchmark")
+
+    def autotune_run(self, *args, **kwargs):
+        # Triton replays a winner cached on disk without timing anything.
+        if len(self.configs) > 1:
+            fail()
+        return run(self, *args, **kwargs)
+
+    run = Autotuner.run
+    monkeypatch.setattr(tune_module, "tune", fail)
+    monkeypatch.setattr(Autotuner, "run", autotune_run)
+
+
+@pytest.fixture
+def deterministic_algorithms() -> Iterator[None]:
+    """Run the test under ``torch.use_deterministic_algorithms(True)``."""
+    enabled = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
 
 
 @pytest.fixture

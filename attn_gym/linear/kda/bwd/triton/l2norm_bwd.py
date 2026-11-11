@@ -23,6 +23,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import PinnedConfigKernel
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear.kda.utils import autotune_cache_kwargs
 
@@ -109,3 +110,6 @@ def l2norm_bwd_kernel(
         b_dx.to(dx.dtype.element_ty),
         mask=mask,
     )
+
+
+PINNED_L2NORM_BWD_KERNEL = PinnedConfigKernel(l2norm_bwd_kernel)

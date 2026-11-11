@@ -828,6 +828,17 @@ def prune_shared_forward_configs(configs, args):
     return [config for config in configs if config.kwargs["BLOCK_N"] == key_rows]
 
 
+_shared_forward_arguments_key = tuning_key(
+    "query_ptr", "H", "D", "ROPE_DIM", "TOPK", "WINDOW", "HAS_CU_SEQLENS"
+)
+
+
+def shared_forward_key(args):
+    """Include the device's key tile because it determines pruning."""
+    _, key_rows = shared_forward_tiles(args["query_ptr"], args["ROPE_DIM"])
+    return (*_shared_forward_arguments_key(args), key_rows)
+
+
 _FWD_SHARED = TritonTuner(
     _gather_attn_fwd_shared,
     [
@@ -835,7 +846,7 @@ _FWD_SHARED = TritonTuner(
         for block_n in (64, 128, 256, 32, 16)
         for num_warps in (4, 8)
     ],
-    key=tuning_key("query_ptr", "H", "D", "ROPE_DIM", "TOPK", "WINDOW", "HAS_CU_SEQLENS"),
+    key=shared_forward_key,
     prune=prune_shared_forward_configs,
 )
 _FWD_TMA = TritonTuner(
@@ -958,6 +969,7 @@ def _launch_grouped_forward(
     kv_heads: int,
     sparse_v: torch.Tensor | None,
     local_v: torch.Tensor | None,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Forward for separate values or grouped KV heads (see ``forward_schedule``).
 
@@ -1003,7 +1015,7 @@ def _launch_grouped_forward(
             selected_counts, spans, cu_seqlens, tile_queries, document_bounds=False
         )
         num_tiles = tile_spans.shape[1]
-        _FWD_DENSE[(num_tiles, batch, kv_heads)](
+        (_FWD_DENSE if autotune else _FWD_DENSE.pinned)[(num_tiles, batch, kv_heads)](
             query,
             sparse_kv,
             sparse_v,
@@ -1035,7 +1047,9 @@ def _launch_grouped_forward(
             BLOCK_M=DENSE_TILE_ROWS,
             BLOCK_D=block_d,
         )
-    _FWD_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
+    (_FWD_GROUPED if autotune else _FWD_GROUPED.pinned)[
+        (seq_len, batch, kv_heads * triton.cdiv(group, block_h))
+    ](
         query,
         sparse_kv,
         local_kv,
@@ -1100,13 +1114,14 @@ def _launch_forward(
     query_rope: torch.Tensor | None = None,
     sparse_rope: torch.Tensor | None = None,
     local_rope: torch.Tensor | None = None,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch forward with query, indices, and sink made contiguous by the opaque op.
 
     ``kv_heads`` is the KV head count before the op broadcasts a single shared head. Without
     separate values the keys are also the values, so the output is as wide as ``query``.
     Key-only RoPE tensors run only on the shared-KV schedule; local tensors may be None
-    without a window.
+    without a window. Without ``autotune`` every kernel launches its pinned configuration.
     """
     if not sliding_window_size:
         # Kernels never read local tensors without a window, so they are passed as None.
@@ -1140,6 +1155,7 @@ def _launch_forward(
             kv_heads=kv_heads,
             sparse_v=sparse_v,
             local_v=local_v,
+            autotune=autotune,
         )
     batch, heads, seq_len, head_dim = query.shape
     topk = kv_indices.shape[-1]
@@ -1170,7 +1186,9 @@ def _launch_forward(
         rope_dim = 0 if query_rope is None else query_rope.shape[-1]
         block_h, key_rows = shared_forward_tiles(query, rope_dim)
         block_k = max(16, min(key_rows, triton.next_power_of_2(topk)))
-        _FWD_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
+        (_FWD_SHARED if autotune else _FWD_SHARED.pinned)[
+            (seq_len, batch, triton.cdiv(heads, block_h))
+        ](
             query,
             sparse_kv,
             local_kv,
@@ -1237,7 +1255,7 @@ def _launch_forward(
             else TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
         )
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
-        _FWD_TMA[grid](
+        (_FWD_TMA if autotune else _FWD_TMA.pinned)[grid](
             query_desc,
             sparse_kv,
             local_desc,

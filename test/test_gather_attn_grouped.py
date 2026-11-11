@@ -259,20 +259,28 @@ def _dense_tile_inputs(heads, kv_heads, head_dim, separate_values, packed, all_d
 def _spy_dense_launches(monkeypatch):
     """Count launches of the three dense-tile kernels: forward, dQ, and dK/dV."""
     launches = {}
+
+    class CountingLaunch:
+        """Count tuned and pinned launches of one tuner alike."""
+
+        def __init__(self, name, kernel):
+            self.name, self.kernel = name, kernel
+
+        def __getitem__(self, grid):
+            launches[self.name] += 1
+            return self.kernel[grid]
+
+        @property
+        def pinned(self):
+            return CountingLaunch(self.name, self.kernel.pinned)
+
     for module, name in (
         (forward, "_FWD_DENSE"),
         (backward, "BWD_DQ_DENSE"),
         (backward, "BWD_DSPARSE_KV_DENSE"),
     ):
-        tuner = getattr(module, name)
         launches[name] = 0
-
-        class CountingLaunch:
-            def __getitem__(self, grid, _tuner=tuner, _name=name):
-                launches[_name] += 1
-                return _tuner[grid]
-
-        monkeypatch.setattr(module, name, CountingLaunch())
+        monkeypatch.setattr(module, name, CountingLaunch(name, getattr(module, name)))
     return launches
 
 

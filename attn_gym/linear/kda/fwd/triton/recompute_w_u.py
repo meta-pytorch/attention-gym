@@ -36,11 +36,8 @@ import triton
 import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.triton.utils import (
-    PinnedConfigKernel,
-    ptr_offset,
-    requires_int64_offsets,
-)
+from attn_gym._backends.triton.tune import PinnedConfigKernel
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,

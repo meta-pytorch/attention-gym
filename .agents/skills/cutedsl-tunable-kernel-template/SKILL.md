@@ -182,6 +182,9 @@ my_op(q, k, tune=True, configs=(cfg_a, cfg_b))  # explicit candidate override
 ```
 
 Reject `config=` with tuning and reject `configs=` without tuning rather than silently ignoring either argument.
+Public operations resolve their tuning flag with `should_autotune`
+(`attn_gym/_backends/autotune.py`) before calling `run_tunable`; deterministic algorithms disable
+timing-based selection. See "Tuned Kernels and Reproducibility" in `AGENTS.md`.
 If target metadata is supplied explicitly, install it before generating candidates so `configs(...)`
 and compilation observe the same target. On heterogeneous multi-GPU hosts, derive that target from
 the runtime tensor's device rather than the process's current device. The installed target is

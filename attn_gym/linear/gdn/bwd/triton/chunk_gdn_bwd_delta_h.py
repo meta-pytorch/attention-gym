@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import PinnedConfigKernel
 from attn_gym._backends.triton.utils import autotune_cache_kwargs, ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
@@ -322,6 +323,10 @@ def chunk_gdn_bwd_delta_h_kernel(
             )
 
 
+_PINNED_DV_LOCAL = PinnedConfigKernel(chunk_gdn_bwd_dv_local_kernel)
+_PINNED_DELTA_H = PinnedConfigKernel(chunk_gdn_bwd_delta_h_kernel)
+
+
 def chunk_gdn_bwd_delta_h(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -332,6 +337,8 @@ def chunk_gdn_bwd_delta_h(
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
     scale: float,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Compute delta-state, initial-state, and corrected-value gradients.
 
@@ -425,7 +432,8 @@ def chunk_gdn_bwd_delta_h(
 
     groups = value_heads // key_heads
     if chunk_slots:
-        chunk_gdn_bwd_dv_local_kernel[(chunk_slots, value_heads)](
+        dv_local_kernel = chunk_gdn_bwd_dv_local_kernel if autotune else _PINNED_DV_LOCAL
+        dv_local_kernel[(chunk_slots, value_heads)](
             q,
             k,
             q.stride(1),
@@ -448,7 +456,8 @@ def chunk_gdn_bwd_delta_h(
     def grid(meta):
         return (num_sequences * value_heads, triton.cdiv(value_dim, meta["BV"]))
 
-    chunk_gdn_bwd_delta_h_kernel[grid](
+    delta_h_kernel = chunk_gdn_bwd_delta_h_kernel if autotune else _PINNED_DELTA_H
+    delta_h_kernel[grid](
         q,
         k,
         q.stride(1),

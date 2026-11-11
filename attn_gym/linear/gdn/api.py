@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
@@ -35,6 +36,7 @@ def chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
+    autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -61,6 +63,11 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
+        autotune: Benchmark candidate configurations of the repo-local fused kernels when
+            true; winners are cached and reused. When false, and always under
+            ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
+            fixed configurations, so bits repeat across processes and winner-cache states on
+            one GPU model and software stack. The cuDNN backend always uses its fixed schedule.
         impl: ``"fused"`` (default) uses the repo-local scalar chunk pipeline on CUDA
             capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
             ``"reference"`` uses eager PyTorch.
@@ -104,6 +111,7 @@ def chunk_gdn(
             cu_seqlens=cu_seqlens,
             scale=scale,
             output_final_state=output_final_state,
+            autotune=should_autotune(autotune),
         )
 
     return reference_delta_rule(
@@ -133,6 +141,7 @@ def paged_chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     scale: float | None = None,
+    autotune: bool = True,
     kernel_options: KernelOptions | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
@@ -158,6 +167,11 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
+        autotune: Benchmark candidate configurations of the repo-local factor and output
+            kernels when true. When false, and always under
+            ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
+            The recurrence that advances ``state_cache`` and the cuDNN backend always use
+            fixed configurations.
         kernel_options: Backend options. The repo-local path is the default;
             ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
             requires 16-byte-aligned pool bases and slot origins. Split schedules are not
@@ -178,10 +192,21 @@ def paged_chunk_gdn(
         state_indices,
         has_initial_state,
     )
-    paged_chunk_forward = (
-        cudnn_paged_chunk_forward if options.backend == "cudnn" else fused_paged_chunk_forward
-    )
-    return paged_chunk_forward(
+    scale = resolve_scale(scale, q.shape[-1])
+    if options.backend == "cudnn":
+        return cudnn_paged_chunk_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            scale=scale,
+        )
+    return fused_paged_chunk_forward(
         q,
         k,
         v,
@@ -191,7 +216,8 @@ def paged_chunk_gdn(
         state_indices,
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
-        scale=resolve_scale(scale, q.shape[-1]),
+        scale=scale,
+        autotune=should_autotune(autotune),
     )
 
 
@@ -295,7 +321,7 @@ def recurrent_gdn(
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            autotune=autotune,
+            autotune=should_autotune(autotune),
             batch_invariant=batch_invariant,
         )
 
