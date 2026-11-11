@@ -242,7 +242,7 @@ body instead.
 
 ### Suppress one check
 
-`unchecked(check, reason=...)` supports `unclosed`, `cross_region`, `tma`, `alias` and `token`.
+`unchecked(check, reason=...)` supports `unclosed`, `cross_region`, `tma`, `alias`, `token` and `fence`.
 It suppresses only that check inside the block and records the opt-out in `describe()`.
 It changes diagnostics, not device synchronization.
 

@@ -137,6 +137,8 @@ print(op.describe())
 | `"strict"` | Raise `ProtocolError` for a potential hazard, not an unverified case |
 | `"off"` | Skip analysis |
 
+The same mode runs the [fence check](channels.md#checking-explicit-fences).
+
 Analysis runs during tracing. `alias_check` is part of `op.__cute_cache_key__()`, so
 `jit_cache` cannot reuse warn/off builds for strict requests. Cache hits restore reports
 and warnings ([compile keys](roles.md#compile-keys)).

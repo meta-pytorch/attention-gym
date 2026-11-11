@@ -173,6 +173,10 @@ Declare fences on the side that needs them, before its managed signal:
 | `"tmem_load"` | `tcgen05.wait::ld` |
 | `"smem_async"` | `fence.proxy.async` |
 
+[`fences.RULES`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/fences.py)
+defines the access pairs used by both default derivation and the
+[explicit fence check](#checking-explicit-fences).
+
 `tmem_store` completes TMEM stores for a reader, usually MMA. `tmem_load` completes
 `tcgen05.ld` before a later MMA overwrites those columns. Declare
 `release_fence="tmem_load"` when every release needs it (FA4 backward's `dq` and `dkv`).
@@ -222,10 +226,32 @@ Explicit values **replace**, not extend, defaults. Include `"smem_async"` when a
 including defaults. Other async work, including TMA stores and TMEM aliases, still needs
 its own completion waits and proxy fences.
 
-The alias diagnostic checks for the required fence kinds. TMEM-store handoffs without
+On declared overlaps, the alias diagnostic checks for the required fence kinds. TMEM-store
+handoffs without
 `"tmem_store"` and SMEM-store-to-async-reader handoffs without `"smem_async"` remain
-unverified. It checks declared overlaps between buffers, not a ring refilling itself,
-so it cannot catch an incorrect `release_fence=()`.
+unverified.
+
+### Checking explicit fences
+
+The fence check compares explicit `commit_fence`/`release_fence` values with
+[access annotations](storage.md#check-declared-aliases) recorded while the channel's handles
+were open. SMEM annotations require `buffer=` storage; `payload=` accesses are not recorded.
+A `Tma` producer implies a fill of the channel's SMEM; an `Umma` consumer implies a read.
+This catches `release_fence=()` on a TMA-filled buffer with annotated generic reads.
+
+`describe()` and `checks().fences` report `covered`, `unverified` or `missing fence`.
+A `fence_async_shared()` or another channel's managed fence after the access and before the
+signal counts when the trace establishes that it executes on that path. Uncertain conditional
+coverage is `unverified`. A TMEM handoff through another open channel can also be unverified:
+the check does not establish which epochs those channels pair.
+
+Missing annotations, raw roles and raw signals can leave requirements unverified. An
+`external=` opposite side is always `unverified`, even with a fully fenced override. A required
+`"tmem_load"` absent from the override is also `unverified`: the trace cannot see a manual
+load-completion wait. Accesses inside `unchecked("fence", reason=...)` are skipped.
+
+Missing fences warn, or raise under `alias_check="strict"`; `"off"` skips the check.
+Explicit values always replace defaults. The check never inserts fences.
 
 ## TMEM
 
