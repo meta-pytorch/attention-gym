@@ -251,7 +251,7 @@ def test_recurrent_reuses_kernel_across_token_counts(triton_compiles):
     # Single-token scans select a different prefetch policy, so they are not part of this set.
     for tokens in (37, 16, 48):
         inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
-        recurrent_gdn(*inputs[:5], autotune=False)
+        recurrent_gdn(*inputs[:5], kernel_options={"autotune": False})
     torch.cuda.synchronize()
     assert triton_compiles["_recurrent_delta_rule_fwd_kernel"] == 1
 
@@ -271,11 +271,11 @@ def test_recurrent_reuses_tuning_across_token_counts(isolated_winners, monkeypat
     monkeypatch.setattr(tune_module, "tune", counting_tune)
     for tokens in (64, 91, 160):
         inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
-        recurrent_gdn(*inputs[:5], autotune=True)
+        recurrent_gdn(*inputs[:5], kernel_options={"autotune": True})
     torch.cuda.synchronize()
     assert len(sweeps) == 1
     inputs = _make_inputs(tokens=1, dtype=torch.bfloat16, initial_state=False)
-    recurrent_gdn(*inputs[:5], autotune=True)
+    recurrent_gdn(*inputs[:5], kernel_options={"autotune": True})
     assert len(sweeps) == 2
 
 
@@ -288,8 +288,7 @@ def _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fr
         cu_seqlens=cu_seqlens.to(torch.int32),
         state_indices=slots,
         has_initial_state=~fresh,
-        autotune=False,
-        kernel_options={"batch_invariant": True},
+        kernel_options={"batch_invariant": True, "autotune": False},
     )  # fmt: skip
     return output
 
@@ -374,8 +373,7 @@ def test_batch_invariant_bits_do_not_depend_on_launch_config(monkeypatch, gate_k
             scan(
                 q, k, v, gate, beta,
                 output_final_state=True,
-                autotune=False,
-                kernel_options={"batch_invariant": True},
+                kernel_options={"batch_invariant": True, "autotune": False},
             )
         )  # fmt: skip
     for config, (output, state) in zip(configs[1:], results[1:]):

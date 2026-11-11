@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym.linear import chunk_gdn, paged_chunk_gdn
+from attn_gym.linear import TuningOptions, chunk_gdn, paged_chunk_gdn
 from attn_gym.testing import make_gdn_test_inputs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -14,7 +14,7 @@ TOKENS = 192
 
 
 def chunk_outputs_and_gradients(
-    head_dim: int, packed: bool, **options: bool
+    head_dim: int, packed: bool, kernel_options: TuningOptions | None = None
 ) -> tuple[torch.Tensor, ...]:
     """Return the output, final state, and input gradients of one fused training step."""
     *inputs, cu_seqlens = make_gdn_test_inputs(
@@ -24,7 +24,7 @@ def chunk_outputs_and_gradients(
         requires_grad=True,
     )
     output, final_state = chunk_gdn(
-        *inputs, cu_seqlens=cu_seqlens, output_final_state=True, **options
+        *inputs, cu_seqlens=cu_seqlens, output_final_state=True, kernel_options=kernel_options
     )
     loss = output.float().square().mean() + final_state.square().mean()
     return output, final_state, *torch.autograd.grad(loss, inputs)
@@ -45,9 +45,9 @@ def test_chunk_gdn_without_autotune_never_benchmarks(
 ):
     tuned = chunk_outputs_and_gradients(head_dim, packed)
     request.getfixturevalue("no_benchmarking")
-    pinned = chunk_outputs_and_gradients(head_dim, packed, autotune=False)
+    pinned = chunk_outputs_and_gradients(head_dim, packed, {"autotune": False})
     assert_matches_tuned(pinned, tuned)
-    repeated = chunk_outputs_and_gradients(head_dim, packed, autotune=False)
+    repeated = chunk_outputs_and_gradients(head_dim, packed, {"autotune": False})
     assert all(torch.equal(first, second) for first, second in zip(pinned, repeated))
 
 
@@ -65,7 +65,11 @@ def test_paged_chunk_gdn_without_autotune_never_benchmarks(no_benchmarking: None
     *inputs, state, _cu_seqlens = make_gdn_test_inputs(TOKENS, sigmoid_beta=True)
     state_cache = torch.cat([torch.zeros_like(state), state])
     state_indices = torch.tensor([1], device="cuda", dtype=torch.int32)
-    expected = chunk_gdn(*inputs, state, output_final_state=True, autotune=False)
+    expected = chunk_gdn(
+        *inputs, state, output_final_state=True, kernel_options={"autotune": False}
+    )
     with torch.no_grad():
-        output = paged_chunk_gdn(*inputs, state_cache, state_indices, autotune=False)
+        output = paged_chunk_gdn(
+            *inputs, state_cache, state_indices, kernel_options={"autotune": False}
+        )
     assert_matches_tuned((output, state_cache[1:]), expected)

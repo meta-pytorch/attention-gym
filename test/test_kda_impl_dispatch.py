@@ -73,13 +73,13 @@ def test_impl_accepts_enum_and_string():
         recurrent_kda(q, k, v, gate, beta, impl="naive")
 
 
-def test_recurrent_accepts_reserved_autotune_flag():
-    """Keep the public selector signatures aligned while recurrent uses a fixed policy."""
+@pytest.mark.parametrize("operation", [chunk_kda, recurrent_kda])
+def test_reference_rejects_the_autotune_option(operation):
+    """The reference has no kernels to tune, so it rejects every kernel option."""
     q, k, v, gate, beta = _inputs(tokens=8)
 
-    tuned, _ = recurrent_kda(q, k, v, gate, beta, autotune=True, impl="reference")
-    fixed, _ = recurrent_kda(q, k, v, gate, beta, autotune=False, impl="reference")
-    torch.testing.assert_close(tuned, fixed, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="kernel_options are not supported with impl='reference'"):
+        operation(q, k, v, gate, beta, kernel_options={"autotune": False}, impl="reference")
 
 
 def test_recurrent_reference_matches_fused():
@@ -252,12 +252,14 @@ def test_chunk_reference_accepts_fastmath_permission(fastmath):
 
 @pytest.mark.skipif(not FUSED_CHUNK, reason="fused chunk_kda requires CUDA capability 8.0")
 def test_chunk_autotune_flag_is_deterministic_and_accurate():
-    """autotune=False pins fixed heuristic configs without changing the math contract."""
+    """``"autotune": False`` pins fixed heuristic configs without changing the math contract."""
     q, k, v, gate, beta = _inputs(tokens=128, head_dim=128, dtype=torch.bfloat16, seed=5)
     q, v = q.requires_grad_(), v.requires_grad_()
 
     def run():
-        output, state = chunk_kda(q, k, v, gate, beta, output_final_state=True, autotune=False)
+        output, state = chunk_kda(
+            q, k, v, gate, beta, output_final_state=True, kernel_options={"autotune": False}
+        )
         grads = torch.autograd.grad(output.float().square().mean() + state.square().mean(), (q, v))
         return output, state, *grads
 

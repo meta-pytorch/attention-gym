@@ -75,7 +75,6 @@ def chunk_kda(
     scale: float | None = None,
     output_final_state: bool = False,
     fastmath: bool = True,
-    autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -118,8 +117,6 @@ def chunk_kda(
             The reference backend uses normal PyTorch math for either value; native cuDNN
             requires ``True``. Configure gate production separately with ``bound_gate`` or
             ``gate_transform``.
-        autotune: Benchmark candidate fused-kernel configurations when true. cuDNN
-            accepts this argument for API compatibility but uses its fixed schedule.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
             differentiable eager PyTorch in FP32. There is no automatic fallback.
         kernel_options: Backend-specific options. This is a sneaky BC trick.
@@ -127,14 +124,17 @@ def chunk_kda(
             but, this trick allows us to add new options without breaking the API. I will
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
+            See :class:`attn_gym.linear.types.KernelOptions`. ``"autotune"`` (default
+            ``True``) benchmarks candidate fused-kernel configurations; cuDNN accepts the
+            option but uses its fixed schedule.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
         per logical sequence or ``None``.
     """
-    autotune = should_autotune(autotune)
     selected_impl = resolve_impl(impl)
     options = resolve_kernel_options(kernel_options)
+    autotune = should_autotune(options.autotune)
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
     validate_kda_inputs(
@@ -206,7 +206,6 @@ def paged_chunk_kda(
     *,
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
     kernel_options: KernelOptions | None = None,
     replay_state: ReplayState | None = None,
 ) -> torch.Tensor:
@@ -235,12 +234,12 @@ def paged_chunk_kda(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
-        autotune: For the repo-local fused backend, benchmark candidate kernel
-            configurations when true; cuDNN uses its fixed schedule.
         kernel_options: Backend-specific options. ``{"backend": "cudnn"}`` selects
             the optional CuTeDSL 4.7 cuDNN backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
-            applies to the fused backend as in ``chunk_kda``.
+            applies to the fused backend as in ``chunk_kda``. ``"autotune"`` (default
+            ``True``) benchmarks candidate configurations of the repo-local fused kernels;
+            cuDNN uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five
             token caches have shape ``[num_slots, 64, ...]``; every count must remain in
@@ -264,7 +263,6 @@ def paged_chunk_kda(
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
-    autotune = should_autotune(autotune)
     validate_kda_inputs(
         q,
         k,
@@ -362,7 +360,7 @@ def paged_chunk_kda(
         state_indices,
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
-        autotune=autotune,
+        autotune=should_autotune(options.autotune),
         schedule=options.schedule,
         replay_state=replay_state,
     )
@@ -381,7 +379,6 @@ def recurrent_kda(
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: RecurrentKernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -426,17 +423,16 @@ def recurrent_kda(
                 seq 3 is padding bc 0
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore stale contents in the selected slot and start from zero.
-        autotune: Benchmark candidate value-tile sizes for non-paged execution
-            when true; winners are cached and reused. Paged execution and false
-            launch a heuristic config, so results are reproducible across processes
-            and autotune cache states. That config still follows the batch shape;
-            see ``kernel_options`` for batch invariance.
         impl: ``"fused"`` uses the inference-only optimized scan; ``"reference"``
             uses differentiable eager PyTorch in FP32, with no automatic
             fallback.
         kernel_options: Fused-scan options, see
-            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``{"batch_invariant": True}``
-            makes a sequence's bits independent of the rest of the batch.
+            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``"autotune"`` (default
+            ``True``) benchmarks candidate value-tile sizes for non-paged execution;
+            winners are cached and reused. Paged execution and ``False`` launch a heuristic
+            config, so results are reproducible across processes and autotune cache states.
+            That config still follows the batch shape: ``{"batch_invariant": True}`` makes
+            a sequence's bits independent of the rest of the batch.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -446,9 +442,8 @@ def recurrent_kda(
     sequences and final states are written out of place, decode preprocessing and scan are
     separate launches, and speculative-decoding rollback is unsupported.
     """
-    autotune = should_autotune(autotune)
     selected_impl = resolve_impl(impl)
-    batch_invariant = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_kda")
+    options = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_kda")
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
@@ -489,8 +484,8 @@ def recurrent_kda(
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            autotune=autotune,
-            batch_invariant=batch_invariant,
+            autotune=should_autotune(options.autotune),
+            batch_invariant=options.batch_invariant,
         )
     return reference_delta_rule(
         naive_recurrent_kda,

@@ -3,15 +3,17 @@
 import pytest
 import torch
 
-from attn_gym.linear import chunk_kda
+from attn_gym.linear import KernelOptions, chunk_kda
 from attn_gym.testing.kda import make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-def _forward(**options: bool) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+def _forward(
+    kernel_options: KernelOptions | None = None,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     inputs = make_kda_test_inputs(192, heads=2, sigmoid_beta=True, requires_grad=True)
-    output, _ = chunk_kda(*inputs, **options)
+    output, _ = chunk_kda(*inputs, kernel_options=kernel_options)
     return output, inputs
 
 
@@ -20,7 +22,7 @@ def _gradients(output: torch.Tensor, inputs: tuple[torch.Tensor, ...]) -> tuple[
 
 
 def test_deterministic_mode_gives_the_bits_of_autotune_false(no_benchmarking, request):
-    pinned_output, pinned_inputs = _forward(autotune=False)
+    pinned_output, pinned_inputs = _forward({"autotune": False})
     pinned_gradients = _gradients(pinned_output, pinned_inputs)
     request.getfixturevalue("deterministic_algorithms")
     output, inputs = _forward()

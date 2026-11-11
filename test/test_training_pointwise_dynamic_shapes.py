@@ -65,7 +65,7 @@ def run_operation(
     """Run one operation; l2norm pins its backward schedule unless ``autotune`` is set, which
     separates backend reuse from the row-bucket autotuning policy."""
     if kind == "l2norm":
-        return l2norm(inputs[0], cu_seqlens=metadata, autotune=autotune)
+        return l2norm(inputs[0], cu_seqlens=metadata, kernel_options={"autotune": autotune})
     assert not _softplus_uses_cute(inputs[0])
     return gate_transform(*inputs, kind="softplus")
 

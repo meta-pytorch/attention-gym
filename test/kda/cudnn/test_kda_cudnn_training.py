@@ -1105,7 +1105,7 @@ def test_cudnn_packed_tail_isolated_from_next_sequence() -> None:
         value[:, :1],
         gate[:, :1],
         beta[:, :1],
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     actual, _ = chunk_kda(
         q,

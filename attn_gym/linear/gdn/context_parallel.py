@@ -19,6 +19,7 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
+from attn_gym.types import TuningOptions
 
 
 def context_parallel_gdn(
@@ -31,16 +32,16 @@ def context_parallel_gdn(
     routing: ContextParallelRouting,
     group: dist.ProcessGroup,
     scale: float | None = None,
-    autotune: bool = True,
+    kernel_options: TuningOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run fused ``chunk_gdn`` over this rank's span with state exchanged by all-gather.
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
-    ``scale`` and ``autotune`` follow ``chunk_gdn``.
+    ``scale`` and the ``"autotune"`` kernel option follow ``chunk_gdn``.
     """
     stages = StagedOp(
-        partial(chunk_gdn_prepare, scale=scale, autotune=autotune),
-        partial(chunk_gdn_prepare_backward, autotune=autotune),
+        partial(chunk_gdn_prepare, scale=scale, kernel_options=kernel_options),
+        partial(chunk_gdn_prepare_backward, kernel_options=kernel_options),
     )
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 

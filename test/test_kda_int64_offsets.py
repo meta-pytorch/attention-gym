@@ -86,7 +86,7 @@ def test_forced_int64_dense_delta_h_fusion_matches_default_path(monkeypatch):
         )
         gate = (-torch.rand(shape, device="cuda") / 16).requires_grad_()
         beta = torch.rand(shape[:3], device="cuda").requires_grad_()
-        output, _ = chunk_kda(q, k, v, gate, beta, autotune=False)
+        output, _ = chunk_kda(q, k, v, gate, beta, kernel_options={"autotune": False})
         gradients = torch.autograd.grad(output.float().square().sum(), (q, k, v, gate, beta))
         return (output, *gradients)
 

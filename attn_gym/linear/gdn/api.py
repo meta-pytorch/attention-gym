@@ -36,7 +36,6 @@ def chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
     output_final_state: bool = False,
-    autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -63,11 +62,6 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        autotune: Benchmark candidate configurations of the repo-local fused kernels when
-            true; winners are cached and reused. When false, and always under
-            ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
-            fixed configurations, so bits repeat across processes and winner-cache states on
-            one GPU model and software stack. The cuDNN backend always uses its fixed schedule.
         impl: ``"fused"`` (default) uses the repo-local scalar chunk pipeline on CUDA
             capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
             ``"reference"`` uses eager PyTorch.
@@ -75,7 +69,12 @@ def chunk_gdn(
             default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
-            for calls without ``initial_state`` or ``output_final_state``.
+            for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
+            (default ``True``) benchmarks candidate configurations of the repo-local fused
+            kernels; winners are cached and reused. When ``False``, and always under
+            ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
+            fixed configurations, so bits repeat across processes and winner-cache states on
+            one GPU model and software stack. The cuDNN backend always uses its fixed schedule.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -111,7 +110,7 @@ def chunk_gdn(
             cu_seqlens=cu_seqlens,
             scale=scale,
             output_final_state=output_final_state,
-            autotune=should_autotune(autotune),
+            autotune=should_autotune(options.autotune),
         )
 
     return reference_delta_rule(
@@ -141,7 +140,6 @@ def paged_chunk_gdn(
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     scale: float | None = None,
-    autotune: bool = True,
     kernel_options: KernelOptions | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
@@ -167,15 +165,14 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        autotune: Benchmark candidate configurations of the repo-local factor and output
-            kernels when true. When false, and always under
-            ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
-            The recurrence that advances ``state_cache`` and the cuDNN backend always use
-            fixed configurations.
         kernel_options: Backend options. The repo-local path is the default;
             ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
             requires 16-byte-aligned pool bases and slot origins. Split schedules are not
-            supported.
+            supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
+            of the repo-local factor and output kernels. When ``False``, and always under
+            ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
+            The recurrence that advances ``state_cache`` and the cuDNN backend always use
+            fixed configurations.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -217,7 +214,7 @@ def paged_chunk_gdn(
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
         scale=scale,
-        autotune=should_autotune(autotune),
+        autotune=should_autotune(options.autotune),
     )
 
 
@@ -234,7 +231,6 @@ def recurrent_gdn(
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: RecurrentKernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -269,22 +265,22 @@ def recurrent_gdn(
         has_initial_state: Optional contiguous boolean mask indicating whether each selected slot
             should be loaded. False entries mark freshly assigned slots whose contents are
             garbage: they start from zero and overwrite the slot, even for empty sequences.
-        autotune: Benchmark candidate value-tile sizes for non-paged execution when true. When
-            false, and always for paged execution (which mutates the state cache), a heuristic
-            picks the config, so results are reproducible across processes and autotune cache
-            states. That config still follows the batch shape; see ``kernel_options`` for batch
-            invariance.
         impl: ``"fused"`` uses the inference-only Triton scan; ``"reference"`` uses eager
             PyTorch with autograd support.
         kernel_options: Fused-scan options, see
-            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``{"batch_invariant": True}``
-            makes a sequence's bits independent of the rest of the batch.
+            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``"autotune"`` (default
+            ``True``) benchmarks candidate value-tile sizes for non-paged execution. When
+            ``False``, and always for paged execution (which mutates the state cache), a
+            heuristic picks the config, so results are reproducible across processes and
+            autotune cache states. That config still follows the batch shape:
+            ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
+            the batch.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    batch_invariant = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_gdn")
+    options = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_gdn")
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
     validate_gdn_inputs(
@@ -321,8 +317,8 @@ def recurrent_gdn(
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            autotune=should_autotune(autotune),
-            batch_invariant=batch_invariant,
+            autotune=should_autotune(options.autotune),
+            batch_invariant=options.batch_invariant,
         )
 
     return reference_delta_rule(

@@ -244,7 +244,7 @@ def test_optimized_chunk_kda_fp16_training_matches_reference(tokens, packed):
         *actual_inputs,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     expected, expected_state = chunk_kda(
         *expected_inputs,
@@ -884,7 +884,7 @@ def test_backward_tuning_reuses_winner_across_packed_document_counts(monkeypatch
     for documents in (1, 2, 16, 37):
         lengths = [100] * (documents - 1) + [tokens - 100 * (documents - 1)]
         cu_seqlens = cumulative_sequence_offsets(lengths)
-        output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens, autotune=True)
+        output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens, kernel_options={"autotune": True})
         torch.autograd.grad(output, inputs, d_output)
         counts.append({config: benchmarked[config] for config in tuned_configs})
 
@@ -1468,8 +1468,7 @@ def test_paged_chunk_kda_replay_prefill_scaling(
         )
         expected, _ = chunk_kda(
             *inputs,
-            autotune=False,
-            kernel_options={"schedule": "static"},
+            kernel_options={"schedule": "static", "autotune": False},
         )
         state_indices = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
         num_slots = num_sequences + 1
@@ -1501,8 +1500,7 @@ def test_paged_chunk_kda_replay_prefill_scaling(
         state_cache,
         state_indices,
         cu_seqlens=cu_seqlens,
-        autotune=False,
-        kernel_options={"schedule": "persistent"},
+        kernel_options={"schedule": "persistent", "autotune": False},
         replay_state=replay_state,
     )
 
@@ -1549,8 +1547,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
         v,
         gate,
         beta,
-        autotune=False,
-        kernel_options={"schedule": "static"},
+        kernel_options={"schedule": "static", "autotune": False},
     )
     state_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
     padding = state_indices <= 0
@@ -1579,8 +1576,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
             state_cache,
             state_indices,
             has_initial_state=padding,
-            autotune=False,
-            kernel_options={"schedule": "static"},
+            kernel_options={"schedule": "static", "autotune": False},
             replay_state=replay_state,
         )
     ]
@@ -1594,8 +1590,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
                 beta[:, position : position + 1],
                 state_cache,
                 state_indices,
-                autotune=False,
-                kernel_options={"schedule": "static"},
+                kernel_options={"schedule": "static", "autotune": False},
                 replay_state=replay_state,
             )
         )
@@ -1615,8 +1610,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
             gate[:, :completed_tokens],
             beta[:, :completed_tokens],
             output_final_state=True,
-            autotune=False,
-            kernel_options={"schedule": "static"},
+            kernel_options={"schedule": "static", "autotune": False},
         )
         assert expected_boundary is not None
         expected_state = expected_boundary[state_indices > 0]
@@ -1676,8 +1670,7 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
             expected_state,
             state_indices[sequence : sequence + 1],
             has_initial_state=initial_flags[sequence : sequence + 1],
-            autotune=False,
-            kernel_options={"schedule": "static"},
+            kernel_options={"schedule": "static", "autotune": False},
             replay_state=expected_replay,
         )
 
@@ -1691,8 +1684,7 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
         state_indices,
         cu_seqlens=cu_seqlens,
         has_initial_state=initial_flags,
-        autotune=False,
-        kernel_options={"schedule": "static"},
+        kernel_options={"schedule": "static", "autotune": False},
         replay_state=replay_state,
     )
 
@@ -1753,8 +1745,7 @@ def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
             state_indices,
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
-            autotune=False,
-            kernel_options={"schedule": "static"},
+            kernel_options={"schedule": "static", "autotune": False},
             replay_state=replay_state,
         )
 
@@ -1853,8 +1844,7 @@ def test_paged_chunk_kda_replay_shapes_reuse_compiled_kernels(
             state_cache,
             torch.arange(1, requests + 1, device="cuda", dtype=torch.int32),
             cu_seqlens=cu_seqlens,
-            autotune=False,
-            kernel_options={"schedule": "static"},
+            kernel_options={"schedule": "static", "autotune": False},
             replay_state=replay_state,
         )
     assert replay_kernels

@@ -154,14 +154,14 @@ def test_public_packed_backward_normalizes_cotangents(layout):
         initial_state,
         cu_seqlens=offsets,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     actual_output, actual_final_state = chunk_kda(
         *actual_inputs,
         actual_state,
         cu_seqlens=offsets,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     assert expected_final_state is not None and actual_final_state is not None
     output_grad = torch.randn_like(expected_output)

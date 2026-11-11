@@ -14,11 +14,12 @@ from attn_gym.linear._delta_rule.validation import (
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_gdn`` backend selection and cuDNN split switches."""
+    """Validated ``chunk_gdn`` backend selection, cuDNN split switches, and tuning request."""
 
     backend: Literal["fused", "cudnn"]
     split_backward: bool
     split_forward: bool
+    autotune: bool = True
 
 
 def resolve_kernel_options(

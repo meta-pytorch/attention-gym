@@ -406,11 +406,13 @@ def test_autotune_matches_reference_and_reuses_winner(
             "scale": 1 / math.sqrt(192),
             "return_aux": AuxRequest(lse=True),
         }
-        out, aux = paged_mla_decode(**inputs, **call, autotune=True)
+        out, aux = paged_mla_decode(**inputs, **call, kernel_options={"autotune": True})
         _fused_reference_check(inputs, call)(out, aux.lse)
     assert len(winners) == 1
     torch.testing.assert_close(
-        paged_mla_decode(**inputs, **{**call, "return_aux": None}, autotune=True),
+        paged_mla_decode(
+            **inputs, **{**call, "return_aux": None}, kernel_options={"autotune": True}
+        ),
         out,
         atol=0,
         rtol=0,
@@ -423,14 +425,16 @@ def test_autotune_matches_reference_and_reuses_winner(
         **{name: inputs[name] for name in ("latent_cache", "rope_cache")},
         cu_seqlens_q=inputs["cu_seqlens_q"][:1],
         **{**call, "return_aux": None},
-        autotune=True,
+        kernel_options={"autotune": True},
     ).shape == (0, num_heads, 512)
     assert len(winners) == 1
 
     # A tuned bucket replays under CUDA graph capture.
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured, captured_aux = paged_mla_decode(**inputs, **call, autotune=True)
+        captured, captured_aux = paged_mla_decode(
+            **inputs, **call, kernel_options={"autotune": True}
+        )
     graph.replay()
     torch.testing.assert_close(captured, out, atol=0, rtol=0)
     torch.testing.assert_close(captured_aux.lse, aux.lse, atol=0, rtol=0)
@@ -439,7 +443,7 @@ def test_autotune_matches_reference_and_reuses_winner(
     # Shorter contexts in the same block table get their own winner.
     short_inputs = {**inputs, "seqused_k": inputs["seqused_k"].clamp(max=64)}
     short_call = {**call, "max_seqlen_k": 64}
-    out, aux = paged_mla_decode(**short_inputs, **short_call, autotune=True)
+    out, aux = paged_mla_decode(**short_inputs, **short_call, kernel_options={"autotune": True})
     _fused_reference_check(short_inputs, short_call)(out, aux.lse)
     assert len(winners) == 2
 
@@ -448,7 +452,11 @@ def test_autotune_matches_reference_and_reuses_winner(
         pytest.raises(RuntimeError, match="during CUDA graph capture"),
         torch.cuda.graph(torch.cuda.CUDAGraph()),
     ):
-        paged_mla_decode(**short_inputs, **{**short_call, "max_seqlen_k": 128}, autotune=True)
+        paged_mla_decode(
+            **short_inputs,
+            **{**short_call, "max_seqlen_k": 128},
+            kernel_options={"autotune": True},
+        )
     assert len(winners) == 2
 
 

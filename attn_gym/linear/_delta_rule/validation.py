@@ -5,9 +5,11 @@ from __future__ import annotations
 import sys
 from collections.abc import Collection, Iterable, Mapping
 from numbers import Real
+from typing import NamedTuple
 
 import torch
 
+from attn_gym._backends.autotune import resolve_autotune
 from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
 
@@ -82,10 +84,10 @@ def resolve_backend_options(
     *,
     op_name: str,
     fields: Collection[str],
-) -> tuple[str, bool, bool]:
-    """Validate the shared chunk ``backend``/``split_*`` options.
+) -> tuple[str, bool, bool, bool]:
+    """Validate the shared chunk ``backend``/``split_*``/``autotune`` options.
 
-    Returns ``(backend, split_backward, split_forward)``; ``fields`` lists every key the
+    Returns ``(backend, split_backward, split_forward, autotune)``; ``fields`` lists every key the
     caller accepts, so family-specific keys are validated by the caller.
     """
     unknown = kernel_options.keys() - fields
@@ -103,23 +105,30 @@ def resolve_backend_options(
         if value and backend != "cudnn":
             raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
         splits.append(value)
-    return backend, *splits
+    return backend, *splits, resolve_autotune(kernel_options)
+
+
+class ResolvedRecurrentKernelOptions(NamedTuple):
+    """Validated recurrent-scan options with their defaults."""
+
+    batch_invariant: bool = False
+    autotune: bool = True
 
 
 def resolve_recurrent_kernel_options(
     kernel_options: Mapping[str, object] | None, *, op_name: str
-) -> bool:
-    """Validate recurrent-scan ``kernel_options``; return ``batch_invariant`` (default False)."""
+) -> ResolvedRecurrentKernelOptions:
+    """Validate recurrent-scan ``kernel_options`` and resolve their defaults."""
     if kernel_options is None:
-        return False
-    unknown = kernel_options.keys() - {"batch_invariant"}
+        return ResolvedRecurrentKernelOptions()
+    unknown = kernel_options.keys() - set(ResolvedRecurrentKernelOptions._fields)
     if unknown:
         names = ", ".join(sorted(unknown))
         raise ValueError(f"unsupported {op_name} kernel options: {names}")
     batch_invariant = kernel_options.get("batch_invariant", False)
     if not isinstance(batch_invariant, bool):
         raise TypeError("kernel_options['batch_invariant'] must be a bool")
-    return batch_invariant
+    return ResolvedRecurrentKernelOptions(batch_invariant, resolve_autotune(kernel_options))
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -240,6 +249,7 @@ def validate_paged_state(
 
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
+    "ResolvedRecurrentKernelOptions",
     "require_inference_only",
     "resolve_backend_options",
     "resolve_decode_out",

@@ -27,11 +27,13 @@ SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_kda`` backend selection, cuDNN switches, and ragged launch schedule."""
+    """Validated ``chunk_kda`` backend selection, cuDNN switches, tuning request, and ragged
+    launch schedule."""
 
     backend: Literal["fused", "cudnn"]
     split_backward: bool
     split_forward: bool
+    autotune: bool = True
     schedule: ScheduleRequest = ScheduleRequest.AUTO
 
 
@@ -41,7 +43,7 @@ def resolve_kernel_options(
     """Validate chunk backend options and resolve their defaults."""
     if kernel_options is None:
         return ResolvedKernelOptions("fused", False, False)
-    backend, split_backward, split_forward = resolve_backend_options(
+    backend, split_backward, split_forward, autotune = resolve_backend_options(
         kernel_options, op_name="chunk_kda", fields=ResolvedKernelOptions._fields
     )
     schedule = kernel_options.get("schedule", "auto")
@@ -49,7 +51,9 @@ def resolve_kernel_options(
         raise ValueError("kernel_options['schedule'] must be 'auto', 'static', or 'persistent'")
     if schedule != "auto" and backend != "fused":
         raise ValueError("schedule requires kernel_options['backend']='fused'")
-    return ResolvedKernelOptions(backend, split_backward, split_forward, ScheduleRequest(schedule))
+    return ResolvedKernelOptions(
+        backend, split_backward, split_forward, autotune, ScheduleRequest(schedule)
+    )
 
 
 def validate_cudnn_fastmath(fastmath: bool) -> None:

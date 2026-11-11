@@ -381,7 +381,7 @@ def test_chunk_state_continues_in_recurrent_decode(head_dim: int):
             beta[:, 64:],
             prefill_state,
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl="fused",
         )
 

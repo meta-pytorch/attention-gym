@@ -114,8 +114,8 @@ def test_recurrent_autotunes_value_tile():
     """Select the only valid candidate for a value dimension below the minimum tile."""
     q, k, v, gate, beta, _ = _inputs(key_dim=7, value_dim=3, seed=2)
 
-    output, _ = recurrent_kda(q, k, v, gate, beta, autotune=True)
-    expected, _ = recurrent_kda(q, k, v, gate, beta, autotune=False)
+    output, _ = recurrent_kda(q, k, v, gate, beta, kernel_options={"autotune": True})
+    expected, _ = recurrent_kda(q, k, v, gate, beta, kernel_options={"autotune": False})
 
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
@@ -132,7 +132,9 @@ def test_recurrent_paged_skips_autotune(monkeypatch):
     from attn_gym.linear._delta_rule import recurrent as delta_rule_recurrent
 
     monkeypatch.setattr(delta_rule_recurrent, "_recurrent_scan", UnexpectedAutotune())
-    recurrent_kda(q, k, v, gate, beta, pool, state_indices=slots, autotune=True)
+    recurrent_kda(
+        q, k, v, gate, beta, pool, state_indices=slots, kernel_options={"autotune": True}
+    )
 
 
 def test_recurrent_packed_capacity_and_empty_slots():
@@ -190,7 +192,7 @@ def test_recurrent_grouped_heads_match_expanded_heads():
     # Fixed heuristics keep both calls on one kernel specialization so equality is exact;
     # HK is an autotune key, so autotuned calls may pick different tiles.
     grouped_output, grouped_state = recurrent_kda(
-        q, k, v, gate, beta, state, output_final_state=True, autotune=False
+        q, k, v, gate, beta, state, output_final_state=True, kernel_options={"autotune": False}
     )
     expanded_output, expanded_state = recurrent_kda(
         q.repeat_interleave(groups, dim=2),
@@ -200,7 +202,7 @@ def test_recurrent_grouped_heads_match_expanded_heads():
         beta,
         state,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
 
     torch.testing.assert_close(grouped_output, expanded_output, rtol=0, atol=0)
@@ -668,7 +670,7 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         state,
         scale=scale,
         output_final_state=output_final_state,
-        autotune=autotune,
+        kernel_options={"autotune": autotune},
     )
     compiled = torch.compile(recurrent_kda, fullgraph=True)
     output, final_state = compiled(
@@ -680,7 +682,7 @@ def test_recurrent_fullgraph_compile(output_final_state: bool, autotune: bool):
         state,
         scale=scale,
         output_final_state=output_final_state,
-        autotune=autotune,
+        kernel_options={"autotune": autotune},
     )
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
     if output_final_state:

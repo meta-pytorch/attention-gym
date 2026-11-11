@@ -39,7 +39,10 @@ when few sequences leave the GPU idle and every head forgets quickly; heads that
 uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan. Pass
 `kernel_options={"batch_invariant": True}` to `recurrent_gdn` or `recurrent_kda` to make a
 sequence's bits independent of the rest of the batch
-(see [Determinism](determinism.md#kda-determinism)).
+(see [Determinism](determinism.md#kda-determinism)). Kernel-specific controls such as these live in
+`kernel_options`, including `{"autotune": False}`, which launches each tuned kernel's pinned
+configuration (see [Autotuned kernels](determinism.md#autotuned-kernels)); options that change the
+math, such as `fastmath`, are keyword arguments.
 
 ```python
 from attn_gym.linear import chunk_gdn

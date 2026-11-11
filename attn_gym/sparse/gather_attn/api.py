@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple, overload
+from typing import Literal, NamedTuple, overload
 
 import torch
 from torch import Tensor
 
 from attn_gym._cu_seqlens import validate_cu_seqlens_pair
-from attn_gym.types import AuxRequest, Impl, resolve_impl
+from attn_gym.types import AuxRequest, Impl, TuningOptions, resolve_impl
 
 from .impl import gather_attn as fused_gather_attn
 from .impl.routing import require_grouped_schedule, uses_grouped_schedule
@@ -21,6 +21,25 @@ class RopePair(NamedTuple):
 
 
 AttentionInput = Tensor | tuple[Tensor, Tensor]
+
+
+class GatherAttnKernelOptions(TuningOptions, total=False):
+    """Fused ``gather_attn`` backend options; nonempty options are invalid with
+    ``Impl.REFERENCE``.
+
+    ``autotune`` applies to the Triton kernels, whose candidates differ in floating-point
+    order. CuTe has one schedule and ignores it.
+    """
+
+    backend: Literal["cute", "triton"]
+    """Override the backend; omit it to prefer eligible CuTe calls, otherwise Triton.
+    Deterministic mode selects Triton automatically. Explicit requests are honored; execution
+    failures are never retried on another backend."""
+
+    bwd_recompute_p: bool
+    """Defaults to ``True``: CuTe backward recomputes attention probabilities. ``False`` saves
+    them in forward instead (BF16, tokens x heads x keys, with backend padding). Triton always
+    recomputes and ignores this option."""
 
 
 def _split_input(value: AttentionInput, name: str) -> tuple[Tensor, Tensor | None]:
@@ -185,7 +204,7 @@ def _validate_inputs(
     validate_cu_seqlens_pair(cu_seqlens, cu_seqlens_k, batch=batch, device=query.device)
 
 
-def _validate_kernel_options(kernel_options: dict[str, str | bool] | None) -> None:
+def _validate_kernel_options(kernel_options: GatherAttnKernelOptions | None) -> None:
     options = kernel_options or {}
     if (
         options.keys() - {"autotune", "backend", "bwd_recompute_p"}
@@ -231,7 +250,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str | bool] | None = None,
+    kernel_options: GatherAttnKernelOptions | None = None,
     scale: float | None = None,
     return_aux: None = ...,
     local_v: Tensor | None = None,
@@ -251,7 +270,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str | bool] | None = None,
+    kernel_options: GatherAttnKernelOptions | None = None,
     scale: float | None = None,
     return_aux: AuxRequest,
     local_v: Tensor | None = None,
@@ -270,7 +289,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str | bool] | None = None,
+    kernel_options: GatherAttnKernelOptions | None = None,
     scale: float | None = None,
     return_aux: AuxRequest | None = None,
     local_v: Tensor | None = None,
@@ -363,11 +382,11 @@ def gather_attn(
         impl: Impl.FUSED (default, or "fused") uses optimized CUDA kernels;
             Impl.REFERENCE (or "reference") uses eager PyTorch on CPU or CUDA.
 
-        kernel_options: Fused backend options. "backend": "cute" or "triton"
-            overrides the backend; omit it to prefer eligible CuTe calls, otherwise
-            Triton. "bwd_recompute_p" (default True): CuTe backward recomputes
-            attention probabilities; False saves them in forward instead (BF16,
-            tokens x heads x keys, with backend padding). Triton always recomputes
+        kernel_options: Fused backend options, see :class:`GatherAttnKernelOptions`.
+            "backend": "cute" or "triton" overrides the backend; omit it to prefer
+            eligible CuTe calls, otherwise Triton. "bwd_recompute_p" (default True):
+            CuTe backward recomputes attention probabilities; False saves them in forward
+            instead (BF16, tokens x heads x keys, with backend padding). Triton always recomputes
             and ignores this option. "autotune" (default True): Triton kernels
             benchmark candidate configurations on first use and reuse the cached
             winner. Candidates differ in floating-point order; False selects each

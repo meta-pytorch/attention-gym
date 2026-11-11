@@ -358,14 +358,14 @@ def test_l2norm_op_registration():
 
 
 def test_l2norm_pinned_backward_skips_autotuning(request):
-    """autotune=False launches the pinned config without benchmarking."""
+    """``"autotune": False`` launches the pinned config without benchmarking."""
     torch.manual_seed(4)
     x = torch.randn(1, 33, 3, 128, device=DEV, dtype=torch.bfloat16, requires_grad=True)
     d_output = torch.randn_like(x)
     expected = torch.autograd.grad(l2norm(x), x, d_output)[0]
 
     request.getfixturevalue("no_benchmarking")
-    actual = torch.autograd.grad(l2norm(x, autotune=False), x, d_output)[0]
+    actual = torch.autograd.grad(l2norm(x, kernel_options={"autotune": False}), x, d_output)[0]
     torch.testing.assert_close(actual, expected)
 
 
@@ -1022,8 +1022,7 @@ def test_output_and_recompute_reuse_tuning_across_token_counts(isolated_winners,
     monkeypatch.setattr(tune_module, "tune", counting_tune)
     H, K = 2, 64  # K=V=64 takes the tuned pointer output kernel on every architecture.
     sweeps_per_shape = []
-    # Chunk counts 5, 6, and 8 share a bucket; 9 starts the next. 384 and 512 are multiples
-    # of 16 and the others are not.
+    # Chunk counts 5, 6, and 8 share a bucket; 9 starts the next.
     for T in (320, 384, 512, 576):
         chunks = T // 64
         q = torch.randn(1, T, H, K, device=DEV, dtype=torch.bfloat16)

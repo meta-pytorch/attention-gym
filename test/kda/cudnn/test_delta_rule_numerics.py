@@ -175,7 +175,7 @@ def test_kda_cudnn_delta_residual_keeps_fp32_precision(dtype: torch.dtype) -> No
     d_output[0, 32, 0, 0] = 64
 
     inputs = (q, k, value, gate, beta)
-    output = chunk_kda(*inputs, scale=1.0, autotune=False, kernel_options=_CUDNN)[0]
+    output = chunk_kda(*inputs, scale=1.0, kernel_options={**_CUDNN, "autotune": False})[0]
     cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
     dq, _, _, _, dbeta = chunk_cudnn_packed_local_bwd_op(*inputs, d_output, cu_seqlens, False, 1.0)
 

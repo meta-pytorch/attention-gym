@@ -513,13 +513,19 @@ def test_backward_from_a_tape_without_factors_matches_saved_factors(packing, dty
         bounds_of((0, 65), (65, 65), (65, 128)) if packing == "packed" else bounds_of((0, 128))
     )
 
-    prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu_seqlens, scale=0.25, autotune=False)
+    prepared = chunk_kda_prepare(
+        *inputs, cu_seqlens=cu_seqlens, scale=0.25, kernel_options={"autotune": False}
+    )
     # A cuDNN forward saves no factors; its backward must match one that did, bit for bit.
     tapes = (prepared.saved, prepared.saved._replace(aqk=None, akk=None))
     results = []
     for saved in tapes:
         backward = chunk_kda_prepare_backward(
-            saved, d_output, state if with_state else None, scale=prepared.scale, autotune=False
+            saved,
+            d_output,
+            state if with_state else None,
+            scale=prepared.scale,
+            kernel_options={"autotune": False},
         )
         results.append((backward.state_grad_summaries(bounds), *backward.run(state)))
     for expected, actual in zip(*results, strict=True):

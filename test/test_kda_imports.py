@@ -144,7 +144,7 @@ def test_chunk_kda_cold_public_fullgraph_compile():
         beta = torch.rand(shape[:3], device='cuda')
 
         compiled = torch.compile(chunk_kda, fullgraph=True)
-        compiled(q, k, v, gate, beta, autotune=False)
+        compiled(q, k, v, gate, beta, kernel_options={"autotune": False})
         torch.cuda.synchronize()
         """
     )

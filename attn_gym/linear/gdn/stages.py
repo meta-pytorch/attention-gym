@@ -20,7 +20,7 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym._backends.autotune import should_autotune
+from attn_gym._backends.autotune import resolve_tuning_options, should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
@@ -42,6 +42,7 @@ from attn_gym.linear.gdn.impl.chunk import (
 )
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
+from attn_gym.types import TuningOptions
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
@@ -126,14 +127,14 @@ def chunk_gdn_prepare(
     *,
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
-    autotune: bool = True,
+    kernel_options: TuningOptions | None = None,
 ) -> ChunkGDNPrepared:
     """Run the factor half of fused ``chunk_gdn`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
-    one packed stream.
+    one packed stream. ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
-    autotune = should_autotune(autotune)
+    autotune = should_autotune(resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare"))
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
@@ -239,15 +240,17 @@ def chunk_gdn_prepare_backward(
     initial_state: torch.Tensor | None,
     *,
     scale: float,
-    autotune: bool = True,
+    kernel_options: TuningOptions | None = None,
 ) -> ChunkGDNBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the forward
-    handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``. ``autotune``
-    follows ``chunk_gdn``.
+    handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
+    ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
-    autotune = should_autotune(autotune)
+    autotune = should_autotune(
+        resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare_backward")
+    )
     metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     scale = float(scale)
     if d_output is None:

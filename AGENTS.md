@@ -102,28 +102,50 @@ performance:
   (`triton.knobs.runtime.jit_post_compile_hook`, `compile_fn.cache_info()`, the tunable winner
   cache). A/B warm performance before keeping or removing a specialization.
 
+## Public Operation Options
+
+Keep the math in keyword arguments and the kernel in `kernel_options`:
+
+- An option that changes what is computed (`scale`, `fastmath`, gate transforms, masks) is a
+  keyword argument, and the reference implementation honors or documents it.
+- An option that only chooses how a fused kernel runs (`backend`, `schedule`, `autotune`,
+  `bwd_recompute_p`, `batch_invariant`) is a key of the operation's typed `kernel_options`
+  dict (`attn_gym/types.py`, `attn_gym/linear/types.py`). New kernel knobs are added there, not
+  as keyword arguments. Unknown keys and wrongly typed values raise; nonempty options with
+  `impl="reference"` raise, except in `paged_mla_decode`, which validates the options but
+  ignores them for reference execution.
+- One option has one spelling across operations. Breaking a public signature to restore that is
+  acceptable; say so in the PR.
+
 ## Tuned Kernels and Reproducibility
 
 Candidates of one kernel usually differ in floating-point order (tile sizes, `num_warps`), so a
 timing-picked winner changes output bits between processes, ranks, and cold winner caches
-(issue #777). Every operation that tunes must also run pinned:
+(issue #777). Every operation that tunes must also run pinned;
+[`docs/developers/tuned-kernels.md`](docs/developers/tuned-kernels.md) records why:
 
 - Tune Triton kernels with `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never
   `triton.autotune`. List the heuristic default first: pinning selects the first candidate
   left by `prune` that the device can run. The tuning `key` must determine what `prune` keeps.
   Tune CuTeDSL kernels with `run_tunable`; pinning selects `default_config`.
-- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. A pinned launch never benchmarks
-  and never reads the winner cache.
-- Tuners do not read deterministic mode. Operations resolve `autotune=`
-  (`kernel_options={"autotune": ...}` for `gather_attn`) with `should_autotune`
-  (`attn_gym/_backends/autotune.py`), then pass the bool through every launch and custom-op
-  schema. Deterministic algorithms disable tuning. Autograd backward resolves the forward's
-  flag again because eager code can change the mode; `gather_attn` resolves inside its CUDA ops.
-- Public `autotune` flags default to `True` except in `paged_mla_decode`. `autotune=False` or
+- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. The recurrent scan instead keeps
+  its host shape heuristic for untuned launches. Neither untuned path benchmarks or reads the
+  winner cache.
+- Tuners do not read deterministic mode. Operations resolve `kernel_options["autotune"]` with
+  `should_autotune` (`attn_gym/_backends/autotune.py`), then pass the bool through every launch
+  and custom-op schema. Deterministic algorithms disable tuning. Autograd backward resolves the
+  forward's flag again because eager code can change the mode; `gather_attn` resolves inside
+  its CUDA ops.
+- `autotune` defaults to `True` except in `paged_mla_decode`. `{"autotune": False}` or
   deterministic mode pins every tuned kernel in forward and backward. State-mutating recurrences
-  cannot be benchmarked safely and stay pinned regardless of the flag; their docstrings state this.
+  cannot be benchmarked safely and stay pinned regardless of the option; their docstrings state
+  this.
+- Migrating a kernel between tuners, or changing its candidates, key, or prune, must leave the
+  pinned result bit-identical (compare against the base commit) and needs a warm before/after
+  latency table for the tuned path.
 - Test both ways to pin with the `no_benchmarking` fixture (`test/conftest.py`): forward and
-  backward must not benchmark under `autotune=False` or deterministic mode with default options.
+  backward must not benchmark under `{"autotune": False}` or deterministic mode with default
+  options.
   Compare bits where schedules match; `test/test_gather_attn_autotune.py` compares forward
   outputs and LSE because deterministic mode changes its backward schedules.
 

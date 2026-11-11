@@ -8,6 +8,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypedDict
 
 
 class Impl(str, Enum):
@@ -24,6 +25,15 @@ def resolve_impl(impl: Impl | str) -> Impl:
     except ValueError:
         valid = ", ".join(repr(member.value) for member in Impl)
         raise ValueError(f"unknown impl {impl!r}; expected one of {valid}") from None
+
+
+class TuningOptions(TypedDict, total=False):
+    """Kernel tuning control shared by public operations that tune."""
+
+    autotune: bool
+    """Benchmark candidate kernel configurations on first use and reuse the cached winner.
+    ``False``, or ``torch.use_deterministic_algorithms(True)``, launches each kernel's pinned
+    configuration instead. See "Autotuned kernels" in ``docs/determinism.md``."""
 
 
 @dataclass(frozen=True, slots=True)

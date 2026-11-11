@@ -6,9 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.autotune import should_autotune
+from attn_gym._backends.autotune import resolve_tuning_options, should_autotune
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import fixed_tree_sum, ptr_offset
+from attn_gym.types import TuningOptions
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
@@ -281,7 +282,7 @@ def l2norm(
     eps: float = 1e-6,
     *,
     cu_seqlens: torch.Tensor | None = None,
-    autotune: bool = True,
+    kernel_options: TuningOptions | None = None,
 ) -> torch.Tensor:
     """Normalize rows, optionally stopping at a packed device endpoint.
 
@@ -289,12 +290,14 @@ def l2norm(
     output and input gradient. Packed callers must hide the inactive suffix from
     later consumers and parameter reductions.
 
-    ``autotune`` benchmarks backward tile configurations when true. False launches one
-    fixed configuration, so the input gradient is reproducible across processes and
-    autotune cache states. The forward never autotunes, and it reduces each row in a fixed
+    ``kernel_options`` is a :class:`attn_gym.types.TuningOptions`: ``"autotune"`` (default
+    ``True``) benchmarks backward tile configurations. ``False`` launches one fixed
+    configuration, so the input gradient is reproducible across processes and autotune cache
+    states. The forward never autotunes, and it reduces each row in a fixed
     order, so a row's output bits do not depend on the token count, head count, or
     ``cu_seqlens`` shape that select its launch config.
     """
+    autotune = resolve_tuning_options(kernel_options, op_name="l2norm")
     if not x.is_cuda:
         raise ValueError("l2norm requires a CUDA tensor")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):

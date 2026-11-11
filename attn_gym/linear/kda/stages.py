@@ -36,7 +36,7 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym._backends.autotune import should_autotune
+from attn_gym._backends.autotune import resolve_tuning_options, should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata, ScheduleRequest
@@ -67,6 +67,7 @@ from attn_gym.linear.kda.validation import (
     validate_kda_inputs,
 )
 from attn_gym.linear.types import KernelOptions
+from attn_gym.types import TuningOptions
 
 
 class ChunkKDASaved(NamedTuple):
@@ -260,7 +261,6 @@ def chunk_kda_prepare(
     *,
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
-    autotune: bool = True,
     fastmath: bool = True,
     kernel_options: KernelOptions | None = None,
 ) -> ChunkKDAPrepared | ChunkKDACudnnPrepared:
@@ -273,9 +273,12 @@ def chunk_kda_prepare(
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
     Pass the same value to ``chunk_kda_prepare_backward``. Native cuDNN requires ``True``.
     ``kernel_options={"backend": "cudnn"}`` runs the local pass and both summaries with cuDNN's
-    kernels. Split schedules are not available with entry states.
+    kernels. Split schedules are not available with entry states. ``"autotune"`` follows
+    ``chunk_kda``.
     """
-    backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
+    backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
+        kernel_options
+    )
     if backend == "cudnn":
         validate_cudnn_fastmath(fastmath)
     if split_backward or split_forward:
@@ -474,9 +477,9 @@ def chunk_kda_prepare_backward(
     initial_state: torch.Tensor | None,
     *,
     scale: float,
-    autotune: bool = True,
     fastmath: bool = True,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    kernel_options: TuningOptions | None = None,
 ) -> ChunkKDABackward | ChunkKDACudnnBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
@@ -493,7 +496,9 @@ def chunk_kda_prepare_backward(
     else:
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
-    autotune = should_autotune(autotune)
+    autotune = should_autotune(
+        resolve_tuning_options(kernel_options, op_name="chunk_kda_prepare_backward")
+    )
     if isinstance(saved, ChunkKDACudnnSaved):
         validate_cudnn_fastmath(fastmath)
         return ChunkKDACudnnBackward(

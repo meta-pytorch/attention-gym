@@ -69,7 +69,7 @@ def _forward(
         impl="fused",
     )
     beta = mask_inactive_tokens(raw_beta.sigmoid(), active)
-    kwargs = {"autotune": False} if variant == "kda" else {}
+    kwargs = {"kernel_options": {"autotune": False}} if variant == "kda" else {}
     output, final_state = (chunk_kda if variant == "kda" else chunk_gdn)(
         q,
         k,
