@@ -82,8 +82,7 @@ The mechanisms choose what completes the handoff:
 
 `Tma` is producer-only. `tx_bytes` is the bytes per stage landing in each destination CTA's
 SMEM, whichever CTA issues the copies. See [multicast](clusters.md#multicast) for
-`Tma(tx_bytes, multicast="n")` and [one CTA loads for others](clusters.md#one-cta-loads-for-others)
-for `Tma(tx_bytes, fills="pair")`.
+`Tma(tx_bytes, multicast="n")`.
 
 A single-mechanism TMA or UMMA side binds to one single-warp role: one active instance per
 epoch for round-robin, or one owner per epoch for [exclusive consumers](#exclusive-consumers).
@@ -142,6 +141,11 @@ for i in cutlass.range(n_blocks - 1, unroll=1):
 - Close each handle exactly once, in the dynamic loop/branch region that opened it.
   Missing, double or cross-region closes raise `ProtocolError` with source locations.
   A [span](#spans) holds a stage from a loop's first iteration to its last.
+- Do not wait for a stage you still hold. An acquire, wait, `peek()` or span `begin()` a ring
+  lap or more past a handle of the same end (one epoch on a `Slots` slot) never returns; the
+  handle's close raises. A span is held from `span()` to its signal. Steps on a later loop trip
+  are not counted. Closes that may hand the stage back earlier pass: `signal=False`, a `Tma`
+  commit and `external=` sides.
 - Return the updated endpoint, not handles, at role exit.
 - `h.retire()` closes a final unused producer acquire without publication; no consumer may
   need it. Automatically tailed pair channels reject it.
@@ -333,7 +337,7 @@ as does an explicit `release_fence=`. Declare `release_fence=()` only if the thr
 generic access to what the producer fills; the alias diagnostic checks each handle against its
 own role's mechanism and fences.
 
-This requires a CTA-local mbarrier `JOIN` side, with no multicast or `fills`.
+This requires a CTA-local mbarrier `JOIN` side, with no multicast.
 Round-robin, exclusive and named channels reject a dict. Each `Umma` role must have one
 single-warp instance. Producers take one mechanism.
 

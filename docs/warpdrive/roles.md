@@ -195,9 +195,8 @@ fits 65536, it exceeds the launch's starting pool and its increase would wait fo
 |---|---|
 | `"all"` (default) | Every CTA |
 | `"leader"` | Rank 0 of each MMA pair in the [cluster](clusters.md) |
-| `"rank0"` | Once per cluster, on cluster rank 0 |
 
-All three are equivalent for one CTA. Without MMA pairs, every CTA is a leader.
+Both are equivalent for one CTA. Without MMA pairs, every CTA is a leader.
 
 Call `begin_roles()` and `run_roles()` in converged CTA/cluster code with the declared launch
 shape. One lane of warp 0 initializes each managed mbarrier; the common initialization
@@ -271,7 +270,7 @@ def compile_kernel(op: MyKernel):
 `op.__cute_cache_key__()` includes:
 
 - The constructor call, with defaults filled in and its arguments copied/frozen for the key.
-- Cluster and each work stream's schedule, mapping, readiness, recording and scheduler warp.
+- Cluster and each work stream's schedule, mapping, readiness and scheduler warp.
 - The trace settings that change the code (`enable_trace`'s backend, and its `waits` and
   `events_per_role` where they apply), `trace_protocol`, `alias_check`, and resolved roles.
 - Source of the modules defining the kernel, cluster and stream-component classes, including

@@ -39,8 +39,8 @@ from attn_gym.warpdrive.channels import (
 from attn_gym.warpdrive.cluster import (
     ALL,
     LEADER,
-    PLACEMENTS,
     RANK0,
+    ROLE_PLACEMENTS,
     Cluster,
     SingleCta,
     apply_overrides,
@@ -287,6 +287,7 @@ class RoleInstance:
     params: list
     uses_tmem: bool = False
     # "all": every CTA of the cluster; "leader": the leader of each MMA pair; "rank0": rank 0
+    # (the broadcast scheduler only)
     cta: str = ALL
     raw: bool = False  # dispatched without ends, protocol log, or trace checks
     keyword_only: frozenset[str] = frozenset()
@@ -315,8 +316,8 @@ class RoleConfig:
     raw: bool = False
 
     def __post_init__(self):
-        if self.cta not in PLACEMENTS:
-            raise ValueError(f"role cta must be one of {PLACEMENTS}, got {self.cta!r}")
+        if self.cta not in ROLE_PLACEMENTS:
+            raise ValueError(f"role cta must be one of {ROLE_PLACEMENTS}, got {self.cta!r}")
         if self.regs is not None and (
             type(self.regs) is not int or not MIN_REGS <= self.regs <= 256 or self.regs % 8 != 0
         ):
@@ -364,7 +365,7 @@ def role(
 
     A list of warp ranges instantiates the method once per range; an ``Instance`` parameter
     receives the index. ``cta="leader"`` runs the role only in each MMA pair's leader (every CTA
-    without pairs), ``cta="rank0"`` only in cluster rank 0; ``"all"`` is the default.
+    without pairs); ``"all"`` is the default.
     ``raw=True`` roles take ``Instance``, ``Local``, ``Tmem``, ``Barriers`` and a context, but no
     managed channel ends or work cursors; they still take part in register allocation and TMEM
     teardown.
@@ -768,29 +769,9 @@ class WarpSpecialized(metaclass=_KernelType):
         if cluster.size > 1:
             for name, ch in chans.items():
                 for side, bound in (("producer", ch.producers), ("consumer", ch.consumers)):
-                    commits = [ri for ri, _ in bound if ch.mechanism(side, ri.role) is Umma]
-                    if not commits:
-                        continue
-                    # A CTA's data is read or written by its pair leader's MMAs (its own without
-                    # pairs), so every leader the other side needs must commit. Without pairs, a
-                    # consumer commit that only releases other CTAs' stages is allowed.
-                    if side == "consumer" and not cluster.pair:
-                        served = set()
-                    else:
-                        other = ch.consumers if side == "producer" else ch.producers
-                        served = {
-                            cluster.group(c)[0] for ri, _ in other for c in cluster.ctas(ri.cta)
-                        }
-                    for ri in commits:
-                        ctas = set(cluster.ctas(ri.cta))
-                        if ctas <= leaders and not served <= ctas:
-                            raise ProtocolError(
-                                f"role {ri.name} signals channel {name} ({side} side) with "
-                                f"tcgen05.commit from CTAs {sorted(ctas)}, but the other side "
-                                f"needs the MMAs of CTAs {sorted(served)} (pair leaders); each "
-                                "needs its own commit: use cta='leader'"
-                            )
-                        if cluster.pair and not ctas <= leaders:
+                    for ri, _ in bound:
+                        commits = ch.mechanism(side, ri.role) is Umma
+                        if commits and cluster.pair and not set(cluster.ctas(ri.cta)) <= leaders:
                             raise ProtocolError(
                                 f"role {ri.name} signals channel {name} ({side} side) with "
                                 f"tcgen05.commit, so it issues the MMAs; in a "
@@ -1003,7 +984,7 @@ class WarpSpecialized(metaclass=_KernelType):
         return (
             self._ws_init_key,
             self.cluster,
-            tuple((s.schedule, s.mapping, s.ready, s.record, s.scheduler_warp) for s in streams),
+            tuple((s.schedule, s.mapping, s.ready, s.scheduler_warp) for s in streams),
             (self.alias_check, self.trace_protocol, self._trace_settings()),
             self.role_config_key(),
             tuple((m, module_source_digest(m)) for m in modules),
@@ -1898,7 +1879,6 @@ class WarpSpecialized(metaclass=_KernelType):
                         end,
                         trace,
                         scheduler=ann is _SchedulerCursor,
-                        slot=(st.roles.index(r.name), r.first_warp),
                     )
                 )
             elif ann is _SchedulerFetch:

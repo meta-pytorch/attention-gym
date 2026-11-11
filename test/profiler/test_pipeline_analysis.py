@@ -8,7 +8,6 @@ import itertools
 import json
 import pkgutil
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -16,51 +15,22 @@ pytest.importorskip("cutlass")  # attn_gym.warpdrive.profiler imports CuTeDSL
 from perfetto.protos.perfetto.trace.perfetto_trace_pb2 import Trace, TrackEvent
 
 import attn_gym.warpdrive.profiler.pipeline as pipeline_package
-import attn_gym.warpdrive.profiler.pipeline.annotations as pipeline_annotations
 from attn_gym.testing.perfetto_trace import read_slices
 from attn_gym.warpdrive.profiler import parse_iket
 from attn_gym.warpdrive.profiler.pipeline import (
     Dependency,
     MeasuredCapture,
     MeasuredRegion,
-    PipelineAnnotations,
     PipelinePlan,
     Region,
     Resource,
     Role,
     analyze_pipeline,
-    extract_plan,
     join,
     report,
     write_pipeline_perfetto,
 )
 from attn_gym.warpdrive.profiler.pipeline.analysis import ring_occupancy_samples
-
-ANNOTATED_SOURCE = """
-PIPELINE = PipelineAnnotations("demo", iteration_name="chunk")
-PIPELINE.resource(
-    "x", label="X ring", depth=1
-)
-PIPELINE.resource(
-    "state", label="State", depth=1, kind="state"
-)
-
-class Kernel:
-    @PIPELINE.role("load", label="Load", warp_start=0, warp_end=1)
-    def run_load(self):
-        PIPELINE.region(
-            "load.x", label="Load X", weight=1, produces=("x",)
-        )
-        PIPELINE.iteration_end()
-
-    @PIPELINE.role("compute", label="Compute", warp_start=1, warp_end=2)
-    def run_compute(self):
-        PIPELINE.region(
-            "compute.x", label="Consume X", weight=3,
-            consumes=("x", "state"), produces=("state@1",), releases=("x",)
-        )
-        PIPELINE.iteration_end()
-"""
 
 
 def toy_plan() -> PipelinePlan:
@@ -114,33 +84,6 @@ def capture(duration_ns: int, regions) -> MeasuredCapture:
         duration_ns,
         tuple(MeasuredRegion(n, n, i, s, e, float(e - s), 1) for n, i, s, e in regions),
     )
-
-
-def test_annotations_extract_data_state_and_reuse(tmp_path: Path) -> None:
-    source = tmp_path / "annotated.py"
-    source.write_text(ANNOTATED_SOURCE)
-
-    plan = extract_plan(source)
-
-    assert list(plan.roles) == ["load", "compute"]
-    assert {(edge.resource, edge.kind, edge.distance) for edge in plan.dependencies} == {
-        ("x", "data", 0),
-        ("state", "state", 1),
-        ("x", "reuse", 1),
-    }
-    assert plan.schedule(iterations=3).logical_duration > 0
-
-
-def test_runtime_annotations_are_noops_until_iket_is_enabled() -> None:
-    annotations = PipelineAnnotations("test", iteration_name="tile")
-
-    @annotations.role("load", label="Load", warp_start=0, warp_end=1)
-    def body(value: int) -> int:
-        annotations.region("work", label="Work", weight=1)
-        return value + 1
-
-    assert body(2) == 3
-    assert annotations.resource("x", label="X", depth=1) is None
 
 
 def test_scheduler_rejects_same_iteration_cycle() -> None:
@@ -410,100 +353,6 @@ def test_perfetto_zero_duration_slice_begins_before_it_ends(tmp_path: Path) -> N
     ]
 
 
-INDEXED_SOURCE = """
-PIPELINE = PipelineAnnotations("indexed", iteration_name="chunk")
-PIPELINE.resource("x_0", label="X hi", depth=1)
-PIPELINE.resource("x_1", label="X lo", depth=1)
-PIPELINE.resource("acc", label="Acc", depth=1)
-
-class Kernel:
-    @PIPELINE.role("state", label="State", warp_start=0, warp_end=4)
-    def run_state(self):
-        PIPELINE.region(
-            "state.split", label="Split", weight=2,
-            produces=("x_0", "x_1"),
-        )
-        PIPELINE.region(
-            "state.wait", label="Wait", weight=1,
-            consumes=("acc",), releases=("acc",),
-        )
-        PIPELINE.iteration_end()
-
-    @PIPELINE.role("mma", label="MMA", warp_start=4, warp_end=5)
-    def run_mma(self):
-        for split in cutlass.range_constexpr(2):
-            PIPELINE.region(
-                "mma.pass", label="Pass", weight=2,
-                consumes=("x_{index}",), releases=("x_{index}",), produces=("acc",),
-                count=2, index=split,
-            )
-        PIPELINE.iteration_end()
-"""
-
-
-def test_indexed_regions_expand_with_per_copy_tokens(tmp_path: Path) -> None:
-    source = tmp_path / "indexed.py"
-    source.write_text(INDEXED_SOURCE)
-
-    plan = extract_plan(source)
-
-    assert [region.name for region in plan.regions.values() if region.role == "mma"] == [
-        "mma.pass[0]",
-        "mma.pass[1]",
-    ]
-    edges = {(edge.source, edge.target, edge.resource, edge.kind) for edge in plan.dependencies}
-    assert ("state.split", "mma.pass[0]", "x_0", "data") in edges
-    assert ("state.split", "mma.pass[1]", "x_1", "data") in edges
-    # Plain produces attach to the last copy only.
-    assert ("mma.pass[1]", "state.wait", "acc", "data") in edges
-    assert not any(
-        edge.source == "mma.pass[0]" and edge.resource == "acc" for edge in plan.dependencies
-    )
-    assert plan.schedule(iterations=2).logical_duration > 0
-
-
-@pytest.mark.parametrize(
-    "source, old, new, match",
-    [
-        (
-            ANNOTATED_SOURCE,
-            'label="Load", warp_start',
-            'label="Load", color="#00f", warp_start',
-            r"Unknown role\(\) keyword 'color'",
-        ),
-        (INDEXED_SOURCE, "count=2, index=split,", "count=2,", "count>1 and index"),
-    ],
-    ids=["unknown_keyword", "count_without_index"],
-)
-def test_extractor_rejects_what_the_markers_reject(tmp_path: Path, source, old, new, match):
-    path = tmp_path / "annotated.py"
-    path.write_text(source.replace(old, new))
-    with pytest.raises(ValueError, match=match):
-        extract_plan(path)
-
-
-def test_runtime_indexed_region_names_and_rejects_dynamic_index(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    annotations = PipelineAnnotations("test", iteration_name="tile")
-    annotations.enable_iket()
-    pushed: list[str] = []
-    fake_iket = SimpleNamespace(range_push=pushed.append, range_pop=lambda: None)
-    monkeypatch.setattr(pipeline_annotations, "iket", fake_iket)
-
-    @annotations.role("mma", label="MMA", warp_start=0, warp_end=1)
-    def body(index) -> None:
-        annotations.region("pass", label="Pass", weight=1, count=2, index=index)
-        annotations.iteration_end()
-
-    body(1)
-    assert pushed == ["pass[1]"]
-    with pytest.raises(TypeError, match="compile-time int"):
-        body(SimpleNamespace())
-    with pytest.raises(ValueError, match="outside count"):
-        body(2)
-
-
 def test_report_lists_regions_and_scheduler_findings() -> None:
     timeline = toy_plan().schedule(iterations=4)
     measured = logical_capture(timeline)
@@ -530,33 +379,3 @@ def test_pipeline_report_is_the_function_after_importing_every_submodule() -> No
         n for n in pipeline_package.__all__ if inspect.ismodule(getattr(pipeline_package, n))
     ]
     assert shadowed == []
-
-
-def test_capture_cli_reanalyzes_an_existing_trace(tmp_path: Path, capsys) -> None:
-    from attn_gym.warpdrive.profiler.pipeline.capture import main
-
-    source = tmp_path / "annotated.py"
-    source.write_text(ANNOTATED_SOURCE)
-    timeline = extract_plan(source).schedule(iterations=3)
-    trace = logical_iket(tmp_path / "iket.trace.json", timeline)
-
-    rc = main(
-        [
-            "--tag",
-            "demo.v1",
-            "--annotated",
-            str(source),
-            "--iterations",
-            "3",
-            "--out",
-            str(tmp_path / "traces"),
-            "--from-trace",
-            str(trace),
-        ]
-    )
-
-    assert rc == 0
-    # A dotted tag keeps its dot: demo.v1.report.txt, not demo.report.txt.
-    assert (tmp_path / "traces" / "demo.v1.enriched.pftrace").exists()
-    assert "RecMII" in (tmp_path / "traces" / "demo.v1.report.txt").read_text()
-    assert "iteration 1 timeline" in capsys.readouterr().out

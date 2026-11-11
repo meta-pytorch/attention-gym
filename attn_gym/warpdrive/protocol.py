@@ -309,7 +309,7 @@ class RoleTrace:
     def where(self) -> tuple:
         """The enclosing dynamic regions of the current insertion point, outermost first."""
         out = []
-        for block in reversed(_ancestors(current_block(), self.root)[:-1]):
+        for block in reversed(self.blocks()[:-1]):
             entry = next((e for e in self._blocks if e[0] == block), None)
             if entry is None:
                 entry = (block, len(self._blocks), _region_kind(block))
@@ -339,6 +339,10 @@ class RoleTrace:
         opt.suppressed.append(what)
         return True
 
+    def blocks(self) -> list:
+        """The current block and its enclosing blocks up to the role body, innermost first."""
+        return _ancestors(current_block(), self.root)
+
     def depth(self) -> int:
         block = current_block()
         try:
@@ -349,7 +353,7 @@ class RoleTrace:
 
     def record(self, chan, op, slot, count: int | None = 1, order: int | None = None):
         # Capture ancestors while live; dereferencing an erased region later crashes.
-        self.ops.append((chan, op, _ancestors(current_block(), self.root), count, order))
+        self.ops.append((chan, op, self.blocks(), count, order))
         if self.log is not None:
             logged = op if count == 1 else f"{op} {'n' if count is None else count}"
             self.log.record(self.role_name, chan, logged, slot, self.depth(), user_site())

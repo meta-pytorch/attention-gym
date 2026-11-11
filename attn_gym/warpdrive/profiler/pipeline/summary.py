@@ -13,10 +13,6 @@ from attn_gym.warpdrive.profiler.pipeline.analysis import PipelineAnalysis
 from attn_gym.warpdrive.profiler.pipeline.measure import MeasuredCapture
 from attn_gym.warpdrive.profiler.pipeline.plan import Timeline
 
-# Approximate cost of one IKET range push/pop pair on the issuing warp (GB200, CuTeDSL 4.7).
-# Regions shorter than twice this are dominated by instrumentation.
-IKET_RANGE_OVERHEAD_NS = 50
-
 
 def steady_iterations(iterations: int) -> range:
     """Return the interior iterations, without pipeline fill and drain (all if under 3)."""
@@ -35,8 +31,8 @@ def report(
 ) -> str:
     """Render per-region medians, one steady-state iteration, and scheduler findings.
 
-    ``range_overhead_ns``: the recorder's cost per range (``IKET_RANGE_OVERHEAD_NS`` for
-    IKET); regions shorter than twice it are flagged as dominated by instrumentation.
+    ``range_overhead_ns`` is an optional caller-measured recorder cost per range. Regions
+    shorter than twice it are flagged as dominated by instrumentation; None skips calibration.
     RecMII and ResMII are in the plan's logical weight units, not nanoseconds.
     """
     iterations = timeline.iterations

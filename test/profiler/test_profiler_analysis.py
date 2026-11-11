@@ -246,45 +246,25 @@ def test_join_treats_compact_ranges_as_one_recorder_per_role():
 PROFILER = Path(__file__).resolve().parents[2] / "attn_gym" / "warpdrive" / "profiler"
 
 
-@pytest.mark.parametrize(
-    "kernel_module, recorder",
-    [
-        ("tracing.py", "ops.py"),
-        ("profiler/pipeline/annotations.py", "pipeline/annotations.py"),
-    ],
-)
-def test_recording_kernels_key_only_the_profilers_device_code(kernel_module, recorder):
+def test_recording_kernels_key_only_the_profilers_device_code():
     """Recording ranges must key only the profiler's device code.
 
     The compile key follows imports, but decoding, analysis, and plans do not affect codegen.
     """
-    closure = module_closure(PROFILER.parent / kernel_module)
+    closure = module_closure(PROFILER.parent / "tracing.py")
     assert {
         path.relative_to(PROFILER).as_posix() for path in closure if path.is_relative_to(PROFILER)
-    } == {recorder}
+    } == {"ops.py"}
 
 
-@pytest.mark.parametrize(
-    "statement, keyed",
-    [
-        (
-            "from attn_gym.warpdrive.profiler import compact_profile_region",
-            {"__init__.py", "ops.py"},
-        ),
-        (
-            "from attn_gym.warpdrive.profiler.pipeline import PipelineAnnotations",
-            {"pipeline/__init__.py", "pipeline/annotations.py"},
-        ),
-    ],
-)
-def test_package_imports_of_device_code_key_no_host_code(tmp_path, statement, keyed):
+def test_package_imports_of_device_code_key_no_host_code(tmp_path):
     """A recorder imported through its package keys the package and device module.
 
     Lazily exported host modules stay out of the key.
     """
     kernel = tmp_path / "kernel.py"
-    kernel.write_text(statement + "\n")
+    kernel.write_text("from attn_gym.warpdrive.profiler import compact_profile_region\n")
     closure = module_closure(kernel)
     assert {
         path.relative_to(PROFILER).as_posix() for path in closure if path.is_relative_to(PROFILER)
-    } == keyed
+    } == {"__init__.py", "ops.py"}
