@@ -1279,10 +1279,7 @@ class WarpSpecialized(metaclass=_KernelType):
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
         self._ws_bars = {name: bars + off for name, off, _ in plan}
-        self._ws_bar_counts = [
-            [c for _, _, counts in plan for c in counts[rank]] for rank in range(self.cluster.size)
-        ]
-        self._init_barriers(bars)
+        self._init_barriers(bars, self._barrier_init_runs(plan))
         self._ws_trace_starts = None
         if self.trace_backend == "globaltimer":  # start times of open ranges, per role
             depth = tracing.MAX_DEPTH
@@ -1341,17 +1338,14 @@ class WarpSpecialized(metaclass=_KernelType):
 
     def _allocate_plan(self, smem, layouts: dict):
         """Allocate every ``smem_plan`` buffer and check each channel binding's stage count."""
-        plan = self.smem_plan
-        names = set() if plan is None else set(plan.buffers)
-        if set(layouts) != names:
+        buffers = {} if self.smem_plan is None else self.smem_plan.buffers
+        if set(layouts) != set(buffers):
             raise ProtocolError(
                 f"begin_roles(layouts=...) needs a layout for each smem_plan buffer "
-                f"{sorted(names)}, got {sorted(layouts)}"
+                f"{sorted(buffers)}, got {sorted(layouts)}"
             )
         self._ws_smem = {}
-        if plan is None:
-            return
-        for buf in plan.buffers.values():
+        for buf in buffers.values():
             self._ws_smem[buf.name] = allocate(smem, buf, layouts[buf.name], self._ws_smem)
         for name, ch in self._ws_chans.items():
             if not ch.buffers:
@@ -1379,10 +1373,12 @@ class WarpSpecialized(metaclass=_KernelType):
             )
         return self._ws_smem[name].tensor
 
-    def _barrier_init_runs(self) -> list[tuple[int, int, dict[int, int]]]:
-        """Runs of contiguous barriers with equal per-rank counts, at most ``WARP_SIZE`` long:
-        one barrier per warp-0 lane."""
-        per_rank = self._ws_bar_counts
+    def _barrier_init_runs(self, plan: list) -> list[tuple[int, int, dict[int, int]]]:
+        """Runs of contiguous barriers from ``_barrier_plan`` with equal per-rank counts, at most
+        ``WARP_SIZE`` long: one barrier per warp-0 lane."""
+        per_rank = [
+            [c for _, _, counts in plan for c in counts[rank]] for rank in range(self.cluster.size)
+        ]
         runs = []
         offset = 0
         while offset < len(per_rank[0]):
@@ -1400,8 +1396,7 @@ class WarpSpecialized(metaclass=_KernelType):
         return runs
 
     @cute.jit
-    def _init_barriers(self, bars):
-        runs = self._barrier_init_runs()
+    def _init_barriers(self, bars, runs):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             rank = self.cluster.rank()
