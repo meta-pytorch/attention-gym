@@ -862,6 +862,8 @@ class Handle(_Stage):
             raise ProtocolError("commit(wait=True) signals the full barrier; drop signal=False")
         self._close(True, "commit" if signal else "commit(raw signal)")
         if wait:
+            trace = self._end._trace
+            trace.record(self._end._chan.name, "rendezvous", self._label, order=self.rec.order)
             _fence(self._end._chan.commit_fence)
             self._end._named_wait(self._end._chan.full_barriers, self.index, "commit")
         elif signal:
@@ -1344,6 +1346,7 @@ class _End:
                 f"{self._trace.role_name}: {self._chan.name} is a named-barrier channel and has no "
                 f"mbarriers ({what}); its barriers are channel.full_barriers/empty_barriers"
             )
+        self._trace.record(self._chan.name, "barrier pointer", None)
 
     @staticmethod
     def _named(barriers, index):
@@ -1440,8 +1443,8 @@ class _End:
     def _raw_state_access(self):
         self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
         self._rec.lineage.advanced(self._copy)
-        if self._chan.owned_epochs:  # raw code may advance it: the epoch sequence is unknown
-            self._trace.record(self._chan.name, "state", None)
+        # Raw code may advance it: the end's epochs are unknown from here on.
+        self._trace.record(self._chan.name, "state", None)
 
     @property
     def index(self):
@@ -1728,7 +1731,7 @@ class _End:
                 "when it acquires); use an ordinary handle"
             )
         index, phase, label = self._next(slot, op)
-        self._trace.record(chan.name, op, label)
+        self._trace.record(chan.name, op, label, order=self._rec.taken(slot) - 1, span=True)
         return Span(self, index, phase, label, producer)
 
     def _take(self, slot, token, op: str):
@@ -1740,7 +1743,7 @@ class _End:
         self._check_hold(slot, op)
         index, phase, label = self._next(slot, op)
         chan, producer = self._chan, isinstance(self, ProducerEnd)
-        self._trace.record(chan.name, op, label)
+        self._trace.record(chan.name, op, label, order=self._rec.taken(slot) - 1)
         if chan.named:
             self._check_turn("producer" if producer else "consumer", op)
             self._named_wait(chan.empty_barriers if producer else chan.full_barriers, index, op)

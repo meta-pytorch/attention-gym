@@ -66,7 +66,10 @@ def record_arch_calls(monkeypatch, labels: dict[str, str]) -> list[str]:
 
 
 class Model(WarpSpecialized):
-    """Roles loop ``n`` times; ``layouts()`` gives the SMEM plan's layouts, if any."""
+    """Roles loop ``n`` times; ``layouts()`` gives the SMEM plan's layouts, if any. The models
+    are access orderings, not complete protocols, so their epochs need not balance."""
+
+    liveness_check = "off"
 
     def layouts(self):
         return {}

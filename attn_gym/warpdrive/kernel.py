@@ -17,7 +17,8 @@ import cutlass
 from cutlass import Int32, Uint32, cute, pipeline
 from cutlass._mlir.dialects import llvm
 
-from attn_gym.warpdrive import alias, fences, tracing
+from attn_gym.warpdrive import alias, fences, liveness, tracing
+from attn_gym.warpdrive.alias import RoleEvents
 from attn_gym.warpdrive.cache._key import canonical_key, module_source_digest
 from attn_gym.warpdrive.channels import (
     SIDES,
@@ -59,6 +60,7 @@ from attn_gym.warpdrive.protocol import (
     current_trace,
     take_opt_outs,
     tracing_role,
+    user_site,
 )
 from attn_gym.warpdrive.scheduling import (
     WorkCursor,
@@ -392,6 +394,7 @@ def role(
 # log); the rest are read at trace time.
 _HOST_SETTINGS = (
     "alias_check",
+    "liveness_check",
     "trace_protocol",
     "trace_backend",
     "trace_waits",
@@ -468,6 +471,7 @@ class WarpSpecialized(metaclass=_KernelType):
     # warning on findings), "strict" (raise on a potential hazard or missing fence), or "off".
     # Host-only: it never changes generated code.
     alias_check: str = "warn"
+    liveness_check: str = "strict"
     trace_protocol: bool = False
     # Ranges named after roles and channels (tracing.py), set with enable_trace().
     trace_backend: str | None = None  # "iket", "globaltimer", or None: no ranges
@@ -664,6 +668,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
         self._ws_alias = None  # alias.AliasReport, after a trace
+        self._ws_liveness = None  # liveness.Liveness, after a trace
         self._ws_fences = None  # fences.FenceReport, after a trace
         self._ws_opt_outs = []
         self._ws_log = ProtocolLog() if self.trace_protocol else None
@@ -975,7 +980,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"{type(self).__name__}: {sorted(late)} assigned after construction, but a "
                 "cached compile keys the constructor call. Pass the value to the constructor or "
                 "set it in __init__ (a subclass works); only cluster, work streams, alias_check, "
-                "trace_protocol and the trace settings may change after construction"
+                "liveness_check, trace_protocol and the trace settings may change after "
+                "construction"
             )
         if isinstance(self._ws_init_key, TypeError):
             raise self._ws_init_key
@@ -987,7 +993,7 @@ class WarpSpecialized(metaclass=_KernelType):
             self._ws_init_key,
             self.cluster,
             tuple((s.schedule, s.mapping, s.ready, s.scheduler_warp) for s in streams),
-            (self.alias_check, self.trace_protocol, self._trace_settings()),
+            (self.alias_check, self.liveness_check, self.trace_protocol, self._trace_settings()),
             self.role_config_key(),
             tuple((m, module_source_digest(m)) for m in modules),
         )
@@ -1011,6 +1017,7 @@ class WarpSpecialized(metaclass=_KernelType):
             "uses": self._ws_uses,
             "named_users": self._ws_named_users,
             "ownership": self._ws_ownership,
+            "liveness": self._ws_liveness,
             "trace_tags": self._ws_trace_tags,
         }
 
@@ -1033,6 +1040,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_uses = record["uses"]
         self._ws_named_users = record["named_users"]
         self._ws_ownership = record["ownership"]
+        self._ws_liveness = record["liveness"]
         self._ws_trace_tags = record["trace_tags"]
         self._ws_traced = True
         self._report_trace()
@@ -1139,11 +1147,10 @@ class WarpSpecialized(metaclass=_KernelType):
         return importlib.import_module(".describe_graph", __package__).describe_graph(self, format)
 
     def checks(self) -> KernelChecks:
-        """Channel, alias and fence verdicts from ``describe()``, as ``describe.KernelChecks``.
+        """Check verdicts from ``describe()``, as ``describe.KernelChecks``.
 
-        Includes TMA copies, epoch ownership, declared overlaps and explicit fences. Applicable
-        channel checks are ``"not checked yet"`` before compilation; a ``jit_cache`` load
-        restores the results.
+        Applicable channel checks are ``"not checked yet"`` before compilation;
+        ``jit_cache`` restores saved results.
         """
         self._collect()
         return kernel_checks(self)
@@ -1193,6 +1200,7 @@ class WarpSpecialized(metaclass=_KernelType):
         ``begin_roles()``; every CTA of a cluster has them at the same offsets."""
         if name not in self._ws_bars:
             raise ProtocolError(f"no barriers named {name!r} (have {sorted(self._ws_bars)})")
+        self._ws_raw_barrier_access = f"{name} at {user_site()}"
         return self._ws_bars[name]
 
     def launch_config(self, work=None, grid=None, min_blocks_per_mp: int | None = None) -> dict:
@@ -1252,7 +1260,8 @@ class WarpSpecialized(metaclass=_KernelType):
         for problem in problems.values():
             problem.start()  # per-CTA start values, computed once ahead of role dispatch
         self._ws_tma = {}
-        self._ws_alias_roles = []  # alias.RoleEvents of every dispatched role
+        self._ws_role_events = []  # RoleEvents of every dispatched role
+        self._ws_raw_barrier_access = ""
         self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
         self._ws_epoch_seqs = {}  # (owned-epoch channel, role) -> RoleTrace.epoch_sequence
         take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
@@ -1490,17 +1499,23 @@ class WarpSpecialized(metaclass=_KernelType):
         return ctx
 
     def _finish_trace(self):
-        """Collect opt-outs, run named-barrier, epoch-ownership, alias and fence checks, and
-        warn once about TMA channels the check could not verify."""
+        """Collect opt-outs and check reports, then report findings."""
         self._ws_opt_outs = take_opt_outs()
         self._check_named_barriers()
         self._check_ownership()
+        if self.liveness_check not in liveness.MODES:
+            raise ValueError(
+                f"liveness_check must be one of {liveness.MODES}, got {self.liveness_check!r}"
+            )
+        self._ws_liveness = None
+        if self.liveness_check != "off":
+            self._ws_liveness = liveness.check(self, self._ws_role_events)
         self._ws_alias = self._ws_fences = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
         if self.alias_check != "off":
-            self._ws_alias = alias.check(self, self._ws_alias_roles)
-            self._ws_fences = fences.check(self, self._ws_alias_roles)
+            self._ws_alias = alias.check(self, self._ws_role_events)
+            self._ws_fences = fences.check(self, self._ws_role_events)
         for name, ch in self._ws_chans.items():
             if ch.checks_tma:
                 report = self._ws_tma.setdefault(name, TmaReport())
@@ -1694,7 +1709,7 @@ class WarpSpecialized(metaclass=_KernelType):
             for nb in (*ch.full_barriers, *ch.empty_barriers)
         }
         ops = {"barrier": "sync", "barrier_arrive": "arrive", "barrier_native": "native"}
-        for role_events in self._ws_alias_roles:
+        for role_events in self._ws_role_events:
             for ev in role_events.events:
                 if ev.kind not in ops:
                     continue
@@ -1760,8 +1775,8 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_named_users = users
 
     def _report_trace(self):
-        """Raise (strict alias check) or warn about what a trace found. Runs after a trace and
-        when a cached kernel's record is restored."""
+        """Report findings under each check's mode, after tracing or cache restoration."""
+        liveness.report(self._ws_liveness, self.liveness_check, type(self).__name__)
         if self._ws_alias is not None:
             alias.report(self._ws_alias, self.alias_check, type(self).__name__)
         if self._ws_fences is not None:
@@ -1842,8 +1857,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 self._ws_epoch_seqs[(name, r.name)] = (
                     "raw role: its waits are not visible" if r.raw else trace.epoch_sequence(name)
                 )
-        # The role's regions are live now; the diagnostic keeps plain data only.
-        self._ws_alias_roles.append(alias.RoleEvents.from_trace(trace, r))
+        role = RoleEvents.from_trace(trace, r)
+        self._ws_role_events.append(role)
         if r.uses_tmem:
             # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
             # peer has no leader-only TMEM roles, so its count is smaller).

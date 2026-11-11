@@ -39,8 +39,8 @@ with acc.consume() as h:
 ```
 
 A lane-dependent condition around the whole `with` changes arrivals without changing the
-count. Producing n+1 stages while consuming n can also compile. Balanced counts alone do not
-ensure progress: two roles may each wait for the other's first value.
+count. The [liveness check](#what-a-successful-check-means) leaves runtime branches
+unverified; predicate data accesses rather than synchronization.
 
 On an [exclusive-consumer ring](channels.md#exclusive-consumers), every epoch needs exactly
 one owner. This is checked only for static waits and skips. A wait after more than one ring
@@ -99,8 +99,15 @@ resource use.
   It rejects a wait for a stage the same role still holds
   ([overlapping handles](channels.md#overlapping-handles)).
   Exclusive/round-robin epoch ownership is checked when all acquires, waits and skips are
-  static. It does not prove balanced epochs across arbitrary role bodies or a live dependency
-  graph.
+  static.
+- **Liveness:** `verified` means balanced, acyclic straight-line managed channel ops in one
+  CTA, including already-expanded compile-time loops, ring reuse, acquired-slot tails and
+  named-channel rendezvous on both sides. Runtime regions, raw roles/state/barriers/signals,
+  external sides, overrides, TMA/async completion, cross-CTA placement, spans, retire, skips,
+  turnstiles, standalone named barriers and unknown epochs are `unverified`. Node/edge budgets,
+  opt-outs and analysis failures are unverified too; no runtime inputs are sampled.
+  Supported cycles, starved waits and imbalances are `error`: `liveness_check="strict"` raises
+  with sites and an override, `"warn"` warns and `"off"` skips this independent pass.
 - **TMA `verified`:** recognized group and byte accounting, not descriptor legality, disjoint
   writes or async safety. Inspect the reasons for any `unverified` use.
 - **Alias `no hazard found`:** no conflicting annotated pair under the diagnostic's rules,
