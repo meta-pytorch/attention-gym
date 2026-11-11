@@ -30,7 +30,9 @@ class ProtocolError(Exception):
 #   token         wait/acquire(token=...) inside the block trust the readiness they are given: a
 #                 Token of any epoch or region, or a raw Boolean (an mbarrier try_wait result)
 #   fence         accesses annotated inside the block are left out of the fence check (fences.py)
-CHECKS = ("unclosed", "cross_region", "tma", "alias", "token", "fence")
+#   liveness      channel and barrier ops inside the block are invisible to the liveness check,
+#                 which reports the kernel unverified instead of checking them
+CHECKS = ("unclosed", "cross_region", "tma", "alias", "token", "fence", "liveness")
 
 
 @dataclass
@@ -234,12 +236,12 @@ class Lineage:
 
 @dataclass
 class Event:
-    """A handle, access or ordering event for the alias diagnostic.
+    """A channel, handle, access or ordering event shared by the trace checks.
 
     ``where`` lists enclosing dynamic regions outermost first as ``(block key, kind)``:
     ``loop`` for ``scf.for``/``scf.while``, ``if`` or ``other``. ``open`` holds the active
-    handle records. ``opted_out`` marks accesses inside ``unchecked("alias")``,
-    ``fence_opted_out`` those inside ``unchecked("fence")``.
+    handles. ``opted_out`` marks unchecked alias accesses or liveness ops;
+    ``fence_opted_out`` marks unchecked fence accesses.
     """
 
     kind: str
@@ -262,9 +264,9 @@ def _region_kind(block) -> str:
 
 
 class ProtocolLog:
-    """Static channel-op sequences for each traced role instance.
+    """Each role instance's channel-op sequence, read from its events.
 
-    Loops trace once, so their ops appear once. ``depth`` counts MLIR blocks below the
+    Loops trace once, so their ops appear once. ``depth`` counts dynamic regions below the
     role body: 0 for the body, 1 for one loop or branch.
     """
 
@@ -272,8 +274,13 @@ class ProtocolLog:
         self.ops: dict[str, list[tuple]] = {}
         self.tmem: dict[str, set] = {}
 
-    def record(self, role_name, chan, op, slot, depth, site):
-        self.ops.setdefault(role_name, []).append((chan, op, slot, depth, site))
+    def add(self, trace: RoleTrace):
+        """Log ``trace``'s channel ops."""
+        for ev in trace.channel_ops():
+            d = ev.data
+            op = d["op"] if d["count"] == 1 else f"{d['op']} {d['count'] or 'n'}"
+            line = (d["chan"], op, d["slot"], len(ev.where), ev.site)
+            self.ops.setdefault(trace.role_name, []).append(line)
 
     def describe(self) -> str:
         lines = []
@@ -290,21 +297,19 @@ class ProtocolLog:
 
 
 class RoleTrace:
-    """Open-handle bookkeeping for one traced role instance."""
+    """Events and handle lifetimes for one traced role instance."""
 
     def __init__(self, role_name: str, log: ProtocolLog | None, ranges=None, waits: bool = True):
         self.role_name = role_name
         self.log = log
         self.ranges = ranges  # the trace backend's ranges of this role (tracing.py), or None
         self.trace_waits = ranges is not None and waits
-        # (channel, op, enclosing blocks innermost first, epochs, order).
-        # epochs: skip count (None if dynamic), else 1; order: the closing handle's order.
-        self.ops: list = []
         self.item_block = None  # the work-item loop body (set by the WorkCursor's advance())
         self.open: list = []
         self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
-        self.events: list[Event] = []  # alias-diagnostic events, in trace order
+        # One record for the trace checks: channel ops, handle lifetimes, accesses and ordering.
+        self.events: list[Event] = []
         self.open_turns: set[str] = set()  # turnstiles whose turn this role holds here
         self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
@@ -331,6 +336,9 @@ class RoleTrace:
             what = f"{data['storage'][1]} access at {site}"
             opted_out = self.opt_out("alias", what)
             fence_opted_out = self.opt_out("fence", what)
+        elif kind in ("op", "barrier", "barrier_arrive"):
+            what = data.get("chan") or getattr(data.get("barrier"), "name", "named barrier")
+            opted_out = self.opt_out("liveness", f"{what} at {site}")
         ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out, fence_opted_out)
         self.events.append(ev)
         return ev
@@ -348,30 +356,38 @@ class RoleTrace:
         """The current block and its enclosing blocks up to the role body, innermost first."""
         return _ancestors(current_block(), self.root)
 
-    def depth(self) -> int:
-        block = current_block()
-        try:
-            blocks = _ancestors(block, self.root)
-            return len(blocks) - 1 if blocks and blocks[-1] == self.root else 0
-        except (AttributeError, ValueError, RuntimeError):
-            return 0
+    def record(
+        self,
+        chan,
+        op,
+        slot,
+        count: int | None = 1,
+        order: int | None = None,
+        span: bool = False,
+    ):
+        """Record a channel op. ``count``: a skip's epochs (None if dynamic), else 1;
+        ``order``: the end's acquires, waits and skips before it (an acquire or wait), or the
+        closing handle's (a close); ``span``: an acquire or wait that takes a span's epoch
+        without waiting."""
+        self.event("op", chan=chan, op=op, slot=slot, count=count, order=order, span=span)
 
-    def record(self, chan, op, slot, count: int | None = 1, order: int | None = None):
-        # Capture ancestors while live; dereferencing an erased region later crashes.
-        self.ops.append((chan, op, self.blocks(), count, order))
-        if self.log is not None:
-            logged = op if count == 1 else f"{op} {'n' if count is None else count}"
-            self.log.record(self.role_name, chan, logged, slot, self.depth(), user_site())
+    def channel_ops(self) -> list[Event]:
+        return [ev for ev in self.events if ev.kind == "op"]
+
+    def _item_key(self) -> int | None:
+        return None if self.item_block is None else self.block_key(self.item_block)
 
     def uses_per_item(self) -> dict:
         """``{channel: n}``: acquires/waits per work item, 0 when inside an inner loop."""
         uses: dict = {}
-        if self.item_block is None:
+        item = self._item_key()
+        if item is None:
             return uses
-        for chan, op, blocks, *_ in self.ops:
-            if op not in ("acquire", "wait") or self.item_block not in blocks:
+        for ev in self.channel_ops():
+            chan, keys = ev.data["chan"], [key for key, _ in ev.where]
+            if ev.data["op"] not in ("acquire", "wait") or item not in keys:
                 continue
-            depth = blocks.index(self.item_block)
+            depth = len(keys) - 1 - keys.index(item)
             if depth == 0 and uses.get(chan) != 0:
                 uses[chan] = uses.get(chan, 0) + 1
             elif depth:  # nested inside the item loop: a dynamic count per item
@@ -387,15 +403,16 @@ class RoleTrace:
         inside the work loop, False outside, and None when there are no ops.
         """
         seq, regions = [], set()
-        for c, op, blocks, count, order in self.ops:
-            if c != chan or op not in ("acquire", "retire", "wait", "skip", "state"):
+        item = self._item_key()
+        for ev in self.channel_ops():
+            d = ev.data
+            op, count, order = d["op"], d["count"], d["order"]
+            if d["chan"] != chan or op not in ("acquire", "retire", "wait", "skip", "state"):
                 continue
             if op == "state":
                 return f"{self.role_name} reads or assigns end.state"
-            inner = blocks[:-1]  # the enclosing blocks below the role body
-            in_item = (
-                self.item_block is not None and len(inner) == 1 and inner[0] == self.item_block
-            )
+            inner = ev.where  # the enclosing regions below the role body
+            in_item = item is not None and len(inner) == 1 and inner[0][0] == item
             if inner and not in_item:
                 return f"{self.role_name}'s {op} runs inside a dynamic loop or branch"
             if count is None:

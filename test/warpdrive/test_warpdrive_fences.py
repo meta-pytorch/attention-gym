@@ -159,6 +159,9 @@ def verdict(op, chan: str, key: str) -> str | None:
 
 
 class Model(WarpSpecialized):
+    # The models are access patterns, not complete protocols, so their epochs need not balance.
+    liveness_check = "off"
+
     def layouts(self):
         return {"X": cute.make_layout((32, 2))}
 

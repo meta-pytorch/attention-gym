@@ -862,6 +862,8 @@ class Handle(_Stage):
             raise ProtocolError("commit(wait=True) signals the full barrier; drop signal=False")
         self._close(True, "commit" if signal else "commit(raw signal)")
         if wait:
+            trace = self._end._trace
+            trace.record(self._end._chan.name, "rendezvous", self._label, order=self.rec.order)
             _fence(self._end._chan.commit_fence)
             self._end._named_wait(self._end._chan.full_barriers, self.index, "commit")
         elif signal:
@@ -1344,6 +1346,7 @@ class _End:
                 f"{self._trace.role_name}: {self._chan.name} is a named-barrier channel and has no "
                 f"mbarriers ({what}); its barriers are channel.full_barriers/empty_barriers"
             )
+        self._trace.record(self._chan.name, "barrier pointer", None)
 
     @staticmethod
     def _named(barriers, index):
@@ -1440,8 +1443,8 @@ class _End:
     def _raw_state_access(self):
         self._rec.resets += 1  # outstanding tokens no longer name the end's epoch
         self._rec.lineage.advanced(self._copy)
-        if self._chan.owned_epochs:  # raw code may advance it: the epoch sequence is unknown
-            self._trace.record(self._chan.name, "state", None)
+        # Raw code may advance it: the end's epochs are unknown from here on.
+        self._trace.record(self._chan.name, "state", None)
 
     @property
     def index(self):
@@ -1479,6 +1482,9 @@ class _End:
         _fence(fence)
         cluster, targets = self._chan.cluster, self.targets
         if mech is Umma:
+            # Stage reuse assumes tcgen05.commit orders MMA SMEM reads before later generic
+            # writes. See docs/warpdrive/guarantees.md, Hardware assumptions.
+            #
             # Without pairs a commit to this CTA's own barrier needs no mask. Every tcgen05 op of
             # a pair kernel is cta_group::2; the multicast mask names the CTAs whose barrier
             # (same offset) receives the arrival.
@@ -1512,6 +1518,8 @@ class _End:
             return
         # See Channel.remote_scope: a cluster-scope release orders generic-memory data for
         # the other CTA's waiter; "cta" (CUTLASS's default) only counts the arrival.
+        # Ordering this thread's reads before remote refill is an assumption at CTA scope
+        # (docs/warpdrive/guarantees.md, Hardware assumptions).
         scope = _nvvm.MemScopeKind.CLUSTER if self._chan.remote_scope == "cluster" else None
         shared = set(targets.values())
         if len(shared) == 1:  # every CTA of the role signals the same ranks
@@ -1723,7 +1731,7 @@ class _End:
                 "when it acquires); use an ordinary handle"
             )
         index, phase, label = self._next(slot, op)
-        self._trace.record(chan.name, op, label)
+        self._trace.record(chan.name, op, label, order=self._rec.taken(slot) - 1, span=True)
         return Span(self, index, phase, label, producer)
 
     def _take(self, slot, token, op: str):
@@ -1735,7 +1743,7 @@ class _End:
         self._check_hold(slot, op)
         index, phase, label = self._next(slot, op)
         chan, producer = self._chan, isinstance(self, ProducerEnd)
-        self._trace.record(chan.name, op, label)
+        self._trace.record(chan.name, op, label, order=self._rec.taken(slot) - 1)
         if chan.named:
             self._check_turn("producer" if producer else "consumer", op)
             self._named_wait(chan.empty_barriers if producer else chan.full_barriers, index, op)
@@ -1992,6 +2000,9 @@ def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline
     return state
 
 
+# Channels omit tcgen05 thread-sync fences, relying on execution and compiler
+# ordering. Roles can emit nvvm.tcgen05_fence explicitly; see
+# docs/warpdrive/guarantees.md, Hardware assumptions.
 def _wait(bar, phase, ready):
     """Blocking parity wait on ``bar``; with a probe's ``ready``, only if the probe failed."""
     if ready is None:
