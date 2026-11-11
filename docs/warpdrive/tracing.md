@@ -120,6 +120,7 @@ checks.aliases  # {("P", "S"): "no hazard found", ...} for declared overlaps
 | `channels[name].tma` | `"verified"`, `"unverified"`, `"opted out"`, `"no copies"`, `"not checked yet"`; `None` without a [TMA check](#tma-checks) | `tma` |
 | `channels[name].epochs` | `"verified"`, `"unverified"`, `"not checked yet"`; `None` without round-robin or exclusive sharing | `epochs` |
 | `aliases[(name, overlapped)]` | `"no hazard found"`, `"unverified"`, `"potential hazard"`; empty before a compile or with `alias_check="off"` | `name ~ overlapped` in the alias diagnostic |
+| `fences[(channel, "commit_fence" or "release_fence")]` | `"covered"`, `"unverified"`, `"missing fence"` per explicit fence; empty before a compile or with `alias_check="off"` | the [fence check](channels.md#checking-explicit-fences) |
 
 `describe()` supplies the evidence: copy sites, byte counts, epoch shares and findings.
 `"not checked yet"` means the instance has neither compiled nor restored a report.

@@ -1479,6 +1479,9 @@ class _End:
         _fence(fence)
         cluster, targets = self._chan.cluster, self.targets
         if mech is Umma:
+            # Stage reuse assumes tcgen05.commit orders MMA SMEM reads before later generic
+            # writes. See docs/warpdrive/guarantees.md, Hardware assumptions.
+            #
             # Without pairs a commit to this CTA's own barrier needs no mask. Every tcgen05 op of
             # a pair kernel is cta_group::2; the multicast mask names the CTAs whose barrier
             # (same offset) receives the arrival.
@@ -1512,6 +1515,8 @@ class _End:
             return
         # See Channel.remote_scope: a cluster-scope release orders generic-memory data for
         # the other CTA's waiter; "cta" (CUTLASS's default) only counts the arrival.
+        # Ordering this thread's reads before remote refill is an assumption at CTA scope
+        # (docs/warpdrive/guarantees.md, Hardware assumptions).
         scope = _nvvm.MemScopeKind.CLUSTER if self._chan.remote_scope == "cluster" else None
         shared = set(targets.values())
         if len(shared) == 1:  # every CTA of the role signals the same ranks
@@ -1992,6 +1997,9 @@ def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline
     return state
 
 
+# Channels omit tcgen05 thread-sync fences, relying on execution and compiler
+# ordering. Roles can emit nvvm.tcgen05_fence explicitly; see
+# docs/warpdrive/guarantees.md, Hardware assumptions.
 def _wait(bar, phase, ready):
     """Blocking parity wait on ``bar``; with a probe's ``ready``, only if the probe failed."""
     if ready is None:
