@@ -1,6 +1,7 @@
 """warpdrive is self-contained: the rest of attn_gym may import it, never the reverse."""
 
 import ast
+import importlib.util
 import re
 import subprocess
 import sys
@@ -12,14 +13,19 @@ WARPDRIVE = Path(attn_gym.warpdrive.__file__).parent
 
 
 def _outside_references(source: Path) -> list[str]:
-    """Absolute imports (and import-shaped strings) of attn_gym modules outside warpdrive."""
+    """Imports (and import-shaped strings) of attn_gym modules outside warpdrive.
+
+    A relative import resolves against the source's package, so ``from .. import linear`` counts.
+    """
+    package = ".".join(("attn_gym", *source.parent.relative_to(WARPDRIVE.parent).parts))
     names = []
     for node in ast.walk(ast.parse(source.read_text(), filename=str(source))):
         match node:
             case ast.Import(names=aliases):
                 names += [alias.name for alias in aliases]
-            case ast.ImportFrom(module=str(module), level=0):
-                names.append(module)
+            case ast.ImportFrom(module=module, level=level, names=aliases):
+                base = importlib.util.resolve_name("." * level + (module or ""), package)
+                names += [f"{base}.{alias.name}" for alias in aliases]
             case ast.Constant(value=str(value)) if re.fullmatch(r"attn_gym(\.\w+)+", value):
                 names.append(value)
     return [
