@@ -441,23 +441,24 @@ def smem_store_f32x4_sw128(raw_ptr: cute.Pointer, row: Int32, col_base: Int32, d
 
 @cute.jit
 def mma_ws_ss_call(
-    a_smem_layout: cute.Layout,
-    desc_a_base: Tcgen05SmemDescriptor,
-    b_smem_layout: cute.Layout,
-    desc_b_base: Tcgen05SmemDescriptor,
+    a_smem: cute.Tensor,
+    b_smem: cute.Tensor,
     tmem_c: Int32,
     K: Int32,
     instruction_descriptor: int,
+    major: cutlass.Constexpr[str],
     is_accum: bool = False,
 ):
     """Issue one weight-stationary MMA sequence over the descriptor K tiles."""
+    desc_a_i64 = smem_descriptor_to_int(make_umma_smem_desc(a_smem.iterator, a_smem.layout, major))
+    desc_b_i64 = smem_descriptor_to_int(make_umma_smem_desc(b_smem.iterator, b_smem.layout, major))
+    desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
+    desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
     with elect_one():
-        a_outer = a_smem_layout.outer
-        b_outer = b_smem_layout.outer
         scale = 1 if is_accum else 0
         for ks in cutlass.range_constexpr(K // 16):
-            a_offset = cute.crd2idx(((0, 0), 0, ks, 0), a_outer) * ELEM_BYTES_F16
-            b_offset = cute.crd2idx(((0, 0), 0, ks, 0), b_outer) * ELEM_BYTES_F16
+            a_offset = cute.crd2idx(((0, 0), 0, ks), a_smem.layout) * ELEM_BYTES_F16
+            b_offset = cute.crd2idx(((0, 0), 0, ks), b_smem.layout) * ELEM_BYTES_F16
             tcgen05mma_ws_ss_f16(
                 desc_a_base + a_offset,
                 desc_b_base + b_offset,
@@ -2450,22 +2451,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 # dq+=do@h
                 sDo_k_cur = smem.sDo_k[(None, None, None, do_h.index)]
                 sH_k_cur = smem.sH_k[(None, None, None, h_h.index)]
-                desc_a_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sDo_k_cur.iterator, sDo_k_cur.layout, "k")
-                )
-                desc_b_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sH_k_cur.iterator, sH_k_cur.layout, "k")
-                )
-                desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-                desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                 mma_ws_ss_call(
-                    params.vloop_opA_smem,
-                    desc_a_base,
-                    params.vloop_opB_smem,
-                    desc_b_base,
+                    sDo_k_cur,
+                    sH_k_cur,
                     TMEM_DQ_ACC_OFF,
                     self.BV,
                     self.idesc_m64n128_k_k,
+                    "k",
                     is_accum,
                 )
 
@@ -2492,44 +2484,26 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 with dvb.produce():
                     sDv_mn_cur = smem.sDv_mn[(None, None, None, dv_h.index)]
                     sA_mn_cur = smem.sA_mn[(None, None, None, a_h.index)]
-                    desc_a_i64 = smem_descriptor_to_int(
-                        make_umma_smem_desc(sA_mn_cur.iterator, sA_mn_cur.layout, "mn")
-                    )
-                    desc_b_i64 = smem_descriptor_to_int(
-                        make_umma_smem_desc(sDv_mn_cur.iterator, sDv_mn_cur.layout, "mn")
-                    )
-                    desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-                    desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                     mma_ws_ss_call(
-                        params.A_mn_opA_smem,
-                        desc_a_base,
-                        params.dv_mn_opB_smem,
-                        desc_b_base,
+                        sA_mn_cur,
+                        sDv_mn_cur,
                         TMEM_FLEX_OFF,
                         self.BT,
                         self.idesc_m64n64_mn_mn,
+                        "mn",
                     )
 
                 # dw += dv @ h
                 dw_span.begin(v_iter)
 
                 sDv_k_cur = smem.sDv_k[(None, None, None, dv_h.index)]
-                desc_a_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sDv_k_cur.iterator, sDv_k_cur.layout, "k")
-                )
-                desc_b_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sH_k_cur.iterator, sH_k_cur.layout, "k")
-                )
-                desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-                desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                 mma_ws_ss_call(
-                    params.vloop_opA_smem,
-                    desc_a_base,
-                    params.vloop_opB_smem,
-                    desc_b_base,
+                    sDv_k_cur,
+                    sH_k_cur,
                     TMEM_DW_ACC_OFF,
                     self.BV,
                     self.idesc_m64n128_k_k,
+                    "k",
                     is_accum,
                 )
 
@@ -2551,22 +2525,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
 
                 dA_span.begin(v_iter)
                 sV_k_cur = smem.sV_k[(None, None, None, v_h.index)]
-                desc_a_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sDv_k_cur.iterator, sDv_k_cur.layout, "k")
-                )
-                desc_b_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sV_k_cur.iterator, sV_k_cur.layout, "k")
-                )
-                desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-                desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                 mma_ws_ss_call(
-                    params.vloop_opA_smem,
-                    desc_a_base,
-                    params.v_opB_smem,
-                    desc_b_base,
+                    sDv_k_cur,
+                    sV_k_cur,
                     TMEM_DA_ACC_OFF,
                     self.BV,
                     self.idesc_m64n64_k_k,
+                    "k",
                     is_accum,
                 )
 
@@ -2597,22 +2562,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
                 dk_span.begin(v_iter)
                 sVnew_k_cur = smem.sVnew_k[(None, None, None, vnew_h.index)]
                 sDh_k_cur = smem.sDh_k[(None, None, None, h_h.index)]
-                desc_a_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sVnew_k_cur.iterator, sVnew_k_cur.layout, "k")
-                )
-                desc_b_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sDh_k_cur.iterator, sDh_k_cur.layout, "k")
-                )
-                desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-                desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                 mma_ws_ss_call(
-                    params.vloop_opA_smem,
-                    desc_a_base,
-                    params.vloop_opB_smem,
-                    desc_b_base,
+                    sVnew_k_cur,
+                    sDh_k_cur,
                     TMEM_DK_ACC_OFF,
                     self.BV,
                     self.idesc_m64n128_k_k,
+                    "k",
                     is_accum,
                 )
 
@@ -2634,22 +2590,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             with dkgb.produce():
                 sA_mn_cur = smem.sA_mn[(None, None, None, a_h.index)]
                 sDw_mn_cur = smem.sDw_mn[(None, None, None, 0)]
-                desc_a_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sA_mn_cur.iterator, sA_mn_cur.layout, "mn")
-                )
-                desc_b_i64 = smem_descriptor_to_int(
-                    make_umma_smem_desc(sDw_mn_cur.iterator, sDw_mn_cur.layout, "mn")
-                )
-                desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-                desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
                 mma_ws_ss_call(
-                    params.A_mn_opA_smem,
-                    desc_a_base,
-                    params.dw_mn_opB_smem,
-                    desc_b_base,
+                    sA_mn_cur,
+                    sDw_mn_cur,
                     TMEM_DKGB_ACC_OFF,
                     self.BT,
                     self.idesc_m64n128_mn_mn,
+                    "mn",
                 )
 
             kg_s = kg_op.wait()
@@ -2657,22 +2604,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
             # dA += dw @ kg^T
             sDw_k_cur = smem.sDw_k[(None, None, None, 0)]
             sKG_k_cur = smem.sKG_k[(None, None, None, 0)]
-            desc_a_i64 = smem_descriptor_to_int(
-                make_umma_smem_desc(sDw_k_cur.iterator, sDw_k_cur.layout, "k")
-            )
-            desc_b_i64 = smem_descriptor_to_int(
-                make_umma_smem_desc(sKG_k_cur.iterator, sKG_k_cur.layout, "k")
-            )
-            desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-            desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
             mma_ws_ss_call(
-                params.dw_k_opA_smem,
-                desc_a_base,
-                params.kg_k_opB_smem,
-                desc_b_base,
+                sDw_k_cur,
+                sKG_k_cur,
                 TMEM_DA_ACC_OFF,
                 self.BK,
                 self.idesc_m64n64_k_k,
+                "k",
                 True,
             )
 
@@ -2687,22 +2625,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
 
             sDA_k_cur = smem.sDA_k[(None, None, None, 0)]
             sA_k_cur = smem.sA_k[(None, None, None, a_h.index)]
-            desc_a_i64 = smem_descriptor_to_int(
-                make_umma_smem_desc(sDA_k_cur.iterator, sDA_k_cur.layout, "k")
-            )
-            desc_b_i64 = smem_descriptor_to_int(
-                make_umma_smem_desc(sA_k_cur.iterator, sA_k_cur.layout, "k")
-            )
-            desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-            desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
             mma_ws_ss_call(
-                params.dA_k_opA_smem,
-                desc_a_base,
-                params.A_k_opB_smem,
-                desc_b_base,
+                sDA_k_cur,
+                sA_k_cur,
                 TMEM_DA2_ACC_OFF,
                 self.BT,
                 self.idesc_m64n64_k_k,
+                "k",
             )
 
             dA2_h.commit()
@@ -2715,22 +2644,13 @@ class ChunkKdaBwdWyDqkgFused(WarpSpecialized):
 
             sA_mn_cur = smem.sA_mn[(None, None, None, a_h.index)]
             sDA_mn_cur = smem.sDA_mn[(None, None, None, 0)]
-            desc_a_i64 = smem_descriptor_to_int(
-                make_umma_smem_desc(sA_mn_cur.iterator, sA_mn_cur.layout, "mn")
-            )
-            desc_b_i64 = smem_descriptor_to_int(
-                make_umma_smem_desc(sDA_mn_cur.iterator, sDA_mn_cur.layout, "mn")
-            )
-            desc_a_base = Tcgen05SmemDescriptor(desc_a_i64)
-            desc_b_base = Tcgen05SmemDescriptor(desc_b_i64)
             mma_ws_ss_call(
-                params.A_mn_opA_smem,
-                desc_a_base,
-                params.dA_mn_opB_smem,
-                desc_b_base,
+                sA_mn_cur,
+                sDA_mn_cur,
                 TMEM_DA2_ACC_OFF,
                 self.BT,
                 self.idesc_m64n64_mn_mn,
+                "mn",
             )
 
             dA3_h.commit()
