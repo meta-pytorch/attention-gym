@@ -3634,7 +3634,8 @@ def _launch_decode(
         channels,
         width,
         dtype,
-        config,
+        # Decode has no time tile, so the caller's tile size stays out of the compile key.
+        ShortConvConfig(config.threads, config.channels_per_thread, 1),
         _input_alignment(x, config),
         state_indices is not None,
         resolved_activation,

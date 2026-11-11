@@ -3504,6 +3504,25 @@ def test_short_conv_decode_folds_sequences_past_grid_limit():
         assert compile_fn.cache_info().currsize == specializations, sequences
 
 
+def test_short_conv_decode_compile_ignores_the_time_tile():
+    """Decode has no time axis, so ``forward_config.times_per_block`` must not specialize it."""
+    compile_fn = cute_backend._compile_decode
+    compile_fn.cache_clear()
+    torch.manual_seed(139)
+    x = torch.randn(3, 64, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(64, 4, device="cuda", dtype=x.dtype)
+    state = torch.randn(3, 3, 64, device="cuda", dtype=x.dtype)
+    outputs = [
+        causal_conv1d_decode(
+            x, weight, state.clone(), forward_config=ShortConvConfig(64, 2, times_per_block)
+        )
+        for times_per_block in (1, 16, 17)
+    ]
+    assert all(torch.equal(output, outputs[0]) for output in outputs)
+    assert compile_fn.cache_info().currsize == 1
+    compile_fn.cache_clear()
+
+
 def test_paged_short_conv_prefill_folds_sequences_past_grid_limit(monkeypatch):
     """Packed state updates reuse one kernel up to 65535 sequences and a second above that."""
     compile_fn = cute_backend._compile_paged_state_update
