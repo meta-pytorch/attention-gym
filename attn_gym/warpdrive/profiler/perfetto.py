@@ -108,14 +108,15 @@ def add_annotation(event, name: str, value: object) -> None:
     """Attach one scalar or string debug annotation to a TrackEvent."""
     annotation = event.debug_annotations.add()
     annotation.name = name
-    if isinstance(value, bool):
-        annotation.bool_value = value
-    elif isinstance(value, int):
-        annotation.int_value = value
-    elif isinstance(value, float):
-        annotation.double_value = value
-    else:
-        annotation.string_value = str(value)
+    match value:
+        case bool():
+            annotation.bool_value = value
+        case int():
+            annotation.int_value = value
+        case float():
+            annotation.double_value = value
+        case _:
+            annotation.string_value = str(value)
 
 
 class TraceBuilder:

@@ -11,16 +11,18 @@ _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
 
 def _contains_torch_tensor(value: Any) -> bool:
-    if isinstance(value, torch.Tensor):
-        return True
-    if isinstance(value, (tuple, list)):
-        return any(_contains_torch_tensor(item) for item in value)
-    if isinstance(value, dict):
-        return any(
-            _contains_torch_tensor(key) or _contains_torch_tensor(item)
-            for key, item in value.items()
-        )
-    return False
+    match value:
+        case torch.Tensor():
+            return True
+        case tuple() | list():
+            return any(_contains_torch_tensor(item) for item in value)
+        case dict():
+            return any(
+                _contains_torch_tensor(key) or _contains_torch_tensor(item)
+                for key, item in value.items()
+            )
+        case _:
+            return False
 
 
 def make_fake_strided_tensor(
