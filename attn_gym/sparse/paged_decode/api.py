@@ -8,6 +8,7 @@ from torch import Tensor
 
 from attn_gym.types import AuxRequest, Impl, resolve_impl
 
+from . import ops  # noqa: F401  # registers the attn_gym::paged_sparse_decode ops
 from .impl import reference
 
 
@@ -209,7 +210,7 @@ def paged_sparse_decode(
     window_kv: PagedKV | None = None,
     attention_sink: Tensor | None = None,
     scale: float | None = None,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
     return_aux: None = ...,
 ) -> Tensor: ...
 
@@ -229,7 +230,7 @@ def paged_sparse_decode(
     window_kv: PagedKV | None = None,
     attention_sink: Tensor | None = None,
     scale: float | None = None,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, PagedSparseDecodeAux]: ...
 
@@ -248,7 +249,7 @@ def paged_sparse_decode(
     window_kv: PagedKV | None = None,
     attention_sink: Tensor | None = None,
     scale: float | None = None,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, PagedSparseDecodeAux]:
     """Attend decode queries to selected entries of a paged cache plus a causal window.
@@ -306,8 +307,8 @@ def paged_sparse_decode(
             ``exp(sink)`` to the softmax denominator and contributes no value. It is not
             scaled.
         scale: Positive logit multiplier. Defaults to ``1 / sqrt(head_dim)``.
-        impl: ``Impl.REFERENCE`` (default) runs eager PyTorch on CPU or CUDA.
-            Other implementations are not available yet.
+        impl: ``Impl.FUSED`` (default) runs the Triton kernel on CUDA. ``Impl.REFERENCE`` runs
+            eager PyTorch on CPU or CUDA.
         return_aux: If None (default), return only the output. If an AuxRequest, return
             ``(output, PagedSparseDecodeAux)`` with the requested outputs.
 
@@ -362,7 +363,13 @@ def paged_sparse_decode(
                 *args, index_block_size=index_block_size, window_size=window_size, scale=scale
             )
         else:
-            raise ValueError('paged_sparse_decode currently supports only impl="reference".')
+            if not query.is_cuda:
+                raise ValueError("The fused paged_sparse_decode requires CUDA tensors.")
+            options = (max_seqlen_q, index_block_size, window_size, scale)
+            if return_lse:
+                out, lse = torch.ops.attn_gym.paged_sparse_decode_with_lse.default(*args, *options)
+            else:
+                out, lse = torch.ops.attn_gym.paged_sparse_decode.default(*args, *options), None
 
     if return_aux is None:
         return out

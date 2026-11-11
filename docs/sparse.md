@@ -273,7 +273,7 @@ deterministic mode between a compiled forward and its backward.
 `paged_sparse_decode` is the serving-side counterpart: decode queries attend to indexer-selected
 entries of a paged KV cache plus an optional causal window, in one softmax with an optional
 attention sink. Indices stay **logical** (positions within each request, `-1` padded); the
-operation translates them through the block table itself, so no expanded token list or physical
+kernel translates them through the block table itself, so no expanded token list or physical
 slot list is built per step.
 
 ```python
@@ -307,7 +307,35 @@ window are skipped, so each key is attended once and the incomplete block holdin
 
 ### Implementations
 
-`impl="reference"` (default) builds each row's key set explicitly in eager PyTorch on CPU or
-CUDA. It supports the complete API and serves as the correctness oracle for optimized backends.
+- `impl="reference"` builds each row's key set explicitly on CPU or CUDA; it is the
+  correctness oracle and supports every shape.
+- `impl="fused"` (default) runs a Triton split-K kernel and an LSE merge on CUDA, under
+  `torch.compile(fullgraph=True, dynamic=True)` and CUDA graph capture. Batch, sequence count,
+  and split count are runtime values, so changing batches do not recompile. The split count
+  comes from a wave-occupancy model of the GPU's SMs. It needs fp16/bf16 inputs, power-of-two
+  head dims of at least 16, and at most 16K elements of `group x head_dim` per KV head (for
+  example 16 x 256 or 32 x 512). Quantized caches (FP8/FP4 DeepSeek formats) are not supported
+  yet; DeepSeek V3.2's 576-wide latent needs the reference path.
+
+
+The benchmark supports `--cold` to evict K/V from L2 before each call while keeping routing
+metadata warm, and `--json <path>` to save results. Cold timings use GPU timestamps from the
+first attention kernel's start to the last kernel's end, including the split/merge dependency
+gap. Warm timings use repeated calls within a CUDA graph. Both alternate implementations.
+The vLLM comparison excludes its index-expansion kernel.
+
+`SOL us` is a bandwidth-only speed-of-light estimate: logical K/V bytes per query and KV head,
+plus Q/O and selected indices, divided by peak HBM bandwidth (8 TB/s by default on B200;
+override with `--peak-bandwidth-tbps`). It excludes launch latency, intermediate buffers,
+and repeated metadata traffic. `--measured-bandwidth-tbps` adds a ceiling based on a separately
+measured streaming read. Warm-cache results and reuse across multiple queries can exceed an
+HBM estimate, so use cold-cache results when assessing bandwidth utilization.
+
+```bash
+python benchmarks/sparse/paged_sparse_decode_benchmark.py \
+  --heads 6 --kv-heads 1 --context 32771 --cold \
+  --vllm-root /path/to/vllm --peak-bandwidth-tbps 8 \
+  --json agent_space/paged_decode_cold.json
+```
 
 ::: attn_gym.sparse.paged_decode.paged_sparse_decode
