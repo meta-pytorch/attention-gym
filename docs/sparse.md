@@ -318,6 +318,9 @@ window are skipped, so each key is attended once and the incomplete block holdin
   yet; DeepSeek V3.2's 576-wide latent needs the reference path.
 
 
+The split kernel stores unnormalized accumulators, maxima, and denominators. The merge
+normalizes once, avoiding per-split division and logarithms.
+
 The benchmark supports `--cold` to evict K/V from L2 before each call while keeping routing
 metadata warm, and `--json <path>` to save results. Cold timings use GPU timestamps from the
 first attention kernel's start to the last kernel's end, including the split/merge dependency
