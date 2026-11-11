@@ -44,8 +44,8 @@ class KernelChecks:
     keyed by ``(name, overlapped name)`` (``name ~ overlapped name`` in ``describe()``).
     ``fences`` maps each explicit fence to its status, keyed by ``(channel, "commit_fence"``
     or ``"release_fence")``. Both are empty before compilation or with ``alias_check="off"``.
-    ``liveness`` is ``"error"`` with a finding, None before compilation or with
-    ``liveness_check="off"``.
+    ``liveness`` is ``"error"`` or ``"possible deadlock"`` with a finding, None before
+    compilation or with ``liveness_check="off"``.
     """
 
     channels: dict[str, ChannelChecks]

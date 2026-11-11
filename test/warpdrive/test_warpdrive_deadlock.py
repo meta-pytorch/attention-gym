@@ -543,10 +543,14 @@ class Graph(Toy):
                     pass
         else:
             for _ in cutlass.range(ctx.n, unroll=1):
-                with a.produce():
-                    pass
-                with b.consume():
-                    pass
+                if cutlass.const_expr(mode == "loop_cross"):  # the cross wait, every trip
+                    with b.consume(), a.produce():
+                        pass
+                else:
+                    with a.produce():
+                        pass
+                    with b.consume():
+                        pass
             if cutlass.const_expr(mode == "unbalanced_n"):  # one fill more than the n taken
                 with a.produce():
                     pass
@@ -592,9 +596,9 @@ def test_straight_line_cross_wait_reports_sites_and_override():
     "mode, prefix",
     [
         ("static", "liveness: verified"),
-        ("loop", "liveness: unverified (runtime loop/branch or unknown region: p at test_"),
-        ("unbalanced_n", "liveness: unverified (runtime loop/branch"),
-        ("lane", "liveness: unverified (runtime loop/branch"),
+        ("loop", "liveness: no deadlock found (1 and 2 loop trips, matched counts)"),
+        ("unbalanced_n", "liveness: unverified (loop counts on a do not line up"),
+        ("lane", "liveness: unverified (runtime branch or unknown region: q at test_"),
         ("unchecked", 'liveness: unverified (unchecked("liveness")'),
         ("state", "liveness: unverified (b.state"),
     ],
@@ -607,6 +611,15 @@ def test_extracted_coverage_is_explicit(mode, prefix):
     restored = Graph(mode)
     compile_toy(restored, f"small_{mode}")
     assert restored.describe() == op.describe()
+
+
+def test_a_cycle_seen_by_repeating_loops_warns_and_compiles():
+    """Which trips run is not known at trace time, so the finding never blocks the compile."""
+    op = Graph("loop_cross")
+    with pytest.warns(UserWarning, match=r"deadlock:.*every runtime loop running 1 times"):
+        compile_toy(op, "small_loop_cross")
+    assert op.checks().liveness == "possible deadlock"
+    assert "liveness: possible deadlock (see the reported finding)" in op.describe()
 
 
 def test_static_imbalance_is_an_error():

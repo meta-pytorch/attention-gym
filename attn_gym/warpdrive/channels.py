@@ -809,7 +809,7 @@ class Handle(_Stage):
     def full_barrier(self):
         """This stage's full-barrier pointer. On a TMA producer, pass it as ``tma_bar_ptr``: the
         layer checks the copies that complete on it (``tma.py``)."""
-        self._end._mbarriers("full_barrier")
+        self._end._mbarriers("full_barrier", self if self._is_producer else None)
         return self._end._handed_full(self.index, self.rec if self._is_producer else None)
 
     barrier = full_barrier
@@ -1327,13 +1327,19 @@ class _End:
                 )
         return self._rebuilt(self._state, {**self._views, **named})
 
-    def _mbarriers(self, what: str):
+    def _mbarriers(self, what: str, handle=None):
         if self._chan.named:
             raise ProtocolError(
                 f"{self._trace.role_name}: {self._chan.name} is a named-barrier channel and has no "
                 f"mbarriers ({what}); its barriers are channel.full_barriers/empty_barriers"
             )
-        self._trace.record(self._chan.name, "barrier pointer", None)
+        if handle is not None and isinstance(self._chan.producer, Tma):
+            # The pointer a TMA copy completes on: where liveness places the stage's fill.
+            self._trace.record(
+                self._chan.name, "tma pointer", handle._label, order=handle.rec.order
+            )
+        else:
+            self._trace.record(self._chan.name, "barrier pointer", None)
 
     @staticmethod
     def _named(barriers, index):

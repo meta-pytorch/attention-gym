@@ -55,15 +55,32 @@ What the layer supplies, checks and leaves to you:
 4. <a id="liveness"></a>**Liveness.** `verified` means every role's managed channel ops form
     a balanced, acyclic, straight-line protocol in one CTA. Compile-time loops are already
     expanded. The check matches channel, slot, epoch and all bound participants; it includes
-    ring reuse, acquired-slot tails and named-channel rendezvous on both sides.
+    ring reuse, acquired-slot tails and named-channel rendezvous on both sides. A
+    `tcgen05.commit` completes on its own once issued, so the commit or release that issues it
+    stands for the signal. A named barrier that exactly one role syncs on, outside any branch,
+    with that role's thread count and no native use of its ID, waits on no other role and is
+    ignored.
 
-    Runtime loops or branches, raw roles/state/barrier pointers/signals, external sides, overrides,
-    skips, spans, retire, unknown epoch correspondence and cross-CTA placement are `unverified`.
-    So are TMA/async signals (their completion is not modeled), standalone named barriers,
-    turnstiles, `unchecked("liveness")`, node/edge limits and analysis failures. The report
-    names the reason and, for unsupported ops, the role and site. No runtime inputs are sampled.
+    Two things are taken on trust, and with either the verdict is `no deadlock found` (not a
+    proof) or `possible deadlock` (a warning that names the ops, never a raise):
 
-    Cycles, starved waits or imbalances entirely inside the supported protocol are `error`.
+    - **TMA.** A copy completes on its own once issued, but the trace does not show where it
+      is issued. The fill is placed where the producer reads `handle.barrier`, which is where
+      the copy is written in practice. Every committed stage must have that read, and the
+      channel's [TMA check](#tma) must be `verified`.
+    - **Runtime loops.** Every loop body is repeated once, twice and one more time than the
+      deepest looped channel has stages. No loop bound is read, so a channel's producers
+      and consumers are assumed to loop the same number of times, and a cycle may need trips
+      that never run. Counts that do not line up under that assumption (one side loops `n`
+      times, the other `n - 1` plus one op outside) are `unverified`.
+
+    Runtime branches, raw roles/state/barrier pointers/signals, external sides, overrides,
+    skips, spans, retire, unknown epoch correspondence, scheduler channels and cross-CTA
+    placement are `unverified`. So are named barriers shared between roles, turnstiles,
+    `unchecked("liveness")`, node/edge limits and analysis failures. The report names the
+    reason and, for unsupported ops, the role and site.
+
+    Cycles, starved waits or imbalances in a straight-line protocol without TMA are `error`.
     `liveness_check="strict"` (default) raises with sites and an override; `"warn"` warns and
     `"off"` skips this independent check. User work and readiness waits must terminate.
 
@@ -73,7 +90,7 @@ What the layer supplies, checks and leaves to you:
     reading `.id` can make missing participation unverified, but cannot justify a count above
     the available threads. Raw IDs must avoid 1, 2 and all allocated IDs.
 
-    Standalone named barriers leave liveness unverified. Supply an acknowledgement for a
+    A named barrier shared between roles leaves liveness unverified. Supply an acknowledgement for a
     reusable arrive/sync protocol. A sync covering exactly the calling role orders its warps
     in the alias model; an arrive alone does not.
 
