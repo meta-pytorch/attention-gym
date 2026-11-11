@@ -1538,6 +1538,7 @@ class _End:
     def _advanced(self, key, epochs: int):
         """Count this copy's move ``epochs`` (0 if dynamic) past the next epoch of ``key`` (a
         slot, None for a ring)."""
+        self._rec.lineage.check_carried(self._copy, self._trace, self._chan.name, "end")
         self._rec.steps.setdefault(key, []).append((epochs, current_block()))
         self._rec.lineage.advanced(self._copy)
 

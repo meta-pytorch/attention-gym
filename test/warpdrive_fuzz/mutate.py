@@ -229,7 +229,7 @@ def mutations() -> list[Mutation]:
             message="only consumers of an exclusive ring",
         ),
         Mutation(
-            "helper_discards_end", "U10", loop + "    self.step(ch)", error=None, obligation=True
+            "helper_discards_end", "U10", loop + "    self.step(ch)", message="does not carry it"
         ),
         Mutation(
             "unbalanced_epochs",
