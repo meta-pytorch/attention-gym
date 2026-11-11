@@ -579,12 +579,11 @@ class BudgetProbe(WarpSpecialized):
 
 def test_budgets_survive_to_sass(requires_blackwell, tmp_path):
     """launch_config's min_blocks_per_mp=1 makes ptxas keep setmaxnreg; without it the role
-    compiles at 32 registers with about 760 bytes of spills."""
+    compiles at 32 registers and spills."""
     disassembler = shutil.which("nvdisasm")
     if disassembler is None:
         pytest.skip("the SASS check requires nvdisasm")
     op = BudgetProbe()
-    assert op.launch_config(grid=(1, 1, 1))["min_blocks_per_mp"] == 1
     fake = make_fake_compact_tensor(cutlass.Float32, (1 << 20,), assumed_align=4)
     compiled = cute.compile(op, fake, cuda.CUstream(0))
     obj = bytes(

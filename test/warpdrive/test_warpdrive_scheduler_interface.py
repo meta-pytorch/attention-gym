@@ -340,27 +340,21 @@ def test_decode_state_follows_each_site(requires_blackwell, schedule, mapping, c
 # Pairs, empty spaces and overflow for custom schedules and mappings
 
 
-def count_cases():
-    """name -> (toy class, schedule, mapping)."""
-    return {
-        "reverse_static": (CountToy, ReverseStatic(), Raster(along="n", swizzle=3)),
-        "reverse_broadcast": (CountToy, ReverseBroadcast(), Raster(along="n", swizzle=3)),
-        "custom_oneshot": (CountToy, OneShot(), CheckedRaster()),
-        "custom_static": (CountToy, StaticPersistent(), CheckedRaster()),
-        "custom_clc": (CountToy, ClusterLaunchControl(), CheckedRaster(drop_odd=True)),
-    }
-
-
 @pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
-@pytest.mark.parametrize("case", list(count_cases()))
-def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell, case, cluster):
+@pytest.mark.parametrize(
+    "schedule", [ReverseStatic(), ReverseBroadcast()], ids=["reverse_static", "reverse_broadcast"]
+)
+def test_swapped_schedules_cover_empty_and_overflowing_spaces(
+    requires_blackwell, schedule, cluster
+):
     """Every CTA in a unit sees its items; empty spaces run no work.
 
     Reject spaces past Int32 at launch, using the custom schedule's default index_limit
-    and the mapping's Int64 count64. Guarded maps must not decode empty or rejected spaces.
+    and the mapping's Int64 count64. Built-in schedules on the guarded CheckedRaster are
+    covered by test_empty_and_overflowing_spaces.
     """
-    toy, schedule, mapping = count_cases()[case]
-    op = toy(schedule, mapping, cluster)
+    mapping = Raster(along="n", swizzle=3)
+    op = CountToy(schedule, mapping, cluster)
     fn = compile_count_toy(op)
     ws, _ = op.work.launch_args("cuda")
     for space in EMPTY_SPACES:
@@ -368,15 +362,7 @@ def test_swapped_schedules_cover_empty_and_overflowing_spaces(requires_blackwell
     for space in OVERFLOWING_SPACES:
         with pytest.raises(Exception, match=INVALID_LAUNCH):
             _count_items(fn, ws, space, 148)
-    want = (
-        sum(
-            mapping.kept((m, n, li)) if isinstance(mapping, CheckedRaster) else 1
-            for li in range(2)
-            for n in range(3)
-            for m in range(5)
-        )
-        * cluster.size
-    )
+    want = 5 * 3 * 2 * cluster.size
     assert _count_items(fn, ws, (5, 3, 2), 4) == [want, want]
 
 

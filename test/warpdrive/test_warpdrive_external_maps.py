@@ -319,7 +319,8 @@ def count_cases():
 def test_external_maps_cover_empty_and_normal_spaces(requires_blackwell, case, cluster):
     """Supported external spaces run once per CTA; empty spaces run no work.
 
-    Oversized spaces are tested with core maps, not FA4's narrower host-math domain.
+    The Cutlass maps reject spaces past Int32 at launch. Oversized spaces are not run through
+    the FA4 maps, whose host math covers a narrower domain.
     """
     toy, schedule, mapping = count_cases()[case]
     op = toy(schedule, mapping, cluster)
@@ -327,26 +328,12 @@ def test_external_maps_cover_empty_and_normal_spaces(requires_blackwell, case, c
     ws, _ = op.work.launch_args("cuda")
     for space in EMPTY_SPACES:
         assert _count_items(fn, ws, space, 148) == [0, 0], space
+    if isinstance(mapping, CutlassRaster):
+        for space in OVERFLOWING_SPACES:
+            with pytest.raises(Exception, match=INVALID_LAUNCH):
+                _count_items(fn, ws, space, 148)
     want = 5 * 3 * 2 * cluster.size
     assert _count_items(fn, ws, (5, 3, 2), 4) == [want, want]
-
-
-@pytest.mark.parametrize("cluster", [SingleCta(), CtaPair()], ids=["single", "pair"])
-@pytest.mark.parametrize(
-    "schedule,mapping",
-    [
-        (StaticPersistent(), CutlassRaster(swizzle=4)),
-        (ClusterLaunchControl(), CutlassRaster(swizzle=4, along="n")),
-    ],
-    ids=["static", "clc"],
-)
-def test_cutlass_rejects_overflowing_spaces(requires_blackwell, schedule, mapping, cluster):
-    op = CountToy(schedule, mapping, cluster)
-    fn = compile_count_toy(op)
-    ws, _ = op.work.launch_args("cuda")
-    for space in OVERFLOWING_SPACES:
-        with pytest.raises(Exception, match=INVALID_LAUNCH):
-            _count_items(fn, ws, space, 148)
 
 
 @pytest.mark.parametrize("along", ["m", "n"])
