@@ -38,7 +38,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive import kernel as kernel_module
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.gemm import Gemm, compile_gemm, gemm
-from attn_gym.warpdrive.examples.persistent_gemm import persistent_gemm
+from attn_gym.warpdrive.examples.persistent_gemm import PersistentGemm, persistent_gemm
 
 # A two-role toy kernel: producer warp 0 -> consumer warp 1 over two fixed slots with a
 # layer-owned SMEM payload. ``mode`` injects protocol violations at trace time.
@@ -276,13 +276,6 @@ def test_bound_producers_fan_in(requires_blackwell):
         assert out.tolist() == [tri] * 32 + [2 * tri] * 32
 
 
-def run_hole_toy(op, n):
-    out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
-    compile_toy(op)(out, n)
-    lane = torch.arange(32, dtype=torch.int32)
-    assert torch.equal(out.cpu(), 32 * n * (n - 1) // 2 + n * lane)
-
-
 # TMEM allocator placement: one CTA allocates from a warp other than warp 0 (which
 # initializes the barriers) when a TMEM role has one. Every toy takes all 512 columns, so a
 # CTA that did not free them would block the next CTA on its SM in tcgen05.alloc.
@@ -385,7 +378,11 @@ def test_register_budgets_run(requires_blackwell, toy):
     """Holes take their warpgroup's budget; FullPoolToy's budgets use exactly the pool."""
     if toy is HoleToy:
         assert "  1-3    (padding)    56\n" in HoleToy().describe()
-    run_hole_toy(toy(), 9)
+    n = 9
+    out = torch.full((32,), -1, device="cuda", dtype=torch.int32)
+    compile_toy(toy())(out, n)
+    lane = torch.arange(32, dtype=torch.int32)
+    assert torch.equal(out.cpu(), 32 * n * (n - 1) // 2 + n * lane)
 
 
 def test_register_budget_branches_are_warpgroup_uniform(monkeypatch, traced_compiles):
@@ -691,12 +688,6 @@ def test_tmem_plan_columns():
     assert plan.alloc_cols == 512
 
 
-def _persistent_gemm(**kw):
-    from attn_gym.warpdrive.examples.persistent_gemm import PersistentGemm
-
-    return PersistentGemm(**kw)
-
-
 PROTOCOL_ERRORS = {
     # Only the context-typed or single unannotated parameter receives the context; anything
     # else is an error naming the parameter, not a silent context injection.
@@ -727,18 +718,18 @@ VALUE_ERRORS = {
     ),
     "tmem_cols": (lambda: TmemPlan().region("S", 128, 5).alloc_cols, "needs 640 > 512"),
     "gemm_tile_n": (lambda: Gemm(tile_n=48), "multiple of 32"),
-    "pgemm_epi": (lambda: _persistent_gemm(epi_tile_n=128), "epi_tile_n must be one of"),
+    "pgemm_epi": (lambda: PersistentGemm(epi_tile_n=128), "epi_tile_n must be one of"),
     "pgemm_tile_n": (
-        lambda: _persistent_gemm(tile_n=224, epi_tile_n=64),
+        lambda: PersistentGemm(tile_n=224, epi_tile_n=64),
         "multiple of epi_tile_n=64",
     ),
-    "pgemm_c_stages_0": (lambda: _persistent_gemm(c_stages=0), "c_stages must be in"),
-    "pgemm_c_stages_9": (lambda: _persistent_gemm(c_stages=9), "c_stages must be in"),
+    "pgemm_c_stages_0": (lambda: PersistentGemm(c_stages=0), "c_stages must be in"),
+    "pgemm_c_stages_9": (lambda: PersistentGemm(c_stages=9), "c_stages must be in"),
     "pgemm_mixed_budgets": (  # load shares the warpgroup of mma
-        lambda: _persistent_gemm(roles={"load": RoleConfig(4, regs=48)}),
+        lambda: PersistentGemm(roles={"load": RoleConfig(4, regs=48)}),
         "mixed register budgets",
     ),
-    "pgemm_early_release": (lambda: _persistent_gemm(early_release=1), "must be a bool"),
+    "pgemm_early_release": (lambda: PersistentGemm(early_release=1), "must be a bool"),
 }
 
 
@@ -822,8 +813,6 @@ def test_persistent_gemm_wrapper_keys_roles_by_content(requires_blackwell):
 
 
 def test_persistent_gemm_config_reaches_names_and_keys():
-    from attn_gym.warpdrive.examples.persistent_gemm import PersistentGemm
-
     tuned = PersistentGemm(roles={"epilogue": RoleConfig(range(4), regs=152)})
     assert "0-3    epilogue    152" in tuned.describe()
     assert tuned.__cute_cache_key__() != PersistentGemm().__cute_cache_key__()

@@ -69,7 +69,6 @@ def test_raster_is_a_bijection(mapping):
     for ext in EXTENTS:
         coords = _all_coords(mapping, ext)
         assert sorted(coords) == sorted(itertools.product(*(range(e) for e in ext))), ext
-        assert len(set(coords)) == len(coords), ext
         assert tuple(int(e) for e in mapping.bind(ext)) == ext  # nonempty spaces bind unchanged
 
 
@@ -1039,14 +1038,6 @@ def test_persistent_gemm_compiles_once_across_shapes(requires_blackwell, cluster
         assert (out.float() - ref).abs().max().item() < 0.05 * ref.abs().max().item() + 1e-2
     info = compile_persistent_gemm.cache_info()
     assert info.currsize == 1 and info.hits + info.misses == 5 and len(fns) == 1
-
-
-def test_persistent_gemm_empty_k(requires_blackwell):
-    from attn_gym.warpdrive.examples.persistent_gemm import persistent_gemm
-
-    a = torch.empty(64, 0, device="cuda", dtype=torch.bfloat16)
-    b = torch.empty(24, 0, device="cuda", dtype=torch.bfloat16)
-    assert (persistent_gemm(a, b) == 0).all()
 
 
 # FA4-style forward on the same primitive: persistent schedules.

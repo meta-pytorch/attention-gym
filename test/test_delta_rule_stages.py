@@ -679,28 +679,36 @@ def simulate_context_parallel(
 
 # Sequences [0, 40), [40, 232), [232, 384); each entry lists one rank's fragments.
 CU_SEQLENS = (0, 40, 232, 384)
-LAYOUTS = [
-    pytest.param(CU_SEQLENS, [[(0, 192)], [(192, 384)]], id="contiguous-2"),
-    pytest.param(CU_SEQLENS, [[(0, 96), (288, 384)], [(96, 192), (192, 288)]], id="zigzag-2"),
-    pytest.param(
+LAYOUTS = {
+    "contiguous-2": (CU_SEQLENS, [[(0, 192)], [(192, 384)]]),
+    "zigzag-2": (CU_SEQLENS, [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]),
+    "zigzag-3": (
         CU_SEQLENS,
         [[(0, 64), (320, 384)], [(64, 128), (256, 320)], [(128, 192), (192, 256)]],
-        id="zigzag-3",
     ),
     # Uneven ownership: rank 0 holds one short piece, rank 1 the rest in reversed order.
-    pytest.param(CU_SEQLENS, [[(96, 160)], [(160, 384), (0, 96)]], id="uneven-reordered"),
+    "uneven-reordered": (CU_SEQLENS, [[(96, 160)], [(160, 384), (0, 96)]]),
     # One document over two ranks: each span is one whole subsequence of complete chunks, so
     # both ranks run the dense kernels and exchange summaries over the dense factor layout.
-    pytest.param((0, 384), [[(0, 192)], [(192, 384)]], id="one-document-dense"),
+    "one-document-dense": ((0, 384), [[(0, 192)], [(192, 384)]]),
     # Same, cut mid-chunk: whole subsequences that fall back to a packed schedule.
-    pytest.param((0, 384), [[(0, 200)], [(200, 384)]], id="one-document-partial-chunk"),
+    "one-document-partial-chunk": ((0, 384), [[(0, 200)], [(200, 384)]]),
+}
+# Routing and summary composition do not depend on the input dtype: FP16 runs one packed
+# multi-fragment layout and the dense one, which between them reach both kernel schedules.
+CP_CASES = [
+    pytest.param(*LAYOUTS[name], dtype, id=f"{name}-{dtype_id}")
+    for dtype, dtype_id, names in [
+        (torch.bfloat16, "bf16", LAYOUTS),
+        (torch.float16, "fp16", ("zigzag-2", "one-document-dense")),
+    ]
+    for name in names
 ]
 
 
 @requires_kda_target
 @op_param
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize(("cu_seqlens", "layout"), LAYOUTS)
+@pytest.mark.parametrize(("cu_seqlens", "layout", "dtype"), CP_CASES)
 def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout, dtype, request):
     if op is KDA_CUDNN and dtype is torch.float16:
         # The unsharded cuDNN op itself returns non-finite FP16 outputs for model-range gates:

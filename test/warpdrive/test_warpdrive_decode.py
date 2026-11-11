@@ -18,6 +18,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 from cutlass import cute
+from probe_kernels import probe_kernel
 
 from attn_gym.testing.warpdrive import raises_protocol as _raises_protocol
 from attn_gym.testing.warpdrive import status
@@ -184,18 +185,6 @@ def test_named_channel_errors(mode, message):
     _raises_protocol(message, lambda: compile_toy(RoundRobinToy(mode)))
 
 
-def _kernel(channels, roles):
-    """A kernel class with the given channel attributes and role functions."""
-    cls = type("Probe", (WarpSpecialized,), dict(roles))
-
-    def init(self):
-        for name, make in channels.items():
-            setattr(self, name, make())
-
-    cls.__init__ = init
-    return cls()
-
-
 def _consumer_pair(width2=1):
     @role(warps=0)
     @cute.jit
@@ -241,7 +230,7 @@ def test_round_robin_declaration_errors():
 
     # A round-robin side with one instance: nothing to take turns.
     rr = Sharing.ROUND_ROBIN
-    op = _kernel(
+    op = probe_kernel(
         {"ch": lambda: Ring(2, Threads, Threads, consumer_sharing=rr)},
         {"prod": prod, "cons": cons},
     )
@@ -251,7 +240,9 @@ def test_round_robin_declaration_errors():
         op.describe,
     )
     # Two different roles, or instances of different widths, cannot alternate one count.
-    op = _kernel({"ch": lambda: Ring(2, Threads, Threads, consumer_sharing=rr)}, _consumer_pair())
+    op = probe_kernel(
+        {"ch": lambda: Ring(2, Threads, Threads, consumer_sharing=rr)}, _consumer_pair()
+    )
     _raises_protocol("must be instances of one role with the same width", op.describe)
 
 
@@ -272,7 +263,7 @@ def test_named_channels_need_free_ids_and_one_cta():
         "a": lambda: Ring(4, Threads, Threads, sync="named"),
         "b": lambda: Ring(3, Threads, Threads, sync="named"),
     }
-    _raises_protocol("need 14 barrier IDs; 13 are free", _kernel(channels, roles).describe)
+    _raises_protocol("need 14 barrier IDs; 13 are free", probe_kernel(channels, roles).describe)
 
     @role(warps=0, cta="leader")
     @cute.jit
@@ -284,7 +275,7 @@ def test_named_channels_need_free_ids_and_one_cta():
     def both(self, ctx, *, a: Consumer):
         return a
 
-    op = _kernel(
+    op = probe_kernel(
         {"a": lambda: Ring(1, Threads, Threads, sync="named")}, {"lead": lead, "both": both}
     )
     op.cluster = CtaPair()
@@ -295,7 +286,7 @@ def test_named_channels_need_free_ids_and_one_cta():
     def pair_cons(self, ctx, *, a: Consumer):
         return a
 
-    op = _kernel(
+    op = probe_kernel(
         {"a": lambda: Ring(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)},
         {"lead": lead, "pair_cons": pair_cons},
     )
@@ -325,7 +316,7 @@ def test_named_turnstile_must_seat_the_round_robin_instances():
         ),
         "t": Turnstile,
     }
-    op = _kernel(channels, {"prod": prod, "other": other, "cons": cons})
+    op = probe_kernel(channels, {"prod": prod, "other": other, "cons": cons})
     _raises_protocol(
         r"declare an enabled Turnstile over \['prod\[0\]', 'prod\[1\]'\]", op.describe
     )

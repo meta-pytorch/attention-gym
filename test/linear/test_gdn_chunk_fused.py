@@ -1007,14 +1007,9 @@ def test_raw_ops_reject_non_fp32_gate_beta_and_state(argument: int):
         chunk_fwd_with_state_op(*args)
 
 
-def raw_args(tokens: int = 64, heads: int = 2, head_dim: int = 128, token_innermost: bool = False):
-    """Construct detached raw-op arguments and their forward tapes."""
-    q, k, v, gate, beta, state = make_inputs(
-        tokens=tokens,
-        key_heads=heads,
-        value_heads=heads,
-        head_dim=head_dim,
-    )
+def raw_args(head_dim: int = 128, token_innermost: bool = False):
+    """Construct detached grouped-head raw-op arguments and their forward tapes."""
+    q, k, v, gate, beta, state = make_inputs(key_heads=1, value_heads=4, head_dim=head_dim)
     if token_innermost:
         q, k, v, beta = (token_innermost_like(tensor) for tensor in (q, k, v, beta))
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
@@ -1057,8 +1052,10 @@ def test_dense_raw_operator_registration(head_dim: int, token_innermost: bool):
     ids=["64-compact", "128-compact", "128-token-innermost"],
 )
 def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
-    """Validate fixed-capacity packed forward/backward registrations."""
-    q, k, v, gate, beta, _state = make_inputs(tokens=128, head_dim=head_dim)
+    """Validate fixed-capacity packed forward/backward registrations with grouped heads."""
+    q, k, v, gate, beta, _state = make_inputs(
+        tokens=128, key_heads=1, value_heads=4, head_dim=head_dim
+    )
     if token_innermost:
         q, k, v, beta = (token_innermost_like(tensor) for tensor in (q, k, v, beta))
     state = torch.randn(2, v.shape[2], head_dim, head_dim, device="cuda")
@@ -1104,10 +1101,9 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
-    ("head_dim", "portable"),
-    [(128, False), (128, True), (64, False)],
+    ("head_dim", "portable", "dtype"),
+    [(128, False, torch.bfloat16), (128, True, torch.bfloat16), (64, False, torch.float16)],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_public_fullgraph_forward_backward(
     packed: bool,
     head_dim: int,
@@ -1115,7 +1111,11 @@ def test_public_fullgraph_forward_backward(
     dtype: torch.dtype,
     monkeypatch,
 ):
-    """Compile both backward implementations with strict forward/backward capture."""
+    """Compile both backward implementations with strict forward/backward capture.
+
+    Capture runs through the same fakes for every dtype, so FP16 runs on one row only; the
+    numerical tests cover the FP16 kernels.
+    """
     if portable:
         force_portable_backward(monkeypatch)
     tokens = 128 if packed else 64

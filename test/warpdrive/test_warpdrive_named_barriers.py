@@ -12,6 +12,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 from cutlass import cute
+from probe_kernels import probe_kernel
 
 from attn_gym.testing.warpdrive import raises_protocol as _raises_protocol
 from attn_gym.warpdrive import (
@@ -175,20 +176,6 @@ def test_named_barrier_trace_errors(mode, message):
 # Allocation and declaration checks (host only)
 
 
-def _kernel(attrs, roles, cluster=None):
-    """A kernel with the given attribute factories and role functions."""
-    cls = type("Probe", (WarpSpecialized,), dict(roles))
-
-    def init(self):
-        for name, make in attrs.items():
-            setattr(self, name, make())
-        if cluster is not None:
-            self.cluster = cluster
-
-    cls.__init__ = init
-    return cls()
-
-
 @role(warps=0)
 @cute.jit
 def _prod(self, ctx, *, a: Producer):
@@ -207,8 +194,8 @@ PAIR = {"prod": _prod, "cons": _cons}
 def test_named_barriers_allocate_upward_and_leave_channel_ids():
     ring = {"a": lambda: Ring(2, Threads, Threads, sync="named")}
     bars = {"x": lambda: NamedBarrier(threads=64), "y": lambda: NamedBarrier(threads=32)}
-    plain = _kernel(ring, PAIR)
-    op = _kernel({**ring, **bars}, PAIR)
+    plain = probe_kernel(ring, PAIR)
+    op = probe_kernel({**ring, **bars}, PAIR)
     assert op.named_barrier_ids == plain.named_barrier_ids == {"a": ([12, 13], [14, 15])}
     op.describe()
     assert (op.x.id, op.y.id) == (3, 4)
@@ -227,9 +214,9 @@ def test_named_barrier_ids_are_exhaustible():
         "x": lambda: NamedBarrier(threads=64),
         "y": lambda: NamedBarrier(threads=64),
     }
-    _raises_protocol("need 14 barrier IDs; 13 are free", _kernel(attrs, PAIR).describe)
+    _raises_protocol("need 14 barrier IDs; 13 are free", probe_kernel(attrs, PAIR).describe)
     del attrs["y"]
-    _kernel(attrs, PAIR).describe()  # 13 fit exactly
+    probe_kernel(attrs, PAIR).describe()  # 13 fit exactly
 
 
 @pytest.mark.parametrize("threads", [0, 48, 2048, 64.0, True])
@@ -253,7 +240,7 @@ SHARED = NamedBarrier(threads=64)
     ids=["count_exceeds_kernel", "shared_declaration"],
 )
 def test_named_barrier_declaration_errors(attrs, message):
-    op = _kernel({"a": lambda: Ring(1, Threads, Threads), **attrs}, PAIR)
+    op = probe_kernel({"a": lambda: Ring(1, Threads, Threads), **attrs}, PAIR)
     _raises_protocol(message, op.describe)
 
 

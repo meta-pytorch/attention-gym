@@ -34,6 +34,7 @@ def test_role_summary_containment():
         ],
     )
     empty = role_summary([], op).roles
+    assert [(r.name, r.warp) for r in empty] == [("load", 4), ("idle", 6)]
     assert all(r.items == r.wait_ns == r.item_ns == r.wait_share == 0 for r in empty)
     assert role_summary([]).roles == ()
 
