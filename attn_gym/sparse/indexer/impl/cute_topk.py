@@ -124,11 +124,6 @@ class IndexerTopKKernel(IndexerKernelBase):
         )
 
     @cute.jit
-    def upcast_offset(self, value):
-        """Widen indices before any address arithmetic in the wide specialization."""
-        return Int64(value) if cutlass.const_expr(self.use_int64_offsets) else value
-
-    @cute.jit
     def select_lowest_ties(
         self,
         row: cute.Tensor,
@@ -389,7 +384,6 @@ class IndexerTopKKernel(IndexerKernelBase):
 
         if batch < output.shape[0] and q < num_queries:
             row_output = output[batch, q, None]
-            candidate_start = self.upcast_offset(Int32(0))
             seg_len = Int32(num_candidates)
             if cutlass.const_expr(candidate_bounds is not None):
                 candidate_start = self.upcast_offset(candidate_bounds[q, 0])
