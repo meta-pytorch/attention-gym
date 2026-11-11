@@ -248,7 +248,7 @@ def mutations() -> list[Mutation]:
         Mutation(
             "unchecked_no_reason",
             "E77",
-            'with unchecked("unclosed", reason=""):\n    ch.acquire(SLOT)',
+            'with unchecked("tma", reason=""):\n    ch.acquire(SLOT)',
             error=ValueError,
             message="non-empty reason",
         ),
