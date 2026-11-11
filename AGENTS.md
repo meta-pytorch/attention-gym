@@ -111,9 +111,8 @@ Keep the math in keyword arguments and the kernel in `kernel_options`:
 - An option that only chooses how a fused kernel runs (`backend`, `schedule`, `autotune`,
   `bwd_recompute_p`, `batch_invariant`) is a key of the operation's typed `kernel_options`
   dict (`attn_gym/types.py`, `attn_gym/linear/types.py`). New kernel knobs are added there, not
-  as keyword arguments. Unknown keys and wrongly typed values raise; nonempty options with
-  `impl="reference"` raise, except in `paged_mla_decode`, which validates the options but
-  ignores them for reference execution.
+  as keyword arguments. Every implementation validates the options: unknown keys and wrongly
+  typed values raise. `impl="reference"` then ignores them, so one dict serves both.
 - One option has one spelling across operations. Breaking a public signature to restore that is
   acceptable; say so in the PR.
 

@@ -81,8 +81,6 @@ def chunk_gdn(
     """
     selected_impl = resolve_impl(impl)
     options = resolve_kernel_options(kernel_options)
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
@@ -281,8 +279,6 @@ def recurrent_gdn(
     """
     selected_impl = resolve_impl(impl)
     options = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_gdn")
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
     validate_gdn_inputs(
         q,
         k,

@@ -89,7 +89,7 @@ def test_fused_requires_cuda(inputs, impl):
 def test_invalid_kernel_options(inputs, options):
     with pytest.raises(ValueError, match="unsupported gather_attn kernel options"):
         gather_attn(**inputs, kernel_options=options)
-    with pytest.raises(ValueError, match="kernel_options are not supported"):
+    with pytest.raises(ValueError, match="unsupported gather_attn kernel options"):
         gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options=options)
 
 
@@ -103,9 +103,10 @@ def test_recompute_p_option_is_valid(inputs, options):
 
 
 @pytest.mark.parametrize("backend", ["cute", "triton"])
-def test_reference_rejects_backend_options(inputs, backend):
-    with pytest.raises(ValueError, match="kernel_options are not supported"):
-        gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options={"backend": backend})
+def test_reference_ignores_backend_options(inputs, backend):
+    expected = gather_attn(**inputs, impl=Impl.REFERENCE)
+    actual = gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options={"backend": backend})
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.usefixtures("fresh_compile_cache")

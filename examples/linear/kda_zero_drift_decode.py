@@ -85,8 +85,8 @@ def run_chunk(
         initial_state,
         output_final_state=output_final_state,
         impl=impl,
-        # Fixed heuristics keep kernel selection repeatable; the reference takes no kernel options.
-        kernel_options={"autotune": False} if impl == "fused" else None,
+        # Fixed heuristics keep kernel selection repeatable.
+        kernel_options={"autotune": False},
     )
 
 

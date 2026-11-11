@@ -63,8 +63,40 @@ def test_cudnn_accepts_the_autotune_option():
 def test_operations_reject_a_non_bool_autotune_option(operation):
     with pytest.raises(TypeError, match="must be a bool"):
         operation(*delta_rule_inputs(), kernel_options={"autotune": 1})
-    with pytest.raises(ValueError, match="kernel_options are not supported with impl='reference'"):
-        operation(*delta_rule_inputs(), impl="reference", kernel_options={"autotune": False})
+    with pytest.raises(TypeError, match="must be a bool"):
+        operation(*delta_rule_inputs(), impl="reference", kernel_options={"autotune": 1})
+
+
+def kda_inputs() -> tuple[torch.Tensor, ...]:
+    q, k, v, _gate, beta = delta_rule_inputs()
+    return q, k, v, -torch.rand(1, 4, 1, 8), beta
+
+
+REFERENCE_OPTIONS = {
+    "chunk_kda": (linear.chunk_kda, kda_inputs, {"autotune": False, "backend": "cudnn"}),
+    "recurrent_kda": (
+        linear.recurrent_kda,
+        kda_inputs,
+        {"autotune": False, "batch_invariant": True},
+    ),
+    "chunk_gdn": (linear.chunk_gdn, delta_rule_inputs, {"autotune": False, "backend": "cudnn"}),
+    "recurrent_gdn": (
+        linear.recurrent_gdn,
+        delta_rule_inputs,
+        {"autotune": False, "batch_invariant": True},
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "operation,make_inputs,options", REFERENCE_OPTIONS.values(), ids=REFERENCE_OPTIONS
+)
+def test_reference_validates_and_ignores_kernel_options(operation, make_inputs, options):
+    """Kernel options choose how fused kernels run, so one dict serves both implementations."""
+    inputs = make_inputs()
+    expected, _ = operation(*inputs, impl="reference")
+    actual, _ = operation(*inputs, impl="reference", kernel_options=options)
+    assert torch.equal(actual, expected)
 
 
 def test_paged_mla_decode_validates_its_kernel_options():

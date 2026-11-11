@@ -199,23 +199,16 @@ def lightning_indexer(
 
     selected_impl = resolve_impl(impl)
     _validate_inputs(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
+    if kernel_options not in (None, {}, {"backend": "cute"}, {"backend": "triton"}):
+        raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
     match selected_impl:
         case Impl.REFERENCE:
-            if kernel_options:
-                raise ValueError("kernel_options are not supported with impl='reference'")
             from .impl import reference
 
             return reference.launch(
                 q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k
             )
         case Impl.FUSED:
-            if kernel_options not in (
-                None,
-                {},
-                {"backend": "cute"},
-                {"backend": "triton"},
-            ):
-                raise ValueError(f"unsupported lightning_indexer kernel options: {kernel_options}")
             if not q.is_cuda:
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
             backend = (kernel_options or {}).get("backend", "auto")

@@ -25,8 +25,7 @@ AttentionInput = Tensor | tuple[Tensor, Tensor]
 
 
 class GatherAttnKernelOptions(TuningOptions, total=False):
-    """Fused ``gather_attn`` backend options; nonempty options are invalid with
-    ``Impl.REFERENCE``.
+    """Fused ``gather_attn`` backend options, validated and then ignored by ``Impl.REFERENCE``.
 
     ``autotune`` applies to the Triton kernels, whose candidates differ in floating-point
     order. CuTe has one schedule and ignores it.
@@ -395,8 +394,8 @@ def gather_attn(
             floating-point order; False, or deterministic mode, launches each kernel's
             pinned configuration instead. CuTe has one schedule and ignores this option.
             Explicit backend requests are honored; execution failures are never
-            retried on another backend. Nonempty options are invalid with
-            Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward, and
+            retried on another backend. Impl.REFERENCE validates the options
+            and ignores them. Bare and zero-width paired shared-KV Triton backward, and
             the grouped schedule's sparse dK/dV for sparse selections over small heads,
             accumulate with nondeterministic atomics unless deterministic algorithms
             are enabled.
@@ -445,8 +444,6 @@ def gather_attn(
         contributions to all inputs are zero. Inactive packed tails remain undefined.
     """
     selected_impl = resolve_impl(impl)
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
     options = kernel_options or {}
     autotune = _resolve_kernel_options(options)
 

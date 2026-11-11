@@ -486,6 +486,7 @@ def _fwd_o_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
         args["BT"],
         args["FASTMATH"],
         args["IS_VARLEN"],
+        args["USE_INT64_OFFSETS"],
     )
 
 

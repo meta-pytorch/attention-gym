@@ -3,8 +3,9 @@
 ``triton.autotune`` and ``triton.heuristics`` rebuild argument dictionaries on every launch;
 ``TritonTuner`` memoizes the winner under an explicit key and launches the kernel directly.
 
-``tuner.pinned`` never benchmarks, so every process on one GPU model launches the same
-configuration. Callers choose between the two; see ``attn_gym._backends.autotune``.
+``tuner.pinned`` never benchmarks. Given the same launch arguments and software stack, it
+selects the same configuration on a given GPU model. Callers choose between the two; see
+``attn_gym._backends.autotune``.
 """
 
 from __future__ import annotations

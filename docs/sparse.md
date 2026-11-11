@@ -44,7 +44,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
   allocation. This scratch is additional to the returned indices; Triton needs no global
   score scratch.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
-  Omit options for automatic selection. Options are rejected for `impl="reference"`.
+  Omit options for automatic selection. `impl="reference"` validates options and ignores them.
   Unsupported shapes, missing dependencies, and launch errors propagate;
   there is no retry with another backend.
 

@@ -63,6 +63,8 @@ candidates would have given up most of the tuning.
 - Pinning does not remove other nondeterminism. `gather_attn`'s default backward uses atomics;
   only deterministic mode switches to the schedules without them.
 - State-mutating recurrences (paged scans, the `paged_chunk_gdn` recurrence) are never tuned.
+- The reference implementation validates `kernel_options` and ignores them, so one dict can be
+  passed to either implementation.
 - `paged_mla_decode` keeps its earlier default of not tuning; when asked to tune, each bucket
   must run once before CUDA graph capture.
 
@@ -79,7 +81,7 @@ candidates would have given up most of the tuning.
 ## Migration measurements
 
 Moving the `triton.autotune` kernels to `TritonTuner`, before (`a6a5a8e4`) against after, on
-a GB200 (sm103) with BF16 inputs, tuning enabled, each run in its own process after a fresh
+a GB200 with BF16 inputs, tuning enabled, each run in its own process after a fresh
 tuning sweep. Lower is better. The portable GDN backward and the pointer output kernel do not
 run on this GPU by default and were forced the way their tests force them.
 
@@ -101,7 +103,7 @@ run on this GPU by default and were forced the way their tests force them.
 
 Rows marked "host" are synchronized wall-clock medians of five runs, which vary by about 10%
 between runs on the smaller shapes; the others are CUDA kernel time, medians of three runs.
-Where the winner is the same, latency is the same. The one 1.17 row is a different pick between
+With matching winners, no latency change was observed beyond run-to-run variation. The one 1.17 row is a different pick between
 two candidates the tuner times within its resolution (15.4 µs each including launch).
 
 A winner-cache miss became cheaper, because `run_tunable` times fewer launches than
@@ -109,6 +111,12 @@ A winner-cache miss became cheaper, because `run_tunable` times fewer launches t
 1.5–1.7 s to 0.21–0.48 s, the recurrent scan 1.8 s to 0.47 s.
 
 The measurement scripts were scratch files and are not checked in.
+
+- **Bucketing the recurrent scan's sequence count.** Its key holds the exact count, so each new
+  batch size tunes once. Sharing one winner across a power-of-two bucket was measured on a
+  GB200 (H=16, K=V=128, BF16): no change where the winner agrees, but 1.12–1.34x slower between
+  9 and 16 sequences at 256 and 2048 tokens, where the preferred value tile
+  changes. The key was left exact.
 
 ## Checks to repeat when touching a tuned kernel
 

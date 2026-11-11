@@ -100,7 +100,7 @@ def test_invalid_backend_options(options):
     q, k, weights = torch.zeros(1, 2, 2, 16), torch.zeros(1, 2, 16), torch.zeros(1, 2, 2)
     with pytest.raises(ValueError, match="unsupported lightning_indexer kernel options"):
         lightning_indexer(q, k, weights, 1, kernel_options=options)
-    with pytest.raises(ValueError, match="kernel_options are not supported"):
+    with pytest.raises(ValueError, match="unsupported lightning_indexer kernel options"):
         lightning_indexer(q, k, weights, 1, impl="reference", kernel_options=options)
 
 

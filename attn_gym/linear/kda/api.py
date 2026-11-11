@@ -135,8 +135,6 @@ def chunk_kda(
     selected_impl = resolve_impl(impl)
     options = resolve_kernel_options(kernel_options)
     autotune = should_autotune(options.autotune)
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
     validate_kda_inputs(
         q,
         k,
@@ -444,8 +442,6 @@ def recurrent_kda(
     """
     selected_impl = resolve_impl(impl)
     options = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_kda")
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
     # A paged pool's leading dimension is the slot count, not the sequence count, so the
     # shared per-sequence state check does not apply; the pool is checked below instead.
     validate_kda_inputs(

@@ -73,15 +73,6 @@ def test_impl_accepts_enum_and_string():
         recurrent_kda(q, k, v, gate, beta, impl="naive")
 
 
-@pytest.mark.parametrize("operation", [chunk_kda, recurrent_kda])
-def test_reference_rejects_the_autotune_option(operation):
-    """The reference has no kernels to tune, so it rejects every kernel option."""
-    q, k, v, gate, beta = _inputs(tokens=8)
-
-    with pytest.raises(ValueError, match="kernel_options are not supported with impl='reference'"):
-        operation(q, k, v, gate, beta, kernel_options={"autotune": False}, impl="reference")
-
-
 def test_recurrent_reference_matches_fused():
     """Agree across implementations on dense batches."""
     q, k, v, gate, beta = _inputs()
@@ -229,16 +220,8 @@ def test_chunk_kernel_options_plumbing():
         kernel_options=options,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    with pytest.raises(ValueError, match="not supported with impl='reference'"):
-        chunk_kda(
-            q,
-            k,
-            v,
-            gate,
-            beta,
-            impl="reference",
-            kernel_options={"backend": "cudnn"},
-        )
+    with pytest.raises(ValueError, match="unsupported chunk_kda kernel options"):
+        chunk_kda(q, k, v, gate, beta, impl="reference", kernel_options={"unknown": True})
 
 
 @pytest.mark.parametrize("fastmath", [False, True])

@@ -85,7 +85,9 @@ def _recurrent_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
 
     The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
     ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; the bucket collapses the exact token
-    count to that information so new lengths do not re-benchmark.
+    count to that information so new lengths do not re-benchmark. ``N`` stays exact because
+    sharing winners across a sequence-count bucket regressed measured latency; see
+    ``docs/developers/tuned-kernels.md``.
     """
     operands = ("q", "k", "v", "gate", "beta", "h0", "cu_seqlens")
     average_tokens = _average_tokens(args["T"], args["N"], args["IS_VARLEN"])

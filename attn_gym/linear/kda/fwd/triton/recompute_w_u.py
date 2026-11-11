@@ -399,6 +399,7 @@ _TUNING_ARGS = (
     "IS_RAGGED",
     "HAS_GK",
     "STORE_QG",
+    "USE_INT64_OFFSETS",
 )
 
 
