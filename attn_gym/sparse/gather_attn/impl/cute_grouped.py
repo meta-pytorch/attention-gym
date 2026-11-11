@@ -1,14 +1,9 @@
-"""Warpdrive gather attention for separate values and grouped KV heads.
+"""Common loader, dynamic ABI and launcher for grouped warpdrive gather attention.
 
-One CTA owns a query and up to four heads of one KV group. Four loading warps gather
-K/V into a two-stage SMEM ring; four compute warps each own one query head. Every
-stage exchanges ``block_k`` occurrences, including duplicates and invalid padding.
-The first two empty stages seed progress. All readers release before a stage is
-overwritten, including warps outside a partial head group.
-
-The forward uses FP32 online softmax. Backward recomputes probabilities and accumulates
-K/V and sink gradients with FP32 atomics; it is not deterministic. Only selected pool
-rows are read. There are no raw barriers, asynchronous copies, or storage aliases.
+Each CTA owns a query and up to 16 heads of one KV group. Loading warps gather
+32 selected K/V rows per stage, preserving duplicates and masking invalid indices.
+A named FULL/EMPTY pair protects each of two shared-memory stages; the initially
+empty stages seed progress. See cute_grouped_mma.py for the tensor-core roles.
 """
 
 from dataclasses import dataclass
@@ -17,9 +12,8 @@ import cutlass
 import torch
 from cutlass import Boolean, Float32, Int32, Int64, cute
 
-from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym._backends.cute.utils import requires_int64_abi, tensor_supports_contiguous_dim
 from attn_gym.warpdrive import (
-    Consumer,
     Local,
     OneShot,
     Producer,
@@ -76,14 +70,15 @@ class GatherGrouped(WarpSpecialized):
         index64: bool = False,
         sink_fp32: bool = False,
         wide: bool = False,
-        block_k: int = 16,
+        vectorized: bool = False,
+        block_k: int = 32,
         stages: int = 2,
     ):
         self.dim = dim
         self.heads = heads
         self.kv_heads = kv_heads
         self.group = heads // kv_heads
-        self.head_tiles = cute.ceil_div(self.group, 4)
+        self.head_tiles = cute.ceil_div(self.group, 16)
         self.has_window = has_window
         self.backward = backward
         self.separate_values = separate_values
@@ -92,11 +87,12 @@ class GatherGrouped(WarpSpecialized):
         self.index64 = index64
         self.sink_fp32 = sink_fp32
         self.wide = wide
+        self.vectorized = vectorized
         self.block_k = block_k
         self.stages = stages
         self.smem_plan = SmemPlan()
-        k = self.smem_plan.buffer("K", cutlass.BFloat16)
-        v = self.smem_plan.buffer("V", cutlass.BFloat16)
+        k = self.smem_plan.buffer("K", cutlass.BFloat16, align=128)
+        v = self.smem_plan.buffer("V", cutlass.BFloat16, align=128)
         index = self.smem_plan.buffer("index", Int32)
         # This is a purely thread-to-thread exchange. Named barriers synchronize
         # all writers/readers directly, with one FULL/EMPTY pair per stage.
@@ -137,7 +133,7 @@ class GatherGrouped(WarpSpecialized):
         total = cutlass.select_(active, local_n + Int32(p.indices.shape[2]), Int32(0))
         return local_n, total, k_start, k_end, active
 
-    @role(warps=range(4, 8))
+    @role(warps=range(1, 4))
     @cute.jit
     def load(self, p: GatherParams, *, kv: Producer, work: WorkCursor, me: Local):
         while work.valid:
@@ -166,7 +162,58 @@ class GatherGrouped(WarpSpecialized):
                                     index = Int32(selected) + k_start
                         if me.lane == 0:
                             data["index"][row] = index
-                        for part in cutlass.range_constexpr(cute.ceil_div(self.dim, 32)):
+                        if cutlass.const_expr(self.vectorized):  # noqa: SIM102
+                            if me.lane * 8 < self.dim:
+                                key_vec = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                                value_vec = cute.make_rmem_tensor((8,), cutlass.BFloat16)
+                                key_vec.fill(0)
+                                value_vec.fill(0)
+                                if index >= 0:
+                                    coord = (
+                                        self.address(batch),
+                                        self.address(kv_head),
+                                        self.address(index),
+                                        None,
+                                    )
+                                    if cutlass.const_expr(self.has_window):
+                                        if local:
+                                            cute.autovec_copy(
+                                                cute.local_tile(p.lk[coord], (8,), (me.lane,)),
+                                                key_vec,
+                                            )
+                                            cute.autovec_copy(
+                                                cute.local_tile(p.lv[coord], (8,), (me.lane,)),
+                                                value_vec,
+                                            )
+                                        else:
+                                            cute.autovec_copy(
+                                                cute.local_tile(p.sk[coord], (8,), (me.lane,)),
+                                                key_vec,
+                                            )
+                                            cute.autovec_copy(
+                                                cute.local_tile(p.sv[coord], (8,), (me.lane,)),
+                                                value_vec,
+                                            )
+                                    else:
+                                        cute.autovec_copy(
+                                            cute.local_tile(p.sk[coord], (8,), (me.lane,)),
+                                            key_vec,
+                                        )
+                                        cute.autovec_copy(
+                                            cute.local_tile(p.sv[coord], (8,), (me.lane,)),
+                                            value_vec,
+                                        )
+                                cute.autovec_copy(
+                                    key_vec,
+                                    cute.local_tile(data["K"][None, row], (8,), (me.lane,)),
+                                )
+                                cute.autovec_copy(
+                                    value_vec,
+                                    cute.local_tile(data["V"][None, row], (8,), (me.lane,)),
+                                )
+                        for part in cutlass.range_constexpr(
+                            0 if self.vectorized else cute.ceil_div(self.dim, 32)
+                        ):
                             d = me.lane + part * 32
                             if d < self.dim:
                                 key, value = Float32(0), Float32(0)
@@ -191,177 +238,6 @@ class GatherGrouped(WarpSpecialized):
                                 data["V"][d, row] = value.to(cutlass.BFloat16)
             work.advance()
         return kv, work
-
-    @role(warps=range(4))
-    @cute.jit
-    def compute(self, p: GatherParams, *, kv: Consumer, work: WorkCursor, me: Local):
-        width = cute.ceil_div(self.dim, 32)
-        q = cute.make_rmem_tensor((width,), Float32)
-        acc = cute.make_rmem_tensor((width,), Float32)
-        go = cute.make_rmem_tensor((width,), Float32)
-        kr = cute.make_rmem_tensor((width,), Float32)
-        vr = cute.make_rmem_tensor((width,), Float32)
-        while work.valid:
-            token, head_tile, batch = work.item
-            kv_head = head_tile // self.head_tiles
-            group_head = head_tile % self.head_tiles * 4 + me.warp
-            head = kv_head * self.group + group_head
-            local_n, total, _, _, active = self.bounds(p, token)
-            valid_head = (group_head < self.group) & active
-            delta, row_lse = Float32(0), Float32(0)
-            maximum, denominator = Float32(-float("inf")), Float32(0)
-            if cutlass.const_expr(self.has_sink):  # noqa: SIM102
-                if valid_head:
-                    maximum = p.sink[self.address(head)].to(Float32)
-                    denominator = cutlass.select_(maximum > -float("inf"), Float32(1), Float32(0))
-            for part in cutlass.range_constexpr(width):
-                d = me.lane + part * 32
-                q[part], acc[part], go[part] = Float32(0), Float32(0), Float32(0)
-                if valid_head & (d < self.dim):
-                    coord = (
-                        self.address(batch),
-                        self.address(head),
-                        self.address(token),
-                        self.address(d),
-                    )
-                    q[part] = p.q[coord].to(Float32)
-                    if cutlass.const_expr(self.backward):
-                        go[part] = p.go[coord].to(Float32)
-                        delta += go[part] * p.out[coord].to(Float32)
-            if cutlass.const_expr(self.backward):
-                delta = cute.arch.warp_reduction_sum(delta)
-                if valid_head:
-                    row_lse = p.lse[self.address(batch), self.address(head), self.address(token)]
-            for base in cutlass.range(0, total, self.block_k, unroll=1):
-                # Every declared consumer participates, even in partial head groups.
-                with kv.consume() as tile:
-                    data = tile.data
-                    for row in cutlass.range(self.block_k, unroll=1):
-                        index = data["index"][row]
-                        if valid_head & (index >= 0):
-                            score, dp = Float32(0), Float32(0)
-                            for part in cutlass.range_constexpr(width):
-                                d = me.lane + part * 32
-                                kr[part], vr[part] = Float32(0), Float32(0)
-                                if d < self.dim:
-                                    kr[part] = data["K"][d, row].to(Float32)
-                                    vr[part] = data["V"][d, row].to(Float32)
-                                score += q[part] * kr[part]
-                                if cutlass.const_expr(self.backward):
-                                    dp += go[part] * vr[part]
-                            score = cute.arch.warp_reduction_sum(score) * p.scale
-                            if cutlass.const_expr(self.backward):
-                                prob = cute.math.exp2((score - row_lse) * LOG2E)
-                                dp = cute.arch.warp_reduction_sum(dp)
-                                ds = prob * (dp - delta) * p.scale
-                                for part in cutlass.range_constexpr(width):
-                                    d = me.lane + part * 32
-                                    acc[part] += ds * kr[part]
-                                    if d < self.dim:
-                                        coord = (
-                                            self.address(batch),
-                                            self.address(kv_head),
-                                            self.address(index),
-                                            self.address(d),
-                                        )
-                                        dk = ds * q[part]
-                                        dv = prob * go[part]
-                                        if cutlass.const_expr(not self.separate_values):
-                                            dk += dv
-                                        if cutlass.const_expr(self.has_window):
-                                            if base + row < local_n:
-                                                cute.arch.atomic_add(
-                                                    p.dlk.iterator + p.dlk.layout(coord),
-                                                    dk,
-                                                    sem="relaxed",
-                                                    scope="gpu",
-                                                )
-                                                if cutlass.const_expr(self.separate_values):
-                                                    cute.arch.atomic_add(
-                                                        p.dlv.iterator + p.dlv.layout(coord),
-                                                        dv,
-                                                        sem="relaxed",
-                                                        scope="gpu",
-                                                    )
-                                            else:
-                                                cute.arch.atomic_add(
-                                                    p.dsk.iterator + p.dsk.layout(coord),
-                                                    dk,
-                                                    sem="relaxed",
-                                                    scope="gpu",
-                                                )
-                                                if cutlass.const_expr(self.separate_values):
-                                                    cute.arch.atomic_add(
-                                                        p.dsv.iterator + p.dsv.layout(coord),
-                                                        dv,
-                                                        sem="relaxed",
-                                                        scope="gpu",
-                                                    )
-                                        else:
-                                            cute.arch.atomic_add(
-                                                p.dsk.iterator + p.dsk.layout(coord),
-                                                dk,
-                                                sem="relaxed",
-                                                scope="gpu",
-                                            )
-                                            if cutlass.const_expr(self.separate_values):
-                                                cute.arch.atomic_add(
-                                                    p.dsv.iterator + p.dsv.layout(coord),
-                                                    dv,
-                                                    sem="relaxed",
-                                                    scope="gpu",
-                                                )
-                            else:
-                                next_max = cutlass.max(maximum, score)
-                                alpha = cute.math.exp2((maximum - next_max) * LOG2E)
-                                prob = cute.math.exp2((score - next_max) * LOG2E)
-                                denominator = denominator * alpha + prob
-                                maximum = next_max
-                                for part in cutlass.range_constexpr(width):
-                                    acc[part] = acc[part] * alpha + prob * vr[part]
-            if valid_head:
-                row_coord = (self.address(batch), self.address(head), self.address(token))
-                for part in cutlass.range_constexpr(width):
-                    d = me.lane + part * 32
-                    if d < self.dim:
-                        coord = (*row_coord, self.address(d))
-                        if cutlass.const_expr(self.backward):
-                            p.dq[coord] = acc[part].to(cutlass.BFloat16)
-                        else:
-                            value = Float32(0)
-                            if denominator > 0:
-                                value = acc[part] / denominator
-                            p.out[coord] = value.to(cutlass.BFloat16)
-                if me.lane == 0:
-                    if cutlass.const_expr(self.backward):
-                        if cutlass.const_expr(self.has_sink):  # noqa: SIM102
-                            if row_lse > -float("inf"):
-                                dsink = -cute.math.exp2((maximum - row_lse) * LOG2E) * delta
-                                cute.arch.atomic_add(
-                                    p.dsink.iterator + p.dsink.layout((self.address(head),)),
-                                    dsink,
-                                    sem="relaxed",
-                                    scope="gpu",
-                                )
-                    else:
-                        result_lse = Float32(-float("inf"))
-                        if denominator > 0:
-                            result_lse = maximum + cute.math.log2(denominator) * LN2
-                        p.lse[row_coord] = result_lse
-            work.advance()
-        return kv, work
-
-    @cute.kernel
-    def kernel(self, p: GatherParams, bound):
-        self.begin_roles(
-            work=bound,
-            layouts={
-                "K": cute.make_layout((self.dim, self.block_k, self.stages)),
-                "V": cute.make_layout((self.dim, self.block_k, self.stages)),
-                "index": cute.make_layout((self.block_k, self.stages)),
-            },
-        )
-        self.run_roles(p)
 
     @cute.jit
     def __call__(
@@ -420,12 +296,13 @@ def compile_grouped(op: GatherGrouped):
     size = cute.sym_int64 if op.wide else cute.sym_int
     batch, tokens, sparse_tokens, topk, docs = (size() for _ in range(5))
 
-    def tensor(dtype, shape, contiguous=-1):
+    def tensor(dtype, shape, contiguous=-1, vector=False):
         return make_fake_strided_tensor(
             dtype,
             shape,
             contiguous_dim=contiguous,
             use_int64_strides=op.wide,
+            stride_divisibility=8 if vector else 1,
         )
 
     q_shape = (batch, op.heads, tokens, op.dim)
@@ -433,16 +310,16 @@ def compile_grouped(op: GatherGrouped):
     l_shape = (batch, op.kv_heads, tokens, op.dim)
     indices = tensor(Int64 if op.index64 else Int32, (batch, tokens, topk), None)
 
-    def optional(dtype, shape, enabled=True, contiguous=-1):
-        return tensor(dtype, shape, contiguous) if enabled else None
+    def optional(dtype, shape, enabled=True, contiguous=-1, vector=False):
+        return tensor(dtype, shape, contiguous, vector) if enabled else None
 
     return compile_tvm_ffi(
         op,
         tensor(cutlass.BFloat16, q_shape),
-        tensor(cutlass.BFloat16, k_shape),
-        optional(cutlass.BFloat16, l_shape, op.has_window),
-        tensor(cutlass.BFloat16, k_shape),
-        optional(cutlass.BFloat16, l_shape, op.has_window),
+        tensor(cutlass.BFloat16, k_shape, vector=op.vectorized),
+        optional(cutlass.BFloat16, l_shape, op.has_window, vector=op.vectorized),
+        tensor(cutlass.BFloat16, k_shape, vector=op.vectorized),
+        optional(cutlass.BFloat16, l_shape, op.has_window, vector=op.vectorized),
         indices,
         optional(Float32 if op.sink_fp32 else cutlass.BFloat16, (op.heads,), op.has_sink, None),
         optional(Int32, (docs,), op.packed),
@@ -557,10 +434,18 @@ def _launch(
         "index64": kv_indices.dtype == torch.int64,
         "sink_fp32": sink is not None and sink.dtype == torch.float32,
         "wide": requires_int64_abi(*args),
+        "vectorized": all(
+            tensor_supports_contiguous_dim(x, alignment_bytes=16)
+            for x in (sparse_kv, local, values, local_values)
+            if x is not None
+        ),
     }
+    from .cute_grouped_mma import GatherGroupedMma, GatherGroupedMmaBackward
+
+    kernel_type = GatherGroupedMmaBackward if backward else GatherGroupedMma
     compiled = compile_grouped.by_static_key(
         (*geometry, *options.values()),
-        lambda: compile_grouped(GatherGrouped(*geometry, **options)),
+        lambda: compile_grouped(kernel_type(*geometry, **options)),
     )
     compiled(*args, scale, sliding_window_size)
     if not backward:

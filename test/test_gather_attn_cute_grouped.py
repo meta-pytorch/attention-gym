@@ -94,6 +94,8 @@ def _check(inputs, window):
         (5, 1, 64, True, 7, 37),
         (4, 4, 16, True, 0, 17),
         (6, 2, 32, True, 0, 0),
+        (34, 2, 48, True, 5, 65),
+        (33, 1, 80, True, 0, 129),
     ],
 )
 @pytest.mark.parametrize("packed", [False, True])
@@ -126,6 +128,16 @@ def test_forward_and_gradients(heads, kv_heads, dim, separate, window, topk, pac
 def test_layouts_and_wide_offsets(monkeypatch, variant):
     from attn_gym.sparse.gather_attn.impl import cute_grouped
 
+    # Observe the actual compile ABI, including when the disk cache is warm.
+    compile_grouped = cute_grouped.compile_grouped
+    vectorized = []
+
+    def compile_op(op):
+        vectorized.append(op.vectorized)
+        return compile_grouped(op)
+
+    compile_op.by_static_key = lambda key, factory: factory()
+    monkeypatch.setattr(cute_grouped, "compile_grouped", compile_op)
     inputs = _inputs()
     for name, tensor in list(inputs.items()):
         if variant == "misaligned":
@@ -149,6 +161,7 @@ def test_layouts_and_wide_offsets(monkeypatch, variant):
         inputs["local_kv"] = inputs["local_v"] = None
         inputs["attention_sink"] = None
     _check(inputs, 0 if variant == "no-local" else 7)
+    assert vectorized == [variant != "misaligned"] * 2
 
 
 @pytest.mark.parametrize("sink", [False, True])

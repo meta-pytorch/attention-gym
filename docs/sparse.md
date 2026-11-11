@@ -238,19 +238,23 @@ positive width can launch.
   output-gradient feature dimensions. It requires CuTeDSL 4.6.2+, without a FlashAttention
   dependency.
 
-The warpdrive grouped kernel assigns one query and up to four heads of a KV group to each
-CTA. Warps 4–7 gather selected K/V rows into a two-stage shared-memory ring, and warps 0–3
-compute one head each. Each stage uses FULL and EMPTY named barriers counting all 256
-threads. All 128 readers release after reading, including unused warps in partial head groups.
-Forward uses FP32 online softmax and SIMT arithmetic. Backward recomputes probabilities and
-uses FP32 atomic K/V and sink accumulation before casting gradients to the input dtype.
+The warpdrive grouped kernel assigns one query and up to 16 heads of a KV group to each
+CTA. Warps 1–3 gather selected K/V rows into a two-stage shared-memory ring, and warp 0
+computes 32-key tiles with BF16 tensor-core matrix products and FP32 accumulation.
+Each stage uses FULL and EMPTY named barriers counting all 128 threads. The compute warp
+holds the stage until its matrix products finish, including for partial head groups.
+Forward uses FP32 online softmax. Backward recomputes probabilities and combines head
+contributions with tensor cores before FP32 atomic K/V accumulation; sink gradients also
+use FP32 atomics. Probabilities and score gradients are rounded to BF16 for matrix products,
+and final gradients are cast to the input dtype.
 This path always recomputes probabilities, including with `bwd_recompute_p=False`.
 It reads only selected rows, preserves duplicates, and supports the same local/sparse pool
 aliases and document-relative selections as the reference. Token, pool, batch, document,
 selection-count and positive window-size changes reuse compiled kernels; head geometry,
-layout address width, index/sink dtype and optional-input modes select variants.
-Triton remains the automatic grouped backend; the SIMT implementation does not imply a
-speedup over Triton's tensor-core schedules.
+layout address width, index/sink dtype and optional-input modes select variants. Aligned K/V
+rows use 16-byte vector loads; element-aligned rows use a separate general signature.
+Triton remains the automatic grouped backend: relative performance depends on the shape
+and selection pattern, and the CuTe path remains slower on long selections in measured cases.
 
 Pool rows that no query selects must be finite on Triton's grouped schedule (separate values or
 `1 < kv_heads < H`). With `W = 0`, tiles of nearby queries whose selections fall in a short
