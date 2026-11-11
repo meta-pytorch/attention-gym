@@ -82,6 +82,22 @@ def _reset_shared_compile_wrapper() -> Iterator[None]:
     reset_code(wrap_inline(len).__code__)
 
 
+@pytest.fixture(autouse=True)
+def _check_real_kernel_fences(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reject missing-fence verdicts in shipped kernels, including cached reports."""
+    module = sys.modules.get("attn_gym.warpdrive.kernel")
+    if module is None:
+        return
+    original = module.WarpSpecialized._report_trace
+
+    def report(op):
+        original(op)
+        if type(op).__module__.startswith("attn_gym."):
+            assert "missing fence" not in op.checks().fences.values(), op.describe()
+
+    monkeypatch.setattr(module.WarpSpecialized, "_report_trace", report)
+
+
 @pytest.fixture
 def requires_blackwell() -> None:
     """Skip unless an SM100-family GPU (the warpdrive target) is present."""

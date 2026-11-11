@@ -1,8 +1,8 @@
 """Format collected kernel declarations and trace results as plain text.
 
 ``describe_kernel`` reads host state from ``WarpSpecialized._collect``. After compilation,
-it also shows TMA reports, opt-outs, alias findings and the traced protocol.
-``kernel_checks`` returns the channel and alias verdicts as data.
+it also shows TMA reports, opt-outs, alias and fence findings and the traced protocol.
+``kernel_checks`` returns the channel, alias and fence verdicts as data.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from attn_gym.warpdrive.channels import Threads, Tma, Umma, Warps
+from attn_gym.warpdrive.fences import FenceStatus
 from attn_gym.warpdrive.scheduling import _tile_grid, scheduler_role
 
 WIDTH = 100  # wrap channel flows past this many columns
@@ -37,15 +38,17 @@ class ChannelChecks:
 
 @dataclass(frozen=True)
 class KernelChecks:
-    """Channel and alias verdicts returned by ``WarpSpecialized.checks()``.
+    """Channel, alias and fence verdicts returned by ``WarpSpecialized.checks()``.
 
     ``channels`` includes every channel. ``aliases`` maps each examined overlap to its status,
     keyed by ``(name, overlapped name)`` (``name ~ overlapped name`` in ``describe()``).
-    It is empty before compilation or with ``alias_check="off"``.
+    ``fences`` maps each explicit fence to its status, keyed by ``(channel, "commit_fence"``
+    or ``"release_fence")``. Both are empty before compilation or with ``alias_check="off"``.
     """
 
     channels: dict[str, ChannelChecks]
     aliases: dict[tuple[str, str], AliasStatus]
+    fences: dict[tuple[str, str], FenceStatus]
 
 
 def kernel_checks(kernel) -> KernelChecks:
@@ -60,7 +63,9 @@ def kernel_checks(kernel) -> KernelChecks:
         channels[name] = ChannelChecks(tma, epochs)
     rep = kernel._ws_alias
     aliases = {} if rep is None else {r.names: r.status for r in rep.results}
-    return KernelChecks(channels, aliases)
+    fence_rep = kernel._ws_fences
+    fences = {} if fence_rep is None else {(r.channel, r.key): r.status for r in fence_rep.results}
+    return KernelChecks(channels, aliases, fences)
 
 
 def ownership_verdict(ownership: str) -> str:
@@ -80,6 +85,7 @@ def describe_kernel(kernel) -> str:
         _smem(kernel),
         _opt_outs(kernel),
         _alias(kernel),
+        _fences(kernel),
         _protocol(kernel),
     ]
     return "\n\n".join(s for s in sections if s)
@@ -514,6 +520,11 @@ def _smem(kernel) -> str:
 
 def _alias(kernel) -> str:
     rep = kernel._ws_alias
+    return "" if rep is None else rep.describe()
+
+
+def _fences(kernel) -> str:
+    rep = kernel._ws_fences
     return "" if rep is None else rep.describe()
 
 

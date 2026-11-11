@@ -17,7 +17,7 @@ import cutlass
 from cutlass import Int32, Uint32, cute, pipeline
 from cutlass._mlir.dialects import llvm
 
-from attn_gym.warpdrive import alias, tracing
+from attn_gym.warpdrive import alias, fences, tracing
 from attn_gym.warpdrive.cache._key import canonical_key, module_source_digest
 from attn_gym.warpdrive.channels import (
     SIDES,
@@ -464,8 +464,9 @@ class WarpSpecialized(metaclass=_KernelType):
     # ``__init__`` from a constructor argument so the compile key sees it, and use a dict: the
     # key canonicalizes dicts, not other mappings. Unknown names raise at collection.
     roles: dict[str, RoleConfig] | None = None
-    # Alias diagnostic (alias.py): "warn" (describe() plus one warning on findings), "strict"
-    # (raise on a potential hazard), or "off". Host-only: it never changes generated code.
+    # Alias diagnostic (alias.py) and fence check (fences.py): "warn" (describe() plus one
+    # warning on findings), "strict" (raise on a potential hazard or missing fence), or "off".
+    # Host-only: it never changes generated code.
     alias_check: str = "warn"
     trace_protocol: bool = False
     # Ranges named after roles and channels (tracing.py), set with enable_trace().
@@ -663,6 +664,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
         self._ws_alias = None  # alias.AliasReport, after a trace
+        self._ws_fences = None  # fences.FenceReport, after a trace
         self._ws_opt_outs = []
         self._ws_log = ProtocolLog() if self.trace_protocol else None
 
@@ -1004,6 +1006,7 @@ class WarpSpecialized(metaclass=_KernelType):
             "tma": self._ws_tma,
             "smem": smem,
             "alias": self._ws_alias,
+            "fences": self._ws_fences,
             "opt_outs": self._ws_opt_outs,
             "uses": self._ws_uses,
             "named_users": self._ws_named_users,
@@ -1025,6 +1028,7 @@ class WarpSpecialized(metaclass=_KernelType):
             name: replace(res, buffer=buffers[name]) for name, res in record["smem"].items()
         }
         self._ws_alias = record["alias"]
+        self._ws_fences = record["fences"]
         self._ws_opt_outs = record["opt_outs"]
         self._ws_uses = record["uses"]
         self._ws_named_users = record["named_users"]
@@ -1135,10 +1139,11 @@ class WarpSpecialized(metaclass=_KernelType):
         return importlib.import_module(".describe_graph", __package__).describe_graph(self, format)
 
     def checks(self) -> KernelChecks:
-        """Channel and alias verdicts from ``describe()``, as ``describe.KernelChecks``.
+        """Channel, alias and fence verdicts from ``describe()``, as ``describe.KernelChecks``.
 
-        Includes TMA copies, epoch ownership and declared overlaps. Applicable channel checks
-        are ``"not checked yet"`` before compilation; a ``jit_cache`` load restores the results.
+        Includes TMA copies, epoch ownership, declared overlaps and explicit fences. Applicable
+        channel checks are ``"not checked yet"`` before compilation; a ``jit_cache`` load
+        restores the results.
         """
         self._collect()
         return kernel_checks(self)
@@ -1485,16 +1490,17 @@ class WarpSpecialized(metaclass=_KernelType):
         return ctx
 
     def _finish_trace(self):
-        """Collect check opt-outs, run the named-barrier, epoch-ownership and alias checks, and
+        """Collect opt-outs, run named-barrier, epoch-ownership, alias and fence checks, and
         warn once about TMA channels the check could not verify."""
         self._ws_opt_outs = take_opt_outs()
         self._check_named_barriers()
         self._check_ownership()
-        self._ws_alias = None
+        self._ws_alias = self._ws_fences = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
         if self.alias_check != "off":
             self._ws_alias = alias.check(self, self._ws_alias_roles)
+            self._ws_fences = fences.check(self, self._ws_alias_roles)
         for name, ch in self._ws_chans.items():
             if ch.checks_tma:
                 report = self._ws_tma.setdefault(name, TmaReport())
@@ -1758,6 +1764,8 @@ class WarpSpecialized(metaclass=_KernelType):
         when a cached kernel's record is restored."""
         if self._ws_alias is not None:
             alias.report(self._ws_alias, self.alias_check, type(self).__name__)
+        if self._ws_fences is not None:
+            fences.report(self._ws_fences, self.alias_check, type(self).__name__)
         unverified = [n for n, rep in self._ws_tma.items() if rep.unverified]
         if unverified:
             details = "; ".join(f"{n}: {self._ws_tma[n].status()}" for n in unverified)

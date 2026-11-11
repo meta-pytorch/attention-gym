@@ -76,6 +76,7 @@ from attn_gym.warpdrive.cluster import (
     rank_value,
 )
 from attn_gym.warpdrive.compat import NATIVE_MULTI_ADVANCE, mbarrier_arrive
+from attn_gym.warpdrive.fences import FENCE_KINDS, derived_fences
 from attn_gym.warpdrive.protocol import (
     Lineage,
     ProtocolError,
@@ -150,9 +151,6 @@ def _fence(kinds: tuple[str, ...]):
             cute.arch.fence_view_async_shared()
         else:
             raise ValueError(f"unknown fence kind {kind!r}")
-
-
-FENCE_KINDS = ("tmem_store", "tmem_load", "smem_async")
 
 
 def _fences(side: str, value) -> tuple[str, ...]:
@@ -449,25 +447,10 @@ class Channel:
         self.remote_scope_overridden = self.remote_scope is not None
         if self.remote_scope is None:
             self.remote_scope = self.derived_remote_scope
-        # A generic read followed, through the release and the producer's acquire, by an
-        # async-proxy write of the same bytes is ordered only by fence.proxy.async in the
-        # reading thread: a proxy fence acts within one thread. TMA completion orders only the
-        # opposite direction, its bytes before the consumers' reads.
-        consumers = self.mechanisms("consumer")
-        refilled_by_tma = isinstance(self.producer, Tma) and any(
-            m in (Threads, Warps) for m in consumers
-        )
-        if refilled_by_tma and self.external != "consumer":
-            self.derived_release_fence = ("smem_async",)
+        # The proxy rules behind both defaults are fences.RULES.
+        self.derived_commit_fence, self.derived_release_fence = derived_fences(self)
         if not self.release_fence_overridden:
             self.release_fence = self.derived_release_fence
-        # Each SMEM writer needs fence.proxy.async before tcgen05.mma reads its stores.
-        # Neither the arrival nor the MMA warp's wait fences proxies. TMEM handoffs need no
-        # SMEM fence.
-        written_for_mma = self.producer in (Threads, Warps) and Umma in consumers
-        smem_storage = self.payload is not None or bool(self.buffers)
-        if written_for_mma and smem_storage and self.external != "producer":
-            self.derived_commit_fence = ("smem_async",)
         if not self.commit_fence_overridden:
             self.commit_fence = self.derived_commit_fence
 
