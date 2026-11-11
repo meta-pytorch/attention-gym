@@ -30,8 +30,6 @@ from attn_gym.warpdrive.describe_graph import (
 )
 from attn_gym.warpdrive.html_page import asset, page
 
-# Node kinds drawn in the side panel instead of the graph.
-_PANEL_KINDS = ("storage", "named_list")
 _HUB_KINDS = ("named", "turnstile", "barriers")
 
 COL_GAP = 48  # between rank columns: wires curve only here
@@ -113,23 +111,24 @@ def _items(graph: Graph, kernel):
     panel = []
     streams = []
     for n in graph.nodes:
-        if n.kind in _PANEL_KINDS:
-            title = "storage aliases" if n.kind == "storage" else "named barriers"
-            panel.append(_section(title, n.lines[1:]))
-        elif n.kind == "stream":
-            streams.append(n.lines)
-            if n.id in edged:
-                boxes[n.id] = _stream_box(n)
-        elif n.kind == "role":
-            boxes[n.id] = _role_box(n, roles[n.ref], kernel)
-        elif n.kind == "channel":
-            boxes[n.id] = _chip_box(n.id, [n.ref], n.lines, kernel)
-        elif n.kind in _HUB_KINDS and n.id not in edged:  # no known users to join
-            panel.append(_section(n.ref, n.lines[1:]))
-        elif n.kind in _HUB_KINDS:
-            boxes[n.id] = _hub_box(n)
-        else:  # raw code, kernel code
-            boxes[n.id] = _external_box(n)
+        match n.kind:
+            case "storage" | "named_list":  # drawn in the side panel instead of the graph
+                title = "storage aliases" if n.kind == "storage" else "named barriers"
+                panel.append(_section(title, n.lines[1:]))
+            case "stream":
+                streams.append(n.lines)
+                if n.id in edged:
+                    boxes[n.id] = _stream_box(n)
+            case "role":
+                boxes[n.id] = _role_box(n, roles[n.ref], kernel)
+            case "channel":
+                boxes[n.id] = _chip_box(n.id, [n.ref], n.lines, kernel)
+            case kind if kind in _HUB_KINDS and n.id not in edged:  # no known users to join
+                panel.append(_section(n.ref, n.lines[1:]))
+            case kind if kind in _HUB_KINDS:
+                boxes[n.id] = _hub_box(n)
+            case _:  # raw code, kernel code
+                boxes[n.id] = _external_box(n)
     if streams:
         panel.insert(
             0, _section("work streams", [" · ".join(s[:2]) + f" ({s[2]})" for s in streams])

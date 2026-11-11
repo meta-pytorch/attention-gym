@@ -144,14 +144,15 @@ def arrivals(mech, threads: int) -> int:
 def _fence(kinds: tuple[str, ...]):
     """Emit the side's fences, in declaration order, before its managed signal."""
     for kind in kinds:
-        if kind == "tmem_store":  # tcgen05.st -> tcgen05.mma reads TMEM
-            cute.arch.fence_view_async_tmem_store()
-        elif kind == "tmem_load":  # finish tcgen05.ld before MMA overwrites its columns
-            cute.arch.fence_view_async_tmem_load()
-        elif kind == "smem_async":  # st.shared -> TMA store / UMMA reads SMEM (async proxy)
-            cute.arch.fence_view_async_shared()
-        else:
-            raise ValueError(f"unknown fence kind {kind!r}")
+        match kind:
+            case "tmem_store":  # tcgen05.st -> tcgen05.mma reads TMEM
+                cute.arch.fence_view_async_tmem_store()
+            case "tmem_load":  # finish tcgen05.ld before MMA overwrites its columns
+                cute.arch.fence_view_async_tmem_load()
+            case "smem_async":  # st.shared -> TMA store / UMMA reads SMEM (async proxy)
+                cute.arch.fence_view_async_shared()
+            case _:
+                raise ValueError(f"unknown fence kind {kind!r}")
 
 
 def _fences(side: str, value) -> tuple[str, ...]:

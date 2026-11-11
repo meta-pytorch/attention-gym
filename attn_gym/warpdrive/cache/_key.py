@@ -302,27 +302,28 @@ def _canonicalize(item: Any) -> Any:
                 for field in dataclasses.fields(item)
             ),
         )
-    if isinstance(item, enum.Enum):
-        return ("enum", type(item).__module__, type(item).__qualname__, item.name)
-    if isinstance(item, types.FunctionType):
-        return _canonicalize_function(item)
-    if isinstance(item, type):
-        return ("type", item.__module__, item.__qualname__)
-    if isinstance(item, Path):
-        return ("path", str(item))
-    if isinstance(item, tuple):
-        return ("tuple", tuple(_canonicalize(value) for value in item))
-    if isinstance(item, list):
-        return ("list", tuple(_canonicalize(value) for value in item))
-    if isinstance(item, dict):
-        entries = [(_canonicalize(key), _canonicalize(value)) for key, value in item.items()]
-        return ("dict", tuple(sorted(entries, key=lambda entry: _pickle_sort_key(entry[0]))))
-    if isinstance(item, set):
-        values = [_canonicalize(value) for value in item]
-        return ("set", tuple(sorted(values, key=_pickle_sort_key)))
-    if isinstance(item, frozenset):
-        values = [_canonicalize(value) for value in item]
-        return ("frozenset", tuple(sorted(values, key=_pickle_sort_key)))
+    match item:
+        case enum.Enum():
+            return ("enum", type(item).__module__, type(item).__qualname__, item.name)
+        case types.FunctionType():
+            return _canonicalize_function(item)
+        case type():
+            return ("type", item.__module__, item.__qualname__)
+        case Path():
+            return ("path", str(item))
+        case tuple():
+            return ("tuple", tuple(_canonicalize(value) for value in item))
+        case list():
+            return ("list", tuple(_canonicalize(value) for value in item))
+        case dict():
+            entries = [(_canonicalize(key), _canonicalize(value)) for key, value in item.items()]
+            return ("dict", tuple(sorted(entries, key=lambda entry: _pickle_sort_key(entry[0]))))
+        case set():
+            values = [_canonicalize(value) for value in item]
+            return ("set", tuple(sorted(values, key=_pickle_sort_key)))
+        case frozenset():
+            values = [_canonicalize(value) for value in item]
+            return ("frozenset", tuple(sorted(values, key=_pickle_sort_key)))
     try:
         pickle.dumps(item, protocol=pickle.HIGHEST_PROTOCOL)
     except (pickle.PickleError, TypeError) as error:
