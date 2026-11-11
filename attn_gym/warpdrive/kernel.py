@@ -6,6 +6,7 @@ import copy
 import functools
 import importlib
 import inspect
+import itertools
 import pickle
 import warnings
 from collections.abc import Mapping
@@ -657,6 +658,7 @@ class WarpSpecialized(metaclass=_KernelType):
             self._bind_stream(name, st, roles, chans, cluster)
         roles.sort(key=lambda r: r.first_warp)
         self._validate(chans, turns, roles)
+        self._plan_registers(roles)
         self._validate_placement(chans, turns, roles)
         self._ws_named = _allocate_named(chans, named_bars)
         for name, nb in named_bars.items():
@@ -894,6 +896,14 @@ class WarpSpecialized(metaclass=_KernelType):
             _ = self.tmem_plan.alloc_cols  # raises when over capacity
         elif any(r.uses_tmem for r in roles):
             raise ProtocolError("roles take Tmem but the kernel has no tmem_plan")
+
+    def _plan_registers(self, roles):
+        """Size the launch and give every warpgroup its ``setmaxnreg`` budget.
+
+        Sets ``_ws_num_warps``, ``_ws_default_regs``, ``_ws_padding`` and
+        ``_ws_budget_groups``; rejects budgets the launch cannot supply.
+        """
+        owner = {w: r for r in roles for w in r.warps}
         num_warps = max(owner) + 1
         if min(owner) < 0 or num_warps > MAX_WARPS:
             raise ValueError(f"role warps must lie in [0, {MAX_WARPS})")
@@ -908,10 +918,9 @@ class WarpSpecialized(metaclass=_KernelType):
         # One setmaxnreg budget per warpgroup, set before dispatch; None when no role sets regs.
         wg_regs = [None] * -(-self._ws_num_warps // WARPGROUP)
         if uses_regs:
-            regs_of = {w: r.regs for r in roles for w in r.warps}
             for g in range(len(wg_regs)):
                 group = range(g * WARPGROUP, (g + 1) * WARPGROUP)
-                budgets = {owner[w]: regs_of[w] for w in group if w in owner}
+                budgets = {owner[w].name: owner[w].regs for w in group if w in owner}
                 vals = set(budgets.values())
                 if len(vals) > 1:
                     raise ValueError(f"warpgroup {g} has mixed register budgets {budgets}")
@@ -937,20 +946,11 @@ class WarpSpecialized(metaclass=_KernelType):
         # with one budget. Non-adjacent warpgroups never share a branch even when their
         # budgets agree: ptxas allocates a merged branch jointly and can spill one role under
         # the other's pressure (docs/warpdrive/configuration.md, "Placement and registers").
-        runs: list[tuple[int | None, list[int]]] = []
-        for g, regs in enumerate(wg_regs):
-            if runs and runs[-1][0] == regs:
-                runs[-1][1].append(g)
-            else:
-                runs.append((regs, [g]))
-        self._ws_budget_groups = [
-            (
-                regs,
-                tuple(wgs),
-                tuple(i for i, r in enumerate(roles) if r.first_warp // WARPGROUP in wgs),
-            )
-            for regs, wgs in runs
-        ]
+        self._ws_budget_groups = []
+        for regs, run in itertools.groupby(range(len(wg_regs)), key=lambda g: wg_regs[g]):
+            wgs = tuple(run)
+            role_ids = tuple(i for i, r in enumerate(roles) if r.first_warp // WARPGROUP in wgs)
+            self._ws_budget_groups.append((regs, wgs, role_ids))
 
     def role_config_key(self) -> tuple:
         """Resolved role placement and budgets, part of ``__cute_cache_key__``. The first call
