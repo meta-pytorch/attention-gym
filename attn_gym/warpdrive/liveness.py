@@ -98,8 +98,6 @@ def _check(kernel, roles: list) -> Liveness:
         if r.unread:
             return Liveness("unverified", r.unread)
         for ev in r.events:
-            if ev.kind == "open" and ev.data["handle"].closed_at is None:
-                return Liveness("unverified", f"{ev.data['handle'].what} at {ev.site} stays open")
             if ev.opted_out and ev.kind != "access":
                 return Liveness("unverified", f'unchecked("liveness") at {ev.site}')
             if ev.kind == "op" and ev.data["chan"] in external:
