@@ -790,9 +790,7 @@ class WorkStream:
             type(self.schedule.stages) is not int or self.schedule.stages <= 0
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
-        if isinstance(self.schedule, TilePersistent) and (
-            type(self.mapping) is not Raster or self.mapping != Raster()
-        ):
+        if isinstance(self.schedule, TilePersistent) and not _plain_raster(self.mapping):
             raise ValueError(
                 f"{self.schedule.describe()} reads the item from blockIdx: it needs the plain "
                 f"Raster() mapping, not {self.describe()}"
@@ -1593,14 +1591,17 @@ def _tile_grid(stream) -> bool:
     """One item per CTA in plain raster order: launch the tile space as the grid (``l`` folded
     into x for ``"2d"``) and take the item from ``blockIdx``. Decoding a 1-D index divides
     by the extents on the load warp's path to its first copy."""
-    mapping = stream.mapping
     return (
         type(stream.schedule) is OneShot  # a subclass may override first_index()
         and stream.schedule.grid != "1d"
-        and type(mapping) is Raster
-        and mapping.along == "m"
-        and mapping.swizzle == 1
+        and _plain_raster(stream.mapping)
     )
+
+
+def _plain_raster(mapping) -> bool:
+    """The default ``Raster()`` (along m, no swizzle): its item order is ``blockIdx`` order, so
+    tile-space grids read items from ``blockIdx``."""
+    return type(mapping) is Raster and mapping == Raster()
 
 
 def _publishes_first(stream) -> bool:
