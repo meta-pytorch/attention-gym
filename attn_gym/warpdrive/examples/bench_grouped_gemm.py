@@ -199,9 +199,7 @@ def run_shape(groups, tokens, n, k, labels, samples, rounds) -> dict:
     for round_idx in range(rounds):
         order = list(calls) if round_idx % 2 == 0 else list(reversed(calls))
         for label in order:
-            stats = benchmark_cuda_graph_stats(
-                graphs[label], num_iters=samples, warmup_iters=2, n_resamples=50
-            )
+            stats = benchmark_cuda_graph_stats(graphs[label], num_iters=samples, warmup_iters=2)
             medians[label].append(stats.median_us / CALLS_PER_GRAPH)
     flops = 2 * sum(sizes) * n * k
     best = {label: min(v) for label, v in medians.items()}
