@@ -198,11 +198,11 @@ def test_local_kv_heads_must_match_sparse_kv(inputs):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("case", ["separate_values", "grouped_heads"])
-def test_cute_rejects_separate_values_and_grouped_heads(inputs, case):
-    """FA4's gather path is MLA-only; it must not silently compute shared-KV MQA."""
+def test_cute_rejects_ineligible_grouped_inputs(inputs, case):
+    """The warpdrive grouped path must reject unsupported dtype/dimension metadata."""
     call = {**inputs, **_values(inputs)} if case == "separate_values" else _grouped(inputs)
     call = {name: tensor.cuda() for name, tensor in call.items()}
-    with pytest.raises(ValueError, match="CuTe gather_attn backend requires keys that are"):
+    with pytest.raises(ValueError, match="CuTe gather_attn supports separate values"):
         gather_attn(**call, kernel_options={"backend": "cute"})
 
 

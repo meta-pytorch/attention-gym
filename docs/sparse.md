@@ -200,18 +200,18 @@ those inputs.
 
 Here `H` is the query head count, `D` the latent width, `R` the rotary width, and `W` the local
 window size. All query/KV components must share a dtype and device; the optional sink can
-also use FP32. Local and sparse pools must have the same KV head count: one shared head or
-`H` per-head operands.
+also use FP32. Local and sparse pools must have the same KV head count, which must divide `H`.
 
-| Input form | CuTe (FA4 sparse MLA) | Triton |
+| Input form | CuTe | Triton |
 |---|---|---|
 | Bare tensors | SM100/SM103, BF16, one shared KV head, `1 <= H <= 128`, `D = 512`; no additional window-size bound in the adapter | Generic CUDA path for FP16/BF16/FP32, shared or per-head KV; no fixed `H`, `D`, or `W` eligibility bounds in the generic launcher. A specialized BF16 shared-KV schedule uses the same GPU, `H`, `D`, `W`, and latent-stride constraints as nonempty pairs below, without rotary requirements. |
 | Nonempty `(latent, rope)` pairs (`R > 0`) | Same CuTe constraints as bare, with `R = 64` | Compute capability major >= 8 (Ampere or newer, including Hopper and SM120), BF16, one shared KV head, `16 <= H <= 128`, `D` in `{16, 32, ..., 128, 512}`, `R` in `{16, 32, 64, 128}`, `0 <= W <= 2048`; shared-schedule stride requirements below must hold. No generic paired path. |
 | Zero-width pairs (`R = 0`) | Same eligibility as bare tensors | Same eligibility as bare tensors; rotary operands are omitted from the kernels and their gradients have empty feature dimensions. |
+| Separate values or `1 < kv_heads < H` | Explicit `backend="cute"`: native warpdrive forward/backward on SM100/SM103, BF16, `D <= 256` divisible by 16, unit KV feature strides, `W <= 2048`. No nonempty RoPE. | Automatic choice for these inputs, with the same shape, dtype and device constraints. |
 
 Zero-width pairs retain paired-form validation and require explicit `scale`; they do not gain
 the bare-tensor default scale. Reference attention runs on CPU or CUDA and accepts either
-shared or per-head KV for every form, without the fused backends' fixed feature/head bounds.
+any KV head count dividing `H`, without the fused backends' fixed feature/head bounds.
 The generic Triton launcher does not define a universal maximum latent width: compilation and
 device resource limits still apply, so its lack of a fixed bound is not a promise that every
 positive width can launch.
@@ -228,11 +228,33 @@ positive width can launch.
 - Generic Triton uses stride-aware KV loads when a tensor-descriptor layout is unavailable;
   the shared schedule's unit-KV-feature-stride restriction does not constrain that bare or
   zero-width fallback.
-- CuTe's eligibility predicate does not impose query/KV stride bounds. FA4 applies its own
+- CuTe's FA4 eligibility predicate does not impose query/KV stride bounds. FA4 applies its own
   layout normalization and may copy incompatible layouts. A singleton sink whose stride is
   not 1 is excluded from automatic CuTe selection, even if PyTorch regards it as contiguous.
   FA4 must provide sparse-MLA sink support when a sink is supplied, and head-padding support
   when `H < 128` (FA4 4.0.0b32+); default probability recomputation requires 4.0.0b33+.
+- CuTe's grouped path accepts arbitrary outer strides and element-aligned storage offsets,
+  including an FP32 sink and int32/int64 selections. It normalizes noncontiguous query and
+  output-gradient feature dimensions. It requires CuTeDSL 4.6.2+, without a FlashAttention
+  dependency.
+
+The warpdrive grouped kernel assigns one query and up to 16 heads of a KV group to each
+CTA. Warps 1–3 gather selected K/V rows into a two-stage shared-memory ring, and warp 0
+computes 32-key tiles with BF16 tensor-core matrix products and FP32 accumulation.
+Each stage uses FULL and EMPTY named barriers counting all 128 threads. The compute warp
+holds the stage until its matrix products finish, including for partial head groups.
+Forward uses FP32 online softmax. Backward recomputes probabilities and combines head
+contributions with tensor cores before FP32 atomic K/V accumulation; sink gradients also
+use FP32 atomics. Probabilities and score gradients are rounded to BF16 for matrix products,
+and final gradients are cast to the input dtype.
+This path always recomputes probabilities, including with `bwd_recompute_p=False`.
+It reads only selected rows, preserves duplicates, and supports the same local/sparse pool
+aliases and document-relative selections as the reference. Token, pool, batch, document,
+selection-count and positive window-size changes reuse compiled kernels; head geometry,
+layout address width, index/sink dtype and optional-input modes select variants. Aligned K/V
+rows use 16-byte vector loads; element-aligned rows use a separate general signature.
+Triton remains the automatic grouped backend: relative performance depends on the shape
+and selection pattern, and the CuTe path remains slower on long selections in measured cases.
 
 Pool rows that no query selects must be finite on Triton's grouped schedule (separate values or
 `1 < kv_heads < H`). With `W = 0`, tiles of nearby queries whose selections fall in a short
@@ -254,12 +276,12 @@ and determinism are guarded; device and installed FA4 capabilities are constant 
 graph. Changing the installed dependency requires retracing or restarting.
 
 Use `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` to require a backend;
-launch errors propagate without retrying another backend. The CuTe backend defaults to
+launch errors propagate without retrying another backend. The FA4 CuTe path defaults to
 `bwd_recompute_p=True`, recomputing probabilities in backward; set it to `False` to save them.
 LSE can be requested with `return_aux=AuxRequest(lse=True)` and is nondifferentiable on fused
 backends. Selection itself remains nondifferentiable.
 
-FA4 sparse backward is not deterministic. Automatic selection uses Triton when deterministic
+Both CuTe backward paths are nondeterministic. Automatic selection uses Triton when deterministic
 algorithms are enabled. Triton backward with nonempty rotary components has no strict
 deterministic implementation; it raises in strict mode and warns and runs in warn-only mode.
 PyTorch does not allow changing
