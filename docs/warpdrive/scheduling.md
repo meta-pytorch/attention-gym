@@ -71,9 +71,7 @@ Use `while work.valid:`, read the item before advancing, call `work.advance()` o
 at the end of the body, and return the cursor. `StaticPersistent` and `TilePersistent` also
 support the [counted form](#a-counted-loop).
 
-The checker rejects item reads after advance, including lookahead reads of the next item
-inside the same iteration. It does not prove advance is lexically last, detect every cursor
-rebind/stale restore, or prove useful and matching work happened before it.
+See the [work contract](guarantees.md#work) for loop checks and author obligations.
 
 ## Bind and launch
 
@@ -197,16 +195,16 @@ rank 0 sends to every CTA. The warp is the lowest free warp unless selected with
 `WorkStream(scheduler_warp=...)`.
 
 ```text
-scheduler: acquire free slot -> claim/decode -> publish item
-role:      receive item      -> release slot -> compute item
+scheduler: acquire free stage -> claim/decode -> publish item
+role:      receive item       -> release stage -> compute item
 ```
 
-`stages` is **work-ring depth**, not A/B buffering. A role releases its work slot on receipt,
+`stages` is **work-ring depth**, not A/B buffering. A role releases its work stage on receipt,
 not when computation finishes. All ring consumers also receive a terminal marker, which is
 not work.
 
-For cluster broadcasts, rank 0 uses `st.async` to fill every CTA's slot and complete its
-FULL barrier. Receivers return the slot with `remote_scope="cta"`: they publish no data.
+For cluster broadcasts, rank 0 uses `st.async` to fill every CTA's stage and complete its
+FULL barrier. Receivers release the stage with `remote_scope="cta"`: they publish no data.
 Cluster-scope releases would add a GPU-scope membar per item in every receiving thread.
 
 ### The grid and empty work
@@ -300,13 +298,8 @@ see [Decode state](#decode-state) for a carried cache.
 Set `skips=True` if `keep` can be false; otherwise it must be the Python constant `True`,
 checked while tracing. Dropping an index permanently removes it from every role's sequence.
 
-Correctness obligations:
-
-- All roles and CTAs must decode the same answer. Tables must be ready before decoding and
-  unchanged while the stream uses them.
-- Kept indices must represent distinct items, and `[0, count)` must reach every needed item.
-  The layer does not prove either property.
-- Each skipping decoder runs once per visited index at each decoding site.
+The [work contract](guarantees.md#work) requires agreement, stable tables and complete,
+distinct items. Each skipping decoder runs once per visited index at each decoding site.
 
 ### Guarded versus speculative decode
 
@@ -475,7 +468,7 @@ Local schedule rules:
 
 Set `broadcast=True`, choose positive `stages`, and implement
 `claim_next(fetch, problem, index)`. The previous index permits a stateful claim sequence
-without another buffer. Only the rank-0 scheduler calls it, after acquiring a free work slot
+without another buffer. Only the rank-0 scheduler calls it, after acquiring a free work stage
 and while the previous claim is valid.
 
 The layer broadcasts `[index, *words]` and owns the work ring's payload, counts, fences,

@@ -4,7 +4,7 @@
 
 A role is a CuTeDSL method assigned to specific warps. In the built-in
 [GEMM](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py),
-load, MMA and epilogue are separate roles. Each receives its declared channel endpoints and
+load, MMA and epilogue are separate roles. Each receives its declared channel ends and
 work cursor, does its work, then returns the updated state.
 
 This load-role excerpt runs on **warp 4**, not four warps:
@@ -129,7 +129,7 @@ types at module level.
 
 ## Return the updated state
 
-Return every endpoint, work cursor and turnstile seat in its current state:
+Return every end, work cursor and turnstile seat in its current state:
 
 ```python
 @role(warps=5, regs=48)
@@ -141,24 +141,16 @@ def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, work: WorkCurs
     return ab, acc, work
 ```
 
-Return one object or a tuple; tuple order does not matter. Missing, duplicate or foreign
-state is an error with tracing on or off, for one or two CTAs.
+Return one object or a tuple; tuple order does not matter. Helpers return updated state too:
 
-- Return **all** endpoints, cursors and seats—not `self`, params, instance indices, TMEM
-  views or raw barrier pointers.
-- Close stage handles inside the role. They are temporary lifetimes, not state to return.
-- Helpers must return updated state too; reassign it at the call site:
+```python
+ab = load_next(ab, params)
+```
 
-  ```python
-  ab = load_next(ab, params)
-  ```
-
-Do not return a saved pre-loop snapshot. Checks catch ownership/return errors and discarded
-advancing-helper results for endpoints and cursors, including inside loops. They do **not**
-prove freshness of reconstructed snapshots, manually supplied raw state or turnstile seats.
-
-The returned endpoints supply final phases for producer tails. Returned cursors also let
-tracing close any remaining work range.
+Reassignment lets CuTeDSL carry the end through a loop or branch; mutating it inside a helper
+without reassigning the result can lose the advance. See the
+[lifetime and lineage contract](guarantees.md#lifetimes) for the checks and limits.
+Returned ends supply the final state for producer tails; cursors close remaining work ranges.
 
 ## Registers belong to warpgroups
 
@@ -272,7 +264,8 @@ def compile_kernel(op: MyKernel):
 - The constructor call, with defaults filled in and its arguments copied/frozen for the key.
 - Cluster and each work stream's schedule, mapping, readiness and scheduler warp.
 - The trace settings that change the code (`enable_trace`'s backend, and its `waits` and
-  `events_per_role` where they apply), `trace_protocol`, `alias_check`, and resolved roles.
+  `events_per_role` where they apply), `trace_protocol`, `alias_check`, `liveness_check`, and
+  resolved roles.
 - Source of the modules defining the kernel, cluster and stream-component classes, including
   their base classes.
 
@@ -288,13 +281,12 @@ narrow:
 | `op.tile_n = 128` after construction | Key raises `TypeError`; pass it to the constructor |
 | Reassign cluster, work stream or `trace_protocol` before collection | Allowed and keyed |
 | Reassign those after collection | Raises `ProtocolError`; channels already depend on them |
-| Change the trace settings (`enable_trace`) or `alias_check` | Allowed and keyed |
+| Change trace settings (`enable_trace`), `alias_check` or `liveness_check` | Allowed and keyed |
 | Mutate a constructed object, e.g. `op.ab.n = 4` | Not tracked; do not do it |
 
 A cache hit skips tracing. `jit_cache` [restores](cache.md#cached-builds-were-never-traced)
-TMA, SMEM and alias reports, opt-outs and warnings for `describe()`. Protocol logs need a
-fresh trace; the example helpers use the optional [uncached hook](cache.md#force-a-new-trace)
-for those builds. Kernels pickle as their constructor call, so `compile_many` can build
-several in parallel.
+check reports, opt-outs and warnings for `describe()`. Protocol logs need a fresh trace;
+the example helpers use the optional [uncached hook](cache.md#force-a-new-trace) for those builds.
+Kernels pickle as their constructor call, so `compile_many` can build several in parallel.
 
 Keep kernel definitions in source files: CuTeDSL re-reads them for AST preprocessing.

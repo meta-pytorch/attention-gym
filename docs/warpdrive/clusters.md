@@ -76,14 +76,14 @@ role allocates after cluster synchronization in `run_roles()`. All declared user
 raw roles, join teardown before free. Pair allocation/free handshakes with the peer, `rank XOR 1`.
 
 A producer automatically tails if a remote UMMA consumer can still read its storage,
-including a multicast partner outside its pair. Return the final endpoint state:
+including a multicast partner outside its pair. Return the final end state:
 
 - Ring tails drain from the returned stage and phase.
 - Slots tails wait only on that end's acquired slots, using their final phase bits.
 - Retired acquires are rejected on these channels: they cannot be tailed.
 
-All threads reach the exit cluster barrier after dispatch and TMEM teardown. This covers
-the managed protocol, **not arbitrary async work** started by a role.
+All threads reach the exit cluster barrier after dispatch and TMEM teardown. See the
+[exit obligations](guarantees.md#what-a-successful-check-means) for work outside that protocol.
 
 ## Larger clusters
 
@@ -137,11 +137,9 @@ leader 2 finishes reading --+
 
 Releasing only your own pair can race with the other pair's MMA reads.
 
-Get partitions and masks from `Cluster.multicast` after `begin_roles()`, in converged code.
-The TMA check verifies the declared mode and byte count. It rejects undeclared multicast;
-a mask from elsewhere leaves the channel `unverified`. It does not prove descriptor legality.
-A 3-way partition can compile and fault, so persistent GEMM requires power-of-two counts
-of MMA tiles along both modes.
+Get partitions and masks from `Cluster.multicast` after `begin_roles()`, in converged code;
+see [TMA checks](guarantees.md#tma). Persistent GEMM requires power-of-two counts of MMA
+tiles along both modes because a 3-way descriptor partition can compile and fault.
 
 ### Work items and the scheduler
 
@@ -227,8 +225,8 @@ Storage is separate from that barrier ordering:
   matching offsets. `buffer=` leaves scope unchanged and derives a commit fence for
   `Threads`/`Warps` -> `Umma`, as `payload=` does
   ([Storage and fences](channels.md#storage-and-fences)).
-- The alias diagnostic reports cluster aliases as `unverified`; it does not analyze cross-CTA
-  ordering.
+
+See [alias checks](guarantees.md#aliases) before relying on cluster storage overlaps.
 
 ## Placement rules
 
@@ -252,7 +250,7 @@ For producer rank `p`:
 - `W(p) = reach(p)`: the CTAs whose SMEM `p`'s copies write.
 
 Same `C` for every participant, with no multicast, means CTA-local: ordinary
-per-slot counts, unscaled bytes, self-targets and no producer tail. Masks are 1, except a
+per-stage counts, unscaled bytes, self-targets and no producer tail. Masks are 1, except a
 UMMA commit to its own CTA uses `1 << rank`.
 
 ### 2. Find the synchronization unit and counts
@@ -267,7 +265,7 @@ A producer targets the consumer CTAs in its unit with FULL signals; a consumer t
 producer CTAs in its unit with EMPTY signals. **User TMA channels use the next subsection
 instead.** In a `CtaPair`, mixed placement therefore targets the consumer/producer union.
 
-For each target and slot, count the signaling instances and CTAs:
+For each target and stage, count the signaling instances and CTAs:
 
 | Mechanism | Arrival contribution |
 |---|---|
@@ -322,9 +320,9 @@ These rules use PTX ISA 9.5:
   of the CTA holding `mbar`. A leader's barrier therefore collects its pair's bytes.
   CUTLASS `SM100_TMA_2SM_LOAD*` clears the barrier address's peer bit for the same effect.
 - `mbarrier.arrive.expect_tx.shared::cluster` (§9.7.15.16.16) arms a remote barrier. The
-  tx-count spans `±(2^20 - 1)` (§9.7.15.16.3), so copies may complete before the arm. A phase
+  tx-count spans `±(2^20 - 1)` (§9.7.15.16.3), so copies may complete before the arm. A barrier
   completes only when pending arrivals and tx-count are both zero (§9.7.15.16.8).
-- A wait must observe phase completion before the next phase's arrive (§9.7.15.16.5.1).
+- A wait must observe completion before the next epoch's arrival (§9.7.15.16.5.1).
   The producer rearms only after EMPTY reports the consumers' release, which follows their
   FULL wait. This is why a filled stage cannot have no waiter.
 
@@ -340,4 +338,5 @@ that barrier. Remote UMMA releases need the producer tails described next.
 - Multicast needs a producer in each destination to arm there.
 - `external=` channels are CTA-local: no multicast, and one placement on the managed
   side. Raw code drives the external side independently in each participating CTA.
-- Clusters have at most 8 CTAs, the portable limit. The alias diagnostic does not model them.
+
+See the [safety contract](guarantees.md) for target and analysis limits.

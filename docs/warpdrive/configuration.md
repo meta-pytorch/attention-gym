@@ -41,7 +41,7 @@ Persistence adds work scheduling and an SMEM-staged TMA-store epilogue.
 
 | Constructor choice | Range / purpose |
 |---|---|
-| `tile_n` (224 for a pair, 256 otherwise) | Positive width ≤256, divisible by `epi_tile_n`; per-MMA-CTA width must be divisible by 8. Defaults are measured choices ([GEMM](examples.md#gemm)) |
+| `tile_n` (224 for a pair, 256 otherwise) | Positive width ≤256, divisible by `epi_tile_n`; per-MMA-CTA width must be divisible by 8 |
 | `ab_stages` (fills ~192 KB), `acc_stages` (2) | A/B buffering and overlapping accumulator lifetimes |
 | `c_stages` (2) | 1–8 epilogue staging buffers |
 | `epi_tile_n` (32) | 16, 32 or 64 columns, dividing `tile_n`: 32–128-byte BF16 rows for the TMA-store box |
@@ -123,7 +123,8 @@ load waits for free K -> QK waits for free P -> PV waits for V
         +---------- load has not issued V -----+
 ```
 
-The layer does not rule out this cycle. Recheck dependencies when changing issue order.
+Recheck dependencies when changing issue order; the [liveness report](guarantees.md#liveness)
+only covers its stated inputs and assumptions.
 
 ### fa4_bwd.py
 
