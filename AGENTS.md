@@ -120,7 +120,9 @@ Keep the math in keyword arguments and the kernel in `kernel_options`:
 
 Candidates of one kernel usually differ in floating-point order (tile sizes, `num_warps`), so a
 timing-picked winner changes output bits between processes, ranks, and cold winner caches
-(issue #777). Every operation that tunes must also run pinned;
+(issue #777). The rule: an operation that tunes does so by default, and pins every tuned kernel
+when either `kernel_options={"autotune": False}` is passed or
+`torch.use_deterministic_algorithms(True)` is set.
 [`docs/developers/tuned-kernels.md`](docs/developers/tuned-kernels.md) records why:
 
 - Tune Triton kernels with `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never
