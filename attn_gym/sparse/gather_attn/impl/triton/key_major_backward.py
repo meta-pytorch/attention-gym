@@ -150,7 +150,7 @@ def _tile_map_pairs(
     )
 
 
-def build_tile_query_map(
+def _build_sorted_tile_query_map(
     selected_rows: torch.Tensor,
     counts: torch.Tensor,
     sparse_seq_len: int,
@@ -237,6 +237,218 @@ def build_tile_query_map(
         pair_masks,
         tile_offsets.to(torch.int32 if entries < 2**31 else torch.int64),
     )
+
+
+@triton.jit
+def _query_pair_starts(keys, slots, TILE: tl.constexpr):
+    previous = tl.gather(keys, tl.maximum(slots - 1, 0), axis=0)
+    valid = keys != 2**31 - 1
+    new_tile = (slots == 0) | (keys // TILE != previous // TILE)
+    return valid & (new_tile | (keys == previous)), new_tile
+
+
+@triton.jit(do_not_specialize=["S", "NUM_TILES", "TOPK"])
+def _query_tile_counts(
+    rows_ptr,
+    counts_ptr,
+    total_ptr,
+    sorted_rows_ptr,
+    query_offsets_ptr,
+    S,
+    NUM_TILES,
+    TOPK,
+    TILE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    HIST_BINS: tl.constexpr,
+):
+    """Sort within each live query, and count its pairs per key tile.
+
+    The total is a device scalar. With no gather queries, even the temporary sort rows and
+    histogram matrix remain untouched; later kernels only publish zero tile offsets.
+    """
+    if tl.load(total_ptr) > 0:
+        row = tl.program_id(0).to(tl.int64)
+        count = tl.load(counts_ptr + row)
+        histogram = tl.full((HIST_BINS,), 0, tl.int32)
+        if count > 0:
+            slots = tl.arange(0, BLOCK_K)
+            keys = tl.load(rows_ptr + row * TOPK + slots, mask=slots < count, other=2**31 - 1).to(
+                tl.int32
+            )
+            keys = tl.sort(keys, descending=False)
+            tl.store(sorted_rows_ptr + row * TOPK + slots, keys, mask=slots < TOPK)
+            starts, _ = _query_pair_starts(keys, slots, TILE)
+            histogram = tl.histogram(keys // TILE, HIST_BINS, mask=starts)
+        tiles = tl.arange(0, HIST_BINS)
+        offset = ((row // S) * NUM_TILES + tiles.to(tl.int64)) * S + row % S
+        tl.store(query_offsets_ptr + offset, histogram, mask=tiles < NUM_TILES)
+
+
+@triton.jit(do_not_specialize=["S"])
+def _query_tile_prefix(
+    query_offsets_ptr,
+    total_ptr,
+    tile_totals_ptr,
+    S,
+    BLOCK: tl.constexpr,
+):
+    """Exclusive query offsets within each key tile, ordered without a global sort."""
+    tile_row = tl.program_id(0).to(tl.int64)
+    total = tl.full((), 0, query_offsets_ptr.dtype.element_ty)
+    if tl.load(total_ptr) > 0:
+        for start in range(0, S, BLOCK):
+            queries = start + tl.arange(0, BLOCK)
+            offsets = tile_row * S + queries
+            counts = tl.load(query_offsets_ptr + offsets, mask=queries < S, other=0)
+            prefix = tl.cumsum(counts)
+            tl.store(query_offsets_ptr + offsets, total + prefix - counts, mask=queries < S)
+            total += tl.sum(counts, axis=0)
+    tl.store(tile_totals_ptr + tile_row, total)
+
+
+@triton.jit(do_not_specialize=["NUM_TILES"])
+def _query_tile_offsets(tile_totals_ptr, tile_offsets_ptr, NUM_TILES, BLOCK: tl.constexpr):
+    batch = tl.program_id(0).to(tl.int64)
+    tiles = tl.arange(0, BLOCK)
+    totals = tl.load(tile_totals_ptr + batch * NUM_TILES + tiles, mask=tiles < NUM_TILES, other=0)
+    prefix = tl.cumsum(totals)
+    tl.store(tile_offsets_ptr + batch * (NUM_TILES + 1), 0)
+    tl.store(
+        tile_offsets_ptr + batch * (NUM_TILES + 1) + tiles + 1,
+        prefix,
+        mask=tiles < NUM_TILES,
+    )
+
+
+@triton.jit(do_not_specialize=["S", "NUM_TILES", "ENTRIES", "TOPK"])
+def _query_tile_pairs(
+    sorted_rows_ptr,
+    counts_ptr,
+    total_ptr,
+    query_offsets_ptr,
+    tile_offsets_ptr,
+    pair_queries_ptr,
+    pair_masks_ptr,
+    S,
+    NUM_TILES,
+    ENTRIES,
+    TOPK,
+    TILE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """Scatter complete pair masks to disjoint, query-ordered positions; no atomics."""
+    if tl.load(total_ptr) > 0:
+        row = tl.program_id(0).to(tl.int64)
+        count = tl.load(counts_ptr + row)
+        if count > 0:
+            batch, query = row // S, row % S
+            slots = tl.arange(0, BLOCK_K)
+            keys = tl.load(
+                sorted_rows_ptr + row * TOPK + slots,
+                mask=slots < count,
+                other=2**31 - 1,
+            )
+            starts, new_tile = _query_pair_starts(keys, slots, TILE)
+            pair = tl.cumsum(starts.to(tl.int32))
+            first_pair = tl.associative_scan(tl.where(new_tile, pair, 0), 0, _maximum)
+            next_start = tl.gather(starts, tl.minimum(slots + 1, BLOCK_K - 1), axis=0)
+            ends = (slots < count) & (next_start | (slots == count - 1))
+            bits = tl.full((BLOCK_K,), 1, tl.uint32) << (keys % TILE)
+            _, bits = tl.associative_scan((starts, bits), 0, _or_within_pairs)
+            tiles = keys // TILE
+            tile_start = tl.load(
+                tile_offsets_ptr + batch * (NUM_TILES + 1) + tiles, mask=ends, other=0
+            )
+            query_start = tl.load(
+                query_offsets_ptr + (batch * NUM_TILES + tiles.to(tl.int64)) * S + query,
+                mask=ends,
+                other=0,
+            )
+            destination = batch * ENTRIES + tile_start + query_start + pair - first_pair
+            tl.store(pair_queries_ptr + destination, query.to(tl.int32), mask=ends)
+            tl.store(pair_masks_ptr + destination, bits.to(tl.int32), mask=ends)
+
+
+@triton.jit
+def _maximum(a, b):
+    return tl.maximum(a, b)
+
+
+def _build_prefix_tile_query_map(selected_rows, counts, sparse_seq_len, tile):
+    """Invert bounded key-tile ranges using per-query sorts and per-tile prefix sums.
+
+    Repeated keys start another pair, exactly as in the global-sort implementation. Prefix
+    sums assign each query a disjoint destination range, preserving deterministic query order.
+    Unlike sorting the full selection capacity, every substantial kernel can bypass its work
+    using a device scalar when dense-span kernels already own all the selections.
+    """
+    batch, seq_len, topk = selected_rows.shape
+    device = selected_rows.device
+    num_tiles = triton.cdiv(sparse_seq_len, tile)
+    entries = max(1, triton.cdiv(seq_len * topk, 16)) * 16
+    offset_dtype = torch.int32 if entries < 2**31 else torch.int64
+    total = counts.sum()
+    sorted_rows = torch.empty(selected_rows.shape, device=device, dtype=torch.int32)
+    query_offsets = torch.empty((batch, num_tiles, seq_len), device=device, dtype=offset_dtype)
+    tile_totals = torch.empty((batch, num_tiles), device=device, dtype=offset_dtype)
+    tile_offsets = torch.empty((batch, num_tiles + 1), device=device, dtype=offset_dtype)
+    pair_queries = torch.empty((batch, entries), device=device, dtype=torch.int32)
+    pair_masks = torch.empty_like(pair_queries)
+    block_k = triton.next_power_of_2(topk)
+    bins = triton.next_power_of_2(num_tiles)
+    _query_tile_counts[(batch * seq_len,)](
+        selected_rows,
+        counts,
+        total,
+        sorted_rows,
+        query_offsets,
+        seq_len,
+        num_tiles,
+        TOPK=topk,
+        TILE=tile,
+        BLOCK_K=block_k,
+        HIST_BINS=bins,
+        num_warps=4,
+    )
+    _query_tile_prefix[(batch * num_tiles,)](
+        query_offsets, total, tile_totals, seq_len, BLOCK=1024, num_warps=4
+    )
+    _query_tile_offsets[(batch,)](tile_totals, tile_offsets, num_tiles, BLOCK=bins, num_warps=4)
+    _query_tile_pairs[(batch * seq_len,)](
+        sorted_rows,
+        counts,
+        total,
+        query_offsets,
+        tile_offsets,
+        pair_queries,
+        pair_masks,
+        seq_len,
+        num_tiles,
+        entries,
+        TOPK=topk,
+        TILE=tile,
+        BLOCK_K=block_k,
+        num_warps=4,
+    )
+    return pair_queries, pair_masks, tile_offsets
+
+
+def build_tile_query_map(
+    selected_rows: torch.Tensor,
+    counts: torch.Tensor,
+    sparse_seq_len: int,
+    tile: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build deterministic key-major pairs, avoiding a full-capacity sort for bounded pools."""
+    assert tile <= 32 and tile & (tile - 1) == 0, tile
+    topk = selected_rows.shape[-1]
+    num_tiles = triton.cdiv(sparse_seq_len, tile)
+    # Bound the histogram and ensure its matrix is no larger than the selection capacity.
+    # Larger pools favor the global sort: with 32K keys and top-k 2051, the query-prefix
+    # matrix and local sorts cost more than sorting the packed selections.
+    if 0 < num_tiles <= min(topk, 256) and topk <= 4096:
+        return _build_prefix_tile_query_map(selected_rows, counts, sparse_seq_len, tile)
+    return _build_sorted_tile_query_map(selected_rows, counts, sparse_seq_len, tile)
 
 
 @triton.jit

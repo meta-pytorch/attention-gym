@@ -864,6 +864,104 @@ def test_tile_query_map_counts_every_valid_selection(packed, dtype, dense, wide_
         assert sorted(actual) == sorted(expected_pairs)
 
 
+@pytest.mark.parametrize("tokens,topk,sparse_tokens", [(31, 33, 97), (1031, 131, 1537)])
+def test_tile_query_map_dense_graph_replay(monkeypatch, tokens, topk, sparse_tokens):
+    """A captured empty gather map must become live, preserve repeats, then become empty again."""
+    from attn_gym.sparse.gather_attn.impl.triton import key_major_backward as maps
+
+    reference = maps._build_sorted_tile_query_map
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("bounded key-major map used the full-capacity global sort")
+
+    monkeypatch.setattr(maps, "_build_sorted_tile_query_map", forbidden)
+    rows = torch.randint(0, sparse_tokens, (2, tokens, topk), device="cuda", dtype=torch.int32)
+    rows[..., :4] = 32
+    counts = torch.zeros((2, tokens), device="cuda", dtype=torch.int32)
+    # Compile both device branches before capture, with unchanged tensor metadata.
+    maps.build_tile_query_map(rows, counts, sparse_tokens, 32)
+    counts.fill_(topk)
+    maps.build_tile_query_map(rows, counts, sparse_tokens, 32)
+    counts.zero_()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = maps.build_tile_query_map(rows, counts, sparse_tokens, 32)
+    for count in (0, topk, 7, 0):
+        counts.fill_(count)
+        counts[:, 1::2] = 0
+        graph.replay()
+        expected = reference(rows, counts, sparse_tokens, 32)
+        torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)
+        for batch in range(2):
+            used = int(expected[2][batch, -1])
+            for a, e in zip(actual[:2], expected[:2]):
+                torch.testing.assert_close(a[batch, :used], e[batch, :used], atol=0, rtol=0)
+
+
+def test_tile_query_map_reuses_dynamic_kernels(triton_compiles):
+    """Query counts and pool lengths within one histogram bucket reuse all map kernels."""
+    from attn_gym.sparse.gather_attn.impl.triton.key_major_backward import (
+        build_tile_query_map,
+    )
+
+    for tokens, sparse_tokens, topk in ((1, 65, 33), (16, 97, 48), (17, 95, 64), (32, 101, 35)):
+        rows = torch.zeros((1, tokens, topk), device="cuda", dtype=torch.int32)
+        counts = torch.full((1, tokens), topk, device="cuda", dtype=torch.int32)
+        _, _, offsets = build_tile_query_map(rows, counts, sparse_tokens, 32)
+        # Repeated selections each need a separate pair.
+        assert offsets[0, -1].item() == tokens * topk
+    expected = {
+        "_query_tile_counts",
+        "_query_tile_prefix",
+        "_query_tile_offsets",
+        "_query_tile_pairs",
+    }
+    assert {name: count for name, count in triton_compiles.items() if name in expected} == {
+        name: 1 for name in expected
+    }
+
+
+def test_dense_key_tiles_reuse_tuning_buckets(monkeypatch, tmp_path):
+    """New token/document counts reuse a winner until average length crosses its bucket."""
+    import importlib
+
+    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
+    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(tune_module, "_WINNERS", {})
+    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
+    tune = tune_module.tune
+    decisions = []
+
+    def count_tuning(configs, compile_fn, *args, **kwargs):
+        if compile_fn().__name__ == "_gather_attn_bwd_dsparse_kv_dense":
+            decisions.append(1)
+        return tune(configs, compile_fn, *args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", count_tuning)
+    for documents, length in ((1, 1), (1, 16), (3, 17), (16, 16), (1, 128), (1, 129), (2, 193)):
+        inputs = make_gather_attn_test_inputs(
+            heads=16,
+            kv_heads=1,
+            head_dim=32,
+            tokens=documents * length,
+            sparse_tokens=documents * 32,
+            topk=16,
+            separate_values=True,
+            dtype=torch.bfloat16,
+        )
+        inputs["kv_indices"][:] = torch.arange(16, device="cuda")
+        leaves = _differentiable_leaves(inputs)
+        output = gather_attn(
+            **inputs,
+            sliding_window_size=0,
+            cu_seqlens=cumulative_sequence_offsets([length] * documents),
+            cu_seqlens_k=cumulative_sequence_offsets([32] * documents),
+            kernel_options={"backend": "triton"},
+        )
+        torch.autograd.grad(output.sum(), [tensor for _, tensor in leaves])
+        assert len(decisions) == (1 if length <= 128 else 2)
+
+
 @pytest.mark.parametrize(
     "separate_values", [False, True], ids=["shared-values", "separate-values"]
 )
