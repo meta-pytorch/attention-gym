@@ -438,7 +438,7 @@ def _raw_barriers(kernel) -> str:
 def _named_barriers(kernel) -> str:
     if not kernel._ws_named_bars:
         return ""
-    traced = getattr(kernel, "_ws_traced", False)
+    traced = kernel._ws_traced
     rows = []
     for name, nb in kernel._ws_named_bars.items():
         users = kernel._ws_named_users.get(name, {})

@@ -37,7 +37,7 @@ def trace_session(
         raise ProtocolError(
             f"trace_session needs enable_trace('globaltimer'), not {kernel.trace_backend!r}"
         )
-    if not getattr(kernel, "_ws_traced", False):
+    if not kernel._ws_traced:
         raise ProtocolError(
             "trace_session needs a compiled kernel: range names come from its trace"
         )

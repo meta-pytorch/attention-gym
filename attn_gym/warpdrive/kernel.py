@@ -428,6 +428,20 @@ _HOST_SETTINGS = (
     "trace_events_per_role",
 )
 _COLLECTED_SETTINGS = ("cluster", "trace_protocol")
+# Trace results for describe(), pipeline plans and trace-time warnings.
+# __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes.
+_TRACE_RESULTS = (
+    "_ws_tma",
+    "_ws_smem",
+    "_ws_alias",
+    "_ws_fences",
+    "_ws_opt_outs",
+    "_ws_uses",
+    "_ws_named_users",
+    "_ws_ownership",
+    "_ws_liveness",
+    "_ws_trace_tags",
+)
 
 
 @functools.cache
@@ -505,6 +519,8 @@ class WarpSpecialized(metaclass=_KernelType):
     trace_waits: bool = True  # also a range around every blocking channel wait
     trace_events_per_role: int = 1024  # globaltimer: records per role instance and CTA
     cluster: Cluster = SingleCta()  # or CtaPair() for 2-CTA MMAs
+    _ws_roles: list | None = None  # the role instances, once collected (_collect)
+    _ws_traced: bool = False  # trace results are present, from tracing or a cached build
 
     def __reduce__(self):
         """Pickle as the constructor call plus what the cache key lets change after it: the
@@ -522,7 +538,7 @@ class WarpSpecialized(metaclass=_KernelType):
     def __setattr__(self, name, value):
         state = vars(self)
         collected_setting = isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS
-        if collected_setting and state.get("_ws_roles") is not None:
+        if collected_setting and self._ws_roles is not None:
             raise ProtocolError(
                 f"{type(self).__name__}.{name} cannot change after collection (describe, "
                 "compile-cache lookup, or tracing derived the channels from it); construct a "
@@ -539,7 +555,7 @@ class WarpSpecialized(metaclass=_KernelType):
     # ---- host-side analysis ------------------------------------------------ #
 
     def _collect(self):
-        if getattr(self, "_ws_roles", None) is not None:
+        if self._ws_roles is not None:
             return
         chans = {k: v for k, v in vars(self).items() if isinstance(v, Channel)}
         turns = {k: v for k, v in vars(self).items() if isinstance(v, Turnstile)}
@@ -670,6 +686,8 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
         self._ws_named_bars = named_bars
+        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item, traced
+        self._ws_trace_tags = []  # globaltimer range names, traced
         self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}, traced
         self._ws_ownership = {}  # owned-epoch channel -> epoch-ownership verdict, traced
         self._ws_streams = streams
@@ -1009,45 +1027,28 @@ class WarpSpecialized(metaclass=_KernelType):
         plain data; None when this instance was not traced. ``jit_cache`` stores it beside the
         compiled kernel and passes it to ``__cute_restore_trace__`` on every call it serves from
         memory or disk."""
-        if not getattr(self, "_ws_traced", False):
+        if not self._ws_traced:
             return None
-        smem = {
+        record = {name: getattr(self, name) for name in _TRACE_RESULTS}
+        record["_ws_smem"] = {
             name: replace(res, buffer=None, tensor=None) for name, res in self._ws_smem.items()
         }
-        return {
-            "tma": self._ws_tma,
-            "smem": smem,
-            "alias": self._ws_alias,
-            "fences": self._ws_fences,
-            "opt_outs": self._ws_opt_outs,
-            "uses": self._ws_uses,
-            "named_users": self._ws_named_users,
-            "ownership": self._ws_ownership,
-            "liveness": self._ws_liveness,
-            "trace_tags": self._ws_trace_tags,
-        }
+        return record
 
     def __cute_restore_trace__(self, record: dict) -> None:
         """Load a cached build's trace record, so ``describe()`` and the warnings match a cold
         compile. An instance that traced, or already took a record, keeps its own. Restored
         SMEM entries have no tensors: ``buffer()`` works only while tracing."""
         self._collect()
-        if record is None or getattr(self, "_ws_traced", False):
+        if record is None or self._ws_traced:
             return
         record = pickle.loads(pickle.dumps(record))  # this instance's own copies
         buffers = self.smem_plan.buffers if self.smem_plan is not None else {}
-        self._ws_tma = record["tma"]
-        self._ws_smem = {
-            name: replace(res, buffer=buffers[name]) for name, res in record["smem"].items()
+        record["_ws_smem"] = {
+            name: replace(res, buffer=buffers[name]) for name, res in record["_ws_smem"].items()
         }
-        self._ws_alias = record["alias"]
-        self._ws_fences = record["fences"]
-        self._ws_opt_outs = record["opt_outs"]
-        self._ws_uses = record["uses"]
-        self._ws_named_users = record["named_users"]
-        self._ws_ownership = record["ownership"]
-        self._ws_liveness = record["liveness"]
-        self._ws_trace_tags = record["trace_tags"]
+        for name in _TRACE_RESULTS:
+            setattr(self, name, record[name])
         self._ws_traced = True
         self._report_trace()
 
