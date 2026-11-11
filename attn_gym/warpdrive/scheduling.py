@@ -971,7 +971,7 @@ class WorkStream:
         count = int(mapping.count64(space))
         total = _narrow(count)
         cs = self.cluster_size
-        units = int(schedule.launch_units(total, _unit_cap(schedule, max_ctas, cs)))
+        units = int(_launch_units(schedule, total, max_ctas, cs))
         if schedule.index_limit(count, units, cs) > INT32_MAX:
             raise ValueError(f"the space's {count} items exceed what a launch indexes in Int32")
         if decode is None and mapping.decodes_any_index:
@@ -1181,7 +1181,7 @@ class BoundWork:
         grid: static extents past their 65535 limit raise here, and runtime ones launch the
         grid as is, which CUDA rejects."""
         schedule = self.stream.schedule
-        units = schedule.launch_units(self.total, _unit_cap(schedule, self.max_ctas, self.cs))
+        units = _launch_units(schedule, self.total, self.max_ctas, self.cs)
         if _tile_grid(self.stream):
             x, y, z = tile_grid_dims(self.space, self.cs, schedule.grid)
         elif _tile_persistent(self.stream):
@@ -1205,15 +1205,16 @@ class BoundWork:
 # --------------------------------------------------------------------------- #
 
 
-def _unit_cap(schedule, max_ctas, cs: int):
-    """``launch_units``'s cap, shared by the launch and ``assignment``: ``max_ctas`` in whole
-    work units of ``cs`` CTAs (at least one cluster when ``cs > 1``), or None for a schedule
-    without ``uses_max_ctas``."""
+def _launch_units(schedule, total, max_ctas, cs: int):
+    """Launched work units, for the grid and ``assignment``. A schedule with ``uses_max_ctas``
+    needs ``max_ctas``, capped in whole work units of ``cs`` CTAs (at least one cluster when
+    ``cs > 1``); any other schedule gets no cap."""
     if not schedule.uses_max_ctas:
-        return None
+        return schedule.launch_units(total, None)
     if max_ctas is None:
         raise ValueError(f"{schedule.describe()} needs max_ctas")
-    return max_ctas if cs == 1 else cutlass.max(max_ctas // cs, 1)
+    cap = max_ctas if cs == 1 else cutlass.max(max_ctas // cs, 1)
+    return schedule.launch_units(total, cap)
 
 
 def _narrow(count):
