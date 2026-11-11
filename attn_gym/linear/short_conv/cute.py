@@ -228,6 +228,22 @@ def load_history(
 
 
 @cute.jit
+def resumes_history(has_initial_state: cute.Tensor | None, sequence: Int32):
+    """Whether to resume a sequence's history; returns True when the mask is absent."""
+    if cutlass.const_expr(has_initial_state is None):
+        return True
+    return has_initial_state[sequence]
+
+
+@cute.jit
+def sequence_span(cu_seqlens: cute.Tensor | None, sequence: Int32, tokens: Int32):
+    """Return ``(batch, start, end)`` of a sequence: a dense batch row or a packed interval."""
+    if cutlass.const_expr(cu_seqlens is None):
+        return Int32(sequence), Int32(0), tokens
+    return Int32(0), Int32(cu_seqlens[sequence]), Int32(cu_seqlens[sequence + 1])
+
+
+@cute.jit
 def load_paged_history(
     state: cute.Tensor,
     state_indices: cute.Tensor,
@@ -246,13 +262,7 @@ def load_paged_history(
     if slot > 0:
         state_offset = width - 1 + input_time - sequence_start
         state_groups = cute.zipped_divide(state, (1, 1, channels_per_thread))
-        if cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
-            values.store(
-                state_groups[((0, 0, None), (slot, state_offset, channel_group))]
-                .load()
-                .to(Float32)
-            )
-        elif has_initial_state[sequence]:
+        if resumes_history(has_initial_state, sequence):
             values.store(
                 state_groups[((0, 0, None), (slot, state_offset, channel_group))]
                 .load()
@@ -808,12 +818,7 @@ class CausalConv1dSiluDecode(ShortConvKernel):
                 taps = cute.make_rmem_tensor(
                     (self.channels_per_thread, self.width), self.dtype.cute_type
                 )
-                if cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
-                    for row in cutlass.range_constexpr(self.width - 1):
-                        taps[(None, row)].store(
-                            state_groups[((0, 0, None), (slot, row, channel_group))].load()
-                        )
-                elif has_initial_state[sequence]:
+                if resumes_history(has_initial_state, sequence):
                     for row in cutlass.range_constexpr(self.width - 1):
                         taps[(None, row)].store(
                             state_groups[((0, 0, None), (slot, row, channel_group))].load()
@@ -903,14 +908,7 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
         if channel < self.channels:
             slot = state_indices[sequence]
             if slot > 0:
-                if cutlass.const_expr(cu_seqlens is None):
-                    batch = Int32(sequence)
-                    sequence_start = Int32(0)
-                    sequence_end = tokens
-                else:
-                    batch = Int32(0)
-                    sequence_start = Int32(cu_seqlens[sequence])
-                    sequence_end = Int32(cu_seqlens[sequence + 1])
+                batch, sequence_start, sequence_end = sequence_span(cu_seqlens, sequence, tokens)
                 sequence_length = sequence_end - sequence_start
                 state_groups = cute.zipped_divide(state, (1, 1, self.channels_per_thread))
 
@@ -924,13 +922,7 @@ class CausalConv1dPagedStateUpdate(ShortConvKernel):
                         values.store(self.input_group(x, batch, input_time, channel_group).load())
                     # For short sequences the source row is ``row + sequence_length``,
                     # so ascending stores cannot overwrite a value before it is read.
-                    elif cutlass.const_expr(has_initial_state is None):  # noqa: SIM114
-                        values.store(
-                            state_groups[
-                                ((0, 0, None), (slot, row + sequence_length, channel_group))
-                            ].load()
-                        )
-                    elif has_initial_state[sequence]:
+                    elif resumes_history(has_initial_state, sequence):
                         values.store(
                             state_groups[
                                 ((0, 0, None), (slot, row + sequence_length, channel_group))
@@ -2508,14 +2500,7 @@ class CausalConv1dSiluInitialStateGradient(ShortConvGradientKernel):
         channel_group = channel_block * self.threads + thread_idx
         channel = channel_group * self.channels_per_thread
 
-        if cutlass.const_expr(cu_seqlens is None):
-            batch = Int32(sequence)
-            sequence_start = Int32(0)
-            sequence_end = tokens
-        else:
-            batch = Int32(0)
-            sequence_start = Int32(cu_seqlens[sequence])
-            sequence_end = Int32(cu_seqlens[sequence + 1])
+        batch, sequence_start, sequence_end = sequence_span(cu_seqlens, sequence, tokens)
         sequence_length = sequence_end - sequence_start
 
         if channel < self.channels:
@@ -3649,7 +3634,8 @@ def _launch_decode(
         channels,
         width,
         dtype,
-        config,
+        # Decode has no time tile, so the caller's tile size stays out of the compile key.
+        ShortConvConfig(config.threads, config.channels_per_thread, 1),
         _input_alignment(x, config),
         state_indices is not None,
         resolved_activation,

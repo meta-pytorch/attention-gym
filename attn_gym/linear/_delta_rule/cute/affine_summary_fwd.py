@@ -164,6 +164,91 @@ def zero_tail_tokens(smem, stage, valid_rows, tid, io_type, token_mode: cutlass.
     cute.arch.sync_warp()
 
 
+@cute.jit
+def range_tail(length):
+    """Return the last chunk index and its valid-row count; the count is zero for a full chunk."""
+    last_chunk = (length + BT - 1) // BT - 1
+    valid_rows = length - last_chunk * BT
+    if valid_rows == BT:
+        valid_rows = Int32(0)
+    return last_chunk, valid_rows
+
+
+@cute.jit
+def tma_partition_a(atom, desc, smem, tile, mma, head):
+    """Partition one head of a dense TMA tensor and its stages as an SS-mode MMA A operand."""
+    gmem = cute.local_tile(desc, cute.slice_(tile, (None, 0, None)), (None, None, (head, 0)))
+    return cpasync.tma_partition(
+        atom,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(smem, 0, 3),
+        cute.group_modes(mma.get_slice(0).partition_A(gmem), 0, 3),
+    )
+
+
+@cute.jit
+def tma_partition_b(atom, desc, smem, tile, mma, head):
+    """Partition one head of a dense TMA tensor and its stages as an SS-mode MMA B operand."""
+    gmem = cute.local_tile(desc, cute.slice_(tile, (0, None, None)), (None, None, (head, 0)))
+    return cpasync.tma_partition(
+        atom,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(smem, 0, 3),
+        cute.group_modes(mma.get_slice(0).partition_B(gmem), 0, 3),
+    )
+
+
+@cute.jit
+def tma_partition_gate(atom, desc, smem, head):
+    """Partition one head's ``[K, T]`` gate rows and the staged ``[K, 1]`` gate tiles."""
+    gmem = cute.flat_divide(desc[None, None, (head, 0)], (KEY_DIM, 1))
+    return cpasync.tma_partition(
+        atom,
+        0,
+        cute.make_layout(1),
+        cute.group_modes(smem, 0, 2),
+        cute.group_modes(gmem, 0, 2),
+    )
+
+
+def tmem_tile_reader(accumulator, tid, columns: int):
+    """Build one thread's load of a staged FP32 TMEM accumulator ``columns`` wide.
+
+    Returns the copy, the thread's slice of it, and its partition of every stage.
+    """
+    atom = cute.make_copy_atom(
+        tcgen05.Ld16x256bOp(tcgen05.Repetition(columns // 8), tcgen05.Pack.NONE), Float32
+    )
+    flat = accumulator[((None, None), 0, 0, None)]
+    copy = tcgen05.make_tmem_copy(atom, flat[(None, None, 0)])
+    thread_copy = copy.get_slice(tid)
+    return copy, thread_copy, thread_copy.partition_S(flat)
+
+
+def smem_tile_writer(reader, tid, io_type):
+    """Build the store of a tile read by ``reader`` into a column-major ``io_type`` stage.
+
+    Returns the copy and the thread's slice of it; the register partition matches the read.
+    """
+    atom = sm100_utils.get_smem_store_op(LayoutEnum.COL_MAJOR, io_type, Float32, reader)
+    copy = cute.make_tiled_copy_D(atom, reader)
+    return copy, copy.get_slice(tid)
+
+
+def store_rounded(value, writer, stage, io_type):
+    """Store an FP32 register vector, rounded to ``io_type``, in one SMEM operand stage.
+
+    Returns the rounded registers, used to form the residual when storing the hi half.
+    """
+    copy, thread_copy = writer
+    rounded = cute.make_rmem_tensor(value.shape, io_type)
+    rounded.store(value.to(io_type))
+    cute.copy(copy, copy.retile(rounded), thread_copy.partition_D(stage))
+    return rounded
+
+
 def _aligned(tensor: torch.Tensor) -> torch.Tensor:
     """Materialize the uncommon contiguous view that misses the TMA alignment."""
     return tensor if tensor.data_ptr() % DATA_ALIGN_BYTES == 0 else tensor.clone()
@@ -220,18 +305,6 @@ class Mmas(NamedTuple):
     wx: cute.TiledMma
     kt: cute.TiledMma
     ktu: cute.TiledMma
-
-
-class SmemLayouts(NamedTuple):
-    """Shared-memory layouts in their device-kernel construction order."""
-
-    w: cute.ComposedLayout
-    kg: cute.ComposedLayout
-    u: cute.ComposedLayout
-    xb: cute.ComposedLayout
-    xb_store: cute.ComposedLayout
-    tmpb: cute.ComposedLayout
-    tmpb_store: cute.ComposedLayout
 
 
 @dataclass(frozen=True)
@@ -482,15 +555,16 @@ class _AffineSummaryFwdOp(WarpSpecialized):
             ),
             mWork,
             mOut,
-            SmemLayouts(
-                s_w_staged,
-                s_kg_staged,
-                s_u_staged,
-                s_xb_staged,
-                s_xb_store_staged,
-                s_tmpb_staged,
-                s_tmpb_store_staged,
-            ),
+            {
+                "W": s_w_staged,
+                "Kg": s_kg_staged,
+                "U": s_u_staged,
+                "Xb": s_xb_staged,
+                "XbStore": s_xb_store_staged,
+                "Tmpb": s_tmpb_staged,
+                "TmpbStore": s_tmpb_store_staged,
+                "Gk": cute.make_layout((KEY_DIM, 1, self.gk_depth), stride=(1, KEY_DIM, KEY_DIM)),
+            },
             bound,
         ).launch(
             **self.launch_config(bound, min_blocks_per_mp=1),
@@ -536,16 +610,14 @@ class _AffineSummaryFwdOp(WarpSpecialized):
             )
             col_base = col_tile * self.BN
             is_value = col_base < VAL_DIM
-            batch = Int32(0)
             desc_w = cute.domain_offset((start, 0, (0, 0)), tma.w.desc)
             desc_kg = cute.domain_offset((0, start, (0, 0)), tma.kg.desc)
             desc_u = cute.domain_offset((0, start, (0, 0)), tma.u.desc)
             desc_gk = cute.domain_offset((0, start, (0, 0)), tma.gk.desc)
-            tWs, tWg = self._part_a(tma.w.atom, desc_w, sW, self.wx_tile, mma_wx, batch, head)
-            tKgs, tKgg = self._part_a(tma.kg.atom, desc_kg, sKg, self.kt_tile, mma_kt, batch, head)
-            sUp, gUp = self._part_b(tma.u.atom, desc_u, sU, self.kt_tile, mma_ktu, batch, head)
-            gGK_l = desc_gk[None, None, (head, batch)]
-            sGKp, gGKp = self._part_epi(tma.gk.atom, gGK_l, (KEY_DIM, 1), gk_3d)
+            tWs, tWg = tma_partition_a(tma.w.atom, desc_w, sW, self.wx_tile, mma_wx, head)
+            tKgs, tKgg = tma_partition_a(tma.kg.atom, desc_kg, sKg, self.kt_tile, mma_kt, head)
+            sUp, gUp = tma_partition_b(tma.u.atom, desc_u, sU, self.kt_tile, mma_ktu, head)
+            sGKp, gGKp = tma_partition_gate(tma.gk.atom, desc_gk, gk_3d, head)
 
             for ct in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 wh = w.acquire()
@@ -639,11 +711,8 @@ class _AffineSummaryFwdOp(WarpSpecialized):
             is_value = col_base < VAL_DIM
             # The range's last chunk may be partial; only the item that scans it must neutralize
             # the over-read rows. An all-zero row has num_chunks == 0 and stores the identity.
-            range_chunks = (length + BT - 1) // BT
-            tail_valid_rows = length - (range_chunks - 1) * BT  # == BT when the last chunk is full
-            if tail_valid_rows == BT:
-                tail_valid_rows = Int32(0)
-            tail_chunk = range_chunks - 1 - chunk_begin  # local index of the range's last chunk
+            last_chunk, tail_valid_rows = range_tail(length)
+            tail_chunk = last_chunk - chunk_begin  # local index of the range's last chunk
             num_chunks = chunk_end - chunk_begin
             for ct in cutlass.range(0, num_chunks, unroll=0):
                 is_tail = ct == tail_chunk and tail_valid_rows != 0
@@ -735,49 +804,17 @@ class _AffineSummaryFwdOp(WarpSpecialized):
         t_kt_acc = cute.make_tensor(tmem.ptr("kt"), params.kt_layout)
         local_tid = me.tmem_row
 
-        # --- T2R setup: read MMA1 (wx) accumulator (BT, BN fp32) from TMEM ---
-        t2r_wx_atom = cute.make_copy_atom(
-            tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BN // 8), tcgen05.Pack.NONE),
-            Float32,
-        )
-        wx_flat = t_wx_acc[((None, None), 0, 0, None)]
-        tc_t2r_wx = tcgen05.make_tmem_copy(t2r_wx_atom, wx_flat[(None, None, 0)])
-        sl_wx = tc_t2r_wx.get_slice(local_tid)
-        p_t_wx = sl_wx.partition_S(wx_flat)
-
-        # --- T2R setup: read MMA2 (kt) accumulator (K, BN fp32) from TMEM ---
-        t2r_kt_atom = cute.make_copy_atom(
-            tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BN // 8), tcgen05.Pack.NONE),
-            Float32,
-        )
-        kt_flat = t_kt_acc[((None, None), 0, 0, None)]
-        tc_t2r_kt = tcgen05.make_tmem_copy(t2r_kt_atom, kt_flat[(None, None, 0)])
-        sl_kt = tc_t2r_kt.get_slice(local_tid)
-        p_t_kt = sl_kt.partition_S(kt_flat)
+        # MMA1's wx accumulator is (BT, BN) and MMA2's kt is (K, BN).
+        tc_t2r_wx, sl_wx, p_t_wx = tmem_tile_reader(t_wx_acc, local_tid, self.BN)
+        tc_t2r_kt, sl_kt, p_t_kt = tmem_tile_reader(t_kt_acc, local_tid, self.BN)
 
         # Identity tensors provide both coordinate maps and range shapes.
         coords_tv = sl_wx.partition_D(cute.make_identity_tensor((BT, self.BN)))
         coords_kv = sl_kt.partition_D(cute.make_identity_tensor((KEY_DIM, self.BN)))
 
-        # R2S X snapshot → sXb (COL_MAJOR, partition matches T2R kt).
-        r2s_atom_xb = sm100_utils.get_smem_store_op(
-            LayoutEnum.COL_MAJOR,
-            self.io_type,
-            Float32,
-            tc_t2r_kt,
-        )
-        tc_r2s_xb = cute.make_tiled_copy_D(r2s_atom_xb, tc_t2r_kt)
-        thr_r2s_xb = tc_r2s_xb.get_slice(local_tid)
-
-        # R2S Tmp → sTmpb (COL_MAJOR, partition matches T2R wx).
-        r2s_atom_tmpb = sm100_utils.get_smem_store_op(
-            LayoutEnum.COL_MAJOR,
-            self.io_type,
-            Float32,
-            tc_t2r_wx,
-        )
-        tc_r2s_tmpb = cute.make_tiled_copy_D(r2s_atom_tmpb, tc_t2r_wx)
-        thr_r2s_tmpb = tc_r2s_tmpb.get_slice(local_tid)
+        # The X snapshot has kt's partition and Tmp has wx's.
+        xb_writer = smem_tile_writer(tc_t2r_kt, local_tid, self.io_type)
+        tmpb_writer = smem_tile_writer(tc_t2r_wx, local_tid, self.io_type)
 
         while work.valid:
             col_tile, head, row = work.item
@@ -801,22 +838,17 @@ class _AffineSummaryFwdOp(WarpSpecialized):
                 # pass while the lo residual is still being formed and stored.
                 xbh = xb.acquire()
                 xbh.access("Store", write=True, by="threads")
-                st_hi = cute.make_rmem_tensor(st.shape, self.io_type)
-                st_hi.store(st.load().to(self.io_type))
-                cute.copy(
-                    tc_r2s_xb,
-                    tc_r2s_xb.retile(st_hi),
-                    thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
+                st_hi = store_rounded(
+                    st.load(), xb_writer, sXb_store[(None, None, xbh.index)], self.io_type
                 )
                 xbh.commit()
                 xbh = xb.acquire()
                 xbh.access("Store", write=True, by="threads")
-                st_lo = cute.make_rmem_tensor(st.shape, self.io_type)
-                st_lo.store((st.load() - st_hi.load().to(Float32)).to(self.io_type))
-                cute.copy(
-                    tc_r2s_xb,
-                    tc_r2s_xb.retile(st_lo),
-                    thr_r2s_xb.partition_D(sXb_store[(None, None, xbh.index)]),
+                store_rounded(
+                    st.load() - st_hi.load().to(Float32),
+                    xb_writer,
+                    sXb_store[(None, None, xbh.index)],
+                    self.io_type,
                 )
                 xbh.commit()
 
@@ -840,22 +872,17 @@ class _AffineSummaryFwdOp(WarpSpecialized):
                 tmp = cute.make_rmem_tensor(coords_tv.shape, Float32)
                 for ei in cutlass.range_constexpr(cute.size(tmp)):
                     tmp[ei] = Float32(0.0) - wx_reg[ei]
-                tmp_hi = cute.make_rmem_tensor(tmp.shape, self.io_type)
-                tmp_hi.store(tmp.load().to(self.io_type))
-                cute.copy(
-                    tc_r2s_tmpb,
-                    tc_r2s_tmpb.retile(tmp_hi),
-                    thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
+                tmp_hi = store_rounded(
+                    tmp.load(), tmpb_writer, sTmpb_store[(None, None, tmpbh.index)], self.io_type
                 )
                 tmpbh.commit()
                 tmpbh = tmpb.acquire()
                 tmpbh.access("Store", write=True, by="threads")
-                tmp_lo = cute.make_rmem_tensor(tmp.shape, self.io_type)
-                tmp_lo.store((tmp.load() - tmp_hi.load().to(Float32)).to(self.io_type))
-                cute.copy(
-                    tc_r2s_tmpb,
-                    tc_r2s_tmpb.retile(tmp_lo),
-                    thr_r2s_tmpb.partition_D(sTmpb_store[(None, None, tmpbh.index)]),
+                store_rounded(
+                    tmp.load() - tmp_hi.load().to(Float32),
+                    tmpb_writer,
+                    sTmpb_store[(None, None, tmpbh.index)],
+                    self.io_type,
                 )
                 tmpbh.commit()
 
@@ -885,24 +912,11 @@ class _AffineSummaryFwdOp(WarpSpecialized):
         tma: TmaOps,
         mWork: cute.Tensor,
         mOut: cute.Tensor,
-        smem_layouts: SmemLayouts,
+        smem_layouts: dict,
         bound,
     ):
-        (s_w, s_kg, s_u, s_xb, s_xb_store, s_tmpb, s_tmpb_store) = smem_layouts
-        gk_layout = cute.make_layout((KEY_DIM, 1, self.gk_depth), stride=(1, KEY_DIM, KEY_DIM))
-        self.begin_roles(
-            work=bound,
-            layouts={
-                "W": s_w,
-                "Kg": s_kg,
-                "U": s_u,
-                "Xb": s_xb,
-                "XbStore": s_xb_store,
-                "Tmpb": s_tmpb,
-                "TmpbStore": s_tmpb_store,
-                "Gk": gk_layout,
-            },
-        )
+        """``smem_layouts`` maps each ``smem_plan`` buffer to its staged layout."""
+        self.begin_roles(work=bound, layouts=smem_layouts)
         mma_wx, mma_kt, _mma_ktu = mmas
         wx_fragment = mma_wx.make_fragment_C(
             cute.append(mma_wx.partition_shape_C(self.wx_tile[:2]), 1)
@@ -929,44 +943,6 @@ class _AffineSummaryFwdOp(WarpSpecialized):
             gk_3d=self.buffer("Gk"),
         )
         self.run_roles(params)
-
-    # ------------------------------------------------------------------
-    # TMA partition helpers
-    # ------------------------------------------------------------------
-
-    @cute.jit
-    def _part_a(self, atom, desc, smem, tile, mma, batch, head):
-        """Partition an A operand for TMA copy (SS-mode)."""
-        g = cute.local_tile(desc, cute.slice_(tile, (None, 0, None)), (None, None, (head, batch)))
-        part = mma.get_slice(0).partition_A(g)
-        return cpasync.tma_partition(
-            atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(smem, 0, 3),
-            cute.group_modes(part, 0, 3),
-        )
-
-    @cute.jit
-    def _part_b(self, atom, desc, smem, tile, mma, batch, head):
-        """Partition a TMA tensor as an MMA B operand."""
-        g = cute.local_tile(desc, cute.slice_(tile, (0, None, None)), (None, None, (head, batch)))
-        part = mma.get_slice(0).partition_B(g)
-        return cpasync.tma_partition(
-            atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(smem, 0, 3),
-            cute.group_modes(part, 0, 3),
-        )
-
-    @cute.jit
-    def _part_epi(self, atom, g_mnl, tile, s_buf):
-        """Partition for epilogue-style TMA."""
-        g_div = cute.flat_divide(g_mnl, tile)
-        sg = cute.group_modes(s_buf, 0, 2)
-        gg = cute.group_modes(g_div, 0, 2)
-        return cpasync.tma_partition(atom, 0, cute.make_layout(1), sg, gg)
 
 
 @jit_cache

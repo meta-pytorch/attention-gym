@@ -9,7 +9,7 @@ One CTA owns one query of the caller's [P, 2, S] FP32 score slab. Candidate, hea
 reduction tiles bound SMEM and TMEM independently of H and D. Head, query and batch stay
 separate TMA modes, so tails zero-fill without reading another query or batch. This module
 allocates no global workspace and selects nothing; masked and inactive slab entries stay
-untouched. The packed entrypoint visits only the absolute M128 tiles covering each query's
+untouched. The packed specialization visits only the absolute M128 tiles covering each query's
 ``candidate_bounds[T, 2]`` interval.
 
 One work item is one query of a slab pair::
@@ -21,11 +21,7 @@ Per item, ``ab`` carries ``candidate tiles * head tiles * D tiles`` epochs and `
 ``candidate tiles * head tiles``. The missing second query of an odd tail visits no tiles.
 """
 
-from dataclasses import dataclass
-
 import cutlass
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
@@ -34,7 +30,6 @@ from attn_gym.warpdrive import (
     Local,
     OneShot,
     Producer,
-    ProtocolError,
     Ring,
     SmemPlan,
     StageView,
@@ -43,35 +38,15 @@ from attn_gym.warpdrive import (
     Tmem,
     TmemPlan,
     Umma,
-    WarpSpecialized,
     WorkCursor,
     WorkStream,
     role,
 )
 
-from .cute_kernel_base import IndexerScoreKernelBase
+from .cute_kernel_base import IndexerScoreKernelBase, ScoreParams
 
 
-@dataclass(frozen=True)
-class GenericScoreParams:
-    """Kernel-prologue values the roles read."""
-
-    tiled_mma: cute.TiledMma
-    tma_k: cute.CopyAtom
-    k: cute.Tensor  # K TMA coordinates: (S, D, B)
-    tma_q: cute.CopyAtom
-    q: cute.Tensor  # Q TMA coordinates: (H, D, T, B)
-    sK: cute.Tensor
-    sQ: cute.Tensor
-    acc_layout: cute.Layout  # every accumulator stage
-    weights: cute.Tensor
-    scores: cute.Tensor
-    pair_start: cutlass.Numeric
-    score_scale: Float32
-    candidate_bounds: cute.Tensor | None
-
-
-class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
+class IndexerGenericScoreKernel(IndexerScoreKernelBase):
     """Tiled score kernel for positive even H and positive D divisible by 16 on SM100.
 
     For each M128 candidate tile and N64 head tile, UMMA accumulates
@@ -93,8 +68,7 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
     tile_candidates = 128
     tile_heads = 64
     tile_dim = 64
-    ab_stages = 2
-    acc_stages = 2
+    k_stages = q_stages = 2  # one ring stages both operands
 
     def __init__(
         self,
@@ -127,21 +101,29 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         q_buffer = self.smem_plan.buffer("Q", dtype, align=1024)
         stage_bytes = (self.tile_candidates + self.tile_heads) * self.tile_dim * dtype.width // 8
         self.ab = Ring(
-            self.ab_stages, Tma(stage_bytes), Umma, buffer={"K": k_buffer, "Q": q_buffer}
+            self.k_stages, Tma(stage_bytes), Umma, buffer={"K": k_buffer, "Q": q_buffer}
         )
         # tcgen05.wait::ld before each release, so MMA cannot overwrite a stage still being read.
         self.acc = Ring(self.acc_stages, Umma, Threads, release_fence="tmem_load")
         self.tmem_plan = TmemPlan().region("acc", self.tile_heads, self.acc_stages)
-        self.work = WorkStream(schedule=OneShot())  # item (qi, slab pair, 0), qi fastest
+        self.work = WorkStream(schedule=OneShot())
+
+    def q_operand(self, q: cute.Tensor) -> cute.Tensor:
+        """Q as (H, D, T, B)."""
+        return cute.make_tensor(q.iterator, cute.select(q.layout, mode=[2, 3, 1, 0]))
+
+    def work_space(self, pairs):
+        """Item ``(qi, slab pair, 0)``, ``qi`` fastest."""
+        return 2, pairs, 1
 
     @cute.jit
-    def query_work(self, params: GenericScoreParams, item):
+    def query_work(self, params: ScoreParams, item):
         """Decode work item ``(qi, local_pair, 0)``.
 
         Every role derives its trip counts from this, so each channel's producer and consumer
         agree on its epoch count.
         Returns ``(batch, query, first_tile, tile_end, interval)``; ``interval`` is the query's
-        ``(start, end)`` candidate interval in the packed entrypoint and None otherwise. The
+        ``(start, end)`` candidate interval in the packed specialization and None otherwise. The
         missing second query of an odd tail visits no tiles.
         """
         qi, local_pair, _ = item
@@ -178,7 +160,7 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
 
     @role(warps=5)
     @cute.jit
-    def load(self, params: GenericScoreParams, *, ab: Producer, work: WorkCursor):
+    def load(self, params: ScoreParams, *, ab: Producer, work: WorkCursor):
         """Stream K and Q tiles into shared stages; TMA zero-fills the head and D tails."""
         cpasync.prefetch_descriptor(params.tma_k)
         cpasync.prefetch_descriptor(params.tma_q)
@@ -238,7 +220,7 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
     @cute.jit
     def mma(
         self,
-        params: GenericScoreParams,
+        params: ScoreParams,
         *,
         ab: Consumer,
         acc: Producer,
@@ -282,7 +264,7 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
     @cute.jit
     def epilogue(
         self,
-        params: GenericScoreParams,
+        params: ScoreParams,
         *,
         acc: Consumer,
         work: WorkCursor,
@@ -290,27 +272,9 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         me: Local,
     ):
         """Keep one candidate's FP32 head sum in registers until its final slab store."""
-        if cutlass.const_expr(me.warps != 4):
-            raise ProtocolError(
-                f"epilogue: one thread per M128 candidate needs 4 warps, got {me.warps}"
-            )
-        tidx = me.tmem_row
-        tiled_mma = params.tiled_mma
-        accumulator = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
-        acc_tile = accumulator[(None, None, None, 0)]
-        tmem_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.tile_heads // 4)),
-            Float32,
+        accumulator, tmem_copy, tmem_thread, tile_candidate, logits = self.accumulator_reader(
+            params, tmem, me
         )
-        tmem_copy = tcgen05.make_tmem_copy(tmem_atom, acc_tile)
-        tmem_thread = tmem_copy.get_slice(tidx)
-        coordinates = tmem_thread.partition_D(
-            tiled_mma.get_slice(tidx).partition_C(cute.make_identity_tensor(self.mma_tile[:2]))
-        )
-        logits = cute.make_rmem_tensor(
-            tmem_thread.partition_D(cute.make_identity_tensor(acc_tile.shape)).shape, Float32
-        )
-        assert cute.size(logits) == self.tile_heads
         # With one head tile, the columns past H hold logits of TMA zero-filled Q rows: their
         # ReLU is +0 against weight 0, so each adds +0 to its sum. They are left unloaded, which
         # frees their registers, and one +0 added to the total keeps it bitwise equal: the only
@@ -326,17 +290,14 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
             weights = params.weights[batch, query, None]
             for candidate_tile in cutlass.range(first_tile, tile_end, unroll=0):
                 candidate = (
-                    self.upcast_offset(candidate_tile) * self.tile_candidates + coordinates[0][0]
+                    self.upcast_offset(candidate_tile) * self.tile_candidates + tile_candidate
                 )
                 valid = candidate < num_candidates
                 if cutlass.const_expr(interval is not None):
                     valid = valid and candidate >= interval[0] and candidate < interval[1]
                 elif cutlass.const_expr(self.causal):
                     valid = valid and candidate < self.visible_candidates(query)
-                sum0 = Float32(0.0)
-                sum1 = Float32(0.0)
-                sum2 = Float32(0.0)
-                sum3 = Float32(0.0)
+                sums = (Float32(0.0),) * 4
                 for head_tile in cutlass.range(self.head_tiles, unroll=0):
                     acc_full = acc.wait()
                     tmem_stage = tmem_thread.partition_S(
@@ -360,22 +321,9 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
                             if head < self.heads:
                                 weight = Float32(weights[head])
                             rW[offset] = weight
-                        for group in cutlass.range_constexpr(live_heads // 4):
-                            offset = group * 4
-                            x0 = Float32(logits[offset])
-                            x1 = Float32(logits[offset + 1])
-                            x2 = Float32(logits[offset + 2])
-                            x3 = Float32(logits[offset + 3])
-                            x0 = x0 if x0 > Float32(0.0) else Float32(0.0)  # noqa: FURB136
-                            x1 = x1 if x1 > Float32(0.0) else Float32(0.0)  # noqa: FURB136
-                            x2 = x2 if x2 > Float32(0.0) else Float32(0.0)  # noqa: FURB136
-                            x3 = x3 if x3 > Float32(0.0) else Float32(0.0)  # noqa: FURB136
-                            sum0 = sum0 + x0 * rW[offset]
-                            sum1 = sum1 + x1 * rW[offset + 1]
-                            sum2 = sum2 + x2 * rW[offset + 2]
-                            sum3 = sum3 + x3 * rW[offset + 3]
+                        sums = self.add_weighted_relu(sums, logits, rW, 0, live_heads)
                 if valid:
-                    total = (sum0 + sum1) + (sum2 + sum3)
+                    total = (sums[0] + sums[1]) + (sums[2] + sums[3])
                     if cutlass.const_expr(live_heads < self.tile_heads):
                         total = total + Float32(0.0)
                     params.scores[self.upcast_offset(local_pair), qi, candidate] = (
@@ -383,122 +331,3 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
                     )
             work.advance()
         return acc, work
-
-    # ----------------------------------------------------------------- kernel
-
-    @cute.kernel
-    def kernel(
-        self,
-        tiled_mma: cute.TiledMma,
-        tma_atom_k: cute.CopyAtom,
-        k: cute.Tensor,
-        tma_atom_q: cute.CopyAtom,
-        q: cute.Tensor,
-        weights: cute.Tensor,
-        scores: cute.Tensor,
-        k_layout: cute.ComposedLayout,
-        q_layout: cute.ComposedLayout,
-        pair_start,
-        score_scale: Float32,
-        candidate_bounds: cute.Tensor | None,
-        bound,
-    ):
-        """Bind the K/Q buffers, then run the roles."""
-        self.begin_roles(work=bound, layouts={"K": k_layout, "Q": q_layout})
-        accumulator_shape = tiled_mma.partition_shape_C(self.mma_tile[:2])
-        params = GenericScoreParams(
-            tiled_mma=tiled_mma,
-            tma_k=tma_atom_k,
-            k=k,
-            tma_q=tma_atom_q,
-            q=q,
-            sK=self.buffer("K"),
-            sQ=self.buffer("Q"),
-            acc_layout=tiled_mma.make_fragment_C(
-                cute.append(accumulator_shape, self.acc_stages)
-            ).layout,
-            weights=weights,
-            scores=scores,
-            pair_start=pair_start,
-            score_scale=score_scale,
-            candidate_bounds=candidate_bounds,
-        )
-        self.run_roles(params)
-
-    # ------------------------------------------------------------------- host
-
-    @cute.jit
-    def launch(
-        self,
-        q: cute.Tensor,
-        k: cute.Tensor,
-        weights: cute.Tensor,
-        scores: cute.Tensor,
-        pair_start,
-        score_scale: Float32,
-        candidate_bounds: cute.Tensor | None,
-        stream: cuda.CUstream,
-    ):
-        """Build the TMA descriptors and launch two CTAs per existing slab pair."""
-        assert q.element_type == self.dtype
-        assert k.element_type == q.element_type and weights.element_type == q.element_type
-        assert scores.element_type == Float32
-        q_hdtb = cute.make_tensor(q.iterator, cute.select(q.layout, mode=[2, 3, 1, 0]))
-        k_sdb = cute.make_tensor(k.iterator, cute.select(k.layout, mode=[1, 2, 0]))
-        tiled_mma = cute.make_tiled_mma(
-            tcgen05.MmaF16BF16Op(
-                q.element_type,
-                Float32,
-                (self.tile_candidates, self.tile_heads, 16),
-                tcgen05.CtaGroup.ONE,
-                tcgen05.OperandSource.SMEM,
-                cute.nvgpu.OperandMajorMode.K,
-                cute.nvgpu.OperandMajorMode.K,
-            )
-        )
-        k_layout = sm100_utils.make_smem_layout_a(
-            tiled_mma, self.mma_tile, k.element_type, self.ab.n
-        )
-        q_layout = sm100_utils.make_smem_layout_b(
-            tiled_mma, self.mma_tile, q.element_type, self.ab.n
-        )
-        tma_load = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
-        tma_atom_k, k_tma = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load,
-            k_sdb,
-            cute.select(k_layout, mode=[0, 1, 2]),
-            self.mma_tile,
-            tiled_mma,
-        )
-        tma_atom_q, q_tma = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load,
-            q_hdtb,
-            cute.select(q_layout, mode=[0, 1, 2]),
-            self.mma_tile,
-            tiled_mma,
-        )
-        pair_start = self.upcast_offset(pair_start)
-        total_pairs = self.upcast_offset(weights.shape[0]) * cute.ceil_div(
-            self.upcast_offset(weights.shape[1]), 2
-        )
-        # The public launcher slices the slab to the remaining pairs. A longer slab from a
-        # direct caller keeps its extra rows untouched.
-        pairs = cutlass.min(self.upcast_offset(scores.shape[0]), total_pairs - pair_start)
-        bound = self.work.bind((2, cutlass.Int32(pairs), 1))
-        packed = "_packed" if cutlass.const_expr(candidate_bounds is not None) else ""
-        self.kernel.set_name_prefix(f"{self.get_name()}_{q.element_type.__name__.lower()}{packed}")
-        self.kernel(
-            tiled_mma,
-            tma_atom_k,
-            k_tma,
-            tma_atom_q,
-            q_tma,
-            weights,
-            scores,
-            k_layout,
-            q_layout,
-            pair_start,
-            score_scale,
-            candidate_bounds,
-            bound,
-        ).launch(**self.launch_config(bound), stream=stream)

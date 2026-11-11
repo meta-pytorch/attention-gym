@@ -47,11 +47,12 @@ def _compile_scores(
     compress_ratio: int,
     use_int64_offsets: bool,
     contiguous_weight_heads: bool,
-    has_candidate_bounds: bool = False,
+    has_candidate_bounds: bool,
 ) -> Callable[..., None]:
     """Compile symbolic B/T/S/strides, specializing only an available unit weight-head stride.
 
-    ``has_candidate_bounds`` scores only each query's packed ``candidate_bounds`` interval.
+    With ``has_candidate_bounds``, score only each query's packed ``candidate_bounds`` interval;
+    otherwise the compiled kernel takes None for ``candidate_bounds``.
     """
     import cutlass
     from cutlass import cute
@@ -99,19 +100,23 @@ def _compile_scores(
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
     )
-    args = (q, k, weights, scores, integer(0), cutlass.Float32(1.0))
-    if has_candidate_bounds:
-        return compile_tvm_ffi(
-            operation.with_candidate_bounds,
-            *args,
-            _fake_candidate_bounds(tokens, use_int64_offsets),
-            name=f"{operation.get_name()}_packed",
-        )
-    return compile_tvm_ffi(operation, *args)
+    return compile_tvm_ffi(
+        operation,
+        q,
+        k,
+        weights,
+        scores,
+        integer(0),
+        cutlass.Float32(1.0),
+        _fake_candidate_bounds(has_candidate_bounds, tokens, use_int64_offsets),
+        name=operation.get_name() + ("_packed" if has_candidate_bounds else ""),
+    )
 
 
-def _fake_candidate_bounds(tokens, use_int64_offsets: bool):
-    """Fake contiguous INT32 [T, 2] packed candidate intervals."""
+def _fake_candidate_bounds(enabled: bool, tokens, use_int64_offsets: bool):
+    """Fake contiguous INT32 [T, 2] packed candidate intervals, or None for a dense kernel."""
+    if not enabled:
+        return None
     import cutlass
     from cutlass import cute
 
@@ -131,7 +136,7 @@ def _compile_topk(
     compress_ratio: int,
     use_int64_offsets: bool,
     deterministic: bool,
-    has_candidate_bounds: bool = False,
+    has_candidate_bounds: bool,
 ) -> Callable[..., None]:
     """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
     import cutlass
@@ -163,16 +168,14 @@ def _compile_topk(
         compress_ratio=compress_ratio,
         deterministic=deterministic,
     )
-    if has_candidate_bounds:
-        return compile_tvm_ffi(
-            operation.with_candidate_bounds,
-            scores,
-            output,
-            integer(0),
-            _fake_candidate_bounds(tokens, use_int64_offsets),
-            name=f"{operation.get_name()}_packed",
-        )
-    return compile_tvm_ffi(operation, scores, output, integer(0))
+    return compile_tvm_ffi(
+        operation,
+        scores,
+        output,
+        integer(0),
+        _fake_candidate_bounds(has_candidate_bounds, tokens, use_int64_offsets),
+        name=operation.get_name() + ("_packed" if has_candidate_bounds else ""),
+    )
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
@@ -243,38 +246,35 @@ def launch(
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(q.device.index))
+        packed = candidate_bounds is not None
         # Packed bounds already contain both mask decisions; neither kernel reads these flags.
-        if candidate_bounds is not None:
+        if packed:
             causal, compress_ratio = False, 1
-        # A unit head stride avoids the generic reducer's measured strided-load overhead.
-        score_args = (
+        score_kernel = _compile_scores(
             q.dtype,
             heads,
             head_dim,
             causal,
             compress_ratio,
             use_int64_offsets,
+            # A unit head stride avoids the generic reducer's measured strided-load overhead.
             weights.stride(-1) == 1,
+            packed,
         )
-        topk_args = (topk, causal, compress_ratio, use_int64_offsets, deterministic)
-        if candidate_bounds is None:
-            score_kernel = _compile_scores(*score_args)
-            topk_kernel = _compile_topk(*topk_args)
-        else:
-            score_kernel = _compile_scores(*score_args, has_candidate_bounds=True)
-            topk_kernel = _compile_topk(*topk_args, has_candidate_bounds=True)
+        topk_kernel = _compile_topk(
+            topk, causal, compress_ratio, use_int64_offsets, deterministic, packed
+        )
     finally:
         set_compile_target(previous)
 
     q, k, weights = q.detach(), k.detach(), weights.detach()
     scale = cutlass.Float32(1.0 / math.sqrt(heads * head_dim))
     total_pairs = batch * cdiv(tokens, 2)
-    bounds = () if candidate_bounds is None else (candidate_bounds,)
     with initialized_cuda_device(q):
         for start in range(0, total_pairs, pairs):
             active_scores = scores[: min(pairs, total_pairs - start)]
-            score_kernel(q, k, weights, active_scores, integer(start), scale, *bounds)
-            topk_kernel(active_scores, output, integer(start), *bounds)
+            score_kernel(q, k, weights, active_scores, integer(start), scale, candidate_bounds)
+            topk_kernel(active_scores, output, integer(start), candidate_bounds)
     return output
 
 

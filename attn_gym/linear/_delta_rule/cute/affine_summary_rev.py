@@ -56,11 +56,19 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     MAX_RANGES,
     SUMMARY_DIM,
     VAL_DIM,
+    TmaOp,
     _aligned,
     _feature_sequence_head_batch_view,
     _sequence_feature_head_batch_view,
     decode_work_row,
     plan_work_budget,
+    range_tail,
+    smem_tile_writer,
+    store_rounded,
+    tma_partition_a,
+    tma_partition_b,
+    tma_partition_gate,
+    tmem_tile_reader,
     zero_tail_tokens,
 )
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
@@ -69,7 +77,6 @@ from attn_gym.warpdrive import (
     Consumer,
     Local,
     Producer,
-    Raster,
     Ring,
     SmemPlan,
     StaticPersistent,
@@ -92,13 +99,6 @@ from attn_gym.warpdrive.compat import LayoutEnum
 _LAUNCH_WORK = WorkStream(schedule=StaticPersistent())
 
 
-class TmaOp(NamedTuple):
-    """One TMA copy atom and its tensor-map descriptor."""
-
-    atom: cute.CopyAtom
-    desc: cute.Tensor
-
-
 class TmaOps(NamedTuple):
     """TMA operations owned by the reverse-summary kernel."""
 
@@ -117,20 +117,6 @@ class Mmas(NamedTuple):
     qdo: cute.TiledMma
     aqdo: cute.TiledMma
     wdv: cute.TiledMma
-
-
-class SmemLayouts(NamedTuple):
-    """Shared-memory layouts in device-kernel construction order."""
-
-    k: cute.ComposedLayout
-    state: cute.ComposedLayout
-    state_store: cute.ComposedLayout
-    q: cute.ComposedLayout
-    do: cute.ComposedLayout
-    w: cute.ComposedLayout
-    dv: cute.ComposedLayout
-    dv_store: cute.ComposedLayout
-    aqk: cute.ComposedLayout
 
 
 @dataclass(frozen=True)
@@ -242,7 +228,7 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
             .region("qdo", self.BN, self.qdo_acc_depth)
             .region("wdv", self.BN, self.wdv_acc_depth)
         )
-        self.work = WorkStream(mapping=Raster(), schedule=StaticPersistent())
+        self.work = WorkStream(schedule=StaticPersistent())
 
     def get_name(self) -> str:
         """Return a stable artifact and profiler name for this specialization."""
@@ -272,7 +258,7 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         """Construct TMA/UMMA descriptors and launch the persistent kernel.
 
         ``work_table[w] = (start, chunk_begin, chunk_end, length)`` names a run of chunks of one
-        range (see ``_decode_work``); ``out[w]`` receives its reverse map.
+        range (see ``decode_work_row``); ``out[w]`` receives its reverse map.
         """
         g_k = _sequence_feature_head_batch_view(kg)
         g_qt = _feature_sequence_head_batch_view(qg)
@@ -392,17 +378,19 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
             self.io_type,
             self.aqk_depth,
         )
-        smem_layouts = SmemLayouts(
-            s_k,
-            s_state,
-            s_state_store,
-            s_q,
-            s_do,
-            s_w,
-            s_dv,
-            s_dv_store,
-            s_aqk,
-        )
+        smem_layouts = {
+            "K": s_k,
+            "State": s_state,
+            "StateStore": s_state_store,
+            "Q": s_q,
+            "Do": s_do,
+            "W": s_w,
+            "DvOperand": s_dv,
+            "DvStore": s_dv_store,
+            "Aqk": s_aqk,
+            "Gate": cute.make_layout((self.BK, 1, self.gate_depth), stride=(1, self.BK, self.BK)),
+            "GateExp": cute.make_layout((self.BK, self.gate_depth)),
+        }
 
         tma_load = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
         cluster_layout = cute.tiled_divide(
@@ -480,27 +468,6 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
             stream=stream,
         )
 
-    @cute.jit
-    def _decode_work(self, work_index, work_table):
-        """Return the column tile, head, output row, token range, and chunk range of a work item.
-
-        The item scans its chunks from ``[0 | I]`` into output row ``w``; see ``decode_work_row``
-        for the row layout. An all-zero row stores the identity.
-        """
-        # Raster decodes runtime extents once per item in each role, m fastest: column tile,
-        # then head, then work-table row.
-        column_tile, head, row = work_index
-        start, length, chunk_begin, chunk_end = decode_work_row(work_table, row, self.whole_ranges)
-        return column_tile, head, row, start, length, chunk_begin, chunk_end
-
-    @cute.jit
-    def _tail_valid_rows(self, length):
-        """Valid token rows of a range's last chunk, or zero when that chunk is full."""
-        rows = length - ((length + self.BT - 1) // self.BT - 1) * self.BT
-        if rows == self.BT:
-            rows = Int32(0)
-        return rows
-
     @role(warps=range(4), regs=192)
     @cute.jit
     def run_state(
@@ -528,32 +495,9 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         t_wdv_acc = cute.make_tensor(tmem.ptr("wdv"), params.wdv_layout)
         local_tid = me.tmem_row
 
-        t2r_dv_atom = cute.make_copy_atom(
-            tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BN // 8), tcgen05.Pack.NONE),
-            self.acc_type,
-        )
-        dv_flat = t_dv_acc[((None, None), 0, 0, None)]
-        t2r_dv = tcgen05.make_tmem_copy(t2r_dv_atom, dv_flat[(None, None, 0)])
-        dv_slice = t2r_dv.get_slice(local_tid)
-        partitioned_dv = dv_slice.partition_S(dv_flat)
-
-        t2r_qdo_atom = cute.make_copy_atom(
-            tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BN // 8), tcgen05.Pack.NONE),
-            self.acc_type,
-        )
-        qdo_flat = t_qdo_acc[((None, None), 0, 0, None)]
-        t2r_qdo = tcgen05.make_tmem_copy(t2r_qdo_atom, qdo_flat[(None, None, 0)])
-        qdo_slice = t2r_qdo.get_slice(local_tid)
-        partitioned_qdo = qdo_slice.partition_S(qdo_flat)
-
-        t2r_wdv_atom = cute.make_copy_atom(
-            tcgen05.Ld16x256bOp(tcgen05.Repetition(self.BN // 8), tcgen05.Pack.NONE),
-            self.acc_type,
-        )
-        wdv_flat = t_wdv_acc[((None, None), 0, 0, None)]
-        t2r_wdv = tcgen05.make_tmem_copy(t2r_wdv_atom, wdv_flat[(None, None, 0)])
-        wdv_slice = t2r_wdv.get_slice(local_tid)
-        partitioned_wdv = wdv_slice.partition_S(wdv_flat)
+        t2r_dv, dv_slice, partitioned_dv = tmem_tile_reader(t_dv_acc, local_tid, self.BN)
+        t2r_qdo, qdo_slice, partitioned_qdo = tmem_tile_reader(t_qdo_acc, local_tid, self.BN)
+        t2r_wdv, wdv_slice, partitioned_wdv = tmem_tile_reader(t_wdv_acc, local_tid, self.BN)
 
         dv_coordinates = dv_slice.partition_D(
             cute.make_identity_tensor(cute.dice(self.dv_tile, (1, 1, None)))
@@ -566,27 +510,13 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         )
         state = cute.make_rmem_tensor(state_coordinates.shape, self.acc_type)
 
-        r2s_state_atom = sm100_utils.get_smem_store_op(
-            LayoutEnum.COL_MAJOR,
-            self.io_type,
-            self.acc_type,
-            t2r_qdo,
-        )
-        r2s_state = cute.make_tiled_copy_D(r2s_state_atom, t2r_qdo)
-        r2s_state_slice = r2s_state.get_slice(local_tid)
-
-        r2s_dv_atom = sm100_utils.get_smem_store_op(
-            LayoutEnum.COL_MAJOR,
-            self.io_type,
-            self.acc_type,
-            t2r_dv,
-        )
-        r2s_dv = cute.make_tiled_copy_D(r2s_dv_atom, t2r_dv)
-        r2s_dv_slice = r2s_dv.get_slice(local_tid)
+        state_writer = smem_tile_writer(t2r_qdo, local_tid, self.io_type)
+        dv_writer = smem_tile_writer(t2r_dv, local_tid, self.io_type)
 
         while work.valid:
-            column_tile, head, row, _start, _length, chunk_begin, chunk_end = self._decode_work(
-                work.item, params.work_table
+            column_tile, head, row = work.item
+            _start, _length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
             )
             has_source = column_tile < VAL_DIM // self.BN
 
@@ -603,22 +533,20 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
                 # pass while the lo residual is still being formed and stored.
                 hi_handle = state_pipe.acquire()
                 hi_handle.access("Store", write=True, by="threads")
-                state_hi = cute.make_rmem_tensor(state.shape, self.io_type)
-                state_hi.store(state.load().to(self.io_type))
-                cute.copy(
-                    r2s_state,
-                    r2s_state.retile(state_hi),
-                    r2s_state_slice.partition_D(s_state_store[(None, None, hi_handle.index)]),
+                state_hi = store_rounded(
+                    state.load(),
+                    state_writer,
+                    s_state_store[(None, None, hi_handle.index)],
+                    self.io_type,
                 )
                 hi_handle.commit()
                 lo_handle = state_pipe.acquire()
                 lo_handle.access("Store", write=True, by="threads")
-                state_lo = cute.make_rmem_tensor(state.shape, self.io_type)
-                state_lo.store((state.load() - state_hi.load().to(Float32)).to(self.io_type))
-                cute.copy(
-                    r2s_state,
-                    r2s_state.retile(state_lo),
-                    r2s_state_slice.partition_D(s_state_store[(None, None, lo_handle.index)]),
+                store_rounded(
+                    state.load() - state_hi.load().to(Float32),
+                    state_writer,
+                    s_state_store[(None, None, lo_handle.index)],
+                    self.io_type,
                 )
                 lo_handle.commit()
 
@@ -633,22 +561,17 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
 
                 hi_handle = dv_operand.acquire()
                 hi_handle.access("Store", write=True, by="threads")
-                dv_hi = cute.make_rmem_tensor(dv.shape, self.io_type)
-                dv_hi.store(dv.load().to(self.io_type))
-                cute.copy(
-                    r2s_dv,
-                    r2s_dv.retile(dv_hi),
-                    r2s_dv_slice.partition_D(s_dv_store[(None, None, hi_handle.index)]),
+                dv_hi = store_rounded(
+                    dv.load(), dv_writer, s_dv_store[(None, None, hi_handle.index)], self.io_type
                 )
                 hi_handle.commit()
                 lo_handle = dv_operand.acquire()
                 lo_handle.access("Store", write=True, by="threads")
-                dv_lo = cute.make_rmem_tensor(dv.shape, self.io_type)
-                dv_lo.store((dv.load() - dv_hi.load().to(Float32)).to(self.io_type))
-                cute.copy(
-                    r2s_dv,
-                    r2s_dv.retile(dv_lo),
-                    r2s_dv_slice.partition_D(s_dv_store[(None, None, lo_handle.index)]),
+                store_rounded(
+                    dv.load() - dv_hi.load().to(Float32),
+                    dv_writer,
+                    s_dv_store[(None, None, lo_handle.index)],
+                    self.io_type,
                 )
                 lo_handle.commit()
 
@@ -729,8 +652,9 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         atom_gate, desc_gate = tma.gate
 
         while work.valid:
-            column_tile, head, _work, start, length, chunk_begin, chunk_end = self._decode_work(
-                work.item, params.work_table
+            column_tile, head, row = work.item
+            start, length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
             )
             has_source = column_tile < VAL_DIM // self.BN
 
@@ -742,44 +666,15 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
             q_desc = cute.domain_offset((0, start, (0, 0)), desc_q)
             do_desc = cute.domain_offset((0, start, (0, 0)), desc_do)
             aqk_desc = cute.domain_offset((0, start, (0, 0)), desc_aqk)
-            k_smem, k_gmem = self._partition_a(atom_k, k_desc, s_k, self.dv_tile, mma_dv, head)
-            w_smem, w_gmem = self._partition_a(
-                atom_w,
-                w_desc,
-                s_w,
-                self.wdv_tile,
-                mma_wdv,
-                head,
+            k_smem, k_gmem = tma_partition_a(atom_k, k_desc, s_k, self.dv_tile, mma_dv, head)
+            w_smem, w_gmem = tma_partition_a(atom_w, w_desc, s_w, self.wdv_tile, mma_wdv, head)
+            gate_smem, gate_gmem = tma_partition_gate(atom_gate, gate_desc, s_gate, head)
+            q_smem, q_gmem = tma_partition_a(atom_q, q_desc, s_q, self.qdo_tile, mma_qdo, head)
+            do_smem, do_gmem = tma_partition_b(
+                atom_do, do_desc, s_do, self.qdo_tile, mma_qdo, head
             )
-            gate_smem, gate_gmem = self._partition_epilogue(
-                atom_gate,
-                gate_desc[None, None, (head, 0)],
-                (self.BK, 1),
-                s_gate,
-            )
-            q_smem, q_gmem = self._partition_a(
-                atom_q,
-                q_desc,
-                s_q,
-                self.qdo_tile,
-                mma_qdo,
-                head,
-            )
-            do_smem, do_gmem = self._partition_b(
-                atom_do,
-                do_desc,
-                s_do,
-                self.qdo_tile,
-                mma_qdo,
-                head,
-            )
-            aqk_smem, aqk_gmem = self._partition_a(
-                atom_aqk,
-                aqk_desc,
-                s_aqk,
-                self.aqdo_tile,
-                mma_aqdo,
-                head,
+            aqk_smem, aqk_gmem = tma_partition_a(
+                atom_aqk, aqk_desc, s_aqk, self.aqdo_tile, mma_aqdo, head
             )
 
             for chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
@@ -860,7 +755,10 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
 
         gate_data = params.gate
         while work.valid:
-            _, _, _, _, _, chunk_begin, chunk_end = self._decode_work(work.item, params.work_table)
+            _column_tile, _head, row = work.item
+            _start, _length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
+            )
             for _chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 gate_handle = gate.wait()
                 ready_handle = gate_ready.acquire()
@@ -928,13 +826,13 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         mma_tid = me.tid
 
         while work.valid:
-            column_tile, _head, _work, _start, length, chunk_begin, chunk_end = self._decode_work(
-                work.item, params.work_table
+            column_tile, _head, row = work.item
+            _start, length, chunk_begin, chunk_end = decode_work_row(
+                params.work_table, row, self.whole_ranges
             )
             has_source = column_tile < VAL_DIM // self.BN
             # The range's last chunk is the first one this range visits when it owns it.
-            tail_valid_rows = self._tail_valid_rows(length)
-            last_chunk = (length + self.BT - 1) // self.BT - 1
+            last_chunk, tail_valid_rows = range_tail(length)
 
             for chunk in cutlass.range(chunk_begin, chunk_end, unroll=0):
                 reverse_chunk = chunk_end - 1 - (chunk - chunk_begin)
@@ -1044,28 +942,12 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
         tma: TmaOps,
         work_table: cute.Tensor,
         out: cute.Tensor,
-        smem_layouts: SmemLayouts,
+        smem_layouts: dict,
         scale: Float32,
         bound,
     ):
-        (s_k, s_state, s_state_store, s_q, s_do, s_w, s_dv, s_dv_store, s_aqk) = smem_layouts
-        gate_layout = cute.make_layout((self.BK, 1, self.gate_depth), stride=(1, self.BK, self.BK))
-        self.begin_roles(
-            work=bound,
-            layouts={
-                "K": s_k,
-                "State": s_state,
-                "StateStore": s_state_store,
-                "Q": s_q,
-                "Do": s_do,
-                "W": s_w,
-                "DvOperand": s_dv,
-                "DvStore": s_dv_store,
-                "Aqk": s_aqk,
-                "Gate": gate_layout,
-                "GateExp": cute.make_layout((self.BK, self.gate_depth)),
-            },
-        )
+        """``smem_layouts`` maps each ``smem_plan`` buffer to its staged layout."""
+        self.begin_roles(work=bound, layouts=smem_layouts)
         mma_dv, mma_qdo, _mma_aqdo, mma_wdv = mmas
         dv_fragment = mma_dv.make_fragment_C(
             cute.append(mma_dv.partition_shape_C(self.dv_tile[:2]), self.dv_acc_depth)
@@ -1102,43 +984,6 @@ class BlackwellDeltaAffineSummaryRev(WarpSpecialized):
             gate_exp=self.buffer("GateExp"),
         )
         self.run_roles(params)
-
-    @cute.jit
-    def _partition_a(self, atom, desc, smem, tile, mma, head):
-        """Partition a dense TMA tensor as an SS-mode MMA A operand."""
-        gmem = cute.local_tile(desc, cute.slice_(tile, (None, 0, None)), (None, None, (head, 0)))
-        partitioned = mma.get_slice(0).partition_A(gmem)
-        return cpasync.tma_partition(
-            atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(smem, 0, 3),
-            cute.group_modes(partitioned, 0, 3),
-        )
-
-    @cute.jit
-    def _partition_b(self, atom, desc, smem, tile, mma, head):
-        """Partition a dense TMA tensor as an SS-mode MMA B operand."""
-        gmem = cute.local_tile(desc, cute.slice_(tile, (0, None, None)), (None, None, (head, 0)))
-        partitioned = mma.get_slice(0).partition_B(gmem)
-        return cpasync.tma_partition(
-            atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(smem, 0, 3),
-            cute.group_modes(partitioned, 0, 3),
-        )
-
-    @cute.jit
-    def _partition_epilogue(self, atom, gmem, tile, smem):
-        """Partition a simple two-dimensional TMA tile."""
-        return cpasync.tma_partition(
-            atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(smem, 0, 2),
-            cute.group_modes(cute.flat_divide(gmem, tile), 0, 2),
-        )
 
 
 @jit_cache
