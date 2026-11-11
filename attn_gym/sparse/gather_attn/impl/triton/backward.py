@@ -832,7 +832,7 @@ def _launch_backward(
     count before the op broadcasts a single shared head; separate values or
     1 < kv_heads < heads run on the grouped schedule. Key-only RoPE runs only on the
     shared-KV schedule, whose sparse gradients are atomic, so the reverse query map may be
-    None. Without ``autotune`` every kernel launches its pinned configuration.
+    None. ``autotune=False`` pins each tuned kernel's configuration.
     """
     if uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None):
         dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v = _launch_grouped_backward(

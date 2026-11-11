@@ -115,7 +115,6 @@ def test_backward_factor_recomputation_preserves_fastmath(packed):
             d_output,
             state,
             scale=prepared.scale,
-            schedule=prepared.schedule,
             fastmath=False,
             kernel_options={"autotune": False},
         )

@@ -555,9 +555,7 @@ summaries = prepared.state_summaries(bounds)  # [bias; transition] per range
 # ...exchange summaries and compose each subsequence's entry state...
 output, final_state = prepared.run(initial_state, output_final_state=True)
 
-grads = chunk_kda_prepare_backward(
-    prepared.saved, d_output, initial_state, scale=prepared.scale, schedule=prepared.schedule
-)
+grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
 grad_summaries = grads.state_grad_summaries(bounds)  # reverse maps [bias; transition]
 # ...exchange and compose each subsequence's exit cotangent...
 dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)

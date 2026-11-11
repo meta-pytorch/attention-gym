@@ -46,7 +46,6 @@ configure_triton_allocator()
 _TOKENS_BUCKET_LIMIT = 64
 
 _RECURRENT_TUNING_ARGS = (
-    "tokens_bucket",
     "N",
     "H",
     "HK",
@@ -76,15 +75,22 @@ def _prune_recurrent_configs(
     return [config for config in configs if config.kwargs["BV"] <= max_block_v]
 
 
+def _average_tokens(tokens: int, num_sequences: int, is_varlen: bool) -> int:
+    """Tokens per sequence: ``tokens`` is the packed total when ``is_varlen``."""
+    return triton.cdiv(tokens, num_sequences) if is_varlen else tokens
+
+
 def _recurrent_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
     """Key winners by grid fill, bucketed scan length, specialization, and operand dtypes.
 
     The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
-    ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; ``tokens_bucket`` collapses the exact
-    token count to that information so new lengths do not re-benchmark.
+    ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; the bucket collapses the exact token
+    count to that information so new lengths do not re-benchmark.
     """
     operands = ("q", "k", "v", "gate", "beta", "h0", "cu_seqlens")
+    average_tokens = _average_tokens(args["T"], args["N"], args["IS_VARLEN"])
     return (
+        min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT),
         *(args[name] for name in _RECURRENT_TUNING_ARGS),
         *(None if args[name] is None else args[name].dtype for name in operands),
     )
@@ -130,7 +136,7 @@ def _load_token(
     return b_q, b_k, b_g, b_beta, b_v
 
 
-@triton.jit(do_not_specialize=["T", "N", "tokens_bucket"])
+@triton.jit(do_not_specialize=["T", "N"])
 def _recurrent_delta_rule_fwd_kernel(
     q,
     k,
@@ -146,7 +152,6 @@ def _recurrent_delta_rule_fwd_kernel(
     scale,
     T,
     N,
-    tokens_bucket,
     state_batch_stride: tl.constexpr,
     H: tl.constexpr,
     HK: tl.constexpr,
@@ -368,8 +373,7 @@ def launch_recurrent_delta_rule_fwd(
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
 
     sequence_heads = num_sequences * heads
-    average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
-    tokens_bucket = min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT)
+    average_tokens = _average_tokens(tokens, num_sequences, cu_seqlens is not None)
     # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
     # Prefetch was slower for K > 128.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
@@ -431,7 +435,6 @@ def launch_recurrent_delta_rule_fwd(
         scale=scale,
         T=tokens,
         N=num_sequences,
-        tokens_bucket=tokens_bucket,
         state_batch_stride=state_batch_stride,
         H=heads,
         HK=key_heads,

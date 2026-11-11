@@ -124,6 +124,13 @@ Every operation that tunes can also launch pinned configurations chosen without 
   `l2norm`, the context-parallel and staged chunk operations, and `gather_attn`.
   `paged_mla_decode` tunes only with `{"autotune": True}`.
 
+Tuning needs one eager call per workload before CUDA graph capture: a capture that reaches an
+untuned kernel raises `RuntimeError`. Capture with `{"autotune": False}` to skip the warm-up.
+
+Upgrading from a release that took `autotune=` as a keyword: pass
+`kernel_options={"autotune": ...}` instead. Winners from Triton's own autotune cache are not
+reused, so each workload tunes once more after the upgrade.
+
 The pinned configuration follows the input shapes and GPU model. For otherwise deterministic
 kernels, bits repeat across processes and cache states on one GPU model and software stack,
 not across GPU architectures.

@@ -52,13 +52,13 @@ def test_chunk_gdn_without_autotune_never_benchmarks(
 
 
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_chunk_gdn_under_deterministic_algorithms_never_benchmarks(
-    head_dim: int, isolated_winners: None, request: pytest.FixtureRequest
+def test_deterministic_mode_gives_the_bits_of_autotune_false(
+    head_dim: int, no_benchmarking: None, request: pytest.FixtureRequest
 ):
-    tuned = chunk_outputs_and_gradients(head_dim, packed=True)
-    request.getfixturevalue("no_benchmarking")
+    pinned = chunk_outputs_and_gradients(head_dim, True, {"autotune": False})
     request.getfixturevalue("deterministic_algorithms")
-    assert_matches_tuned(chunk_outputs_and_gradients(head_dim, packed=True), tuned)
+    actual = chunk_outputs_and_gradients(head_dim, packed=True)
+    assert all(torch.equal(result, expected) for result, expected in zip(actual, pinned))
 
 
 def test_paged_chunk_gdn_without_autotune_never_benchmarks(no_benchmarking: None):

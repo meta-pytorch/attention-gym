@@ -6,6 +6,7 @@ from typing import Literal, NamedTuple, overload
 import torch
 from torch import Tensor
 
+from attn_gym._backends.autotune import resolve_autotune
 from attn_gym._cu_seqlens import validate_cu_seqlens_pair
 from attn_gym.types import AuxRequest, Impl, TuningOptions, resolve_impl
 
@@ -204,15 +205,15 @@ def _validate_inputs(
     validate_cu_seqlens_pair(cu_seqlens, cu_seqlens_k, batch=batch, device=query.device)
 
 
-def _validate_kernel_options(kernel_options: GatherAttnKernelOptions | None) -> None:
-    options = kernel_options or {}
+def _resolve_kernel_options(kernel_options: GatherAttnKernelOptions) -> bool:
+    """Validate ``kernel_options`` and return the ``autotune`` request."""
     if (
-        options.keys() - {"autotune", "backend", "bwd_recompute_p"}
-        or options.get("backend", "cute") not in ("cute", "triton")
-        or type(options.get("bwd_recompute_p", False)) is not bool
-        or type(options.get("autotune", True)) is not bool
+        kernel_options.keys() - {"autotune", "backend", "bwd_recompute_p"}
+        or kernel_options.get("backend", "cute") not in ("cute", "triton")
+        or type(kernel_options.get("bwd_recompute_p", False)) is not bool
     ):
         raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
+    return resolve_autotune(kernel_options)
 
 
 def _select_backend(
@@ -386,15 +387,13 @@ def gather_attn(
             "backend": "cute" or "triton" overrides the backend; omit it to prefer
             eligible CuTe calls, otherwise Triton. "bwd_recompute_p" (default True):
             CuTe backward recomputes attention probabilities; False saves them in forward
-            instead (BF16, tokens x heads x keys, with backend padding). Triton always recomputes
-            and ignores this option. "autotune" (default True): Triton kernels
-            benchmark candidate configurations on first use and reuse the cached
-            winner. Candidates differ in floating-point order; False selects each
-            kernel's pinned configuration independently of timing and winner-cache
-            state. Deterministic mode implies False. CuTe has one schedule and
-            ignores this option. Deterministic mode selects
-            Triton automatically, but nonempty paired RoPE has no strict
-            deterministic backward there.
+            instead (BF16, tokens x heads x keys, with backend padding). Triton always
+            recomputes and ignores this option. Deterministic mode selects Triton
+            automatically, but nonempty paired RoPE has no strict deterministic backward
+            there. "autotune" (default True): Triton kernels benchmark candidate
+            configurations on first use and reuse the cached winner. Candidates differ in
+            floating-point order; False, or deterministic mode, launches each kernel's
+            pinned configuration instead. CuTe has one schedule and ignores this option.
             Explicit backend requests are honored; execution failures are never
             retried on another backend. Nonempty options are invalid with
             Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward, and
@@ -448,7 +447,8 @@ def gather_attn(
     selected_impl = resolve_impl(impl)
     if selected_impl is Impl.REFERENCE and kernel_options:
         raise ValueError("kernel_options are not supported with impl='reference'")
-    _validate_kernel_options(kernel_options)
+    options = kernel_options or {}
+    autotune = _resolve_kernel_options(options)
 
     query_latent, query_rope = _split_input(query, "query")
     paired = query_rope is not None
@@ -502,7 +502,6 @@ def gather_attn(
         raise ValueError("scale must be greater than 0.")
     scale = query_latent.shape[-1] ** -0.5 if scale is None else scale
 
-    options = kernel_options or {}
     if selected_impl is Impl.REFERENCE:
         from .impl import reference
 
@@ -577,7 +576,7 @@ def gather_attn(
             local_rope=local_rope,
             backend=backend,
             bwd_recompute_p=options.get("bwd_recompute_p", True),
-            autotune=options.get("autotune", True),
+            autotune=autotune,
             local_v=local_v,
             sparse_v=sparse_v,
         )

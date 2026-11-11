@@ -7,11 +7,13 @@ from attn_gym.sparse.gather_attn import AuxRequest, gather_attn
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-# (heads, kv_heads, head_dim, topk, window): the TMA, shared and grouped Triton schedules.
+# (heads, kv_heads, head_dim, topk, window): the TMA, shared and grouped Triton schedules;
+# without a window the grouped schedule also launches the dense-tile kernels.
 SCHEDULES = {
     "tma": (16, 1, 256, 16, 16),
     "shared": (16, 1, 64, 32, 128),
     "grouped": (16, 4, 128, 32, 128),
+    "grouped-dense": (16, 4, 128, 32, 0),
 }
 
 
@@ -60,7 +62,7 @@ def test_autotune_false_and_deterministic_mode_launch_the_same_pinned_forward(
 
 def test_autotune_option_must_be_a_bool():
     query = torch.randn(1, 2, 8, 16)
-    with pytest.raises(ValueError, match="unsupported gather_attn kernel options"):
+    with pytest.raises(TypeError, match=r"kernel_options\['autotune'\] must be a bool"):
         gather_attn(
             query,
             query,

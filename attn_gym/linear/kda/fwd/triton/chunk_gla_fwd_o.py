@@ -37,21 +37,6 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 from attn_gym.linear.kda.utils import exp2
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            args["q"],
-            args["v"],
-            args["g"],
-            args["h"],
-            args["o"],
-            args["A"],
-            args["cu_seqlens"],
-            args["chunk_offsets"],
-        ),
-    }
-)
 @triton.jit(
     do_not_specialize=[
         "T",
@@ -492,7 +477,7 @@ def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
 
 def _fwd_o_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
     return (
-        *(args[name].dtype for name in ("q", "g", "h", "A")),
+        *(args[name].dtype for name in ("q", "v", "g", "h", "A")),
         args["H"],
         args["K"],
         args["V"],
@@ -500,7 +485,7 @@ def _fwd_o_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
         triton.next_power_of_2(triton.cdiv(args["T"], args["BT"])),
         args["BT"],
         args["FASTMATH"],
-        args["cu_seqlens"] is not None,
+        args["IS_VARLEN"],
     )
 
 
@@ -669,6 +654,8 @@ def chunk_gla_fwd_o_gk(
         def grid(meta):
             return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * heads)
 
+        cu_seqlens = None if metadata is None else metadata.cu_seqlens
+        chunk_offsets = None if metadata is None else metadata.chunk_offsets
         (_fwd_o if autotune else _fwd_o.pinned)[grid](
             q=q,
             v=v,
@@ -676,8 +663,8 @@ def chunk_gla_fwd_o_gk(
             h=h,
             o=output,
             A=A,
-            cu_seqlens=None if metadata is None else metadata.cu_seqlens,
-            chunk_offsets=None if metadata is None else metadata.chunk_offsets,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
             scale=scale,
             T=tokens,
             q_stride_t=q.stride(1),
@@ -687,6 +674,10 @@ def chunk_gla_fwd_o_gk(
             V=value_dim,
             BT=chunk_size,
             num_sequences=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
+            IS_VARLEN=metadata is not None,
+            USE_INT64_OFFSETS=requires_int64_offsets(
+                q, v, g, h, output, A, cu_seqlens, chunk_offsets
+            ),
             FASTMATH=fastmath,
             enable_reflect_ftz=fastmath,
         )

@@ -147,8 +147,9 @@ class ContextParallelDeltaRuleAttention(DeltaRuleAttention):
 
     def __init__(self, *args, group: dist.ProcessGroup, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if self.variant == "gdn" and self.kernel_options:
-            raise ValueError("context_parallel_gdn does not take kernel_options")
+        # Fail at construction rather than at the first distributed forward.
+        if self.variant == "gdn" and (self.kernel_options or {}).keys() - {"autotune"}:
+            raise ValueError("context_parallel_gdn takes only the autotune kernel option")
         self.cp_group = group
 
     def forward(
@@ -237,7 +238,14 @@ class ContextParallelDeltaRuleAttention(DeltaRuleAttention):
             )
         else:
             output, final_state = context_parallel_gdn(
-                q, k, v, gate, beta, routing=routing, group=self.cp_group
+                q,
+                k,
+                v,
+                gate,
+                beta,
+                routing=routing,
+                group=self.cp_group,
+                kernel_options=self.kernel_options,
             )
         return output, final_state if return_final_state else None
 

@@ -1120,7 +1120,7 @@ def _launch_forward(
     ``kv_heads`` is the KV head count before the op broadcasts a single shared head. Without
     separate values the keys are also the values, so the output is as wide as ``query``.
     Key-only RoPE tensors run only on the shared-KV schedule; local tensors may be None
-    without a window. Without ``autotune`` every kernel launches its pinned configuration.
+    without a window. ``autotune=False`` pins each tuned kernel's configuration.
     """
     if not sliding_window_size:
         # Kernels never read local tensors without a window, so they are passed as None.

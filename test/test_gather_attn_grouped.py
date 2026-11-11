@@ -261,7 +261,7 @@ def _spy_dense_launches(monkeypatch):
     launches = {}
 
     class CountingLaunch:
-        """Count tuned and pinned launches of one tuner alike."""
+        """Count both tuned and pinned launches."""
 
         def __init__(self, name, kernel):
             self.name, self.kernel = name, kernel

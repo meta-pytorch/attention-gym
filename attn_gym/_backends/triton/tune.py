@@ -3,9 +3,8 @@
 ``triton.autotune`` and ``triton.heuristics`` rebuild argument dictionaries on every launch;
 ``TritonTuner`` memoizes the winner under an explicit key and launches the kernel directly.
 
-Every tuner also has a pinned launch, ``tuner.pinned``, that never benchmarks, for callers that
-need the same configuration in every process. The caller chooses between the two; see
-``attn_gym._backends.autotune``.
+``tuner.pinned`` never benchmarks, so every process on one GPU model launches the same
+configuration. Callers choose between the two; see ``attn_gym._backends.autotune``.
 """
 
 from __future__ import annotations
@@ -72,7 +71,6 @@ class TritonTuner:
         # Winners are namespaced by the kernel source and its @triton.jit dependencies.
         compile_kernel.cache_namespace = lambda: self.jit_function.cache_key  # type: ignore[attr-defined]
         self.compile = compile_kernel
-        self._kernel = kernel
         self._arg_names = kernel.arg_names
         self._configs = list(configs)
         self._candidates = {id(c): tuple(sorted(c.all_kwargs().items())) for c in self._configs}
@@ -91,16 +89,12 @@ class TritonTuner:
     def launch_pinned(self, grid: Grid, args: dict[str, Any]) -> None:
         """Launch the first candidate the device can run, without benchmarking."""
         key = self._key(args)
-        candidate = self._pinned_candidates.get(key)
-        if candidate is not None:
-            self.launch(self._kernel, candidate, grid, args)
-            return
-        candidates = self.configs(grid, args)
-        if not candidates:
-            raise ValueError("a pinned launch requires at least one candidate")
+        remembered = self._pinned_candidates.get(key)
+        candidates = self.configs(grid, args) if remembered is None else [remembered]
+        error: Exception = ValueError("a pinned launch requires at least one candidate")
         for candidate in candidates:
             try:
-                self.launch(self._kernel, candidate, grid, args)
+                self.launch(self.compile(), candidate, grid, args)
             except self.benchmark_errors as candidate_error:
                 error = candidate_error
                 continue

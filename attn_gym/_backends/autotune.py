@@ -27,7 +27,7 @@ def resolve_tuning_options(
 
 
 def should_autotune(requested: bool) -> bool:
-    """Return ``requested`` unless deterministic algorithms are enabled.
+    """Return ``False`` in deterministic mode, otherwise ``requested``.
 
     Candidates can differ in floating-point order, so timing-based selection can change bits
     across processes and winner-cache states. Deterministic algorithms pin configurations as

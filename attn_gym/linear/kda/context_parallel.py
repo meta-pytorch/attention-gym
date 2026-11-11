@@ -19,9 +19,7 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
-from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.linear.types import KernelOptions
-from attn_gym.types import TuningOptions
 
 
 def context_parallel_kda(
@@ -53,15 +51,9 @@ def _kda_stages(
     scale: float | None, fastmath: bool, kernel_options: KernelOptions | None
 ) -> StagedOp:
     """Bind ``chunk_kda``'s options to its staged entry points."""
-    options = resolve_kernel_options(kernel_options)
     return StagedOp(
         partial(chunk_kda_prepare, scale=scale, fastmath=fastmath, kernel_options=kernel_options),
-        partial(
-            chunk_kda_prepare_backward,
-            fastmath=fastmath,
-            schedule=options.schedule,
-            kernel_options=TuningOptions(autotune=options.autotune),
-        ),
+        partial(chunk_kda_prepare_backward, fastmath=fastmath, kernel_options=kernel_options),
     )
 
 

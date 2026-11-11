@@ -23,7 +23,7 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import TritonTuner, tuning_key
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import ptr_offset
 
 
@@ -31,7 +31,6 @@ from attn_gym._backends.triton.utils import ptr_offset
     do_not_specialize=[
         "N_ROWS",
         "TOKENS",
-        "ROW_BUCKET",
         "NUM_SEQUENCES",
         "X_STRIDES",
         "DY_STRIDES",
@@ -52,7 +51,6 @@ def l2norm_bwd_kernel(
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
-    ROW_BUCKET,
     NUM_SEQUENCES,
     IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
@@ -111,6 +109,11 @@ L2NORM_BWD = TritonTuner(
         for num_warps in (2, 1, 4, 8, 16)
         for bt in (8, 16, 32, 64, 128)
     ],
-    # ROW_BUCKET selects a tuned schedule per power-of-two row count, not a binary per shape.
-    key=tuning_key("x", "D", "ROW_BUCKET", "IS_VARLEN"),
+    # Tune per power of two of the row count, not per shape.
+    key=lambda args: (
+        args["x"].dtype,
+        args["D"],
+        triton.next_power_of_2(args["N_ROWS"]),
+        args["IS_VARLEN"],
+    ),
 )

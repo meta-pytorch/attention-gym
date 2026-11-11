@@ -585,7 +585,6 @@ def test_l2norm_bwd(dtype, T, D, strided):
         HEADS=1,
         D=D,
         BD=BD,
-        ROW_BUCKET=triton.next_power_of_2(T),
         NUM_SEQUENCES=0,
         IS_VARLEN=False,
         BT=16,
@@ -677,6 +676,8 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         num_sequences=0,
         BK=64,
         BV=64,
+        IS_VARLEN=False,
+        USE_INT64_OFFSETS=False,
         num_warps=4,
         num_stages=4,
     )

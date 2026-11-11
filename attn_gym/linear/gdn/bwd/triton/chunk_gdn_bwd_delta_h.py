@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import ptr_offset
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
@@ -23,7 +23,6 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 )
 
 
-@triton.heuristics({"IS_VARLEN": lambda args: args["cu_seqlens"] is not None})
 @triton.jit(do_not_specialize=["num_sequences"])
 def chunk_gdn_bwd_dv_local_kernel(
     q,
@@ -109,13 +108,6 @@ def chunk_gdn_bwd_dv_local_kernel(
         )
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "STORE_INITIAL_STATE_GRADIENT": lambda args: args["d_initial_state"] is not None,
-        "USE_FINAL_STATE_GRADIENT": lambda args: args["d_final_state"] is not None,
-    }
-)
 @triton.jit(do_not_specialize=["T", "num_sequences"])
 def chunk_gdn_bwd_delta_h_kernel(
     q,
@@ -290,7 +282,7 @@ _dv_local = TritonTuner(
         triton.Config({"BK": 32, "BV": 32}, num_warps=2, num_stages=2),
         triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=2),
     ],
-    key=lambda a: (a["H"], a["HK"], a["K"], a["V"], a["q"].dtype, a["cu_seqlens"] is not None),
+    key=tuning_key("q", "H", "HK", "K", "V", "IS_VARLEN"),
     prune=lambda configs, a: [
         config
         for config in configs
@@ -315,9 +307,9 @@ _delta_h = TritonTuner(
         a["K"],
         a["V"],
         a["q"].dtype,
-        a["cu_seqlens"] is not None,
-        a["d_initial_state"] is not None,
-        a["d_final_state"] is not None,
+        a["IS_VARLEN"],
+        a["STORE_INITIAL_STATE_GRADIENT"],
+        a["USE_FINAL_STATE_GRADIENT"],
     ),
     prune=lambda configs, a: [
         config
@@ -451,6 +443,7 @@ def chunk_gdn_bwd_delta_h(
             K=key_dim,
             V=value_dim,
             BT=bt,
+            IS_VARLEN=metadata is not None,
         )
 
     def grid(meta):
@@ -480,6 +473,9 @@ def chunk_gdn_bwd_delta_h(
         K=key_dim,
         V=value_dim,
         BT=bt,
+        IS_VARLEN=metadata is not None,
+        STORE_INITIAL_STATE_GRADIENT=d_initial_state is not None,
+        USE_FINAL_STATE_GRADIENT=d_final_state is not None,
     )
     return dh, d_initial_state, dv
 

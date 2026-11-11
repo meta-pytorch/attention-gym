@@ -133,9 +133,9 @@ timing-picked winner changes output bits between processes, ranks, and cold winn
   winner cache.
 - Tuners do not read deterministic mode. Operations resolve `kernel_options["autotune"]` with
   `should_autotune` (`attn_gym/_backends/autotune.py`), then pass the bool through every launch
-  and custom-op schema. Deterministic algorithms disable tuning. Autograd backward resolves the
-  forward's flag again because eager code can change the mode; `gather_attn` resolves inside
-  its CUDA ops.
+  and custom-op schema. Deterministic algorithms disable tuning. An autograd backward, and the `run`
+  of a staged handle, resolve the stored request again because eager code can change the mode;
+  `gather_attn` resolves inside its CUDA ops.
 - `autotune` defaults to `True` except in `paged_mla_decode`. `{"autotune": False}` or
   deterministic mode pins every tuned kernel in forward and backward. State-mutating recurrences
   cannot be benchmarked safely and stay pinned regardless of the option; their docstrings state

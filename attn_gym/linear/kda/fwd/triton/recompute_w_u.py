@@ -62,25 +62,6 @@ _CONFIGS = [
     triton.Config({}, num_warps=4, num_stages=3),
     triton.Config({}, num_warps=8, num_stages=3),
 ]
-_HEURISTICS = {
-    "STORE_QG": lambda args: args["q"] is not None,
-    "HAS_GK": lambda args: args["gk"] is not None,
-    "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
-    "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-        args["q"],
-        args["k"],
-        args["qg"],
-        args["kg"],
-        args["v"],
-        args["beta"],
-        args["w"],
-        args["u"],
-        args["A"],
-        args["gk"],
-        args["cu_seqlens"],
-        args["chunk_offsets"],
-    ),
-}
 
 
 @triton.jit
@@ -235,7 +216,6 @@ def _recompute_w_u_task(
         )
 
 
-@triton.heuristics(_HEURISTICS)
 @triton.jit(
     do_not_specialize=[
         "T",
@@ -320,7 +300,6 @@ def recompute_w_u_fwd_kernel(
     )
 
 
-@triton.heuristics(_HEURISTICS)
 @triton.jit(
     do_not_specialize=[
         "T",
@@ -407,12 +386,26 @@ def recompute_w_u_fwd_kernel_persistent(
         )
 
 
+_TUNING_ARGS = (
+    "H",
+    "HV",
+    "K",
+    "V",
+    "BT",
+    "BK",
+    "BV",
+    "PRECISION",
+    "FASTMATH",
+    "IS_RAGGED",
+    "HAS_GK",
+    "STORE_QG",
+)
+
+
 def _tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
     return (
         *(args[name].dtype for name in ("k", "beta", "A")),
-        *(args[name] for name in ("H", "HV", "K", "V", "BT", "BK", "BV", "PRECISION", "FASTMATH")),
-        # The heuristic constexprs IS_RAGGED, HAS_GK and STORE_QG.
-        *(args[name] is not None for name in ("chunk_offsets", "gk", "q")),
+        *(args[name] for name in _TUNING_ARGS),
     )
 
 
@@ -513,7 +506,7 @@ def recompute_w_u_fwd_triton(
     if isinstance(k, FakeTensor):
         return w, u, qg, kg
     chunks = metadata.capacity if metadata is not None else tokens // chunk_size
-    kernel_kwargs = {
+    tensors = {
         "q": q if has_q else None,
         "k": k,
         "qg": qg,
@@ -526,6 +519,9 @@ def recompute_w_u_fwd_triton(
         "gk": gk,
         "cu_seqlens": None if metadata is None else metadata.cu_seqlens,
         "chunk_offsets": None if metadata is None else metadata.chunk_offsets,
+    }
+    kernel_kwargs = {
+        **tensors,
         "T": tokens,
         "q_stride_t": q.stride(1) if has_q else 0,
         "k_stride_t": k.stride(1),
@@ -539,6 +535,10 @@ def recompute_w_u_fwd_triton(
         "BV": 64,
         "PRECISION": _PRECISION_MODES[dot_precision],
         "num_sequences": 0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
+        "STORE_QG": has_q,
+        "HAS_GK": has_gk,
+        "IS_RAGGED": metadata is not None,
+        "USE_INT64_OFFSETS": requires_int64_offsets(*tensors.values()),
         "FASTMATH": fastmath,
         "enable_reflect_ftz": fastmath,
     }

@@ -76,6 +76,7 @@ class ChunkGDNPrepared:
     factors: ChunkGDNFactors
     metadata: RaggedChunkMetadata | None
     scale: float
+    # The request; ``run`` applies ``should_autotune`` again because the mode can change.
     autotune: bool
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
@@ -113,7 +114,7 @@ class ChunkGDNPrepared:
             initial_state,
             self.metadata,
             self.scale,
-            autotune=self.autotune,
+            autotune=should_autotune(self.autotune),
         )
         return output, final_state if output_final_state else None
 
@@ -134,7 +135,7 @@ def chunk_gdn_prepare(
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
     one packed stream. ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
-    autotune = should_autotune(resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare"))
+    autotune = resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare")
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
@@ -148,7 +149,9 @@ def chunk_gdn_prepare(
         )
     )
     reject_int64_offsets(q, k, v, cumulative_gate, beta)
-    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, metadata, autotune=autotune)
+    factors = _prepare_chunk_gdn_fwd(
+        k, v, cumulative_gate, beta, metadata, autotune=should_autotune(autotune)
+    )
     saved = ChunkGDNSaved(
         q, k, v, cumulative_gate, beta, factors.inverse, cu_seqlens, chunk_offsets
     )
@@ -165,7 +168,7 @@ class ChunkGDNBackward:
     metadata: RaggedChunkMetadata | None
     prepared: ChunkGDNBwdPrepared
     scale: float
-    autotune: bool
+    autotune: bool  # The request, as in ``ChunkGDNPrepared``.
 
     @cached_property
     def aqk(self) -> torch.Tensor:
@@ -230,7 +233,7 @@ class ChunkGDNBackward:
             self.prepared,
             self.scale,
             aqk=self.__dict__.get("aqk"),  # Reuse it only when the reverse summary computed it.
-            autotune=self.autotune,
+            autotune=should_autotune(self.autotune),
         )
 
 
@@ -248,9 +251,7 @@ def chunk_gdn_prepare_backward(
     handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
     ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
-    autotune = should_autotune(
-        resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare_backward")
-    )
+    autotune = resolve_tuning_options(kernel_options, op_name="chunk_gdn_prepare_backward")
     metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     scale = float(scale)
     if d_output is None:
@@ -269,7 +270,7 @@ def chunk_gdn_prepare_backward(
         saved.inverse,
         initial_state,
         metadata,
-        autotune=autotune,
+        autotune=should_autotune(autotune),
     )
     return ChunkGDNBackward(saved, d_output, initial_state, metadata, prepared, scale, autotune)
 
