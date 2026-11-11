@@ -6,6 +6,7 @@ import copy
 import functools
 import importlib
 import inspect
+import itertools
 import pickle
 import warnings
 from collections.abc import Mapping
@@ -277,6 +278,29 @@ def _resolve_param(role_name: str, pname: str, ann, fn) -> tuple[object, type | 
     )
 
 
+def _context_type(ctx_types: dict) -> tuple[type | None, str | None]:
+    """Return ``(context type, first "role.param" annotated with it)`` from
+    ``{annotated type: first "role.param" using it}``, or ``(None, None)`` when no role
+    annotates its context."""
+    for t, site in ctx_types.items():
+        if not (is_dataclass(t) and t.__dataclass_params__.frozen):
+            raise ProtocolError(
+                f"{site} is annotated {t.__name__}, which is not a frozen dataclass; an "
+                "annotated context reaches the roles as itself, which the layer supports "
+                "for frozen dataclasses (leave a SimpleNamespace context unannotated)"
+            )
+    # The context type is the most derived annotation; the others must be its bases.
+    derived = [t for t in ctx_types if all(issubclass(t, u) for u in ctx_types)]
+    if ctx_types and not derived:
+        sites = ", ".join(f"{site}: {t.__name__}" for t, site in ctx_types.items())
+        raise ProtocolError(
+            f"roles annotate the context with unrelated types ({sites}); {_CTX_RULE}"
+        )
+    if not derived:
+        return None, None
+    return derived[0], ctx_types[derived[0]]
+
+
 @dataclass
 class RoleInstance:
     name: str  # "softmax[0]", or the method name for single-instance roles
@@ -287,7 +311,6 @@ class RoleInstance:
     regs: int | None
     fn: object
     params: list
-    uses_tmem: bool = False
     # "all": every CTA of the cluster; "leader": the leader of each MMA pair; "rank0": rank 0
     # (the broadcast scheduler only)
     cta: str = ALL
@@ -301,6 +324,10 @@ class RoleInstance:
     @property
     def num_threads(self) -> int:
         return self.num_warps * WARP_SIZE
+
+    @property
+    def uses_tmem(self) -> bool:
+        return any(ann is Tmem for _, ann in self.params)
 
 
 @dataclass(frozen=True)
@@ -401,6 +428,20 @@ _HOST_SETTINGS = (
     "trace_events_per_role",
 )
 _COLLECTED_SETTINGS = ("cluster", "trace_protocol")
+# Trace results for describe(), pipeline plans and trace-time warnings.
+# __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes.
+_TRACE_RESULTS = (
+    "_ws_tma",
+    "_ws_smem",
+    "_ws_alias",
+    "_ws_fences",
+    "_ws_opt_outs",
+    "_ws_uses",
+    "_ws_named_users",
+    "_ws_ownership",
+    "_ws_liveness",
+    "_ws_trace_tags",
+)
 
 
 @functools.cache
@@ -478,6 +519,8 @@ class WarpSpecialized(metaclass=_KernelType):
     trace_waits: bool = True  # also a range around every blocking channel wait
     trace_events_per_role: int = 1024  # globaltimer: records per role instance and CTA
     cluster: Cluster = SingleCta()  # or CtaPair() for 2-CTA MMAs
+    _ws_roles: list | None = None  # the role instances, once collected (_collect)
+    _ws_traced: bool = False  # trace results are present, from tracing or a cached build
 
     def __reduce__(self):
         """Pickle as the constructor call plus what the cache key lets change after it: the
@@ -495,7 +538,7 @@ class WarpSpecialized(metaclass=_KernelType):
     def __setattr__(self, name, value):
         state = vars(self)
         collected_setting = isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS
-        if collected_setting and state.get("_ws_roles") is not None:
+        if collected_setting and self._ws_roles is not None:
             raise ProtocolError(
                 f"{type(self).__name__}.{name} cannot change after collection (describe, "
                 "compile-cache lookup, or tracing derived the channels from it); construct a "
@@ -512,7 +555,7 @@ class WarpSpecialized(metaclass=_KernelType):
     # ---- host-side analysis ------------------------------------------------ #
 
     def _collect(self):
-        if getattr(self, "_ws_roles", None) is not None:
+        if self._ws_roles is not None:
             return
         chans = {k: v for k, v in vars(self).items() if isinstance(v, Channel)}
         turns = {k: v for k, v in vars(self).items() if isinstance(v, Turnstile)}
@@ -567,15 +610,12 @@ class WarpSpecialized(metaclass=_KernelType):
         roles = []
         ctx_types = {}  # annotated context type -> first "role.param" using it
         declared = {
-            name: meta
+            name: config
             for name in dir(type(self))
-            if (meta := getattr(getattr(type(self), name), "_warpdrive", None)) is not None
+            if (config := getattr(getattr(type(self), name), "_warpdrive", None)) is not None
         }
-        overrides = _role_overrides(self.roles, declared)
-        for name, meta in declared.items():
+        for name, config in _role_configs(self.roles, declared).items():
             fn = getattr(type(self), name)
-            resolved = overrides.get(name, meta)
-            ranges, regs, cta, raw = resolved.warps, resolved.regs, resolved.cta, resolved.raw
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
             signature = inspect.signature(fn)
@@ -593,7 +633,7 @@ class WarpSpecialized(metaclass=_KernelType):
             params = []
             for pname, p in list(signature.parameters.items())[1:]:
                 ann, ctx_type = _resolve_param(name, pname, p.annotation, fn)
-                if raw and ann not in _RAW_ANNOTATIONS:
+                if config.raw and ann not in _RAW_ANNOTATIONS:
                     raise ProtocolError(
                         f"raw role {name}: parameter {pname} is {getattr(ann, '__name__', ann)}; "
                         "raw roles take Instance, Local, Tmem, Barriers, and the context only "
@@ -612,45 +652,29 @@ class WarpSpecialized(metaclass=_KernelType):
                     f"role {name}: parameters {ctx_params} would all receive the context; "
                     f"{_CTX_RULE}"
                 )
-            uses_tmem = any(a is Tmem for _, a in params)
-            for idx, wr in enumerate(ranges):
-                inst = f"{name}[{idx}]" if len(ranges) > 1 else name
+            for idx, wr in enumerate(config.warps):
+                inst = f"{name}[{idx}]" if len(config.warps) > 1 else name
                 ri = RoleInstance(
                     inst,
                     name,
                     idx,
                     wr.start,
                     len(wr),
-                    regs,
+                    config.regs,
                     fn,
                     params,
-                    uses_tmem=uses_tmem,
-                    cta=cta,
-                    raw=raw,
+                    cta=config.cta,
+                    raw=config.raw,
                     keyword_only=keyword_only,
                 )
                 roles.append(ri)
                 self._bind(ri, chans, turns)
-        for t, site in ctx_types.items():
-            if not (is_dataclass(t) and t.__dataclass_params__.frozen):
-                raise ProtocolError(
-                    f"{site} is annotated {t.__name__}, which is not a frozen dataclass; an "
-                    "annotated context reaches the roles as itself, which the layer supports "
-                    "for frozen dataclasses (leave a SimpleNamespace context unannotated)"
-                )
-        # The context type is the most derived annotation; the others must be its bases.
-        derived = [t for t in ctx_types if all(issubclass(t, u) for u in ctx_types)]
-        if ctx_types and not derived:
-            sites = ", ".join(f"{site}: {t.__name__}" for t, site in ctx_types.items())
-            raise ProtocolError(
-                f"roles annotate the context with unrelated types ({sites}); {_CTX_RULE}"
-            )
-        self._ws_ctx_type = derived[0] if derived else None
-        self._ws_ctx_site = ctx_types.get(self._ws_ctx_type)
+        self._ws_ctx_type, self._ws_ctx_site = _context_type(ctx_types)
         for name, st in streams.items():
             self._bind_stream(name, st, roles, chans, cluster)
         roles.sort(key=lambda r: r.first_warp)
         self._validate(chans, turns, roles)
+        self._plan_registers(roles)
         self._validate_placement(chans, turns, roles)
         self._ws_named = _allocate_named(chans, named_bars)
         for name, nb in named_bars.items():
@@ -662,6 +686,8 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
         self._ws_named_bars = named_bars
+        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item, traced
+        self._ws_trace_tags = []  # globaltimer range names, traced
         self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}, traced
         self._ws_ownership = {}  # owned-epoch channel -> epoch-ownership verdict, traced
         self._ws_streams = streams
@@ -789,7 +815,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 if len({cluster.ctas(r.cta) for r in ts.parties}) != 1:
                     raise ProtocolError(f"turnstile {name}: seats run in different CTAs")
             tmem_roles = [r for r in roles if r.uses_tmem]
-            everywhere = tuple(range(cluster.size))
+            everywhere = cluster.ctas(ALL)
             if tmem_roles and not any(cluster.ctas(r.cta) == everywhere for r in tmem_roles):
                 raise ProtocolError(
                     "TMEM is allocated by one warp in each CTA of the cluster (2-CTA TMEM: of "
@@ -888,6 +914,14 @@ class WarpSpecialized(metaclass=_KernelType):
             _ = self.tmem_plan.alloc_cols  # raises when over capacity
         elif any(r.uses_tmem for r in roles):
             raise ProtocolError("roles take Tmem but the kernel has no tmem_plan")
+
+    def _plan_registers(self, roles):
+        """Size the launch and give every warpgroup its ``setmaxnreg`` budget.
+
+        Sets ``_ws_num_warps``, ``_ws_default_regs``, ``_ws_padding`` and
+        ``_ws_budget_groups``; rejects budgets the launch cannot supply.
+        """
+        owner = {w: r for r in roles for w in r.warps}
         num_warps = max(owner) + 1
         if min(owner) < 0 or num_warps > MAX_WARPS:
             raise ValueError(f"role warps must lie in [0, {MAX_WARPS})")
@@ -902,10 +936,9 @@ class WarpSpecialized(metaclass=_KernelType):
         # One setmaxnreg budget per warpgroup, set before dispatch; None when no role sets regs.
         wg_regs = [None] * -(-self._ws_num_warps // WARPGROUP)
         if uses_regs:
-            regs_of = {w: r.regs for r in roles for w in r.warps}
             for g in range(len(wg_regs)):
                 group = range(g * WARPGROUP, (g + 1) * WARPGROUP)
-                budgets = {owner[w]: regs_of[w] for w in group if w in owner}
+                budgets = {owner[w].name: owner[w].regs for w in group if w in owner}
                 vals = set(budgets.values())
                 if len(vals) > 1:
                     raise ValueError(f"warpgroup {g} has mixed register budgets {budgets}")
@@ -931,20 +964,11 @@ class WarpSpecialized(metaclass=_KernelType):
         # with one budget. Non-adjacent warpgroups never share a branch even when their
         # budgets agree: ptxas allocates a merged branch jointly and can spill one role under
         # the other's pressure (docs/warpdrive/configuration.md, "Placement and registers").
-        runs: list[tuple[int | None, list[int]]] = []
-        for g, regs in enumerate(wg_regs):
-            if runs and runs[-1][0] == regs:
-                runs[-1][1].append(g)
-            else:
-                runs.append((regs, [g]))
-        self._ws_budget_groups = [
-            (
-                regs,
-                tuple(wgs),
-                tuple(i for i, r in enumerate(roles) if r.first_warp // WARPGROUP in wgs),
-            )
-            for regs, wgs in runs
-        ]
+        self._ws_budget_groups = []
+        for regs, run in itertools.groupby(range(len(wg_regs)), key=lambda g: wg_regs[g]):
+            wgs = tuple(run)
+            role_ids = tuple(i for i, r in enumerate(roles) if r.first_warp // WARPGROUP in wgs)
+            self._ws_budget_groups.append((regs, wgs, role_ids))
 
     def role_config_key(self) -> tuple:
         """Resolved role placement and budgets, part of ``__cute_cache_key__``. The first call
@@ -1003,45 +1027,28 @@ class WarpSpecialized(metaclass=_KernelType):
         plain data; None when this instance was not traced. ``jit_cache`` stores it beside the
         compiled kernel and passes it to ``__cute_restore_trace__`` on every call it serves from
         memory or disk."""
-        if not getattr(self, "_ws_traced", False):
+        if not self._ws_traced:
             return None
-        smem = {
+        record = {name: getattr(self, name) for name in _TRACE_RESULTS}
+        record["_ws_smem"] = {
             name: replace(res, buffer=None, tensor=None) for name, res in self._ws_smem.items()
         }
-        return {
-            "tma": self._ws_tma,
-            "smem": smem,
-            "alias": self._ws_alias,
-            "fences": self._ws_fences,
-            "opt_outs": self._ws_opt_outs,
-            "uses": self._ws_uses,
-            "named_users": self._ws_named_users,
-            "ownership": self._ws_ownership,
-            "liveness": self._ws_liveness,
-            "trace_tags": self._ws_trace_tags,
-        }
+        return record
 
     def __cute_restore_trace__(self, record: dict) -> None:
         """Load a cached build's trace record, so ``describe()`` and the warnings match a cold
         compile. An instance that traced, or already took a record, keeps its own. Restored
         SMEM entries have no tensors: ``buffer()`` works only while tracing."""
         self._collect()
-        if record is None or getattr(self, "_ws_traced", False):
+        if record is None or self._ws_traced:
             return
         record = pickle.loads(pickle.dumps(record))  # this instance's own copies
         buffers = self.smem_plan.buffers if self.smem_plan is not None else {}
-        self._ws_tma = record["tma"]
-        self._ws_smem = {
-            name: replace(res, buffer=buffers[name]) for name, res in record["smem"].items()
+        record["_ws_smem"] = {
+            name: replace(res, buffer=buffers[name]) for name, res in record["_ws_smem"].items()
         }
-        self._ws_alias = record["alias"]
-        self._ws_fences = record["fences"]
-        self._ws_opt_outs = record["opt_outs"]
-        self._ws_uses = record["uses"]
-        self._ws_named_users = record["named_users"]
-        self._ws_ownership = record["ownership"]
-        self._ws_liveness = record["liveness"]
-        self._ws_trace_tags = record["trace_tags"]
+        for name in _TRACE_RESULTS:
+            setattr(self, name, record[name])
         self._ws_traced = True
         self._report_trace()
 
@@ -1272,10 +1279,7 @@ class WarpSpecialized(metaclass=_KernelType):
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
         self._ws_bars = {name: bars + off for name, off, _ in plan}
-        self._ws_bar_counts = [
-            [c for _, _, counts in plan for c in counts[rank]] for rank in range(self.cluster.size)
-        ]
-        self._init_barriers(bars)
+        self._init_barriers(bars, self._barrier_init_runs(plan))
         self._ws_trace_starts = None
         if self.trace_backend == "globaltimer":  # start times of open ranges, per role
             depth = tracing.MAX_DEPTH
@@ -1322,7 +1326,7 @@ class WarpSpecialized(metaclass=_KernelType):
         role's lowest warp other than 0 (FA4 allocates from warp 1) and falls back to warp 0. A
         cluster allocates after the cluster sync, where any warp works, so it takes the first.
         """
-        everywhere = tuple(range(self.cluster.size))
+        everywhere = self.cluster.ctas(ALL)
         roles = [
             r for r in self._ws_roles if r.uses_tmem and self.cluster.ctas(r.cta) == everywhere
         ]
@@ -1334,17 +1338,14 @@ class WarpSpecialized(metaclass=_KernelType):
 
     def _allocate_plan(self, smem, layouts: dict):
         """Allocate every ``smem_plan`` buffer and check each channel binding's stage count."""
-        plan = self.smem_plan
-        names = set() if plan is None else set(plan.buffers)
-        if set(layouts) != names:
+        buffers = {} if self.smem_plan is None else self.smem_plan.buffers
+        if set(layouts) != set(buffers):
             raise ProtocolError(
                 f"begin_roles(layouts=...) needs a layout for each smem_plan buffer "
-                f"{sorted(names)}, got {sorted(layouts)}"
+                f"{sorted(buffers)}, got {sorted(layouts)}"
             )
         self._ws_smem = {}
-        if plan is None:
-            return
-        for buf in plan.buffers.values():
+        for buf in buffers.values():
             self._ws_smem[buf.name] = allocate(smem, buf, layouts[buf.name], self._ws_smem)
         for name, ch in self._ws_chans.items():
             if not ch.buffers:
@@ -1372,10 +1373,12 @@ class WarpSpecialized(metaclass=_KernelType):
             )
         return self._ws_smem[name].tensor
 
-    def _barrier_init_runs(self) -> list[tuple[int, int, dict[int, int]]]:
-        """Runs of contiguous barriers with equal per-rank counts, at most ``WARP_SIZE`` long:
-        one barrier per warp-0 lane."""
-        per_rank = self._ws_bar_counts
+    def _barrier_init_runs(self, plan: list) -> list[tuple[int, int, dict[int, int]]]:
+        """Runs of contiguous barriers from ``_barrier_plan`` with equal per-rank counts, at most
+        ``WARP_SIZE`` long: one barrier per warp-0 lane."""
+        per_rank = [
+            [c for _, _, counts in plan for c in counts[rank]] for rank in range(self.cluster.size)
+        ]
         runs = []
         offset = 0
         while offset < len(per_rank[0]):
@@ -1393,8 +1396,7 @@ class WarpSpecialized(metaclass=_KernelType):
         return runs
 
     @cute.jit
-    def _init_barriers(self, bars):
-        runs = self._barrier_init_runs()
+    def _init_barriers(self, bars, runs):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         if warp_idx == 0:
             rank = self.cluster.rank()
@@ -1429,12 +1431,6 @@ class WarpSpecialized(metaclass=_KernelType):
                 cute.arch.sync_threads()  # publishes the TMEM base address
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         rank = self.cluster.rank()
-        roles = self._ws_roles
-        # Threads of the TMEM users in each CTA rank (leader-only roles skip a pair's peer).
-        tmem_threads = {
-            c: sum(r.num_threads for r in roles if r.uses_tmem and c in self.cluster.ctas(r.cta))
-            for c in range(self.cluster.size)
-        }
         # setmaxnreg is .sync.aligned over a warpgroup: every warp of a group must execute the
         # same instruction. Branch once per run of adjacent warpgroups with one budget (a
         # warpgroup-uniform condition), adjust there, then split into roles inside that branch
@@ -1442,7 +1438,7 @@ class WarpSpecialized(metaclass=_KernelType):
         groups = self._ws_budget_groups
         for gi in cutlass.range_constexpr(len(groups)):
             if _in_warpgroups(warp_idx, groups[gi][1]):
-                self._dispatch_group(groups[gi], params, tmem_threads, warp_idx, rank)
+                self._dispatch_group(groups[gi], params, warp_idx, rank)
         if cutlass.const_expr(clustered):
             # Remote arrivals into a CTA must land before it exits. Each thread-issued remote
             # arrive precedes that thread's cluster arrive (a release), and producers whose
@@ -1791,7 +1787,7 @@ class WarpSpecialized(metaclass=_KernelType):
             )
 
     @cute.jit
-    def _dispatch_group(self, group, ctx, tmem_threads, warp_idx, rank):
+    def _dispatch_group(self, group, ctx, warp_idx, rank):
         regs, _, role_ids = group
         self._set_regs(regs)
         size = self.cluster.size
@@ -1804,9 +1800,9 @@ class WarpSpecialized(metaclass=_KernelType):
             # Only a call on `self` inside the dynamic `if`: an assignment through `self`
             # would make the preprocessor carry `self` as an if-result.
             if here:
-                self._dispatch(r, ctx, tmem_threads)
+                self._dispatch(r, ctx)
 
-    def _dispatch(self, r: RoleInstance, ctx, tmem_threads: dict[int, int]):
+    def _dispatch(self, r: RoleInstance, ctx):
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
         ranges = None
         if self._ws_trace is not None:
@@ -1834,17 +1830,23 @@ class WarpSpecialized(metaclass=_KernelType):
             ]
             final = _returned_state(r, result, state_args)
             if ranges is not None:
-                for _, arg in state_args:
-                    if isinstance(arg, WorkCursor):
-                        cur = final[_state_identity(arg)]
+                for cur in final:
+                    if isinstance(cur, WorkCursor):
                         pop_if(ranges, cur.index < cur._problem.total, r.name, cur.index)
-            for _, arg in state_args:
-                if isinstance(arg, ProducerEnd) and arg.scope.tail:
-                    final[_state_identity(arg)].tail()
+            for end in final:
+                if isinstance(end, ProducerEnd) and end.scope.tail:
+                    end.tail()
         if whole_range:
             ranges.pop(r.name)
         if ranges is not None and ranges.names:
             raise ProtocolError(f"{r.name}: trace ranges {ranges.names} left open at role exit")
+        self._record_role(r, trace)
+        if r.uses_tmem:
+            self._tmem_teardown(r)
+
+    def _record_role(self, r: RoleInstance, trace: RoleTrace):
+        """Check a traced role and keep its results for ``_finish_trace``'s kernel-wide checks.
+        Host only: it emits no device code."""
         if not r.raw:
             check_tma(trace, self.cluster, self._ws_tma)
             trace.finish()
@@ -1857,20 +1859,25 @@ class WarpSpecialized(metaclass=_KernelType):
                 self._ws_epoch_seqs[(name, r.name)] = (
                     "raw role: its waits are not visible" if r.raw else trace.epoch_sequence(name)
                 )
-        role = RoleEvents.from_trace(trace, r)
-        self._ws_role_events.append(role)
-        if r.uses_tmem:
-            # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
-            # peer has no leader-only TMEM roles, so its count is smaller).
-            ctas = self.cluster.ctas(r.cta)
-            count = rank_value({c: tmem_threads[c] for c in ctas}, self.cluster.rank)
-            # Roles reach this from different code sites after per-lane mbarrier spins, so use
-            # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
-            _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
-            if r is self._ws_tmem_alloc_role:
-                ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-                # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
-                self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
+        self._ws_role_events.append(RoleEvents.from_trace(trace, r))
+
+    def _tmem_teardown(self, r: RoleInstance):
+        """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp."""
+        # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
+        # peer has no leader-only TMEM roles, so its count is smaller).
+        users = [u for u in self._ws_roles if u.uses_tmem]
+        threads = {
+            c: sum(u.num_threads for u in users if c in self.cluster.ctas(u.cta))
+            for c in self.cluster.ctas(r.cta)
+        }
+        count = rank_value(threads, self.cluster.rank)
+        # Roles reach this from different code sites after per-lane mbarrier spins, so use
+        # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
+        _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
+        if r is self._ws_tmem_alloc_role:
+            ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
+            # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
+            self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
 
     def _set_regs(self, regs):
         if regs is None:
@@ -1997,9 +2004,9 @@ def _state_identity(state):
     return id(state._rec)
 
 
-def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]]) -> dict:
-    """Match a role's returned state to its state arguments, independent of names and tuple
-    order.
+def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]]) -> list:
+    """Return each state argument's final value in argument order, matching the role's returned
+    state independently of names and tuple order.
 
     Rebuilt ends and cursors share a record; turnstile copies share a role, turnstile and seat.
     A returned end or cursor must be current: not a snapshot saved before a loop or branch that
@@ -2031,7 +2038,7 @@ def _returned_state(r: RoleInstance, result, state_args: list[tuple[str, object]
             f"{role_name}: return all warpdrive state arguments; missing {', '.join(missing)} "
             f"(for example, return {names})"
         )
-    return final
+    return [final[_state_identity(arg)] for _, arg in state_args]
 
 
 def _check_signal_once(name: str, side: str, chan, bound):
@@ -2116,10 +2123,11 @@ def _check_named_turns(name: str, chan, turns: dict):
             )
 
 
-def _role_overrides(roles, declared: dict) -> dict:
-    """Check a kernel's ``roles`` mapping against its declared role names."""
+def _role_configs(roles, declared: dict) -> dict:
+    """Each role's config: its ``@role`` declaration, replaced by the kernel's ``roles`` entry
+    when it has one. Checks ``roles`` against the declared role names."""
     if roles is None:
-        return {}
+        return declared
     if not isinstance(roles, Mapping):
         raise ProtocolError(
             f"roles must be a mapping from role name to RoleConfig, got {type(roles).__name__}"
@@ -2132,7 +2140,7 @@ def _role_overrides(roles, declared: dict) -> dict:
             raise ProtocolError(
                 f"roles[{name!r}] must be a RoleConfig, got {type(config).__name__}"
             )
-    return dict(roles)
+    return {**declared, **roles}
 
 
 def _allocate_named(chans: dict, named_bars: dict) -> dict:

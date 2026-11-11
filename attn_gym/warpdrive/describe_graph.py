@@ -269,7 +269,7 @@ def _slot(slot: int | None) -> tuple[str, ...]:
 
 
 def _hubs(kernel, graph: Graph, roles: dict) -> None:
-    traced = getattr(kernel, "_ws_traced", False)
+    traced = kernel._ws_traced
     outside = None  # the "kernel code" node, added for the first native caller outside roles
     named = kernel._ws_named_bars
     if named and not traced:  # no users to join yet: list them in one node

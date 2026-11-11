@@ -61,7 +61,7 @@ def plan_from_warpdrive(kernel, *, cta: int = 0, name: str | None = None) -> Pip
                 else:
                     downstream[prod].add(cons)
                     plan.add_dependency(Dependency(prod, cons, cname, 0, "data", cname))
-    uses = getattr(kernel, "_ws_uses", {})
+    uses = kernel._ws_uses
     work_rings = {f"{stream}_ring" for stream in kernel._ws_streams}
     for cname, (ch, producers, consumers) in channels.items():
         bound = {ri.name for ri, slot in [*ch.producers, *ch.consumers] if slot is not None}
