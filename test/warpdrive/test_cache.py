@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import importlib.util
 import multiprocessing
 import os
 import struct
@@ -82,7 +82,9 @@ def wait_for_processes(processes, timeout: float = 15.0) -> None:
     try:
         for process in processes:
             process.join(timeout=max(0.0, deadline - time.monotonic()))
-        failures = [(process.pid, process.exitcode) for process in processes if process.exitcode]
+        failures = [
+            (process.pid, process.exitcode) for process in processes if process.exitcode != 0
+        ]
         assert failures == []
     finally:
         for process in processes:
@@ -745,9 +747,10 @@ def test_callers_outside_the_package_key_on_their_package_imports(
         "import pkg.sub.leaf\nfrom attn_gym.warpdrive.cache.jit import jit_cache\n\n"
         "@jit_cache\ndef compile_kernel():\n    pass\n"
     )
-    monkeypatch.syspath_prepend(str(caller.parent))
-    module = importlib.import_module("outside_kernels")
+    spec = importlib.util.spec_from_file_location("outside_kernels", caller)
+    module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, "outside_kernels", module)  # Removed at teardown.
+    spec.loader.exec_module(module)
     compile_kernel = module.compile_kernel
 
     def namespace_after_editing(path: Path) -> str:
@@ -758,8 +761,9 @@ def test_callers_outside_the_package_key_on_their_package_imports(
 
     baseline = compile_kernel.cache_namespace()
     assert namespace_after_editing(synthetic_package / "unrelated.py") == baseline
-    assert namespace_after_editing(synthetic_package / "relative.py") != baseline
-    assert namespace_after_editing(caller) != baseline
+    package_edited = namespace_after_editing(synthetic_package / "relative.py")
+    assert package_edited != baseline
+    assert namespace_after_editing(caller) != package_edited
 
 
 def test_module_source_digest_follows_the_module_closure(synthetic_package):
