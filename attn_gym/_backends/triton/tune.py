@@ -109,7 +109,7 @@ class TritonTuner:
 
     def bind(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
         """Name positional launch arguments by the kernel's parameters."""
-        return {**dict(zip(self._arg_names, args)), **kwargs}
+        return {**dict(zip(self._arg_names, args)), **kwargs} if args else kwargs
 
     def configs(self, _grid: Grid, args: dict[str, Any]) -> list[TritonCandidate]:
         configs = self._configs if self._prune is None else self._prune(self._configs, args)
@@ -126,10 +126,8 @@ class TritonTuner:
         return (candidate,)
 
     def launch(self, kernel: Any, candidate: TritonCandidate, grid: Grid, args: dict) -> None:
-        meta = dict(candidate)
-        if callable(grid):
-            grid = grid({**args, **meta})
-        kernel[grid](**args, **meta)
+        launch_args = {**args, **dict(candidate)}
+        kernel[grid(launch_args) if callable(grid) else grid](**launch_args)
 
 
 def tuning_key(tensor: str, *names: str) -> Callable[[dict[str, Any]], tuple[Any, ...]]:

@@ -279,6 +279,65 @@ def test_recurrent_reuses_tuning_across_token_counts(isolated_winners, monkeypat
     assert len(sweeps) == 2
 
 
+def test_paged_launch_never_benchmarks(no_benchmarking):
+    """A paged launch asked to autotune is pinned: each candidate would advance the pool."""
+    query, key, value, gate, beta, _ = _make_inputs(
+        tokens=5, dtype=torch.bfloat16, initial_state=False
+    )
+    pool = torch.randn(3, value.shape[2], value.shape[3], query.shape[3], device="cuda")
+    slots = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
+
+    def launch(autotune: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        advanced = pool.clone()
+        output, _ = launch_recurrent_delta_rule_fwd(
+            query, key, value, gate, beta, advanced, None,
+            scale=1.0,
+            gate_kind=GateKind.SCALAR,
+            store_final_state=True,
+            state_indices=slots,
+            autotune=autotune,
+            batch_invariant=False,
+        )  # fmt: skip
+        return output, advanced
+
+    for tuned, pinned in zip(launch(True), launch(False)):
+        assert torch.equal(tuned, pinned)
+
+
+def test_tuning_key_determines_pinned_configuration():
+    """Shapes that share a tuning key pin the same configuration.
+
+    ``TritonTuner`` remembers the pinned candidate per key, so a key coarser than the shape
+    heuristic would hand one shape another's configuration.
+    """
+    operand = torch.empty(0, dtype=torch.bfloat16)
+    pinned_by_key: dict[tuple, set] = {}
+    shapes = itertools.product(
+        (*range(70), 128, 4096), (1, 2, 16, 64, 200), (64, 128, 256), (1, 48, 128), (False, True)
+    )
+    for tokens, num_sequences, key_dim, value_dim, is_varlen in shapes:
+        args = {
+            "T": tokens * num_sequences if is_varlen else tokens,
+            "N": num_sequences,
+            "H": 16,
+            "HK": 16,
+            "K": key_dim,
+            "V": value_dim,
+            "USE_INITIAL_STATE": False,
+            "STORE_FINAL_STATE": False,
+            "IS_VARLEN": is_varlen,
+            "SCALAR_GATE": True,
+            "PREFETCH": False,
+            "BATCH_INVARIANT": False,
+            **dict.fromkeys(("q", "k", "v", "gate", "beta"), operand),
+            "h0": None,
+            "cu_seqlens": operand if is_varlen else None,
+        }
+        pinned = recurrent_module._recurrent_scan.configs(None, args)[0]
+        pinned_by_key.setdefault(recurrent_module._recurrent_tuning_key(args), set()).add(pinned)
+    assert all(len(pinned) == 1 for pinned in pinned_by_key.values())
+
+
 def _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fresh):
     """Run ``scan`` with ``batch_invariant`` over packed sequences of ``lens`` tokens, reading and
     writing ``pool[slots]``."""
@@ -352,9 +411,9 @@ def test_batch_invariant_bits_do_not_depend_on_launch_config(monkeypatch, gate_k
 
     class ForcedConfig:
         def __getitem__(self, grid):
-            return lambda *args, **kwargs: kernel[grid](*args, **{**kwargs, **forced})
+            return lambda *args, autotune, **kwargs: kernel[grid](*args, **{**kwargs, **forced})
 
-    monkeypatch.setattr(recurrent_module, "_recurrent_delta_rule_fwd_kernel", ForcedConfig())
+    monkeypatch.setattr(recurrent_module, "_recurrent_scan", ForcedConfig())
     torch.manual_seed(0)
     tokens, heads, dim = 64, 4, 128
     q = F.normalize(torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1).bfloat16()

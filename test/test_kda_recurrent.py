@@ -120,21 +120,21 @@ def test_recurrent_autotunes_value_tile():
     torch.testing.assert_close(output, expected, rtol=1e-5, atol=1e-5)
 
 
-def test_recurrent_paged_skips_autotune(monkeypatch):
+def test_recurrent_paged_never_benchmarks(no_benchmarking):
+    """A paged scan asked to autotune advances its pool with one pinned launch."""
     q, k, v, gate, beta, _ = _inputs(batch=2, tokens=1, seed=3)
     _, pool = strided_state_pool(3, q.shape[2], q.shape[3], v.shape[-1])
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    pinned_pool = pool.clone()
 
-    class UnexpectedAutotune:
-        def __getitem__(self, _grid):
-            raise AssertionError("paged execution must not invoke the autotuner")
-
-    from attn_gym.linear._delta_rule import recurrent as delta_rule_recurrent
-
-    monkeypatch.setattr(delta_rule_recurrent, "_recurrent_scan", UnexpectedAutotune())
-    recurrent_kda(
+    output, _ = recurrent_kda(
         q, k, v, gate, beta, pool, state_indices=slots, kernel_options={"autotune": True}
     )
+    pinned_output, _ = recurrent_kda(
+        q, k, v, gate, beta, pinned_pool, state_indices=slots, kernel_options={"autotune": False}
+    )
+    assert torch.equal(output, pinned_output)
+    assert torch.equal(pool, pinned_pool)
 
 
 def test_recurrent_packed_capacity_and_empty_slots():

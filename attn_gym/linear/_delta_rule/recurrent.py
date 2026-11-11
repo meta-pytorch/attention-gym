@@ -45,6 +45,9 @@ configure_triton_allocator()
 # (GB200, H=16, K=V=128) and differed only among shorter scans.
 _TOKENS_BUCKET_LIMIT = 64
 
+# Register cap of pinned one-warp launches; see `_pinned_launch_options`.
+_ONE_WARP_MAXNREG = 128
+
 _RECURRENT_TUNING_ARGS = (
     "N",
     "H",
@@ -70,9 +73,32 @@ class GateKind(Enum):
 def _prune_recurrent_configs(
     configs: list[triton.Config], args: dict[str, Any]
 ) -> list[triton.Config]:
-    """Drop value tiles wider than the padded value dimension."""
+    """List the pinned configuration, then the uncapped tiles that suit the value dimension.
+
+    ``_recurrent_tuning_key`` must determine the result. Its token bucket preserves
+    ``average_tokens > 1``, the only scan-length test in ``_pinned_launch_options``.
+    """
+    pinned_options = _pinned_launch_options(
+        _average_tokens(args["T"], args["N"], args["IS_VARLEN"]),
+        args["N"] * args["H"],
+        args["K"],
+        args["V"],
+        args["IS_VARLEN"],
+    )
+    pinned = next(
+        config
+        for config in configs
+        if (config.kwargs["BV"], config.num_warps, config.maxnreg) == pinned_options
+    )
+    # BV=1 serves only V=1, where the pinned tile has no padding.
+    min_block_v = min(2, args["V"])
     max_block_v = max(8, triton.next_power_of_2(args["V"]))
-    return [config for config in configs if config.kwargs["BV"] <= max_block_v]
+    tuned = (
+        config
+        for config in configs
+        if config.maxnreg is None and min_block_v <= config.kwargs["BV"] <= max_block_v
+    )
+    return [pinned, *(config for config in tuned if config is not pinned)]
 
 
 def _average_tokens(tokens: int, num_sequences: int, is_varlen: bool) -> int:
@@ -274,23 +300,27 @@ def _recurrent_delta_rule_fwd_kernel(
 
 
 # Unpaged launches write a fresh output and final state, so benchmarking candidates back to back
-# needs no reset; paged launches advance the pool in place and never reach the tuner.
+# needs no reset; paged launches advance the pool in place and are always pinned.
+# Only a one-warp pinned configuration caps registers; the other retained candidates are
+# uncapped: capping every one-warp tile slowed a tuned KDA prefill 1.05x (GB200, B=8 T=512 H=16
+# K=V=128).
 _recurrent_scan = TritonTuner(
     _recurrent_delta_rule_fwd_kernel,
     [
-        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
-        for block_v in (32, 16, 8, 4, 2)
+        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3, maxnreg=maxnreg)
+        for block_v in (32, 16, 8, 4, 2, 1)
         for num_warps in (1, 2, 4)
+        for maxnreg in ((None, _ONE_WARP_MAXNREG) if num_warps == 1 else (None,))
     ],
     key=_recurrent_tuning_key,
     prune=_prune_recurrent_configs,
 )
 
 
-def _heuristic_launch_options(
+def _pinned_launch_options(
     average_tokens: int, sequence_heads: int, key_dim: int, value_dim: int, is_varlen: bool
-) -> dict[str, int]:
-    """Pick the value tile and warps of an untuned launch from the host-visible shape."""
+) -> tuple[int, int, int | None]:
+    """Pick ``(BV, num_warps, maxnreg)`` of a pinned launch from the host-visible shape."""
     # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
     # Multi-token scans use one warp so per-token reductions stay in registers. Each program
     # carries its tile through the whole sequence, so the grid should fit one wave: tiny
@@ -320,14 +350,8 @@ def _heuristic_launch_options(
         block_v_limit, num_warps = 16, 2
     else:
         block_v_limit, num_warps = 32, 2
-    launch_options = {
-        "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
-        "num_warps": num_warps,
-        "num_stages": 3,
-    }
-    if num_warps == 1:
-        launch_options["maxnreg"] = 128
-    return launch_options
+    block_v = min(triton.next_power_of_2(value_dim), block_v_limit)
+    return block_v, num_warps, _ONE_WARP_MAXNREG if num_warps == 1 else None
 
 
 def launch_recurrent_delta_rule_fwd(
@@ -376,8 +400,9 @@ def launch_recurrent_delta_rule_fwd(
             contents: the scan starts from zero and overwrites the slot, including for empty
             sequences, so the slot is initialized before a later decode reads it. Without
             this mask every selected slot is treated as real history.
-        autotune: Benchmark tile configurations when true; paged launches always use fixed
-            heuristics because rerunning candidates would advance the pool repeatedly.
+        autotune: Benchmark tile configurations when true; otherwise launch the first usable
+            candidate, preferring the one ``_pinned_launch_options`` picks. Paged launches are
+            always pinned because rerunning candidates would advance the pool repeatedly.
         batch_invariant: Use one formula, fixed-order sums over K and no FMA fusion, so a
             sequence's output and state bits do not depend on the launch config that the batch
             shape picks. Composes with ``autotune`` and prefetching.
@@ -457,18 +482,8 @@ def launch_recurrent_delta_rule_fwd(
     if batch_invariant:
         # Disable FMA fusion to avoid layout-dependent rounding.
         options["enable_fp_fusion"] = False
-    if autotune and state_indices is None:
-        _recurrent_scan[grid](*tensors, **options, autotune=True)
-    else:
-        # Untuned and paged launches use the host shape heuristic, not the tuner's pinned
-        # selection.
-        _recurrent_delta_rule_fwd_kernel[grid](
-            *tensors,
-            **options,
-            **_heuristic_launch_options(
-                average_tokens, sequence_heads, key_dim, value_dim, cu_seqlens is not None
-            ),
-        )
+    # Benchmarking a paged launch would repeatedly advance the pool.
+    _recurrent_scan[grid](*tensors, **options, autotune=autotune and state_indices is None)
     return output, final_state
 
 

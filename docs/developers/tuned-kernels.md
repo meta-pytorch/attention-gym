@@ -34,8 +34,17 @@ would sacrifice most tuning.
 - **Pin the first usable Triton candidate.** A `tuner[grid](..., autotune=False)` launch follows
   `prune` and skips candidates the device cannot run, as tuning already did: some do not fit
   devices with 99 KiB shared memory. The choice is cached per device and tuning key, so the key
-  must determine pruning; `_FWD_SHARED` gained the device key tile for this reason. CuTeDSL pins `default_config`; the untuned
-  recurrent scan retains its host shape heuristic.
+  must determine pruning; `_FWD_SHARED` gained the device key tile for this reason. CuTeDSL pins
+  `default_config`.
+- **Express a shape heuristic as candidate order.** The recurrent scan's `prune` lists the
+  configuration its shape heuristic picks first, so untuned and paged launches go through the
+  tuner like every other pinned launch, bit-identical to the separate launch they replaced.
+  When that configuration uses one warp it caps registers at 128, the only capped candidate:
+  tuning now compares it with the uncapped tiles (GDN prefill T=4096 H=16: 959 → 935 µs),
+  whereas capping every one-warp tile slowed KDA prefill (8×512, H=16) from 478 to 500 µs.
+  A pinned launch costs about 6 µs more host time than the direct launch did: 55 → 61 µs per
+  call for a single-token scan over 64 sequences (GB200, BF16, K=V=128). Kernel time is
+  unchanged, so only host-bound scans notice.
 - **Use one Triton tuner.** Migrating all `triton.autotune` kernels to `TritonTuner` removed a
   second pinning path that used the first listed config without pruning or fallback. Pinned
   results stayed bit-identical; matching configurations had unchanged speed
