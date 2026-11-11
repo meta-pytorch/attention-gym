@@ -5,8 +5,7 @@
 """Shared helpers for the SM100 indexer score and Top-K kernel classes."""
 
 import cutlass
-from cuda.bindings import driver as cuda
-from cutlass import Float32, Int32, Int64, cute
+from cutlass import Int32, Int64, cute
 
 
 class IndexerKernelBase:
@@ -32,7 +31,7 @@ class IndexerKernelBase:
 
 
 class IndexerScoreKernelBase(IndexerKernelBase):
-    """Dense and packed TVM-FFI entrypoints for score kernels that define ``launch``."""
+    """Static choices and artifact naming shared by the score kernels."""
 
     name_prefix: str
     heads: int
@@ -47,32 +46,3 @@ class IndexerScoreKernelBase(IndexerKernelBase):
             f"r{self.compress_ratio}_i64{int(self.use_int64_offsets)}_"
             f"wh{int(self.contiguous_weight_heads)}"
         )
-
-    @cute.jit
-    def __call__(
-        self,
-        q: cute.Tensor,
-        k: cute.Tensor,
-        weights: cute.Tensor,
-        scores: cute.Tensor,
-        pair_start,
-        score_scale: Float32,
-        stream: cuda.CUstream,
-    ):
-        """Dense entrypoint: score each query's full or causal candidate prefix."""
-        self.launch(q, k, weights, scores, pair_start, score_scale, None, stream)
-
-    @cute.jit
-    def with_candidate_bounds(
-        self,
-        q: cute.Tensor,
-        k: cute.Tensor,
-        weights: cute.Tensor,
-        scores: cute.Tensor,
-        pair_start,
-        score_scale: Float32,
-        candidate_bounds: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        """Packed entrypoint: score only each query's ``candidate_bounds`` interval."""
-        self.launch(q, k, weights, scores, pair_start, score_scale, candidate_bounds, stream)

@@ -103,11 +103,13 @@ def test_radix_launches_only_active_pairs(radix_impl, monkeypatch, batch, tokens
 def test_radix_fake_tensor_abi(monkeypatch, use_int64_offsets, contiguous_weight_heads):
     """Only Q/K's D stride and an available unit weight-head stride are static."""
     pytest.importorskip("cutlass.cute")
-    monkeypatch.setattr(impl, "compile_tvm_ffi", lambda operation, *args: args)
+    monkeypatch.setattr(impl, "compile_tvm_ffi", lambda operation, *args, name: args)
     q, k, weights, scores, *_ = impl._compile_scores.__wrapped__(
-        torch.bfloat16, 32, 128, True, 1, use_int64_offsets, contiguous_weight_heads
+        torch.bfloat16, 32, 128, True, 1, use_int64_offsets, contiguous_weight_heads, False
     )
-    topk_scores, output, _ = impl._compile_topk.__wrapped__(37, True, 1, use_int64_offsets, False)
+    topk_scores, output, *_ = impl._compile_topk.__wrapped__(
+        37, True, 1, use_int64_offsets, False, False
+    )
     width = 64 if use_int64_offsets else 32
     assert q._assumed_align == k._assumed_align == 16
     assert weights._assumed_align == 2
@@ -244,14 +246,14 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, de
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(torch.cuda.current_device()))
-        kernel = radix_impl._compile_topk(topk, False, 1, False, deterministic)
+        kernel = radix_impl._compile_topk(topk, False, 1, False, deterministic, False)
     finally:
         set_compile_target(previous)
     rows = scores.view(4, tokens)
     expected = _lowest_index_topk(rows, topk)
     for _ in range(3 if deterministic else 1):
         # The deterministic kernel may overwrite its score slab, so use fresh scores.
-        kernel(scores.clone(), output, cutlass.Int32(0))
+        kernel(scores.clone(), output, cutlass.Int32(0), None)
         actual = output[0, :4].long()
         if deterministic:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -298,11 +300,13 @@ def test_radix_deterministic_causal_window_boundary(
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(torch.cuda.current_device()))
-        kernel = radix_impl._compile_topk(topk, True, compress_ratio, use_int64_offsets, True)
+        kernel = radix_impl._compile_topk(
+            topk, True, compress_ratio, use_int64_offsets, True, False
+        )
     finally:
         set_compile_target(previous)
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
-    kernel(scores.clone(), output, integer(first_pair))
+    kernel(scores.clone(), output, integer(first_pair), None)
     visible = []
     for pair in range(4):
         for qi in range(2):

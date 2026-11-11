@@ -388,8 +388,8 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
             for compiler in compilers:
                 assert compiler.cache_info().misses == 1
                 assert compiler.cache_info().currsize == 1
-        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, 1, False, True)
-        assert impl._compile_topk.is_cached(16, True, 1, False, False)
+        assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, 1, False, True, False)
+        assert impl._compile_topk.is_cached(16, True, 1, False, False, False)
         for compiler in compilers:
             assert compiler.cache_info().hits == 3
             compiler.cache_clear()
@@ -515,7 +515,7 @@ def test_cute_generic_scores_match_zero_padded_head_tile(heads, causal):
     for h, (qq, ww) in ((heads, (q, w)), (64, padded)):
         out = torch.zeros(batch * tokens // 2, 2, tokens, device="cuda")
         compiled = impl._compile_scores(torch.bfloat16, h, dim, causal, 1, False, True, False)
-        compiled(qq, k, ww, out, cutlass.Int32(0), scale)
+        compiled(qq, k, ww, out, cutlass.Int32(0), scale, None)
         scores.append(out)
     assert scores[0].isnan().any() and scores[0].isfinite().any()
     underflow = scores[1][(tokens + 50) // 2, 0, :51]

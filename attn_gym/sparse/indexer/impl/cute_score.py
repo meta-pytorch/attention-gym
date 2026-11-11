@@ -12,7 +12,7 @@ generates scores; Top-K and the caller's [P, 2, S] FP32 slab are owned elsewhere
 
 Head, query and batch stay separate TMA modes despite the packing, so their strides are
 independent and the missing query of an odd tail is zero-filled. Only valid rows and
-candidates are written. The packed entrypoint reads each query's candidate interval from
+candidates are written. The packed specialization reads each query's candidate interval from
 ``candidate_bounds[T, 2]`` and visits only the absolute M128 tiles covering the union of
 the pair's nonempty intervals.
 
@@ -180,7 +180,7 @@ class IndexerScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         Every role derives its trip counts from this, so each channel's producer and consumer
         agree on its epoch count.
         Returns ``(batch, batch_pair, query0, first_tile, tile_end, intervals)``; ``intervals``
-        holds both queries' ``(start, end)`` candidate intervals in the packed entrypoint and
+        holds both queries' ``(start, end)`` candidate intervals in the packed specialization and
         is None otherwise.
         """
         num_queries = self.upcast_offset(params.weights.shape[1])
@@ -433,7 +433,7 @@ class IndexerScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
     # ------------------------------------------------------------------- host
 
     @cute.jit
-    def launch(
+    def __call__(
         self,
         q: cute.Tensor,
         k: cute.Tensor,
@@ -444,7 +444,11 @@ class IndexerScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         candidate_bounds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
-        """Build the TMA descriptors and launch one CTA per existing slab pair."""
+        """Build the TMA descriptors and launch one CTA per existing slab pair.
+
+        ``candidate_bounds`` selects the packed specialization, which scores only each query's
+        interval; None scores its full or causal candidate prefix.
+        """
         assert q.element_type == self.dtype
         assert k.element_type == q.element_type and weights.element_type == q.element_type
         assert scores.element_type == Float32

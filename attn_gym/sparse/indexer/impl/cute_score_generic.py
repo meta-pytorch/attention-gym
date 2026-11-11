@@ -9,7 +9,7 @@ One CTA owns one query of the caller's [P, 2, S] FP32 score slab. Candidate, hea
 reduction tiles bound SMEM and TMEM independently of H and D. Head, query and batch stay
 separate TMA modes, so tails zero-fill without reading another query or batch. This module
 allocates no global workspace and selects nothing; masked and inactive slab entries stay
-untouched. The packed entrypoint visits only the absolute M128 tiles covering each query's
+untouched. The packed specialization visits only the absolute M128 tiles covering each query's
 ``candidate_bounds[T, 2]`` interval.
 
 One work item is one query of a slab pair::
@@ -141,7 +141,7 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         Every role derives its trip counts from this, so each channel's producer and consumer
         agree on its epoch count.
         Returns ``(batch, query, first_tile, tile_end, interval)``; ``interval`` is the query's
-        ``(start, end)`` candidate interval in the packed entrypoint and None otherwise. The
+        ``(start, end)`` candidate interval in the packed specialization and None otherwise. The
         missing second query of an odd tail visits no tiles.
         """
         qi, local_pair, _ = item
@@ -428,7 +428,7 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
     # ------------------------------------------------------------------- host
 
     @cute.jit
-    def launch(
+    def __call__(
         self,
         q: cute.Tensor,
         k: cute.Tensor,
@@ -439,7 +439,11 @@ class IndexerGenericScoreKernel(IndexerScoreKernelBase, WarpSpecialized):
         candidate_bounds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
-        """Build the TMA descriptors and launch two CTAs per existing slab pair."""
+        """Build the TMA descriptors and launch two CTAs per existing slab pair.
+
+        ``candidate_bounds`` selects the packed specialization, which scores only each query's
+        interval; None scores its full or causal candidate prefix.
+        """
         assert q.element_type == self.dtype
         assert k.element_type == q.element_type and weights.element_type == q.element_type
         assert scores.element_type == Float32

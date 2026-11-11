@@ -209,14 +209,14 @@ PORTED = [
         "indexer_score_packed",
         "sparse.indexer.impl.cute",
         "_compile_scores",
-        (torch.bfloat16, 64, 128, True, 1, False, True),
+        (torch.bfloat16, 64, 128, True, 1, False, True, False),
         {},
     ),
     (
         "indexer_score_generic",
         "sparse.indexer.impl.cute",
         "_compile_scores",
-        (torch.bfloat16, 16, 64, True, 1, False, True),
+        (torch.bfloat16, 16, 64, True, 1, False, True, False),
         {},
     ),
 ]

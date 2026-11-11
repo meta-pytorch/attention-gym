@@ -605,27 +605,16 @@ class IndexerTopKKernel(IndexerKernelBase):
         scores: cute.Tensor,
         output: cute.Tensor,
         pair_start: Int32 | Int64,
+        candidate_bounds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
-        """Launch one 512-thread CTA per physical query row in the score slab."""
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(scores, output, pair_start, None).launch(
-            grid=(scores.shape[0] * 2, 1, 1),
-            block=(self.block_threads, 1, 1),
-            stream=stream,
-        )
+        """Launch one 512-thread CTA per physical query row in the score slab.
 
-    @cute.jit
-    def with_candidate_bounds(
-        self,
-        scores: cute.Tensor,
-        output: cute.Tensor,
-        pair_start: Int32 | Int64,
-        candidate_bounds: cute.Tensor,
-        stream: cuda.CUstream,
-    ):
-        """Packed TVM-FFI entrypoint, retaining the existing dense-call ABI."""
-        self.kernel.set_name_prefix(f"{self.get_name()}_packed")
+        ``candidate_bounds`` selects the packed specialization; None selects from each
+        query's full or causal candidate prefix.
+        """
+        packed = "_packed" if cutlass.const_expr(candidate_bounds is not None) else ""
+        self.kernel.set_name_prefix(f"{self.get_name()}{packed}")
         self.kernel(scores, output, pair_start, candidate_bounds).launch(
             grid=(scores.shape[0] * 2, 1, 1),
             block=(self.block_threads, 1, 1),
