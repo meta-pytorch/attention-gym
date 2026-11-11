@@ -296,8 +296,27 @@ class ProtocolLog:
         return "\n".join(lines)
 
 
+@dataclass(eq=False)
+class Lifetime:
+    """A handle or span until close, or a preview until its adopting wait.
+
+    ``RoleTrace.finish`` checks for resources left live at role exit. Handles close in their
+    opening region because tracing sees each region once and does not carry handle copies.
+    Spans may close in their counted loop's last trip. Previews may cross regions: the end's
+    next wait adopts the outstanding preview.
+    """
+
+    what: str
+    site: str
+    block: object  # the region that took it
+    region_bound: bool = True
+    closed_at: str | None = None
+    closed_op: str | None = None
+    unclosed_ok: object = None  # the unchecked("unclosed") opt-out active when it was taken
+
+
 class RoleTrace:
-    """Events and handle lifetimes for one traced role instance."""
+    """Live-resource and event bookkeeping for one traced role instance."""
 
     def __init__(self, role_name: str, log: ProtocolLog | None, ranges=None, waits: bool = True):
         self.role_name = role_name
@@ -305,7 +324,7 @@ class RoleTrace:
         self.ranges = ranges  # the trace backend's ranges of this role (tracing.py), or None
         self.trace_waits = ranges is not None and waits
         self.item_block = None  # the work-item loop body (set by the WorkCursor's advance())
-        self.open: list = []
+        self.live: list[Lifetime] = []  # in the order they were taken
         self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
         # One record for the trace checks: channel ops, handle lifetimes, accesses and ordering.
@@ -423,41 +442,56 @@ class RoleTrace:
             return f"{self.role_name} uses it both inside and outside the work-item loop"
         return (regions.pop() if regions else None), seq
 
-    def opened(self, handle):
-        if (opt := active_opt_out("unclosed")) is not None:
-            handle.unclosed_ok = opt
-        self.open.append(handle)
+    @property
+    def open(self) -> list:
+        """The open handles and spans, in the order they opened."""
+        return [r for r in self.live if r.region_bound]
 
-    def closed(self, handle, op: str, region_checked: bool = False):
-        """Record ``op`` closing ``handle``. ``region_checked``: the caller checked where this
-        close runs itself (a ``Span`` closes in its loop's last iteration)."""
+    def opened(self, res: Lifetime):
+        if res.region_bound and (opt := active_opt_out("unclosed")) is not None:
+            res.unclosed_ok = opt
+        self.live.append(res)
+
+    def closed(self, res: Lifetime, op: str, *, last_trip: bool = False, hint: str = ""):
+        """Record ``op`` ending ``res``. A region-bound resource ending in another region leaves
+        both regions' live sets changed. ``last_trip``: a span signalling in its loop's last
+        trip, which ends it once per take (``Span`` checks the loop)."""
         site = user_site()
-        if handle.closed_at is not None:
+        if res.closed_at is not None:
             raise ProtocolError(
-                f"{self.role_name}: {handle.what} closed twice: {handle.closed_op} at "
-                f"{handle.closed_at}, then {op} at {site}"
+                f"{self.role_name}: {res.what} closed twice: {res.closed_op} at "
+                f"{res.closed_at}, then {op} at {site}"
             )
-        cross = not region_checked and current_block() != handle.block
-        if cross and not self.opt_out("cross_region", f"{handle.what} {op} at {site}"):
+        cross = res.region_bound and not last_trip and current_block() != res.block
+        if cross and not self.opt_out("cross_region", f"{res.what} {op} at {site}"):
             raise ProtocolError(
-                f"{self.role_name}: {handle.what} opened at {handle.site} but {op} at "
-                f"{site} is in a different dynamic region (loop or branch), so it would run a "
-                "different number of times than the acquire; close handles in the region "
-                "that opened them"
+                f"{self.role_name}: {res.what} opened at {res.site} but {op} at "
+                f"{site} is in a different dynamic region (loop or branch). Close it in the "
+                f"region that opened it{hint}"
             )
-        handle.closed_at, handle.closed_op = site, op
-        self.open.remove(handle)
+        res.closed_at, res.closed_op = site, op
+        self.live.remove(res)
 
     def finish(self):
         for check in self.checks:
             check()
         leaks = []
-        for h in self.open:
-            if h.unclosed_ok is None:
-                leaks.append(h)
+        for r in self.live:
+            if r.unclosed_ok is None:
+                leaks.append(r)
                 continue
-            h.unclosed_ok.role = h.unclosed_ok.role or self.role_name
-            h.unclosed_ok.suppressed.append(f"{h.what} opened at {h.site} left open")
+            r.unclosed_ok.role = r.unclosed_ok.role or self.role_name
+            r.unclosed_ok.suppressed.append(f"{r.what} opened at {r.site} left open")
+        handles = "; ".join(f"{r.what} opened at {r.site}" for r in leaks if r.region_bound)
+        if handles:
+            raise ProtocolError(
+                f"{self.role_name}: handles never closed: {handles}. Close each handle in its "
+                "opening region."
+            )
         if leaks:
-            items = "; ".join(f"{h.what} opened at {h.site}" for h in leaks)
-            raise ProtocolError(f"{self.role_name}: handles never closed: {items}")
+            items = "; ".join(f"{r.what} at {r.site}" for r in leaks)
+            raise ProtocolError(
+                f"{self.role_name}: previews no later wait consumes: {items}. Add a wait() "
+                "after the peek in trace order and release its handle; peel the last iteration "
+                "if the peek reads the next iteration's epoch."
+            )
