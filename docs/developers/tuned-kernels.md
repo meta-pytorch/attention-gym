@@ -1,19 +1,17 @@
 # Tuned kernels: design notes
 
-This page records why tuned kernels are built the way they are. The rules themselves live in
-`AGENTS.md` ("Public Operation Options" and "Tuned Kernels and Reproducibility"); the user-facing
-contract is in [Determinism](../determinism.md#autotuned-kernels).
+Authoring rules live in `AGENTS.md` ("Public Operation Options" and "Tuned Kernels and
+Reproducibility"); the user contract is in [Determinism](../determinism.md#autotuned-kernels).
 
 ## The problem
 
-[Issue #777](https://github.com/meta-pytorch/attention-gym/issues/777): torchtitan's DeepSeek-V4
-training was not reproducible under `torch.use_deterministic_algorithms(True)`. Four cold-cache
-runs of one 4-GPU job gave four different step-1 losses.
+[Issue #777](https://github.com/meta-pytorch/attention-gym/issues/777): four cold-cache runs of
+one 4-GPU torchtitan DeepSeek-V4 training job gave four different step-1 losses under
+`torch.use_deterministic_algorithms(True)`.
 
-Each kernel candidate was repeatable. The winner was not: it is picked by timing, and candidates
-differ in floating-point order. Forcing one candidate at a time showed how widespread this was
-(GB200, BF16, revision `ff06a922`, deterministic mode, each alternate candidate compared with the
-first):
+Each candidate was repeatable, but timing picks among different floating-point orders, changing
+bits across processes, ranks, and cold winner caches. Forcing each candidate showed the scope
+(GB200, BF16, revision `ff06a922`, deterministic mode, each alternate compared with the first):
 
 | Operation | Tuners with changed bits | Largest observed difference |
 |---|---|---|
@@ -21,69 +19,62 @@ first):
 | `chunk_gdn` portable backward, K=V=64 | Three of four | Gradients: ~2e-3 |
 | `chunk_gdn` forward, K=V=64 and 128 | None | — |
 
-K=V=128 takes the CuTeDSL backward on that GPU, so the portable backward was not exercised there.
-
-Tile sizes changed bits as well as `num_warps`, so restricting the search space to bit-identical
-candidates would have given up most of the tuning.
+K=V=128 uses CuTeDSL backward on that GPU, so portable backward was not exercised there.
+Both tile sizes and `num_warps` changed bits; restricting candidates to bit-identical ones
+would sacrifice most tuning.
 
 ## Decisions
 
-1. **Tuners carry no policy.** `TritonTuner` and `run_tunable` tune when asked and otherwise
-   launch a pinned configuration. They never read `torch.are_deterministic_algorithms_enabled()`.
-   The alternative, having the tuner skip benchmarking in deterministic mode, hides a public
-   behavior inside infrastructure and would not have covered kernels using `triton.autotune`.
-2. **One policy function.** `should_autotune(requested)` is false in deterministic mode. The
-   operation resolves it and passes a bool down. An autograd backward resolves it again, because
-   eager code can enable deterministic mode after the forward.
-3. **Triton pinning selects the first usable candidate.** `tuner.pinned` selects the first
-   candidate left by `prune` that the device can run. CuTeDSL uses `default_config`; the
-   recurrent scan uses a host shape heuristic when untuned. Skipping unusable candidates matters:
-   on 99 KiB shared-memory devices some candidates do not fit, and tuning already skipped them.
-   The choice is remembered per tuning key, so the key must determine what `prune` keeps
-   (`_FWD_SHARED` gained the device key tile for this reason).
-4. **One tuner type.** Every tuned Triton kernel uses `TritonTuner`. `triton.autotune` kernels
-   needed a second pinning path that launched the first listed config with no pruning and no
-   fallback. Migrating them removed that path. Pinned results stayed bit-identical, and the same
-   configuration runs at the same speed (see [Migration measurements](#migration-measurements));
-   two keys that held exact sizes are now bucketed.
-5. **`autotune` is a kernel option.** It was a keyword argument on the linear operations and a
-   `kernel_options` key on `gather_attn`. It now has one spelling: a key of the typed
-   `kernel_options` dict. This broke the keyword on purpose. `fastmath` stays a keyword argument
-   because it changes the result, not only the kernel that computes it.
-
-6. **Split-phase handles resolve the policy at each phase.** A staged `prepare` and its `run`,
-   like an autograd forward and backward, can straddle a change of deterministic mode in eager
-   code. Each launch boundary resolves the stored request again.
+- **Policy belongs to operations, not tuners.** `should_autotune(requested)` disables tuning in
+  deterministic mode; operations pass the resolved bool to `TritonTuner` and `run_tunable`.
+  Reading `torch.are_deterministic_algorithms_enabled()` in tuners would hide public behavior
+  in infrastructure and would not have covered `triton.autotune` kernels. Autograd backward
+  and staged handles' `run` resolve the stored request again: eager code can change the mode
+  after forward or `prepare`.
+- **Pin the first usable Triton candidate.** `tuner.pinned` follows `prune` and skips candidates
+  the device cannot run, as tuning already did: some do not fit devices with 99 KiB shared
+  memory. The choice is cached per tuning key, so the key must determine pruning; `_FWD_SHARED`
+  gained the device key tile for this reason. CuTeDSL pins `default_config`; the untuned
+  recurrent scan retains its host shape heuristic.
+- **Use one Triton tuner.** Migrating all `triton.autotune` kernels to `TritonTuner` removed a
+  second pinning path that used the first listed config without pruning or fallback. Pinned
+  results stayed bit-identical; matching configurations had unchanged speed
+  ([measurements](#migration-measurements)). Two exact-size keys became bucketed.
+- **Make `autotune` a kernel option.** Unifying linear operations' keyword argument with
+  `gather_attn`'s typed `kernel_options` key deliberately broke the keyword. `fastmath` remains
+  a keyword because it changes the result, not just the kernel.
 
 ## What pinning does and does not give
 
-- For otherwise deterministic kernels, bits repeat across processes and winner-cache states on
-  one GPU model and software stack. The pinned configuration follows input shapes and the device,
-  so it can differ across GPU architectures.
-- Pinning does not remove other nondeterminism. `gather_attn`'s default backward uses atomics;
-  only deterministic mode switches to the schedules without them.
-- State-mutating recurrences (paged scans, the `paged_chunk_gdn` recurrence) are never tuned.
-- The reference implementation validates `kernel_options` and ignores them, so one dict can be
-  passed to either implementation.
-- `paged_mla_decode` keeps its earlier default of not tuning; when asked to tune, each bucket
-  must run once before CUDA graph capture.
+- Otherwise deterministic kernels repeat bits across processes and winner-cache states on one
+  GPU model and software stack. Pinned configurations depend on shapes and device and may
+  differ across GPU architectures.
+- Pinning does not remove other nondeterminism: `gather_attn`'s default backward uses atomics;
+  only deterministic mode selects schedules without them.
+- State-mutating recurrences (paged scans, the `paged_chunk_gdn` recurrence) never tune.
+- Reference implementations validate and ignore `kernel_options`, allowing the same dict for
+  either implementation.
+- `paged_mla_decode` retains its default-off tuning. When tuning, run each bucket once before
+  CUDA graph capture.
 
 ## Things that were tried and dropped
 
-- **Tuning only `num_stages`** for the two kernels in the issue: the broader sweep found
-  candidates that changed bits in all eight gather tuners reached and in three of four
-  portable GDN backward kernels at K=V=64.
-- **Changing the tuner's warm-up or timing policy.** Over 30 cold sweeps of a roughly 7 µs
-  kernel (the pointer output kernel, T=256 H=2, GB200), the existing policy picked the fastest candidate 21 times; an untimed first launch
-  picked it 27 times, and `triton.testing.do_bench` picked it 23 times. Median sweep time was
-  42 ms for the existing policy and 776 ms for `do_bench`. The policy was left unchanged.
+- **Tuning only `num_stages`** for the issue's two kernels: the broader sweep changed bits in
+  all eight gather tuners reached and three of four portable GDN backward kernels at K=V=64.
+- **Changing warm-up or timing policy.** Over 30 cold sweeps of the roughly 7 µs pointer output
+  kernel (T=256 H=2, GB200), fastest-candidate picks were 21 with the existing policy, 27 with
+  an untimed first launch, and 23 with `triton.testing.do_bench`. Median sweep time was 42 ms
+  with the existing policy versus 776 ms with `do_bench`. The policy stayed unchanged.
+- **Bucketing the recurrent scan's sequence count.** Its exact-count key tunes once per new
+  batch size. Sharing a winner across a power-of-two bucket (GB200, H=16, K=V=128, BF16) was
+  unchanged where winners agreed, but 1.12–1.34x slower between 9 and 16 sequences at 256 and
+  2048 tokens, where the preferred value tile changes. The key stayed exact.
 
 ## Migration measurements
 
-Moving the `triton.autotune` kernels to `TritonTuner`, before (`a6a5a8e4`) against after, on
-a GB200 with BF16 inputs, tuning enabled, each run in its own process after a fresh
-tuning sweep. Lower is better. The portable GDN backward and the pointer output kernel do not
-run on this GPU by default and were forced the way their tests force them.
+`triton.autotune` → `TritonTuner`, before (`a6a5a8e4`) versus after: GB200, BF16, tuning enabled,
+separate processes after fresh tuning sweeps. Lower is better. Portable GDN backward and the
+pointer output kernel were forced as in their tests; neither runs by default on this GPU.
 
 | Workload | Before (µs) | After (µs) | After/before | Winner |
 |---|---|---|---|---|
@@ -101,26 +92,24 @@ run on this GPU by default and were forced the way their tests force them.
 | `recurrent_kda` varlen, 16 sequences, T=2048 | 200.7 | 200.8 | 1.00 | same |
 | `recurrent_gdn` decode, 64 sequences, T=1 | 24.22 | 24.30 | 1.00 | same |
 
-Rows marked "host" are synchronized wall-clock medians of five runs, which vary by about 10%
-between runs on the smaller shapes; the others are CUDA kernel time, medians of three runs.
-With matching winners, no latency change was observed beyond run-to-run variation. The one 1.17 row is a different pick between
-two candidates the tuner times within its resolution (15.4 µs each including launch).
+"Host" rows are synchronized wall-clock medians of five runs; smaller shapes vary about 10%
+between runs. Other rows are CUDA kernel time, medians of three runs. Matching winners showed
+no change beyond run-to-run variation. The 1.17 row picked differently between two candidates
+timed within the tuner's resolution (15.4 µs each including launch).
 
-A winner-cache miss became cheaper, because `run_tunable` times fewer launches than
-`triton.testing.do_bench`: `l2norm` backward 3.1–3.3 s to 0.17–0.27 s, `chunk_gdn` at K=64
-1.5–1.7 s to 0.21–0.48 s, the recurrent scan 1.8 s to 0.47 s.
+Winner-cache misses became cheaper because `run_tunable` times fewer launches than
+`triton.testing.do_bench`:
 
-The measurement scripts were scratch files and are not checked in.
+| Workload | Before | After |
+|---|---|---|
+| `l2norm` backward | 3.1–3.3 s | 0.17–0.27 s |
+| `chunk_gdn`, K=64 | 1.5–1.7 s | 0.21–0.48 s |
+| Recurrent scan | 1.8 s | 0.47 s |
 
-- **Bucketing the recurrent scan's sequence count.** Its key holds the exact count, so each new
-  batch size tunes once. Sharing one winner across a power-of-two bucket was measured on a
-  GB200 (H=16, K=V=128, BF16): no change where the winner agrees, but 1.12–1.34x slower between
-  9 and 16 sequences at 256 and 2048 tokens, where the preferred value tile
-  changes. The key was left exact.
+Measurement scripts were scratch files, not checked in.
 
 ## Checks to repeat when touching a tuned kernel
 
-- Pinned bits: `{"autotune": False}` output and gradients equal the base commit's.
-- No benchmarking when pinned: the `no_benchmarking` fixture in `test/conftest.py`.
-- Winner reuse across shapes: count `tune` calls under `isolated_winners`.
-- Warm tuned latency before and after, with the winners picked on each side.
+Follow `AGENTS.md` for base-commit pinned-bit comparisons, `no_benchmarking`
+(`test/conftest.py`), and warm before/after tuned latency; record each side's winners.
+Check winner reuse across shapes by counting `tune` calls under `isolated_winners`.

@@ -104,53 +104,41 @@ performance:
 
 ## Public Operation Options
 
-Keep the math in keyword arguments and the kernel in `kernel_options`:
-
-- An option that changes what is computed (`scale`, `fastmath`, gate transforms, masks) is a
-  keyword argument, and the reference implementation honors or documents it.
-- An option that only chooses how a fused kernel runs (`backend`, `schedule`, `autotune`,
-  `bwd_recompute_p`, `batch_invariant`, the short-convolution schedule configs) is a key of
-  the operation's typed `kernel_options` dict (`attn_gym/types.py`,
-  `attn_gym/linear/types.py`, `attn_gym/linear/short_conv/cute.py`). New kernel knobs are
-  added there, not as keyword arguments. Every implementation validates the options: unknown
-  keys and wrongly typed values raise. `impl="reference"` then ignores them, so one dict
-  serves both.
-- One option has one spelling across operations. Breaking a public signature to restore that is
-  acceptable; say so in the PR.
+- Keep math-changing options (`scale`, `fastmath`, gate transforms, masks) as keyword arguments;
+  the reference implementation must honor or document them.
+- Put kernel choices (`backend`, `schedule`, `autotune`, `bwd_recompute_p`, `batch_invariant`,
+  short-convolution schedule configs) in the operation's typed `kernel_options` dict, not keyword
+  arguments: `attn_gym/types.py`, `attn_gym/linear/types.py`,
+  `attn_gym/linear/short_conv/cute.py`. Every implementation must reject unknown keys and wrongly
+  typed values; `impl="reference"` then ignores the options, so one dict serves both.
+- Use one spelling per option across operations. Breaking a public signature to restore this is
+  acceptable; disclose it in the PR.
 
 ## Tuned Kernels and Reproducibility
 
-Candidates of one kernel usually differ in floating-point order (tile sizes, `num_warps`), so a
-timing-picked winner changes output bits between processes, ranks, and cold winner caches
-(issue #777). The rule: an operation that tunes does so by default, and pins every tuned kernel
-when either `kernel_options={"autotune": False}` is passed or
-`torch.use_deterministic_algorithms(True)` is set.
-[`docs/developers/tuned-kernels.md`](docs/developers/tuned-kernels.md) records why:
+For operations that tune, default to tuning except in `paged_mla_decode` (default off). Pin every
+tuned kernel in forward and backward under `kernel_options={"autotune": False}` or
+`torch.use_deterministic_algorithms(True)`. See the
+[design note](docs/developers/tuned-kernels.md) for issue #777, rationale, and measurements.
 
-- Tune Triton kernels with `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never
-  `triton.autotune`. List the heuristic default first: pinning selects the first candidate
-  left by `prune` that the device can run. The tuning `key` must determine what `prune` keeps.
-  Tune CuTeDSL kernels with `run_tunable`; pinning selects `default_config`.
-- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. The recurrent scan instead keeps
-  its host shape heuristic for untuned launches. Neither untuned path benchmarks or reads the
-  winner cache.
-- Tuners do not read deterministic mode. Operations resolve `kernel_options["autotune"]` with
-  `should_autotune` (`attn_gym/_backends/autotune.py`), then pass the bool through every launch
-  and custom-op schema. Deterministic algorithms disable tuning. An autograd backward, and the `run`
-  of a staged handle, resolve the stored request again because eager code can change the mode;
-  `gather_attn` resolves inside its CUDA ops.
-- `autotune` defaults to `True` except in `paged_mla_decode`. `{"autotune": False}` or
-  deterministic mode pins every tuned kernel in forward and backward. State-mutating recurrences
-  cannot be benchmarked safely and stay pinned regardless of the option; their docstrings state
-  this.
-- Migrating a kernel between tuners, or changing its candidates, key, or prune, must leave the
-  pinned result bit-identical (compare against the base commit) and needs a warm before/after
-  latency table for the tuned path.
-- Test both ways to pin with the `no_benchmarking` fixture (`test/conftest.py`): forward and
-  backward must not benchmark under `{"autotune": False}` or deterministic mode with default
-  options.
-  Compare bits where schedules match; `test/test_gather_attn_autotune.py` compares forward
-  outputs and LSE because deterministic mode changes its backward schedules.
+- Use `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never `triton.autotune`. List the
+  heuristic default first: pinning selects the first candidate left by `prune` that the device
+  can run. The tuning `key` must determine what `prune` keeps. Use `run_tunable` for CuTeDSL;
+  pinning selects `default_config`.
+- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. Keep the recurrent scan's host
+  shape heuristic when untuned. Neither untuned path may benchmark or read the winner cache.
+- Keep deterministic-mode policy out of tuners. Resolve the `kernel_options["autotune"]` request
+  with `should_autotune` (`attn_gym/_backends/autotune.py`) and pass the bool through every launch
+  and custom-op schema. Resolve the stored request again in autograd backward and staged handles'
+  `run`: eager code can change the mode between phases. `gather_attn` resolves inside its CUDA ops.
+- Never tune state-mutating recurrences: benchmarking is unsafe. Keep them pinned regardless of
+  the option and document this in their docstrings.
+- When migrating tuners or changing candidates, key, or prune, verify bit-identical pinned
+  results against the base commit and provide a warm before/after tuned-latency table.
+- Use `no_benchmarking` (`test/conftest.py`) to test forward and backward under both ways to pin:
+  `{"autotune": False}` and deterministic mode with default options. Compare bits where schedules
+  match; `test/test_gather_attn_autotune.py` compares forward outputs and LSE because deterministic
+  mode changes its backward schedules.
 
 ## Adding CuTeDSL Kernels
 
