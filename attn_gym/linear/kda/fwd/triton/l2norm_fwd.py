@@ -204,7 +204,7 @@ def _l2norm_bwd_cuda(
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
     row_stride = _l2norm_row_stride(x)
     dy_row_stride = _l2norm_row_stride(d_output)
-    (L2NORM_BWD if autotune else L2NORM_BWD.pinned)[grid](
+    L2NORM_BWD[grid](
         x,
         rstd,
         d_output,
@@ -223,6 +223,7 @@ def _l2norm_bwd_cuda(
         BD=block_dim,
         NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         IS_VARLEN=cu_seqlens is not None,
+        autotune=autotune,
     )
     return d_input.view_as(x)
 

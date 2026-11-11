@@ -31,10 +31,10 @@ would sacrifice most tuning.
   in infrastructure and would not have covered `triton.autotune` kernels. Autograd backward
   and staged handles' `run` resolve the stored request again: eager code can change the mode
   after forward or `prepare`.
-- **Pin the first usable Triton candidate.** `tuner.pinned` follows `prune` and skips candidates
-  the device cannot run, as tuning already did: some do not fit devices with 99 KiB shared
-  memory. The choice is cached per tuning key, so the key must determine pruning; `_FWD_SHARED`
-  gained the device key tile for this reason. CuTeDSL pins `default_config`; the untuned
+- **Pin the first usable Triton candidate.** A `tuner[grid](..., autotune=False)` launch follows
+  `prune` and skips candidates the device cannot run, as tuning already did: some do not fit
+  devices with 99 KiB shared memory. The choice is cached per device and tuning key, so the key
+  must determine pruning; `_FWD_SHARED` gained the device key tile for this reason. CuTeDSL pins `default_config`; the untuned
   recurrent scan retains its host shape heuristic.
 - **Use one Triton tuner.** Migrating all `triton.autotune` kernels to `TritonTuner` removed a
   second pinning path that used the first listed config without pruning or fallback. Pinned

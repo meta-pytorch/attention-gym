@@ -165,7 +165,7 @@ def chunk_gdn_fwd_output_dense(
     def grid(meta):
         return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * value_heads)
 
-    (_chunk_fwd_o if autotune else _chunk_fwd_o.pinned)[grid](
+    _chunk_fwd_o[grid](
         q=q,
         k=k,
         v=v,
@@ -186,6 +186,7 @@ def chunk_gdn_fwd_output_dense(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return output
 
@@ -217,7 +218,7 @@ def chunk_gdn_fwd_output_packed(
     def grid(meta):
         return (triton.cdiv(value_dim, meta["BV"]), metadata.capacity, value_heads)
 
-    (_chunk_fwd_o if autotune else _chunk_fwd_o.pinned)[grid](
+    _chunk_fwd_o[grid](
         q=q,
         k=k,
         v=v,
@@ -238,6 +239,7 @@ def chunk_gdn_fwd_output_packed(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return output
 

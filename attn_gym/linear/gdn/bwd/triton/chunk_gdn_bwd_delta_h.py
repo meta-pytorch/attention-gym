@@ -425,7 +425,7 @@ def chunk_gdn_bwd_delta_h(
 
     groups = value_heads // key_heads
     if chunk_slots:
-        (_dv_local if autotune else _dv_local.pinned)[(chunk_slots, value_heads)](
+        _dv_local[(chunk_slots, value_heads)](
             q,
             k,
             q.stride(1),
@@ -444,12 +444,13 @@ def chunk_gdn_bwd_delta_h(
             V=value_dim,
             BT=bt,
             IS_VARLEN=metadata is not None,
+            autotune=autotune,
         )
 
     def grid(meta):
         return (num_sequences * value_heads, triton.cdiv(value_dim, meta["BV"]))
 
-    (_delta_h if autotune else _delta_h.pinned)[grid](
+    _delta_h[grid](
         q,
         k,
         q.stride(1),
@@ -476,6 +477,7 @@ def chunk_gdn_bwd_delta_h(
         IS_VARLEN=metadata is not None,
         STORE_INITIAL_STATE_GRADIENT=d_initial_state is not None,
         USE_FINAL_STATE_GRADIENT=d_final_state is not None,
+        autotune=autotune,
     )
     return dh, d_initial_state, dv
 

@@ -287,6 +287,49 @@ _recurrent_scan = TritonTuner(
 )
 
 
+def _heuristic_launch_options(
+    average_tokens: int, sequence_heads: int, key_dim: int, value_dim: int, is_varlen: bool
+) -> dict[str, int]:
+    """Pick the value tile and warps of an untuned launch from the host-visible shape."""
+    # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
+    # Multi-token scans use one warp so per-token reductions stay in registers. Each program
+    # carries its tile through the whole sequence, so the grid should fit one wave: tiny
+    # grids split V finely, and BV=16 under the 128-register cap fits 256 sequence-heads at
+    # K=128. Skewed varlen lengths are bound by the longest sequence, so varlen keeps BV=4.
+    if average_tokens > 1 and key_dim >= 128:
+        num_warps = 1
+        if sequence_heads <= 16:
+            block_v_limit = 2
+        elif is_varlen or sequence_heads <= 64:
+            block_v_limit = 4
+        else:
+            # BV * K <= 2048 fits the 128-register cap.
+            block_v_limit = 16 if key_dim <= 128 else 8
+    elif average_tokens > 1:
+        # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
+        if sequence_heads >= 2048:
+            block_v_limit, num_warps = 32, 2
+        else:
+            block_v_limit, num_warps = (4 if sequence_heads <= 256 else 8), 1
+    elif value_dim >= 128:
+        block_v_limit = 4 if key_dim > 128 or sequence_heads > 512 else 8
+        num_warps = 1
+    elif sequence_heads <= 8:
+        block_v_limit, num_warps = 8, 4
+    elif sequence_heads < 1024:
+        block_v_limit, num_warps = 16, 2
+    else:
+        block_v_limit, num_warps = 32, 2
+    launch_options = {
+        "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
+        "num_warps": num_warps,
+        "num_stages": 3,
+    }
+    if num_warps == 1:
+        launch_options["maxnreg"] = 128
+    return launch_options
+
+
 def launch_recurrent_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -379,50 +422,7 @@ def launch_recurrent_delta_rule_fwd(
     # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
     # Prefetch was slower for K > 128.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
-    use_autotune = autotune and state_indices is None
-    kernel = _recurrent_scan if use_autotune else _recurrent_delta_rule_fwd_kernel
-    launch_options = {}
-    if not use_autotune:
-        # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
-        # Multi-token scans use one warp so per-token reductions stay in registers. Each program
-        # carries its tile through the whole sequence, so the grid should fit one wave: tiny
-        # grids split V finely, and BV=16 under the 128-register cap fits 256 sequence-heads at
-        # K=128. Skewed varlen lengths are bound by the longest sequence, so varlen keeps BV=4.
-        if average_tokens > 1 and key_dim >= 128:
-            num_warps = 1
-            if sequence_heads <= 16:
-                block_v_limit = 2
-            elif cu_seqlens is not None or sequence_heads <= 64:
-                block_v_limit = 4
-            else:
-                # BV * K <= 2048 fits the 128-register cap.
-                block_v_limit = 16 if key_dim <= 128 else 8
-        elif average_tokens > 1:
-            # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
-            if sequence_heads >= 2048:
-                block_v_limit, num_warps = 32, 2
-            else:
-                block_v_limit, num_warps = (4 if sequence_heads <= 256 else 8), 1
-        elif value_dim >= 128:
-            block_v_limit = 4 if key_dim > 128 or sequence_heads > 512 else 8
-            num_warps = 1
-        elif sequence_heads <= 8:
-            block_v_limit, num_warps = 8, 4
-        elif sequence_heads < 1024:
-            block_v_limit, num_warps = 16, 2
-        else:
-            block_v_limit, num_warps = 32, 2
-        launch_options = {
-            "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
-            "num_warps": num_warps,
-            "num_stages": 3,
-        }
-        if num_warps == 1:
-            launch_options["maxnreg"] = 128
-    if batch_invariant:
-        # Disable FMA fusion to avoid layout-dependent rounding.
-        launch_options["enable_fp_fusion"] = False
-    kernel[grid](
+    tensors = (
         q,
         k,
         v,
@@ -434,25 +434,41 @@ def launch_recurrent_delta_rule_fwd(
         cu_seqlens,
         state_indices,
         has_initial_state,
-        scale=scale,
-        T=tokens,
-        N=num_sequences,
-        state_batch_stride=state_batch_stride,
-        H=heads,
-        HK=key_heads,
-        K=key_dim,
-        V=value_dim,
-        BK=triton.next_power_of_2(key_dim),
-        USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        USE_STATE_INDICES=state_indices is not None,
-        USE_HAS_INITIAL_STATE=has_initial_state is not None,
-        SCALAR_GATE=gate_kind is GateKind.SCALAR,
-        PREFETCH=prefetch,
-        BATCH_INVARIANT=batch_invariant,
-        **launch_options,
     )
+    options: dict[str, Any] = {
+        "scale": scale,
+        "T": tokens,
+        "N": num_sequences,
+        "state_batch_stride": state_batch_stride,
+        "H": heads,
+        "HK": key_heads,
+        "K": key_dim,
+        "V": value_dim,
+        "BK": triton.next_power_of_2(key_dim),
+        "USE_INITIAL_STATE": initial_state is not None,
+        "STORE_FINAL_STATE": final_state is not None,
+        "IS_VARLEN": cu_seqlens is not None,
+        "USE_STATE_INDICES": state_indices is not None,
+        "USE_HAS_INITIAL_STATE": has_initial_state is not None,
+        "SCALAR_GATE": gate_kind is GateKind.SCALAR,
+        "PREFETCH": prefetch,
+        "BATCH_INVARIANT": batch_invariant,
+    }
+    if batch_invariant:
+        # Disable FMA fusion to avoid layout-dependent rounding.
+        options["enable_fp_fusion"] = False
+    if autotune and state_indices is None:
+        _recurrent_scan[grid](*tensors, **options, autotune=True)
+    else:
+        # Untuned and paged launches use the host shape heuristic, not the tuner's pinned
+        # selection.
+        _recurrent_delta_rule_fwd_kernel[grid](
+            *tensors,
+            **options,
+            **_heuristic_launch_options(
+                average_tokens, sequence_heads, key_dim, value_dim, cu_seqlens is not None
+            ),
+        )
     return output, final_state
 
 

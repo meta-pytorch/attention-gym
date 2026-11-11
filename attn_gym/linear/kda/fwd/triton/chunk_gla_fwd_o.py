@@ -657,7 +657,7 @@ def chunk_gla_fwd_o_gk(
 
         cu_seqlens = None if metadata is None else metadata.cu_seqlens
         chunk_offsets = None if metadata is None else metadata.chunk_offsets
-        (_fwd_o if autotune else _fwd_o.pinned)[grid](
+        _fwd_o[grid](
             q=q,
             v=v,
             g=g,
@@ -681,6 +681,7 @@ def chunk_gla_fwd_o_gk(
             ),
             FASTMATH=fastmath,
             enable_reflect_ftz=fastmath,
+            autotune=autotune,
         )
     return output
 

@@ -1014,7 +1014,7 @@ def _launch_grouped_forward(
             selected_counts, spans, cu_seqlens, tile_queries, document_bounds=False
         )
         num_tiles = tile_spans.shape[1]
-        (_FWD_DENSE if autotune else _FWD_DENSE.pinned)[(num_tiles, batch, kv_heads)](
+        _FWD_DENSE[(num_tiles, batch, kv_heads)](
             query,
             sparse_kv,
             sparse_v,
@@ -1045,10 +1045,9 @@ def _launch_grouped_forward(
             TILE_QUERIES=tile_queries,
             BLOCK_M=DENSE_TILE_ROWS,
             BLOCK_D=block_d,
+            autotune=autotune,
         )
-    (_FWD_GROUPED if autotune else _FWD_GROUPED.pinned)[
-        (seq_len, batch, kv_heads * triton.cdiv(group, block_h))
-    ](
+    _FWD_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
         query,
         sparse_kv,
         local_kv,
@@ -1092,6 +1091,7 @@ def _launch_grouped_forward(
         RESOLVED_INDICES=True,
         tile_spans_ptr=tile_spans,
         DENSE_TILE_QUERIES=tile_queries,
+        autotune=autotune,
     )
     return output, lse
 
@@ -1185,9 +1185,7 @@ def _launch_forward(
         rope_dim = 0 if query_rope is None else query_rope.shape[-1]
         block_h, key_rows = shared_forward_tiles(query, rope_dim)
         block_k = max(16, min(key_rows, triton.next_power_of_2(topk)))
-        (_FWD_SHARED if autotune else _FWD_SHARED.pinned)[
-            (seq_len, batch, triton.cdiv(heads, block_h))
-        ](
+        _FWD_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
             local_kv,
@@ -1231,6 +1229,7 @@ def _launch_forward(
             BLOCK_D=block_d,
             SPARSE_STAGES=2,
             RESOLVED_INDICES=False,
+            autotune=autotune,
         )
         return output, lse
     if query_rope is not None:
@@ -1254,7 +1253,7 @@ def _launch_forward(
             else TensorDescriptor.from_tensor(local_kv, [1, 1, block_n, block_d])
         )
         output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
-        (_FWD_TMA if autotune else _FWD_TMA.pinned)[grid](
+        _FWD_TMA[grid](
             query_desc,
             sparse_kv,
             local_desc,
@@ -1281,6 +1280,7 @@ def _launch_forward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             BLOCK_D=block_d,
+            autotune=autotune,
         )
     else:
         _gather_attn_fwd[grid](

@@ -535,7 +535,7 @@ def chunk_gdn_bwd_wy(
 
     if chunk_slots:
         direct_grid = (key_tiles, chunk_slots, value_heads)
-        (_dqkwg if autotune else _dqkwg.pinned)[direct_grid](
+        _dqkwg[direct_grid](
             q,
             k,
             q.stride(1),
@@ -563,8 +563,9 @@ def chunk_gdn_bwd_wy(
             BK=block_key,
             SCALE=scale,
             IS_VARLEN=metadata is not None,
+            autotune=autotune,
         )
-        (_wy if autotune else _wy.pinned)[(chunk_slots, value_heads)](
+        _wy[(chunk_slots, value_heads)](
             k,
             v,
             k.stride(1),
@@ -588,6 +589,7 @@ def chunk_gdn_bwd_wy(
             V=value_dim,
             BT=bt,
             IS_VARLEN=metadata is not None,
+            autotune=autotune,
         )
         chunk_gdn_bwd_gate_cumsum_kernel[(chunk_slots, value_heads)](
             d_gate_direct,

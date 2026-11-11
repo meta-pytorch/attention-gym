@@ -129,14 +129,16 @@ def compile_only_for_target(
         launches.append(launch)
 
     def tuner_getitem(self, grid):
-        return lambda *args, **kwargs: launch_candidates(self, grid, self.bind(args, kwargs))
+        # ``autotune`` stays required but is unused: both launches build every candidate.
+        return lambda *args, autotune, **kwargs: launch_candidates(
+            self, grid, self.bind(args, kwargs)
+        )
 
     try:
         with (
             emulate_device_dispatch(capability, max_shared_mem),
             mock.patch.object(JITFunction, "run", jit_run),
             mock.patch.object(TritonTuner, "__getitem__", tuner_getitem),
-            mock.patch.object(TritonTuner, "launch_pinned", launch_candidates),
             mock.patch.object(
                 triton.runtime.driver.active, "get_current_target", return_value=target
             ),

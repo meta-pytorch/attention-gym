@@ -207,7 +207,6 @@ class ChunkKDACudnnPrepared:
     saved: ChunkKDACudnnSaved
     metadata: RaggedChunkMetadata
     scale: float
-    autotune: bool
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -305,7 +304,7 @@ def chunk_kda_prepare(
         gate = normalize_compact_tensor(gate)
         validate_cudnn_constraints(q, k, v, gate, beta, None, cu_seqlens)
         saved = ChunkKDACudnnSaved(q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets)
-        return ChunkKDACudnnPrepared(saved, metadata, scale, autotune)
+        return ChunkKDACudnnPrepared(saved, metadata, scale)
     factors = _prepare_chunk_kda_fwd(
         q,
         k,
@@ -413,7 +412,6 @@ class ChunkKDACudnnBackward:
     d_output: torch.Tensor
     initial_state: torch.Tensor | None
     scale: float
-    autotune: bool
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
@@ -494,9 +492,7 @@ def chunk_kda_prepare_backward(
     options = resolve_kernel_options(kernel_options)
     if isinstance(saved, ChunkKDACudnnSaved):
         validate_cudnn_fastmath(fastmath)
-        return ChunkKDACudnnBackward(
-            saved, d_output, _normalize_cudnn_state(initial_state), scale, options.autotune
-        )
+        return ChunkKDACudnnBackward(saved, d_output, _normalize_cudnn_state(initial_state), scale)
     metadata = None
     if saved.cu_seqlens is not None:
         assert saved.chunk_offsets is not None

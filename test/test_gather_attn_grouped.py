@@ -261,18 +261,12 @@ def _spy_dense_launches(monkeypatch):
     launches = {}
 
     class CountingLaunch:
-        """Count both tuned and pinned launches."""
-
         def __init__(self, name, kernel):
             self.name, self.kernel = name, kernel
 
         def __getitem__(self, grid):
             launches[self.name] += 1
             return self.kernel[grid]
-
-        @property
-        def pinned(self):
-            return CountingLaunch(self.name, self.kernel.pinned)
 
     for module, name in (
         (forward, "_FWD_DENSE"),

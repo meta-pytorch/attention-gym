@@ -125,8 +125,9 @@ tuned kernel in forward and backward under `kernel_options={"autotune": False}` 
   heuristic default first: pinning selects the first candidate left by `prune` that the device
   can run. The tuning `key` must determine what `prune` keeps. Use `run_tunable` for CuTeDSL;
   pinning selects `default_config`.
-- Launch `(tuner if autotune else tuner.pinned)[grid](...)`. Keep the recurrent scan's host
-  shape heuristic when untuned. Neither untuned path may benchmark or read the winner cache.
+- Launch `tuner[grid](..., autotune=autotune)`; the keyword is required, and `False` launches
+  the pinned candidate. Keep the recurrent scan's host shape heuristic when untuned. Neither
+  untuned path may benchmark or read the winner cache.
 - Keep deterministic-mode policy out of tuners. Resolve the `kernel_options["autotune"]` request
   with `should_autotune` (`attn_gym/_backends/autotune.py`) and pass the bool through every launch
   and custom-op schema. Resolve the stored request again in autograd backward and staged handles'

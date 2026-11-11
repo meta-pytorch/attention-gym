@@ -543,11 +543,10 @@ def recompute_w_u_fwd_triton(
         "FASTMATH": fastmath,
         "enable_reflect_ftz": fastmath,
     }
-    kernel = _w_u if autotune else _w_u.pinned
     if chunks == 0:
         return w, u, qg, kg
     if metadata is None:
-        kernel[(chunks, value_heads)](**kernel_kwargs)
+        _w_u[(chunks, value_heads)](**kernel_kwargs, autotune=autotune)
         return w, u, qg, kg
     resolved = GridScheduler(metadata).resolve_flat(
         schedule,
@@ -556,10 +555,11 @@ def recompute_w_u_fwd_triton(
         auto_persistent=False,  # heavy kernel; see GridScheduler.resolve_flat
     )
     if resolved.kind is ScheduleKind.PERSISTENT:
-        persistent_kernel = _w_u_persistent if autotune else _w_u_persistent.pinned
-        persistent_kernel[(resolved.workers,)](num_workers=resolved.workers, **kernel_kwargs)
+        _w_u_persistent[(resolved.workers,)](
+            num_workers=resolved.workers, **kernel_kwargs, autotune=autotune
+        )
     else:
-        kernel[(chunks, value_heads)](**kernel_kwargs)
+        _w_u[(chunks, value_heads)](**kernel_kwargs, autotune=autotune)
     return w, u, qg, kg
 
 

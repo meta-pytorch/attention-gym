@@ -963,9 +963,7 @@ def _launch_backward(
         grad_sink_partials = torch.empty(
             batch, heads, seq_len, device=query.device, dtype=torch.float32
         )
-        (BWD_DQ_SHARED if autotune else BWD_DQ_SHARED.pinned)[
-            (seq_len, batch, triton.cdiv(heads, block_h))
-        ](
+        BWD_DQ_SHARED[(seq_len, batch, triton.cdiv(heads, block_h))](
             query,
             sparse_kv,
             kernel_local_kv,
@@ -1016,6 +1014,7 @@ def _launch_backward(
             BLOCK_D=block_d,
             SPARSE_STAGES=2,
             RESOLVED_INDICES=False,
+            autotune=autotune,
         )
     else:
         # Full-width D=512 operands otherwise exceed per-block shared-memory limits. FP32 window
@@ -1088,7 +1087,7 @@ def _launch_backward(
             output_desc = TensorDescriptor.from_tensor(output, [1, 1, block_m, block_d])
             grad_output_desc = TensorDescriptor.from_tensor(grad_output, [1, 1, block_m, block_d])
             grad_local_desc = TensorDescriptor.from_tensor(grad_local_kv, [1, 1, block_n, block_d])
-            (_BWD_DLOCAL_KV_TMA if autotune else _BWD_DLOCAL_KV_TMA.pinned)[local_grid](
+            _BWD_DLOCAL_KV_TMA[local_grid](
                 query_desc,
                 local_desc,
                 cu_seqlens,
@@ -1110,6 +1109,7 @@ def _launch_backward(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_D=block_d,
+                autotune=autotune,
             )
         else:
             _gather_attn_bwd_dlocal_kv[local_grid](
@@ -1177,9 +1177,7 @@ def _launch_backward(
             batch,
             triton.cdiv(heads, meta["BLOCK_H"]) * triton.cdiv(topk, meta["BLOCK_K"]),
         )
-        (BWD_DSPARSE_KV_SHARED_ATOMIC if autotune else BWD_DSPARSE_KV_SHARED_ATOMIC.pinned)[
-            sparse_grid
-        ](
+        BWD_DSPARSE_KV_SHARED_ATOMIC[sparse_grid](
             query,
             sparse_kv,
             sparse_kv,
@@ -1221,6 +1219,7 @@ def _launch_backward(
             USE_INT64_OFFSETS=use_int64_offsets,
             BLOCK_D=block_d,
             DENSE_TILE_QUERIES=0,
+            autotune=autotune,
         )
         grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
         if rope_dim:
@@ -1250,7 +1249,7 @@ def _launch_backward(
             sparse_kernel = _BWD_DSPARSE_KV
             sparse_grid = (sparse_seq_len, batch * heads)
 
-        (sparse_kernel if autotune else sparse_kernel.pinned)[sparse_grid](
+        sparse_kernel[sparse_grid](
             query,
             sparse_kv,
             selected_queries,
@@ -1273,6 +1272,7 @@ def _launch_backward(
             SCALE=scale,
             USE_INT64_OFFSETS=use_int64_offsets or requires_int64_offsets(grad_sparse_kv_partials),
             BLOCK_D=block_d,
+            autotune=autotune,
         )
         grad_sparse_kv = (
             grad_sparse_kv_partials.sum(dim=1, keepdim=True)
@@ -1419,7 +1419,7 @@ def _launch_grouped_backward(
         num_dense_tiles = tile_spans.shape[1]
     if dense_shape is not None:
         dense_rows = tile_queries * group
-        (BWD_DQ_DENSE if autotune else BWD_DQ_DENSE.pinned)[
+        BWD_DQ_DENSE[
             lambda meta: (
                 num_dense_tiles * triton.cdiv(dense_rows, meta["BLOCK_M"]),
                 batch,
@@ -1463,10 +1463,9 @@ def _launch_grouped_backward(
             USE_INT64_OFFSETS=use_int64_offsets,
             TILE_QUERIES=tile_queries,
             BLOCK_D=block_d,
+            autotune=autotune,
         )
-    (BWD_DQ_GROUPED if autotune else BWD_DQ_GROUPED.pinned)[
-        (seq_len, batch, kv_heads * triton.cdiv(group, block_h))
-    ](
+    BWD_DQ_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
         query,
         sparse_kv,
         kernel_local_kv,
@@ -1518,6 +1517,7 @@ def _launch_grouped_backward(
         RESOLVED_INDICES=True,
         tile_spans_ptr=tile_spans,
         DENSE_TILE_QUERIES=tile_queries,
+        autotune=autotune,
     )
     grad_sink = grad_sink_partials.sum(dim=(0, 2)).to(attention_sink.dtype)
 
@@ -1603,9 +1603,7 @@ def _launch_grouped_backward(
             if v_is_k
             else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
         )
-        (BWD_DSPARSE_KV_DENSE if autotune else BWD_DSPARSE_KV_DENSE.pinned)[
-            (key_tile_grid, kv_heads, batch)
-        ](
+        BWD_DSPARSE_KV_DENSE[(key_tile_grid, kv_heads, batch)](
             query,
             sparse_kv,
             sparse_values,
@@ -1642,6 +1640,7 @@ def _launch_grouped_backward(
             BLOCK_M=DENSE_TILE_ROWS,
             BLOCK_N=dense_block_n,
             BLOCK_D=block_d,
+            autotune=autotune,
         )
     if not sparse_backward:
         grad_sparse_kv = torch.zeros(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
@@ -1662,7 +1661,7 @@ def _launch_grouped_backward(
                 if v_is_k
                 else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
             )
-        (BWD_DSPARSE_KV_SHARED_ATOMIC if autotune else BWD_DSPARSE_KV_SHARED_ATOMIC.pinned)[
+        BWD_DSPARSE_KV_SHARED_ATOMIC[
             lambda meta: (
                 seq_len,
                 batch,
@@ -1715,6 +1714,7 @@ def _launch_grouped_backward(
             BLOCK_D=block_d,
             tile_spans_ptr=tile_spans,
             DENSE_TILE_QUERIES=tile_queries,
+            autotune=autotune,
         )
         grad_sparse_kv = rounded(grad_sparse_kv_fp32)
         grad_sparse_v = grad_sparse_kv if v_is_k else rounded(grad_sparse_v_fp32)
