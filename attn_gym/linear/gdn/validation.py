@@ -2,36 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from typing import Literal, NamedTuple
-
 import torch
 
-from attn_gym.linear._delta_rule.validation import (
-    resolve_backend_options,
-    validate_delta_rule_inputs,
-)
-
-
-class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_gdn`` backend selection and cuDNN split switches."""
-
-    backend: Literal["fused", "cudnn"]
-    split_backward: bool
-    split_forward: bool
-
-
-def resolve_kernel_options(
-    kernel_options: Mapping[str, object] | None,
-) -> ResolvedKernelOptions:
-    """Validate chunk backend options while keeping the repo-local path as default."""
-    if kernel_options is None:
-        return ResolvedKernelOptions("fused", False, False)
-    return ResolvedKernelOptions(
-        *resolve_backend_options(
-            kernel_options, op_name="chunk_gdn", fields=ResolvedKernelOptions._fields
-        )
-    )
+from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 
 def validate_gdn_inputs(
@@ -71,4 +44,4 @@ def validate_gdn_inputs(
         )
 
 
-__all__ = ["ResolvedKernelOptions", "resolve_kernel_options", "validate_gdn_inputs"]
+__all__ = ["validate_gdn_inputs"]

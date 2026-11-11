@@ -86,21 +86,23 @@ def test_backend_dispatch_uses_input_device(
 
 
 @pytest.mark.parametrize(
-    "options",
+    ("options", "message"),
     [
-        {"backend": "auto"},
-        {"backend": "missing"},
-        {"other": "triton"},
-        {"backend": "triton", "other": "x"},
-        {"backend": None},
+        ({"backend": "auto"}, "'backend'. must be 'cute' or 'triton'"),
+        ({"backend": None}, "'backend'. must be 'cute' or 'triton'"),
+        ({"other": "triton"}, "unsupported lightning_indexer kernel options: other"),
+        (
+            {"backend": "triton", "other": "x"},
+            "unsupported lightning_indexer kernel options: other",
+        ),
     ],
 )
-def test_invalid_backend_options(options):
+def test_invalid_backend_options(options, message):
     """Reject unknown options before launching a backend."""
     q, k, weights = torch.zeros(1, 2, 2, 16), torch.zeros(1, 2, 16), torch.zeros(1, 2, 2)
-    with pytest.raises(ValueError, match="unsupported lightning_indexer kernel options"):
+    with pytest.raises(ValueError, match=message):
         lightning_indexer(q, k, weights, 1, kernel_options=options)
-    with pytest.raises(ValueError, match="kernel_options are not supported"):
+    with pytest.raises(ValueError, match=message):
         lightning_indexer(q, k, weights, 1, impl="reference", kernel_options=options)
 
 

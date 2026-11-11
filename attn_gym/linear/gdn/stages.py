@@ -20,6 +20,7 @@ from typing import NamedTuple
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
@@ -41,6 +42,7 @@ from attn_gym.linear.gdn.impl.chunk import (
 )
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
+from attn_gym.types import TUNING_OPTION_SPEC, TuningOptions, validate_kernel_options
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
@@ -74,6 +76,8 @@ class ChunkGDNPrepared:
     factors: ChunkGDNFactors
     metadata: RaggedChunkMetadata | None
     scale: float
+    # The request; ``run`` applies ``should_autotune`` again because the mode can change.
+    autotune: bool
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -110,6 +114,7 @@ class ChunkGDNPrepared:
             initial_state,
             self.metadata,
             self.scale,
+            autotune=should_autotune(self.autotune),
         )
         return output, final_state if output_final_state else None
 
@@ -123,12 +128,16 @@ def chunk_gdn_prepare(
     *,
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
+    kernel_options: TuningOptions | None = None,
 ) -> ChunkGDNPrepared:
     """Run the factor half of fused ``chunk_gdn`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
-    one packed stream.
+    one packed stream. ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
+    autotune = validate_kernel_options(
+        kernel_options, TUNING_OPTION_SPEC, op_name="chunk_gdn_prepare"
+    )["autotune"]
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
@@ -142,11 +151,13 @@ def chunk_gdn_prepare(
         )
     )
     reject_int64_offsets(q, k, v, cumulative_gate, beta)
-    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, metadata)
+    factors = _prepare_chunk_gdn_fwd(
+        k, v, cumulative_gate, beta, metadata, autotune=should_autotune(autotune)
+    )
     saved = ChunkGDNSaved(
         q, k, v, cumulative_gate, beta, factors.inverse, cu_seqlens, chunk_offsets
     )
-    return ChunkGDNPrepared(saved, factors, metadata, scale)
+    return ChunkGDNPrepared(saved, factors, metadata, scale, autotune)
 
 
 @dataclass
@@ -159,6 +170,7 @@ class ChunkGDNBackward:
     metadata: RaggedChunkMetadata | None
     prepared: ChunkGDNBwdPrepared
     scale: float
+    autotune: bool  # The request, as in ``ChunkGDNPrepared``.
 
     @cached_property
     def aqk(self) -> torch.Tensor:
@@ -223,6 +235,7 @@ class ChunkGDNBackward:
             self.prepared,
             self.scale,
             aqk=self.__dict__.get("aqk"),  # Reuse it only when the reverse summary computed it.
+            autotune=should_autotune(self.autotune),
         )
 
 
@@ -232,12 +245,17 @@ def chunk_gdn_prepare_backward(
     initial_state: torch.Tensor | None,
     *,
     scale: float,
+    kernel_options: TuningOptions | None = None,
 ) -> ChunkGDNBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the forward
     handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
+    ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
     """
+    autotune = validate_kernel_options(
+        kernel_options, TUNING_OPTION_SPEC, op_name="chunk_gdn_prepare_backward"
+    )["autotune"]
     metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     scale = float(scale)
     if d_output is None:
@@ -256,8 +274,9 @@ def chunk_gdn_prepare_backward(
         saved.inverse,
         initial_state,
         metadata,
+        autotune=should_autotune(autotune),
     )
-    return ChunkGDNBackward(saved, d_output, initial_state, metadata, prepared, scale)
+    return ChunkGDNBackward(saved, d_output, initial_state, metadata, prepared, scale, autotune)
 
 
 __all__ = [

@@ -681,18 +681,14 @@ def chunk_gated_delta_rule_fwd_h(
     chunk_size: int = 64,
     output_final_state: bool = True,
     metadata: RaggedChunkMetadata | None = None,
-    autotune: bool = True,
     fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run the fixed-length or packed inter-chunk delta-rule state recurrence.
 
     ``gk`` may hold one cumulative log2 decay per key channel (KDA) or one
-    scalar decay per head (GDN). ``autotune`` is accepted for launcher-ABI
-    parity with the other stages;
-    the warp-specialized kernel has a single fixed configuration, so pinned
-    and autotuned launches are identical. ``fastmath`` selects the decay ``exp2``.
+    scalar decay per head (GDN). Launch configurations are chosen heuristically, not tuned.
+    ``fastmath`` selects the decay ``exp2``.
     """
-    del autotune
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     if metadata is None:

@@ -74,22 +74,24 @@ def test_fused_requires_cuda(inputs, impl):
 
 
 @pytest.mark.parametrize(
-    "options",
+    ("options", "error", "message"),
     [
-        {"backend": "auto"},
-        {"backend": "eager"},
-        {"backend": None},
-        {"other": "triton"},
-        {"backend": "triton", "other": "x"},
-        {"bwd_recompute_p": None},
-        {"bwd_recompute_p": 1},
-        {"bwd_recompute_p": "false"},
+        ({"backend": "auto"}, ValueError, "'backend'. must be 'cute' or 'triton'"),
+        ({"backend": None}, ValueError, "'backend'. must be 'cute' or 'triton'"),
+        ({"other": "triton"}, ValueError, "unsupported gather_attn kernel options: other"),
+        (
+            {"backend": "triton", "other": "x"},
+            ValueError,
+            "unsupported gather_attn kernel options: other",
+        ),
+        ({"bwd_recompute_p": None}, TypeError, "'bwd_recompute_p'. must be a bool"),
+        ({"bwd_recompute_p": 1}, TypeError, "'bwd_recompute_p'. must be a bool"),
     ],
 )
-def test_invalid_kernel_options(inputs, options):
-    with pytest.raises(ValueError, match="unsupported gather_attn kernel options"):
+def test_invalid_kernel_options(inputs, options, error, message):
+    with pytest.raises(error, match=message):
         gather_attn(**inputs, kernel_options=options)
-    with pytest.raises(ValueError, match="kernel_options are not supported"):
+    with pytest.raises(error, match=message):
         gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options=options)
 
 
@@ -103,9 +105,10 @@ def test_recompute_p_option_is_valid(inputs, options):
 
 
 @pytest.mark.parametrize("backend", ["cute", "triton"])
-def test_reference_rejects_backend_options(inputs, backend):
-    with pytest.raises(ValueError, match="kernel_options are not supported"):
-        gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options={"backend": backend})
+def test_reference_ignores_backend_options(inputs, backend):
+    expected = gather_attn(**inputs, impl=Impl.REFERENCE)
+    actual = gather_attn(**inputs, impl=Impl.REFERENCE, kernel_options={"backend": backend})
+    assert torch.equal(actual, expected)
 
 
 @pytest.mark.usefixtures("fresh_compile_cache")

@@ -54,7 +54,7 @@ def test_fused_recurrent_matches_reference(use_initial_state: bool, output_final
             *inputs[:-1],
             state,
             output_final_state=output_final_state,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl=Impl.FUSED,
         )
 
@@ -93,7 +93,7 @@ def test_fused_recurrent_matches_packed_reference(key_heads: int | None):
             state,
             cu_seqlens=cu_seqlens,
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl=Impl.FUSED,
         )
 
@@ -360,7 +360,7 @@ def test_fused_recurrent_low_precision(state_dtype: torch.dtype):
             *inputs[3:5],
             inputs[5].to(state_dtype),
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl=Impl.FUSED,
         )
     assert output.dtype == torch.bfloat16
@@ -418,7 +418,7 @@ def test_fused_recurrent_fullgraph():
         return recurrent_gdn(
             *args,
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl=Impl.FUSED,
         )
 
@@ -426,7 +426,7 @@ def test_fused_recurrent_fullgraph():
         expected = recurrent_gdn(
             *inputs,
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl=Impl.FUSED,
         )
         actual = compiled(*inputs)

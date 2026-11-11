@@ -259,20 +259,22 @@ def _dense_tile_inputs(heads, kv_heads, head_dim, separate_values, packed, all_d
 def _spy_dense_launches(monkeypatch):
     """Count launches of the three dense-tile kernels: forward, dQ, and dK/dV."""
     launches = {}
+
+    class CountingLaunch:
+        def __init__(self, name, kernel):
+            self.name, self.kernel = name, kernel
+
+        def __getitem__(self, grid):
+            launches[self.name] += 1
+            return self.kernel[grid]
+
     for module, name in (
         (forward, "_FWD_DENSE"),
         (backward, "BWD_DQ_DENSE"),
         (backward, "BWD_DSPARSE_KV_DENSE"),
     ):
-        tuner = getattr(module, name)
         launches[name] = 0
-
-        class CountingLaunch:
-            def __getitem__(self, grid, _tuner=tuner, _name=name):
-                launches[_name] += 1
-                return _tuner[grid]
-
-        monkeypatch.setattr(module, name, CountingLaunch())
+        monkeypatch.setattr(module, name, CountingLaunch(name, getattr(module, name)))
     return launches
 
 
@@ -1369,9 +1371,10 @@ def test_grouped_operator_contracts(case):
         torch.library.opcheck(
             _gather_attn_fwd_op,
             (query, sparse_kv, local_kv, kv_indices, sink, *common, needs_backward, *trailing),
+            {"autotune": True},
         )
     output, lse, state = _gather_attn_fwd_op(
-        query, sparse_kv, local_kv, kv_indices, sink, *common, True, *trailing
+        query, sparse_kv, local_kv, kv_indices, sink, *common, True, *trailing, autotune=True
     )
     torch.library.opcheck(
         _gather_attn_bwd_op,
@@ -1389,4 +1392,5 @@ def test_grouped_operator_contracts(case):
             *common[2:],
             *trailing,
         ),
+        {"autotune": True},
     )

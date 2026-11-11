@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
-from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
 
 from ..routing import uses_grouped_schedule
@@ -29,7 +29,6 @@ from .primitives import (
     resolve_selected_rows,
     select_tiles,
     store_bhsd,
-    tuning_key,
 )
 from .shared_backward import (
     BWD_DQ_GROUPED,
@@ -824,6 +823,7 @@ def _launch_backward(
     query_rope: torch.Tensor | None = None,
     sparse_rope: torch.Tensor | None = None,
     local_rope: torch.Tensor | None = None,
+    autotune: bool,
 ) -> tuple[torch.Tensor | None, ...]:
     """Launch backward kernels for gather attention.
 
@@ -832,7 +832,7 @@ def _launch_backward(
     count before the op broadcasts a single shared head; separate values or
     1 < kv_heads < heads run on the grouped schedule. Key-only RoPE runs only on the
     shared-KV schedule, whose sparse gradients are atomic, so the reverse query map may be
-    None.
+    None. ``autotune=False`` pins each tuned kernel's configuration.
     """
     if uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None):
         dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v = _launch_grouped_backward(
@@ -851,6 +851,7 @@ def _launch_backward(
             kv_heads=kv_heads,
             sparse_v=sparse_v,
             local_v=local_v,
+            autotune=autotune,
         )
         # Zero-width RoPE pairs add nothing to the scores; their gradients are empty.
         rope_grads = (
@@ -881,6 +882,7 @@ def _launch_backward(
             share_kv,
             scale,
             kv_heads=kv_heads,
+            autotune=autotune,
         )
         kv_heads = 1 if share_kv else query.shape[1]
         rope_grads = (
@@ -1012,6 +1014,7 @@ def _launch_backward(
             BLOCK_D=block_d,
             SPARSE_STAGES=2,
             RESOLVED_INDICES=False,
+            autotune=autotune,
         )
     else:
         # Full-width D=512 operands otherwise exceed per-block shared-memory limits. FP32 window
@@ -1106,6 +1109,7 @@ def _launch_backward(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 BLOCK_D=block_d,
+                autotune=autotune,
             )
         else:
             _gather_attn_bwd_dlocal_kv[local_grid](
@@ -1215,6 +1219,7 @@ def _launch_backward(
             USE_INT64_OFFSETS=use_int64_offsets,
             BLOCK_D=block_d,
             DENSE_TILE_QUERIES=0,
+            autotune=autotune,
         )
         grad_sparse_kv = grad_sparse_kv_fp32.to(sparse_kv.dtype)
         if rope_dim:
@@ -1267,6 +1272,7 @@ def _launch_backward(
             SCALE=scale,
             USE_INT64_OFFSETS=use_int64_offsets or requires_int64_offsets(grad_sparse_kv_partials),
             BLOCK_D=block_d,
+            autotune=autotune,
         )
         grad_sparse_kv = (
             grad_sparse_kv_partials.sum(dim=1, keepdim=True)
@@ -1329,6 +1335,7 @@ def _launch_grouped_backward(
     kv_heads: int,
     sparse_v: torch.Tensor | None,
     local_v: torch.Tensor | None,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Backward for separate values or grouped KV heads, mirroring the grouped forward.
 
@@ -1456,6 +1463,7 @@ def _launch_grouped_backward(
             USE_INT64_OFFSETS=use_int64_offsets,
             TILE_QUERIES=tile_queries,
             BLOCK_D=block_d,
+            autotune=autotune,
         )
     BWD_DQ_GROUPED[(seq_len, batch, kv_heads * triton.cdiv(group, block_h))](
         query,
@@ -1509,6 +1517,7 @@ def _launch_grouped_backward(
         RESOLVED_INDICES=True,
         tile_spans_ptr=tile_spans,
         DENSE_TILE_QUERIES=tile_queries,
+        autotune=autotune,
     )
     grad_sink = grad_sink_partials.sum(dim=(0, 2)).to(attention_sink.dtype)
 
@@ -1631,6 +1640,7 @@ def _launch_grouped_backward(
             BLOCK_M=DENSE_TILE_ROWS,
             BLOCK_N=dense_block_n,
             BLOCK_D=block_d,
+            autotune=autotune,
         )
     if not sparse_backward:
         grad_sparse_kv = torch.zeros(sparse_shape, dtype=sparse_kv.dtype, device=sparse_kv.device)
@@ -1704,6 +1714,7 @@ def _launch_grouped_backward(
             BLOCK_D=block_d,
             tile_spans_ptr=tile_spans,
             DENSE_TILE_QUERIES=tile_queries,
+            autotune=autotune,
         )
         grad_sparse_kv = rounded(grad_sparse_kv_fp32)
         grad_sparse_v = grad_sparse_kv if v_is_k else rounded(grad_sparse_v_fp32)

@@ -6,10 +6,21 @@ from typing import overload
 import torch
 from torch import Tensor
 
-from attn_gym.types import AuxRequest, Impl, resolve_impl
+from attn_gym._backends.autotune import should_autotune
+from attn_gym.types import (
+    AuxRequest,
+    Impl,
+    KernelOptionSpec,
+    TuningOptions,
+    resolve_impl,
+    validate_kernel_options,
+)
 
 from . import ops  # noqa: F401  # registers the attn_gym::paged_mla_decode ops
 from .impl import reference
+
+# Unlike other tuned operations, tuning is off unless requested.
+KERNEL_OPTION_SPEC: KernelOptionSpec = {"autotune": (bool, False)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,7 +159,7 @@ def paged_mla_decode(
     max_seqlen_k: int | None = None,
     scale: float,
     impl: Impl | str = Impl.FUSED,
-    autotune: bool = False,
+    kernel_options: TuningOptions | None = None,
     return_aux: None = ...,
 ) -> Tensor: ...
 
@@ -167,7 +178,7 @@ def paged_mla_decode(
     max_seqlen_k: int | None = None,
     scale: float,
     impl: Impl | str = Impl.FUSED,
-    autotune: bool = False,
+    kernel_options: TuningOptions | None = None,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, PagedMLADecodeAux]: ...
 
@@ -185,7 +196,7 @@ def paged_mla_decode(
     max_seqlen_k: int | None = None,
     scale: float,
     impl: Impl | str = Impl.FUSED,
-    autotune: bool = False,
+    kernel_options: TuningOptions | None = None,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, PagedMLADecodeAux]:
     """Attend packed queries to a paged, compressed MLA cache without expanding it.
@@ -219,7 +230,7 @@ def paged_mla_decode(
         seqused_k: Contiguous int32 ``[num_sequences]`` cached key count per sequence,
             including the keys of the current queries.
         max_seqlen_q: Host-side upper bound on any sequence's query count.
-        max_seqlen_k: Optional host-side upper bound on ``seqused_k``. Only ``autotune``
+        max_seqlen_k: Optional host-side upper bound on ``seqused_k``. Only autotuning
             reads it, to give short and long contexts separate winners; without it, every
             context uses the ``block_table`` capacity. A wrong value costs speed, not
             correctness.
@@ -229,12 +240,14 @@ def paged_mla_decode(
         impl: ``Impl.FUSED`` (default) runs FlashAttention's absorbed MLA kernel:
             FlashAttention-4 on SM100/SM103, FlashAttention-3 on SM90. Both support
             ``torch.compile``. ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
-        autotune: If True, benchmark FlashAttention-4's MLA kernels and split counts on the
-            first call of each workload bucket and launch the fastest; winners are cached in
-            memory and on disk. Buckets are the head count, block size, and power-of-two
-            buckets of ``max_seqlen_q``, the sequence count, and ``max_seqlen_k``. Run each
-            bucket once before CUDA graph capture; an untuned bucket raises ``RuntimeError``
-            there. Ignored on SM90, with ``Impl.REFERENCE``, and for empty inputs.
+        kernel_options: Kernel options, see :class:`attn_gym.types.TuningOptions`.
+            ``"autotune"`` defaults to ``False`` for this operation. If True, benchmark
+            FlashAttention-4's MLA kernels and split counts on the first call of each workload
+            bucket and launch the fastest; winners are cached in memory and on disk. Buckets
+            are the head count, block size, and power-of-two buckets of ``max_seqlen_q``, the
+            sequence count, and ``max_seqlen_k``. Run each bucket once before CUDA graph
+            capture; an untuned bucket raises ``RuntimeError`` there. Tuning has no effect on
+            SM90, with ``Impl.REFERENCE``, or for empty inputs; options are still validated.
         return_aux: If None (default), return only the output tensor. If an AuxRequest
             instance, return ``(output, PagedMLADecodeAux)`` with the requested outputs.
 
@@ -243,6 +256,9 @@ def paged_mla_decode(
         the output and ``PagedMLADecodeAux``. Rows past ``cu_seqlens_q[-1]`` are undefined.
     """
     selected_impl = resolve_impl(impl)
+    autotune = validate_kernel_options(
+        kernel_options, KERNEL_OPTION_SPEC, op_name="paged_mla_decode"
+    )["autotune"]
     _validate_inputs(
         q_latent,
         q_rope,
@@ -284,7 +300,7 @@ def paged_mla_decode(
                 max_seqlen_q,
                 max_seqlen_k,
                 scale,
-                autotune,
+                should_autotune(autotune),
             )
             if return_lse:
                 out, lse = torch.ops.attn_gym.paged_mla_decode_with_lse.default(*args)

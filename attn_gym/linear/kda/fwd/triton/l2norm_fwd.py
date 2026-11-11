@@ -6,8 +6,10 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym._backends.triton.utils import PinnedConfigKernel, fixed_tree_sum, ptr_offset
+from attn_gym._backends.triton.utils import fixed_tree_sum, ptr_offset
+from attn_gym.types import TUNING_OPTION_SPEC, TuningOptions, validate_kernel_options
 
 # A Triton pointer does not carry tensor shape or stride metadata. The registered-operator
 # boundary keeps runtime stride tuples opaque to Dynamo while preserving ptr_offset indexing.
@@ -180,7 +182,7 @@ def _l2norm_fwd_fake(
 
 torch.library.define(
     "attn_gym::kda_l2norm_bwd",
-    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None, bool autotune=True) "
+    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None, *, bool autotune) "
     "-> Tensor",
 )
 
@@ -190,10 +192,11 @@ def _l2norm_bwd_cuda(
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
-    autotune: bool = True,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Launch L2Norm backward behind the same opaque stride boundary."""
-    from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
+    from attn_gym.linear.kda.bwd.triton.l2norm_bwd import L2NORM_BWD
 
     _, tokens, heads, head_dim = x.shape
     rows = x.numel() // head_dim
@@ -202,8 +205,7 @@ def _l2norm_bwd_cuda(
     grid = lambda meta: (triton.cdiv(rows, meta["BT"]),)
     row_stride = _l2norm_row_stride(x)
     dy_row_stride = _l2norm_row_stride(d_output)
-    kernel = l2norm_bwd_kernel if autotune else PinnedConfigKernel(l2norm_bwd_kernel)
-    kernel[grid](
+    L2NORM_BWD[grid](
         x,
         rstd,
         d_output,
@@ -220,9 +222,9 @@ def _l2norm_bwd_cuda(
         HEADS=heads,
         D=head_dim,
         BD=block_dim,
-        ROW_BUCKET=triton.next_power_of_2(rows),
         NUM_SEQUENCES=0 if cu_seqlens is None else cu_seqlens.shape[0] - 1,
         IS_VARLEN=cu_seqlens is not None,
+        autotune=autotune,
     )
     return d_input.view_as(x)
 
@@ -236,7 +238,8 @@ def _l2norm_bwd_fake(
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
-    autotune: bool = True,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Describe input-gradient metadata without reading the packed endpoint."""
     del rstd, d_output, cu_seqlens, autotune
@@ -271,7 +274,9 @@ class _L2Norm(torch.autograd.Function):
     def backward(ctx, d_output: torch.Tensor):
         x, rstd, *metadata = ctx.saved_tensors
         cu_seqlens = metadata[0] if ctx.is_ragged else None
-        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, ctx.autotune), None, None, None
+        # The mode can change between an eager forward and its backward.
+        autotune = should_autotune(ctx.autotune)
+        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, autotune=autotune), None, None, None
 
 
 def l2norm(
@@ -279,7 +284,7 @@ def l2norm(
     eps: float = 1e-6,
     *,
     cu_seqlens: torch.Tensor | None = None,
-    autotune: bool = True,
+    kernel_options: TuningOptions | None = None,
 ) -> torch.Tensor:
     """Normalize rows, optionally stopping at a packed device endpoint.
 
@@ -287,12 +292,16 @@ def l2norm(
     output and input gradient. Packed callers must hide the inactive suffix from
     later consumers and parameter reductions.
 
-    ``autotune`` benchmarks backward tile configurations when true. False launches one
-    fixed configuration, so the input gradient is reproducible across processes and
-    autotune cache states. The forward never autotunes, and it reduces each row in a fixed
+    ``kernel_options`` is a :class:`attn_gym.types.TuningOptions`: ``"autotune"`` (default
+    ``True``) benchmarks backward tile configurations. ``False`` launches one fixed
+    configuration, so the input gradient is reproducible across processes and autotune cache
+    states. The forward never autotunes, and it reduces each row in a fixed
     order, so a row's output bits do not depend on the token count, head count, or
     ``cu_seqlens`` shape that select its launch config.
     """
+    autotune = validate_kernel_options(kernel_options, TUNING_OPTION_SPEC, op_name="l2norm")[
+        "autotune"
+    ]
     if not x.is_cuda:
         raise ValueError("l2norm requires a CUDA tensor")
     if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -312,7 +321,7 @@ def l2norm(
             raise ValueError("cu_seqlens must be contiguous int32")
         if cu_seqlens.device != x.device:
             raise ValueError("cu_seqlens must be on the same device as x")
-    return _L2Norm.apply(x, eps, cu_seqlens, autotune)
+    return _L2Norm.apply(x, eps, cu_seqlens, should_autotune(autotune))
 
 
 __all__ = ["l2norm"]

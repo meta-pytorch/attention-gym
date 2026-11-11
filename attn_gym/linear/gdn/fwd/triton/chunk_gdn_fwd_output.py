@@ -144,6 +144,8 @@ def chunk_gdn_fwd_output_dense(
     h: torch.Tensor,
     cumulative_gate: torch.Tensor,
     scale: float,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Compose dense GQA-capable BT64 output without materializing Aqk."""
     batch, tokens, key_heads, key_dim = q.shape
@@ -184,6 +186,7 @@ def chunk_gdn_fwd_output_dense(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return output
 
@@ -196,6 +199,8 @@ def chunk_gdn_fwd_output_packed(
     cumulative_gate: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Compose fixed-capacity packed GQA output without materializing Aqk."""
     metadata.validate_chunk_size(64)
@@ -234,6 +239,7 @@ def chunk_gdn_fwd_output_packed(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return output
 

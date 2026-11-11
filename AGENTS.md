@@ -102,6 +102,50 @@ performance:
   (`triton.knobs.runtime.jit_post_compile_hook`, `compile_fn.cache_info()`, the tunable winner
   cache). A/B warm performance before keeping or removing a specialization.
 
+## Public Operation Options
+
+- Keep math-changing options (`scale`, `fastmath`, gate transforms, masks) as keyword arguments;
+  the reference implementation must honor or document them.
+- Put kernel choices (`backend`, `schedule`, `autotune`, `bwd_recompute_p`, `batch_invariant`,
+  short-convolution schedule configs) in the operation's typed `kernel_options` dict, not keyword
+  arguments: `attn_gym/types.py`, `attn_gym/linear/types.py`,
+  `attn_gym/linear/short_conv/cute.py`. Every implementation must reject unknown keys and wrongly
+  typed values through `validate_kernel_options` (`attn_gym/types.py`), with a `KernelOptionSpec`
+  beside the options' `TypedDict`; `impl="reference"` then ignores the options, so one dict
+  serves both.
+- Use one spelling per option across operations. Breaking a public signature to restore this is
+  acceptable; disclose it in the PR.
+
+## Tuned Kernels and Reproducibility
+
+For operations that tune, default to tuning except in `paged_mla_decode` (default off). Pin every
+tuned kernel in forward and backward under `kernel_options={"autotune": False}` or
+`torch.use_deterministic_algorithms(True)`. See the
+[design note](docs/developers/tuned-kernels.md) for issue #777, rationale, and measurements.
+
+- Use `TritonTuner` (`attn_gym/_backends/triton/tune.py`), never `triton.autotune`. List the
+  heuristic default first: pinning selects the first candidate left by `prune` that the device
+  can run. The tuning `key` must determine what `prune` keeps. Use `run_tunable`
+  (`attn_gym/_backends/tune.py`) for CuTeDSL; pinning selects `default_config`.
+- Launch `tuner[grid](..., autotune=autotune)`; the keyword is required, and `False` launches
+  the pinned candidate, which may not benchmark or read the winner cache. A heuristic that
+  depends on the shape belongs in `prune`, which lists its choice first (the recurrent scan).
+- Keep deterministic-mode policy out of tuners. Resolve the `kernel_options["autotune"]` request
+  with `should_autotune` (`attn_gym/_backends/autotune.py`) and pass the bool through every launch
+  and custom-op schema as a required argument: a default would hide a launch that was never
+  wired. Resolve the stored request again in autograd backward and staged handles' `run`: eager
+  code can change the mode between phases. An autograd Function may store the bool its forward
+  resolved instead of the raw request; deterministic mode at backward still pins.
+  `gather_attn` resolves inside its CUDA ops.
+- Never tune state-mutating recurrences: benchmarking is unsafe. Keep them pinned regardless of
+  the option and document this in their docstrings.
+- When migrating tuners or changing candidates, key, or prune, verify bit-identical pinned
+  results against the base commit and provide a warm before/after tuned-latency table.
+- Use `no_benchmarking` (`test/conftest.py`) to test forward and backward under both ways to pin:
+  `{"autotune": False}` and deterministic mode with default options. Compare bits where schedules
+  match; `test/test_gather_attn_autotune.py` compares forward outputs and LSE because deterministic
+  mode changes its backward schedules.
+
 ## Adding CuTeDSL Kernels
 
 Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache` from

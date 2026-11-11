@@ -51,7 +51,7 @@ def test_wy_compiles_once_per_layout_across_runtime_shapes():
         for tokens in (64, 128, 192, 1088):
             for config in configs:
                 inputs = _inputs(tokens, tokens // 64)
-                wy.chunk_kda_bwd_wy_dqkg(*inputs, scale=128**-0.5, config=config)
+                wy.chunk_kda_bwd_wy_dqkg(*inputs, scale=128**-0.5, config=config, autotune=False)
                 calls += 1
         for lengths in ([1], [64, 0, 17], [16] * 17, [65, 300, 2]):
             tokens = sum(lengths)
@@ -60,7 +60,9 @@ def test_wy_compiles_once_per_layout_across_runtime_shapes():
             )
             for config in configs:
                 inputs = _inputs(tokens, metadata.capacity)
-                wy.chunk_kda_bwd_wy_dqkg(*inputs, metadata, scale=128**-0.5, config=config)
+                wy.chunk_kda_bwd_wy_dqkg(
+                    *inputs, metadata, scale=128**-0.5, config=config, autotune=False
+                )
                 calls += 1
         torch.cuda.synchronize()
         info = wy._compile_chunk_kda_bwd_wy_dqkg.cache_info()
@@ -88,7 +90,9 @@ def test_wy_persistent_units_match_across_grid_sizes(monkeypatch, lengths):
 
     def run(waves):
         config = wy.ChunkKdaBwdWyDqkgConfig(waves)
-        return wy.chunk_kda_bwd_wy_dqkg(*inputs, metadata, scale=128**-0.5, config=config)
+        return wy.chunk_kda_bwd_wy_dqkg(
+            *inputs, metadata, scale=128**-0.5, config=config, autotune=False
+        )
 
     expected = run(1)
     results = [run(2)]
@@ -113,7 +117,9 @@ def test_wy_persistent_units_match_across_grid_sizes(monkeypatch, lengths):
 def test_wy_rejects_empty_persistent_grid():
     inputs = _inputs(64, 1)
     with pytest.raises(ValueError, match="grid_waves must be positive"):
-        wy.chunk_kda_bwd_wy_dqkg(*inputs, scale=128**-0.5, config=wy.ChunkKdaBwdWyDqkgConfig(0))
+        wy.chunk_kda_bwd_wy_dqkg(
+            *inputs, scale=128**-0.5, config=wy.ChunkKdaBwdWyDqkgConfig(0), autotune=False
+        )
 
 
 @pytest.mark.parametrize(

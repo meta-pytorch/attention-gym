@@ -19,7 +19,6 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
-from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.linear.types import KernelOptions
 
 
@@ -33,40 +32,28 @@ def context_parallel_kda(
     routing: ContextParallelRouting,
     group: dist.ProcessGroup,
     scale: float | None = None,
-    autotune: bool = True,
     fastmath: bool = True,
     kernel_options: KernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run ``chunk_kda`` over this rank's span with state exchanged by all-gather.
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
-    ``scale``, ``autotune``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``.
+    ``scale``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``.
     Forward, backward, and their summaries share the same math policy.
     ``kernel_options={"backend": "cudnn"}`` selects cuDNN for the local pass and summaries
     and requires ``fastmath=True``.
     """
-    stages = _kda_stages(scale, autotune, fastmath, kernel_options)
+    stages = _kda_stages(scale, fastmath, kernel_options)
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
 def _kda_stages(
-    scale: float | None, autotune: bool, fastmath: bool, kernel_options: KernelOptions | None
+    scale: float | None, fastmath: bool, kernel_options: KernelOptions | None
 ) -> StagedOp:
     """Bind ``chunk_kda``'s options to its staged entry points."""
     return StagedOp(
-        partial(
-            chunk_kda_prepare,
-            scale=scale,
-            autotune=autotune,
-            fastmath=fastmath,
-            kernel_options=kernel_options,
-        ),
-        partial(
-            chunk_kda_prepare_backward,
-            autotune=autotune,
-            fastmath=fastmath,
-            schedule=resolve_kernel_options(kernel_options).schedule,
-        ),
+        partial(chunk_kda_prepare, scale=scale, fastmath=fastmath, kernel_options=kernel_options),
+        partial(chunk_kda_prepare_backward, fastmath=fastmath, kernel_options=kernel_options),
     )
 
 

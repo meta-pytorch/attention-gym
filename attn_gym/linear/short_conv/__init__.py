@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from attn_gym.linear.short_conv.activations import register_activation
     from attn_gym.linear.short_conv.cute import (
         ShortConvConfig,
+        ShortConvDecodeKernelOptions,
+        ShortConvKernelOptions,
         ShortConvTunedConfig,
         causal_conv1d,
         causal_conv1d_decode,
@@ -29,6 +31,8 @@ if TYPE_CHECKING:
 
 _BACKEND_EXPORTS = {
     "ShortConvConfig": "attn_gym.linear.short_conv.cute",
+    "ShortConvDecodeKernelOptions": "attn_gym.linear.short_conv.cute",
+    "ShortConvKernelOptions": "attn_gym.linear.short_conv.cute",
     "ShortConvTunedConfig": "attn_gym.linear.short_conv.cute",
     "causal_conv1d": "attn_gym.linear.short_conv.cute",
     "causal_conv1d_decode": "attn_gym.linear.short_conv.cute",

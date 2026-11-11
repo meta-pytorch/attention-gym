@@ -107,6 +107,34 @@ python examples/flex_attention/flex_determinism.py
 
 The script resets compiler state and uses fresh Inductor caches between runs so that it tests repeatability across independent compilations rather than repeatedly executing one cached kernel.
 
+## Autotuned kernels
+
+Autotuned kernels benchmark candidates on a winner-cache miss and reuse the winner.
+Candidates differ in floating-point order (tile sizes, warps per block), so timing noise can
+change the selected configuration and output bits across processes, ranks, and winner-cache
+states.
+
+Every operation that tunes can also launch pinned configurations chosen without timing:
+
+- `torch.use_deterministic_algorithms(True)` disables autotuning. Operations resolve the flag;
+  autograd backward resolves it again because eager code can change the mode after forward.
+  `gather_attn` resolves it inside its CUDA op implementations at launch.
+- `kernel_options={"autotune": False}` pins one call of any operation that tunes: `chunk_kda`,
+  `paged_chunk_kda`, `recurrent_kda`, `chunk_gdn`, `paged_chunk_gdn`, `recurrent_gdn`,
+  `l2norm`, the context-parallel and staged chunk operations, and `gather_attn`.
+  `paged_mla_decode` tunes only with `{"autotune": True}`.
+
+Tuning needs one eager call per workload before CUDA graph capture: a capture that reaches an
+untuned kernel raises `RuntimeError`. Capture with `{"autotune": False}` to skip the warm-up.
+
+Upgrading from a release that took `autotune=` as a keyword: pass
+`kernel_options={"autotune": ...}` instead. Winners from Triton's own autotune cache are not
+reused, so each workload tunes once more after the upgrade.
+
+The pinned configuration follows the input shapes and GPU model. For otherwise deterministic
+kernels, bits repeat across processes and cache states on one GPU model and software stack,
+not across GPU architectures.
+
 ## KDA determinism
 
 The KDA operations contain no atomics, so every kernel is bitwise-deterministic
@@ -114,27 +142,28 @@ given a fixed configuration. The guarantees, strongest first:
 
 - **Same selected configurations, run to run: bitwise.** Repeating a call
   that resolves to the same kernel configurations — across runs and processes —
-  reproduces identical bits for outputs and gradients. Under the default
-  ``autotune=True`` a cold winner cache re-benchmarks and timing noise may
-  select a different configuration; the next bullet removes that variable.
-- **`chunk_kda(..., autotune=False)`: bitwise by construction.** The default
-  (`autotune=True`) benchmarks candidate configurations — Triton and CuTeDSL
-  stages alike — the first time a shape is seen and reuses the cached winner
-  afterwards; `autotune=False` pins every stage to its fixed heuristic
-  configuration instead, so kernel selection is repeatable across machines and
-  cache states. `recurrent_kda(..., autotune=False)` pins its heuristic
-  configuration the same way. `causal_conv1d` has a single fixed schedule and
-  needs no flag.
+  reproduces identical bits for outputs and gradients. Under default
+  autotuning, a cold winner cache re-benchmarks and timing noise may
+  select a different configuration; the next bullet removes that variable, as do
+  deterministic algorithms (see [Autotuned kernels](#autotuned-kernels)).
+- **`chunk_kda(..., kernel_options={"autotune": False})`: bitwise by construction.** The
+  default benchmarks candidate configurations — Triton and CuTeDSL
+  stages alike — on a winner-cache miss and reuses the cached winner
+  afterwards; `{"autotune": False}` pins every stage to its fixed heuristic
+  configuration instead, so kernel selection is repeatable across processes and
+  cache states. With the same option, `recurrent_kda` uses its host shape heuristic without
+  tuning. `causal_conv1d` never benchmarks: it launches fixed default schedules
+  unless `kernel_options` names others, so it has no `autotune` key.
 - **`recurrent_kda` and `recurrent_gdn` with `kernel_options={"batch_invariant": True}`:
   bitwise across batches.** On one GPU model and software stack, a sequence gets
   the same output and final-state bits alone, among empty slots, or decoded one
   token per call with an FP32 state pool (a BF16 pool rounds the state between
   calls). The scan picks its launch
-  configuration from the batch shape, so `autotune=False` alone does not give
+  configuration from the batch shape, so `{"autotune": False}` alone does not give
   this. The option makes the configuration irrelevant: one formula for every
   configuration, sums over K in a fixed order, and no FMA fusion. `l2norm` makes
   the same split: its forward always reduces in a fixed order, and its `autotune`
-  flag only pins the backward configuration. Autotuning and prefetching still
+  option only pins the backward configuration. Autotuning and prefetching still
   run. The option costs up to ~20% GPU time on long prefills and ~9% on decode
   (GB300). The fused decode ops (`recurrent_kda_decode`, `recurrent_gdn_decode`)
   do not support it. For batch-invariant decode, apply `gate_transform`, the beta

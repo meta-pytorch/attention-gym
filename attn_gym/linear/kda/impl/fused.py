@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import (
@@ -179,7 +180,8 @@ class _ChunkKDA(torch.autograd.Function):
             initial_state,
             ctx.scale,
             ctx.fastmath,
-            ctx.autotune,
+            # The mode can change between an eager forward and its backward.
+            should_autotune(ctx.autotune),
             ctx.schedule,
         )
         if initial_state is not None:
@@ -208,7 +210,7 @@ def chunk_forward(
     scale: float,
     output_final_state: bool = False,
     fastmath: bool = True,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize per-token natural-log gates and invoke the fused chunk operators."""
@@ -283,7 +285,7 @@ def paged_chunk_forward(
     *,
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     replay_state: ReplayState | None = None,
 ) -> torch.Tensor:

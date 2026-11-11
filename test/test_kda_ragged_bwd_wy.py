@@ -67,7 +67,7 @@ def _inputs(
 
 
 def _run(inputs: StageInputs, metadata):
-    return chunk_kda_bwd_wy_dqkg(*inputs, metadata, scale=128**-0.5)
+    return chunk_kda_bwd_wy_dqkg(*inputs, metadata, scale=128**-0.5, autotune=False)
 
 
 def _sequence_local_reference(inputs: StageInputs, lengths: list[int]):
@@ -225,7 +225,7 @@ def test_ragged_wy_cuda_graph_replay():
     def operation(*args):
         *stage_tensors, offsets = args
         metadata = prepare_ragged_chunk_metadata(offsets, tokens, 64)
-        return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata, scale=128**-0.5)
+        return chunk_kda_bwd_wy_dqkg(*stage_tensors, metadata, scale=128**-0.5, autotune=False)
 
     operation(*inputs, cu_seqlens)
     torch.cuda.synchronize()
@@ -284,10 +284,11 @@ def test_wy_grouped_scalar_gate_matches_expanded_vector_gate(
             dv,
             metadata,
             scale=128**-0.5,
+            autotune=False,
         )
     )
     actual = chunk_kda_bwd_wy_dqkg(
-        q, k, v, v_new, gate, beta, A, h, do, dh, dv, metadata, scale=128**-0.5
+        q, k, v, v_new, gate, beta, A, h, do, dh, dv, metadata, scale=128**-0.5, autotune=False
     )
     expected[3] = expected[3].sum(-1)
     names = ("dq", "dk", "dv", "dg", "db", "dA")

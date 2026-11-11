@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.linear import gate_transform
 from attn_gym.linear._delta_rule.gate import _softplus_uses_cute
 from attn_gym.linear._delta_rule.triton import softplus_gate as softplus_backend
@@ -21,18 +22,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 
 @pytest.fixture(autouse=True)
-def fixed_l2norm_schedule(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest):
-    """Separate backend reuse from the row-bucket autotuning policy."""
+def seed():
     torch.manual_seed(123)
-    if request.node.get_closest_marker("full_autotune") is not None:
-        return
-    config = next(
-        config
-        for config in l2norm_bwd_kernel.configs
-        if config.kwargs["BT"] == 16 and config.num_warps == 4
-    )
-    monkeypatch.setattr(l2norm_bwd_kernel, "configs", [config])
-    monkeypatch.setattr(l2norm_bwd_kernel, "cache", {})
 
 
 def cache_size(kernel) -> int:
@@ -66,10 +57,15 @@ def make_view(shape: tuple[int, ...], dtype: torch.dtype, layout: str) -> torch.
 
 
 def run_operation(
-    kind: str, inputs: tuple[torch.Tensor, ...], metadata: torch.Tensor | None = None
+    kind: str,
+    inputs: tuple[torch.Tensor, ...],
+    metadata: torch.Tensor | None = None,
+    autotune: bool = False,
 ) -> torch.Tensor:
+    """Run one operation; l2norm pins its backward schedule unless ``autotune`` is set, which
+    separates backend reuse from the row-bucket autotuning policy."""
     if kind == "l2norm":
-        return l2norm(inputs[0], cu_seqlens=metadata)
+        return l2norm(inputs[0], cu_seqlens=metadata, kernel_options={"autotune": autotune})
     assert not _softplus_uses_cute(inputs[0])
     return gate_transform(*inputs, kind="softplus")
 
@@ -146,7 +142,7 @@ def make_inputs(
 @pytest.mark.parametrize("layout", ["compact", "strided", "strided3", "transposed", "misaligned"])
 def test_pointwise_reuses_backend_cache(kind, layout):
     kernels = (
-        (l2norm_fwd_kernel, l2norm_bwd_kernel.fn)
+        (l2norm_fwd_kernel, l2norm_bwd_kernel)
         if kind == "l2norm"
         else (softplus_backend.softplus_gate_fwd_kernel, softplus_backend.softplus_gate_bwd_kernel)
     )
@@ -177,58 +173,50 @@ def test_pointwise_reuses_backend_cache(kind, layout):
         )
 
 
-def stub_l2norm_tuning(monkeypatch: pytest.MonkeyPatch) -> list[int]:
-    """Tune over two configs with one untimed trial each; return the trial log."""
-    configs = [
-        config
-        for config in l2norm_bwd_kernel.configs
-        if config.kwargs["BT"] in (16, 32) and config.num_warps == 4
-    ]
-    monkeypatch.setattr(l2norm_bwd_kernel, "configs", configs)
-    monkeypatch.setattr(l2norm_bwd_kernel, "cache", {})
-    monkeypatch.setattr(l2norm_bwd_kernel, "cache_results", False)
-    trials = []
+def count_tuning_sweeps(monkeypatch: pytest.MonkeyPatch) -> list[None]:
+    """Return a list that grows by one entry per benchmarked tuning decision."""
+    tune = tune_module.tune
+    sweeps = []
 
-    def one_trial(call, quantiles):
-        call()
-        trials.append(1)
-        return [1.0] * len(quantiles)
+    def counting_tune(*args, **kwargs):
+        sweeps.append(None)
+        return tune(*args, **kwargs)
 
-    monkeypatch.setattr(l2norm_bwd_kernel, "do_bench", one_trial)
-    return trials
+    monkeypatch.setattr(tune_module, "tune", counting_tune)
+    return sweeps
 
 
 @pytest.mark.full_autotune
-def test_l2norm_retunes_without_recompiling(monkeypatch):
-    """A new row bucket retunes the same two binaries, not a new binary per row count."""
-    trials = stub_l2norm_tuning(monkeypatch)
-    l2norm_bwd_kernel.fn.device_caches.clear()
+def test_l2norm_retunes_without_recompiling(monkeypatch, isolated_winners):
+    """A new row bucket retunes the same binaries, not a new binary per row count."""
+    sweeps = count_tuning_sweeps(monkeypatch)
+    l2norm_bwd_kernel.device_caches.clear()
     counts = []
     for tokens in (65, 193):
         inputs = make_inputs("l2norm", 2, tokens, torch.bfloat16, "compact")
-        output = run_operation("l2norm", inputs)
+        output = run_operation("l2norm", inputs, autotune=True)
         torch.autograd.grad(output, inputs, torch.randn_like(output))
-        counts.append(cache_size(l2norm_bwd_kernel.fn))
-    assert len(trials) == 4
-    assert len(l2norm_bwd_kernel.cache) == 2
-    assert counts == [2, 2], counts
+        counts.append(cache_size(l2norm_bwd_kernel))
+    assert len(sweeps) == 2
+    # One binary per candidate tile and warp count, all built by the first sweep.
+    assert counts[0] > 1
+    assert counts[1] == counts[0], counts
 
 
 @pytest.mark.full_autotune
-def test_l2norm_reuses_tuning_within_row_bucket(monkeypatch):
+def test_l2norm_reuses_tuning_within_row_bucket(monkeypatch, isolated_winners):
     """Row counts within one power of two reuse the first autotuning result."""
-    trials = stub_l2norm_tuning(monkeypatch)
+    sweeps = count_tuning_sweeps(monkeypatch)
     for tokens in (65, 97, 127):
         inputs = make_inputs("l2norm", 2, tokens, torch.bfloat16, "compact")
-        output = run_operation("l2norm", inputs)
+        output = run_operation("l2norm", inputs, autotune=True)
         torch.autograd.grad(output, inputs, torch.randn_like(output))
-    assert len(trials) == 2
-    assert len(l2norm_bwd_kernel.cache) == 1
+    assert len(sweeps) == 1
 
 
 @pytest.mark.parametrize("layout", ["compact", "qkv", "transposed"])
 def test_packed_l2norm_reuses_backend_cache(layout):
-    kernels = (l2norm_fwd_kernel, l2norm_bwd_kernel.fn)
+    kernels = (l2norm_fwd_kernel, l2norm_bwd_kernel)
     for kernel in kernels:
         kernel.device_caches.clear()
     counts = []

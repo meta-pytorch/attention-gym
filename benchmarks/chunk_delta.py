@@ -154,9 +154,8 @@ def operation_forward(
         gate,
         beta,
         cu_seqlens=cu_seqlens,
-        autotune=False,
         impl="fused",
-        kernel_options={"backend": "cudnn"},
+        kernel_options={"backend": "cudnn", "autotune": False},
     )[0]
 
 

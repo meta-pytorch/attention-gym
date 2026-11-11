@@ -11,13 +11,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import (
-    PinnedConfigKernel,
     can_use_tensor_descriptors,
     ptr_offset,
     requires_int64_offsets,
@@ -32,36 +34,9 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work,
     load_ragged_task_count,
 )
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
+from attn_gym.linear.kda.utils import exp2
 
 
-@triton.heuristics(
-    {
-        "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
-        "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            args["q"],
-            args["v"],
-            args["g"],
-            args["h"],
-            args["o"],
-            args["A"],
-            args["cu_seqlens"],
-            args["chunk_offsets"],
-        ),
-    }
-)
-@triton.autotune(
-    configs=[
-        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 32, "BV": 64}, num_warps=2, num_stages=4),
-        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=4),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=4),
-        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
-    ],
-    key=["H", "K", "V", "T", "BT", "FASTMATH"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(
     do_not_specialize=[
         "T",
@@ -500,7 +475,34 @@ def chunk_gla_fwd_kernel_o_ragged_tma_persistent(
         )
 
 
-_PINNED_FWD_O = PinnedConfigKernel(chunk_gla_fwd_kernel_o)
+def _fwd_o_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        *(args[name].dtype for name in ("q", "v", "g", "h", "A")),
+        args["H"],
+        args["K"],
+        args["V"],
+        # The grid scales with the chunk count; tune per power of two of it, not per T.
+        triton.next_power_of_2(triton.cdiv(args["T"], args["BT"])),
+        args["BT"],
+        args["FASTMATH"],
+        args["IS_VARLEN"],
+        args["USE_INT64_OFFSETS"],
+    )
+
+
+# Each launch overwrites o from its inputs, so benchmarking needs no reset.
+_fwd_o = TritonTuner(
+    chunk_gla_fwd_kernel_o,
+    [
+        triton.Config({"BK": 64, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 32, "BV": 64}, num_warps=2, num_stages=4),
+        triton.Config({"BK": 32, "BV": 64}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 32}, num_warps=4, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=2, num_stages=4),
+        triton.Config({"BK": 64, "BV": 64}, num_warps=8, num_stages=4),
+    ],
+    key=_fwd_o_tuning_key,
+)
 
 
 def chunk_gla_fwd_o_gk(
@@ -513,7 +515,7 @@ def chunk_gla_fwd_o_gk(
     *,
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = True,
 ) -> torch.Tensor:
@@ -653,16 +655,17 @@ def chunk_gla_fwd_o_gk(
         def grid(meta):
             return (triton.cdiv(value_dim, meta["BV"]), chunks, batch * heads)
 
-        kernel = chunk_gla_fwd_kernel_o if autotune else _PINNED_FWD_O
-        kernel[grid](
+        cu_seqlens = None if metadata is None else metadata.cu_seqlens
+        chunk_offsets = None if metadata is None else metadata.chunk_offsets
+        _fwd_o[grid](
             q=q,
             v=v,
             g=g,
             h=h,
             o=output,
             A=A,
-            cu_seqlens=None if metadata is None else metadata.cu_seqlens,
-            chunk_offsets=None if metadata is None else metadata.chunk_offsets,
+            cu_seqlens=cu_seqlens,
+            chunk_offsets=chunk_offsets,
             scale=scale,
             T=tokens,
             q_stride_t=q.stride(1),
@@ -672,8 +675,13 @@ def chunk_gla_fwd_o_gk(
             V=value_dim,
             BT=chunk_size,
             num_sequences=(0 if metadata is None else metadata.cu_seqlens.shape[0] - 1),
+            IS_VARLEN=metadata is not None,
+            USE_INT64_OFFSETS=requires_int64_offsets(
+                q, v, g, h, output, A, cu_seqlens, chunk_offsets
+            ),
             FASTMATH=fastmath,
             enable_reflect_ftz=fastmath,
+            autotune=autotune,
         )
     return output
 

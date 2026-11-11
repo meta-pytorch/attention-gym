@@ -99,6 +99,7 @@ nav:
   - Development:
       - developers/index.md
       - CI Health: developers/ci-health.md
+      - Tuned Kernels: developers/tuned-kernels.md
 
 markdown_extensions:
   - pymdownx.highlight:

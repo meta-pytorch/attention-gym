@@ -84,8 +84,9 @@ def run_chunk(
         inputs.beta,
         initial_state,
         output_final_state=output_final_state,
-        autotune=False,  # Fixed heuristics keep kernel selection repeatable.
         impl=impl,
+        # Fixed heuristics keep kernel selection repeatable.
+        kernel_options={"autotune": False},
     )
 
 

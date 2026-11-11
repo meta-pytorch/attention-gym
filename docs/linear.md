@@ -39,7 +39,10 @@ when few sequences leave the GPU idle and every head forgets quickly; heads that
 uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan. Pass
 `kernel_options={"batch_invariant": True}` to `recurrent_gdn` or `recurrent_kda` to make a
 sequence's bits independent of the rest of the batch
-(see [Determinism](determinism.md#kda-determinism)).
+(see [Determinism](determinism.md#kda-determinism)). Kernel-specific controls such as these live in
+`kernel_options`, including `{"autotune": False}`, which launches each tuned kernel's pinned
+configuration (see [Autotuned kernels](determinism.md#autotuned-kernels)); options that change the
+math, such as `fastmath`, are keyword arguments.
 
 ```python
 from attn_gym.linear import chunk_gdn
@@ -181,11 +184,23 @@ Positive `state_indices` must be unique and within the pool; non-positive routes
 touching it. `has_initial_state=False` gives paged prefill a zero history before it overwrites a
 fresh slot.
 
+`causal_conv1d` and `causal_conv1d_decode` never benchmark; `kernel_options` can override their
+default schedules. To tune `causal_conv1d` explicitly, call `tune_causal_conv1d` and pass its
+result as `kernel_options=tuned.kernel_options()`.
+
 ::: attn_gym.linear.causal_conv1d
 
 ::: attn_gym.linear.paged_causal_conv1d
 
 ::: attn_gym.linear.causal_conv1d_decode
+
+::: attn_gym.linear.short_conv.ShortConvKernelOptions
+
+::: attn_gym.linear.short_conv.ShortConvDecodeKernelOptions
+
+::: attn_gym.linear.short_conv.ShortConvConfig
+
+::: attn_gym.linear.short_conv.tune_causal_conv1d
 
 ## Kimi Delta Attention
 
@@ -552,9 +567,7 @@ summaries = prepared.state_summaries(bounds)  # [bias; transition] per range
 # ...exchange summaries and compose each subsequence's entry state...
 output, final_state = prepared.run(initial_state, output_final_state=True)
 
-grads = chunk_kda_prepare_backward(
-    prepared.saved, d_output, initial_state, scale=prepared.scale, schedule=prepared.schedule
-)
+grads = chunk_kda_prepare_backward(prepared.saved, d_output, initial_state, scale=prepared.scale)
 grad_summaries = grads.state_grad_summaries(bounds)  # reverse maps [bias; transition]
 # ...exchange and compose each subsequence's exit cotangent...
 dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)

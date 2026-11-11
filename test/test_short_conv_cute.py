@@ -17,6 +17,8 @@ import attn_gym.linear.short_conv.cute as cute_backend
 from attn_gym.linear.short_conv import activations
 from attn_gym.linear.short_conv.cute import (
     ShortConvConfig,
+    ShortConvDecodeKernelOptions,
+    ShortConvKernelOptions,
     ShortConvTunedConfig,
     _candidate_configs,
     causal_conv1d,
@@ -376,9 +378,7 @@ def test_short_conv_supports_more_than_65535_time_tiles():
         weight,
         activation="silu",
         cu_seqlens=cu_seqlens,
-        forward_config=config,
-        input_grad_config=config,
-        weight_grad_config=config,
+        kernel_options=ShortConvTunedConfig(config, config, config).kernel_options(),
     )
     expected = _reference(x, weight)
 
@@ -387,12 +387,12 @@ def test_short_conv_supports_more_than_65535_time_tiles():
 
 
 @pytest.mark.parametrize(
-    ("width", "batch", "tokens", "activation", "weight_grad_config"),
+    ("width", "batch", "tokens", "activation", "kernel_options"),
     [
         (1, 1, 17, "silu", None),
         (4, 1, 17, "silu", None),
         (5, 1, 17, "silu", None),
-        (4, 3, 19, "silu", ShortConvConfig(128, 4, 8)),
+        (4, 3, 19, "silu", {"weight_grad_config": ShortConvConfig(128, 4, 8)}),
         (4, 1, 17, None, None),
     ],
 )
@@ -401,13 +401,13 @@ def test_short_conv_forward_and_backward_match_pytorch(
     batch: int,
     tokens: int,
     activation: str | None,
-    weight_grad_config: ShortConvConfig | None,
+    kernel_options: ShortConvKernelOptions | None,
 ):
     """Check generic widths, independent batches, partial time tiles, and no activation."""
     torch.manual_seed(0)
     x, weight = _inputs(tokens=tokens, width=width, batch=batch)
     grad_output = torch.randn_like(x)
-    run = functools.partial(causal_conv1d, weight_grad_config=weight_grad_config)
+    run = functools.partial(causal_conv1d, kernel_options=kernel_options)
 
     actual, expected = _assert_conv_matches(run, x, weight, activation)
 
@@ -1280,9 +1280,7 @@ def test_short_conv_explicit_config_and_tuning_flow():
         weight,
         activation="silu",
         initial_state=initial_state,
-        forward_config=selected.forward,
-        input_grad_config=selected.input_gradient,
-        weight_grad_config=selected.weight_gradient,
+        kernel_options=selected.kernel_options(),
     )
     extended = torch.cat((initial_state, x), dim=1)
     expected = F.silu(
@@ -1296,9 +1294,7 @@ def test_short_conv_explicit_config_and_tuning_flow():
             weight,
             activation="silu",
             initial_state=initial_state,
-            forward_config=selected.forward,
-            input_grad_config=selected.input_gradient,
-            weight_grad_config=selected.weight_gradient,
+            kernel_options=selected.kernel_options(),
         ),
         fullgraph=True,
     )
@@ -1725,7 +1721,7 @@ def test_short_conv_public_persistent_tma_input_gradient_matches_static():
             activation="silu",
             cu_seqlens=cu_seqlens,
             initial_state=state,
-            persistent_tma_input_gradient=True,
+            kernel_options={"persistent_tma_input_gradient": True},
         ),
         fullgraph=True,
     )
@@ -1749,7 +1745,7 @@ def test_short_conv_persistent_tma_input_gradient_validates_route():
     """Reject the explicit option when no packed TMA input-gradient route exists."""
     x, weight = _inputs(tokens=32, channels=12)
     with pytest.raises(ValueError, match="require packed cu_seqlens"):
-        causal_conv1d(x, weight, persistent_tma_input_gradient=True)
+        causal_conv1d(x, weight, kernel_options={"persistent_tma_input_gradient": True})
 
     cu_seqlens = torch.tensor([0, 32], device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError, match="require the staged input-gradient"):
@@ -1757,7 +1753,7 @@ def test_short_conv_persistent_tma_input_gradient_validates_route():
             x,
             weight,
             cu_seqlens=cu_seqlens,
-            persistent_tma_input_gradient=True,
+            kernel_options={"persistent_tma_input_gradient": True},
         )
 
     if torch.cuda.get_device_capability() >= (9, 0):
@@ -1768,7 +1764,7 @@ def test_short_conv_persistent_tma_input_gradient_validates_route():
             x,
             weight,
             cu_seqlens=cu_seqlens,
-            persistent_tma_input_gradient=True,
+            kernel_options={"persistent_tma_input_gradient": True},
         )
         with pytest.raises(ValueError, match="16-byte aligned"):
             output.sum().backward()
@@ -2130,14 +2126,14 @@ def test_short_conv_decode_supported_dtypes(dtype: torch.dtype, rtol: float, ato
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize(
-    ("channels", "width", "config", "activation"),
+    ("channels", "width", "options", "activation"),
     [
         (132, 4, None, None),  # Preserve the default four-channel ownership too.
         (133, 4, None, None),
-        (134, 5, ShortConvConfig(64, 2, 8), "silu"),
+        (134, 5, {"forward_config": ShortConvConfig(64, 2, 8)}, "silu"),
     ],
 )
-def test_short_conv_decode_fresh_history(dtype, channels, width, config, activation):
+def test_short_conv_decode_fresh_history(dtype, channels, width, options, activation):
     """Fresh rows must not read finite or NaN history, even beside resumed/null rows."""
     torch.manual_seed(109)
     x = torch.randn(5, channels, device="cuda", dtype=dtype)
@@ -2148,7 +2144,7 @@ def test_short_conv_decode_fresh_history(dtype, channels, width, config, activat
     storage = torch.randn(7, elements + 3, device="cuda", dtype=dtype)
     state = storage[:, :elements].view(7, width - 1, channels)
     storage[:, elements:].fill_(123)
-    kwargs = {"state_indices": slots, "forward_config": config, "activation": activation}
+    kwargs = {"state_indices": slots, "kernel_options": options, "activation": activation}
 
     for poison in (91.0, float("nan")):
         state[0] = poison
@@ -2200,17 +2196,17 @@ def test_short_conv_decode_fresh_implicit_slot_zero(dtype):
     state[0].fill_(float("nan"))
     mask = torch.tensor((False, True), device="cuda")
     history, expected_state = _decode_history_reference(x, state, None, mask)
-    config = ShortConvConfig(32, 1, 1)
-    actual = causal_conv1d_decode(x, weight, state, has_initial_state=mask, forward_config=config)
+    options: ShortConvDecodeKernelOptions = {"forward_config": ShortConvConfig(32, 1, 1)}
+    actual = causal_conv1d_decode(x, weight, state, has_initial_state=mask, kernel_options=options)
     expected = _plain_conv_reference(history.double(), weight.double())[:, -1]
     torch.testing.assert_close(actual.double(), expected, rtol=torch.finfo(dtype).eps, atol=2e-6)
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
     # An all-true mask is exactly the default None behavior, including slot zero.
     default_state = state.clone()
-    expected = causal_conv1d_decode(x, weight, default_state, forward_config=config)
+    expected = causal_conv1d_decode(x, weight, default_state, kernel_options=options)
     mask.fill_(True)
-    actual = causal_conv1d_decode(x, weight, state, has_initial_state=mask, forward_config=config)
+    actual = causal_conv1d_decode(x, weight, state, has_initial_state=mask, kernel_options=options)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(state, default_state, rtol=0, atol=0)
 
@@ -2867,7 +2863,7 @@ def test_short_conv_decode_configured_fullgraph_forward(
     """Keep explicit scalar schedules behind the configured opaque operator."""
     torch.manual_seed(6)
     x, weight, state, slots = paged_short_conv_inputs(channels=6)
-    config = ShortConvConfig(64, 2, 8)
+    options: ShortConvDecodeKernelOptions = {"forward_config": ShortConvConfig(64, 2, 8)}
     mask = torch.tensor((True, False, True), device="cuda") if with_mask else None
     expected_state = state.clone()
     expected = causal_conv1d_decode(
@@ -2876,7 +2872,7 @@ def test_short_conv_decode_configured_fullgraph_forward(
         expected_state,
         state_indices=slots,
         has_initial_state=mask,
-        forward_config=config,
+        kernel_options=options,
     )
     compiled = torch.compile(causal_conv1d_decode, fullgraph=True)
     actual = compiled(
@@ -2885,16 +2881,16 @@ def test_short_conv_decode_configured_fullgraph_forward(
         state,
         state_indices=slots,
         has_initial_state=mask,
-        forward_config=config,
+        kernel_options=options,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("config", [None, ShortConvConfig(64, 2, 8)])
+@pytest.mark.parametrize("options", [None, {"forward_config": ShortConvConfig(64, 2, 8)}])
 @pytest.mark.parametrize("with_mask", [False, True])
 def test_short_conv_decode_dynamic_shapes(
-    paged_short_conv_inputs, fresh_compile_cache, config, with_mask
+    paged_short_conv_inputs, fresh_compile_cache, options, with_mask
 ):
     """Reuse default and configured full graphs across sequence counts without recompilation."""
     compiled = torch.compile(causal_conv1d_decode, fullgraph=True, dynamic=True)
@@ -2913,7 +2909,7 @@ def test_short_conv_decode_dynamic_shapes(
                 expected_state,
                 state_indices=slots,
                 has_initial_state=mask,
-                forward_config=config,
+                kernel_options=options,
             )
             actual = compiled(
                 x,
@@ -2921,7 +2917,7 @@ def test_short_conv_decode_dynamic_shapes(
                 actual_state,
                 state_indices=slots,
                 has_initial_state=mask,
-                forward_config=config,
+                kernel_options=options,
             )
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
@@ -3062,7 +3058,7 @@ def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
             weight,
             state,
             state_indices=slots,
-            forward_config=ShortConvConfig(64, 4, 8),
+            kernel_options={"forward_config": ShortConvConfig(64, 4, 8)},
         )
     for mask in (
         torch.ones(2, device="cuda", dtype=torch.bool),
@@ -3078,8 +3074,49 @@ def test_short_conv_decode_validates_inputs_and_config(paged_short_conv_inputs):
             _configured_decode_op(x, weight, state, slots, 64, 2, 8, has_initial_state=mask)
 
 
-@pytest.mark.parametrize("config", [None, ShortConvConfig(64, 1, 8)])
-def test_short_conv_decode_cuda_graph_replays_fresh_routing(config, tmp_path):
+@pytest.mark.parametrize(
+    ("options", "error", "message"),
+    [
+        ({"autotune": False}, ValueError, "unsupported {op} kernel options: autotune"),
+        ({"forward_config": None}, TypeError, "'forward_config'. must be a ShortConvConfig"),
+        ({"forward_config": (64, 2, 8)}, TypeError, "'forward_config'. must be a ShortConvConfig"),
+    ],
+)
+def test_short_conv_kernel_options_reject_unknown_keys_and_wrong_types(
+    paged_short_conv_inputs, options, error, message
+):
+    x, weight, state, slots = paged_short_conv_inputs(channels=6)
+    with pytest.raises(error, match=message.format(op="causal_conv1d")):
+        causal_conv1d(x[None], weight, kernel_options=options)
+    with pytest.raises(error, match=message.format(op="causal_conv1d_decode")):
+        causal_conv1d_decode(x, weight, state, state_indices=slots, kernel_options=options)
+
+
+def test_short_conv_kernel_options_are_specific_to_each_operation(paged_short_conv_inputs):
+    x, weight, state, _ = paged_short_conv_inputs(channels=6)
+    config = ShortConvConfig(64, 2, 8)
+    with pytest.raises(ValueError, match="causal_conv1d_decode kernel options: input_grad_config"):
+        causal_conv1d_decode(x, weight, state, kernel_options={"input_grad_config": config})
+    with pytest.raises(TypeError, match="'weight_grad_config'. must be a ShortConvConfig"):
+        causal_conv1d(x[None], weight, kernel_options={"weight_grad_config": "default"})
+    with pytest.raises(TypeError, match="'persistent_tma_input_gradient'. must be a bool"):
+        causal_conv1d(x[None], weight, kernel_options={"persistent_tma_input_gradient": 1})
+
+
+@pytest.mark.parametrize(
+    "keyword",
+    ["forward_config", "input_grad_config", "weight_grad_config", "persistent_tma_input_gradient"],
+)
+def test_short_conv_kernel_knobs_are_not_keyword_arguments(paged_short_conv_inputs, keyword):
+    x, weight, state, _ = paged_short_conv_inputs(channels=6)
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        causal_conv1d(x[None], weight, **{keyword: None})
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        causal_conv1d_decode(x, weight, state, **{keyword: None})
+
+
+@pytest.mark.parametrize("options", [None, {"forward_config": ShortConvConfig(64, 1, 8)}])
+def test_short_conv_decode_cuda_graph_replays_fresh_routing(options, tmp_path):
     """Replay changing masks and indices on dirty reused slots with one fused kernel."""
     torch.manual_seed(111)
     channels, width = 133, 4
@@ -3091,7 +3128,7 @@ def test_short_conv_decode_cuda_graph_replays_fresh_routing(config, tmp_path):
     state = storage[:, :elements].view(6, width - 1, channels)
     slots = torch.tensor((2, 1, 0, -1), device="cuda", dtype=torch.int32)
     mask = torch.tensor((False, True, False, True), device="cuda")
-    kwargs = {"state_indices": slots, "forward_config": config, "activation": "silu"}
+    kwargs = {"state_indices": slots, "kernel_options": options, "activation": "silu"}
     causal_conv1d_decode(x, weight, state, has_initial_state=mask, **kwargs)
     torch.cuda.synchronize()
 
@@ -3238,7 +3275,7 @@ def test_short_conv_training_reuses_jit_cache(
             activation="silu",
             cu_seqlens=offsets,
             initial_state=initial,
-            persistent_tma_input_gradient=route == "persistent",
+            kernel_options={"persistent_tma_input_gradient": route == "persistent"},
         )
         inputs = (x, weight, initial) if with_state else (x, weight)
         gradients = torch.autograd.grad(actual, inputs, incoming)
@@ -3375,7 +3412,7 @@ def test_short_conv_training_graph_replays_boundaries(route: str, tokens: int):
             activation="silu",
             cu_seqlens=offsets,
             initial_state=initial,
-            persistent_tma_input_gradient=route == "persistent",
+            kernel_options={"persistent_tma_input_gradient": route == "persistent"},
         )
         return output, torch.autograd.grad(output, (x, weight, initial), incoming)
 

@@ -89,6 +89,8 @@ def diagonal(inputs, metadata, *, fixed: bool):
         USE_GATHER=IS_GATHER_SUPPORTED,
         GRID_NT=1,
         MAX_NT=capacity,
+        num_warps=1,
+        num_stages=3,
     )
     return aq, ak
 
@@ -158,7 +160,7 @@ def check_backward(inputs, outputs, lengths):
 @pytest.mark.parametrize("stage", ["diagonal", "backward"])
 def test_intra_backend_cache_reuse(stage, fixed, packed):
     """T and N vary independently, including equal capacity and multiple grid waves."""
-    jit = chunk_kda_fwd_kernel_intra_sub_chunk_forloop.fn.fn
+    jit = chunk_kda_fwd_kernel_intra_sub_chunk_forloop.fn
     cache = jit.device_caches[torch.cuda.current_device()][0]
     cache.clear()
     _compile_chunk_kda_bwd_intra.cache_clear()
@@ -183,7 +185,10 @@ def test_intra_backend_cache_reuse(stage, fixed, packed):
             assert len(cache) == 1, "diagonal compiled again for runtime T/N/capacity/grid"
         else:
             outputs = chunk_kda_bwd_intra(
-                *inputs, metadata, config=ChunkKdaBwdIntraConfig(1) if fixed else None
+                *inputs,
+                metadata,
+                config=ChunkKdaBwdIntraConfig(1) if fixed else None,
+                autotune=False,
             )
             check_backward(inputs, outputs, lengths or [tokens])
             info = _compile_chunk_kda_bwd_intra.cache_info()
@@ -215,7 +220,7 @@ def test_intra_graph_replay_changed_metadata(dtype, poison):
     def operation():
         metadata = prepare_ragged_chunk_metadata(cu, 193, 64)
         return diagonal(inputs, metadata, fixed=True), chunk_kda_bwd_intra(
-            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1)
+            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1), autotune=False
         )
 
     for _ in range(3):

@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 from triton.language.extra import libdevice
-from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.utils import _document_ids, ptr_offset, requires_int64_offsets
@@ -139,20 +138,6 @@ def shared_forward_tiles(query: torch.Tensor, rope_dim: int) -> tuple[int, int]:
 def optional_strides(tensor: torch.Tensor | None) -> tuple[int, ...] | None:
     """Strides of an optional kernel operand; None compiles out its constexpr-guarded uses."""
     return None if tensor is None else tensor.stride()
-
-
-def tuning_key(tensor: str, *names: str):
-    """Key a ``TritonTuner`` by the dtype of argument ``tensor`` and the arguments ``names``.
-
-    Unlike ``triton.autotune``'s implicit dtype key, this also sees through TMA descriptors.
-    """
-
-    def key(args):
-        value = args[tensor]
-        dtype = (value.base if isinstance(value, TensorDescriptor) else value).dtype
-        return (dtype, *(args[name] for name in names))
-
-    return key
 
 
 def prune_wide_backward_configs(configs, args):

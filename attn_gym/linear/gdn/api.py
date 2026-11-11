@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_kernel_options,
     resolve_decode_out,
-    resolve_recurrent_kernel_options,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
@@ -19,9 +20,16 @@ from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
-from attn_gym.linear.gdn.validation import resolve_kernel_options, validate_gdn_inputs
-from attn_gym.linear.types import Impl, RecurrentKernelOptions, resolve_impl
+from attn_gym.linear.gdn.validation import validate_gdn_inputs
+from attn_gym.linear.types import (
+    RECURRENT_OPTION_SPEC,
+    SPLIT_OPTION_SPEC,
+    Impl,
+    RecurrentKernelOptions,
+    resolve_impl,
+)
 from attn_gym.linear.types import SplitOptions as KernelOptions
+from attn_gym.types import validate_kernel_options
 
 
 def chunk_gdn(
@@ -68,19 +76,22 @@ def chunk_gdn(
             default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
-            for calls without ``initial_state`` or ``output_final_state``.
+            for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
+            (default ``True``) benchmarks candidate configurations of the repo-local fused
+            kernels; winners are cached and reused. When ``False``, and always under
+            ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
+            fixed configurations, so bits repeat across processes and winner-cache states on
+            one GPU model and software stack. The cuDNN backend always uses its fixed schedule.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    options = resolve_kernel_options(kernel_options)
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
+    options = resolve_chunk_kernel_options(kernel_options, SPLIT_OPTION_SPEC, op_name="chunk_gdn")
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if options.backend == "cudnn":
+        if options["backend"] == "cudnn":
             return cudnn_chunk_forward(
                 q,
                 k,
@@ -91,8 +102,8 @@ def chunk_gdn(
                 cu_seqlens=cu_seqlens,
                 scale=scale,
                 output_final_state=output_final_state,
-                split_backward=options.split_backward,
-                split_forward=options.split_forward,
+                split_backward=options["split_backward"],
+                split_forward=options["split_forward"],
             )
         return fused_chunk_forward(
             q,
@@ -104,6 +115,7 @@ def chunk_gdn(
             cu_seqlens=cu_seqlens,
             scale=scale,
             output_final_state=output_final_state,
+            autotune=should_autotune(options["autotune"]),
         )
 
     return reference_delta_rule(
@@ -161,13 +173,19 @@ def paged_chunk_gdn(
         kernel_options: Backend options. The repo-local path is the default;
             ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
             requires 16-byte-aligned pool bases and slot origins. Split schedules are not
-            supported.
+            supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
+            of the repo-local factor and output kernels. When ``False``, and always under
+            ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
+            The recurrence that advances ``state_cache`` and the cuDNN backend always use
+            fixed configurations.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
-    options = resolve_kernel_options(kernel_options)
-    if options.split_backward or options.split_forward:
+    options = resolve_chunk_kernel_options(
+        kernel_options, SPLIT_OPTION_SPEC, op_name="paged_chunk_gdn"
+    )
+    if options["split_backward"] or options["split_forward"]:
         raise ValueError("split schedules are not supported by paged_chunk_gdn")
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     validate_paged_state(
@@ -178,10 +196,21 @@ def paged_chunk_gdn(
         state_indices,
         has_initial_state,
     )
-    paged_chunk_forward = (
-        cudnn_paged_chunk_forward if options.backend == "cudnn" else fused_paged_chunk_forward
-    )
-    return paged_chunk_forward(
+    scale = resolve_scale(scale, q.shape[-1])
+    if options["backend"] == "cudnn":
+        return cudnn_paged_chunk_forward(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+            scale=scale,
+        )
+    return fused_paged_chunk_forward(
         q,
         k,
         v,
@@ -191,7 +220,8 @@ def paged_chunk_gdn(
         state_indices,
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
-        scale=resolve_scale(scale, q.shape[-1]),
+        scale=scale,
+        autotune=should_autotune(options["autotune"]),
     )
 
 
@@ -208,7 +238,6 @@ def recurrent_gdn(
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
     impl: Impl | str = Impl.FUSED,
     kernel_options: RecurrentKernelOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -243,24 +272,24 @@ def recurrent_gdn(
         has_initial_state: Optional contiguous boolean mask indicating whether each selected slot
             should be loaded. False entries mark freshly assigned slots whose contents are
             garbage: they start from zero and overwrite the slot, even for empty sequences.
-        autotune: Benchmark candidate value-tile sizes for non-paged execution when true. When
-            false, and always for paged execution (which mutates the state cache), a heuristic
-            picks the config, so results are reproducible across processes and autotune cache
-            states. That config still follows the batch shape; see ``kernel_options`` for batch
-            invariance.
         impl: ``"fused"`` uses the inference-only Triton scan; ``"reference"`` uses eager
             PyTorch with autograd support.
         kernel_options: Fused-scan options, see
-            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``{"batch_invariant": True}``
-            makes a sequence's bits independent of the rest of the batch.
+            :class:`attn_gym.linear.types.RecurrentKernelOptions`. ``"autotune"`` (default
+            ``True``) benchmarks candidate value-tile sizes for non-paged execution. When
+            ``False``, and always for paged execution (which mutates the state cache), a
+            heuristic picks the config, so results are reproducible across processes and
+            autotune cache states. That config still follows the batch shape:
+            ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
+            the batch.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
     """
     selected_impl = resolve_impl(impl)
-    batch_invariant = resolve_recurrent_kernel_options(kernel_options, op_name="recurrent_gdn")
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
+    options = validate_kernel_options(
+        kernel_options, RECURRENT_OPTION_SPEC, op_name="recurrent_gdn"
+    )
     validate_gdn_inputs(
         q,
         k,
@@ -295,8 +324,8 @@ def recurrent_gdn(
             output_final_state=output_final_state,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
-            autotune=autotune,
-            batch_invariant=batch_invariant,
+            autotune=should_autotune(options["autotune"]),
+            batch_invariant=options["batch_invariant"],
         )
 
     return reference_delta_rule(

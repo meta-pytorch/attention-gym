@@ -31,16 +31,15 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 import triton
 import triton.language as tl
 from torch._subclasses.fake_tensor import FakeTensor
 
-from attn_gym._backends.triton.utils import (
-    PinnedConfigKernel,
-    ptr_offset,
-    requires_int64_offsets,
-)
+from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
@@ -51,51 +50,18 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work,
     load_ragged_task_count,
 )
-from attn_gym.linear.kda.utils import autotune_cache_kwargs, exp2
+from attn_gym.linear.kda.utils import exp2
 
 # Compile-time dot-precision selector shared with the launch wrapper.
 _PRECISION_MODES = {"bf16": 0, "tf32": 1, "tf32x3": 2}
 
 
-_AUTOTUNE_CONFIGS = [
+_CONFIGS = [
     triton.Config({}, num_warps=8, num_stages=2),
     triton.Config({}, num_warps=4, num_stages=2),
     triton.Config({}, num_warps=4, num_stages=3),
     triton.Config({}, num_warps=8, num_stages=3),
 ]
-_AUTOTUNE_KEY = [
-    "H",
-    "HV",
-    "K",
-    "V",
-    "BT",
-    "BK",
-    "BV",
-    "IS_RAGGED",
-    "HAS_GK",
-    "STORE_QG",
-    "PRECISION",
-    "FASTMATH",
-]
-_HEURISTICS = {
-    "STORE_QG": lambda args: args["q"] is not None,
-    "HAS_GK": lambda args: args["gk"] is not None,
-    "IS_RAGGED": lambda args: args["chunk_offsets"] is not None,
-    "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-        args["q"],
-        args["k"],
-        args["qg"],
-        args["kg"],
-        args["v"],
-        args["beta"],
-        args["w"],
-        args["u"],
-        args["A"],
-        args["gk"],
-        args["cu_seqlens"],
-        args["chunk_offsets"],
-    ),
-}
 
 
 @triton.jit
@@ -250,8 +216,6 @@ def _recompute_w_u_task(
         )
 
 
-@triton.heuristics(_HEURISTICS)
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=_AUTOTUNE_KEY, **autotune_cache_kwargs)
 @triton.jit(
     do_not_specialize=[
         "T",
@@ -336,8 +300,6 @@ def recompute_w_u_fwd_kernel(
     )
 
 
-@triton.heuristics(_HEURISTICS)
-@triton.autotune(configs=_AUTOTUNE_CONFIGS, key=_AUTOTUNE_KEY, **autotune_cache_kwargs)
 @triton.jit(
     do_not_specialize=[
         "T",
@@ -424,8 +386,33 @@ def recompute_w_u_fwd_kernel_persistent(
         )
 
 
-_PINNED_W_U = PinnedConfigKernel(recompute_w_u_fwd_kernel)
-_PINNED_W_U_PERSISTENT = PinnedConfigKernel(recompute_w_u_fwd_kernel_persistent)
+_TUNING_ARGS = (
+    "H",
+    "HV",
+    "K",
+    "V",
+    "BT",
+    "BK",
+    "BV",
+    "PRECISION",
+    "FASTMATH",
+    "IS_RAGGED",
+    "HAS_GK",
+    "STORE_QG",
+    "USE_INT64_OFFSETS",
+)
+
+
+def _tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        *(args[name].dtype for name in ("k", "beta", "A")),
+        *(args[name] for name in _TUNING_ARGS),
+    )
+
+
+# Each launch overwrites w, u, qg and kg from the inputs, so benchmarking needs no reset.
+_w_u = TritonTuner(recompute_w_u_fwd_kernel, _CONFIGS, key=_tuning_key)
+_w_u_persistent = TritonTuner(recompute_w_u_fwd_kernel_persistent, _CONFIGS, key=_tuning_key)
 
 
 def recompute_w_u_fwd_triton(
@@ -439,7 +426,7 @@ def recompute_w_u_fwd_triton(
     *,
     chunk_size: int = 64,
     dot_precision: str = "bf16",
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
@@ -520,7 +507,7 @@ def recompute_w_u_fwd_triton(
     if isinstance(k, FakeTensor):
         return w, u, qg, kg
     chunks = metadata.capacity if metadata is not None else tokens // chunk_size
-    kernel_kwargs = {
+    tensors = {
         "q": q if has_q else None,
         "k": k,
         "qg": qg,
@@ -533,6 +520,9 @@ def recompute_w_u_fwd_triton(
         "gk": gk,
         "cu_seqlens": None if metadata is None else metadata.cu_seqlens,
         "chunk_offsets": None if metadata is None else metadata.chunk_offsets,
+    }
+    kernel_kwargs = {
+        **tensors,
         "T": tokens,
         "q_stride_t": q.stride(1) if has_q else 0,
         "k_stride_t": k.stride(1),
@@ -546,14 +536,17 @@ def recompute_w_u_fwd_triton(
         "BV": 64,
         "PRECISION": _PRECISION_MODES[dot_precision],
         "num_sequences": 0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
+        "STORE_QG": has_q,
+        "HAS_GK": has_gk,
+        "IS_RAGGED": metadata is not None,
+        "USE_INT64_OFFSETS": requires_int64_offsets(*tensors.values()),
         "FASTMATH": fastmath,
         "enable_reflect_ftz": fastmath,
     }
-    kernel = recompute_w_u_fwd_kernel if autotune else _PINNED_W_U
     if chunks == 0:
         return w, u, qg, kg
     if metadata is None:
-        kernel[(chunks, value_heads)](**kernel_kwargs)
+        _w_u[(chunks, value_heads)](**kernel_kwargs, autotune=autotune)
         return w, u, qg, kg
     resolved = GridScheduler(metadata).resolve_flat(
         schedule,
@@ -562,12 +555,11 @@ def recompute_w_u_fwd_triton(
         auto_persistent=False,  # heavy kernel; see GridScheduler.resolve_flat
     )
     if resolved.kind is ScheduleKind.PERSISTENT:
-        persistent_kernel = (
-            recompute_w_u_fwd_kernel_persistent if autotune else _PINNED_W_U_PERSISTENT
+        _w_u_persistent[(resolved.workers,)](
+            num_workers=resolved.workers, **kernel_kwargs, autotune=autotune
         )
-        persistent_kernel[(resolved.workers,)](num_workers=resolved.workers, **kernel_kwargs)
     else:
-        kernel[(chunks, value_heads)](**kernel_kwargs)
+        _w_u[(chunks, value_heads)](**kernel_kwargs, autotune=autotune)
     return w, u, qg, kg
 
 

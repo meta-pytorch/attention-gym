@@ -23,24 +23,14 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import ptr_offset
-from attn_gym.linear.kda.utils import autotune_cache_kwargs
-
-_BT_LIST = [8, 16, 32, 64, 128]
 
 
-@triton.autotune(
-    # The first config is the pinned autotune=False schedule: BT=8 with two warps.
-    configs=[triton.Config({"BT": bt}, num_warps=w) for w in [2, 1, 4, 8, 16] for bt in _BT_LIST],
-    # ROW_BUCKET selects a tuned schedule per power-of-two row count, not a binary per shape.
-    key=["D", "ROW_BUCKET"],
-    **autotune_cache_kwargs,
-)
 @triton.jit(
     do_not_specialize=[
         "N_ROWS",
         "TOKENS",
-        "ROW_BUCKET",
         "NUM_SEQUENCES",
         "X_STRIDES",
         "DY_STRIDES",
@@ -61,7 +51,6 @@ def l2norm_bwd_kernel(
     HEADS: tl.constexpr,
     D: tl.constexpr,
     BD: tl.constexpr,
-    ROW_BUCKET,
     NUM_SEQUENCES,
     IS_VARLEN: tl.constexpr,
     BT: tl.constexpr,
@@ -109,3 +98,22 @@ def l2norm_bwd_kernel(
         b_dx.to(dx.dtype.element_ty),
         mask=mask,
     )
+
+
+# Each launch overwrites dx from x, rstd and dy, so benchmarking needs no reset.
+L2NORM_BWD = TritonTuner(
+    l2norm_bwd_kernel,
+    # The first config is the pinned autotune=False schedule: BT=8 with two warps.
+    [
+        triton.Config({"BT": bt}, num_warps=num_warps)
+        for num_warps in (2, 1, 4, 8, 16)
+        for bt in (8, 16, 32, 64, 128)
+    ],
+    # Tune per power of two of the row count, not per shape.
+    key=lambda args: (
+        args["x"].dtype,
+        args["D"],
+        triton.next_power_of_2(args["N_ROWS"]),
+        args["IS_VARLEN"],
+    ),
+)

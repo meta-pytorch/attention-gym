@@ -6,6 +6,7 @@ import importlib
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
@@ -15,7 +16,7 @@ from attn_gym.linear._lazy import register_lazy_cuda_impls
 
 _CHUNK_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
-    "Tensor? initial_state, float scale)"
+    "Tensor? initial_state, float scale, bool autotune)"
 )
 torch.library.define("attn_gym::gdn_chunk_fwd", _CHUNK_ARGS + " -> (Tensor, Tensor)")
 torch.library.define(
@@ -25,7 +26,7 @@ torch.library.define(
 _CHUNK_BWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor inverse, "
     "Tensor d_output, Tensor? d_final_state, Tensor? initial_state, Tensor? cu_seqlens, "
-    "Tensor? chunk_offsets, float scale)"
+    "Tensor? chunk_offsets, float scale, bool autotune)"
 )
 torch.library.define(
     "attn_gym::gdn_chunk_bwd",
@@ -37,7 +38,8 @@ torch.library.define(
 )
 _CHUNK_PACKED_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
-    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale)"
+    "Tensor? initial_state, Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, "
+    "float scale, bool autotune)"
 )
 torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed",
@@ -51,7 +53,8 @@ torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale) -> Tensor",
+    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune) "
+    "-> Tensor",
 )
 _RECURRENT_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state, "
@@ -127,8 +130,9 @@ def _chunk_fwd_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    del k, cumulative_gate, beta, initial_state, scale
+    del k, cumulative_gate, beta, initial_state, scale, autotune
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
     # The chunk fakes mirror the kernels' fresh contiguous outputs, not the input strides.
     return v.new_empty(v.shape), inverse
@@ -143,8 +147,11 @@ def _chunk_fwd_with_state_fake(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    output, inverse = _chunk_fwd_fake(q, k, v, cumulative_gate, beta, initial_state, scale)
+    output, inverse = _chunk_fwd_fake(
+        q, k, v, cumulative_gate, beta, initial_state, scale, autotune
+    )
     final_state = q.new_empty(
         q.shape[0], v.shape[2], v.shape[-1], q.shape[-1], dtype=torch.float32
     )
@@ -163,8 +170,10 @@ def _chunk_fwd_packed_fake(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del k, cumulative_gate, beta, initial_state, cu_seqlens, chunk_offsets, capacity, scale
+    del autotune
     inverse = q.new_empty(q.shape[0], q.shape[1], v.shape[2], 64)
     return v.new_empty(v.shape), inverse
 
@@ -181,6 +190,7 @@ def _chunk_fwd_packed_with_state_fake(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     output, inverse = _chunk_fwd_packed_fake(
         q,
@@ -193,6 +203,7 @@ def _chunk_fwd_packed_with_state_fake(
         chunk_offsets,
         capacity,
         scale,
+        autotune,
     )
     final_state = q.new_empty(
         cu_seqlens.shape[0] - 1,
@@ -218,6 +229,7 @@ def _chunk_fwd_packed_paged_fake(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
+    autotune: bool,
 ) -> torch.Tensor:
     return torch.empty(v.shape, dtype=q.dtype, device=v.device)
 
@@ -236,8 +248,10 @@ def _chunk_bwd_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     del inverse, d_output, d_final_state, initial_state, cu_seqlens, chunk_offsets, scale
+    del autotune
     return tuple(tensor.new_empty(tensor.shape) for tensor in (q, k, v, cumulative_gate, beta))
 
 
@@ -255,6 +269,7 @@ def _chunk_bwd_with_state_grad_fake(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     outputs = _chunk_bwd_fake(
         q,
@@ -269,6 +284,7 @@ def _chunk_bwd_with_state_grad_fake(
         cu_seqlens,
         chunk_offsets,
         scale,
+        autotune,
     )
     state_batch = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     d_initial_state = q.new_empty(
@@ -380,13 +396,14 @@ class _ChunkGDN(torch.autograd.Function):
         chunk_offsets,
         capacity,
         scale,
+        autotune,
         output_final_state,
     ):
         cumulative_gate = _plain_gate_scan_op(
             gate.unsqueeze(-1), cu_seqlens, chunk_offsets, False
         ).squeeze(-1)
         if cu_seqlens is None:
-            args = (q, k, v, cumulative_gate, beta, initial_state, scale)
+            args = (q, k, v, cumulative_gate, beta, initial_state, scale, autotune)
             if output_final_state:
                 output, final_state, inverse = chunk_fwd_with_state_op(*args)
             else:
@@ -403,6 +420,7 @@ class _ChunkGDN(torch.autograd.Function):
                 chunk_offsets,
                 capacity,
                 scale,
+                autotune,
             )
             if output_final_state:
                 output, final_state, inverse = chunk_fwd_packed_with_state_op(*args)
@@ -420,6 +438,7 @@ class _ChunkGDN(torch.autograd.Function):
             chunk_offsets,
         )
         ctx.scale = scale
+        ctx.autotune = autotune
         ctx.set_materialize_grads(False)
         if output_final_state:
             return output, final_state
@@ -454,13 +473,15 @@ class _ChunkGDN(torch.autograd.Function):
             cu_seqlens,
             chunk_offsets,
             ctx.scale,
+            # The mode can change between an eager forward and its backward.
+            should_autotune(ctx.autotune),
         )
         if initial_state is not None:
             dq, dk, dv, d_gate, db, d_initial_state = chunk_bwd_with_state_grad_op(*args)
         else:
             dq, dk, dv, d_gate, db = chunk_bwd_op(*args)
             d_initial_state = None
-        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None
+        return dq, dk, dv, d_gate, db, d_initial_state, None, None, None, None, None, None
 
 
 def _validate_fused_chunk_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
@@ -488,6 +509,7 @@ def chunk_forward(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     output_final_state: bool,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Route dense inputs and invoke the fused scalar chunk forward operator."""
     _validate_fused_chunk_qkv(q, k, v)
@@ -522,6 +544,7 @@ def chunk_forward(
         chunk_offsets,
         capacity,
         scale,
+        autotune,
         output_final_state,
     )
     if output_final_state:
@@ -542,6 +565,7 @@ def paged_chunk_forward(
     cu_seqlens: torch.Tensor | None,
     has_initial_state: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> torch.Tensor:
     """Normalize inputs and advance selected state-cache slots with chunk GDN."""
     _validate_fused_chunk_qkv(q, k, v)
@@ -573,6 +597,7 @@ def paged_chunk_forward(
         metadata.chunk_offsets,
         metadata.capacity,
         scale,
+        autotune,
     )
     return output.reshape(output_shape)
 

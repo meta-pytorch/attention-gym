@@ -34,8 +34,8 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float16, Float32, Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
-from attn_gym._backends.cute import run_tunable
 from attn_gym._backends.cute.utils import cute_dtype, get_device_properties, requires_int64_abi
+from attn_gym._backends.tune import run_tunable
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
@@ -3083,7 +3083,7 @@ def chunk_kda_bwd_wy_dqkg(
     chunk_size: int = 64,
     fastmath: bool = False,
     config: ChunkKdaBwdWyDqkgConfig | None = None,
-    autotune: bool = False,
+    autotune: bool,
     configs: Iterable[ChunkKdaBwdWyDqkgConfig] | None = None,
 ) -> tuple[
     torch.Tensor,

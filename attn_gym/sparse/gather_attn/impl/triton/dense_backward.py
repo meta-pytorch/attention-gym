@@ -10,7 +10,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import _document_ids, ptr_offset
 
 from .primitives import (
@@ -18,7 +18,6 @@ from .primitives import (
     load_document_bounds,
     offset_strides,
     selection_bits,
-    tuning_key,
 )
 
 

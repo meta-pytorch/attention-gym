@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from attn_gym._backends import tune as tune_module
 from attn_gym._backends.cute import normalize_tma_rows
 from attn_gym.linear import (
     active_token_mask,
@@ -380,7 +381,7 @@ def test_chunk_state_continues_in_recurrent_decode(head_dim: int):
             beta[:, 64:],
             prefill_state,
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
             impl="fused",
         )
 
@@ -451,6 +452,7 @@ def test_paged_chunk_raw_operator_registration(state_dtype: torch.dtype):
             metadata.chunk_offsets,
             metadata.capacity,
             128**-0.5,
+            True,
         ),
     )
 
@@ -848,7 +850,7 @@ def test_misaligned_contiguous_inputs_and_cotangent():
         args[5],
         None,
         None,
-        args[6],
+        *args[6:],
     )
     outputs = chunk_bwd_with_state_grad_op(*backward_args)
     assert all(torch.isfinite(result).all() for result in outputs)
@@ -1001,7 +1003,7 @@ def test_raw_ops_reject_non_fp32_gate_beta_and_state(argument: int):
     """The fakes advertise FP32 state and gate/beta gradients, so the kernels must not see BF16."""
     q, k, v, gate, beta, state = make_inputs()
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
-    args = [q, k, v, cumulative, beta, state, q.shape[-1] ** -0.5]
+    args = [q, k, v, cumulative, beta, state, q.shape[-1] ** -0.5, True]
     args[argument] = args[argument].bfloat16()
     with pytest.raises(TypeError, match="requires float32"):
         chunk_fwd_with_state_op(*args)
@@ -1013,7 +1015,7 @@ def raw_args(head_dim: int = 128, token_innermost: bool = False):
     if token_innermost:
         q, k, v, beta = (token_innermost_like(tensor) for tensor in (q, k, v, beta))
     cumulative = _plain_gate_scan_op(gate.unsqueeze(-1), None, None, False).squeeze(-1)
-    args = (q, k, v, cumulative, beta, state, head_dim**-0.5)
+    args = (q, k, v, cumulative, beta, state, head_dim**-0.5, True)
     with torch.no_grad():
         output, final_state, inverse = chunk_fwd_with_state_op(*args)
     return args, output, final_state, inverse
@@ -1039,7 +1041,7 @@ def test_dense_raw_operator_registration(head_dim: int, token_innermost: bool):
         args[5],
         None,
         None,
-        args[6],
+        *args[6:],
     )
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(chunk_bwd_op, backward_args, test_utils=utilities)
@@ -1075,6 +1077,7 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
         metadata.chunk_offsets,
         metadata.capacity,
         head_dim**-0.5,
+        True,
     )
     torch.library.opcheck(chunk_fwd_packed_op, args)
     torch.library.opcheck(chunk_fwd_packed_with_state_op, args)
@@ -1089,6 +1092,7 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
         cu_seqlens,
         metadata.chunk_offsets,
         head_dim**-0.5,
+        True,
     )
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(chunk_bwd_op, backward_args, test_utils=utilities)
@@ -1234,59 +1238,48 @@ def test_backward_cuda_graph_replay(head_dim: int, portable: bool, monkeypatch):
 
 def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, triton_compiles):
     """New token and sequence counts launch the Triton backward compiled for an earlier shape."""
-    from triton.runtime.jit import JITFunction
-
-    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_wy as wy_module
-
     force_portable_backward(monkeypatch)
-    # Autotuning may compile every candidate config once; nothing else may compile.
-    config_counts: dict[str, int] = {}
-    for kernel in (
-        wy_module.chunk_gdn_bwd_dqkwg_kernel,
-        wy_module.chunk_gdn_bwd_wy_kernel,
-        wy_module.chunk_gdn_bwd_gate_cumsum_kernel,
-    ):
-        configs = 1
-        while not isinstance(kernel, JITFunction):
-            configs = len(kernel.configs)
-            kernel = kernel.fn
-        config_counts[kernel.fn.__name__] = configs
+    kernels = (
+        "chunk_gdn_bwd_dqkwg_kernel",
+        "chunk_gdn_bwd_wy_kernel",
+        "chunk_gdn_bwd_gate_cumsum_kernel",
+    )
+    # The first shape may compile every candidate config while tuning; nothing compiles after.
+    first_shape: dict[str, int] = {}
     # Sequence and token counts cover Triton's integer classes: one, a multiple of 16, other.
     for lengths in ((70, 58), (64,), (1,), (37, 43, 65), (9,) * 16, (16,) * 16):
         *inputs, cu_seqlens = make_gdn_test_inputs(
             lengths, key_heads=1, value_heads=2, key_dim=64, requires_grad=True
         )
         run_with_gradients(tuple(inputs), "fused", cu_seqlens)
-    torch.cuda.synchronize()
-    compiled = {name: triton_compiles[name] for name in config_counts}
-    assert all(1 <= compiled[name] <= config_counts[name] for name in compiled), compiled
+        torch.cuda.synchronize()
+        first_shape = first_shape or {name: triton_compiles[name] for name in kernels}
+    assert all(first_shape.values()), first_shape
+    assert {name: triton_compiles[name] for name in kernels} == first_shape
 
 
-def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch):
-    """New token counts reuse the autotuning result of an earlier packed shape."""
-    from triton.runtime.autotuner import Autotuner
-
-    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_delta_h as delta_h_module
-    from attn_gym.linear.gdn.bwd.triton import chunk_gdn_bwd_wy as wy_module
-
+def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch, isolated_winners):
+    """New token counts and a sequence count in the same bucket reuse an earlier tuning."""
     force_portable_backward(monkeypatch)
-    tuners = []
-    for kernel in (
-        delta_h_module.chunk_gdn_bwd_delta_h_kernel,
-        wy_module.chunk_gdn_bwd_dqkwg_kernel,
-    ):
-        while not isinstance(kernel, Autotuner):
-            kernel = kernel.fn
-        tuners.append(kernel)
-        monkeypatch.setattr(kernel, "cache", {})
-    # The same sequence count with new token counts, aligned and unaligned to 16.
-    for lengths in ((37, 43, 65), (64, 64, 64), (100, 20, 57)):
+    tune = tune_module.tune
+    tunes_per_shape: list[int] = []
+
+    def count_tune(*args, **kwargs):
+        tunes_per_shape[-1] += 1
+        return tune(*args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", count_tune)
+    # New token counts, aligned and unaligned to 16, then four sequences instead of three.
+    for lengths in ((37, 43, 65), (64, 64, 64), (100, 20, 57), (30, 40, 50, 60)):
         *inputs, cu_seqlens = make_gdn_test_inputs(
             lengths, key_heads=1, value_heads=2, key_dim=64, requires_grad=True
         )
+        tunes_per_shape.append(0)
         run_with_gradients(tuple(inputs), "fused", cu_seqlens)
     torch.cuda.synchronize()
-    assert [len(tuner.cache) for tuner in tuners] == [1, 1]
+    # The portable backward alone tunes four kernels.
+    assert tunes_per_shape[0] >= 4
+    assert tunes_per_shape[1:] == [0, 0, 0]
 
 
 def test_packed_cuda_graph_replays_boundaries():

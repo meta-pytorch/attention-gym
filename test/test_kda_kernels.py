@@ -14,6 +14,7 @@ import torch
 triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
+from attn_gym._backends import tune as tune_module
 from attn_gym._backends.triton.utils import can_use_tma
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
@@ -110,39 +111,13 @@ def _case_id(value):
     return None
 
 
-def _autotuner(kernel):
-    """Return the Triton Autotuner below optional heuristic wrappers."""
-    while not hasattr(kernel, "configs"):
-        kernel = kernel.fn
-    return kernel
-
-
-def _representative_config(kernel, *, num_warps, num_stages=None, **kwargs):
-    """Select one explicit production config for a correctness test."""
-    autotuner = _autotuner(kernel)
-    matches = [
-        config
-        for config in autotuner.configs
-        if config.num_warps == num_warps
-        and (num_stages is None or config.num_stages == num_stages)
-        and all(config.kwargs.get(name) == value for name, value in kwargs.items())
-    ]
-    assert len(matches) == 1
-    return autotuner, matches[0]
-
-
 @pytest.fixture(scope="module", autouse=True)
-def use_one_autotune_config_for_correctness_tests():
-    """Avoid benchmarking configs whose outputs these tests never inspect."""
-    selections = (_representative_config(l2norm_bwd_kernel, BT=16, num_warps=4),)
+def tf32_matmul():
     # cuBLAS settings are not plain attributes, so monkeypatch cannot restore them.
     matmul_precision = torch.backends.cuda.matmul.fp32_precision
     torch.backends.cuda.matmul.fp32_precision = "tf32"
     try:
-        with pytest.MonkeyPatch.context() as monkeypatch:
-            for autotuner, config in selections:
-                monkeypatch.setattr(autotuner, "configs", [config])
-            yield
+        yield
     finally:
         torch.backends.cuda.matmul.fp32_precision = matmul_precision
 
@@ -375,24 +350,25 @@ def test_l2norm_op_registration():
 
     _, rstd = _l2norm_fwd_op(x, 1e-6)
     d_output = torch.randn_like(x)
-    torch.library.opcheck(_l2norm_bwd_op, (x, rstd, d_output))
+    torch.library.opcheck(_l2norm_bwd_op, (x, rstd, d_output), {"autotune": True})
     _, ragged_rstd = _l2norm_fwd_op(x, 1e-6, cu_seqlens)
-    torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens))
-    torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens, False))
+    torch.library.opcheck(
+        _l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens), {"autotune": True}
+    )
+    torch.library.opcheck(
+        _l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens), {"autotune": False}
+    )
 
 
-def test_l2norm_pinned_backward_skips_autotuning(monkeypatch):
-    """autotune=False launches the first config without consulting the autotuner."""
+def test_l2norm_pinned_backward_skips_autotuning(request):
+    """``"autotune": False`` launches the pinned config without benchmarking."""
     torch.manual_seed(4)
     x = torch.randn(1, 33, 3, 128, device=DEV, dtype=torch.bfloat16, requires_grad=True)
     d_output = torch.randn_like(x)
     expected = torch.autograd.grad(l2norm(x), x, d_output)[0]
 
-    def autotuner_run(*args, **kwargs):
-        raise AssertionError("autotune=False reached the autotuner")
-
-    monkeypatch.setattr(l2norm_bwd_kernel, "run", autotuner_run)
-    actual = torch.autograd.grad(l2norm(x, autotune=False), x, d_output)[0]
+    request.getfixturevalue("no_benchmarking")
+    actual = torch.autograd.grad(l2norm(x, kernel_options={"autotune": False}), x, d_output)[0]
     torch.testing.assert_close(actual, expected)
 
 
@@ -596,9 +572,8 @@ def test_l2norm_bwd(dtype, T, D, strided):
     BD = triton.next_power_of_2(D)
 
     dx = _empty_strided_like(x) if strided else torch.empty_like(x)
-    grid = lambda meta: (triton.cdiv(T, meta["BT"]),)
     # Present physical [T, D] storage to the kernel as logical [1, T, 1, D].
-    l2norm_bwd_kernel[grid](
+    l2norm_bwd_kernel[(triton.cdiv(T, 16),)](
         x,
         rstd,
         dy,
@@ -613,9 +588,10 @@ def test_l2norm_bwd(dtype, T, D, strided):
         HEADS=1,
         D=D,
         BD=BD,
-        ROW_BUCKET=triton.next_power_of_2(T),
         NUM_SEQUENCES=0,
         IS_VARLEN=False,
+        BT=16,
+        num_warps=4,
     )
     assert_golden(dx, golden, ref, dtype, f"l2norm_bwd_kernel T={T} D={D}")
 
@@ -683,8 +659,7 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
     ref = _fwd_o_ref(q, g, h, A, v, scale)
 
     o = torch.empty(B, T, H, V, device="cuda", dtype=dtype)
-    grid = lambda meta: (triton.cdiv(V, meta["BV"]), num_chunks, B * H)
-    chunk_gla_fwd_kernel_o[grid](
+    chunk_gla_fwd_kernel_o[(triton.cdiv(V, 64), num_chunks, B * H)](
         q=q,
         v=v,
         g=g,
@@ -702,6 +677,12 @@ def test_chunk_gla_fwd_o(dtype, T, H, K, V):
         V=V,
         BT=64,
         num_sequences=0,
+        BK=64,
+        BV=64,
+        IS_VARLEN=False,
+        USE_INT64_OFFSETS=False,
+        num_warps=4,
+        num_stages=4,
     )
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o T={T} H={H} K={K} V={V}")
 
@@ -736,7 +717,7 @@ def test_chunk_gla_fwd_o_gk_tma(dtype, T):
     ref = _fwd_o_ref(q, g, h.reshape(B * num_chunks, H, K, V), A, v, scale)
 
     assert can_use_tma(v), "expected TMA-eligible tensors so the launcher takes its TMA path"
-    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale)
+    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale, autotune=True)
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o_gk_tma T={T}")
 
 
@@ -953,6 +934,8 @@ def test_chunk_kda_fwd_intra(dtype, T, H, K, causal_normref):
         CAUSAL_NORMREF=causal_normref,
         GRID_NT=num_chunks,
         MAX_NT=num_chunks,
+        num_warps=1,
+        num_stages=3,
     )
     tag = f"T={T} H={H} K={K} causal_normref={causal_normref}"
     assert_golden(Aqk, gAqk, rAqk, dtype, f"fwd_intra Aqk {tag}")
@@ -1007,14 +990,7 @@ def test_recompute_w_u_fwd_triton():
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
 
     w, u, qg, kg = recompute_w_u_fwd_triton(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        metadata=None,
-        q=q,
-        gk=gk,
-        chunk_size=64,
+        k=k, v=v, beta=beta, A=A, metadata=None, q=q, gk=gk, chunk_size=64, autotune=True
     )
 
     gW, gU, gQG, gKG = _recompute_wu_ref(
@@ -1026,6 +1002,39 @@ def test_recompute_w_u_fwd_triton():
     assert_golden(u, gU, rU, torch.bfloat16, f"recompute_w_u u {tag}")
     assert_golden(qg, gQG, rQG, torch.bfloat16, f"recompute_w_u qg {tag}")
     assert_golden(kg, gKG, rKG, torch.bfloat16, f"recompute_w_u kg {tag}")
+
+
+def test_output_and_recompute_reuse_tuning_across_token_counts(isolated_winners, monkeypatch):
+    """Token counts tune the output kernel once per power of two of the chunk count and the
+    W/U recompute once."""
+    tune = tune_module.tune
+    sweeps = []
+
+    def counting_tune(*args, **kwargs):
+        sweeps.append(None)
+        return tune(*args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", counting_tune)
+    H, K = 2, 64  # K=V=64 takes the tuned pointer output kernel on every architecture.
+    sweeps_per_shape = []
+    # Chunk counts 5, 6, and 8 share a bucket; 9 starts the next.
+    for T in (320, 384, 512, 576):
+        chunks = T // 64
+        q = torch.randn(1, T, H, K, device=DEV, dtype=torch.bfloat16)
+        g = -torch.rand(1, T, H, K, device=DEV)
+        A = torch.randn(1, T, H, 64, device=DEV, dtype=torch.bfloat16)
+        h = torch.randn(1, chunks, H, K, K, device=DEV, dtype=torch.bfloat16)
+        chunk_gla_fwd_o_gk(q, torch.randn_like(q), g, A, h, K**-0.5, autotune=True)
+        sweeps_per_shape.append(len(sweeps))
+    assert sweeps_per_shape == [1, 1, 1, 2]
+
+    sweeps.clear()
+    for T in (64, 320, 1024):
+        k = torch.randn(1, T, H, 128, device=DEV, dtype=torch.bfloat16)
+        beta = torch.rand(1, T, H, device=DEV)
+        A = torch.randn(1, T, H, 64, device=DEV)
+        recompute_w_u_fwd_triton(k, torch.randn_like(k), beta, A, autotune=True)
+    assert len(sweeps) == 1
 
 
 def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
@@ -1213,14 +1222,7 @@ def test_chunk_kda_fwd_intra_cute():
     beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
 
     w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra_cute(
-        q,
-        k,
-        v,
-        gk,
-        beta,
-        scale,
-        None,
-        chunk_size=64,
+        q, k, v, gk, beta, scale, None, chunk_size=64, autotune=True
     )
 
     gAqk, gAkk = _inter_solve_ref(q.double(), k.double(), gk.double(), beta.double(), scale)
@@ -1313,6 +1315,7 @@ def test_chunk_kda_bwd_intra_cute():
         zb.clone(),
         zq.clone(),
         None,
+        autotune=False,
     )
 
     gdq, gdk, gdb, gdg = _bwd_intra_ref(
@@ -1362,20 +1365,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
     A = _perchunk_unit_lower(cu, chunk_indices, T, HV)
 
     dq, dk, dv2, dg, db, dA = chunk_kda_bwd_wy_dqkg_fused_cute(
-        q,
-        k,
-        v,
-        v_new,
-        g,
-        beta,
-        A,
-        h,
-        do,
-        dh,
-        dv,
-        None,
-        scale=scale,
-        chunk_size=64,
+        q, k, v, v_new, g, beta, A, h, do, dh, dv, None, scale=scale, chunk_size=64, autotune=False
     )
 
     ref_args = (v_new, g, beta, A, h, do, dh, dv)

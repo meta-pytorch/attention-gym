@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple, overload
+from typing import Literal, NamedTuple, overload
 
 import torch
 from torch import Tensor
 
 from attn_gym._cu_seqlens import validate_cu_seqlens_pair
-from attn_gym.types import AuxRequest, Impl, resolve_impl
+from attn_gym.types import (
+    TUNING_OPTION_SPEC,
+    AuxRequest,
+    Impl,
+    KernelOptionSpec,
+    TuningOptions,
+    resolve_impl,
+    validate_kernel_options,
+)
 
 from .impl import gather_attn as fused_gather_attn
 from .impl.routing import require_grouped_schedule, uses_grouped_schedule
@@ -21,6 +29,31 @@ class RopePair(NamedTuple):
 
 
 AttentionInput = Tensor | tuple[Tensor, Tensor]
+
+
+class GatherAttnKernelOptions(TuningOptions, total=False):
+    """Fused ``gather_attn`` backend options, validated and then ignored by ``Impl.REFERENCE``.
+
+    ``autotune`` applies to the Triton kernels, whose candidates differ in floating-point
+    order. CuTe has one schedule and ignores it.
+    """
+
+    backend: Literal["cute", "triton"]
+    """Override the backend; omit it to prefer eligible CuTe calls, otherwise Triton.
+    Deterministic mode selects Triton automatically. Explicit requests are honored; execution
+    failures are never retried on another backend."""
+
+    bwd_recompute_p: bool
+    """Defaults to ``True``: CuTe backward recomputes attention probabilities. ``False`` saves
+    them in forward instead (BF16, tokens x heads x keys, with backend padding). Triton always
+    recomputes and ignores this option."""
+
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    **TUNING_OPTION_SPEC,
+    "backend": (("cute", "triton"), None),
+    "bwd_recompute_p": (bool, True),
+}
 
 
 def _split_input(value: AttentionInput, name: str) -> tuple[Tensor, Tensor | None]:
@@ -185,16 +218,6 @@ def _validate_inputs(
     validate_cu_seqlens_pair(cu_seqlens, cu_seqlens_k, batch=batch, device=query.device)
 
 
-def _validate_kernel_options(kernel_options: dict[str, str | bool] | None) -> None:
-    options = kernel_options or {}
-    if (
-        options.keys() - {"backend", "bwd_recompute_p"}
-        or options.get("backend", "cute") not in ("cute", "triton")
-        or type(options.get("bwd_recompute_p", False)) is not bool
-    ):
-        raise ValueError(f"unsupported gather_attn kernel options: {kernel_options}")
-
-
 def _select_backend(
     query: Tensor,
     attention_sink: Tensor | None,
@@ -230,7 +253,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str | bool] | None = None,
+    kernel_options: GatherAttnKernelOptions | None = None,
     scale: float | None = None,
     return_aux: None = ...,
     local_v: Tensor | None = None,
@@ -250,7 +273,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = ...,
     cu_seqlens_k: Tensor | None = ...,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str | bool] | None = None,
+    kernel_options: GatherAttnKernelOptions | None = None,
     scale: float | None = None,
     return_aux: AuxRequest,
     local_v: Tensor | None = None,
@@ -269,7 +292,7 @@ def gather_attn(
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str | bool] | None = None,
+    kernel_options: GatherAttnKernelOptions | None = None,
     scale: float | None = None,
     return_aux: AuxRequest | None = None,
     local_v: Tensor | None = None,
@@ -362,16 +385,20 @@ def gather_attn(
         impl: Impl.FUSED (default, or "fused") uses optimized CUDA kernels;
             Impl.REFERENCE (or "reference") uses eager PyTorch on CPU or CUDA.
 
-        kernel_options: Fused backend options. "backend": "cute" or "triton"
-            overrides the backend; omit it to prefer eligible CuTe calls, otherwise
-            Triton. "bwd_recompute_p" (default True): CuTe backward recomputes
-            attention probabilities; False saves them in forward instead (BF16,
-            tokens x heads x keys, with backend padding). Triton always recomputes
-            and ignores this option. Deterministic mode selects Triton automatically,
-            but nonempty paired RoPE has no strict deterministic backward there.
+        kernel_options: Fused backend options, see :class:`GatherAttnKernelOptions`.
+            "backend": "cute" or "triton" overrides the backend; omit it to prefer
+            eligible CuTe calls, otherwise Triton. "bwd_recompute_p" (default True):
+            CuTe backward recomputes attention probabilities; False saves them in forward
+            instead (BF16, tokens x heads x keys, with backend padding). Triton always
+            recomputes and ignores this option. Deterministic mode selects Triton
+            automatically, but nonempty paired RoPE has no strict deterministic backward
+            there. "autotune" (default True): Triton kernels benchmark candidate
+            configurations on first use and reuse the cached winner. Candidates differ in
+            floating-point order; False, or deterministic mode, launches each kernel's
+            pinned configuration instead. CuTe has one schedule and ignores this option.
             Explicit backend requests are honored; execution failures are never
-            retried on another backend. Nonempty options are invalid with
-            Impl.REFERENCE. Bare and zero-width paired shared-KV Triton backward, and
+            retried on another backend. Impl.REFERENCE validates the options
+            and ignores them. Bare and zero-width paired shared-KV Triton backward, and
             the grouped schedule's sparse dK/dV for sparse selections over small heads,
             accumulate with nondeterministic atomics unless deterministic algorithms
             are enabled.
@@ -420,9 +447,7 @@ def gather_attn(
         contributions to all inputs are zero. Inactive packed tails remain undefined.
     """
     selected_impl = resolve_impl(impl)
-    if selected_impl is Impl.REFERENCE and kernel_options:
-        raise ValueError("kernel_options are not supported with impl='reference'")
-    _validate_kernel_options(kernel_options)
+    options = validate_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name="gather_attn")
 
     query_latent, query_rope = _split_input(query, "query")
     paired = query_rope is not None
@@ -476,7 +501,6 @@ def gather_attn(
         raise ValueError("scale must be greater than 0.")
     scale = query_latent.shape[-1] ** -0.5 if scale is None else scale
 
-    options = kernel_options or {}
     if selected_impl is Impl.REFERENCE:
         from .impl import reference
 
@@ -509,7 +533,7 @@ def gather_attn(
             raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
         if paired and query_rope.shape[-1] > 0 and not share_kv:
             raise ValueError("Fused paired attention requires a single shared KV head.")
-        backend = options.get("backend")
+        backend = options["backend"]
         grouped = uses_grouped_schedule(query_latent.shape[1], kv_heads, sparse_v is not None)
         if grouped and backend == "cute":
             raise ValueError(
@@ -550,7 +574,8 @@ def gather_attn(
             sparse_rope=sparse_rope,
             local_rope=local_rope,
             backend=backend,
-            bwd_recompute_p=options.get("bwd_recompute_p", True),
+            bwd_recompute_p=options["bwd_recompute_p"],
+            autotune=options["autotune"],
             local_v=local_v,
             sparse_v=sparse_v,
         )

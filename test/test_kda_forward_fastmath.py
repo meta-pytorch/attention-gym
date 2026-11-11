@@ -62,7 +62,9 @@ def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
     golden = gate[0, 16, 0, 0].double().exp().expand(128).to(q.dtype)
     for fastmath in (False, True, None):
         options = {} if fastmath is None else {"fastmath": fastmath}
-        output, _ = operation(q, k, v, gate, beta, scale=1.0, autotune=False, **options)
+        output, _ = operation(
+            q, k, v, gate, beta, scale=1.0, kernel_options={"autotune": False}, **options
+        )
         torch.testing.assert_close(output[0, 16, 0], golden, rtol=0, atol=0)
         dv, dbeta = torch.autograd.grad(output[0, 16, 0, 0], (v, beta))
         torch.testing.assert_close(dv[0, 15, 0, 0], golden[0], rtol=0, atol=0)
@@ -83,7 +85,7 @@ def test_default_fastmath_gate_gradient_at_gate_bound(gate_value):
     generator = torch.Generator(device="cuda").manual_seed(4)
     d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
     leaves = [value.detach().clone().requires_grad_() for value in inputs]
-    output, _ = chunk_kda(*leaves, autotune=False)
+    output, _ = chunk_kda(*leaves, kernel_options={"autotune": False})
     (d_gate,) = torch.autograd.grad(output, leaves[3], d_output)
     reference = [value.detach().double().requires_grad_() for value in inputs]
     expected, _ = kda_reference(*reference, output_final_state=False)
@@ -102,7 +104,7 @@ def test_backward_factor_recomputation_preserves_fastmath(packed):
     offsets = cumulative_sequence_offsets([65, 63]) if packed else None
     state = torch.randn(2 if packed else 1, 1, 128, 128, device="cuda") / 32
     prepared = stages.chunk_kda_prepare(
-        *inputs, cu_seqlens=offsets, fastmath=False, autotune=False
+        *inputs, cu_seqlens=offsets, fastmath=False, kernel_options={"autotune": False}
     )
     d_output = torch.randn_like(inputs[2])
     d_state = torch.randn_like(state)
@@ -113,9 +115,8 @@ def test_backward_factor_recomputation_preserves_fastmath(packed):
             d_output,
             state,
             scale=prepared.scale,
-            schedule=prepared.schedule,
             fastmath=False,
-            autotune=False,
+            kernel_options={"autotune": False},
         )
         return handle.run(d_state)
 

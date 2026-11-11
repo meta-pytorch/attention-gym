@@ -36,6 +36,7 @@ from typing import NamedTuple
 
 import torch
 
+from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata, ScheduleRequest
@@ -149,6 +150,7 @@ class ChunkKDAPrepared:
     factors: ChunkKDAFactors
     metadata: RaggedChunkMetadata | None
     scale: float
+    # The request; ``run`` applies ``should_autotune`` again because the mode can change.
     autotune: bool
     schedule: ScheduleRequest
     fastmath: bool = True
@@ -187,7 +189,7 @@ class ChunkKDAPrepared:
             self.metadata,
             scale=self.scale,
             output_final_state=output_final_state,
-            autotune=self.autotune,
+            autotune=should_autotune(self.autotune),
             schedule=self.schedule,
             fastmath=self.fastmath,
         )
@@ -205,9 +207,6 @@ class ChunkKDACudnnPrepared:
     saved: ChunkKDACudnnSaved
     metadata: RaggedChunkMetadata
     scale: float
-    autotune: bool
-    # cuDNN rejects other schedules; kept so both handles feed chunk_kda_prepare_backward alike.
-    schedule: ScheduleRequest = ScheduleRequest.AUTO
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -259,7 +258,6 @@ def chunk_kda_prepare(
     *,
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
-    autotune: bool = True,
     fastmath: bool = True,
     kernel_options: KernelOptions | None = None,
 ) -> ChunkKDAPrepared | ChunkKDACudnnPrepared:
@@ -272,9 +270,12 @@ def chunk_kda_prepare(
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
     Pass the same value to ``chunk_kda_prepare_backward``. Native cuDNN requires ``True``.
     ``kernel_options={"backend": "cudnn"}`` runs the local pass and both summaries with cuDNN's
-    kernels. Split schedules are not available with entry states.
+    kernels. Split schedules are not available with entry states. ``"autotune"`` follows
+    ``chunk_kda``.
     """
-    backend, split_backward, split_forward, schedule = resolve_kernel_options(kernel_options)
+    backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
+        kernel_options, op_name="chunk_kda_prepare"
+    )
     if backend == "cudnn":
         validate_cudnn_fastmath(fastmath)
     if split_backward or split_forward:
@@ -303,7 +304,7 @@ def chunk_kda_prepare(
         gate = normalize_compact_tensor(gate)
         validate_cudnn_constraints(q, k, v, gate, beta, None, cu_seqlens)
         saved = ChunkKDACudnnSaved(q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets)
-        return ChunkKDACudnnPrepared(saved, metadata, scale, autotune)
+        return ChunkKDACudnnPrepared(saved, metadata, scale)
     factors = _prepare_chunk_kda_fwd(
         q,
         k,
@@ -312,7 +313,7 @@ def chunk_kda_prepare(
         beta,
         metadata,
         scale=scale,
-        autotune=autotune,
+        autotune=should_autotune(autotune),
         schedule=schedule,
         fastmath=fastmath,
     )
@@ -335,7 +336,7 @@ class ChunkKDABackward:
     metadata: RaggedChunkMetadata | None
     prepared: ChunkKDABwdPrepared
     scale: float
-    autotune: bool
+    autotune: bool  # The request, as in ``ChunkKDAPrepared``.
     fastmath: bool
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
@@ -391,7 +392,7 @@ class ChunkKDABackward:
             scale=self.scale,
             chunk_size=CHUNK_SIZE,
             fastmath=self.fastmath,
-            autotune=self.autotune,
+            autotune=should_autotune(self.autotune),
         )
         dgate = _plain_gate_scan_op(d_cumulative, saved.cu_seqlens, saved.chunk_offsets, True)
         return dq, dk, dv, dgate, dbeta, d_initial_state
@@ -411,8 +412,6 @@ class ChunkKDACudnnBackward:
     d_output: torch.Tensor
     initial_state: torch.Tensor | None
     scale: float
-    autotune: bool
-    schedule: ScheduleRequest
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
@@ -472,30 +471,28 @@ def chunk_kda_prepare_backward(
     initial_state: torch.Tensor | None,
     *,
     scale: float,
-    autotune: bool = True,
     fastmath: bool = True,
-    schedule: ScheduleRequest = ScheduleRequest.AUTO,
+    kernel_options: KernelOptions | None = None,
 ) -> ChunkKDABackward | ChunkKDACudnnBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the
     forward handle's resolved ``prepared.scale``; there is no default because a silently
     re-derived scale would corrupt every gradient. Both live outside ``saved`` because the
-    caller's autograd function owns them. Use the forward's ``fastmath`` and
-    ``prepared.schedule`` for matching factors and launch geometry. A cuDNN tape
-    (:class:`ChunkKDACudnnSaved`) returns :class:`ChunkKDACudnnBackward` and requires
-    ``fastmath=True``.
+    caller's autograd function owns them. Pass the forward's ``fastmath`` and
+    ``kernel_options`` for matching factors, launch geometry (``"schedule"``), and tuning
+    (``"autotune"``). The tape selects the backend: a cuDNN tape (:class:`ChunkKDACudnnSaved`)
+    returns :class:`ChunkKDACudnnBackward` and requires ``fastmath=True``.
     """
     if d_output is None:
         d_output = torch.zeros_like(saved.v)
     else:
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
+    options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare_backward")
     if isinstance(saved, ChunkKDACudnnSaved):
         validate_cudnn_fastmath(fastmath)
-        return ChunkKDACudnnBackward(
-            saved, d_output, _normalize_cudnn_state(initial_state), scale, autotune, schedule
-        )
+        return ChunkKDACudnnBackward(saved, d_output, _normalize_cudnn_state(initial_state), scale)
     metadata = None
     if saved.cu_seqlens is not None:
         assert saved.chunk_offsets is not None
@@ -516,12 +513,12 @@ def chunk_kda_prepare_backward(
         metadata,
         scale=scale,
         chunk_size=CHUNK_SIZE,
-        autotune=autotune,
-        schedule=schedule,
+        autotune=should_autotune(options.autotune),
+        schedule=options.schedule,
         fastmath=fastmath,
     )
     return ChunkKDABackward(
-        saved, d_output, initial_state, metadata, prepared, scale, autotune, fastmath
+        saved, d_output, initial_state, metadata, prepared, scale, options.autotune, fastmath
     )
 
 

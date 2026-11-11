@@ -83,7 +83,7 @@ def _assert_training_matches_reference(
         cu_seqlens=cu_seqlens,
         output_final_state=True,
         fastmath=fastmath,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     reference_output, reference_state = chunk_kda(
         *reference_inputs,
@@ -218,7 +218,7 @@ def test_hopper_final_state_only_gradient(dtype: torch.dtype):
         *actual_inputs,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     _, reference_state = chunk_kda(
         *reference_inputs,
@@ -259,7 +259,7 @@ def test_hopper_fullgraph_forward_backward(dtype: torch.dtype):
             *args,
             cu_seqlens=cu_seqlens,
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
         )
 
     expected_output, expected_state = operation(*eager_inputs)
@@ -338,13 +338,13 @@ def test_hopper_outer_strided_cotangents():
         *actual_inputs,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     expected_output, expected_state = chunk_kda(
         *expected_inputs,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     assert actual_state is not None and expected_state is not None
 
@@ -379,7 +379,7 @@ def test_hopper_cuda_graph_replays_packed_boundaries_and_backward():
         *inputs,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     assert warm_state is not None
     torch.autograd.grad(warm_output.float().sum() + warm_state.sum(), inputs)
@@ -392,7 +392,7 @@ def test_hopper_cuda_graph_replays_packed_boundaries_and_backward():
                 *inputs,
                 cu_seqlens=cu_seqlens,
                 output_final_state=True,
-                autotune=False,
+                kernel_options={"autotune": False},
             )
             assert state is not None
             gradients = torch.autograd.grad(output.float().sum() + state.sum(), inputs)
@@ -407,7 +407,7 @@ def test_hopper_cuda_graph_replays_packed_boundaries_and_backward():
         *expected_inputs,
         cu_seqlens=cu_seqlens,
         output_final_state=True,
-        autotune=False,
+        kernel_options={"autotune": False},
     )
     assert expected_state is not None
     expected_gradients = torch.autograd.grad(
@@ -438,7 +438,7 @@ def test_hopper_int64_specializations_match_default(monkeypatch):
         output, _ = chunk_kda(
             *inputs,
             cu_seqlens=cu_seqlens,
-            autotune=False,
+            kernel_options={"autotune": False},
         )
         gradients = torch.autograd.grad(output.float().square().sum(), inputs)
         return output, *gradients
@@ -486,9 +486,11 @@ def test_paged_chunk_kda_uses_pre_blackwell_route():
             *inputs,
             expected_cache[state_indices.long()].clone(),
             output_final_state=True,
-            autotune=False,
+            kernel_options={"autotune": False},
         )
-        output = paged_chunk_kda(*inputs, state_cache, state_indices, autotune=False)
+        output = paged_chunk_kda(
+            *inputs, state_cache, state_indices, kernel_options={"autotune": False}
+        )
     assert expected_state is not None
     expected_cache[state_indices.long()] = expected_state
     torch.testing.assert_close(output, expected_output, rtol=0, atol=0)

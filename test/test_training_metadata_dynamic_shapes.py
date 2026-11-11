@@ -255,7 +255,7 @@ def test_public_training_persistent_recompute_gradients(
     inputs = _training_inputs(256, 64, scalar_gate)
     boundaries = cumulative_sequence_offsets([4] * 64)
     op = chunk_gdn if scalar_gate else chunk_kda
-    options = {} if scalar_gate else {"autotune": False}
+    options = {} if scalar_gate else {"kernel_options": {"autotune": False}}
     selected_workers = []
     original = chunk_delta_h._persistent_sequence_workers
 

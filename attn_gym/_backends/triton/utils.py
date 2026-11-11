@@ -1,6 +1,5 @@
 """Small utilities shared by hand-written Triton kernels."""
 
-import inspect
 import math
 from collections.abc import Sequence
 
@@ -13,9 +12,6 @@ from triton.language.extra import libdevice
 # Wrapped as a constexpr so ``@triton.jit`` functions can reference it as a module global.
 LOG2_E = tl.constexpr(math.log2(math.e))
 LN_2 = tl.constexpr(math.log(2.0))
-
-SUPPORTS_AUTOTUNE_CACHE = "cache_results" in inspect.signature(triton.autotune).parameters
-autotune_cache_kwargs = {"cache_results": True} if SUPPORTS_AUTOTUNE_CACHE else {}
 
 
 def configure_triton_allocator() -> None:
@@ -175,34 +171,3 @@ def can_use_tma(tensor: torch.Tensor) -> bool:
 def can_use_tensor_descriptors(*tensors: torch.Tensor) -> bool:
     """Return whether every tensor satisfies the host TMA requirements."""
     return all(can_use_tma(tensor) for tensor in tensors)
-
-
-class PinnedConfigKernel:
-    """An autotuned kernel pinned to its first config, the list's heuristic default.
-
-    Bypasses timing-based selection entirely so launches are reproducible
-    across processes, machines, and cache states. Heuristic constexprs
-    (``@triton.heuristics``) still apply.
-    """
-
-    def __init__(self, kernel):
-        from triton.runtime.autotuner import Autotuner, Heuristics
-
-        heuristic_values = None
-        if isinstance(kernel, Heuristics):
-            heuristic_values = kernel.values
-            kernel = kernel.fn
-        if not isinstance(kernel, Autotuner):
-            raise TypeError(f"expected an autotuned kernel, got {type(kernel).__name__}")
-        self._config_kwargs = kernel.configs[0].all_kwargs()
-        self._kernel = (
-            triton.heuristics(heuristic_values)(kernel.fn) if heuristic_values else kernel.fn
-        )
-
-    def __getitem__(self, grid):
-        launch = self._kernel[grid]
-
-        def pinned_launch(*args, **kwargs):
-            return launch(*args, **kwargs, **self._config_kwargs)
-
-        return pinned_launch

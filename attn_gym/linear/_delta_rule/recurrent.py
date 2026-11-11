@@ -23,14 +23,15 @@ registers per (sequence, head, value tile). Forward-only; training uses the chun
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.tune import TritonTuner
 from attn_gym._backends.triton.utils import (
     LOG2_E,
-    autotune_cache_kwargs,
     configure_triton_allocator,
     fixed_tree_sum,
     ptr_offset,
@@ -44,6 +45,23 @@ configure_triton_allocator()
 # (GB200, H=16, K=V=128) and differed only among shorter scans.
 _TOKENS_BUCKET_LIMIT = 64
 
+# Register cap of pinned one-warp launches; see `_pinned_launch_options`.
+_ONE_WARP_MAXNREG = 128
+
+_RECURRENT_TUNING_ARGS = (
+    "N",
+    "H",
+    "HK",
+    "K",
+    "V",
+    "USE_INITIAL_STATE",
+    "STORE_FINAL_STATE",
+    "IS_VARLEN",
+    "SCALAR_GATE",
+    "PREFETCH",
+    "BATCH_INVARIANT",
+)
+
 
 class GateKind(Enum):
     """Gate layout consumed by the scan."""
@@ -52,10 +70,58 @@ class GateKind(Enum):
     VECTOR = "vector"  # one natural-log decay per key channel, shaped [B, T, H, K]
 
 
-def _prune_recurrent_configs(configs, _named_args, V, **_):
-    """Drop value tiles wider than the padded value dimension."""
-    max_block_v = max(8, triton.next_power_of_2(V))
-    return [config for config in configs if config.kwargs["BV"] <= max_block_v]
+def _prune_recurrent_configs(
+    configs: list[triton.Config], args: dict[str, Any]
+) -> list[triton.Config]:
+    """List the pinned configuration, then the uncapped tiles that suit the value dimension.
+
+    ``_recurrent_tuning_key`` must determine the result. Its token bucket preserves
+    ``average_tokens > 1``, the only scan-length test in ``_pinned_launch_options``.
+    """
+    pinned_options = _pinned_launch_options(
+        _average_tokens(args["T"], args["N"], args["IS_VARLEN"]),
+        args["N"] * args["H"],
+        args["K"],
+        args["V"],
+        args["IS_VARLEN"],
+    )
+    pinned = next(
+        config
+        for config in configs
+        if (config.kwargs["BV"], config.num_warps, config.maxnreg) == pinned_options
+    )
+    # BV=1 serves only V=1, where the pinned tile has no padding.
+    min_block_v = min(2, args["V"])
+    max_block_v = max(8, triton.next_power_of_2(args["V"]))
+    tuned = (
+        config
+        for config in configs
+        if config.maxnreg is None and min_block_v <= config.kwargs["BV"] <= max_block_v
+    )
+    return [pinned, *(config for config in tuned if config is not pinned)]
+
+
+def _average_tokens(tokens: int, num_sequences: int, is_varlen: bool) -> int:
+    """Tokens per sequence: ``tokens`` is the packed total when ``is_varlen``."""
+    return triton.cdiv(tokens, num_sequences) if is_varlen else tokens
+
+
+def _recurrent_tuning_key(args: dict[str, Any]) -> tuple[Any, ...]:
+    """Key winners by grid fill, bucketed scan length, specialization, and operand dtypes.
+
+    The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
+    ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; the bucket collapses the exact token
+    count to that information so new lengths do not re-benchmark. ``N`` stays exact because
+    sharing winners across a sequence-count bucket regressed measured latency; see
+    ``docs/developers/tuned-kernels.md``.
+    """
+    operands = ("q", "k", "v", "gate", "beta", "h0", "cu_seqlens")
+    average_tokens = _average_tokens(args["T"], args["N"], args["IS_VARLEN"])
+    return (
+        min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT),
+        *(args[name] for name in _RECURRENT_TUNING_ARGS),
+        *(None if args[name] is None else args[name].dtype for name in operands),
+    )
 
 
 @triton.jit
@@ -98,7 +164,7 @@ def _load_token(
     return b_q, b_k, b_g, b_beta, b_v
 
 
-@triton.jit(do_not_specialize=["T", "N", "tokens_bucket"])
+@triton.jit(do_not_specialize=["T", "N"])
 def _recurrent_delta_rule_fwd_kernel(
     q,
     k,
@@ -114,7 +180,6 @@ def _recurrent_delta_rule_fwd_kernel(
     scale,
     T,
     N,
-    tokens_bucket,
     state_batch_stride: tl.constexpr,
     H: tl.constexpr,
     HK: tl.constexpr,
@@ -234,32 +299,59 @@ def _recurrent_delta_rule_fwd_kernel(
         tl.store(ht + p_state, b_state, mask=m_kv)
 
 
-recurrent_delta_rule_fwd_kernel = triton.autotune(
-    configs=[
-        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3)
-        for block_v in (32, 16, 8, 4, 2)
+# Unpaged launches write a fresh output and final state, so benchmarking candidates back to back
+# needs no reset; paged launches advance the pool in place and are always pinned.
+# Only a one-warp pinned configuration caps registers; the other retained candidates are
+# uncapped: capping every one-warp tile slowed a tuned KDA prefill 1.05x (GB200, B=8 T=512 H=16
+# K=V=128).
+_recurrent_scan = TritonTuner(
+    _recurrent_delta_rule_fwd_kernel,
+    [
+        triton.Config({"BV": block_v}, num_warps=num_warps, num_stages=3, maxnreg=maxnreg)
+        for block_v in (32, 16, 8, 4, 2, 1)
         for num_warps in (1, 2, 4)
+        for maxnreg in ((None, _ONE_WARP_MAXNREG) if num_warps == 1 else (None,))
     ],
-    # The best tile follows the grid fill (``N * H`` programs) and, for scans shorter than
-    # ``_TOKENS_BUCKET_LIMIT`` tokens, the scan length; ``tokens_bucket`` collapses the exact
-    # token count to that information so new lengths do not re-benchmark.
-    key=[
-        "tokens_bucket",
-        "N",
-        "H",
-        "HK",
-        "K",
-        "V",
-        "USE_INITIAL_STATE",
-        "STORE_FINAL_STATE",
-        "IS_VARLEN",
-        "SCALAR_GATE",
-        "PREFETCH",
-        "BATCH_INVARIANT",
-    ],
-    prune_configs_by={"early_config_prune": _prune_recurrent_configs},
-    **autotune_cache_kwargs,
-)(_recurrent_delta_rule_fwd_kernel)
+    key=_recurrent_tuning_key,
+    prune=_prune_recurrent_configs,
+)
+
+
+def _pinned_launch_options(
+    average_tokens: int, sequence_heads: int, key_dim: int, value_dim: int, is_varlen: bool
+) -> tuple[int, int, int | None]:
+    """Pick ``(BV, num_warps, maxnreg)`` of a pinned launch from the host-visible shape."""
+    # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
+    # Multi-token scans use one warp so per-token reductions stay in registers. Each program
+    # carries its tile through the whole sequence, so the grid should fit one wave: tiny
+    # grids split V finely, and BV=16 under the 128-register cap fits 256 sequence-heads at
+    # K=128. Skewed varlen lengths are bound by the longest sequence, so varlen keeps BV=4.
+    if average_tokens > 1 and key_dim >= 128:
+        num_warps = 1
+        if sequence_heads <= 16:
+            block_v_limit = 2
+        elif is_varlen or sequence_heads <= 64:
+            block_v_limit = 4
+        else:
+            # BV * K <= 2048 fits the 128-register cap.
+            block_v_limit = 16 if key_dim <= 128 else 8
+    elif average_tokens > 1:
+        # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
+        if sequence_heads >= 2048:
+            block_v_limit, num_warps = 32, 2
+        else:
+            block_v_limit, num_warps = (4 if sequence_heads <= 256 else 8), 1
+    elif value_dim >= 128:
+        block_v_limit = 4 if key_dim > 128 or sequence_heads > 512 else 8
+        num_warps = 1
+    elif sequence_heads <= 8:
+        block_v_limit, num_warps = 8, 4
+    elif sequence_heads < 1024:
+        block_v_limit, num_warps = 16, 2
+    else:
+        block_v_limit, num_warps = 32, 2
+    block_v = min(triton.next_power_of_2(value_dim), block_v_limit)
+    return block_v, num_warps, _ONE_WARP_MAXNREG if num_warps == 1 else None
 
 
 def launch_recurrent_delta_rule_fwd(
@@ -276,7 +368,7 @@ def launch_recurrent_delta_rule_fwd(
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = False,
+    autotune: bool,
     batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
@@ -308,8 +400,9 @@ def launch_recurrent_delta_rule_fwd(
             contents: the scan starts from zero and overwrites the slot, including for empty
             sequences, so the slot is initialized before a later decode reads it. Without
             this mask every selected slot is treated as real history.
-        autotune: Benchmark tile configurations when true; paged launches always use fixed
-            heuristics because rerunning candidates would advance the pool repeatedly.
+        autotune: Benchmark tile configurations when true; otherwise launch the first usable
+            candidate, preferring the one ``_pinned_launch_options`` picks. Paged launches are
+            always pinned because rerunning candidates would advance the pool repeatedly.
         batch_invariant: Use one formula, fixed-order sums over K and no FMA fusion, so a
             sequence's output and state bits do not depend on the launch config that the batch
             shape picks. Composes with ``autotune`` and prefetching.
@@ -350,55 +443,11 @@ def launch_recurrent_delta_rule_fwd(
     grid = lambda meta: (triton.cdiv(value_dim, meta["BV"]) * num_sequences * heads,)
 
     sequence_heads = num_sequences * heads
-    average_tokens = tokens if cu_seqlens is None else triton.cdiv(tokens, num_sequences)
-    tokens_bucket = min(triton.next_power_of_2(average_tokens), _TOKENS_BUCKET_LIMIT)
+    average_tokens = _average_tokens(tokens, num_sequences, cu_seqlens is not None)
     # Up to 16 sequence-heads, prefetch hides load latency (GB200: 0.6-0.8x at K=64 and K=128).
     # Prefetch was slower for K > 128.
     prefetch = average_tokens > 1 and sequence_heads <= 16 and key_dim <= 128
-    use_autotune = autotune and state_indices is None
-    kernel = recurrent_delta_rule_fwd_kernel if use_autotune else _recurrent_delta_rule_fwd_kernel
-    launch_options = {}
-    if not use_autotune:
-        # B200 sweeps set the small-value one-token tiles; GB200 sweeps set the rest.
-        # Multi-token scans use one warp so per-token reductions stay in registers. Each program
-        # carries its tile through the whole sequence, so the grid should fit one wave: tiny
-        # grids split V finely, and BV=16 under the 128-register cap fits 256 sequence-heads at
-        # K=128. Skewed varlen lengths are bound by the longest sequence, so varlen keeps BV=4.
-        if average_tokens > 1 and key_dim >= 128:
-            num_warps = 1
-            if sequence_heads <= 16:
-                block_v_limit = 2
-            elif cu_seqlens is not None or sequence_heads <= 64:
-                block_v_limit = 4
-            else:
-                # BV * K <= 2048 fits the 128-register cap.
-                block_v_limit = 16 if key_dim <= 128 else 8
-        elif average_tokens > 1:
-            # Narrow keys leave little per-token work, so wide tiles win once the grid is full.
-            if sequence_heads >= 2048:
-                block_v_limit, num_warps = 32, 2
-            else:
-                block_v_limit, num_warps = (4 if sequence_heads <= 256 else 8), 1
-        elif value_dim >= 128:
-            block_v_limit = 4 if key_dim > 128 or sequence_heads > 512 else 8
-            num_warps = 1
-        elif sequence_heads <= 8:
-            block_v_limit, num_warps = 8, 4
-        elif sequence_heads < 1024:
-            block_v_limit, num_warps = 16, 2
-        else:
-            block_v_limit, num_warps = 32, 2
-        launch_options = {
-            "BV": min(triton.next_power_of_2(value_dim), block_v_limit),
-            "num_warps": num_warps,
-            "num_stages": 3,
-        }
-        if num_warps == 1:
-            launch_options["maxnreg"] = 128
-    if batch_invariant:
-        # Disable FMA fusion to avoid layout-dependent rounding.
-        launch_options["enable_fp_fusion"] = False
-    kernel[grid](
+    tensors = (
         q,
         k,
         v,
@@ -410,26 +459,31 @@ def launch_recurrent_delta_rule_fwd(
         cu_seqlens,
         state_indices,
         has_initial_state,
-        scale=scale,
-        T=tokens,
-        N=num_sequences,
-        tokens_bucket=tokens_bucket,
-        state_batch_stride=state_batch_stride,
-        H=heads,
-        HK=key_heads,
-        K=key_dim,
-        V=value_dim,
-        BK=triton.next_power_of_2(key_dim),
-        USE_INITIAL_STATE=initial_state is not None,
-        STORE_FINAL_STATE=final_state is not None,
-        IS_VARLEN=cu_seqlens is not None,
-        USE_STATE_INDICES=state_indices is not None,
-        USE_HAS_INITIAL_STATE=has_initial_state is not None,
-        SCALAR_GATE=gate_kind is GateKind.SCALAR,
-        PREFETCH=prefetch,
-        BATCH_INVARIANT=batch_invariant,
-        **launch_options,
     )
+    options: dict[str, Any] = {
+        "scale": scale,
+        "T": tokens,
+        "N": num_sequences,
+        "state_batch_stride": state_batch_stride,
+        "H": heads,
+        "HK": key_heads,
+        "K": key_dim,
+        "V": value_dim,
+        "BK": triton.next_power_of_2(key_dim),
+        "USE_INITIAL_STATE": initial_state is not None,
+        "STORE_FINAL_STATE": final_state is not None,
+        "IS_VARLEN": cu_seqlens is not None,
+        "USE_STATE_INDICES": state_indices is not None,
+        "USE_HAS_INITIAL_STATE": has_initial_state is not None,
+        "SCALAR_GATE": gate_kind is GateKind.SCALAR,
+        "PREFETCH": prefetch,
+        "BATCH_INVARIANT": batch_invariant,
+    }
+    if batch_invariant:
+        # Disable FMA fusion to avoid layout-dependent rounding.
+        options["enable_fp_fusion"] = False
+    # Benchmarking a paged launch would repeatedly advance the pool.
+    _recurrent_scan[grid](*tensors, **options, autotune=autotune and state_indices is None)
     return output, final_state
 
 

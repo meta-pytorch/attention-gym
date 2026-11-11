@@ -313,7 +313,7 @@ def test_fused_chunk_gate_range_boundary_is_finite(dtype):
     )
     inputs = tuple(tensor.requires_grad_() for tensor in inputs)
 
-    output, _ = chunk_kda(*inputs, autotune=False)
+    output, _ = chunk_kda(*inputs, kernel_options={"autotune": False})
     gradients = torch.autograd.grad(output.float().square().mean(), inputs)
     assert torch.isfinite(output).all()
     assert all(torch.isfinite(gradient).all() for gradient in gradients)

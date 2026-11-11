@@ -92,11 +92,17 @@ def _prepare_chunk_gdn_fwd(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     metadata: RaggedChunkMetadata | None,
+    *,
+    autotune: bool,
 ) -> ChunkGDNFactors:
     """Run the intra-chunk factorization on already normalized inputs."""
     if metadata is None:
-        return ChunkGDNFactors(*chunk_gdn_fwd_intra_dense(k, v, cumulative_gate, beta))
-    return ChunkGDNFactors(*chunk_gdn_fwd_intra_packed(k, v, cumulative_gate, beta, metadata))
+        return ChunkGDNFactors(
+            *chunk_gdn_fwd_intra_dense(k, v, cumulative_gate, beta, autotune=autotune)
+        )
+    return ChunkGDNFactors(
+        *chunk_gdn_fwd_intra_packed(k, v, cumulative_gate, beta, metadata, autotune=autotune)
+    )
 
 
 def _finish_chunk_gdn_fwd(
@@ -108,6 +114,8 @@ def _finish_chunk_gdn_fwd(
     metadata: RaggedChunkMetadata | None,
     scale: float,
     store_final_state: bool = True,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the state recurrence and output composition from prepared factors.
 
@@ -118,7 +126,9 @@ def _finish_chunk_gdn_fwd(
         h, v_new, final_state = chunk_gdn_fwd_recurrence_dense(
             factors.kg, factors.w, factors.u, cumulative_gate, initial_state
         )
-        output = chunk_gdn_fwd_output_dense(q, k, v_new, h, cumulative_gate, scale)
+        output = chunk_gdn_fwd_output_dense(
+            q, k, v_new, h, cumulative_gate, scale, autotune=autotune
+        )
     else:
         h, v_new, final_state = chunk_gdn_fwd_recurrence_packed(
             factors.kg,
@@ -129,7 +139,9 @@ def _finish_chunk_gdn_fwd(
             metadata,
             store_final_state=store_final_state,
         )
-        output = chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
+        output = chunk_gdn_fwd_output_packed(
+            q, k, v_new, h, cumulative_gate, scale, metadata, autotune=autotune
+        )
     return output, final_state
 
 
@@ -141,6 +153,7 @@ def chunk_gdn_fwd_dense(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the dense B=1 BT64 scalar forward and return output, state, and inverse tape."""
     validate_supported_device(q)
@@ -163,9 +176,9 @@ def chunk_gdn_fwd_dense(
         normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta, initial_state)
     )
 
-    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, None)
+    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, None, autotune=autotune)
     output, final_state = _finish_chunk_gdn_fwd(
-        q, k, factors, cumulative_gate, initial_state, None, scale
+        q, k, factors, cumulative_gate, initial_state, None, scale, autotune=autotune
     )
     return output, final_state, factors.inverse
 
@@ -178,10 +191,11 @@ def _gdn_chunk_fwd_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Registered dense forward without a public final-state output."""
     output, _state, inverse = chunk_gdn_fwd_dense(
-        q, k, v, cumulative_gate, beta, initial_state, scale
+        q, k, v, cumulative_gate, beta, initial_state, scale, autotune
     )
     return output, inverse
 
@@ -194,9 +208,10 @@ def _gdn_chunk_fwd_with_state_cuda(
     beta: torch.Tensor,
     initial_state: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Registered dense forward with final state and inverse tape."""
-    return chunk_gdn_fwd_dense(q, k, v, cumulative_gate, beta, initial_state, scale)
+    return chunk_gdn_fwd_dense(q, k, v, cumulative_gate, beta, initial_state, scale, autotune)
 
 
 def chunk_gdn_fwd_packed(
@@ -208,6 +223,7 @@ def chunk_gdn_fwd_packed(
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata,
     scale: float,
+    autotune: bool,
     store_final_state: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor]:
     """Run fixed-capacity packed scalar forward and return output, state, and inverse tape.
@@ -231,9 +247,17 @@ def chunk_gdn_fwd_packed(
     if initial_state is not None:
         initial_state = normalize_compact_tensor(initial_state)
 
-    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, metadata)
+    factors = _prepare_chunk_gdn_fwd(k, v, cumulative_gate, beta, metadata, autotune=autotune)
     output, final_state = _finish_chunk_gdn_fwd(
-        q, k, factors, cumulative_gate, initial_state, metadata, scale, store_final_state
+        q,
+        k,
+        factors,
+        cumulative_gate,
+        initial_state,
+        metadata,
+        scale,
+        store_final_state,
+        autotune=autotune,
     )
     return output, final_state, factors.inverse
 
@@ -249,11 +273,21 @@ def _gdn_chunk_fwd_packed_cuda(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Registered packed forward without a public final-state output."""
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
     output, _state, inverse = chunk_gdn_fwd_packed(
-        q, k, v, cumulative_gate, beta, initial_state, metadata, scale, store_final_state=False
+        q,
+        k,
+        v,
+        cumulative_gate,
+        beta,
+        initial_state,
+        metadata,
+        scale,
+        autotune,
+        store_final_state=False,
     )
     return output, inverse
 
@@ -269,10 +303,13 @@ def _gdn_chunk_fwd_packed_with_state_cuda(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Registered packed forward with final state and inverse tape."""
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
-    return chunk_gdn_fwd_packed(q, k, v, cumulative_gate, beta, initial_state, metadata, scale)
+    return chunk_gdn_fwd_packed(
+        q, k, v, cumulative_gate, beta, initial_state, metadata, scale, autotune
+    )
 
 
 def _gdn_chunk_fwd_packed_paged_cuda(
@@ -288,8 +325,13 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     chunk_offsets: torch.Tensor,
     capacity: int,
     scale: float,
+    autotune: bool,
 ) -> torch.Tensor:
-    """Run packed scalar GDN while advancing selected cache slots in place."""
+    """Run packed scalar GDN while advancing selected cache slots in place.
+
+    ``autotune`` covers only the factor and output kernels; the recurrence that advances
+    ``state_cache`` always launches its fixed configuration.
+    """
     validate_supported_device(q)
     metadata = RaggedChunkMetadata(cu_seqlens, chunk_offsets, capacity, 64)
     batch, _tokens, key_heads, key_dim = q.shape
@@ -315,7 +357,9 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         normalize_compact_tensor(tensor) for tensor in (cumulative_gate, beta)
     )
 
-    w, u, restored_k, _inverse = chunk_gdn_fwd_intra_packed(k, v, cumulative_gate, beta, metadata)
+    w, u, restored_k, _inverse = chunk_gdn_fwd_intra_packed(
+        k, v, cumulative_gate, beta, metadata, autotune=autotune
+    )
     h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
         restored_k,
         w,
@@ -326,10 +370,11 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         has_initial_state=has_initial_state,
         output_final_state=False,
         metadata=metadata,
-        autotune=False,
     )
     assert final_state is None
-    return chunk_gdn_fwd_output_packed(q, k, v_new, h, cumulative_gate, scale, metadata)
+    return chunk_gdn_fwd_output_packed(
+        q, k, v_new, h, cumulative_gate, scale, metadata, autotune=autotune
+    )
 
 
 @dataclass
@@ -357,9 +402,13 @@ def _prepare_chunk_gdn_bwd(
     inverse: torch.Tensor,
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
+    *,
+    autotune: bool,
 ) -> ChunkGDNBwdPrepared:
     """Recompute local factors and forward state on normalized inputs before communication."""
-    w, u, qg, kg = chunk_gdn_recompute_w_u_qg_kg(q, k, v, cumulative_gate, beta, inverse, metadata)
+    w, u, qg, kg = chunk_gdn_recompute_w_u_qg_kg(
+        q, k, v, cumulative_gate, beta, inverse, metadata, autotune=autotune
+    )
     if metadata is None:
         recurrence_state = zero_state(q, v, None) if initial_state is None else initial_state
         h, v_new, _final_state = chunk_gdn_fwd_recurrence_dense(
@@ -384,6 +433,7 @@ def chunk_gdn_bwd(
     initial_state: torch.Tensor | None,
     metadata: RaggedChunkMetadata | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Differentiate dense or packed fused chunk GDN through one shared protocol."""
     validate_supported_device(q)
@@ -408,7 +458,7 @@ def chunk_gdn_bwd(
     if initial_state is not None:
         initial_state = normalize_compact_tensor(initial_state)
     prepared = _prepare_chunk_gdn_bwd(
-        q, k, v, cumulative_gate, beta, inverse, initial_state, metadata
+        q, k, v, cumulative_gate, beta, inverse, initial_state, metadata, autotune=autotune
     )
     return _finish_chunk_gdn_bwd(
         q,
@@ -423,6 +473,7 @@ def chunk_gdn_bwd(
         metadata,
         prepared,
         scale,
+        autotune=autotune,
     )
 
 
@@ -440,11 +491,15 @@ def _finish_chunk_gdn_bwd(
     prepared: ChunkGDNBwdPrepared,
     scale: float,
     aqk: torch.Tensor | None = None,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Finish the local gradients from recomputed factors and the exit-state cotangent.
 
     ``aqk`` is the per-value-head intra-chunk Q/K factor when the caller already holds it (the
     staged reverse summary computes it first); the Blackwell path recomputes it otherwise.
+    ``autotune`` selects the portable path's kernel configurations by benchmark; the Blackwell
+    stages always launch fixed configurations.
 
     The Blackwell path releases every recomputed tensor at its last use (``prepared`` fields
     and the ``del`` statements) because the step's peak memory sits inside this function:
@@ -466,6 +521,7 @@ def _finish_chunk_gdn_bwd(
             initial_state,
             metadata,
             scale,
+            autotune=autotune,
         )
         dq, dk, dv, d_gate, db = chunk_gdn_bwd_wy(
             q,
@@ -482,6 +538,7 @@ def _finish_chunk_gdn_bwd(
             dv,
             metadata,
             scale,
+            autotune=autotune,
         )
         return dq, dk, dv, d_gate, db, d_initial_state
 
@@ -602,6 +659,7 @@ def _gdn_chunk_bwd_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Registered dense or packed backward without an initial-state gradient output."""
     dq, dk, dv, dg, db, _d_initial_state = chunk_gdn_bwd(
@@ -616,6 +674,7 @@ def _gdn_chunk_bwd_cuda(
         initial_state,
         resolve_backward_metadata(q, cu_seqlens, chunk_offsets),
         scale,
+        autotune,
     )
     return dq, dk, dv, dg, db
 
@@ -633,6 +692,7 @@ def _gdn_chunk_bwd_with_state_grad_cuda(
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     scale: float,
+    autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Registered dense or packed backward preserving the initial-state gradient."""
     return chunk_gdn_bwd(
@@ -647,6 +707,7 @@ def _gdn_chunk_bwd_with_state_grad_cuda(
         initial_state,
         resolve_backward_metadata(q, cu_seqlens, chunk_offsets),
         scale,
+        autotune,
     )
 
 

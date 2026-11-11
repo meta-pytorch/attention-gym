@@ -8,6 +8,8 @@ no worst-case scratch reservation or CPU bookkeeping output is needed.
 import torch
 from torch import Tensor
 
+from attn_gym._backends.autotune import should_autotune
+
 from .routing import uses_grouped_schedule
 
 torch.library.define(
@@ -17,7 +19,7 @@ torch.library.define(
     "int sliding_window_size, bool share_kv, float scale, bool needs_backward, "
     "str backend, bool bwd_recompute_p=True, Tensor? query_rope=None, "
     "Tensor? sparse_rope=None, Tensor? local_rope=None, Tensor? sparse_v=None, "
-    "Tensor? local_v=None) -> (Tensor, Tensor, Tensor?[])",
+    "Tensor? local_v=None, *, bool autotune) -> (Tensor, Tensor, Tensor?[])",
 )
 torch.library.define(
     "attn_gym::_gather_attn_bwd",
@@ -27,7 +29,7 @@ torch.library.define(
     "Tensor grad_output, int sliding_window_size, bool share_kv, float scale, "
     "str backend, bool bwd_recompute_p=True, Tensor? query_rope=None, "
     "Tensor? sparse_rope=None, Tensor? local_rope=None, Tensor? sparse_v=None, "
-    "Tensor? local_v=None) "
+    "Tensor? local_v=None, *, bool autotune) "
     "-> (Tensor, Tensor, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?, Tensor?)",
 )
 
@@ -64,6 +66,8 @@ def _gather_attn_fwd_cuda(
     local_rope: Tensor | None = None,
     sparse_v: Tensor | None = None,
     local_v: Tensor | None = None,
+    *,
+    autotune: bool,
 ) -> tuple[Tensor, Tensor, list[Tensor | None]]:
     with torch.cuda.device(query.device):
         if backend not in ("cute", "triton"):
@@ -141,6 +145,7 @@ def _gather_attn_fwd_cuda(
                 query_rope=query_rope,
                 sparse_rope=sparse_rope,
                 local_rope=local_rope,
+                autotune=should_autotune(autotune),
             )
             if needs_backward:
                 # Only full-width backward uses the reverse map, including when determinism
@@ -180,6 +185,8 @@ def _gather_attn_bwd_cuda(
     local_rope: Tensor | None = None,
     sparse_v: Tensor | None = None,
     local_v: Tensor | None = None,
+    *,
+    autotune: bool,
 ) -> tuple[Tensor | None, ...]:
     with torch.cuda.device(query.device):
         if sliding_window_size == 0 and kv_indices.shape[-1] == 0:
@@ -260,6 +267,8 @@ def _gather_attn_bwd_cuda(
             query_rope=query_rope,
             sparse_rope=sparse_rope,
             local_rope=local_rope,
+            # Recheck the mode at launch; eager code may have changed it since forward.
+            autotune=should_autotune(autotune),
         )
         return (
             dq,
@@ -298,6 +307,8 @@ def _gather_attn_fwd_fake(
     local_rope: Tensor | None = None,
     sparse_v: Tensor | None = None,
     local_v: Tensor | None = None,
+    *,
+    autotune: bool,
 ) -> tuple[Tensor, Tensor, list[Tensor | None]]:
     if backend not in ("cute", "triton"):
         raise ValueError(f"gather-attention operators require a concrete backend, got {backend!r}")
@@ -393,6 +404,8 @@ def _gather_attn_bwd_fake(
     local_rope: Tensor | None = None,
     sparse_v: Tensor | None = None,
     local_v: Tensor | None = None,
+    *,
+    autotune: bool,
 ) -> tuple[Tensor | None, ...]:
     return (
         query.new_empty(query.shape),

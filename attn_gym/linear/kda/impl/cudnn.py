@@ -169,7 +169,6 @@ def chunk_forward(
     scale: float | None = None,
     output_final_state: bool = False,
     fastmath: bool = True,
-    autotune: bool = True,
     split_backward: bool = False,
     split_forward: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
@@ -180,7 +179,6 @@ def chunk_forward(
         raise ValueError("split_backward currently requires a no-state call")
     if split_forward and (initial_state is not None or output_final_state):
         raise ValueError("split_forward currently requires a no-state call")
-    del autotune
     if not torch.compiler.is_compiling():
         validate_cudnn_available(q)
 

@@ -8,7 +8,7 @@ an inverted query map so each sparse-KV program exclusively owns its output.
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.triton.tune import TritonTuner, tuning_key
 from attn_gym._backends.triton.utils import ptr_offset
 
 from .primitives import (
@@ -17,7 +17,6 @@ from .primitives import (
     load_document_bounds,
     offset_strides,
     prune_wide_backward_configs,
-    tuning_key,
 )
 
 

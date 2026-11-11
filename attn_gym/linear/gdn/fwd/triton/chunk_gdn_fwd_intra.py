@@ -459,6 +459,8 @@ def chunk_gdn_fwd_intra_dense(
     v: torch.Tensor,
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run dense GQA-capable BT64 scalar KKT/solve and W/U/kg."""
     batch, tokens, key_heads, key_dim = k.shape
@@ -494,6 +496,7 @@ def chunk_gdn_fwd_intra_dense(
         K=key_dim,
         BT=64,
         BC=16,
+        autotune=autotune,
     )
 
     w = k.new_empty(batch, tokens, value_heads, key_dim)
@@ -524,6 +527,7 @@ def chunk_gdn_fwd_intra_dense(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return w, u, restored_k, inverse
 
@@ -534,6 +538,8 @@ def chunk_gdn_fwd_intra_packed(
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
     metadata: RaggedChunkMetadata,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run fixed-capacity packed scalar KKT/solve and W/U/kg."""
     metadata.validate_chunk_size(64)
@@ -569,6 +575,7 @@ def chunk_gdn_fwd_intra_packed(
         K=key_dim,
         BT=64,
         BC=16,
+        autotune=autotune,
     )
 
     # Only active token rows are written; the inactive suffix is unspecified like every ragged
@@ -601,6 +608,7 @@ def chunk_gdn_fwd_intra_packed(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return w, u, restored_k, inverse
 
@@ -613,6 +621,8 @@ def chunk_gdn_recompute_w_u_qg_kg(
     beta: torch.Tensor,
     inverse: torch.Tensor,
     metadata: RaggedChunkMetadata | None,
+    *,
+    autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Recompute scalar W/U/qg/kg from the saved inverse without rebuilding KKT."""
     batch, tokens, key_heads, key_dim = q.shape
@@ -664,6 +674,7 @@ def chunk_gdn_recompute_w_u_qg_kg(
         K=key_dim,
         V=value_dim,
         BT=64,
+        autotune=autotune,
     )
     return w, u, qg, restored_k
 

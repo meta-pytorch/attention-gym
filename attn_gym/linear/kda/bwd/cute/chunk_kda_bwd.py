@@ -89,7 +89,6 @@ def _prepare_chunk_kda_bwd(
             chunk_size=chunk_size,
             output_final_state=False,
             metadata=metadata,
-            autotune=autotune,
             fastmath=fastmath,
         )
     with profiler_range("kda/triton/backward_daqk"):
@@ -242,7 +241,7 @@ def chunk_kda_bwd(
     scale: float,
     chunk_size: int = 64,
     fastmath: bool = False,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[
     torch.Tensor,

@@ -14,11 +14,11 @@ from unittest import mock
 import torch
 import triton
 from triton.backends.compiler import GPUTarget
-from triton.runtime.autotuner import Autotuner
 from triton.runtime.jit import JITFunction
 
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym._backends.triton.tune import TritonTuner
+from attn_gym._backends.tune import device_identity
 from attn_gym.warpdrive.cache import get_compile_target
 
 
@@ -60,7 +60,7 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
 
     ``torch.cuda.get_device_capability`` and ``get_device_properties`` report the emulated
     device. Triton derives its compile target from the capability, so it is pinned to the
-    local GPU; kernels still run here.
+    local GPU; kernels still run here. Winner keys use the emulated capability.
     """
     local_target = triton.runtime.driver.active.get_current_target()
     # TritonTuner keys winners by the process-wide compile target, discovered once from the
@@ -73,8 +73,9 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
             real_get_device_properties(device), capability, max_shared_mem
         )
 
-    # Host dispatch caches device properties: drop the real ones here and the emulated ones after.
+    # Clear cached device facts before and after emulation to keep them from leaking across modes.
     get_device_properties.cache_clear()
+    device_identity.cache_clear()
     try:
         with (
             mock.patch.object(
@@ -86,6 +87,7 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
             yield
     finally:
         get_device_properties.cache_clear()
+        device_identity.cache_clear()
 
 
 @contextmanager
@@ -96,8 +98,8 @@ def compile_only_for_target(
 
     Host dispatch is emulated as in ``emulate_device_dispatch``, but kernels compile for the
     emulated target and never run: outputs stay unwritten and only the recorded shared memory
-    is meaningful. Autotuned and ``TritonTuner`` launches record every config left after
-    pruning, since the tuner may pick any of them that fits.
+    is meaningful. Tuned and pinned ``TritonTuner`` launches record every candidate left
+    after pruning.
     """
     target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
     launches: list[Launch] = []
@@ -118,38 +120,27 @@ def compile_only_for_target(
             launches.append(launch)
         return kernel
 
-    def autotune_run(self, *args, **kwargs):
-        self.nargs = dict(zip(self.arg_names, args))
-        launch = Launch(self.base_fn.__name__)
+    def launch_candidates(self, grid, bound):
+        kernel = self.compile()
+        launch = Launch(self.jit_function.__name__)
         active_autotune.append(launch)
         try:
-            for config in self.prune_configs(kwargs):
-                self.fn.run(*args, **kwargs, **config.all_kwargs())
+            for candidate in self.configs(grid, bound):
+                self.launch(kernel, candidate, grid, bound)
         finally:
             active_autotune.clear()
-            self.nargs = None
         launches.append(launch)
 
     def tuner_getitem(self, grid):
-        def launch_candidates(*args, **kwargs):
-            bound = self.bind(args, kwargs)
-            kernel = self.compile()
-            launch = Launch(kernel.__name__)
-            active_autotune.append(launch)
-            try:
-                for candidate in self.configs(grid, bound):
-                    self.launch(kernel, candidate, grid, bound)
-            finally:
-                active_autotune.clear()
-            launches.append(launch)
-
-        return launch_candidates
+        # ``autotune`` stays required but is unused: both launches build every candidate.
+        return lambda *args, autotune, **kwargs: launch_candidates(
+            self, grid, self.bind(args, kwargs)
+        )
 
     try:
         with (
             emulate_device_dispatch(capability, max_shared_mem),
             mock.patch.object(JITFunction, "run", jit_run),
-            mock.patch.object(Autotuner, "run", autotune_run),
             mock.patch.object(TritonTuner, "__getitem__", tuner_getitem),
             mock.patch.object(
                 triton.runtime.driver.active, "get_current_target", return_value=target

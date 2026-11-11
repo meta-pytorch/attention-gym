@@ -14,6 +14,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("triton")
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.linear import recurrent_gdn, recurrent_kda
 from attn_gym.linear._delta_rule import recurrent as recurrent_module
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
@@ -76,6 +77,7 @@ def _launch_scalar_gdn(
         gate_kind=GateKind.SCALAR,
         store_final_state=store_final_state,
         batch_invariant=batch_invariant,
+        autotune=False,
     )
     return output, final_state
 
@@ -183,6 +185,7 @@ def test_scalar_and_vector_gate_specializations_agree():
             gate_kind=GateKind.VECTOR,
             store_final_state=True,
             batch_invariant=False,
+            autotune=False,
         )
 
     torch.testing.assert_close(scalar_output, vector_output, rtol=1e-5, atol=1e-5)
@@ -227,6 +230,7 @@ def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim,
             gate_kind=gate_kind,
             store_final_state=True,
             batch_invariant=batch_invariant,
+            autotune=False,
         )
         reference = recurrent_kda if gate_kind is GateKind.VECTOR else recurrent_gdn
         expected = reference(
@@ -250,26 +254,94 @@ def test_recurrent_reuses_kernel_across_token_counts(triton_compiles):
     # Single-token scans select a different prefetch policy, so they are not part of this set.
     for tokens in (37, 16, 48):
         inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
-        recurrent_gdn(*inputs[:5], autotune=False)
+        recurrent_gdn(*inputs[:5], kernel_options={"autotune": False})
     torch.cuda.synchronize()
     assert triton_compiles["_recurrent_delta_rule_fwd_kernel"] == 1
 
 
-def test_recurrent_reuses_tuning_across_token_counts(monkeypatch):
+def test_recurrent_reuses_tuning_across_token_counts(isolated_winners, monkeypatch):
     """Scans of 64 or more tokens at one sequence count share one autotuning result, which a
     single-token scan does not reuse."""
-    from attn_gym.linear._delta_rule import recurrent as recurrent_module
+    tune = tune_module.tune
+    sweeps = []
 
-    tuner = recurrent_module.recurrent_delta_rule_fwd_kernel
-    monkeypatch.setattr(tuner, "cache", {})
+    def counting_tune(*args, **kwargs):
+        sweeps.append(None)
+        return tune(*args, **kwargs)
+
+    monkeypatch.setattr(tune_module, "tune", counting_tune)
     for tokens in (64, 91, 160):
         inputs = _make_inputs(tokens=tokens, dtype=torch.bfloat16, initial_state=False)
-        recurrent_gdn(*inputs[:5], autotune=True)
+        recurrent_gdn(*inputs[:5], kernel_options={"autotune": True})
     torch.cuda.synchronize()
-    assert len(tuner.cache) == 1
+    assert len(sweeps) == 1
     inputs = _make_inputs(tokens=1, dtype=torch.bfloat16, initial_state=False)
-    recurrent_gdn(*inputs[:5], autotune=True)
-    assert len(tuner.cache) == 2
+    recurrent_gdn(*inputs[:5], kernel_options={"autotune": True})
+    assert len(sweeps) == 2
+
+
+def test_paged_launch_never_benchmarks(no_benchmarking):
+    """A paged launch asked to autotune is pinned: each candidate would advance the pool."""
+    query, key, value, gate, beta, _ = _make_inputs(
+        tokens=5, dtype=torch.bfloat16, initial_state=False
+    )
+    pool = torch.randn(3, value.shape[2], value.shape[3], query.shape[3], device="cuda")
+    slots = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
+
+    def launch(autotune: bool) -> tuple[torch.Tensor, torch.Tensor]:
+        advanced = pool.clone()
+        output, _ = launch_recurrent_delta_rule_fwd(
+            query, key, value, gate, beta, advanced, None,
+            scale=1.0,
+            gate_kind=GateKind.SCALAR,
+            store_final_state=True,
+            state_indices=slots,
+            autotune=autotune,
+            batch_invariant=False,
+        )  # fmt: skip
+        return output, advanced
+
+    for tuned, pinned in zip(launch(True), launch(False)):
+        assert torch.equal(tuned, pinned)
+
+
+def test_tuning_key_determines_pinned_configuration():
+    """Shapes that share a tuning key pin the same configuration.
+
+    ``TritonTuner`` remembers the pinned candidate per key, so a key coarser than the shape
+    heuristic would hand one shape another's configuration.
+    """
+    operand = torch.empty(0, dtype=torch.bfloat16)
+    pinned_by_key: dict[tuple, set] = {}
+    shapes = itertools.product(
+        (*range(70), 128, 4096),
+        (1, 2, 16, 64, 200),
+        (1, 16),
+        (64, 128, 256),
+        (1, 48, 128),
+        (False, True),
+    )
+    for tokens, num_sequences, heads, key_dim, value_dim, is_varlen in shapes:
+        args = {
+            "T": tokens * num_sequences if is_varlen else tokens,
+            "N": num_sequences,
+            "H": heads,
+            "HK": heads,
+            "K": key_dim,
+            "V": value_dim,
+            "USE_INITIAL_STATE": False,
+            "STORE_FINAL_STATE": False,
+            "IS_VARLEN": is_varlen,
+            "SCALAR_GATE": True,
+            "PREFETCH": False,
+            "BATCH_INVARIANT": False,
+            **dict.fromkeys(("q", "k", "v", "gate", "beta"), operand),
+            "h0": None,
+            "cu_seqlens": operand if is_varlen else None,
+        }
+        pinned = recurrent_module._recurrent_scan.configs(None, args)[0]
+        pinned_by_key.setdefault(recurrent_module._recurrent_tuning_key(args), set()).add(pinned)
+    assert all(len(pinned) == 1 for pinned in pinned_by_key.values())
 
 
 def _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fresh):
@@ -281,8 +353,7 @@ def _batch_invariant_paged_scan(scan, q, k, v, gate, beta, lens, pool, slots, fr
         cu_seqlens=cu_seqlens.to(torch.int32),
         state_indices=slots,
         has_initial_state=~fresh,
-        autotune=False,
-        kernel_options={"batch_invariant": True},
+        kernel_options={"batch_invariant": True, "autotune": False},
     )  # fmt: skip
     return output
 
@@ -346,9 +417,9 @@ def test_batch_invariant_bits_do_not_depend_on_launch_config(monkeypatch, gate_k
 
     class ForcedConfig:
         def __getitem__(self, grid):
-            return lambda *args, **kwargs: kernel[grid](*args, **{**kwargs, **forced})
+            return lambda *args, autotune, **kwargs: kernel[grid](*args, **{**kwargs, **forced})
 
-    monkeypatch.setattr(recurrent_module, "_recurrent_delta_rule_fwd_kernel", ForcedConfig())
+    monkeypatch.setattr(recurrent_module, "_recurrent_scan", ForcedConfig())
     torch.manual_seed(0)
     tokens, heads, dim = 64, 4, 128
     q = F.normalize(torch.randn(1, tokens, heads, dim, device="cuda"), dim=-1).bfloat16()
@@ -367,8 +438,7 @@ def test_batch_invariant_bits_do_not_depend_on_launch_config(monkeypatch, gate_k
             scan(
                 q, k, v, gate, beta,
                 output_final_state=True,
-                autotune=False,
-                kernel_options={"batch_invariant": True},
+                kernel_options={"batch_invariant": True, "autotune": False},
             )
         )  # fmt: skip
     for config, (output, state) in zip(configs[1:], results[1:]):

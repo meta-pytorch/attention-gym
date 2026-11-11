@@ -149,7 +149,9 @@ def test_native_transition_matches_basis_reference(
 def test_native_two_tile_handoff_matches_fp64(dtype: torch.dtype, monkeypatch) -> None:
     """Native forward/reverse maps hand off both states; outputs, finals, and grads track FP64."""
     inputs, cu = _packed_inputs([64, 65], dtype)
-    prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu, autotune=False, kernel_options=CUDNN)
+    prepared = chunk_kda_prepare(
+        *inputs, cu_seqlens=cu, kernel_options={**CUDNN, "autotune": False}
+    )
     _forbid_fused_factors(monkeypatch)
     bounds = torch.stack((cu[:-1], cu[1:]), dim=1)
     maps = prepared.state_summaries(bounds)
@@ -216,9 +218,11 @@ def test_native_selected_bounds(dtype: torch.dtype, heads: int, probe: str, monk
     """
     inputs, cu = _packed_inputs(LENGTHS, dtype, heads=heads)
     do = torch.randn_like(inputs[2])
-    prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu, autotune=False, kernel_options=CUDNN)
+    prepared = chunk_kda_prepare(
+        *inputs, cu_seqlens=cu, kernel_options={**CUDNN, "autotune": False}
+    )
     backward = chunk_kda_prepare_backward(
-        prepared.saved, do, None, scale=prepared.scale, autotune=False
+        prepared.saved, do, None, scale=prepared.scale, kernel_options={"autotune": False}
     )
     _forbid_fused_factors(monkeypatch)
     grad_summaries = partial(build_cudnn_state_grad_summaries, *inputs, do, cu, prepared.scale)
@@ -261,10 +265,12 @@ def test_native_reverse_bias_and_ownership(
     """C is exactly native dH0 and neither reverse probe depends on tile ownership/state."""
     inputs, cu = _packed_inputs(LENGTHS, dtype)
     d_output = torch.randn_like(inputs[2])
-    prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu, autotune=False, kernel_options=CUDNN)
+    prepared = chunk_kda_prepare(
+        *inputs, cu_seqlens=cu, kernel_options={**CUDNN, "autotune": False}
+    )
     initial = torch.randn(4, 1, 128, 128, device="cuda")
     backward = chunk_kda_prepare_backward(
-        prepared.saved, d_output, initial, scale=prepared.scale, autotune=False
+        prepared.saved, d_output, initial, scale=prepared.scale, kernel_options={"autotune": False}
     )
     _forbid_fused_factors(monkeypatch)
     grad_summaries = partial(
@@ -282,7 +288,7 @@ def test_native_reverse_bias_and_ownership(
             torch.zeros_like(d_output),
             initial,
             scale=prepared.scale,
-            autotune=False,
+            kernel_options={"autotune": False},
         )
         identity = torch.eye(128, device="cuda").expand_as(initial).contiguous()
         assert torch.equal(maps[:, :, 128:], zero_backward.run(identity)[-1])
@@ -430,8 +436,12 @@ def test_native_reverse_matches_fp64(dtype: torch.dtype, gate_value: float) -> N
         )
         for transpose in (False, True)
     ]
-    prepared = chunk_kda_prepare(*inputs, cu_seqlens=cu, scale=scale, autotune=False)
-    backward = chunk_kda_prepare_backward(prepared.saved, do, None, scale=scale, autotune=False)
+    prepared = chunk_kda_prepare(
+        *inputs, cu_seqlens=cu, scale=scale, kernel_options={"autotune": False}
+    )
+    backward = chunk_kda_prepare_backward(
+        prepared.saved, do, None, scale=scale, kernel_options={"autotune": False}
+    )
     maps.append(backward.state_grad_summaries(_bounds([[0, 129]])))
     references = []
     for precision in (torch.float64, torch.float32):

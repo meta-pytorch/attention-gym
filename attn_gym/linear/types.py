@@ -7,11 +7,11 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple, TypedDict
+from typing import Literal, NamedTuple
 
 import torch
 
-from attn_gym.types import Impl, resolve_impl
+from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOptions, resolve_impl
 
 
 class ReplayState(NamedTuple):
@@ -28,8 +28,8 @@ class ReplayState(NamedTuple):
     count: torch.Tensor
 
 
-class BackendOptions(TypedDict, total=False):
-    """Backend selection shared by optimized linear-attention operations."""
+class BackendOptions(TuningOptions, total=False):
+    """Backend selection and tuning shared by optimized linear-attention operations."""
 
     backend: Literal["fused", "cudnn"]
     """Select the repo-local fused backend or the optional cuDNN backend."""
@@ -60,16 +60,30 @@ class KernelOptions(SplitOptions, total=False):
     inputs."""
 
 
-class RecurrentKernelOptions(TypedDict, total=False):
+class RecurrentKernelOptions(TuningOptions, total=False):
     """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
 
     batch_invariant: bool
     """Keep output and final-state bits identical across batches on the same GPU model and
-    software stack. Defaults to ``False`` for speed; ``autotune=False`` alone is not enough.
+    software stack. Defaults to ``False`` for speed; ``"autotune": False`` alone is not enough.
     Token-by-token equivalence requires FP32 state; BF16 state rounds between calls.
     Autotuning and prefetching remain available. The fused ``recurrent_gdn_decode`` and
     ``recurrent_kda_decode`` ops do not support this option.
     See ``docs/determinism.md`` for the full contract and performance costs."""
+
+
+# Accepted values and defaults of the option dicts above; see ``KernelOptionSpec``.
+SPLIT_OPTION_SPEC: KernelOptionSpec = {
+    **TUNING_OPTION_SPEC,
+    "backend": (("fused", "cudnn"), "fused"),
+    "split_backward": (bool, False),
+    "split_forward": (bool, False),
+}
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    **SPLIT_OPTION_SPEC,
+    "schedule": (("auto", "static", "persistent"), "auto"),
+}
+RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
 
 
 class GateTransform(str, Enum):
@@ -102,6 +116,7 @@ __all__ = [
     "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
+    "TuningOptions",
     "resolve_gate_transform",
     "resolve_impl",
 ]
