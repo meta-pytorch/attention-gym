@@ -56,7 +56,6 @@ class _Slice:
 
 @dataclass
 class _Track:
-    uuid: int
     parent: int
     name: str
     rank: int
@@ -145,9 +144,7 @@ class TraceBuilder:
         uuid = stable_id("track", process, key)
         if uuid not in self.tracks:
             siblings = sum(track.parent == process for track in self.tracks.values())
-            self.tracks[uuid] = _Track(
-                uuid, process, name, siblings if rank is None else rank, counter
-            )
+            self.tracks[uuid] = _Track(process, name, siblings if rank is None else rank, counter)
         return uuid
 
     def slice(
@@ -197,10 +194,10 @@ class TraceBuilder:
             descriptor.sibling_order_rank = rank
 
         events: list[tuple[int, int, object]] = []  # (timestamp, lane track uuid, payload)
-        for track in self.tracks.values():
+        for track_uuid, track in self.tracks.items():
             lanes = nesting_lanes(track.slices) or [[]]
             for lane_index, lane in enumerate(lanes):
-                uuid = track.uuid if lane_index == 0 else stable_id(track.uuid, lane_index)
+                uuid = track_uuid if lane_index == 0 else stable_id(track_uuid, lane_index)
                 descriptor = builder.add_packet().track_descriptor
                 descriptor.uuid = uuid
                 descriptor.parent_uuid = track.parent
@@ -212,12 +209,12 @@ class TraceBuilder:
                     descriptor.sibling_merge_behavior = (
                         TrackDescriptor.SIBLING_MERGE_BEHAVIOR_BY_SIBLING_MERGE_KEY
                     )
-                    descriptor.sibling_merge_key = str(track.uuid)
+                    descriptor.sibling_merge_key = str(track_uuid)
                 events.extend((ts, uuid, marker) for ts, marker in lane_markers(lane))
             events.extend(
-                (ts, track.uuid, ("instant", name, args)) for ts, name, args in track.instants
+                (ts, track_uuid, ("instant", name, args)) for ts, name, args in track.instants
             )
-            events.extend((ts, track.uuid, ("counter", value)) for ts, value in track.samples)
+            events.extend((ts, track_uuid, ("counter", value)) for ts, value in track.samples)
 
         for timestamp_ns, uuid, payload in sorted(events, key=lambda event: event[0]):
             packet = builder.add_packet()

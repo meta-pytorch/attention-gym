@@ -3,8 +3,6 @@
 import hashlib
 import importlib.metadata
 import os
-import random
-import statistics
 import subprocess
 import time
 from collections.abc import Iterable, Sequence
@@ -93,10 +91,7 @@ def provenance(sources: dict[str, Path], arguments: dict) -> dict:
 @dataclass(frozen=True)
 class CudaBenchmarkStats:
     samples_us: tuple[float, ...]
-    median_us: float
-    median_ci_us: tuple[float, float]
     quantiles_us: tuple[float, float, float]
-    confidence: float
 
     @staticmethod
     def quantile(samples: Sequence[float], q: float) -> float:
@@ -121,73 +116,21 @@ class CudaBenchmarkStats:
         return lower + (upper - lower) * weight
 
     @classmethod
-    def bootstrap_median_confidence_interval(
-        cls,
-        samples: Sequence[float],
-        confidence: float = 0.95,
-        n_resamples: int = 1000,
-        seed: int = 0,
-    ) -> tuple[float, float]:
-        """Estimate a percentile bootstrap confidence interval for the sample median.
-
-        Resample timings with replacement and take quantiles of the resampled medians.
-        No parametric distribution is assumed. Samples must come from one stable,
-        warmed-up workload and be approximately exchangeable: thermal drift, autotuning
-        and startup effects invalidate that assumption.
-
-        Small samples give unstable intervals; single-digit counts are weak, and low
-        tens still need caution. Check that adding or removing a few steady-state
-        samples does not move the median much.
-        """
-        if not 0 < confidence < 1:
-            raise ValueError(f"confidence must be in (0, 1), got {confidence}")
-        if len(samples) == 0:
-            raise ValueError("samples must be non-empty")
-        if len(samples) == 1:
-            value = float(samples[0])
-            return value, value
-
-        rng = random.Random(seed)
-        estimates = [
-            statistics.median(rng.choices(samples, k=len(samples)))
-            for _ in range(max(1, n_resamples))
-        ]
-        alpha = 1.0 - confidence
-        return cls.quantile(estimates, alpha / 2), cls.quantile(estimates, 1.0 - alpha / 2)
-
-    @classmethod
-    def from_samples(
-        cls,
-        samples_us: Sequence[float],
-        confidence: float = 0.95,
-        n_resamples: int = 1000,
-        seed: int = 0,
-    ) -> "CudaBenchmarkStats":
+    def from_samples(cls, samples_us: Sequence[float]) -> "CudaBenchmarkStats":
         samples = tuple(float(sample) for sample in samples_us)
         quantiles_us = (
             cls.quantile(samples, 0.05),
             cls.quantile(samples, 0.50),
             cls.quantile(samples, 0.95),
         )
-        return cls(
-            samples_us=samples,
-            median_us=quantiles_us[1],
-            median_ci_us=cls.bootstrap_median_confidence_interval(
-                samples,
-                confidence=confidence,
-                n_resamples=n_resamples,
-                seed=seed,
-            ),
-            quantiles_us=quantiles_us,
-            confidence=confidence,
-        )
+        return cls(samples_us=samples, quantiles_us=quantiles_us)
 
     @property
     def p05_us(self) -> float:
         return self.quantiles_us[0]
 
     @property
-    def p50_us(self) -> float:
+    def median_us(self) -> float:
         return self.quantiles_us[1]
 
     @property
@@ -195,12 +138,28 @@ class CudaBenchmarkStats:
         return self.quantiles_us[2]
 
 
-def _time_cuda_graph_replay_samples_us(
+def benchmark_cuda_graph_stats(
     graph: torch.cuda.CUDAGraph,
     *,
-    num_iters: int,
-    warmup_iters: int,
-) -> list[float]:
+    num_iters: int = 100,
+    warmup_iters: int = 20,
+) -> CudaBenchmarkStats:
+    """Time an already-captured CUDA graph without capturing or invoking its Python body.
+
+    Return replay samples and quantiles in microseconds. Capture, input updates and
+    correctness checks are untimed.
+    Fixed buffers give a reused-buffer workload. CUDA-event intervals include GPU work
+    and can include host submission gaps; they are not kernel-only times.
+
+    The caller owns the graph and buffers, selects its CUDA device, and orders input
+    updates before replay on the current stream. Warmup and timing both execute captured
+    mutations. The helper synchronizes the current device after warmup and each timed replay.
+
+    Args:
+        graph: An already-captured graph, ready to replay on the current device.
+        num_iters: Number of measured replays; must be positive.
+        warmup_iters: Number of untimed replays; may be zero.
+    """
     if num_iters <= 0:
         raise ValueError("num_iters must be positive")
     if warmup_iters < 0:
@@ -219,40 +178,4 @@ def _time_cuda_graph_replay_samples_us(
         end.record()
         torch.cuda.synchronize()
         samples_us.append(start.elapsed_time(end) * 1e3)
-    return samples_us
-
-
-def benchmark_cuda_graph_stats(
-    graph: torch.cuda.CUDAGraph,
-    *,
-    num_iters: int = 100,
-    warmup_iters: int = 20,
-    confidence: float = 0.95,
-    n_resamples: int = 1000,
-    seed: int = 0,
-) -> CudaBenchmarkStats:
-    """Time an already-captured CUDA graph without capturing or invoking its Python body.
-
-    Return replay samples and quantiles in microseconds, plus a bootstrap confidence
-    interval for the median. Capture, input updates and correctness checks are untimed.
-    Fixed buffers give a reused-buffer workload. CUDA-event intervals include GPU work
-    and can include host submission gaps; they are not kernel-only times.
-
-    The caller owns the graph and buffers, selects its CUDA device, and orders input
-    updates before replay on the current stream. Warmup and timing both execute captured
-    mutations. The helper synchronizes the current device after warmup and each timed replay.
-
-    Args:
-        graph: An already-captured graph, ready to replay on the current device.
-        num_iters: Number of measured replays; must be positive.
-        warmup_iters: Number of untimed replays; may be zero.
-        confidence: Bootstrap confidence level in (0, 1).
-        n_resamples: Number of bootstrap resamples.
-        seed: Seed for bootstrap resampling, not the captured workload.
-    """
-    samples_us = _time_cuda_graph_replay_samples_us(
-        graph, num_iters=num_iters, warmup_iters=warmup_iters
-    )
-    return CudaBenchmarkStats.from_samples(
-        samples_us, confidence=confidence, n_resamples=n_resamples, seed=seed
-    )
+    return CudaBenchmarkStats.from_samples(samples_us)

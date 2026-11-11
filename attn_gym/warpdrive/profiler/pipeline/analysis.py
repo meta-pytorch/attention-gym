@@ -303,14 +303,10 @@ def critical_path(
             earliest[node] = 0.0
     makespan = max(earliest[node] + weights[node] for node in nodes)
 
-    latest_finish: dict[NodeKey, float] = {}
     latest_start: dict[NodeKey, float] = {}
     for node in reversed(order):
-        if successors[node]:
-            latest_finish[node] = min(latest_start[edge.target] for edge in successors[node])
-        else:
-            latest_finish[node] = makespan
-        latest_start[node] = latest_finish[node] - weights[node]
+        finish = min((latest_start[edge.target] for edge in successors[node]), default=makespan)
+        latest_start[node] = finish - weights[node]
     slack = {node: latest_start[node] - earliest[node] for node in nodes}
 
     sink = max(nodes, key=lambda node: (earliest[node] + weights[node], node))

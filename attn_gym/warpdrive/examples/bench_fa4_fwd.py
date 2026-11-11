@@ -98,9 +98,7 @@ def run_shape(b: int, h: int, s: int, variants: list[str], samples: int, profile
     for round_idx in range(7):
         order = variants if round_idx % 2 == 0 else list(reversed(variants))
         for label in order:
-            stats = benchmark_cuda_graph_stats(
-                graphs[label], num_iters=samples, warmup_iters=3, n_resamples=50
-            )
+            stats = benchmark_cuda_graph_stats(graphs[label], num_iters=samples, warmup_iters=3)
             median = stats.median_us / FORWARDS_PER_GRAPH
             medians[label].append(median)
             raw_samples[label].append([x / FORWARDS_PER_GRAPH for x in stats.samples_us])

@@ -3,10 +3,7 @@
 import pytest
 import torch
 
-from attn_gym.warpdrive.examples.bench_support import (
-    CudaBenchmarkStats,
-    benchmark_cuda_graph_stats,
-)
+from attn_gym.warpdrive.examples.bench_support import benchmark_cuda_graph_stats
 
 
 @pytest.mark.parametrize("warmup_iters", [0, 2])
@@ -42,17 +39,14 @@ def test_benchmark_cuda_graph_stats_does_not_capture(monkeypatch, warmup_iters):
         FakeGraph(),
         num_iters=3,
         warmup_iters=warmup_iters,
-        confidence=0.90,
-        n_resamples=50,
-        seed=7,
     )
 
     expected_calls = ["replay"] * warmup_iters + ["sync"]
     expected_calls += ["record", "replay", "record", "sync", "elapsed"] * 3
     assert calls == expected_calls
-    assert stats == CudaBenchmarkStats.from_samples(
-        [10.0, 12.0, 11.0], confidence=0.90, n_resamples=50, seed=7
-    )
+    assert stats.samples_us == (10.0, 12.0, 11.0)
+    assert stats.median_us == 11.0
+    assert (stats.p05_us, stats.p95_us) == (10.1, 11.9)
 
 
 @pytest.mark.parametrize(
