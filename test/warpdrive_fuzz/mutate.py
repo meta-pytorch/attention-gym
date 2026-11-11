@@ -234,9 +234,8 @@ def mutations() -> list[Mutation]:
         Mutation(
             "unbalanced_epochs",
             "U1",
-            valid.replace("ctx.n,", "ctx.n + 1,"),
-            error=None,
-            obligation=True,  # sampled counts are unverified: a caller could pass other values
+            valid + "\nh = ch.acquire(SLOT)\nh.commit()",
+            message="unbalanced epochs",
         ),
         Mutation(
             "lane_predicated_pair",
