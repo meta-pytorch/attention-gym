@@ -78,6 +78,7 @@ from attn_gym.warpdrive.cluster import (
 from attn_gym.warpdrive.compat import NATIVE_MULTI_ADVANCE, mbarrier_arrive
 from attn_gym.warpdrive.fences import FENCE_KINDS, derived_fences
 from attn_gym.warpdrive.protocol import (
+    Lifetime,
     Lineage,
     ProtocolError,
     current_block,
@@ -647,13 +648,7 @@ class Barriers:
 
 
 @dataclass(eq=False)
-class HandleRecord:
-    what: str
-    site: str
-    block: object
-    closed_at: str | None = None
-    closed_op: str | None = None
-    unclosed_ok: object = None  # the unchecked("unclosed") opt-out active at open
+class HandleRecord(Lifetime):
     chan: object = None  # the Channel
     slot: int | None = None  # the Slots slot; None for a Ring stage (dynamic)
     producer: bool = False
@@ -887,16 +882,14 @@ class Handle(_Stage):
         if signal:
             self._end._signal(self.index)
 
-    def _close(
-        self, producer: bool, op: str, region_checked: bool = False, once: str | None = None
-    ):
+    def _close(self, producer: bool, op: str, once: str | None = None, hint: str = ""):
         trace = self._end._trace
         if producer != self._is_producer:
             raise ProtocolError(
                 f"{trace.role_name}: {op}() on a {self.describe()} handle; producer handles "
                 "commit or retire, consumer handles release"
             )
-        trace.closed(self.rec, op, region_checked)
+        trace.closed(self.rec, op, last_trip=once == "last", hint=hint)
         if op in ("commit", "release") and self.rec.held_across is not None:
             self._end._hold_error(self.rec, *self.rec.held_across)
         trace.record(self._end._chan.name, op, self._label, order=self.rec.order)
@@ -1019,13 +1012,7 @@ class Span(Handle):
         progress = self._progress
         if progress.begin_site is None:
             raise ProtocolError(f"{self._where(f'{op}()')} before begin(i) waited for the stage")
-        if i is None:
-            if current_block() != self.rec.block:
-                raise ProtocolError(
-                    f"{self._where(f'{op}()')} is not in the region that opened the span; "
-                    f"inside the loop of begin() pass the loop index, {op}(i)"
-                )
-        else:
+        if i is not None:
             trips = self._trips(i, op)
             if current_block() != progress.loop:
                 raise ProtocolError(
@@ -1037,8 +1024,8 @@ class Span(Handle):
         self._close(
             producer,
             op if signal else f"{op}(raw signal)",
-            region_checked=True,
             once=None if i is None else "last",
+            hint=f"; inside the loop of begin() pass the loop index, {op}(i)",
         )
         if not signal:
             return
@@ -1071,6 +1058,7 @@ class Preview(_Stage):
         self._block = current_block()
         self._owner_rec = None  # the adopting wait's HandleRecord
         self._events = []  # access events recorded before adoption
+        self._life = Lifetime(self.describe(), self._site, self._block, region_bound=False)
 
     def describe(self) -> str:
         label = "i" if self._key is None else self._key
@@ -1240,7 +1228,6 @@ class _EndRecord:
     previews: list = field(default_factory=list)
     # (block, slot, why stale or None, probe site) of each token crossing a region boundary.
     token_exports: list = field(default_factory=list)
-    checked: bool = False  # the role-exit check of unadopted previews is registered
     lineage: Lineage = field(default_factory=Lineage)
 
     def taken(self, key) -> int:
@@ -1551,6 +1538,7 @@ class _End:
     def _advanced(self, key, epochs: int):
         """Count this copy's move ``epochs`` (0 if dynamic) past the next epoch of ``key`` (a
         slot, None for a ring)."""
+        self._rec.lineage.check_carried(self._copy, self._trace, self._chan.name, "end")
         self._rec.steps.setdefault(key, []).append((epochs, current_block()))
         self._rec.lineage.advanced(self._copy)
 
@@ -1661,23 +1649,17 @@ class _End:
 
     def _take_token(self, token, slot, op: str):
         """Check that ``token`` is this end's probe of the epoch ``op`` is about to take, and
-        return its readiness. Inside ``unchecked("token")`` any Token or raw Boolean is
-        trusted instead."""
+        return its readiness."""
         chan, who, site = self._chan, self._trace.role_name, user_site()
         probe = "try_acquire" if isinstance(self, ProducerEnd) else "try_wait"
         where = f"{who}: {chan.name}.{op}(token=...) at {site}"
         if chan.named:
             raise ProtocolError(f"{where}: a named-barrier channel has no tokens")
-        trusted = isinstance(token, (Token, cutlass.Boolean)) and self._trace.opt_out(
-            "token", f"{chan.name}.{op}(token={type(token).__name__}) at {site}"
-        )
-        if trusted:
-            return token.ready if isinstance(token, Token) else token
         if not isinstance(token, Token):
             raise ProtocolError(
                 f"{where} takes the Token returned by {chan.name}.{probe}(), got "
-                f"{type(token).__name__} (a raw readiness Boolean needs "
-                '`with unchecked("token", reason=...)`)'
+                f"{type(token).__name__}. Carry the Token through the loop, or wait on "
+                "the end's barrier with raw code."
             )
         if token._rec is not self._rec:
             raise ProtocolError(
@@ -1893,9 +1875,7 @@ class ConsumerEnd(_End):
             cute.arch.mbarrier_wait(self._full(index), phase)
         preview = Preview(self, index, phase, slot)
         self._rec.previews.append(preview)
-        if not self._rec.checked:
-            self._rec.checked = True
-            self._trace.checks.append(self._check_previews)
+        self._trace.opened(preview._life)
         return preview
 
     def _adopt(self, slot, rec: HandleRecord):
@@ -1909,16 +1889,7 @@ class ConsumerEnd(_End):
                 )
             preview._adopt(rec)
             self._rec.previews.remove(preview)
-
-    def _check_previews(self):
-        if self._rec.previews:
-            items = "; ".join(f"{p.describe()} at {p._site}" for p in self._rec.previews)
-            raise ProtocolError(
-                f"{self._trace.role_name}: previews no later wait consumes: {items}. A "
-                "wait() on the end, after the peek in trace order, must own and release the "
-                "previewed epoch (peel a loop's last iteration when the peek reads the next "
-                "iteration's epoch)"
-            )
+            self._trace.closed(preview._life, "adopted")
 
     def _signal(self, index):
         chan = self._chan

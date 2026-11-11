@@ -74,11 +74,11 @@ h.data["A"]  -> canonical A at h.index
 h.view("A")  -> registered tAsA at h.index (canonical A if none registered)
 ```
 
-Reassign the result of `views()` and return that endpoint from the role. It keeps the same
+Reassign the result of `views()` and return that end from the role. It keeps the same
 state and checks the stage extent, **not** whether the tensor addresses the named buffer.
 Use a view registered in a loop only in that region; it holds the loop's values.
 
-`h.view()` selects the handle's stage, never the endpoint's next one. Omit the name only
+`h.view()` selects the handle's stage, never the end's next one. Omit the name only
 for a single buffer. Registered partitions do not change `h.data`.
 
 To select other modes too, supply one coordinate per nonstage mode (`None` keeps a mode):
@@ -122,8 +122,8 @@ by a peer, follow the [pair memory-scope rules](clusters.md#memory-scope).
 
 ## Check declared aliases
 
-The alias diagnostic checks declared SMEM overlaps and `TmemPlan.alias` regions for
-conflicting accesses. **It reads your annotations, not all kernel memory accesses.**
+Annotate overlapping accesses so the alias diagnostic can compare their lifetimes and
+ordering. See [alias checks](guarantees.md#aliases) for what a result establishes.
 
 ```python
 op.alias_check = "warn"  # default; set before compiling
@@ -131,13 +131,8 @@ compile_kernel(op)  # your kernel's compile helper
 print(op.describe())
 ```
 
-| Mode | Effect |
-|---|---|
-| `"warn"` | Warn about findings and keep a report |
-| `"strict"` | Raise `ProtocolError` for a potential hazard, not an unverified case |
-| `"off"` | Skip analysis |
-
-The same mode runs the [fence check](channels.md#checking-explicit-fences).
+`alias_check` controls both alias analysis and the
+[fence check](channels.md#checking-explicit-fences).
 
 Analysis runs during tracing. `alias_check` is part of `op.__cute_cache_key__()`, so
 `jit_cache` cannot reuse warn/off builds for strict requests. Cache hits restore reports
@@ -167,7 +162,7 @@ tmem.access("P", stage, read=True, by="umma")
 ```
 
 `tmem.view()` returns an fp32 pointer, **not a CuTe tensor**. `tmem.access()` only records.
-The slot is a Python int [TMEM plan slot](channels.md#tmem), not a dynamic ring index.
+Pass a Python int [TMEM plan index](channels.md#tmem), not a dynamic ring index.
 Use `"threads"` for `tcgen05.ld/st` and `"umma"` for MMA.
 
 For a narrower TMEM footprint, declare `warps`, `lanes` and `cols`:
@@ -199,77 +194,18 @@ avoid allocated channel/barrier IDs too. Prefer a declared
 [`NamedBarrier`](channels.md#named-barriers), whose `sync()` records the same event, or
 choose an available ID with the correct participant count.
 
-- Wrappers emit the underlying instruction plus a host trace event, not another device op.
-- Access annotations emit no device code. Enabling/disabling this host-only analysis does
-  not change generated device code.
-- Managed signals and declared fences are recorded automatically. Raw instructions remain
-  legal but add no modeled ordering edge.
-- `signal=False` records the managed close, not your manual signal. An ordering supplied only
-  by that signal is `unverified`. So is one that might depend on a handle opened under
-  `unchecked("unclosed")` and never closed.
+Wrappers emit the underlying instruction plus a host trace event; annotations emit no device
+code. Managed signals and declared fences are recorded automatically. See
+[raw code and opt-outs](guarantees.md#opt-outs) before replacing them.
 
 ### Read the result
 
-`describe()` reports each declared alias:
-
-| Result | Meaning |
-|---|---|
-| `potential hazard` | Conflicting annotations with an established missing ordering edge; includes accesses, source lines and rule |
-| `unverified` | Not enough modeled information to decide |
-| `no hazard found` | No hazard among the annotated conflicting pairs; **not proof of safety** |
-
 Inspect `describe()` even without a warning: some unverified cases appear only there.
+See [alias checks](guarantees.md#aliases) for verdicts and modeled handoffs.
 
-The model covers single-CTA kernels, whole-region/stage footprints, same-channel handoffs
-and cross-channel paths. It runs loops and persistent work items twice. Clusters,
-raw/unannotated accesses and unmatched epochs can remain unverified. `h.data`, `tmem.ptr`,
-`tmem.cols` and `tmem.base` do not annotate later accesses. Cross-role convergence is not proved.
+When a report says "unknown epoch correspondence", prologues, peeled tiles or different
+loops may have given roles different traced counts. Balance the counts or inspect the
+overlap by hand; the diagnostic does not choose loop counts to make them balance.
 
-**Which handoffs order storage?**
-
-- An `n`-stage ring orders epoch `e` before `e+n`, not `e+1`. The stage-reuse edge covers only
-  storage indexed by that ring's stage, with static, disjoint stage spans.
-- Ring-stage SMEM shared across channels is unverified. Consumers of one fan-out epoch, and
-  producers of one fan-in epoch, are unordered with respect to each other.
-- Ring reuse inside an inner work-item loop adds no modeled edge. A pair ordered only by that
-  reuse can therefore be reported as a hazard.
-- Exclusive-ring same-stage handoffs are checked normally: consumers do not share epochs.
-  Paths through the exclusive ring and another channel are unverified because owners follow
-  runtime skips.
-- Round-robin epoch matching is not modeled. An ordering through that channel is unverified;
-  a pair no possible epoch pairing could order remains a potential hazard.
-
-**Unequal traced counts leave epoch matching unknown.** Prologues, peeled tiles or different
-loops can give roles different per-item counts. Only these cross-role links remain definite:
-
-```text
-item's commits -> consumer's last wait for that item
-Slots release  -> next item's first acquire
-```
-
-Other pairings within this item and the next are guesses. If only a guess orders a pair,
-the report says `unverified`, naming the channel, both counts and "unknown epoch correspondence",
-without warning. If no pairing could order it, the result remains `potential hazard`.
-
-An unbalanced channel can therefore downgrade a real hazard to unverified. Treat these
-entries as unchecked: balance traced counts or inspect the overlap by hand. The diagnostic
-does not choose loop counts to balance channels; that could hide a missing publication/release.
-
-Other assumptions and limits:
-
-- Loops run at least twice; TMEM loads finish before the next signal.
-- `tcgen05` thread-sync fences surround recorded barriers and channel signals; the analysis
-  assumes rather than verifies them.
-- A role's SMEM accesses are treated as one thread set: no cross-warp SMEM check.
-- Annotations are trusted to cover the role's uses of each annotated region.
-
-For an intentionally unmodeled access:
-
-```python
-with unchecked("alias", reason="access is ordered by the raw protocol below"):
-    tmem.access("P", stage, write=True, by="threads")
-```
-
-Only annotations inside the block are excluded. It adds no fence and certifies no safety.
-See [alias.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/alias.py) for modeled rules/PTX references and
-the [safety contract](guarantees.md) for the synchronization rules beyond aliasing.
+See [alias.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/alias.py)
+for the ordering rules and their PTX references.

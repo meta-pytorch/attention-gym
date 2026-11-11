@@ -26,7 +26,8 @@ item, connect the roles, and validate the handoffs. The [safety contract](guaran
 what warpdrive handles and what you must establish. You can still compile busted kernels, but its harder.
 We also got a skill boss: [authoring skill](https://github.com/meta-pytorch/attention-gym/blob/main/.agents/skills/authoring-warpdrive/SKILL.md).
 
-**To learn the vocabulary,** read the [tour notebook](tour.ipynb): it builds from a
+**For the vocabulary,** see [channels](channels.md#stages-and-phases). The
+[tour notebook](tour.ipynb) builds from a
 two-warp producer/consumer kernel to the pipelined GEMM, then schedules, clusters, storage
 aliases and the checkers, with saved `describe()` output, PTX excerpts and checks against
 PyTorch.

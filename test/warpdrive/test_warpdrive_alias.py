@@ -34,7 +34,6 @@ from attn_gym.warpdrive import (
     WorkCursor,
     WorkStream,
     role,
-    unchecked,
 )
 
 
@@ -48,19 +47,17 @@ def compile_quietly(op, compile_fn):
 
 
 class AliasRing(PreviewOverlap):
-    def __init__(self, opt_out: bool = False):
+    def __init__(self, annotated: bool = True):
         super().__init__(Umma)
-        self.opt_out = opt_out
+        self.annotated = annotated
 
     @role(warps=1)
     @cute.jit
     def cons(self, ctx, *, c: Consumer):
         for _ in cutlass.range(ctx.n, unroll=1):
-            if cutlass.const_expr(self.opt_out):
-                with unchecked("alias", reason="test: UMMA release does not publish thread reads"):
-                    c.peek().access("P", read=True)
-            else:
-                c.peek().access("P", read=True)
+            preview = c.peek()
+            if cutlass.const_expr(self.annotated):
+                preview.access("P", read=True)
             c.wait().release()
         return c
 
@@ -89,16 +86,15 @@ def test_alias_warning_restores_from_disk(tmp_path, monkeypatch):
     assert warm.describe() == cold.describe() and warm.checks() == cold.checks()
 
 
-def test_alias_strict_off_and_unchecked():
+def test_alias_strict_off_and_unannotated():
     compile_quietly(AliasRing(), compile_alias_ring)
     strict = AliasRing()
     strict.alias_check = "strict"
     raises_protocol(r"alias diagnostic \(strict\)", lambda: compile_alias_ring(strict))
 
-    opted = AliasRing(opt_out=True)
-    _, alias = compile_quietly(opted, compile_alias_ring)
+    unannotated = AliasRing(annotated=False)
+    _, alias = compile_quietly(unannotated, compile_alias_ring)
     assert alias == []
-    assert "unchecked alias @ test_warpdrive_alias.py:" in opted.describe()
 
     off = AliasRing()
     off.alias_check = "off"
@@ -122,12 +118,12 @@ def fa4():
     )
 
     class QkBeforePv(FlashAttentionForward):
-        def __init__(self, opt_out: bool = False, **kwargs):
+        def __init__(self, annotated: bool = True, **kwargs):
             super().__init__(**kwargs)
-            self.opt_out = opt_out
+            self.annotated = annotated
 
         def get_name(self) -> str:
-            return f"{super().get_name()}_qk_before_pv{int(self.opt_out)}"
+            return f"{super().get_name()}_qk_before_pv{int(not self.annotated)}"
 
         @role(warps=12, regs=48, cta="leader")
         @cute.jit
@@ -178,10 +174,7 @@ def fa4():
                     for j in cutlass.range_constexpr(Q_STAGE):
                         sl = s.acquire(j)
                         # MUTANT: S_j(i) = Q_j K_i^T overwrites P_j before PV_j reads it.
-                        if cutlass.const_expr(self.opt_out):
-                            with unchecked("alias", reason="mutant: deliberately unordered"):
-                                tmem.access("S", j, write=True, by="umma")
-                        else:
+                        if cutlass.const_expr(self.annotated):
                             tmem.access("S", j, write=True, by="umma")
                         umma(
                             params.mma_qk,
@@ -349,17 +342,18 @@ def test_qk_overwriting_p_before_pv_is_a_potential_hazard(fa4, tmp_path, monkeyp
     assert {c.tma for c in warm.checks().channels.values()} == {"verified", None}
 
 
-def test_strict_mode_raises_and_off_or_unchecked_opts_out(fa4):
+def test_strict_mode_raises_and_off_or_unannotated_opts_out(fa4):
     fa4.compile_quietly(fa4.QkBeforePv())  # a cached "warn" build must not satisfy a "strict" one
     strict = fa4.QkBeforePv()
     strict.alias_check = "strict"
     raises_protocol(r"alias diagnostic \(strict\)", lambda: fa4.compile_fa4_fwd(strict))
 
-    opted = fa4.QkBeforePv(opt_out=True)
-    _, alias = fa4.compile_quietly(opted)
+    unannotated = fa4.QkBeforePv(annotated=False)
+    _, alias = fa4.compile_quietly(unannotated)
     assert alias == []
-    assert "potential hazard" not in opted.checks().aliases.values(), alias_section(opted)
-    assert "unchecked alias @ test_warpdrive_alias.py:" in opted.describe()
+    assert "potential hazard" not in unannotated.checks().aliases.values(), alias_section(
+        unannotated
+    )
 
     off = fa4.QkBeforePv()
     off.alias_check = "off"

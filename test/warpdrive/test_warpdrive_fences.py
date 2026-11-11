@@ -216,11 +216,6 @@ class RefilledRing(Model):
                 h.access(read=True)
                 h.release(signal=False)
                 cute.arch.mbarrier_arrive(h.empty_barrier)
-            elif cutlass.const_expr(self.mode == "unclosed"):
-                with unchecked("unclosed", reason="test: released by the arrival below"):
-                    h = ring.wait()
-                h.access(read=True)
-                cute.arch.mbarrier_arrive(h.empty_barrier)
             else:
                 with ring.consume() as h:
                     if cutlass.const_expr(self.mode == "unannotated"):
@@ -271,7 +266,6 @@ def test_strict_mode_raises_on_a_missing_fence():
         ((), "unannotated", "unverified"),
         ((), "opted_out", "unverified"),
         ((), "raw_release", "unverified"),
-        ((), "unclosed", "unverified"),
         ((), "conditional_fence", "unverified"),
         ((), "loop_fence", "unverified"),
         ("smem_async", "span", "covered"),
@@ -284,7 +278,6 @@ def test_strict_mode_raises_on_a_missing_fence():
         "unannotated",
         "opted_out",
         "raw_release",
-        "unclosed",
         "conditional_fence",
         "loop_fence",
         "span_own_fence",

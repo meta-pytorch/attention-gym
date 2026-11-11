@@ -62,15 +62,11 @@ the epilogue drains the other. All stage choices must fit SMEM and TMEM.
 <summary>Tile choices, benchmarks and buffer reuse</summary>
 
 For two pairs sharing A along N, pass `cluster=Cluster(2, 2, pair=True)`; see
-[clusters](clusters.md#larger-clusters). At `tile_n=224`, this matches the cuBLAS 256x224 2x2
-configuration observed for 3000x5000x4096.
+[clusters](clusters.md#larger-clusters).
 
-**Choosing `tile_n`.** It defaults to 224 for `CtaPair()` and 256 otherwise. The winning width
-is mostly wave quantization: how the tile count divides into resident CTAs (152 CTAs, 76 pairs
-or 36 2x2 clusters on a GB300) and how full the last wave is, against the better per-FLOP
-efficiency of a 256-wide tile at many waves. No width wins everywhere and there is no
-shape-based selector; set `tile_n` for the shapes you run. Two traps: on a 2x2 cluster, 224
-makes a 448-wide cluster tile that gives N=4096 a fifth wave; 128 wins only tiny tile counts.
+`tile_n` defaults to 224 for `CtaPair()` and 256 otherwise. Tile width trades work per tile
+against how evenly tiles fill resident CTAs. There is no shape-based selector; benchmark the
+shapes you run.
 
 ```bash
 gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
@@ -79,8 +75,7 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 ```
 
 Variants are `mm` (`torch.mm`), `single`/`pair` with optional `_late` (`early_release=False`),
-`_clc`/`_atomic` schedules, `_acc1` (`acc_stages=1`) and `_n<tile_n>`. Short-K shapes trail
-`torch.mm`, from wave quantization and store bandwidth.
+`_clc`/`_atomic` schedules, `_acc1` (`acc_stages=1`) and `_n<tile_n>`.
 
 ### Tile boundaries
 
@@ -144,9 +139,8 @@ One compiled kernel handles dynamic `G`, `total_M`, `N`, `K` and routing. Option
 `ceil(total_M / tile_m) + G` m-tiles, since each ragged group adds at most one. `GroupedTiles`
 numbers real tiles back to back, dropping only indices after the last tile. Its
 [decode state](scheduling.md#decode-state) carries the prefix-sum walk between items,
-testing eight groups per round trip instead of restarting. Exact numbering is what lets the
-static schedule tie atomic/CLC without a scheduler warp: a binary search over a padded tile
-space scattered dropped slots through static units' strided sequences and unbalanced them.
+testing eight groups per round trip instead of restarting. Consecutive real-tile indices keep
+dropped entries from unbalancing static units' strided sequences.
 
 **Stopping stores at a group boundary.** A/out each use one descriptor plus
 `cute.domain_offset`; B is `(N, K, G)`, with group as a TMA coordinate. The output's ragged
@@ -199,9 +193,8 @@ Override warp placement and register budgets with
 `tile_n=64` halves the K/V tile; `rescale_threshold` controls FA4's lazy rescale. Head dimension
 comes from the tensors. See [configuration](configuration.md) for all options and fixed choices.
 
-For short sequences prefer `StaticPersistent()` (FA4's default) over `ClusterLaunchControl()`:
-at 8x16x1024, CLC launches 512 CTAs where static launches 152, and static is faster; on long
-sequences the two tie.
+Compare `StaticPersistent()` (FA4's default) with `ClusterLaunchControl()` on your workload;
+they can launch different numbers of CTAs.
 
 K/V share channel-bound SMEM. The constructor-only `overlap_o_q=True` also reuses Q's bytes
 for epilogue SMEM; `fa4_fwd` does not expose it. This requires a non-persistent schedule
@@ -236,8 +229,8 @@ out, lse = fa4_fwd(
 - Tests compare O/LSE bitwise: ragged Q, nonuniform scales, repeated launches, persistent
   wraps, and subnormal rescale amplified by large finite V. SASS and wrapper kernel-name
   checks verify that the hardware path runs.
-- It cuts instructions, not traffic: `LDTM.STAT.x32.MAX.F32` replaces most of the software
-  path's `FMNMX`, so the gain is small.
+- `LDTM.STAT.x32.MAX.F32` replaces the software path's maximum reduction without reducing
+  the score bytes loaded.
 
 ```bash
 gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 60s \
@@ -315,20 +308,19 @@ Design points worth reusing:
   `q.wait()` owns that epoch ([previews](channels.md#previews)). The 2-CTA kernel previews dO
   the same way.
 - **Defer a commit past the loop's back edge** with `commit(signal=False)` and a raw arrival
-  after S_{t+1}'s load (FA4's "dS_t is published once S_{t+1} is read"); a rotated loop that
-  closes the handle in its own iteration carries P_t in registers and is slower on causal runs.
-- **Arrive once per warp.** `Warps` sides replace per-thread arrivals; the other examples keep
-  `Threads`, where `Warps` showed no consistent gain.
+  after S_{t+1}'s load (FA4's "dS_t is published once S_{t+1} is read"). The handle still closes
+  in its opening region; only the raw signal is deferred.
+- **Arrive once per warp.** `Warps` sides synchronize readers before electing an arrival.
 - **Two Q stages are required:** with one, S_{t+1} waits for a load that needs Q_t's release.
 - **Write the peer's dS straight to SMEM** once the ds acquire guards it, and acquire ds only
-  after both dS stages are in TMEM; holding dS in registers or acquiring early is slower.
+  after both dS stages are in TMEM.
 - dQ reduce and dK/dV epilogues order SMEM staging with declared `NamedBarrier`s and
   `bulk_commit_group`/`bulk_wait_group`, as in the persistent GEMM epilogue.
 - The pair's dS exchange is raw: compute thread 0 arms the peer's `xchg` mbarrier
   (`mbarrier.arrive.expect_tx` on the peer) and issues `cp.async.bulk.shared::cluster`; the relay
   waits with a hand-kept phase. The ds channel orders sdS/sdSx and barrier reuse.
-- The alias report marks P~S, dS~dP, dQ~dP and dQ~dS `unverified` (unknown epoch
-  correspondence, not hazards), and every alias in the pair (pairs are not modeled).
+- See [alias checks](guarantees.md#aliases) when reading reports for peeled iterations and
+  pair storage.
 
 </details>
 
@@ -425,8 +417,8 @@ gpu-run --timeout 1800 auto -- timeout --signal=TERM --kill-after=5s 900s \
 ```
 
 The bench runs FA4's prepare/decode/combine against the port's decode/combine on seven dense
-and ragged shapes, timing the decode kernel with CUPTI, and asserts bitwise partials. Long
-splits tie FA4; short and ragged ones trail it. For NCU source attribution add
+and ragged shapes, timing the decode kernel with CUPTI, and asserts bitwise partials.
+For NCU source attribution add
 `--profile --shapes 0` under
 `CUTE_DSL_LINEINFO=1 ncu --profile-from-start off --cache-control none --import-source yes`,
 filtering kernels to `attn_kernel|warpdrive_fa4_decode`.
@@ -460,14 +452,13 @@ The declaration uses `consumer_sharing=Sharing.EXCLUSIVE` with QK/PV consumer ro
 FA4's QKIssued/PVIssued `NamedBarrier`s bound cursor skew; follow the
 [rendezvous recipe](channels.md#rendezvous-recipe-fa4s-qkissuedpvissued).
 
-Both MMA warps probe the next stage after releasing, using try tokens; here they help, unlike
-on split rings. The loader probes after each commit within a block's K or V group; its token
+Both MMA warps probe the next stage after releasing, using try tokens.
+The loader probes after each commit within a block's K or V group; its token
 cannot cross those dynamic regions, unlike FA4's loader token.
 
-Why it helps: with split rings, V-stage reuse waits on the previous PV, so the loader stalls
-before the next K; in the shared ring V reuses K stages that QK already released. Split rings
-stay the default because the effect depends on the shape, and "ragged" alone does not predict
-it: shared wins on some ragged shapes and loses on others. Measure with `--shared-kv`.
+With split rings, V-stage reuse waits on the previous PV before the loader reaches the next K.
+The shared ring lets V reuse K stages that QK already released. Compare with `--shared-kv`;
+the shape determines whether that reuse helps.
 
 ## Qwen3-0.6B decode megakernel
 
@@ -527,14 +518,12 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 - **Numerics** follow HF's bf16 rounding boundaries with fp32 accumulation; every per-step
   intermediate has its own buffer, so a launch has no write-after-read hazards.
 
-**What limits it** is latency between dependent phases, not bandwidth: a step has about 140
-dependent phases, each pays a flag handoff between SMs, and fetching already-published words
-costs an L2 round trip plus bytes. Compute almost never waits for weights. Optimize the number
-and length of dependent phases, not cache hints.
+Dependent model steps exchange flags between SMs; already-published words still need to be
+fetched. Use the trace to distinguish those waits from weight loading.
 
 `QwenDecodeMegakernel(splits=19)` (passed through `QwenMegakernel(..., splits=19)`) gives one
-attention item per GB300 SM; it is faster at long contexts and slower at short ones. The split
-count is static, so pick it for the contexts the runner decodes.
+attention item per GB300 SM. The split count is static; benchmark it for the contexts the
+runner decodes.
 
 </details>
 
@@ -601,17 +590,16 @@ Disabled, both emit no instructions.
   imports such as `cutlass._mlir_helpers.arith.bitcast`. Each strong load is one L2 request per
   lane, so use vector loads when polling.
 
-Known layer limits: there is no channel kind between CTAs (the tagged words are raw code),
-`Tma(tx_bytes)` fixes a ring's bytes per stage, and `plan_from_warpdrive` models only the
-CTA-local ring, so it cannot see this kernel's cross-CTA critical path.
+The tagged-word protocol crosses clusters and uses raw code, not the layer's
+[cluster channels](clusters.md). `plan_from_warpdrive` sees only this kernel's CTA-local ring,
+not its cross-CTA critical path; see [raw code and opt-outs](guarantees.md#opt-outs).
 
 </details>
 
 ## Known limits
 
-Non-bulk `cp.async` producer mechanisms are not supported (`cp.async.bulk` loads can use
-`Tma`; see [TMA checks](tracing.md#tma-checks)). Both decode variants are OneShot-only. The
-alias diagnostic has limited ordering coverage; see [storage](storage.md#read-the-result).
+Both decode variants are OneShot-only. See the [safety contract](guarantees.md) for layer
+mechanisms and analysis boundaries.
 
 For the normal and quick-fuzz commands, see [Tests](index.md#tests). Long campaigns and
 what the harness covers are in the [fuzz harness guide](https://github.com/meta-pytorch/attention-gym/blob/main/test/warpdrive_fuzz/README.md).

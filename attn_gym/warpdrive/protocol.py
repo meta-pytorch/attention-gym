@@ -22,17 +22,14 @@ class ProtocolError(Exception):
     """A role protocol violation detected while declaring or tracing a kernel."""
 
 
-# Checks a role can opt out of at one site (``with unchecked(check, reason=...)``):
-#   unclosed      handles opened inside the block may stay open at role exit
-#   cross_region  closes inside the block may sit in a different loop/branch than their open
-#   tma           TMA copies into barriers taken inside the block skip the atom and byte checks
-#   alias         accesses annotated inside the block are left out of the alias diagnostic
-#   token         wait/acquire(token=...) inside the block trust the readiness they are given: a
-#                 Token of any epoch or region, or a raw Boolean (an mbarrier try_wait result)
-#   fence         accesses annotated inside the block are left out of the fence check (fences.py)
-#   liveness      channel and barrier ops inside the block are invisible to the liveness check,
-#                 which reports the kernel unverified instead of checking them
-CHECKS = ("unclosed", "cross_region", "tma", "alias", "token", "fence", "liveness")
+# Per-site opt-outs: ``with unchecked(check, reason=...)``.
+#   tma       copies through barrier pointers obtained inside the block skip atom/byte checks
+#   fence     accesses annotated inside the block are left out of the fence check (fences.py)
+#   liveness  channel and barrier ops inside the block are invisible to the liveness check,
+#             which reports the kernel unverified instead of checking them
+# Use a span across a counted loop. ``signal=False`` omits the signal, not the handle close.
+# Leave alias accesses unannotated, carry a Token, or use raw barriers.
+CHECKS = ("tma", "fence", "liveness")
 
 
 @dataclass
@@ -73,11 +70,11 @@ def current_trace():
 
 @contextmanager
 def unchecked(check: str, *, reason: str):
-    """Disable one trace-time check inside the block.
+    """Opt out of one trace check without changing synchronization.
 
-    ``reason`` must be non-empty. ``describe()`` lists it with the source line and
-    suppressed checks. Other checks stay active. Use this only when the checker cannot
-    see the ordering, such as a handle closed in the next loop iteration.
+    ``reason`` must be non-empty; ``describe()`` records it with the site and suppressed checks.
+    ``CHECKS`` lists accepted kinds. Other checks stay active;
+    see ``docs/warpdrive/dropping-down.md``.
     """
     if check not in CHECKS:
         raise ValueError(f"unknown check {check!r}; one of {CHECKS}")
@@ -163,6 +160,7 @@ class _Copy:
     site: str
     function: str | None  # the user function that made it
     callee: str | None  # its bound or standalone spelling, for schematic reassignment advice
+    block: object = None  # creation region; a carry creates a copy inside the new region
 
 
 class Lineage:
@@ -195,8 +193,28 @@ class Lineage:
                 callee = f"self.{function}"
                 break
             caller = _user_frame(caller.f_back) if caller.f_back is not None else None
-        self._copies.append(_Copy(self._advances, _frame_site(frame), function, callee))
+        try:
+            block = current_block()
+        except ValueError:  # made outside a trace
+            block = None
+        copy = _Copy(self._advances, _frame_site(frame), function, callee, block)
+        self._copies.append(copy)
         return len(self._copies) - 1
+
+    def check_carried(self, copy: int, trace: RoleTrace, name: str, kind: str) -> None:
+        """Raise if ``copy`` advances inside a loop or branch that did not carry it in.
+
+        CuTeDSL carries a value through a region only when the region reassigns it or calls a
+        method on it. A helper that advances an end in place, called without reassigning its
+        result, loses the advance when the region ends."""
+        made = self._copies[copy]
+        if made.block is None or made.block == current_block():
+            return
+        raise ProtocolError(
+            f"{trace.role_name}: the {name} {kind} advances at {user_site()} inside a loop or "
+            f"branch that does not carry it (created at {made.site}). Reassign the {kind} "
+            f"returned by the helper: `{name} = helper({name}, ...)`."
+        )
 
     def advanced(self, copy: int) -> None:
         """Record an advance, raw-state access or phase assignment by ``copy``."""
@@ -240,8 +258,8 @@ class Event:
 
     ``where`` lists enclosing dynamic regions outermost first as ``(block key, kind)``:
     ``loop`` for ``scf.for``/``scf.while``, ``if`` or ``other``. ``open`` holds the active
-    handles. ``opted_out`` marks unchecked alias accesses or liveness ops;
-    ``fence_opted_out`` marks unchecked fence accesses.
+    handle records. ``opted_out`` marks an access inside ``unchecked("fence")`` or a channel or
+    barrier op inside ``unchecked("liveness")``.
     """
 
     kind: str
@@ -250,7 +268,6 @@ class Event:
     where: tuple
     open: tuple
     opted_out: bool = False
-    fence_opted_out: bool = False
 
 
 def _region_kind(block) -> str:
@@ -296,8 +313,26 @@ class ProtocolLog:
         return "\n".join(lines)
 
 
+@dataclass(eq=False)
+class Lifetime:
+    """A handle or span until close, or a preview until its adopting wait.
+
+    ``RoleTrace.finish`` checks for resources left live at role exit. Handles close in their
+    opening region because tracing sees each region once and does not carry handle copies.
+    Spans may close in their counted loop's last trip. Previews may cross regions: the end's
+    next wait adopts the outstanding preview.
+    """
+
+    what: str
+    site: str
+    block: object  # the region that took it
+    region_bound: bool = True
+    closed_at: str | None = None
+    closed_op: str | None = None
+
+
 class RoleTrace:
-    """Events and handle lifetimes for one traced role instance."""
+    """Live-resource and event bookkeeping for one traced role instance."""
 
     def __init__(self, role_name: str, log: ProtocolLog | None, ranges=None, waits: bool = True):
         self.role_name = role_name
@@ -305,7 +340,7 @@ class RoleTrace:
         self.ranges = ranges  # the trace backend's ranges of this role (tracing.py), or None
         self.trace_waits = ranges is not None and waits
         self.item_block = None  # the work-item loop body (set by the WorkCursor's advance())
-        self.open: list = []
+        self.live: list[Lifetime] = []  # in the order they were taken
         self.checks: list = []  # end-of-role trace checks (e.g. work cursors)
         self.tma_bars: list = []  # TMA-channel full-barrier pointers handed out (tma.py)
         # One record for the trace checks: channel ops, handle lifetimes, accesses and ordering.
@@ -331,15 +366,13 @@ class RoleTrace:
 
     def event(self, kind: str, /, **data):  # positional: an event may carry a "kind" field
         site = user_site()
-        opted_out = fence_opted_out = False
+        opted_out = False
         if kind == "access":
-            what = f"{data['storage'][1]} access at {site}"
-            opted_out = self.opt_out("alias", what)
-            fence_opted_out = self.opt_out("fence", what)
+            opted_out = self.opt_out("fence", f"{data['storage'][1]} access at {site}")
         elif kind in ("op", "barrier", "barrier_arrive"):
             what = data.get("chan") or getattr(data.get("barrier"), "name", "named barrier")
             opted_out = self.opt_out("liveness", f"{what} at {site}")
-        ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out, fence_opted_out)
+        ev = Event(kind, data, site, self.where(), tuple(self.open), opted_out)
         self.events.append(ev)
         return ev
 
@@ -423,41 +456,46 @@ class RoleTrace:
             return f"{self.role_name} uses it both inside and outside the work-item loop"
         return (regions.pop() if regions else None), seq
 
-    def opened(self, handle):
-        if (opt := active_opt_out("unclosed")) is not None:
-            handle.unclosed_ok = opt
-        self.open.append(handle)
+    @property
+    def open(self) -> list:
+        """The open handles and spans, in the order they opened."""
+        return [r for r in self.live if r.region_bound]
 
-    def closed(self, handle, op: str, region_checked: bool = False):
-        """Record ``op`` closing ``handle``. ``region_checked``: the caller checked where this
-        close runs itself (a ``Span`` closes in its loop's last iteration)."""
+    def opened(self, res: Lifetime):
+        self.live.append(res)
+
+    def closed(self, res: Lifetime, op: str, *, last_trip: bool = False, hint: str = ""):
+        """Record ``op`` ending ``res``. A region-bound resource ending in another region leaves
+        both regions' live sets changed. ``last_trip``: a span signalling in its loop's last
+        trip, which ends it once per take (``Span`` checks the loop)."""
         site = user_site()
-        if handle.closed_at is not None:
+        if res.closed_at is not None:
             raise ProtocolError(
-                f"{self.role_name}: {handle.what} closed twice: {handle.closed_op} at "
-                f"{handle.closed_at}, then {op} at {site}"
+                f"{self.role_name}: {res.what} closed twice: {res.closed_op} at "
+                f"{res.closed_at}, then {op} at {site}"
             )
-        cross = not region_checked and current_block() != handle.block
-        if cross and not self.opt_out("cross_region", f"{handle.what} {op} at {site}"):
+        if res.region_bound and not last_trip and current_block() != res.block:
             raise ProtocolError(
-                f"{self.role_name}: {handle.what} opened at {handle.site} but {op} at "
-                f"{site} is in a different dynamic region (loop or branch), so it would run a "
-                "different number of times than the acquire; close handles in the region "
-                "that opened them"
+                f"{self.role_name}: {res.what} opened at {res.site} but {op} at "
+                f"{site} is in a different dynamic region (loop or branch). Close it in the "
+                f"region that opened it{hint}"
             )
-        handle.closed_at, handle.closed_op = site, op
-        self.open.remove(handle)
+        res.closed_at, res.closed_op = site, op
+        self.live.remove(res)
 
     def finish(self):
         for check in self.checks:
             check()
-        leaks = []
-        for h in self.open:
-            if h.unclosed_ok is None:
-                leaks.append(h)
-                continue
-            h.unclosed_ok.role = h.unclosed_ok.role or self.role_name
-            h.unclosed_ok.suppressed.append(f"{h.what} opened at {h.site} left open")
-        if leaks:
-            items = "; ".join(f"{h.what} opened at {h.site}" for h in leaks)
-            raise ProtocolError(f"{self.role_name}: handles never closed: {items}")
+        handles = "; ".join(f"{r.what} opened at {r.site}" for r in self.open)
+        if handles:
+            raise ProtocolError(
+                f"{self.role_name}: handles never closed: {handles}. Close each handle in its "
+                "opening region."
+            )
+        if self.live:
+            items = "; ".join(f"{r.what} at {r.site}" for r in self.live)
+            raise ProtocolError(
+                f"{self.role_name}: previews no later wait consumes: {items}. Add a wait() "
+                "after the peek in trace order and release its handle; peel the last iteration "
+                "if the peek reads the next iteration's epoch."
+            )

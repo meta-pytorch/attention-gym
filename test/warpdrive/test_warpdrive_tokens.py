@@ -30,7 +30,6 @@ from attn_gym.warpdrive import (
     Umma,
     WarpSpecialized,
     role,
-    unchecked,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 
@@ -216,7 +215,7 @@ class Misuse(Toy):
     [
         (
             "boolean",
-            r"ch\.wait\(token=\.\.\.\) at .* takes the Token returned by ch\.try_wait\(\), got Boolean \(a raw readiness Boolean needs",
+            r"ch\.wait\(token=\.\.\.\) at .* takes the Token returned by ch\.try_wait\(\), got Boolean\. Carry the Token",
         ),
         ("forged", r"this token was not returned by ch\.try_wait\(\)"),
         ("other_end", r"got a token of the other consumer end of cons"),
@@ -405,17 +404,15 @@ def test_preview_reads_are_checked_against_the_owning_release(consumer, expected
 
 
 class CarriedToy(Toy):
-    """Probe before the loop and after each release; use readiness in the next wait.
-
-    ``carry="raw"`` carries token.ready as a Boolean under unchecked("token"); "token"
-    carries a checked Token. A delayed producer makes every probe find the stage empty;
+    """Probe before the loop and after each release; the loop carries the Token to the next
+    wait. A delayed producer makes every probe find the stage empty;
     a delayed consumer makes every probe find it full. ``out`` holds consumer probe
     results followed by wrong words. Producer probes are in test_warpdrive_hardening.py.
     """
 
-    def __init__(self, carry: str, late: str):
-        self.carry, self.late = carry, late
-        self.label = f"carried_{carry}_{late}"
+    def __init__(self, late: str):
+        self.late = late
+        self.label = f"carried_token_{late}"
         self.ch = Ring(2, Threads, Threads, payload=(cutlass.Int32, (N,)))
 
     @role(warps=0)
@@ -436,45 +433,25 @@ class CarriedToy(Toy):
         bad = cutlass.Int32(0)
         if cutlass.const_expr(self.late == "consumer"):
             spin(ctx.delay)
-        if cutlass.const_expr(self.carry == "raw"):
-            ready = ch.try_wait().ready
-            for i in cutlass.range(ctx.n, unroll=1):
-                if lane == 0:
-                    ctx.out[i] = cutlass.Int32(ready)
-                with unchecked("token", reason="probed at the end of the previous iteration"):
-                    h = ch.wait(token=ready)
-                bad = bad + (h.data[lane] != i * N + lane)
-                h.release()
-                if cutlass.const_expr(self.late == "consumer"):
-                    spin(ctx.delay)
-                ready = ch.try_wait().ready  # the next iteration's epoch
-        else:
-            token = ch.try_wait()
-            for i in cutlass.range(ctx.n, unroll=1):
-                if lane == 0:
-                    ctx.out[i] = cutlass.Int32(token.ready)
-                h = ch.wait(token=token)
-                bad = bad + (h.data[lane] != i * N + lane)
-                h.release()
-                if cutlass.const_expr(self.late == "consumer"):
-                    spin(ctx.delay)
-                token = ch.try_wait()  # the next iteration's epoch
+        token = ch.try_wait()
+        for i in cutlass.range(ctx.n, unroll=1):
+            if lane == 0:
+                ctx.out[i] = cutlass.Int32(token.ready)
+            h = ch.wait(token=token)
+            bad = bad + (h.data[lane] != i * N + lane)
+            h.release()
+            if cutlass.const_expr(self.late == "consumer"):
+                spin(ctx.delay)
+            token = ch.try_wait()  # the next iteration's epoch
         ctx.out[ctx.n + lane] = bad
         return ch
 
 
-@pytest.mark.parametrize("carry", ["raw", "token"])
 @pytest.mark.parametrize("late", ["producer", "consumer"])
-def test_readiness_carried_across_iterations(requires_blackwell, carry, late):
+def test_readiness_carried_across_iterations(requires_blackwell, late):
     n = 6
-    op = CarriedToy(carry, late)
+    op = CarriedToy(late)
     fn = compile_toy(op, op.label)
-    if carry == "raw":
-        assert re.search(
-            r"unchecked token @ .*'probed at the end of the previous iteration' -> "
-            r"ch\.wait\(token=Boolean\)",
-            op.describe(),
-        ), op.describe()
     for _ in range(3):
         out = torch.full((n + N,), -1, device="cuda", dtype=torch.int32)
         fn(out, n, DELAY)
