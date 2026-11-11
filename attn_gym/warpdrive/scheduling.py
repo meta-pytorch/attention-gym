@@ -790,9 +790,7 @@ class WorkStream:
             type(self.schedule.stages) is not int or self.schedule.stages <= 0
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
-        if isinstance(self.schedule, TilePersistent) and (
-            type(self.mapping) is not Raster or self.mapping != Raster()
-        ):
+        if isinstance(self.schedule, TilePersistent) and not _plain_raster(self.mapping):
             raise ValueError(
                 f"{self.schedule.describe()} reads the item from blockIdx: it needs the plain "
                 f"Raster() mapping, not {self.describe()}"
@@ -973,7 +971,7 @@ class WorkStream:
         count = int(mapping.count64(space))
         total = _narrow(count)
         cs = self.cluster_size
-        units = int(schedule.launch_units(total, _unit_cap(schedule, max_ctas, cs)))
+        units = int(_launch_units(schedule, total, max_ctas, cs))
         if schedule.index_limit(count, units, cs) > INT32_MAX:
             raise ValueError(f"the space's {count} items exceed what a launch indexes in Int32")
         if decode is None and mapping.decodes_any_index:
@@ -1063,6 +1061,7 @@ class BoundWork:
         self.total = total
         self.limit = limit  # a Limit, read per decoding site (``_limited``)
         self.cs = stream.cluster_size  # CTAs per work unit
+        self.first_words = None  # item words from blockIdx, set by ``start`` in the prologue
 
     def _in_units(self, ctas):
         """A CTA count or index along x in work units (clusters of ``cs`` CTAs)."""
@@ -1088,7 +1087,6 @@ class BoundWork:
         """Device-side, in the kernel prologue (``begin_roles``): the first item's words of a
         ``_tile_grid`` stream. Every role shares them, which keeps the 1-D fallback branch of
         ``OneShot(grid="auto")`` off the roles' paths."""
-        self.first_words = None
         if _tile_persistent(self.stream):
             _check_single_cta(self.stream, self.cs)
             self.first_words = tuple(Int32(b) for b in cute.arch.block_idx())
@@ -1140,10 +1138,10 @@ class BoundWork:
         site's whole stream, so the copy serves its loops without being carried."""
         if self.limit is None:
             return self
-        new = BoundWork(self.stream, self.space, self.workspace, None, total=self.total)
         limit = cutlass.max(Int32(self.limit.read()), Int32(0))
-        new.total = cutlass.min(Int32(self.total), limit)
-        new.first_words = getattr(self, "first_words", None)
+        total = cutlass.min(Int32(self.total), limit)
+        new = BoundWork(self.stream, self.space, self.workspace, None, total=total)
+        new.first_words = self.first_words
         return new
 
     def __extract_mlir_values__(self):
@@ -1171,7 +1169,7 @@ class BoundWork:
             limit = cutlass.new_from_mlir_values(self.limit, values[n:])
         new = BoundWork(self.stream, space, ws, None, total, limit)
         # Prologue values (begin_roles) dominate every later region, so they carry as is.
-        new.first_words = getattr(self, "first_words", None)
+        new.first_words = self.first_words
         return new
 
     def grid(self):
@@ -1183,7 +1181,7 @@ class BoundWork:
         grid: static extents past their 65535 limit raise here, and runtime ones launch the
         grid as is, which CUDA rejects."""
         schedule = self.stream.schedule
-        units = schedule.launch_units(self.total, _unit_cap(schedule, self.max_ctas, self.cs))
+        units = _launch_units(schedule, self.total, self.max_ctas, self.cs)
         if _tile_grid(self.stream):
             x, y, z = tile_grid_dims(self.space, self.cs, schedule.grid)
         elif _tile_persistent(self.stream):
@@ -1207,15 +1205,16 @@ class BoundWork:
 # --------------------------------------------------------------------------- #
 
 
-def _unit_cap(schedule, max_ctas, cs: int):
-    """``launch_units``'s cap, shared by the launch and ``assignment``: ``max_ctas`` in whole
-    work units of ``cs`` CTAs (at least one cluster when ``cs > 1``), or None for a schedule
-    without ``uses_max_ctas``."""
+def _launch_units(schedule, total, max_ctas, cs: int):
+    """Launched work units, for the grid and ``assignment``. A schedule with ``uses_max_ctas``
+    needs ``max_ctas``, capped in whole work units of ``cs`` CTAs (at least one cluster when
+    ``cs > 1``); any other schedule gets no cap."""
     if not schedule.uses_max_ctas:
-        return None
+        return schedule.launch_units(total, None)
     if max_ctas is None:
         raise ValueError(f"{schedule.describe()} needs max_ctas")
-    return max_ctas if cs == 1 else cutlass.max(max_ctas // cs, 1)
+    cap = max_ctas if cs == 1 else cutlass.max(max_ctas // cs, 1)
+    return schedule.launch_units(total, cap)
 
 
 def _narrow(count):
@@ -1593,14 +1592,17 @@ def _tile_grid(stream) -> bool:
     """One item per CTA in plain raster order: launch the tile space as the grid (``l`` folded
     into x for ``"2d"``) and take the item from ``blockIdx``. Decoding a 1-D index divides
     by the extents on the load warp's path to its first copy."""
-    mapping = stream.mapping
     return (
         type(stream.schedule) is OneShot  # a subclass may override first_index()
         and stream.schedule.grid != "1d"
-        and type(mapping) is Raster
-        and mapping.along == "m"
-        and mapping.swizzle == 1
+        and _plain_raster(stream.mapping)
     )
+
+
+def _plain_raster(mapping) -> bool:
+    """The default ``Raster()`` (along m, no swizzle): its item order is ``blockIdx`` order, so
+    tile-space grids read items from ``blockIdx``."""
+    return type(mapping) is Raster and mapping == Raster()
 
 
 def _publishes_first(stream) -> bool:
