@@ -202,23 +202,11 @@ def test_binding_rejects(kwargs, match):
         JointRing(**kwargs).describe()
 
 
-class PairPlaced(JointRing):
-    def __init__(self):
-        super().__init__()
-        self.cluster = CtaPair()
-
-    @role(warps=5, cta="leader")
-    @cute.jit
-    def mma(self, ctx, *, h: Consumer):
-        for _ in cutlass.range(ctx.n, unroll=1):
-            with h.consume():
-                pass
-        return h
-
-
 def test_cross_cta_placement_is_rejected():
+    op = JointRing(roles={"mma": RoleConfig(5, cta="leader")})
+    op.cluster = CtaPair()
     with pytest.raises(ProtocolError, match="CTA-local only"):
-        PairPlaced().describe()
+        op.describe()
 
 
 # Tracing: signals, fences and the alias diagnostic

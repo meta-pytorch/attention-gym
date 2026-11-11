@@ -3,7 +3,7 @@
 import re
 import shutil
 import subprocess
-from dataclasses import FrozenInstanceError, dataclass, field, replace
+from dataclasses import FrozenInstanceError, dataclass, replace
 from types import SimpleNamespace
 
 import pytest
@@ -102,8 +102,8 @@ def compile_copy(op: ConfiguredCopy):
 
 @dataclass(frozen=True)
 class CopyRoles:
-    load: RoleConfig = field(default_factory=lambda: LOAD)
-    consume: RoleConfig = field(default_factory=lambda: CONSUME)
+    load: RoleConfig = LOAD
+    consume: RoleConfig = CONSUME
 
 
 class SelectedCopy(ConfiguredCopy):
@@ -267,9 +267,8 @@ def test_omitted_registers_emit_no_adjustment(requires_blackwell, monkeypatch, t
     compile_copy(op)
 
 
-def test_cache_key_is_the_resolved_config(tmp_path, monkeypatch):
-    """jit_cache keys the resolved roles and the class, not the name (compile only)."""
-    monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
+def test_cache_key_is_the_constructor_call():
+    """jit_cache keys the class and its constructor call, not the resolved roles."""
     built = []
 
     @jit_cache(persistent=False)

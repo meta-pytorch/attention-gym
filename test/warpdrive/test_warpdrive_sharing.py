@@ -15,6 +15,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 from cutlass import cute
+from probe_kernels import probe_kernel
 
 from attn_gym.testing.warpdrive import raises_protocol as _raises_protocol
 from attn_gym.warpdrive import (
@@ -218,17 +219,6 @@ def test_external_side_declaration_errors():
         Ring(2, external="producer", override={"full_counts": 1}, commit_fence="smem_async")
 
 
-def _kernel(channels, roles):
-    cls = type("Probe", (WarpSpecialized,), dict(roles))
-
-    def init(self):
-        for name, make in channels.items():
-            setattr(self, name, make())
-
-    cls.__init__ = init
-    return cls()
-
-
 @role(warps=0)
 @cute.jit
 def _prod(self, ctx, *, ch: Producer):
@@ -243,7 +233,7 @@ def _cons(self, ctx, *, ch: Consumer):
 
 def test_external_side_binds_no_role():
     external = {"ch": lambda: Ring(2, external="consumer", override={"empty_counts": 1})}
-    text = _kernel(external, {"prod": _prod}).describe()
+    text = probe_kernel(external, {"prod": _prod}).describe()
     assert "ch  Ring(2)  prod -> raw code\n" in text, text
     assert "empty     1 x2" in text, text
     assert (
@@ -252,12 +242,12 @@ def test_external_side_binds_no_role():
     _raises_protocol(
         r"channel ch: its consumer side is external \(driven by raw code\), but roles "
         r"\['cons'\] take a Consumer end",
-        _kernel(external, {"prod": _prod, "cons": _cons}).describe,
+        probe_kernel(external, {"prod": _prod, "cons": _cons}).describe,
     )
     # The managed side still needs its role.
     _raises_protocol(
         "channel ch: slot 0 has no producer role",
-        _kernel(external, {"other": _cons}).describe,
+        probe_kernel(external, {"other": _cons}).describe,
     )
 
 
@@ -311,7 +301,7 @@ def test_external_channels_stay_cta_local():
         return ch
 
     external = {"ch": lambda: Ring(2, external="producer", override={"full_counts": 1})}
-    op = _kernel(external, {"cons": _cons, "lead": lead})
+    op = probe_kernel(external, {"cons": _cons, "lead": lead})
     op.cluster = CtaPair()
     _raises_protocol(
         "channel ch: its consumer roles run in different CTAs, but its producer side is "

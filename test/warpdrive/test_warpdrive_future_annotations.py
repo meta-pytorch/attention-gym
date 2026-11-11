@@ -46,16 +46,8 @@ class FutureToy(WarpSpecialized):
         return ch
 
 
-class FutureTypoToy(WarpSpecialized):
-    def __init__(self):
-        self.ch = Slots(2, Threads, Threads)
-
-    @role(warps=0)
-    @cute.jit
-    def prod(self, ch: Producer, params: FutureParams):
-        return ch
-
-    @role(warps=1)
+class FutureTypoToy(FutureToy):
+    @role(warps=2)
     @cute.jit
     def cons(self, ch: Consumer, params: FutreParams):  # noqa: F821 (the typo under test)
         return ch

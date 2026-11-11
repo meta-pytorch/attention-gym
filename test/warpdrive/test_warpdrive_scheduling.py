@@ -69,7 +69,6 @@ def test_raster_is_a_bijection(mapping):
     for ext in EXTENTS:
         coords = _all_coords(mapping, ext)
         assert sorted(coords) == sorted(itertools.product(*(range(e) for e in ext))), ext
-        assert len(set(coords)) == len(coords), ext
         assert tuple(int(e) for e in mapping.bind(ext)) == ext  # nonempty spaces bind unchanged
 
 

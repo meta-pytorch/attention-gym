@@ -58,11 +58,11 @@ class _Recorder:
     def range_push(self, name, *payload):
         self.pushed.append(name)
         self.payloads.append(bool(payload))
-        return self.real.range_push(name, *payload) if self.real else None
+        return self.real.range_push(name, *payload)
 
     def range_pop(self):
         self.pops += 1
-        return self.real.range_pop() if self.real else None
+        return self.real.range_pop()
 
 
 @pytest.fixture

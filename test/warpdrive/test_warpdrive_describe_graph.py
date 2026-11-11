@@ -287,7 +287,8 @@ class Page(HTMLParser):
         self.nodes, self.wires, self.external = {}, [], []
         self._node, self._data = None, None
         self.feed(text)
-        self.svg = ElementTree.fromstring(text[text.index("<svg") : text.index("</svg>") + 6])
+        # Parsing raises unless the SVG is well formed.
+        ElementTree.fromstring(text[text.index("<svg") : text.index("</svg>") + 6])
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)

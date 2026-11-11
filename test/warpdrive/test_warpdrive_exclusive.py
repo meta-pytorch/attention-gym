@@ -16,6 +16,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 from cutlass import cute
+from probe_kernels import probe_kernel
 
 from attn_gym.testing.warpdrive import alias_section, status
 from attn_gym.testing.warpdrive import raises_protocol as _raises_protocol
@@ -121,20 +122,6 @@ def take(ctx, kv, e, who: int, delay):
 # Declaration and collection errors
 
 
-def _kernel(channels, roles, cluster=None):
-    """A kernel class with the given channel attributes and role functions."""
-    cls = type("Probe", (WarpSpecialized,), dict(roles))
-
-    def init(self):
-        for name, make in channels.items():
-            setattr(self, name, make())
-        if cluster is not None:
-            self.cluster = cluster
-
-    cls.__init__ = init
-    return cls()
-
-
 def _role(warps, side, cta="all"):
     @role(warps=warps, cta=cta)
     @cute.jit
@@ -151,7 +138,7 @@ _P, _A, _B = _role(0, Producer), _role(1, Consumer), _role(2, Consumer)
 def _probe(roles, cluster=None, consumer_roles=("a", "b")):
     """A kernel with the given roles on ``kv``, an exclusive Ring of ``consumer_roles``."""
     channels = {"kv": lambda: Ring(2, Threads, Threads, consumer_roles=consumer_roles, **_EXCL)}
-    return _kernel(channels, roles, cluster)
+    return probe_kernel(channels, roles, cluster)
 
 
 VALUE_ERRORS = {
@@ -210,17 +197,17 @@ def test_overrides_apply_to_exclusive_rings():
     Umma consumers are valid because each epoch has one commit.
     """
     roles = {"p": _P, "a": _A, "b": _role(range(2, 4), Consumer)}
-    op = _kernel({"kv": lambda: exclusive(2, override={"empty_counts": 1})}, roles)
+    op = probe_kernel({"kv": lambda: exclusive(2, override={"empty_counts": 1})}, roles)
     text = op.describe()
     assert "empty     1 x2" in text
     assert "empty counts overridden: each owner's release must supply them (unverified)" in text
-    op = _kernel(
+    op = probe_kernel(
         {"kv": lambda: exclusive(2, override={"full_counts": 1})}, {"p": _P, "a": _A, "b": _B}
     )
     text = op.describe()
     assert "override  full_counts 32 x2 -> 1 x2  (differs from derived)" in text
     assert "counts are one consumer's" in text
-    op = _kernel({"kv": lambda: exclusive(2, Umma)}, {"p": _P, "a": _A, "b": _B})
+    op = probe_kernel({"kv": lambda: exclusive(2, Umma)}, {"p": _P, "a": _A, "b": _B})
     assert "empty     1 x2" in op.describe()
 
 

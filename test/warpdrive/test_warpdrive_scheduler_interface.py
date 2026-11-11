@@ -594,15 +594,14 @@ class PlainToy:
                 trips = work.trip_count()
             if cutlass.const_expr(self.mode == "count_item_before_loop"):
                 _hit(0, work.item_at(0), ctx)
-            if cutlass.const_expr(self.mode != "count_no_loop"):
-                for k in cutlass.range(trips, unroll=2):
-                    if cutlass.const_expr(self.mode == "count_item_in_branch"):
-                        if first_thread:
-                            _hit(0, work.item_at(k), ctx)
-                    else:
-                        item = work.item_at(k)
-                        if first_thread:
-                            _hit(0, item, ctx)
+            for k in cutlass.range(trips, unroll=2):
+                if cutlass.const_expr(self.mode == "count_item_in_branch"):
+                    if first_thread:
+                        _hit(0, work.item_at(k), ctx)
+                else:
+                    item = work.item_at(k)
+                    if first_thread:
+                        _hit(0, item, ctx)
             if cutlass.const_expr(self.mode == "count_then_advance"):
                 work.advance()
         else:

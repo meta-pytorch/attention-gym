@@ -65,10 +65,7 @@ class TaggedGemm(Tagged, Gemm):
 
 
 def test_key_names_each_compile_time_choice():
-    """Equal configurations share a key; codegen and trace-check settings get distinct keys.
-
-    Compile only.
-    """
+    """Equal configurations share a key; codegen and trace-check settings get distinct keys."""
     base = key_of(Gemm())
     assert key_of(Gemm()) == key_of(Gemm(ab_stages=3)) == base  # defaults are filled in
     strict = Gemm()
@@ -110,10 +107,7 @@ def test_key_names_each_compile_time_choice():
 
 
 def test_pickled_kernel_keeps_its_key():
-    """Pickle the constructor call and host settings for a fresh compiler process.
-
-    Compile only.
-    """
+    """Pickle the constructor call and host settings for a fresh compiler process."""
     op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair(), tile_n=224)
     op.enable_iket(waits=False).alias_check = "off"
     copy = pickle.loads(pickle.dumps(op))

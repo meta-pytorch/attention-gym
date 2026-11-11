@@ -36,8 +36,8 @@ def weights():
     return load_qwen3_weights(path)
 
 
-def bf16_values(*shape, scale=1.0):
-    return (torch.randn(*shape, device="cuda") * scale).bfloat16().float()
+def bf16_values(*shape):
+    return torch.randn(*shape, device="cuda").bfloat16().float()
 
 
 def rope_at(pos: int):
