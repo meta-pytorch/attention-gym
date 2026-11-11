@@ -2,17 +2,18 @@
 
 [Back to warpdrive](index.md)
 
-A channel says **when a producer may fill a stage, when consumers may read it, and when
-that stage may be reused**. It carries synchronization; the data can live in separately
-allocated SMEM or TMEM.
+A channel controls **when a producer may fill a stage, when consumers may read it, and when
+it can be reused**. Start with `Ring` for an ordered stream of tiles, as in the built-in
+[GEMM](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py).
+The channel manages synchronization; the data can live in separate SMEM or TMEM.
 
 ```python
 self.ab = Ring(3, Tma(stage_bytes), Umma)
 self.acc = Ring(2, Umma, Warps)
 ```
 
-Read `Ring(2, Umma, Warps)` as: two reusable stages, MMA completion publishes each stage,
-and consumer warps release it. With one MMA warp and four consumer warps:
+`Ring(2, Umma, Warps)` has two reusable stages. MMA completion publishes a stage; consumer
+warps release it. With one MMA warp and four consumer warps:
 
 ```text
 producer acquires EMPTY stage
@@ -22,8 +23,22 @@ producer acquires EMPTY stage
   -> 4 EMPTY arrivals -> producer may reuse the stage
 ```
 
-The two stages are capacity, not two consumers. FULL/EMPTY barriers hold protocol state,
-not the payload. A channel without `payload=` or `buffer=` allocates no payload storage.
+The stage count is capacity, not a consumer count. FULL/EMPTY barriers hold protocol state,
+not data. A channel without `payload=` or `buffer=` allocates no payload storage.
+
+Roles receive [producer and consumer endpoints](roles.md#arguments) by parameter name.
+Use a handle to hold one stage while working on it:
+
+```python
+with ab.produce() as h:
+    ...  # fill stage h.index; commit on exit
+
+with ab.consume() as h:
+    ...  # read stage h.index; release on exit
+```
+
+These are separate producer and consumer excerpts. The endpoint tracks the next stage;
+the handle owns the current one. Return the updated endpoint from the role.
 
 ## Stages and phases
 
@@ -48,21 +63,13 @@ consumer phase         0  0  1  1  0  0
 producer phase         1  1  0  0  1  1
 ```
 
-The opposite initial phases let producers acquire initially empty stages while consumers
-wait for the first publication. Matching epochs preserve publication order and prevent
-reuse until the declared consumers release.
+The opposite initial phases let producers acquire empty stages while consumers wait for the
+first publication. Matching epochs preserve publication order and prevent reuse until all
+declared consumers release.
 
-```python
-with ab.produce() as h:
-    ...  # fill stage h.index; commit on exit
-
-with ab.consume() as h:
-    ...  # read stage h.index; release on exit
-```
-
-**Acquire/wait advances the endpoint; commit/release does not.** Each handle keeps its own
-index and phase snapshot even after the endpoint moves on. In each CTA, an mbarrier
-channel's full barriers occupy `[0, n)` and its empty barriers `[n, 2*n)` from its base.
+**Acquire/wait advances the endpoint; commit/release does not.** A handle keeps its index
+and phase after the endpoint moves on. In each CTA, full mbarriers occupy `[0, n)` and empty
+mbarriers `[n, 2*n)` from the channel's base.
 
 The mechanisms choose what completes the handoff:
 
@@ -78,8 +85,8 @@ SMEM, whichever CTA issues the copies. See [multicast](clusters.md#multicast) fo
 `Tma(tx_bytes, multicast="n")` and [one CTA loads for others](clusters.md#one-cta-loads-for-others)
 for `Tma(tx_bytes, fills="pair")`.
 
-A TMA or UMMA side binds to exactly one single-warp role: one active instance per epoch on a
-round-robin side, or one owner per epoch for [exclusive consumers](#exclusive-consumers).
+A single-mechanism TMA or UMMA side binds to one single-warp role: one active instance per
+epoch for round-robin, or one owner per epoch for [exclusive consumers](#exclusive-consumers).
 
 ## Counts come from the roles
 
@@ -96,7 +103,7 @@ Thus the four-warp consumer above supplies 4 EMPTY arrivals with `Warps`, or 128
 targets follow the [placement rules](clusters.md#placement-rules); `Warps` counts one arrival
 per warp of each signalling CTA.
 
-For both `Threads` and `Warps`, **predicate the work, not the handoff**:
+For both `Threads` and `Warps`, **predicate data accesses, not the handoff**:
 
 ```python
 with acc.consume() as h:
@@ -104,11 +111,10 @@ with acc.consume() as h:
         ...  # only valid lanes store; every role thread releases
 ```
 
-Putting the whole `with` under `if output_in_bounds` changes participation without changing
-the count. On a `Warps` side, every lane runs the declared fence and `bar.warp.sync` before
-the elected arrival. The warp sync orders its lanes' accesses; a lane skipping the handoff
-can leave its warp waiting there. Compilation does not prove participation or matching
-producer/consumer loop counts.
+Putting the whole `with` under `if output_in_bounds` changes participation, not the count.
+With `Warps`, every lane runs the declared fence and `bar.warp.sync` before the elected
+arrival. That sync orders the lanes' accesses; a missing lane can strand its warp.
+Compilation does not prove participation or matching producer/consumer loop counts.
 
 `Warps` requires mbarriers; named channels count threads and reject it. Prefer it for
 multi-warp releases: FA4 and CUTLASS signal per warp.
@@ -116,43 +122,148 @@ multi-warp releases: FA4 and CUTLASS signal per warp.
 Use [count overrides or raw barriers](dropping-down.md) for async-copy relay warps or sparse
 protocols. Changing a count neither elects lanes nor synchronizes their work.
 
-## Per-role consumer mechanisms
+## Overlapping handles
 
-When an MMA warp and CUDA threads both read every stage, give each consumer role its own
-mechanism:
+Use explicit handles when lifetimes overlap without nesting. In FA4, K and V share a ring.
+MMA holds V(i-1) and K(i), then releases V first:
 
 ```python
-self.h = Ring(2, Tma(stage_bytes), {"mma": Umma, "cuda": Threads}, buffer=h_buf)
+for i in cutlass.range(n_blocks - 1, unroll=1):
+    v = kv.wait()  # V(i-1)
+    k = kv.wait()  # K(i)
+    pv(o, p, v.index)
+    v.release()
+    qk(s, q, k.index)
+    k.release()
 ```
 
-The dict replaces the single consumer mechanism and names the consumer roles (it implies
-`consumer_roles`). Every key must bind a consumer end, and every consumer role must be a key.
-The side joins: both roles take every epoch, and each bound instance contributes its own
-role's [count](#counts-come-from-the-roles). With a one-warp `mma` and an eight-warp `cuda`:
+`pv`/`qk` stand for the kernel's MMA code. Nested `with` blocks would release K first.
 
-| Role | Mechanism | Release | Fence before it | EMPTY arrivals |
-|---|---|---|---|---|
-| `mma` | `Umma` | elected `tcgen05.commit` | none (MMAs read through the async proxy) | 1 |
-| `cuda` | `Threads` | every thread arrives | `smem_async` (derived on a `Tma` ring) | 256 |
-| `cuda` | `Warps` | warp sync, one elected arrival per warp | `smem_async` | 8 |
+- Close each handle exactly once, in the dynamic loop/branch region that opened it.
+  Missing, double or cross-region closes raise `ProtocolError` with source locations.
+  A [span](#spans) holds a stage from a loop's first iteration to its last.
+- Return the updated endpoint, not handles, at role exit.
+- `h.retire()` closes a final unused producer acquire without publication; no consumer may
+  need it. Automatically tailed pair channels reject it.
+- Do not use payloads/pointers after close. The checker is not an ownership system.
 
-With `Threads` the empty count is 257, the sum; `describe()` shows
-`Tma(… B) -> {mma: Umma, cuda: Threads}`, `empty 257` and
-`release_fence smem_async (cuda)`. No setting changes the count except an `empty_counts`
-[override](dropping-down.md).
+## Storage and fences
 
-The [derived release fence](#storage-and-fences) applies to the `Threads`/`Warps` roles only,
-as does an explicit `release_fence=`. Declare `release_fence=()` only if the thread roles make no
-generic access to what the producer fills; the alias diagnostic checks each handle against its
-own role's mechanism and fences.
+Keep buffers separate and index them with `h.index`, or attach simple CTA-local storage:
 
-Limits: an mbarrier `JOIN` side (round-robin, exclusive and named channels reject a dict),
-CTA-local placement with no multicast or `fills`, and each `Umma` role a single-warp,
-single-instance role. Producers take one mechanism.
+```python
+self.stats = Ring(2, Threads, Threads, payload=(cutlass.Float32, (32,)))
+```
+
+This allocates uninitialized, 16-byte-aligned SMEM of shape `(32, 2)`—generally `(*shape, n)`.
+`h.data` selects the handle's stage. User pair-scoped channels cannot own these payloads.
+For swizzled tiles, multiple buffers or overlaps, use [`SmemPlan` and `buffer=`](storage.md).
+Binding a buffer leaves remote memory scope unchanged. It derives a commit fence for
+`Threads`/`Warps` -> `Umma` channels (see below).
+
+Declare fences on the side that needs them, before its managed signal:
+
+| Fence kind | Instruction |
+|---|---|
+| `"tmem_store"` | `tcgen05.wait::st` |
+| `"tmem_load"` | `tcgen05.wait::ld` |
+| `"smem_async"` | `fence.proxy.async` |
+
+`tmem_store` completes TMEM stores for a reader, usually MMA. `tmem_load` completes
+`tcgen05.ld` before a later MMA overwrites those columns. Declare
+`release_fence="tmem_load"` when every release needs it (FA4 backward's `dq` and `dkv`).
+If only one path needs it, call `fence_view_async_tmem_load()` there instead (persistent
+GEMM's `early_release`). Channel fences run on every managed signal.
+`smem_async` orders generic SMEM accesses against the async proxy (TMA, `tcgen05.mma`).
+
+`commit_fence`/`release_fence` accept a string or ordered tuple of distinct kinds. For
+example, FA4 backward's dS uses `commit_fence=("tmem_store", "smem_async")` to hand over both
+TMEM and SMEM stores. A string is a one-element tuple; the layer emits exactly that order.
+Unknown/repeated kinds and commit fences on TMA producers are rejected.
+
+Two SMEM handoffs get a default proxy fence:
+
+- **TMA producer → `Threads`/`Warps` consumer:** `release_fence="smem_async"` orders ordinary
+  reads (`ld.shared`, `autovec_copy`, `ldmatrix`) before the next TMA fill. Without it, a
+  pending read may observe that next fill. TMA completion covers the other direction:
+  consumers can read after the FULL wait without a fence. `Umma` consumers read through the
+  async proxy and get no default release fence.
+- **`Threads`/`Warps` producer → `Umma` consumer, with `payload=` or `buffer=`:**
+  `commit_fence="smem_async"` orders ordinary stores before MMA's async-proxy reads.
+  FA4 decode's P ring uses this default. Without SMEM storage, no commit fence is derived;
+  declare `"tmem_store"` for TMEM stores.
+
+A proxy fence acts only in its issuing thread. Every reading/writing thread must run it
+before arrival, including every lane before a `Warps` arrival. See PTX's Memory Consistency
+Model ("Proxies" and the causality axiom) and tcgen05 "Shared Memory Accesses".
+The fence is still required across CTAs and does not change `remote_scope`
+([Memory scope](clusters.md#memory-scope)). TMA stage releases still default to `"cta"`,
+as in CUTLASS.
+
+Use `release_fence=()` only when consumers make no generic access to the filled storage
+(for example, they only issue TMA stores or MMAs), or every reader calls
+`fence_async_shared()` after its last read and before release. CTA-pair FA4 backward's dPsum
+uses the latter.
+
+Use `commit_fence=()` only when producers make no generic writes or every writer calls
+`fence_async_shared()` after its last write and before arrival. CTA-pair FA4 backward's `ds`
+opts out: `make_ds` fences its writers before raw signaling; the managed relay writes no data.
+
+Explicit values **replace**, not extend, defaults. Include `"smem_async"` when adding
+`"tmem_store"`, as single-CTA FA4 backward's `ds` does with `("tmem_store", "smem_async")`.
+`describe()` shows replacements as `override  commit_fence smem_async -> ...` or
+`override  release_fence smem_async -> ...`.
+
+`commit(signal=False)` and `release(signal=False)` omit **the signal and all its fences**,
+including defaults. Other async work, including TMA stores and TMEM aliases, still needs
+its own completion waits and proxy fences.
+
+The alias diagnostic checks for the required fence kinds. TMEM-store handoffs without
+`"tmem_store"` and SMEM-store-to-async-reader handoffs without `"smem_async"` remain
+unverified. It checks declared overlaps between buffers, not a ring refilling itself,
+so it cannot catch an incorrect `release_fence=()`.
+
+## TMEM
+
+A `TmemPlan` assigns named column ranges; aliases share columns, not lifetimes:
+
+```python
+self.tmem_plan = (
+    TmemPlan().region("S", 128, 2).region("O", 128, 2).alias("P", of="S", offset=64, cols=64)
+)
+```
+
+S uses 256 columns, O another 256, and P uses no additional allocation.
+`print(self.tmem_plan.describe())` shows:
+
+```text
+  tmem S   [0, 128), [128, 256)
+  tmem O   [256, 384), [384, 512)
+  tmem P   [64, 128), [192, 256) (inside S)
+```
+
+- `tmem.ptr("S", stage)` returns an fp32 TMEM pointer; `tmem.cols("S", stage)` its column
+  offset. Here `stage` is a **Python int plan slot**, not a dynamic ring index.
+- To select a ring stage dynamically, build a tensor spanning the region's slots and index
+  it with `h.index`, as GEMM does. Reinterpret packed BF16 yourself.
+- Nonaliases occupy declaration-order intervals of `cols * slots`; each alias stays inside
+  its parent slot. Allocation rounds up to a power of two, 32–512 columns. Capacity,
+  duplicate names and alias bounds are checked.
+
+**Every TMEM-using role, including raw roles, must take `tmem: Tmem`.** All declared users
+join an unaligned teardown barrier before free. With no annotated users, nothing allocates.
+
+In one CTA, `begin_roles()` allocates from the lowest TMEM-user warp other than warp 0,
+or warp 0 if it is the only user. This overlaps warp 0's barrier initialization. The same
+warp frees. Clusters allocate after the cluster sync in `run_roles()`
+([work and exit](clusters.md#work-and-exit)).
+
+Order S/P alias accesses yourself. The [alias diagnostic](storage.md#check-declared-aliases)
+can inspect annotated overlaps, not prove safety.
 
 ## Slots and instances
 
-Use `Slots` for independently reused buffers, rather than one ordered ring:
+Use `Slots` when buffers are reused independently, not in ring order:
 
 ```python
 self.s = Slots(2, Umma, Threads)
@@ -191,6 +302,40 @@ softmax[1] -> slot 1 -> phase 0, 1, 0, ...   (independent)
 For `Slots`, “bound” means bound to that slot. Non-join sides give each epoch one owner.
 When their acquire/wait/skip sequences are static, collection checks
 [ownership](#static-ownership-check).
+
+## Per-role consumer mechanisms
+
+When an MMA warp and CUDA threads both read every stage, give each consumer role its own
+mechanism:
+
+```python
+self.h = Ring(2, Tma(stage_bytes), {"mma": Umma, "cuda": Threads}, buffer=h_buf)
+```
+
+The dict names every consumer role and its mechanism; it implies `consumer_roles`.
+Every key must bind a consumer endpoint, and no consumer role may be omitted. Both roles
+take every epoch. Each instance contributes its role's [count](#counts-come-from-the-roles).
+With a one-warp `mma` and an eight-warp `cuda`:
+
+| Role | Mechanism | Release | Fence before it | EMPTY arrivals |
+|---|---|---|---|---|
+| `mma` | `Umma` | elected `tcgen05.commit` | none (MMAs read through the async proxy) | 1 |
+| `cuda` | `Threads` | every thread arrives | `smem_async` (derived on a `Tma` ring) | 256 |
+| `cuda` | `Warps` | warp sync, one elected arrival per warp | `smem_async` | 8 |
+
+With `Threads`, the empty count is 257. `describe()` shows
+`Tma(… B) -> {mma: Umma, cuda: Threads}`, `empty 257` and
+`release_fence smem_async (cuda)`. For these bindings, only an `empty_counts`
+[override](dropping-down.md) changes the count.
+
+The [derived release fence](#storage-and-fences) applies to the `Threads`/`Warps` roles only,
+as does an explicit `release_fence=`. Declare `release_fence=()` only if the thread roles make no
+generic access to what the producer fills; the alias diagnostic checks each handle against its
+own role's mechanism and fences.
+
+This requires a CTA-local mbarrier `JOIN` side, with no multicast or `fills`.
+Round-robin, exclusive and named channels reject a dict. Each `Umma` role must have one
+single-warp instance. Producers take one mechanism.
 
 ## Round-robin instances
 
@@ -273,10 +418,10 @@ or assigning `end.state`, make ownership `unverified`. Skips stale outstanding
 
 ### Static ownership check
 
-The check applies when all acquires, waits and skips are static—no dynamic loop/branch around
-them except the work-item loop—and roles use the channel consistently per work item or per
-launch. It requires one joining instance opposite the shared side. Both sides round-robin,
-several joining instances, raw state, or dynamic sequences remain `unverified` with a reason.
+This check needs static acquires, waits and skips, with no dynamic loop/branch except the
+work-item loop. Roles must use the channel consistently per item or per launch, with one
+joining instance opposite the shared side. Both sides round-robin, several joining instances,
+raw state or dynamic sequences remain `unverified`, with a reason.
 
 For a checkable sequence, collection verifies:
 
@@ -289,13 +434,13 @@ For a checkable sequence, collection verifies:
 Violations raise. `describe()` reports `epochs  verified: ...` or `unverified (...)`.
 Unverified ownership is your obligation.
 
-**Ownership does not make a skipped-to parity wait exact.** For epoch `e` on `n` stages,
-the wait tests `(e // n) % 2` at stage `e % n`. It is exact once epoch `e-n` was filled;
-before that, an older generation can make the wait pass immediately.
+**Ownership does not make a skipped-to parity wait exact.** Epoch `e` waits for
+`(e // n) % 2` at stage `e % n`. That wait is exact once epoch `e-n` was filled. Before
+then, an older generation can make it pass immediately.
 
-A consumer has observed enough history if its first wait is below `n`, and each later wait
-follows a wait of epoch `e-n` or later. Join/valid round-robin consumers observe that history
-themselves. An exclusive consumer may skip it:
+A consumer has enough history if its first wait is below `n` and each later wait follows
+a wait for epoch `e-n` or later. Join/valid round-robin consumers observe this themselves.
+An exclusive consumer may skip it and need a rendezvous:
 
 ```text
 3-stage ring; consumer's first wait is epoch 4 (stage 1)
@@ -410,8 +555,8 @@ even small ones. `alias.named_barrier` checks collisions; raw `cute.arch.barrier
 
 ## Named barriers
 
-A `NamedBarrier` is a lower-level rendezvous: one allocated CTA barrier ID and a thread
-count, without a channel's full/empty protocol.
+Use `NamedBarrier` for a CTA rendezvous without a channel's full/empty protocol. It allocates
+one barrier ID with a thread count:
 
 ```python
 self.compute_sync = NamedBarrier(threads=256)  # both compute warpgroups
@@ -422,8 +567,8 @@ self.max_done.arrive()  # correction: arrive and continue
 self.max_done.sync()  # load: arrive and wait
 ```
 
-Declare it in `__init__`; managed and raw roles use `self.<name>`. A generation completes
-when `threads` arrivals have come through `sync()` or `arrive()`.
+Declare it in `__init__` and use `self.<name>` in managed or raw roles. A generation
+completes after `threads` arrivals through `sync()` or `arrive()`.
 
 - Default calls are unaligned, so participants can reach them from different code sites.
 - `aligned=True` emits `bar.sync`/`bar.arrive`: every thread of each participating warp must
@@ -475,20 +620,20 @@ waiters:                           sync   -> read published stores
 ```
 
 The [PTX `bar`/`barrier` contract](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#parallel-synchronization-and-communication-instructions-bar)
-says **sync, red and arrive** make prior accesses performed relative to participants when
-the barrier completes; a performed write is visible to them. Sync also prevents new accesses
-until completion. Thus `st.shared; barrier.arrive id, N` publishes to
-`barrier.sync id, N; ld.shared` without an extra `membar`. The ISA permits mixed arrive/sync;
+makes prior accesses performed relative to participants when **sync, red or arrive** completes
+the barrier. Performed writes are visible to participants; sync also holds new accesses until
+completion. Thus `st.shared; barrier.arrive id, N` publishes to
+`barrier.sync id, N; ld.shared` without an extra `membar`. Mixed arrive/sync is allowed;
 `bar.arrive`/`bar.sync` are the aligned spellings.
 
 Every writer must arrive and every waiter must sync with the same ID/count. This argument
 covers ordinary SMEM, not asynchronous proxies: TMA/TMEM still need their completion waits
 and fences.
 
-Reuse is sound only once per launch, or once per work item with at most one item per CTA
-(as in the `OneShot` [decode](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py)). Otherwise a fast publisher
-can contribute its next arrival to the current generation. Add an acknowledgement edge, or
-use a named channel whose EMPTY barrier provides one.
+Use this once per launch, or once per item with at most one item per CTA (the `OneShot`
+[decode](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py)).
+Otherwise a fast publisher can add its next arrival to the current generation. Add an
+acknowledgement edge, or use a named channel's EMPTY barrier.
 
 **Racecheck can flag this pattern.** compute-sanitizer racecheck reports stores published
 by `arrive()` against reads after `sync()` on the same barrier (swap-AB decode's row sums are
@@ -506,45 +651,19 @@ for t in cutlass.range(n_tiles, unroll=1):
     ...  # read the other half
 ```
 
-Barrier generations can repeat safely when exactly `threads` participants all sync in each
-generation: none leaves generation `g` before all arrive, so none arrives early for `g+1`.
-This does not by itself protect data overwritten after the sync from readers still using it.
+Exactly `threads` participants must sync each generation. None can leave generation `g`
+until all arrive, so none arrives early for `g+1`. This does not protect data overwritten
+after the sync from readers still using it.
 
 With arrive-only participants, your protocol must prevent a second arrival before the current
 generation completes. A wait on another edge can do that; the named channel's EMPTY wait is
 one example. `NamedBarrier` itself supplies no such edge.
 
-## Overlapping handles
-
-Use explicit handles when lifetimes overlap without nesting. FA4's K and V share a ring;
-the MMA can hold V(i-1) and K(i), then release V first:
-
-```python
-for i in cutlass.range(n_blocks - 1, unroll=1):
-    v = kv.wait()  # V(i-1)
-    k = kv.wait()  # K(i)
-    pv(o, p, v.index)
-    v.release()
-    qk(s, q, k.index)
-    k.release()
-```
-
-`pv`/`qk` stand for the kernel's MMA code. Nested `with` blocks would release K first.
-
-- Close each handle exactly once, in the dynamic loop/branch region that opened it.
-  Missing, double or cross-region closes raise `ProtocolError` with source locations.
-  A [span](#spans) holds a stage from a loop's first iteration to its last.
-- Return the updated endpoint, not handles, at role exit.
-- `h.retire()` closes a final unused producer acquire without publication; no consumer may
-  need it. Automatically tailed pair channels reject it.
-- Do not use payloads/pointers after close. The checker is not an ownership system.
-
 ## Spans
 
-Use a span when a stage is filled, or read, across the iterations of a counted loop: the wait
-belongs in the first iteration and the signal in the last, which a handle cannot do because it
-closes in the region that opened it. KDA's WY backward accumulates dq over its V tiles this
-way:
+Use a span to hold a stage from a counted loop's first iteration to its last. An ordinary
+handle must close in the region that opened it. A span can wait in the first iteration and
+signal in the last. KDA's WY backward uses this to accumulate dq over its V tiles:
 
 ```python
 dq_span = dq.span()  # takes the stage and advances the end; no wait yet
@@ -561,16 +680,16 @@ span()   begin: wait EMPTY          begin: nothing         begin: nothing
          commit: nothing            commit: nothing        commit: signal FULL
 ```
 
-`mma` stands for the kernel's MMA code. `commit()` without an index publishes after the loop
-instead, in the region that opened the span (WY's dA gets one more MMA after its V loop). A
-consumer's span waits for FULL in the first iteration and takes `release(v)` or `release()`.
-Both closes accept `signal=False`, and a span is otherwise a handle: `index`, `phase`,
-`view()`, `data` and the barrier pointers.
+`mma` stands for the kernel's MMA code. To publish after the loop, call `commit()` without
+an index in the region that opened the span. WY's dA does this after one more MMA.
+A consumer span waits for FULL in the first iteration, then closes with `release(v)` or
+`release()`. Both closes accept `signal=False`. A span also exposes `index`, `phase`,
+`view()`, `data` and barrier pointers.
 
-Acquiring before the loop is the simpler form when the role has nothing else to do first;
-unrolling the loop with `cutlass.range_constexpr` and an ordinary handle is another. A span
-keeps the loop dynamic and the wait late: in WY, taking the four accumulators before the V
-loop is slower, and unrolling it spills the MMA warp.
+Prefer acquiring before the loop when the role has no work to do first. You can also use an
+ordinary handle with `cutlass.range_constexpr`. A span keeps the loop dynamic and delays the
+wait. In WY, acquiring all four accumulators before the V loop is slower; unrolling spills
+the MMA warp.
 
 Tracing checks, and raises `ProtocolError` otherwise:
 
@@ -590,8 +709,8 @@ Tracing checks, and raises `ProtocolError` otherwise:
 a previewed epoch). The [alias diagnostic](storage.md#check-declared-aliases) places a span's
 wait in its loop's first repetition and an in-loop signal in the last.
 
-Not checked: using the stage in iteration 0 before `begin`, or before the loop. The stage is
-the role's only between that wait and the signal.
+Use the stage only between the wait and signal. Tracing does not catch accesses before
+`begin` in iteration 0 or before the loop.
 
 ## Try tokens
 
@@ -611,9 +730,9 @@ h = out.acquire(token=token)  # a Tma producer arms the stage here, once, either
 `mbarrier.try_wait.parity` and returns a `Token` with dynamic Boolean `ready`. For `Slots`,
 pass the same slot to probe and take. Without `token=`, codegen is the ordinary blocking wait.
 
-A probe may suspend for a hardware-dependent time: **not a nonblocking poll or latency
-bound**. A token records readiness, carries no stage index and cannot arm, commit or release.
-An unused token is harmless.
+A probe may suspend for a hardware-dependent time. **It is not a nonblocking poll and has
+no latency bound.** A token records readiness, not a stage index. It cannot arm, commit or
+release a stage; leaving it unused is harmless.
 
 Tracing rejects a token that:
 
@@ -656,7 +775,7 @@ automatically faster; measure before keeping it.
 
 ## Previews
 
-Use a preview to read the next epoch before opening its owning handle:
+Use a preview to read the next epoch before opening the handle that will release it:
 
 ```python
 preview = q.peek()  # wait for the next epoch, without advancing
@@ -667,11 +786,11 @@ h = q.wait()  # owns that epoch; its release must cover the preview's reads
 h.release()
 ```
 
-`peek()` is consumer-only and mbarrier-only. It waits for FULL, returns a read-only `Preview`,
-and adds no arrival, handle or state advance. `preview.index`/`phase` identify the stage and
-parity. `view(name, *coords, by=...)` and `access(name, by=...)` are handle-style reads;
-`write=True`, `commit`, `release` and `retire` raise. FA4 backward previews Q(t+1) for S(t+1)
-while Q(t)'s handle remains open for dK(t).
+`peek()` waits for FULL and returns a read-only `Preview`, without arrival, handle or state
+advance. It is consumer-only and mbarrier-only. `preview.index`/`phase` identify the stage and parity;
+`view(name, *coords, by=...)` and `access(name, by=...)` record reads. `write=True`, `commit`,
+`release` and `retire` raise. FA4 backward previews Q(t+1) for S(t+1) while Q(t)'s handle
+remains open for dK(t).
 
 The next `wait()` on the end (same slot for `Slots`) **in trace order** owns the preview.
 Its release mechanism/fences cover the preview's annotated accesses in the alias diagnostic.
@@ -689,124 +808,6 @@ to carry a preview through a dynamic loop/branch that calls its methods.
 These checks do not prove runtime epoch matching, completion of asynchronous preview reads
 before release, or eventual producer publication. A preview is not a carried handle;
 handles still close in their opening region.
-
-## Storage and fences
-
-Keep buffers separate and index them with `h.index`, or attach simple CTA-local storage:
-
-```python
-self.stats = Ring(2, Threads, Threads, payload=(cutlass.Float32, (32,)))
-```
-
-This allocates uninitialized, 16-byte-aligned SMEM of shape `(32, 2)`—generally `(*shape, n)`.
-`h.data` selects the handle's stage. User pair-scoped channels cannot own these payloads.
-For swizzled tiles, multiple buffers or overlaps, use [`SmemPlan` and `buffer=`](storage.md).
-Binding a buffer leaves remote memory scope unchanged. It derives a commit fence for
-`Threads`/`Warps` -> `Umma` channels (see below).
-
-Declare fences on the side that needs them, before its managed signal:
-
-| Fence kind | Instruction |
-|---|---|
-| `"tmem_store"` | `tcgen05.wait::st` |
-| `"tmem_load"` | `tcgen05.wait::ld` |
-| `"smem_async"` | `fence.proxy.async` |
-
-`tmem_store` completes TMEM stores for a reader, usually an MMA. `tmem_load` waits for
-`tcgen05.ld` to finish before a later MMA overwrites those columns. If every release needs
-that wait, declare `release_fence="tmem_load"` rather than calling
-`fence_view_async_tmem_load()` before each release (FA4 backward's `dq` and `dkv`). Keep the
-fence at the use site when only one path needs it (persistent GEMM's `early_release`);
-a channel fence runs on every managed release.
-`smem_async` orders generic SMEM accesses against the async proxy (TMA, `tcgen05.mma`).
-
-`commit_fence`/`release_fence` accept a string or ordered tuple of distinct kinds. For
-example, FA4 backward's dS uses `commit_fence=("tmem_store", "smem_async")` to hand over both
-TMEM and SMEM stores. A string is a one-element tuple; the layer emits exactly that order.
-Unknown/repeated kinds and commit fences on TMA producers are rejected.
-
-**A TMA-filled channel released by `Threads` or `Warps` defaults to
-`release_fence="smem_async"`.** Its consumers may read the stage with ordinary loads
-(`ld.shared`, `autovec_copy`, `ldmatrix`), and the next fill writes the same bytes through the
-async proxy. The release and the producer's acquire order the two, but PTX orders accesses of
-different proxies only through a proxy fence on that path (Memory Consistency Model, "Proxies"
-and the causality axiom). Without one, the pending read may observe the next fill.
-`fence.proxy.async` acts only within the thread that issues it, so every reading thread runs
-it before its arrival; a `Warps` side runs it in every lane before the warp's elected arrival.
-TMA completion covers the other direction: consumers may read the filled bytes after the full
-wait without a fence. When the consumers release a producer in another CTA, the fence is still
-required. The arrival's memory scope does not change: it stays `remote_scope="cta"`, as in
-CUTLASS (see [Memory scope](clusters.md#memory-scope)).
-
-Declare `release_fence=()` only if the consumers make no generic access to what the producer
-fills, for example when they only issue TMA stores or MMAs from it. You can also declare it if
-every reading thread runs `fence_async_shared()` after its last read and before the release,
-as the CTA-pair FA4 backward does for dPsum. Another value replaces the default rather than
-adding to it, so include `"smem_async"` when you also need `"tmem_store"`. `describe()` prints
-a replaced default as `override  release_fence smem_async -> ...`. `Umma` consumers read through
-the async proxy and get no default.
-
-**A `Threads` or `Warps` channel to `Umma` with SMEM storage (`payload=` or `buffer=`)
-defaults to `commit_fence="smem_async"`.** Each writing thread must fence its ordinary stores
-before arrival: `tcgen05.mma` reads through the async proxy (PTX ISA, tcgen05 "Shared Memory
-Accesses"). A proxy fence acts only within its thread, so `Warps` runs it in every lane before
-the elected arrival. FA4 decode's P ring uses this default.
-
-Declare `commit_fence=()` only if producers make no generic writes to that storage or run
-`fence_async_shared()` after their last write and before arrival. CTA-pair FA4 backward's
-`ds` opts out: `make_ds` fences its writers before raw signaling, and the managed relay makes
-no generic writes. An explicit value replaces the default; single-CTA `ds` also hands over
-TMEM stores, so it declares `("tmem_store", "smem_async")`. `describe()` prints replacements as
-`override  commit_fence smem_async -> ...`.
-
-Without SMEM storage, a TMEM or register handoff gets no default: declare `"tmem_store"`
-for TMEM stores. On pair-scoped channels, `remote_scope` still controls the arrival's memory
-scope ([Memory scope](clusters.md#memory-scope)); the proxy fence does not change it.
-
-`commit(signal=False)` and `release(signal=False)` omit **both signal and all its fences**,
-including a derived `commit_fence` or `release_fence`.
-The alias diagnostic credits fences by membership: a TMEM-store handoff without
-`"tmem_store"`, or an SMEM-store-to-async-reader handoff without `"smem_async"`, remains
-unverified. It compares declared overlaps of different buffers, not a ring refilling its own
-stage, so it cannot catch an incorrect `release_fence=()`. Other async work still needs its
-own completion waits/proxy fences, including TMA stores and TMEM alias accesses.
-
-## TMEM
-
-A `TmemPlan` assigns named column ranges; aliases share columns, not lifetimes:
-
-```python
-self.tmem_plan = (
-    TmemPlan().region("S", 128, 2).region("O", 128, 2).alias("P", of="S", offset=64, cols=64)
-)
-```
-
-S uses 256 columns, O another 256, and P uses no additional allocation.
-`print(self.tmem_plan.describe())` shows:
-
-```text
-  tmem S   [0, 128), [128, 256)
-  tmem O   [256, 384), [384, 512)
-  tmem P   [64, 128), [192, 256) (inside S)
-```
-
-- `tmem.ptr("S", stage)` returns an fp32 TMEM pointer; `tmem.cols("S", stage)` its column
-  offset. Here `stage` is a **Python int plan slot**, not a dynamic ring index.
-- To select a ring stage dynamically, build a tensor spanning the region's slots and index
-  it with `h.index`, as GEMM does. Reinterpret packed BF16 yourself.
-- Nonaliases occupy declaration-order intervals of `cols * slots`; each alias stays inside
-  its parent slot. Allocation rounds up to a power of two, 32–512 columns. Capacity,
-  duplicate names and alias bounds are checked.
-
-Every actual TMEM user, including raw roles, must take `tmem: Tmem` for teardown. With no
-annotated users, no allocation occurs. In a single CTA, `begin_roles()` allocates from the
-lowest TMEM-user warp other than warp 0 (warp 0 if it is the only user), overlapping warp 0's
-barrier initialization. That warp also frees. Clusters allocate after the cluster sync in
-`run_roles()` ([work and exit](clusters.md#work-and-exit)). All declared users join an
-unaligned teardown barrier before free.
-
-Order S/P alias accesses yourself. The [alias diagnostic](storage.md#check-declared-aliases)
-can inspect annotated overlaps, not prove safety.
 
 ## Turnstiles
 

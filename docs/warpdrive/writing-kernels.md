@@ -2,34 +2,25 @@
 
 [Back to warpdrive](index.md) · [Safety contract](guarantees.md)
 
-Start with a complete kernel. warpdrive connects the roles and manages declared handoffs;
-you write the CuTeDSL math, layouts and data movement inside them.
+Start from a working kernel and adapt one piece at a time. You write the math, layouts and
+data movement; warpdrive connects the roles and manages their declared handoffs.
 
-```text
-work item       what output does this CTA/cluster own?
-    |
-roles + edges   who produces each value, who reads it, when can storage be reused?
-    |
-role bodies     exchange handles, do the math, return current state
-    |
-launch + tests  enforce the input contract, then check the actual lifetimes
-```
-
-Read the [safety contract](guarantees.md) too: successful compilation is not a proof of
-correctness.
+The basic steps are: define the work one CTA owns, draw the handoffs, write the roles, then
+check the launch and output. Keep the [safety contract](guarantees.md) nearby: successful
+compilation does not prove correctness.
 
 ## Run a complete example
 
-[gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py) is the smallest complete GEMM: three roles, SMEM partitions,
-TMEM views, launch setup, cached compilation and a PyTorch wrapper. It computes BF16
-`D = A @ B.T` with FP32 accumulation on Blackwell SM100/SM103. Use CuTeDSL 4.6.2 or newer and
-the repository's [environment setup](index.md#tests).
+[gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py)
+is the smallest complete example. It computes BF16 `D = A @ B.T` with FP32 accumulation on
+Blackwell SM100/SM103, including storage, launch, caching and a PyTorch wrapper. Use CuTeDSL
+4.6.2 or newer and the repository's [environment setup](index.md#tests).
 
 From the checkout root, in that environment:
 
 ```bash
 python -m attn_gym.warpdrive.examples.gemm
-pytest -q test/warpdrive/test_warpdrive.py -k test_gemm
+pytest -n 6 -q test/warpdrive/test_warpdrive.py -k test_gemm
 ```
 
 On a shared GPU host, run each command through its GPU reservation tool with a process
@@ -47,8 +38,8 @@ Read the example in this order:
 | `Gemm.__call__` | Atoms, TMA descriptors, bound work and launch |
 | `compile_gemm / check_gemm_args / gemm` | Static choices, runtime ABI and input checks |
 
-For an operation without MMA, keep the role/channel structure and omit TMEM. Do not copy
-MMA-specific layouts or the GEMM's register split merely to get a skeleton.
+If your operation does not use MMA, keep the role/channel structure but omit TMEM and
+MMA-specific layouts. Choose register budgets for your own roles.
 
 ## Define one work item
 
@@ -56,7 +47,7 @@ In the default GEMM, item `(m_tile, n_tile, 0)` owns one 128 × 256 output tile.
 roles visit that item. Load and MMA exchange `ceil(K / 64)` input tiles; epilogue stores one
 result.
 
-Write the equivalent sentence for your operation before choosing a schedule:
+Before choosing a schedule, answer the same questions for your operation:
 
 - Which output does one CTA or cluster own?
 - Which inputs and reduction steps produce it?
@@ -94,12 +85,12 @@ epoch:  0  1  2  3  4  5 ...
 stage:  0  1  2  0  1  2 ...    (three-stage ring)
 ```
 
-Adding stages adds capacity, not values: producer and consumer epoch counts must still
-match. With joined consumers, all readers release before reuse. Other ownership policies
-have their own [channel contracts](channels.md).
+More stages let the producer get further ahead; they do not change how many values each side
+exchanges. Producer and consumer epoch counts must match. With joined consumers, all readers
+must release before reuse. See [channels](channels.md) for other sharing policies.
 
-Draw feedback edges too. Identify the initial value or free capacity that lets something
-run first; balanced counts do not help if every role starts by waiting for another.
+Include feedback in the diagram. What value or free slot lets the first role proceed?
+Balanced counts are not enough if every role starts by waiting for another.
 
 ## Declare storage and connect the roles
 
@@ -123,9 +114,9 @@ self.work = WorkStream(schedule=OneShot())
 TMA and UMMA ends require a single-warp role; `Threads` counts every bound thread. See
 [roles](roles.md) for bindings and register-budget rules.
 
-Start with separate buffers for overlapping lifetimes. Allocate with `SmemPlan`, build
-TMA/MMA partitions with CuTe, then wrap them in `StageView`. `h.view(...)` selects the handle's stage.
-You still own the layouts and must ensure each view refers to its named buffer. Read
+Use separate buffers for data needed at the same time. Allocate with `SmemPlan`, build
+TMA/MMA partitions with CuTe, then wrap them in `StageView`. `h.view(...)` selects the current
+handle's stage; you must still make sure the layout and backing buffer are correct. Read
 [storage](storage.md) before adding aliases or accessing buffers outside handles.
 
 ## Implement the lifecycle, then the math
@@ -161,13 +152,13 @@ Follow one input stage through the consumer:
 The MMA role holds `acc.produce()` around the **whole K reduction**, publishing once.
 Epilogue holds `acc.consume()` until it has finished reading that accumulator stage.
 
-Index threads through the role, not the hardware: take `me: Local` and use `me.tid` /
-`me.warp`, so a `roles=` override that moves the role keeps its indices; TMEM rows use
-`me.tmem_row` ([role-local indices](roles.md#index-the-role-not-the-hardware)).
+Take `me: Local`: `me.tid` and `me.warp` are role-local indices; `me.tmem_row` selects
+hardware-compatible TMEM rows. See [role-local indices](roles.md#index-the-role-not-the-hardware)
+before changing role placement.
 
-Keep participation outside lane-dependent predicates. For a ragged output, every epilogue
-thread enters and releases its handle; only in-bounds lanes store. Guarding the whole
-exchange can strand a barrier whose count still includes the absent lanes.
+Predicate the data access, not the handoff. For a ragged output, every epilogue thread enters
+and releases its handle; only in-bounds lanes store. Otherwise the barrier may wait forever
+for the lanes you excluded.
 
 Carry state and respect handle lifetimes:
 
@@ -182,7 +173,7 @@ Carry state and respect handle lifetimes:
 
 ## Wire the prologue, launch and cache
 
-Keep four boundaries visible:
+The complete example separates setup into four parts:
 
 | Boundary | Your responsibilities |
 |---|---|
@@ -191,9 +182,8 @@ Keep four boundaries visible:
 | **Compile helper** | Use a [`jit_cache`](cache.md) function and follow the [compile-key contract](roles.md#compile-keys). Use fake compact tensors for a compact ABI. Key every static code choice; runtime dimensions may stay dynamic within their constraints. |
 | **Python wrapper** | Validate dtype, device, rank, related shapes, compactness, alignment and output overlap before relying on that ABI. Define empty-output and empty-reduction behavior. |
 
-In particular, zero K work must not publish an uninitialized sum. A successful compile does
-not replace these checks: the wrapper enforces the input contract and the role bodies
-implement it.
+Handle zero K explicitly: it must not publish an uninitialized sum. The wrapper checks the
+inputs; the role bodies must implement the promised behavior.
 
 ## Check the kernel before tuning
 
@@ -201,7 +191,7 @@ Compare nonuniform inputs against a reference with an explicit tolerance. GEMM's
 compare FP32-reference error against the BF16 PyTorch baseline; another reduction or
 approximation needs its own criterion.
 
-Exercise the lifetimes your kernel claims to support:
+Test the cases that can expose lifetime or state errors:
 
 - One item, then enough epochs to wrap every ring's stages **and phases**.
 - Ragged tails and supported empty work/reductions.
@@ -230,7 +220,7 @@ fixed across measurements. More stages or fewer instructions alone do not establ
 - [Dropping down](dropping-down.md): raw barriers and targeted opt-outs. Explain the
   replacement ordering; do not suppress a check simply to make compilation pass.
 
-For agent-assisted authoring, ask for the work item, role/channel diagram and epoch counts
-before implementation. The local [authoring skill](https://github.com/meta-pytorch/attention-gym/blob/main/.agents/skills/authoring-warpdrive/SKILL.md) follows this guide and the
-safety contract. Finish with a runnable kernel, tests and remaining raw/unverified sites—not
-just declarations or a profiler screenshot.
+When working with an agent, ask it to define the work item, draw the handoffs and count epochs
+before writing the kernel. The [authoring skill](https://github.com/meta-pytorch/attention-gym/blob/main/.agents/skills/authoring-warpdrive/SKILL.md)
+follows this guide. The result should include a runnable kernel, tests and a list of any
+raw or unverified sites.

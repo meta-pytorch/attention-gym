@@ -5,7 +5,7 @@
 
 warpdrive helps write warp-specialized CuTeDSL kernels, and is also the CuTeDSL authoring base
 of attention-gym: its [compile cache](cache.md), CuTeDSL version shims, the intra-kernel
-[profiler](profiler.md) and work scheduling live here.
+[profiler](profiler.md) and [work scheduling](scheduling.md) live here.
 
 At a high level this provides nice utilities for the common mechanisms (channels) to communicate between warps. While also
 providing some syntactic sugar that helps guarantee correctness when you author your kernels in a certain way.
@@ -33,126 +33,89 @@ PyTorch.
 
 ## A GEMM
 
-[gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py) computes BF16 `D = A @ B.T`. Warp 4 loads A/B, warp 5 issues MMA,
-and warps 0–3 store D. Here is the declaration and load role; the linked file has the MMA,
-epilogue, tensor partitions and launch:
+GEMM is one example of what you can author with warpdrive. The two channels above connect
+a load role, an MMA role and an epilogue:
 
-```python
-import cutlass
-from cutlass import cute
-from attn_gym.warpdrive import (
-    OneShot,
-    Producer,
-    Ring,
-    SmemPlan,
-    Threads,
-    Tma,
-    TmemPlan,
-    Umma,
-    WarpSpecialized,
-    WorkCursor,
-    WorkStream,
-    role,
-)
-from attn_gym.warpdrive.examples.gemm import GemmParams
-
-
-class Gemm(WarpSpecialized):  # excerpt; other roles and the kernel prologue are in gemm.py
-    def __init__(self):
-        self.smem_plan = SmemPlan()
-        a = self.smem_plan.buffer("A", cutlass.BFloat16, align=1024)
-        b = self.smem_plan.buffer("B", cutlass.BFloat16, align=1024)
-        self.ab = Ring(3, Tma((128 + 256) * 64 * 2), Umma, buffer={"A": a, "B": b})
-        self.acc = Ring(1, Umma, Threads)
-        self.tmem_plan = TmemPlan().region("acc", 256)
-        self.work = WorkStream(schedule=OneShot())
-
-    @role(warps=4, regs=48)
-    @cute.jit
-    def load(self, params: GemmParams, *, ab: Producer, work: WorkCursor):
-        ab = ab.views(A=params.tAsA, B=params.tBsB)
-        while work.valid:
-            m, n, _ = work.item
-            for k in cutlass.range(params.num_k_tiles, unroll=1):
-                with ab.produce() as h:
-                    cute.copy(
-                        params.tma_a,
-                        params.tAgA[None, m, k],
-                        h.view("A"),
-                        tma_bar_ptr=h.barrier,
-                    )
-                    cute.copy(
-                        params.tma_b,
-                        params.tBgB[None, n, k],
-                        h.view("B"),
-                        tma_bar_ptr=h.barrier,
-                    )
-            work.advance()
-        return ab, work
+```text
+warp 4: load A/B --> warp 5: MMA --> warps 0–3: store D
 ```
 
-`ab.produce()` waits for a free stage; TMA fills it and completes its full barrier. The MMA
-role waits with `ab.consume()`, reads that stage and releases it for the next load.
-`warps=4` means warp index 4, not four warps.
-
-Run the complete example through its wrapper:
+Here is the shape of those methods inside a `WarpSpecialized` kernel. This is pseudocode for
+one output tile; layouts, MMA setup, work cursors and launch code are omitted.
 
 ```python
-import torch
-from attn_gym.warpdrive.examples.gemm import gemm
+@role(warps=4, regs=48)
+@cute.jit
+def load(self, params: GemmParams, *, ab: Producer):
+    for k in cutlass.range(params.num_k_tiles):
+        with ab.produce() as tile:
+            ...  # issue TMA loads of A/B into tile, completing tile.barrier
+    return ab
 
-a = torch.randn(1024, 1024, device="cuda", dtype=torch.bfloat16)
-b = torch.randn_like(a)
-out = gemm(a, b)
+
+@role(warps=5, regs=48)
+@cute.jit
+def mma(self, params: GemmParams, *, ab: Consumer, acc: Producer, tmem: Tmem):
+    with acc.produce() as result:
+        for k in cutlass.range(params.num_k_tiles):
+            with ab.consume() as tile:
+                ...  # issue MMA using tile, accumulating into result's TMEM stage
+    return ab, acc
+
+
+@role(warps=range(4), regs=160)
+@cute.jit
+def epilogue(self, params: GemmParams, *, acc: Consumer, tmem: Tmem):
+    with acc.consume() as result:
+        ...  # finish reading result from TMEM and store D
+    return acc
 ```
+
+`@role` places the warps; `Producer` and `Consumer` bind each role to its channel ends.
+The handles delimit when a stage is safe to fill, read and reuse. You supply the CuTeDSL
+operations inside them. `warps=4` means warp index 4; `warps=range(4)` means warps 0–3.
+
+[gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py)
+has the complete implementation. See [Write a kernel](writing-kernels.md) to build your own,
+or [Examples](examples.md#gemm) to run this one.
 
 ## How it fits together
 
-A role gets its input values from `params` and its channel ends from annotated arguments.
-The argument `ab: Producer` binds to `self.ab`. Use a frozen dataclass for `params`; return
-every endpoint, work cursor and turnstile seat you take as an argument. Helpers must return
-updated state too. See [roles](roles.md) for placement and binding.
+The two rings control when input and accumulator stages are ready to read or safe to reuse.
+`ab.produce()` waits for a free input stage; TMA fills it, and the MMA role consumes it.
+The stage can be reused after MMA completes.
 
-Channels describe handoffs, not the math. A `Ring` cycles through stages; `Slots` lets you name
-the slot. `Tma`, `Umma`, `Threads` and `Warps` say how each side signals. For `Threads`, all
-threads of the bound role participate, even when only some lanes have data to write; `Warps`
-counts one elected lane per warp.
+- [Roles](roles.md) receive data through `params` and channel ends through annotated
+  arguments: `ab: Producer` binds to `self.ab`. Each role returns its updated state.
+- [Channels](channels.md) describe publication and reuse. `Ring` cycles through stages;
+  `Slots` lets you choose a slot. `Threads` counts all bound threads, even if only some write
+  data; `Warps` counts one elected lane per warp.
+- [Scheduling](scheduling.md) decides which items each CTA runs. Start with `OneShot()`;
+  persistent schedules reuse the role loop, with their own
+  [launch setup](scheduling.md#bind-and-launch).
+- [Storage](storage.md) connects buffers to channel stages. `begin_roles()` initializes
+  barriers and returns a `SmemAllocator`; `run_roles(params)` dispatches the roles and frees
+  TMEM after its users finish.
 
-`WorkStream` decides which work each CTA runs. `mapping=` turns a linear index into an item;
-`schedule=` chooses the indices. Change `OneShot()` to `StaticPersistent()`,
-`AtomicPersistent()` or `ClusterLaunchControl()` without changing the role loop. The host
-setup must also supply the [schedule's launch arguments](scheduling.md#bind-and-launch).
-
-In the kernel prologue, `begin_roles()` initializes the barriers and returns a `SmemAllocator`.
-Allocate your tensors there, or declare a `SmemPlan` and bind its buffers to channels with
-`buffer=`. `run_roles(params)` synchronizes, runs the roles and frees TMEM after its users
-finish. [Storage](storage.md) shows how a handle selects its own buffer stage.
-
-`print(op.describe())` shows what warpdrive worked out for a kernel: roles, warps, register
-budgets, every channel's per-CTA arrival counts, masks and TMA bytes, the scheduler and TMEM.
-[Tracing](tracing.md#inspect-the-kernel) has the full output for the 2-CTA persistent GEMM.
-`op.describe(format="mermaid")` draws the same pipeline as a
-[diagram](tracing.md#draw-the-pipeline).
+Use `print(op.describe())` to inspect roles, warps, registers, channel counts, TMA bytes and
+scheduling. `op.describe(format="mermaid")` draws the pipeline. See
+[Tracing](tracing.md#inspect-the-kernel) for examples and IKET capture.
 
 ## More examples and details
 
-- [Tour](tour.ipynb): every noun and verb on small runnable kernels, executed on a GB300.
-- [Roles](roles.md): placement, params, returned state and register budgets.
-- [Scheduling](scheduling.md): launch setup, custom work lists and external tile orders.
-- [Channels](channels.md): rings, slots, round-robin instances, exclusive consumers,
-  named barriers, overlapping handles, spans, try tokens, previews, TMEM and turnstiles.
-- [Storage](storage.md): stage views and checking declared aliases.
-- [Clusters](clusters.md): two-CTA MMA, larger clusters, TMA multicast and cross-CTA
-  handoffs.
-- [Dropping down](dropping-down.md): raw barriers, count overrides and unchecked sites.
-- [Tracing](tracing.md): inspect the kernel, capture IKET ranges and use the profiler.
-- [Profiler](profiler.md): compact intra-kernel records, summaries and Perfetto traces.
-- [Compile cache](cache.md): `jit_cache`, what keys include, cache location and CuTeDSL
-  version compatibility.
-- [Examples](examples.md): persistent GEMM, MoE grouped GEMM, FA4 forward and backward,
-  swap-AB decode, a Qwen3-0.6B decode megakernel, their input limits and benchmarks.
-- [Configuration](configuration.md): which choices of the layer and the examples are
-  constructor arguments, which are fixed, and why.
+- [Tour](tour.ipynb): learn the API through small kernels, with results from a GB300.
+- [Roles](roles.md): place warps, pass parameters and carry state.
+- [Scheduling](scheduling.md): choose a schedule or supply a custom work list.
+- [Channels](channels.md): exchange data, coordinate readers and manage overlapping work.
+- [Storage](storage.md): bind stage views and check storage aliases.
+- [Clusters](clusters.md): use CTA pairs, multicast and cross-CTA handoffs.
+- [Dropping down](dropping-down.md): mix managed channels with raw synchronization.
+- [Tracing](tracing.md): inspect declarations, diagnose handoffs and capture execution.
+- [Profiler](profiler.md): record with IKET, read timings and explore Perfetto traces.
+- [Compile cache](cache.md): reuse builds and understand what causes a rebuild.
+- [Examples](examples.md): GEMM, grouped GEMM, attention and Qwen3 decode, with input limits
+  and benchmark commands.
+- [Configuration](configuration.md): find the available knobs and fixed choices.
 
 ## Tests
 
@@ -176,8 +139,10 @@ The suite covers numerical correctness and determinism, shape reuse, schedules, 
 larger clusters, protocol errors, raw/managed synchronization, TMA and alias diagnostics, and
 both trace backends' paths into the profiler.
 
-To test another supported CuTeDSL version, install it into a separate environment along with
-this checkout, and give it its own caches:
+<details markdown="1">
+<summary>Testing another CuTeDSL version</summary>
+
+Use a separate environment with this checkout and its own caches:
 
 ```bash
 uv venv /tmp/dsl-4.7 && source /tmp/dsl-4.7/bin/activate
@@ -192,3 +157,5 @@ x86_64, which pins its own CuTeDSL version. The FA4 examples need `flash_attn.cu
 `quack-kernels` release that supports the CuTeDSL version under test (quack 0.6.5 needs 4.7;
 0.6.3 works with 4.6). Version-dependent CuTeDSL APIs are covered in
 [CuTeDSL versions](cache.md#cutedsl-versions).
+
+</details>

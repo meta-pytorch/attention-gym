@@ -2,8 +2,16 @@
 
 [Back to warpdrive](index.md)
 
-A `WorkStream` gives the roles of one work unit the same sequence of items. A **work unit**
-is one CTA, or one whole cluster with `CtaPair()` or `Cluster(...)`.
+Use a `WorkStream` to give cooperating roles the same work items. By default, each CTA
+gets one tile from `Raster()` using `OneShot()`:
+
+```python
+self.work = WorkStream()
+```
+
+A **work unit** is one CTA, or one whole cluster with `CtaPair()` or `Cluster(...)`.
+Declare at most one stream per kernel. The schedule assigns indices; the mapping turns
+each index into the item that roles read:
 
 ```text
 schedule                    mapping                   role
@@ -13,34 +21,16 @@ choose linear index 5  ---> decode 5 as (m, n, l) ---> work.item
                          before decoding starts
 ```
 
-Declare at most one stream per kernel. `WorkStream()` defaults to `Raster()` and `OneShot()`:
-
-```python
-self.work = WorkStream()
-```
-
-For `space=(3, 2, 1)`, plain Raster maps indices 0–5 to
-`(0,0,0), (1,0,0), (2,0,0), (0,1,0), (1,1,0), (2,1,0)`. The schedule decides which unit gets
-each index; changing the schedule need not change these items.
-
-Raster options:
-
-- `along="m"` chooses the raster axis; `"n"` chooses the other one.
-- `swizzle=8` groups the other axis into eight-tile bands, visiting the band's tiles
-  innermost. The final band may be narrower.
-- `reverse="m"` visits m high-to-low. l is always the slowest axis.
-
-For positive extents Raster is a bijection. Its decode intermediates stay within
-`max(index, item_count)`, avoiding overflow for admitted indices.
-
 ## Choose a schedule
 
-| Schedule | After unit b's first index b… | Distribution |
+Start with `OneShot()`. Use `StaticPersistent()` to reuse each unit for several items.
+
+| Schedule | How a unit gets its next index | Distribution |
 |---|---|---|
-| `OneShot()` | Return terminal index `total`; no local reassignment of dropped items | Local |
-| `StaticPersistent()` | Add U, the number of launched units | Local |
-| `TilePersistent(axis)` | Step its `axis` coordinate by `gridDim[axis]`; the other two stay at `blockIdx` | Local |
-| `AtomicPersistent(stages=2)` | Claim from a global atomic counter | Scheduler warp |
+| `OneShot()` | None: return terminal index `total`; dropped items are not reassigned | Local |
+| `StaticPersistent()` | Start at unit index b, then add the number of launched units | Local |
+| `TilePersistent(axis)` | Step one tile coordinate by `gridDim[axis]` | Local |
+| `AtomicPersistent(stages=2)` | Claim from a global atomic counter after its first index b | Scheduler warp |
 | `ClusterLaunchControl(stages=2)` | Cancel an unlaunched unit and take its work | Scheduler warp |
 
 With eight items and three static-persistent units:
@@ -51,37 +41,19 @@ unit 1:  1 -> 4 -> 7 -> terminal
 unit 2:  2 -> 5      -> terminal
 ```
 
-The local schedules fix these sequences before the launch, so the host can list them:
-`work.assignment(space, max_ctas)` returns each CTA's `(index, item)` list in run order
-([drawn per CTA](tracing.md#see-which-cta-runs-what)).
+For local schedules, `work.assignment(space, max_ctas)` lists each CTA's `(index, item)`
+sequence before launch ([drawn per CTA](tracing.md#see-which-cta-runs-what)).
 
-`TilePersistent(axis="m" | "n" | "l")` launches the plain `Raster()` tile space with that axis
-capped at `max_ctas` units, so `max_ctas` caps the units along the axis (per slice of the other
-two), not the CTA count. Each CTA keeps the other two coordinates from `blockIdx`, with no
-division, and walks its axis coordinate by `gridDim[axis]`. The stream's index is that
-coordinate and `total` the axis extent, so a [limit](#a-device-read-limit) bounds the
-coordinate. `TilePersistent("n")` over `(pairs, chunks, heads)` launches
-`(pairs, workers, heads)`, with `workers` at most `max_ctas`. It needs a single-CTA cluster and
-no `record`.
-
-`TilePersistent(axis, units=n)` fixes the grid's axis extent at `n` instead (CTAs past the axis
-extent run nothing, and `max_ctas` is not read), which makes the stride a compile-time constant.
-A register-heavy loop can need that. It specializes the kernel on `n`, so bucket it.
-
-Atomic claims are unique but have no fixed inter-unit order. CLC recovers the canceled
-work index from its CTA x coordinate divided by cluster size. It waits for every cancellation
-response and never queries again after failure.
-
-A correctly launched and drained stream assigns each kept index to exactly one unit. Its
-roles see the same ordered sequence in the CTAs where they run: every CTA for `all`, pair
-leaders for `leader`, rank 0 for `rank0`. This does not mean every CTA sees every item.
+A correctly launched and drained stream assigns each kept index to exactly one unit.
+Within that unit, roles see the same sequence wherever they run: every CTA for `all`,
+pair leaders for `leader`, rank 0 for `rank0`.
 
 ### The role loop
 
 This role fragment works with either local or broadcast distribution:
 
 ```python
-self.work = WorkStream(mapping=Raster(swizzle=8), schedule=ClusterLaunchControl(stages=2))
+self.work = WorkStream(schedule=StaticPersistent())
 
 
 @role(warps=4, regs=40)
@@ -94,59 +66,20 @@ def load(self, params: PersistentGemmParams, *, ab: Producer, work: WorkCursor):
     return ab, work
 ```
 
-Every managed role must drain a persistent stream, even a role with no per-item work.
-Use exactly `while work.valid:`, read the item before advancing, call `work.advance()` once
-directly at the end of the loop body, and return the cursor. A `StaticPersistent` or
-`TilePersistent` stream may use the [counted form](#a-counted-loop) instead.
+Every managed role must drain a persistent stream, even if it has no per-item work.
+Use `while work.valid:`, read the item before advancing, call `work.advance()` once directly
+at the end of the body, and return the cursor. `StaticPersistent` and `TilePersistent` also
+support the [counted form](#a-counted-loop).
 
 The checker rejects item reads after advance, including lookahead reads of the next item
 inside the same iteration. It does not prove advance is lexically last, detect every cursor
 rebind/stale restore, or prove useful and matching work happened before it.
 
-### A counted loop
-
-A `while work.valid` loop is an `scf.while`, which `cutlass.range(..., unroll=n)` cannot
-unroll. A local `StaticPersistent` or `TilePersistent` stream over `Raster()` (a mapping that
-keeps every item, decodes any index and keeps no state) without `record` can loop over a trip
-count instead:
-
-```python
-for k in cutlass.range(work.trip_count(), unroll=2):  # two items' loads overlap
-    m, n, l = work.item_at(k)
-    ...
-```
-
-Item `k` is index `first + k * stride`, and `trip_count()` is
-`ceil((end - first) / stride)` (0 when the first index is already terminal), with `end` the total
-or the [limit](#a-device-read-limit). A cursor runs in one mode: calling `advance()` on a counted
-cursor, or `trip_count()` on an advanced one, raises at trace time. Return the cursor from the
-role as usual.
-
-### What the scheduler warp buffers
-
-Local schedules compute and decode indices in each role. Atomic and CLC schedules add a
-scheduler warp that claims, decodes and broadcasts items through a work ring. In a cluster,
-rank 0 sends to every CTA. The warp is the lowest free warp unless selected with
-`WorkStream(scheduler_warp=...)`.
-
-```text
-scheduler: acquire free slot -> claim/decode -> publish item
-role:      receive item      -> release slot -> compute item
-```
-
-`stages` is **work-ring depth**, not A/B buffering. A role releases its work slot on receipt,
-not when computation finishes. All ring consumers also receive a terminal marker, which is
-not work.
-
-For cluster broadcasts, the leader uses `st.async` to fill every CTA's slot; the bytes
-complete that CTA's FULL barrier. Receivers return the slot with CTA-scope arrivals
-(`remote_scope="cta"`), publishing no data. Cluster-scope releases would add a GPU-scope
-membar **per item in every role**, a cost comparable to a short-K mainloop.
-
 ## Bind and launch
 
-Keep scheduling choices static and problem dimensions runtime. From
-[persistent_gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/persistent_gemm.py), these excerpts run at three boundaries:
+Keep scheduling choices static and problem dimensions runtime. The
+[persistent GEMM](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/persistent_gemm.py)
+binds and launches work at three boundaries:
 
 ```python
 # Python, outside the compiled entry point:
@@ -160,20 +93,18 @@ self.kernel(..., bound).launch(**self.launch_config(bound), stream=stream)
 smem = self.begin_roles(work=bound, layouts={"A": a_layout, "B": b_layout, "C": c_layout})
 ```
 
-`bind()` returns `BoundWork`, the runtime problem passed to the kernel. Shapes, counts and
-the persistent grid cap are not per-shape compile keys. The keyword `work=bound` matches
-`self.work`. Supply layouts for every `SmemPlan` buffer; omit `layouts` when allocating
-storage yourself.
+`bind()` returns the kernel's runtime `BoundWork`. Shapes, counts and the persistent grid
+cap stay out of the compile key. `work=bound` matches the declaration `self.work`. Supply
+layouts for every `SmemPlan` buffer; omit `layouts` if you allocate storage yourself.
 
-Keep both launch arguments in the entry point's signature even for schedules that ignore
-them, so switching schedules preserves the ABI.
+Keep `workspace` and `max_ctas` in the compiled entry point's signature even when a schedule
+ignores them. This lets you switch schedules without changing the launch ABI.
 
 ### Grid cap
 
-Static and atomic persistence require `max_ctas`. It caps **CTAs**, not clusters. With
-cluster size `cs`, the cap becomes `max_ctas // cs` units, at least one; both schedules also
-cap units by item count, again at least one. `TilePersistent` without `units` requires it too,
-as the cap on the units along its axis.
+Static and atomic persistence require `max_ctas`. It caps **CTAs**, not clusters:
+with cluster size `cs`, they launch `max(1, min(total, max_ctas // cs))` units.
+`TilePersistent` without `units` instead uses it to cap units along its axis.
 
 `launch_args()` estimates how many CTAs fit in resident clusters: the SM count for single
 CTAs or pairs, fewer for four-CTA clusters (36 clusters on a 152-SM GB300). This is a capacity
@@ -193,25 +124,100 @@ The last scheduler report resets claim state for the next ordered launch, includ
 graph replay. It is not a statement that all earlier item computations have finished.
 
 `launch_args()` caches workspace by device and **current stream**. Ordered launches on one
-stream can share it; calls on different streams obtain different workspaces. Never manually
-share one between concurrent launches: they would steal each other's indices and one could
-reset the counter while the other still claims.
+stream can share it; different streams get separate workspaces. Never share one between
+concurrent launches: their claims and resets would interfere.
 
 Without `record`, schedules that use no workspace (`OneShot`, `StaticPersistent`,
 `TilePersistent`, CLC) receive one placeholder per device. The kernel never accesses it; graph
 capture on a new stream therefore records no fill.
+
+## Built-in schedule details
+
+### Raster order
+
+For `space=(3, 2, 1)`, plain Raster maps indices 0–5 to
+`(0,0,0), (1,0,0), (2,0,0), (0,1,0), (1,1,0), (2,1,0)`. The schedule decides which unit gets
+each index; changing the schedule need not change these items.
+
+Raster options:
+
+- `along="m"` chooses the raster axis; `"n"` chooses the other one.
+- `swizzle=8` groups the other axis into eight-tile bands, visiting the band's tiles
+  innermost. The final band may be narrower.
+- `reverse="m"` visits m high-to-low. l is always the slowest axis.
+
+For positive extents Raster is a bijection. Its decode intermediates stay within
+`max(index, item_count)`, avoiding overflow for admitted indices.
+
+### Tile persistence
+
+`TilePersistent("n")` over `(pairs, chunks, heads)` launches `(pairs, workers, heads)`,
+with `workers` capped by `max_ctas`. Each CTA keeps its pair and head from `blockIdx` and
+steps through chunks by `gridDim.y`, without division.
+
+The axis can be `"m"`, `"n"` or `"l"`. `max_ctas` caps that axis per slice of the other two,
+not the total CTA count. The stream index is the axis coordinate and `total` is its extent,
+so a [limit](#a-device-read-limit) bounds that coordinate. This schedule needs plain
+`Raster()`, a single-CTA cluster and no `record`.
+
+`TilePersistent(axis, units=n)` fixes the grid's axis extent and stride at compile time.
+CTAs past the work extent run nothing; `max_ctas` is ignored. Bucket `n` to bound the number
+of compiled variants.
+
+### A counted loop
+
+To unroll work across items, use a counted loop. `while work.valid` lowers to `scf.while`
+and cannot use `cutlass.range(..., unroll=n)`. The counted form supports local
+`StaticPersistent` or `TilePersistent` streams over `Raster()` without `record`: the mapping
+must keep every item, decode any index and carry no state.
+
+```python
+for k in cutlass.range(work.trip_count(), unroll=2):  # two items' loads overlap
+    m, n, l = work.item_at(k)
+    ...
+```
+
+Item `k` is index `first + k * stride`, and `trip_count()` is
+`ceil((end - first) / stride)` (0 when the first index is already terminal), with `end` the total
+or the [limit](#a-device-read-limit). A cursor runs in one mode: calling `advance()` on a counted
+cursor, or `trip_count()` on an advanced one, raises at trace time. Return the cursor from the
+role as usual.
+
+### What the scheduler warp buffers
+
+Atomic claims are unique but have no fixed inter-unit order. CLC gets the canceled work
+index from its CTA x coordinate divided by cluster size. It waits for every cancellation
+response and never queries again after failure.
+
+Local schedules compute and decode indices in each role. Atomic and CLC schedules add a
+scheduler warp that claims, decodes and broadcasts items through a work ring. In a cluster,
+rank 0 sends to every CTA. The warp is the lowest free warp unless selected with
+`WorkStream(scheduler_warp=...)`.
+
+```text
+scheduler: acquire free slot -> claim/decode -> publish item
+role:      receive item      -> release slot -> compute item
+```
+
+`stages` is **work-ring depth**, not A/B buffering. A role releases its work slot on receipt,
+not when computation finishes. All ring consumers also receive a terminal marker, which is
+not work.
+
+For cluster broadcasts, rank 0 uses `st.async` to fill every CTA's slot and complete its
+FULL barrier. Receivers return the slot with `remote_scope="cta"`: they publish no data.
+Cluster-scope releases would add a GPU-scope membar per item in every receiving thread.
 
 ### The grid and empty work
 
 Plain `Raster()` with `OneShot()` normally launches
 `(m_tiles * cluster_size, n_tiles, l)` and reads `blockIdx` coordinates. If y or z exceeds
 65535, it switches to a decoded 1-D grid. A hand-built `(total * cluster_size, 1, 1)` grid is
-also supported for this path. Other built-in combinations use 1-D grids.
+also supported for this path. Apart from `TilePersistent`, other built-in combinations
+use 1-D grids.
 
-That is `OneShot(grid="auto")`: one kernel for both grids, with a prologue branch on the launch
-shape. The branch merges `blockIdx` with a decoded index, so the item, and every address and
-predicate computed from it, leaves the uniform datapath, which slows a pointwise kernel
-noticeably. When that matters, make the grid a static choice:
+`OneShot(grid="auto")` handles both grids with a runtime branch. The merged item and its
+derived addresses and predicates leave the uniform datapath. To avoid that branch, choose
+a static grid. The table shows single-CTA grids; clusters multiply x by `cluster_size`:
 
 | `OneShot(grid=...)` | Launch grid | Item |
 |---|---|---|
@@ -231,12 +237,11 @@ op = MyKernel(grid=OneShot.grid_for((chunks, heads, batch)))
 self.work = WorkStream(schedule=OneShot(grid=grid))
 ```
 
-That is at most three compiled variants, and two when the model bounds `n_tiles` or `l`: with
-heads on n and batch on l, only `"3d"` and `"2d"` are ever selected.
+This needs at most three compiled variants. If heads on n always fit the grid limit,
+only `"3d"` and `"2d"` are selected as batch on l grows.
 
-A `"3d"` or `"2d"` kernel bound to a space past its limit cannot launch. Static extents
-raise a `ValueError` from `bound.grid()`. Runtime extents cannot raise from the jit entry
-point, so the grid is launched as is and CUDA rejects it before any CTA runs:
+Past a `"3d"` or `"2d"` limit, `bound.grid()` raises `ValueError` for static extents.
+For runtime extents, CUDA rejects the grid before any CTA runs:
 `CUDA launch failed: cudaErrorInvalidValue (1)`, `CUDA rejected the launch configuration before
 running the kernel.`
 
@@ -273,9 +278,10 @@ independently fit Int32 and CUDA limits.
 
 ## Custom mappings
 
-A `WorkMap` turns an index into an item; it does not choose the next index. For example, a
-table-backed map can return table row `index`, dropping unused rows. Subclass `WorkMap`;
-[scheduling.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/scheduling.py) defines the full protocol.
+Subclass `WorkMap` when `Raster` does not describe your items. A map decodes an index;
+it does not choose the next one. For example, it can return table row `index` and drop
+unused rows. [scheduling.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/scheduling.py)
+defines the full protocol.
 
 | Method or field | Contract |
 |---|---|
@@ -394,10 +400,9 @@ are ignored. The schedule visits all capacity, so avoid excessive padding.
 
 ### A device-read limit
 
-When the live items are a prefix of the stream, end it there instead of dropping the rest
-one decode at a time: bind a `Limit`, which every decoding site reads once, after the
-readiness hook, and which ends the stream at `min(total, limit)` in the schedule's index
-order.
+If live items form a prefix, bind a `Limit` rather than decoding and dropping the rest.
+Each decoding site reads it once after readiness. The stream ends at `min(total, limit)`
+in the schedule's index order.
 
 ```python
 from attn_gym.warpdrive import LastEntry
@@ -495,12 +500,10 @@ Override `index_limit` if the default does not bound your sequence. See `IndexSc
 
 ## External tile orders: subclass WorkMap
 
-An external library's index-to-tile order can be a custom `WorkMap`; warpdrive still owns
-index distribution, the launch grid and the work ring. The worked
-[external_maps.py example](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py)
-shows how to wrap CUTLASS's static persistent order and FA4's tile schedulers. These mappings
-are user code, not part of warpdrive's core API; their library-specific domains belong to
-their users.
+Wrap an external tile order in a `WorkMap`; warpdrive still owns index distribution,
+the grid and the work ring. [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py)
+wraps CUTLASS's static persistent order and FA4's tile schedulers. These are user mappings,
+not core APIs; their authors own the library-specific input domains.
 
 When wrapping a library, keep the [WorkMap contract](#custom-mappings):
 

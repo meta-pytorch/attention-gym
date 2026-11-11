@@ -2,17 +2,14 @@
 
 [Write a kernel](writing-kernels.md) · [API guides](index.md#more-examples-and-details)
 
-warpdrive derives synchronization from your roles and channels. You supply the algorithm,
+warpdrive manages synchronization for your declared roles and channels. You supply the math,
 layouts and matching work on both sides of each handoff. **A kernel that compiles can still
 race or deadlock.**
 
-This contract covers CuTeDSL 4.6.2 through 4.8 on Blackwell SM100/SM103, with a single CTA, a
-CTA pair or a cluster of at most eight CTAs. Example wrappers have their own tensor and numerical contracts.
-
 ## What the layer handles
 
-These guarantees assume matching channel epochs and participants, enough storage for live
-values, a dependency graph that can make progress, and terminating user work.
+These guarantees require matching epochs and participants, enough storage for live values,
+a dependency graph that can make progress, and terminating user work.
 
 | When you use… | warpdrive handles… | You still supply… |
 |---|---|---|
@@ -23,13 +20,17 @@ values, a dependency graph that can make progress, and terminating user work.
 | `TmemPlan` and annotated users | Column allocation and coordinated teardown | Every actual TMEM user declared, and correct alias ordering |
 | A drained `WorkStream` | Once-only assignment of kept indices to work units, with the same sequence for their participating roles | A valid mapping/schedule and correct work for each item |
 
-A work unit is one CTA or one cluster, not each CTA of a cluster independently. Custom
-schedules and mappings must meet the [scheduling protocol](scheduling.md#custom-mappings).
+A work unit is one CTA or one cluster, not each CTA in a cluster. Custom schedules and
+mappings must meet the [scheduling protocol](scheduling.md#custom-mappings).
+
+This contract covers CuTeDSL 4.6.2 through 4.8 on Blackwell SM100/SM103, with one CTA, a CTA
+pair or a cluster of at most eight CTAs. Example wrappers have their own tensor and numerical
+contracts.
 
 ## The authoring rules that matter
 
-**Keep participants and epochs balanced.** A `Threads` side counts every thread of its bound
-roles. Predicate the data access, not the handoff:
+**Balance participants and epochs.** A `Threads` side counts every thread of its bound roles.
+Predicate the data access, not the handoff:
 
 ```python
 with acc.consume() as h:
@@ -37,82 +38,86 @@ with acc.consume() as h:
         ...  # store valid output; every participating thread still releases
 ```
 
-Putting the whole `with` inside a lane-dependent condition changes the arrivals without
-changing the count. Likewise, producing n+1 stages while consuming n can compile. Counts
-alone do not establish liveness: two roles can each wait for a value the other hasn't produced.
-On a ring with [exclusive consumers](channels.md#exclusive-consumers), every epoch needs
-exactly one owner (checked only when the waits and skips are static), and a wait that follows
-more than a ring lap of skips needs a rendezvous with the epoch's previous owner.
+A lane-dependent condition around the whole `with` changes arrivals without changing the
+count. Producing n+1 stages while consuming n can also compile. Balanced counts alone do not
+ensure progress: two roles may each wait for the other's first value.
 
-**Carry current state.** Return every managed endpoint, work cursor and turnstile seat from a
-role. Helpers return updated state and callers reassign it. Close each handle once, in its
-opening dynamic region, and do not access its storage after closing. The checker detects
-missing returns, local lifetime errors and discarded advancing-helper results for managed
-channel ends/work cursors, including inside loops; it does not prove freshness of reconstructed
-snapshots, manually supplied raw state or turnstile seats, or all post-close accesses.
+On an [exclusive-consumer ring](channels.md#exclusive-consumers), every epoch needs exactly
+one owner. This is checked only for static waits and skips. A wait after more than one ring
+lap of skips needs a rendezvous with that epoch's previous owner.
 
-**Drain the work loop.** Use `while work.valid:`, read `work.item` before advancing, and call
-`work.advance()` once directly at the end of the body, or use the
-[counted form](scheduling.md#a-counted-loop) on a `StaticPersistent` or `TilePersistent`
-stream. Return the cursor. The layer checks the traced loop structure, not matching runtime
-trip counts inside different roles.
+**Carry current state.** Return every managed endpoint, work cursor and turnstile seat from
+its role. Helpers return updated state; callers reassign it. Close each handle once, in its
+opening dynamic region, and stop accessing its storage. The checker catches missing returns,
+local lifetime errors and discarded advancing-helper results for managed ends and cursors,
+including in loops. It does not prove freshness of reconstructed snapshots, raw state or
+turnstile seats, or catch every post-close access.
 
-**Own the memory ordering.** A channel's fences run before its managed signal: the declared ones,
-which default to `smem_async` on the release of a TMA-filled channel with thread consumers
-(the thread roles only, on a [per-role consumer side](channels.md#per-role-consumer-mechanisms))
-and on the commit of a thread-written channel with SMEM storage that an MMA consumes.
-TMA stores, raw async copies, TMEM aliases and storage
-shared across channels may need additional waits and proxy fences. Complete that work before
-reusing its storage or exiting. For ordinary writes read by another CTA, use the correct peer
-address and `remote_scope="cluster"`; a channel cannot infer either for you.
+**Drain the work loop.** Use `while work.valid:`, read `work.item`, then call `work.advance()`
+once, directly at the end of the body. Alternatively, use the
+[counted form](scheduling.md#a-counted-loop) with `StaticPersistent` or `TilePersistent`.
+Return the cursor. The checker recognizes loop structure; it does not compare runtime trip
+counts across roles.
+
+**Own the memory ordering.** Declared channel fences run before managed signals. The default
+`smem_async` fence applies to:
+
+- Release by thread consumers of a TMA-filled channel. On a
+  [per-role consumer side](channels.md#per-role-consumer-mechanisms), only thread roles run it.
+- Commit by thread producers writing SMEM that an MMA consumes.
+
+TMA stores, raw async copies, TMEM aliases and storage shared across channels may need more
+waits and proxy fences. Complete those accesses before reuse or exit. For ordinary writes
+read by another CTA, supply the correct peer address and `remote_scope="cluster"`; a channel
+cannot infer either.
 
 **Launch what you declared.** Call `begin_roles` and `run_roles` in converged CTA/cluster code.
 Use `launch_config(bound)` for the declared block/cluster shape and checked work grid. Keep
-raw named barriers clear of IDs 1 and 2, `op.named_barrier_ids` and each `NamedBarrier.id`. Initialize any
-`Barriers(counts=None)` yourself before dispatch. Cluster exit synchronization and automatic
-producer tails cover the managed protocol, not arbitrary user async operations.
+raw named barriers clear of IDs 1 and 2, `op.named_barrier_ids` and each `NamedBarrier.id`.
+Initialize any `Barriers(counts=None)` before dispatch. Cluster exit synchronization and
+automatic producer tails cover the managed protocol, not arbitrary async work.
 
-**Keep configuration and workspaces valid.** Construct a new op when static declarations
-change; do not mutate a collected one (reassigning its cluster, a work stream or
-`trace_protocol` after collection raises; other declarations are not checked). Include all
-static algorithm choices in its compile
-key, using the [cache integration](roles.md#compile-keys). Do not share a scheduler
-workspace between concurrent launches; use `launch_args()` for the current device and stream.
-The launch checks do not validate arbitrary indices, pointer arithmetic or resource use in
-user code.
+**Keep configuration and workspaces valid.** Put static choices in the constructor and use
+the [cache integration](roles.md#compile-keys). Construct a new op when declarations change;
+do not mutate a collected one. Reassigning its cluster, work stream or `trace_protocol` after
+collection raises. Trace/alias settings may still change; other public attributes assigned
+after construction are rejected at cache lookup. In-place declaration mutations are not
+checked or keyed.
+
+Do not share scheduler workspaces between concurrent launches. Use `launch_args()` for the
+current device and stream. Launch checks do not validate user indices, pointer arithmetic or
+resource use.
 
 ## What a successful check means
 
-- **`describe()`:** declaration checks and derived roles, counts, masks, storage and budgets.
-  Before a body has been traced, it cannot report that body's checks.
-  A build loaded through `jit_cache` restores its saved TMA/alias reports and warnings;
-  protocol-traced builds compile uncached.
-- **Compilation:** also checks local handle lifetimes, required returned state, recognizable
-  work-loop structure, attributable TMA operations, and that try tokens and previews are used
-  by their own end, epoch and dynamic region (or a loop carry whose entry and back-edge
-  still name that epoch), and the epoch ownership of an exclusive or round-robin channel
-  when every acquire, wait and skip on it is static. It does not compare arbitrary role
-  bodies to prove balanced epochs or a live dependency graph.
-- **TMA `verified`:** recognized group and byte accounting. Not proof of descriptor legality,
-  disjoint writes or async safety. Opaque uses may remain `unverified`; inspect the reasons.
-- **Alias `no hazard found`:** no conflicting annotated pair found under the diagnostic's
-  rules. Not proof of safe aliasing. Clusters, raw accesses, round-robin channels and
-  orderings through an exclusive ring's epochs have
-  [limited or no ordering coverage](storage.md#read-the-result).
-- **Passing tests:** evidence for the executed shapes, schedules and toolchain, not all
-  accepted programs. Neither profiling plans nor protocol logs prove liveness or performance.
+- **`describe()`:** checks declarations and reports derived roles, counts, masks, storage and
+  budgets. Body checks appear only after compilation. `jit_cache` restores saved TMA/alias
+  reports and warnings; the examples compile protocol-traced builds uncached.
+- **Compilation:** checks local handle lifetimes, returned state and recognizable work loops.
+  It checks attributable TMA operations and binds try tokens/previews to their end, epoch and
+  dynamic region, including loop carries whose entry and back-edge still name that epoch.
+  Exclusive/round-robin epoch ownership is checked when all acquires, waits and skips are
+  static. It does not prove balanced epochs across arbitrary role bodies or a live dependency
+  graph.
+- **TMA `verified`:** recognized group and byte accounting, not descriptor legality, disjoint
+  writes or async safety. Inspect the reasons for any `unverified` use.
+- **Alias `no hazard found`:** no conflicting annotated pair under the diagnostic's rules,
+  not proof of safe aliasing. Clusters, raw accesses, round-robin channels and orderings
+  through exclusive-ring epochs have [limited or no coverage](storage.md#read-the-result).
+- **Passing tests:** evidence for the shapes, schedules and toolchain tested. Profiling plans
+  and protocol logs prove neither liveness nor performance.
 
 Invalid configurations generally raise `ValueError`; invalid bindings and traced protocols
 raise `ProtocolError`. Read the message and any nested compiler cause. **There is no public
-numbered error-code API.** The E/R/U/G labels in fuzz reports identify test cases
-and contract clauses, not exception attributes or message prefixes.
+numbered error-code API.** E/R/U/G labels in fuzz reports name test cases and contract clauses,
+not exception attributes or message prefixes.
 
 ## Dropping down
 
-Raw roles still get placement, initialization and annotated TMEM teardown, but not managed
+Raw roles keep placement, initialization and annotated TMEM teardown, but lose managed
 endpoint/cursor checks. `signal=False` omits both the signal and its fence. Overrides and
-`unchecked(...)` leave the corresponding reasoning to you; suppress only the specific check
-and document the reason. See [Dropping down](dropping-down.md) for the APIs and boundaries.
+`unchecked(...)` leave the corresponding reasoning to you. Suppress only the specific check
+and document why. See [Dropping down](dropping-down.md) for the APIs and boundaries.
 
 ## Further reading
 
