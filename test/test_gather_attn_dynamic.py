@@ -67,8 +67,9 @@ def test_triton_operator_contracts(share_kv, gather_attn_single_config):
         torch.library.opcheck(
             _gather_attn_fwd_op,
             (*args, needs_backward, "triton"),
+            {"autotune": True},
         )
-    out, lse, tape = _gather_attn_fwd_op(*args, True, "triton")
+    out, lse, tape = _gather_attn_fwd_op(*args, True, "triton", autotune=True)
     torch.library.opcheck(
         _gather_attn_bwd_op,
         (
@@ -88,6 +89,7 @@ def test_triton_operator_contracts(share_kv, gather_attn_single_config):
             0.25,
             "triton",
         ),
+        {"autotune": True},
     )
 
 

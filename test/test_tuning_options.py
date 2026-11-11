@@ -8,6 +8,7 @@ import torch
 from attn_gym import linear, mla, sparse
 from attn_gym.linear import gdn, kda
 from attn_gym.linear import types as linear_types
+from attn_gym.mla import api as mla_api
 from attn_gym.mla import paged_mla_decode
 from attn_gym.sparse.gather_attn import api as gather_attn_api
 from attn_gym.sparse.indexer import api as indexer_api
@@ -21,7 +22,7 @@ def short_conv_specs(decode: bool) -> tuple[dict, type]:
     return cute.KERNEL_OPTION_SPEC, cute.ShortConvKernelOptions
 
 
-# Each specification with the TypedDict that documents it; ``None`` where there is none.
+# Each specification with the TypedDict that documents it.
 OPTION_SPECS = {
     "tuning": lambda: (TUNING_OPTION_SPEC, TuningOptions),
     "chunk_gdn": lambda: (linear_types.SPLIT_OPTION_SPEC, linear_types.SplitOptions),
@@ -34,7 +35,11 @@ OPTION_SPECS = {
         gather_attn_api.KERNEL_OPTION_SPEC,
         gather_attn_api.GatherAttnKernelOptions,
     ),
-    "lightning_indexer": lambda: (indexer_api.KERNEL_OPTION_SPEC, None),
+    "lightning_indexer": lambda: (
+        indexer_api.KERNEL_OPTION_SPEC,
+        indexer_api.IndexerKernelOptions,
+    ),
+    "paged_mla_decode": lambda: (mla_api.KERNEL_OPTION_SPEC, TuningOptions),
     "causal_conv1d": lambda: short_conv_specs(decode=False),
     "causal_conv1d_decode": lambda: short_conv_specs(decode=True),
 }
@@ -88,12 +93,11 @@ def test_kernel_options_follow_one_contract(make_spec):
             with pytest.raises(error, match=rf"kernel_options\['{name}'\] must be .*{expected}"):
                 resolve({name: value})
 
-    if typed_dict is not None:
-        documented = {
-            name: get_args(hint) if get_origin(hint) is Literal else hint
-            for name, hint in get_type_hints(typed_dict).items()
-        }
-        assert documented == {name: accepted for name, (accepted, _) in spec.items()}
+    documented = {
+        name: get_args(hint) if get_origin(hint) is Literal else hint
+        for name, hint in get_type_hints(typed_dict).items()
+    }
+    assert documented == {name: accepted for name, (accepted, _) in spec.items()}
 
 
 @pytest.mark.parametrize("operation", [linear.chunk_gdn, linear.recurrent_gdn])

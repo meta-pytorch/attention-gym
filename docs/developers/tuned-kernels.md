@@ -40,8 +40,9 @@ would sacrifice most tuning.
   configuration its shape heuristic picks first, so untuned and paged launches go through the
   tuner like every other pinned launch, bit-identical to the separate launch they replaced.
   When that configuration uses one warp it caps registers at 128, the only capped candidate:
-  tuning now compares it with the uncapped tiles (GDN prefill T=4096 H=16: 959 → 935 µs),
-  whereas capping every one-warp tile slowed KDA prefill (8×512, H=16) from 478 to 500 µs.
+  tuning now compares it with the uncapped tiles (GDN prefill B=1, T=4096, H=16, K=V=128,
+  BF16, GB200: 959 → 935 µs), whereas capping every one-warp tile slowed KDA prefill
+  (8×512, H=16) from 478 to 500 µs.
   A pinned launch costs about 6 µs more host time than the direct launch did: 55 → 61 µs per
   call for a single-token scan over 64 sequences (GB200, BF16, K=V=128). Kernel time is
   unchanged, so only host-bound scans notice.
@@ -53,7 +54,8 @@ would sacrifice most tuning.
   winners by the current CUDA device's name and compute capability (`device_identity` in
   `attn_gym/_backends/tune.py`), not its index. Matching devices can reuse a winner across
   processes. The process-wide compile target does not follow device switches. The lookup,
-  cached per device index, adds about 0.5 µs of host time to a warm tuned launch (GB200).
+  cached per device index, took 0.3 µs per call in a tight loop and 0.8 µs between GPU
+  operations on GB200; over half the tight-loop cost was `torch.cuda.current_device()`.
 - **Make `autotune` a kernel option.** Unifying linear operations' keyword argument with
   `gather_attn`'s typed `kernel_options` key deliberately broke the keyword. `fastmath` remains
   a keyword because it changes the result, not just the kernel.

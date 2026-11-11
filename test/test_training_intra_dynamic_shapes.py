@@ -185,7 +185,10 @@ def test_intra_backend_cache_reuse(stage, fixed, packed):
             assert len(cache) == 1, "diagonal compiled again for runtime T/N/capacity/grid"
         else:
             outputs = chunk_kda_bwd_intra(
-                *inputs, metadata, config=ChunkKdaBwdIntraConfig(1) if fixed else None
+                *inputs,
+                metadata,
+                config=ChunkKdaBwdIntraConfig(1) if fixed else None,
+                autotune=False,
             )
             check_backward(inputs, outputs, lengths or [tokens])
             info = _compile_chunk_kda_bwd_intra.cache_info()
@@ -217,7 +220,7 @@ def test_intra_graph_replay_changed_metadata(dtype, poison):
     def operation():
         metadata = prepare_ragged_chunk_metadata(cu, 193, 64)
         return diagonal(inputs, metadata, fixed=True), chunk_kda_bwd_intra(
-            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1)
+            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1), autotune=False
         )
 
     for _ in range(3):

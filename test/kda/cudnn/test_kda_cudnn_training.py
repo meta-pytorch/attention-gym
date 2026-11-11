@@ -639,14 +639,16 @@ def test_cudnn_document_aligned_spans_are_bitwise_equal(kda_plan_comparison) -> 
 def test_cudnn_kernel_options_are_strict() -> None:
     from attn_gym.linear.kda.validation import ResolvedKernelOptions, resolve_kernel_options
 
-    fused = ResolvedKernelOptions("fused", split_backward=False, split_forward=False)
+    fused = ResolvedKernelOptions(
+        "fused", split_backward=False, split_forward=False, autotune=True
+    )
     assert resolve_kernel_options(None) == fused
     assert resolve_kernel_options({}) == fused
     assert resolve_kernel_options({"backend": "cudnn", "split_backward": True}) == (
-        ResolvedKernelOptions("cudnn", split_backward=True, split_forward=False)
+        ResolvedKernelOptions("cudnn", split_backward=True, split_forward=False, autotune=True)
     )
     assert resolve_kernel_options({"backend": "cudnn", "split_forward": True}) == (
-        ResolvedKernelOptions("cudnn", split_backward=False, split_forward=True)
+        ResolvedKernelOptions("cudnn", split_backward=False, split_forward=True, autotune=True)
     )
     with pytest.raises(ValueError, match="unsupported chunk_kda kernel options"):
         resolve_kernel_options({"unknown": True})

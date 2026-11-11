@@ -34,7 +34,7 @@ class ResolvedKernelOptions(NamedTuple):
     backend: Literal["fused", "cudnn"]
     split_backward: bool
     split_forward: bool
-    autotune: bool = True
+    autotune: bool
     schedule: ScheduleRequest = ScheduleRequest.AUTO
 
 

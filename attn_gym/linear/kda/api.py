@@ -161,7 +161,6 @@ def chunk_kda(
                 scale=scale,
                 output_final_state=output_final_state,
                 fastmath=fastmath,
-                autotune=autotune,
                 split_backward=options.split_backward,
                 split_forward=options.split_forward,
             )

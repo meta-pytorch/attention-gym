@@ -3203,7 +3203,7 @@ def chunk_kda_bwd_wy_dqkg(
     chunk_size: int = 64,
     fastmath: bool = False,
     config: ChunkKdaBwdWyDqkgConfig | None = None,
-    autotune: bool = False,
+    autotune: bool,
     configs: Iterable[ChunkKdaBwdWyDqkgConfig] | None = None,
 ) -> tuple[
     torch.Tensor,

@@ -370,7 +370,6 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         has_initial_state=has_initial_state,
         output_final_state=False,
         metadata=metadata,
-        autotune=False,
     )
     assert final_state is None
     return chunk_gdn_fwd_output_packed(

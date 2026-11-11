@@ -809,7 +809,7 @@ def recurrent_forward(
     output_final_state: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
+    autotune: bool,
     batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and invoke the lazily loaded fused recurrent implementation."""

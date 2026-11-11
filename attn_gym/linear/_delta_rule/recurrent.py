@@ -368,7 +368,7 @@ def launch_recurrent_delta_rule_fwd(
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = False,
+    autotune: bool,
     batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.

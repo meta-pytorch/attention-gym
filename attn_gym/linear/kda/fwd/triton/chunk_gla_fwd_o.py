@@ -515,7 +515,7 @@ def chunk_gla_fwd_o_gk(
     *,
     chunk_size: int = 64,
     metadata: RaggedChunkMetadata | None = None,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = True,
 ) -> torch.Tensor:

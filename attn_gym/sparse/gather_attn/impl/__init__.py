@@ -48,7 +48,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             local_rope,
             sparse_v,
             local_v,
-            autotune,
+            autotune=autotune,
         )
         ctx.save_for_backward(
             query,
@@ -110,7 +110,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             local_rope,
             sparse_v,
             local_v,
-            ctx.autotune,
+            autotune=ctx.autotune,
         )
         return (
             *(dq, ds, dl, None, dsink, None, None, None, None, None, None, None),
@@ -133,7 +133,7 @@ def gather_attn(
     scale: float,
     backend: str,
     bwd_recompute_p: bool = True,
-    autotune: bool = True,
+    autotune: bool,
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
@@ -176,6 +176,6 @@ def gather_attn(
         bwd_recompute_p,
         *ropes,
         *values,
-        autotune,
+        autotune=autotune,
     )
     return output, lse

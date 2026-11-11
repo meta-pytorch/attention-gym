@@ -8,13 +8,14 @@ from .gather_attn import (
     RopePair,
     gather_attn,
 )
-from .indexer import lightning_indexer
+from .indexer import IndexerKernelOptions, lightning_indexer
 
 __all__ = [
     "AuxRequest",
     "GatherAttnAux",
     "GatherAttnKernelOptions",
     "Impl",
+    "IndexerKernelOptions",
     "RopePair",
     "gather_attn",
     "lightning_indexer",

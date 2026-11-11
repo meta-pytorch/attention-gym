@@ -1,5 +1,7 @@
 """Public weighted-ReLU Top-K selection and backend-independent validation."""
 
+from typing import Literal, TypedDict
+
 import torch
 from torch import Tensor
 
@@ -8,7 +10,15 @@ from attn_gym.types import Impl, KernelOptionSpec, resolve_impl, validate_kernel
 
 from .ops import _indexer_op
 
-KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), "auto")}
+
+class IndexerKernelOptions(TypedDict, total=False):
+    """Fused ``lightning_indexer`` options, validated and then ignored by ``Impl.REFERENCE``."""
+
+    backend: Literal["cute", "triton"]
+    """See :func:`lightning_indexer` for default selection and backend requirements."""
+
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), None)}
 
 
 def _validate_inputs(
@@ -109,7 +119,7 @@ def lightning_indexer(
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
-    kernel_options: dict[str, str] | None = None,
+    kernel_options: IndexerKernelOptions | None = None,
 ) -> Tensor:
     """Return the Top-K candidate indices for every (batch, query) row.
 
@@ -161,8 +171,8 @@ def lightning_indexer(
         impl: Impl.REFERENCE (or ``"reference"``) uses eager PyTorch on CPU or CUDA;
             Impl.FUSED (default, or ``"fused"``) uses optimized CUDA kernels.
 
-        kernel_options: Fused backend override: ``{"backend": "cute"}`` or
-            ``{"backend": "triton"}``. Omit options to select CuTe
+        kernel_options: Fused backend override, see :class:`IndexerKernelOptions`:
+            ``{"backend": "cute"}`` or ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100/SM103 and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
 
@@ -215,5 +225,13 @@ def lightning_indexer(
             if not q.is_cuda:
                 raise ValueError("the fused lightning_indexer requires CUDA tensors")
             return _indexer_op(
-                q, k, weights, topk, causal, compress_ratio, backend, cu_seqlens, cu_seqlens_k
+                q,
+                k,
+                weights,
+                topk,
+                causal,
+                compress_ratio,
+                backend or "auto",
+                cu_seqlens,
+                cu_seqlens_k,
             )

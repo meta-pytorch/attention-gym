@@ -210,7 +210,7 @@ def chunk_forward(
     scale: float,
     output_final_state: bool = False,
     fastmath: bool = True,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize per-token natural-log gates and invoke the fused chunk operators."""
@@ -285,7 +285,7 @@ def paged_chunk_forward(
     *,
     cu_seqlens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     replay_state: ReplayState | None = None,
 ) -> torch.Tensor:

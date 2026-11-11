@@ -132,8 +132,11 @@ tuned kernel in forward and backward under `kernel_options={"autotune": False}` 
   depends on the shape belongs in `prune`, which lists its choice first (the recurrent scan).
 - Keep deterministic-mode policy out of tuners. Resolve the `kernel_options["autotune"]` request
   with `should_autotune` (`attn_gym/_backends/autotune.py`) and pass the bool through every launch
-  and custom-op schema. Resolve the stored request again in autograd backward and staged handles'
-  `run`: eager code can change the mode between phases. `gather_attn` resolves inside its CUDA ops.
+  and custom-op schema as a required argument: a default would hide a launch that was never
+  wired. Resolve the stored request again in autograd backward and staged handles' `run`: eager
+  code can change the mode between phases. An autograd Function may store the bool its forward
+  resolved instead of the raw request; deterministic mode at backward still pins.
+  `gather_attn` resolves inside its CUDA ops.
 - Never tune state-mutating recurrences: benchmarking is unsafe. Keep them pinned regardless of
   the option and document this in their docstrings.
 - When migrating tuners or changing candidates, key, or prune, verify bit-identical pinned

@@ -80,9 +80,7 @@ def _run(inputs: tuple[torch.Tensor, ...], lengths: list[int]):
     """Run a ragged launch with the full fixed-capacity grid exposed."""
     metadata = _metadata(lengths)
     return chunk_kda_bwd_intra(
-        *inputs,
-        metadata,
-        config=ChunkKdaBwdIntraConfig(metadata.capacity),
+        *inputs, metadata, config=ChunkKdaBwdIntraConfig(metadata.capacity), autotune=False
     )
 
 
@@ -226,7 +224,7 @@ def test_bwd_intra_keeps_subchunk_decays_at_gate_bound(
     inputs[6:] = tuple(torch.zeros_like(tensor) for tensor in inputs[6:])
     metadata = None if lengths is None else _metadata(lengths)
 
-    dq, dk, dg, db = chunk_kda_bwd_intra(*inputs, metadata, fastmath=fastmath)
+    dq, dk, dg, db = chunk_kda_bwd_intra(*inputs, metadata, fastmath=fastmath, autotune=False)
     # The FP32 reference overflows exp2 at this gate, so bound the error by the FP64 scale.
     expected = bwd_intra_reference(
         *(tensor.double() for tensor in inputs[:6]),
@@ -271,7 +269,7 @@ def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
     running = [torch.zeros(shape, device="cuda") for _ in range(3)]
     dq, dk, dg, db = chunk_kda_bwd_intra(
         q, k, g, beta, dAqk, dAkk, *running[:2], torch.zeros_like(beta), running[2], None,
-        fastmath=fastmath,
+        fastmath=fastmath, autotune=False
     )  # fmt: skip
     expected = bwd_intra_reference(*(tensor.double() for tensor in (q, k, g, beta, dAqk, dAkk)))
     for name, actual, golden in zip(("dq", "dk", "dbeta", "dg"), (dq, dk, db, dg), expected):
@@ -282,7 +280,7 @@ def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
 def test_ragged_bwd_intra_rejects_mismatched_chunk_size():
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([64]), 64, 32)
     with pytest.raises(ValueError, match="metadata chunk size"):
-        chunk_kda_bwd_intra(*_inputs(64), metadata)
+        chunk_kda_bwd_intra(*_inputs(64), metadata, autotune=False)
 
 
 @pytest.mark.parametrize("lengths", [[65, 63], [0, 1, 64, 0, 65]])
@@ -295,7 +293,7 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
         assert active_chunks < metadata.capacity
 
     config = ChunkKdaBwdIntraConfig(metadata.capacity) if 0 in lengths else None
-    actual = chunk_kda_bwd_intra(*inputs, metadata, config=config)
+    actual = chunk_kda_bwd_intra(*inputs, metadata, config=config, autotune=False)
     expected = _sequence_local_reference(inputs, lengths)
 
     for packed, sequence_local in zip(actual, expected, strict=True):
@@ -308,7 +306,7 @@ def test_ragged_bwd_intra_clamps_grid_wider_than_capacity():
     inputs = _inputs(sum(lengths))
     metadata = _metadata(lengths)
     wide = chunk_kda_bwd_intra(
-        *inputs, metadata, config=ChunkKdaBwdIntraConfig(4 * metadata.capacity)
+        *inputs, metadata, config=ChunkKdaBwdIntraConfig(4 * metadata.capacity), autotune=False
     )
     for actual, expected in zip(wide, _run(inputs, lengths), strict=True):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -317,7 +315,11 @@ def test_ragged_bwd_intra_clamps_grid_wider_than_capacity():
 @pytest.mark.parametrize("metadata", [None, "ragged"], ids=["dense", "ragged"])
 def test_bwd_intra_accepts_zero_tokens(metadata):
     inputs = _inputs(0)
-    outputs = chunk_kda_bwd_intra(*inputs, None) if metadata is None else _run(inputs, [0, 0])
+    outputs = (
+        chunk_kda_bwd_intra(*inputs, None, autotune=False)
+        if metadata is None
+        else _run(inputs, [0, 0])
+    )
     dq, dk, dg, db = outputs
 
     assert dq.shape == dk.shape == dg.shape == (1, 0, 1, 128)
@@ -335,10 +337,14 @@ def test_bwd_intra_reuses_compile_across_grid_caps_and_capacities(ragged):
         lengths = [0, 1, tokens - 1, 0] if ragged else None
         metadata = _metadata(lengths) if ragged else None
         inputs = _inputs(tokens)
-        expected = chunk_kda_bwd_intra(*inputs, metadata, config=ChunkKdaBwdIntraConfig(1))
+        expected = chunk_kda_bwd_intra(
+            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1), autotune=False
+        )
         launches += 1
         for cap in (1, 16, 17, 64):
-            actual = chunk_kda_bwd_intra(*inputs, metadata, config=ChunkKdaBwdIntraConfig(cap))
+            actual = chunk_kda_bwd_intra(
+                *inputs, metadata, config=ChunkKdaBwdIntraConfig(cap), autotune=False
+            )
             launches += 1
             for output, reference in zip(actual, expected, strict=True):
                 torch.testing.assert_close(output, reference, rtol=0, atol=0)
@@ -352,13 +358,13 @@ def test_ragged_bwd_intra_replays_aligned_to_partial():
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
     warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
     config = ChunkKdaBwdIntraConfig(warm_metadata.capacity)
-    chunk_kda_bwd_intra(*inputs, warm_metadata, config=config)
+    chunk_kda_bwd_intra(*inputs, warm_metadata, config=config, autotune=False)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-        actual = chunk_kda_bwd_intra(*inputs, metadata, config=config)
+        actual = chunk_kda_bwd_intra(*inputs, metadata, config=config, autotune=False)
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
     graph.replay()

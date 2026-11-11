@@ -350,10 +350,14 @@ def test_l2norm_op_registration():
 
     _, rstd = _l2norm_fwd_op(x, 1e-6)
     d_output = torch.randn_like(x)
-    torch.library.opcheck(_l2norm_bwd_op, (x, rstd, d_output))
+    torch.library.opcheck(_l2norm_bwd_op, (x, rstd, d_output), {"autotune": True})
     _, ragged_rstd = _l2norm_fwd_op(x, 1e-6, cu_seqlens)
-    torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens))
-    torch.library.opcheck(_l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens, False))
+    torch.library.opcheck(
+        _l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens), {"autotune": True}
+    )
+    torch.library.opcheck(
+        _l2norm_bwd_op, (x, ragged_rstd, d_output, cu_seqlens), {"autotune": False}
+    )
 
 
 def test_l2norm_pinned_backward_skips_autotuning(request):
@@ -713,7 +717,7 @@ def test_chunk_gla_fwd_o_gk_tma(dtype, T):
     ref = _fwd_o_ref(q, g, h.reshape(B * num_chunks, H, K, V), A, v, scale)
 
     assert can_use_tma(v), "expected TMA-eligible tensors so the launcher takes its TMA path"
-    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale)
+    o = chunk_gla_fwd_o_gk(q, v, g, A, h, scale, autotune=True)
     assert_golden(o, golden, ref, dtype, f"gla_fwd_o_gk_tma T={T}")
 
 
@@ -986,14 +990,7 @@ def test_recompute_w_u_fwd_triton():
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
 
     w, u, qg, kg = recompute_w_u_fwd_triton(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        metadata=None,
-        q=q,
-        gk=gk,
-        chunk_size=64,
+        k=k, v=v, beta=beta, A=A, metadata=None, q=q, gk=gk, chunk_size=64, autotune=True
     )
 
     gW, gU, gQG, gKG = _recompute_wu_ref(
@@ -1027,7 +1024,7 @@ def test_output_and_recompute_reuse_tuning_across_token_counts(isolated_winners,
         g = -torch.rand(1, T, H, K, device=DEV)
         A = torch.randn(1, T, H, 64, device=DEV, dtype=torch.bfloat16)
         h = torch.randn(1, chunks, H, K, K, device=DEV, dtype=torch.bfloat16)
-        chunk_gla_fwd_o_gk(q, torch.randn_like(q), g, A, h, K**-0.5)
+        chunk_gla_fwd_o_gk(q, torch.randn_like(q), g, A, h, K**-0.5, autotune=True)
         sweeps_per_shape.append(len(sweeps))
     assert sweeps_per_shape == [1, 1, 1, 2]
 
@@ -1036,7 +1033,7 @@ def test_output_and_recompute_reuse_tuning_across_token_counts(isolated_winners,
         k = torch.randn(1, T, H, 128, device=DEV, dtype=torch.bfloat16)
         beta = torch.rand(1, T, H, device=DEV)
         A = torch.randn(1, T, H, 64, device=DEV)
-        recompute_w_u_fwd_triton(k, torch.randn_like(k), beta, A)
+        recompute_w_u_fwd_triton(k, torch.randn_like(k), beta, A, autotune=True)
     assert len(sweeps) == 1
 
 
@@ -1225,14 +1222,7 @@ def test_chunk_kda_fwd_intra_cute():
     beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
 
     w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra_cute(
-        q,
-        k,
-        v,
-        gk,
-        beta,
-        scale,
-        None,
-        chunk_size=64,
+        q, k, v, gk, beta, scale, None, chunk_size=64, autotune=True
     )
 
     gAqk, gAkk = _inter_solve_ref(q.double(), k.double(), gk.double(), beta.double(), scale)
@@ -1325,6 +1315,7 @@ def test_chunk_kda_bwd_intra_cute():
         zb.clone(),
         zq.clone(),
         None,
+        autotune=False,
     )
 
     gdq, gdk, gdb, gdg = _bwd_intra_ref(
@@ -1374,20 +1365,7 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
     A = _perchunk_unit_lower(cu, chunk_indices, T, HV)
 
     dq, dk, dv2, dg, db, dA = chunk_kda_bwd_wy_dqkg_fused_cute(
-        q,
-        k,
-        v,
-        v_new,
-        g,
-        beta,
-        A,
-        h,
-        do,
-        dh,
-        dv,
-        None,
-        scale=scale,
-        chunk_size=64,
+        q, k, v, v_new, g, beta, A, h, do, dh, dv, None, scale=scale, chunk_size=64, autotune=False
     )
 
     ref_args = (v_new, g, beta, A, h, do, dh, dv)

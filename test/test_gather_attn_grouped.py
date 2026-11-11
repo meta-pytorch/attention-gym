@@ -1371,9 +1371,10 @@ def test_grouped_operator_contracts(case):
         torch.library.opcheck(
             _gather_attn_fwd_op,
             (query, sparse_kv, local_kv, kv_indices, sink, *common, needs_backward, *trailing),
+            {"autotune": True},
         )
     output, lse, state = _gather_attn_fwd_op(
-        query, sparse_kv, local_kv, kv_indices, sink, *common, True, *trailing
+        query, sparse_kv, local_kv, kv_indices, sink, *common, True, *trailing, autotune=True
     )
     torch.library.opcheck(
         _gather_attn_bwd_op,
@@ -1391,4 +1392,5 @@ def test_grouped_operator_contracts(case):
             *common[2:],
             *trailing,
         ),
+        {"autotune": True},
     )

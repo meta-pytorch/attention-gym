@@ -112,8 +112,9 @@ def chunk_kda_fwd_intra(
     beta: torch.Tensor,
     scale: float,
     metadata: RaggedChunkMetadata | None,
+    *,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = False,
 ) -> tuple[

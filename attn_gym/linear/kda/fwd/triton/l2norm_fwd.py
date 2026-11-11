@@ -182,7 +182,7 @@ def _l2norm_fwd_fake(
 
 torch.library.define(
     "attn_gym::kda_l2norm_bwd",
-    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None, bool autotune=True) "
+    "(Tensor x, Tensor rstd, Tensor d_output, Tensor? cu_seqlens=None, *, bool autotune) "
     "-> Tensor",
 )
 
@@ -192,7 +192,8 @@ def _l2norm_bwd_cuda(
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
-    autotune: bool = True,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Launch L2Norm backward behind the same opaque stride boundary."""
     from attn_gym.linear.kda.bwd.triton.l2norm_bwd import L2NORM_BWD
@@ -237,7 +238,8 @@ def _l2norm_bwd_fake(
     rstd: torch.Tensor,
     d_output: torch.Tensor,
     cu_seqlens: torch.Tensor | None = None,
-    autotune: bool = True,
+    *,
+    autotune: bool,
 ) -> torch.Tensor:
     """Describe input-gradient metadata without reading the packed endpoint."""
     del rstd, d_output, cu_seqlens, autotune
@@ -274,7 +276,7 @@ class _L2Norm(torch.autograd.Function):
         cu_seqlens = metadata[0] if ctx.is_ragged else None
         # The mode can change between an eager forward and its backward.
         autotune = should_autotune(ctx.autotune)
-        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, autotune), None, None, None
+        return _l2norm_bwd_op(x, rstd, d_output, cu_seqlens, autotune=autotune), None, None, None
 
 
 def l2norm(

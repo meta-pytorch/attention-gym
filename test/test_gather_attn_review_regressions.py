@@ -68,12 +68,14 @@ def test_empty_paired_operator_contract(backend):
     args = (q, kv, None, inputs.kv_indices, sink, None, None, 0, True, 0.0625)
     ropes = {"query_rope": qr, "sparse_rope": kr}
     for training in (False, True):
-        torch.library.opcheck(_gather_attn_fwd_op, (*args, training, backend), ropes)
-    out, lse, state = _gather_attn_fwd_op(*args, True, backend, **ropes)
+        torch.library.opcheck(
+            _gather_attn_fwd_op, (*args, training, backend), {**ropes, "autotune": True}
+        )
+    out, lse, state = _gather_attn_fwd_op(*args, True, backend, **ropes, autotune=True)
     torch.library.opcheck(
         _gather_attn_bwd_op,
         (*args[:4], state, *args[4:7], out, lse, torch.randn_like(out), *args[7:], backend),
-        ropes,
+        {**ropes, "autotune": True},
     )
 
 

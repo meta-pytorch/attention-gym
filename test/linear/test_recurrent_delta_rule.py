@@ -77,6 +77,7 @@ def _launch_scalar_gdn(
         gate_kind=GateKind.SCALAR,
         store_final_state=store_final_state,
         batch_invariant=batch_invariant,
+        autotune=False,
     )
     return output, final_state
 
@@ -184,6 +185,7 @@ def test_scalar_and_vector_gate_specializations_agree():
             gate_kind=GateKind.VECTOR,
             store_final_state=True,
             batch_invariant=False,
+            autotune=False,
         )
 
     torch.testing.assert_close(scalar_output, vector_output, rtol=1e-5, atol=1e-5)
@@ -228,6 +230,7 @@ def test_wide_key_fixed_tiles_match_reference(gate_kind, batch, tokens, key_dim,
             gate_kind=gate_kind,
             store_final_state=True,
             batch_invariant=batch_invariant,
+            autotune=False,
         )
         reference = recurrent_kda if gate_kind is GateKind.VECTOR else recurrent_gdn
         expected = reference(
@@ -311,14 +314,19 @@ def test_tuning_key_determines_pinned_configuration():
     operand = torch.empty(0, dtype=torch.bfloat16)
     pinned_by_key: dict[tuple, set] = {}
     shapes = itertools.product(
-        (*range(70), 128, 4096), (1, 2, 16, 64, 200), (64, 128, 256), (1, 48, 128), (False, True)
+        (*range(70), 128, 4096),
+        (1, 2, 16, 64, 200),
+        (1, 16),
+        (64, 128, 256),
+        (1, 48, 128),
+        (False, True),
     )
-    for tokens, num_sequences, key_dim, value_dim, is_varlen in shapes:
+    for tokens, num_sequences, heads, key_dim, value_dim, is_varlen in shapes:
         args = {
             "T": tokens * num_sequences if is_varlen else tokens,
             "N": num_sequences,
-            "H": 16,
-            "HK": 16,
+            "H": heads,
+            "HK": heads,
             "K": key_dim,
             "V": value_dim,
             "USE_INITIAL_STATE": False,

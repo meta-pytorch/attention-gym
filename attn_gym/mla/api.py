@@ -10,6 +10,7 @@ from attn_gym._backends.autotune import should_autotune
 from attn_gym.types import (
     AuxRequest,
     Impl,
+    KernelOptionSpec,
     TuningOptions,
     resolve_impl,
     validate_kernel_options,
@@ -17,6 +18,9 @@ from attn_gym.types import (
 
 from . import ops  # noqa: F401  # registers the attn_gym::paged_mla_decode ops
 from .impl import reference
+
+# Unlike other tuned operations, tuning is off unless requested.
+KERNEL_OPTION_SPEC: KernelOptionSpec = {"autotune": (bool, False)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,7 +257,7 @@ def paged_mla_decode(
     """
     selected_impl = resolve_impl(impl)
     autotune = validate_kernel_options(
-        kernel_options, {"autotune": (bool, False)}, op_name="paged_mla_decode"
+        kernel_options, KERNEL_OPTION_SPEC, op_name="paged_mla_decode"
     )["autotune"]
     _validate_inputs(
         q_latent,

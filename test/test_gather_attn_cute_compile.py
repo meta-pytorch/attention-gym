@@ -188,8 +188,9 @@ def test_fa4_operator_contracts(fa4_launches, rope_dim, packed, recompute, with_
         torch.library.opcheck(
             _gather_attn_fwd_op,
             (*args, needs_backward, "cute", recompute, *ropes),
+            {"autotune": True},
         )
-    out, lse, tape = _gather_attn_fwd_op(*args, True, "cute", recompute, *ropes)
+    out, lse, tape = _gather_attn_fwd_op(*args, True, "cute", recompute, *ropes, autotune=True)
     grad = torch.randn_like(out).transpose(-1, -2).contiguous().transpose(-1, -2)
     torch.library.opcheck(
         _gather_attn_bwd_op,
@@ -212,6 +213,7 @@ def test_fa4_operator_contracts(fa4_launches, rope_dim, packed, recompute, with_
             recompute,
             *ropes,
         ),
+        {"autotune": True},
     )
 
 

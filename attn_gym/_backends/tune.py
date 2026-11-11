@@ -183,7 +183,10 @@ def tune(
         )
     can_precompile = callable(getattr(compile_fn, "precompile", None))
     if not can_precompile and not callable(getattr(compile_fn, "cache_namespace", None)):
-        raise TypeError("tune() requires a compile function decorated with jit_cache")
+        raise TypeError(
+            "tune() requires compile_fn to define precompile() or cache_namespace(), "
+            "as jit_cache does"
+        )
     if compile_call is None:
         calls = [(config,) for config in candidates]
     else:
@@ -245,6 +248,7 @@ def device_identity(index: int) -> tuple[str, tuple[int, int]]:
     """Return the model name and compute capability of CUDA device ``index``.
 
     Model identity lets identical GPUs share winners across processes; indices are process-local.
+    Tuned launches must run on the current CUDA device, whose model identifies cached winners.
     """
     return torch.cuda.get_device_name(index), torch.cuda.get_device_capability(index)
 
@@ -455,4 +459,4 @@ def run_tunable(
     return kernel.launch(compiled, selected, *runtime_args), selected
 
 
-__all__ = ["TunableKernel", "benchmark_gpu", "run_tunable", "tune"]
+__all__ = ["TunableKernel", "benchmark_gpu", "device_identity", "run_tunable", "tune"]

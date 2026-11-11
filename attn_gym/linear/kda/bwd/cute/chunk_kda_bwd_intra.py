@@ -2260,7 +2260,7 @@ def chunk_kda_bwd_intra(
     metadata: RaggedChunkMetadata | None,
     *,
     config: ChunkKdaBwdIntraConfig | None = None,
-    autotune: bool = False,
+    autotune: bool,
     configs: Iterable[ChunkKdaBwdIntraConfig] | None = None,
     fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:

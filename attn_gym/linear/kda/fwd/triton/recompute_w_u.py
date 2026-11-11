@@ -426,7 +426,7 @@ def recompute_w_u_fwd_triton(
     *,
     chunk_size: int = 64,
     dot_precision: str = "bf16",
-    autotune: bool = True,
+    autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None]:

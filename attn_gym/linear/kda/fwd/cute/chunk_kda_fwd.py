@@ -174,7 +174,6 @@ def _finish_chunk_kda_fwd(
             chunk_size=_CHUNK_SIZE,
             output_final_state=output_final_state,
             metadata=metadata,
-            autotune=autotune,
             fastmath=fastmath,
         )
     with profiler_range("kda/triton/output_composition"):

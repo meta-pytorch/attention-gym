@@ -47,7 +47,8 @@ class TritonTuner:
         key: Maps the launch arguments to the host-static values that decide the winner, like
             ``triton.autotune(key=...)``. It must also determine what ``prune`` keeps: winners
             are remembered per GPU model and key, pinned candidates per ``(device, key)``.
-        prune: Optional ``prune(configs, args)`` dropping candidates invalid for these arguments.
+        prune: Optional ``prune(configs, args)`` returning the candidates valid for these
+            arguments in pinning order; it may reorder them as well as drop some.
         reset: Optional ``reset(grid, args) -> restore`` for kernels that mutate their inputs;
             see ``run_tunable``'s ``benchmark_reset``.
     """
