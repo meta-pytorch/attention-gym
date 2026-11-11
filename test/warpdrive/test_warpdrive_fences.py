@@ -1,5 +1,4 @@
-"""Fence rules (``fences.py``): the derived defaults for every channel configuration, the table
-itself, and the trace-time check of explicit fences against annotated accesses."""
+"""Fence defaults and explicit overrides must cover the annotated access pairs."""
 
 import itertools
 import warnings
@@ -41,8 +40,8 @@ THREAD_MECHS = (Threads, Warps)
 # Host-only: the table and every channel's derived fences
 
 
-# Hand-reviewed: (storage, the signalling side's access, the other side's next access) -> the
-# fence the signal needs. Every other combination needs none.
+# (storage, signalling access, next access) -> required fence.
+# Other pairs need none of the fence kinds modeled here.
 NEEDS = {
     ("smem", Access("threads", True), Access("umma", False)): "smem_async",
     ("smem", Access("threads", True), Access("tma", False)): "smem_async",
@@ -175,9 +174,10 @@ class Model(WarpSpecialized):
 
 
 class RefilledRing(Model):
-    """A TMA ring whose consumers read the stage with generic loads: the next TMA fill of that
-    stage is an async-proxy write after those reads. The alias diagnostic sees no overlap of
-    two names here, so only the fence check can catch a wrong ``release_fence=()``."""
+    """TMA refill needs a proxy fence after generic reads of the same stage.
+
+    With no declared overlap, only the fence check catches ``release_fence=()``.
+    """
 
     def __init__(
         self, release_fence, mode: str = "annotated", alias_check: str = "warn", renamed=False
@@ -353,8 +353,10 @@ def test_commit_fence_against_an_async_reader(consumer, fence, expected, renamed
 
 
 class StoresOverAccumulator(Model):
-    """Threads load S and store P over it, then release to the MMA that reads P (FA4's S
-    ring): the release needs ``tmem_store``; the load's own wait is not visible."""
+    """Threads load S and overwrite it with P before MMA reads P and overwrites S.
+
+    Both TMEM waits are required; missing either is unverified because manual waits are invisible.
+    """
 
     def __init__(self, release_fence):
         self.ring = Ring(1, Umma, Threads, release_fence=release_fence)

@@ -1,7 +1,7 @@
 """Fence rules for managed channel handoffs.
 
-``RULES`` lists access pairs, their required fences and PTX reasons. A commit hands
-storage to consumers; a release hands it to the next epoch's producer.
+``RULES`` ties access pairs to fences and PTX requirements. A commit hands storage to
+consumers; a release permits the producer to reuse it.
 
 ``derived_fences`` supplies two SMEM defaults: a release fence for thread consumers
 before a TMA refill, and a commit fence for thread producers before an Umma read.
@@ -63,8 +63,8 @@ RULES = (
         (_WRITE,),
         (Access("umma", False), Access("tma", False)),
         "smem_async",
-        "MMA operands and TMA stores read SMEM through the async proxy, which sees generic "
-        "stores only after the writer's own fence.proxy.async",
+        "generic SMEM stores need fence.proxy.async in the writing thread before "
+        "MMA or TMA reads them",
         f"{_ASYNC_PROXY}; 9.7.18.6.5 ({PTX}#tcgen05-memory-consistency-model-smem-access)",
     ),
     Rule(
@@ -72,8 +72,8 @@ RULES = (
         (_READ, _WRITE),
         (Access("tma", True),),
         "smem_async",
-        "a TMA fill writes through the async proxy, ordered after a generic access only by "
-        "fence.proxy.async in the accessing thread, not by the release and acquire",
+        "generic SMEM accesses need fence.proxy.async in the accessing thread before "
+        "TMA refills the stage; release/acquire alone does not order the proxies",
         f"{_ASYNC_PROXY}; Memory Consistency Model, proxies and the causality axiom",
     ),
     Rule(
@@ -86,8 +86,8 @@ RULES = (
             Access("umma", True),
         ),
         "tmem_store",
-        "tcgen05.wait::st establishes store completion before the handoff; an explicit wait "
-        "in the role is not visible to this trace",
+        "tcgen05.wait::st must complete stores before the handoff; manual waits are "
+        "invisible to the trace",
         _TCGEN05_SYNC,
         visible=False,
     ),
@@ -96,8 +96,8 @@ RULES = (
         (_READ,),
         (Access("threads", True), Access("umma", True)),
         "tmem_load",
-        "tcgen05.wait::ld establishes load completion before an overwrite; an explicit wait "
-        "in the role is not visible to this trace",
+        "tcgen05.wait::ld must complete loads before an overwrite; manual waits are "
+        "invisible to the trace",
         _TCGEN05_SYNC,
         visible=False,
     ),
@@ -121,8 +121,7 @@ def matching_rules(storage: str, mine: Access, theirs: Access) -> list[Rule]:
 
 
 def required(storage: str, mine, theirs) -> tuple[str, ...]:
-    """The fence kinds, in ``FENCE_KINDS`` order, that ``mine`` accesses followed by
-    ``theirs`` need on the signal between them."""
+    """Fences required before the handoff from ``mine`` to ``theirs``, in ``FENCE_KINDS`` order."""
     kinds = {r.kind for m in mine for t in theirs for r in matching_rules(storage, m, t)}
     return tuple(k for k in FENCE_KINDS if k in kinds)
 
@@ -277,11 +276,11 @@ def _check_handoff(s: alias.Access, rec, other: str, matches, res: FenceResult):
                 if rule.kind in fenced:
                     continue
                 text = (
-                    f"{rule.kind}: {s.describe()}, then a {other} {t.agent} "
-                    f"{'write' if t.write else 'read'} @ {ev.site}: {rule.reason}"
+                    f"{rule.kind}: {s.describe()}, before {other} {t.agent} "
+                    f"{'write' if t.write else 'read'}; handoff @ {ev.site}: {rule.reason}"
                 )
                 if rule.kind in uncertain:
-                    text += "; conditional fence coverage is not established"
+                    text += "; fence may not run on this path"
                 alternative = _other_handoff(s, access, rec.chan, rule.kind)
                 if alternative:
                     text += "; another open channel may order this access"
@@ -352,10 +351,15 @@ def report(rep: FenceReport, mode: str, kernel_name: str):
     if not flagged:
         return
     if mode == "strict":
-        raise ProtocolError(f"warpdrive fence check (strict):\n{rep.describe()}")
+        raise ProtocolError(
+            f"warpdrive fence check (strict):\n{rep.describe()}\n"
+            'Restore the required fence kinds or use unchecked("fence", reason=...) on the '
+            'access; alias_check="off" skips analysis.'
+        )
     names = ", ".join(f"{r.channel} {r.key}" for r in flagged)
     warnings.warn(
-        f"warpdrive: fence check flagged {names} in {kernel_name} (no error raised; see "
-        f"describe()): missing {flagged[0].missing[0]}",
+        f"warpdrive: fence check flagged {names} in {kernel_name}: "
+        f"missing {flagged[0].missing[0]}. Restore the required fence kinds or use "
+        'unchecked("fence", reason=...) on the access; alias_check="off" skips analysis.',
         stacklevel=3,
     )
