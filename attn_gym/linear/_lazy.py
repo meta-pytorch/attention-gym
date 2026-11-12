@@ -46,10 +46,19 @@ def register_lazy_cuda_impls(
 
     ``kernels`` maps an operator name to the backend attribute implementing it, so the optional
     backend is imported when an operator first executes rather than when it is registered.
+    Every operator's first argument is a tensor that selects the CUDA device for all launches.
     """
 
     def kernel(attr: str) -> Callable[..., object]:
-        return lambda *args: getattr(backend(), attr)(*args)
+        def launch(tensor: torch.Tensor, *args: object) -> object:
+            # Enter a device context only when needed: the context manager costs ~1.7 us of host
+            # time per call, which the common same-device call should not pay.
+            if tensor.device.index == torch.cuda.current_device():
+                return getattr(backend(), attr)(tensor, *args)
+            with torch.cuda.device(tensor.device):
+                return getattr(backend(), attr)(tensor, *args)
+
+        return launch
 
     for op, attr in kernels.items():
         torch.library.impl(f"attn_gym::{op}", "CUDA", kernel(attr))

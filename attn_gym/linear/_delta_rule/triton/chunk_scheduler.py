@@ -379,15 +379,16 @@ def _prepare_ragged_chunk_offsets(
     # at most ~0.4 us per launch (GB200), negligible next to the chunk kernels, while each
     # power-of-two block is a separate compile.
     block = max(128, triton.next_power_of_2(num_sequences))
-    _prepare_ragged_chunk_offsets_kernel[(1,)](
-        cu_seqlens,
-        chunk_offsets,
-        num_sequences=num_sequences,
-        tokens=tokens,
-        chunk_size=chunk_size,
-        BLOCK=block,
-        num_warps=min(8, max(1, block // 32)),
-    )
+    with torch.cuda.device(cu_seqlens.device):
+        _prepare_ragged_chunk_offsets_kernel[(1,)](
+            cu_seqlens,
+            chunk_offsets,
+            num_sequences=num_sequences,
+            tokens=tokens,
+            chunk_size=chunk_size,
+            BLOCK=block,
+            num_warps=min(8, max(1, block // 32)),
+        )
     return chunk_offsets
 
 
