@@ -246,8 +246,12 @@ CTAs.
 
 `trace_session.write_trace(path, op, session.ranges, name=..., args=..., flows=...)` writes one
 process per CTA and one track per role, forwarding options to the profiler's `write_ranges`.
-The [Qwen megakernel](examples.md#qwen3-06b-decode-megakernel) uses this to link instruction rows
+The [Qwen megakernel](examples.md#qwen3-decode-megakernel) uses this to link instruction rows
 across CTAs.
+
+`work_item_ranges(session.ranges, role)` keys each work item's range of `role` by its payload,
+the work index; `work_item_spans(session.ranges, role)` turns them into `[item, cta, start,
+end]` in us from the earliest start, the measured spans `schedule_html` draws.
 
 ## Draw the pipeline
 
@@ -435,7 +439,7 @@ Two examples use it:
 python -m attn_gym.warpdrive.examples.schedule_views OUTDIR --ctas 152
 # the Qwen megakernel's instruction table under its latency model; --timeline overlays a
 # trace="globaltimer" capture (overlay() in the module docstring writes it)
-python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html --ctas 152
+python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html --model Qwen/Qwen3-32B --ctas 152
 ```
 
 ![The Qwen megakernel's predicted timeline with its critical path](images/qwen_megakernel_schedule.png)

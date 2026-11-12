@@ -83,6 +83,27 @@ def write_trace(path: str | Path, kernel, ranges: list[Range], **options) -> Pat
     )
 
 
+def work_item_ranges(ranges: list[Range], role: str) -> dict[int, Range]:
+    """Each work item's range on ``role``, keyed by its payload: the work index the item's
+    mapping decoded (a static table's row, a tile index). Ranges without one are skipped."""
+    return {r.payload: r for r in ranges if r.name == role and r.payload is not None}
+
+
+def work_item_spans(ranges: list[Range], role: str) -> list[list]:
+    """``[item, cta, start, end]`` per work item of ``role``, sorted by item, in us from the
+    earliest start: the measured spans of one traced launch, as ``schedule_html`` draws them."""
+    items = sorted(work_item_ranges(ranges, role).items())
+    if not items:
+        raise ValueError(
+            f"no {role} work-item ranges: trace a launch with enable_trace('globaltimer')"
+        )
+    t0 = min(item.start_ns for _, item in items)
+    return [
+        [index, item.cta[0], (item.start_ns - t0) / 1e3, (item.end_ns - t0) / 1e3]
+        for index, item in items
+    ]
+
+
 WAIT_OPERATIONS = frozenset({"acquire", "wait", "peek", "tail", "turn", "sync"})
 
 

@@ -54,8 +54,7 @@ def test_decode_matches_hf_and_writes_only_current_cache_position(checkpoint: Pa
     packed = prepare_fast_weights(weights, 10)
     layer_caches = tuple(tuple(cache.unbind(0)) for cache in caches)
     fast_logits = decode_step_fast(packed, token, pos, *layer_caches)
-    high_weights = weights.to(torch.float32)
-    high_logits = decode_step_ref(high_weights, token, pos, *caches, dtype=torch.float32)
+    high_logits = decode_step_ref(weights, token, pos, *caches, dtype=torch.float32)
     assert compare_logits(fast_logits, logits, high_logits)["passed"]
     for cache, before in zip(caches, prefix):
         torch.testing.assert_close(cache[:, :, :pos], before, rtol=0, atol=0)

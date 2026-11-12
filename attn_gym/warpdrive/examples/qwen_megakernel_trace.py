@@ -27,16 +27,16 @@ from attn_gym.warpdrive.examples.qwen_megakernel import (
     ATTN,
     DOWN,
     GATEUP,
-    LAYERS,
     LMHEAD,
     OP_NAMES,
     OPROJ,
     QKV,
+    QwenDecodeMegakernel,
     row_groups,
 )
 from attn_gym.warpdrive.profiler import Range
 from attn_gym.warpdrive.trace_session import trace_session as kernel_session
-from attn_gym.warpdrive.trace_session import write_trace
+from attn_gym.warpdrive.trace_session import work_item_ranges, write_trace
 
 # The instruction kind each phase waits for; QKV and the LM head wait for the previous layer's
 # down.
@@ -76,29 +76,31 @@ def write_step_trace(path, runner, ranges: list[Range]):
         op, layer, a, b, _ = rows[item.payload]
         return {"op": OP_NAMES[op], "layer": layer, "a": a, "b": b}
 
-    computed = item_ranges(ranges)
+    computed = work_item_ranges(ranges, "compute")
     done = {row: item.end_ns for row, item in computed.items()}
     flows = [
         (computed[source], computed[target])
-        for edges in input_edges(rows, done).values()
+        for edges in input_edges(runner.op, rows, done).values()
         for source, target in edges
     ]
     return write_trace(path, runner.op, ranges, name=name, args=args, flows=flows)
 
 
-def input_edges(rows: list[list[int]], done: dict[int, float]) -> dict[tuple, list]:
+def input_edges(
+    kernel: QwenDecodeMegakernel, rows: list[list[int]], done: dict[int, float]
+) -> dict[tuple, list]:
     """``{(producer op name, consumer op name): [(producer row, consumer row)]}``: for every row
-    and each group it waits for, the group's last-finishing row. ``done`` maps row -> end
-    time."""
+    of ``kernel``'s table and each group it waits for, the group's last-finishing row.
+    ``done`` maps row -> end time."""
     groups: dict[tuple, list[int]] = {}
     for row, (op, layer, a, b, _) in enumerate(rows):
         if op >= 0:
-            groups.setdefault(row_groups(op, layer, a, b)[1], []).append(row)
+            groups.setdefault(row_groups(kernel, op, layer, a, b)[1], []).append(row)
     edges: dict[tuple, list] = {}
     for row, (op, layer, a, b, _) in enumerate(rows):
         if op < 0 or row not in done:
             continue
-        for group in row_groups(op, layer, a, b)[0]:
+        for group in row_groups(kernel, op, layer, a, b)[0]:
             finished = [r for r in groups.get(group, ()) if r in done]
             if finished:
                 last = max(finished, key=done.__getitem__)
@@ -107,20 +109,14 @@ def input_edges(rows: list[list[int]], done: dict[int, float]) -> dict[tuple, li
     return edges
 
 
-def item_ranges(ranges: list[Range], role: str = "compute") -> dict[int, Range]:
-    """Each table row's work-item range of ``role``, by row."""
-    return {r.payload: r for r in ranges if r.name == role and r.payload is not None}
-
-
 def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     """Mean us per layer, by instruction kind, from the producer phase's last row done to this
     phase's last row done. QKV counts from layer 1, whose producer is the previous layer's
     down."""
     rows = table.tolist()
     last: dict[tuple[int, int], int] = {}
-    for row, item in item_ranges(ranges).items():
-        op, layer = rows[row][:2]
-        key = (op, LAYERS if op == LMHEAD else layer)
+    for row, item in work_item_ranges(ranges, "compute").items():
+        key = tuple(rows[row][:2])  # (op, layer); the LM head's layer is the layer count
         last[key] = max(last.get(key, 0), item.end_ns)
     spans: dict[str, list[int]] = {}
     for (op, layer), end in last.items():
@@ -136,7 +132,7 @@ def input_waits(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     first ``poll``). Rows that reuse the previous row's GEMV input poll nothing and are not
     counted."""
     rows = table.tolist()
-    starts = {row: item.start_ns for row, item in item_ranges(ranges).items()}
+    starts = {row: item.start_ns for row, item in work_item_ranges(ranges, "compute").items()}
     ready: dict[int, float] = {}
     for item in ranges:
         if item.name == "poll" and item.payload is not None:
