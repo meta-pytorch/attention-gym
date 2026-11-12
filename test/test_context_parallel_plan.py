@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 import torch
+import torch.utils._pytree as pytree
 
 from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
@@ -152,6 +155,44 @@ def test_routing_builds_directly_from_fragments():
             torch.testing.assert_close(actual_value, expected_value)
         else:
             assert actual_value == expected_value
+
+
+def test_routing_flattens_every_tensor_for_graph_input_copies():
+    """Copying another layout's flattened leaves into captured routing reproduces that layout."""
+    # Same span length per rank, 5 fragments then 3, as in replays over a fixed token budget.
+    tables = [FRAGMENTS, [[(0, 6)], [(6, 12)], [(12, 16)]]]
+    captured, fresh = (
+        ContextParallelRouting.from_fragments(
+            (0, 5, 12, 16),
+            table,
+            cp_rank=1,
+            device="cpu",
+            slots=3,
+            max_subsequences=4,
+            conv_history=2,
+        )
+        for table in tables
+    )
+    captured_leaves, spec = pytree.tree_flatten(captured)
+    fresh_leaves, fresh_spec = pytree.tree_flatten(fresh)
+    tensor_fields = [
+        field.name
+        for field in dataclasses.fields(ContextParallelRouting)
+        if isinstance(getattr(captured, field.name), torch.Tensor)
+    ]
+
+    assert fresh_spec == spec
+    assert sum(isinstance(leaf, torch.Tensor) for leaf in captured_leaves) == len(tensor_fields)
+    for captured_leaf, fresh_leaf in zip(captured_leaves, fresh_leaves):
+        if isinstance(captured_leaf, torch.Tensor):
+            captured_leaf.copy_(fresh_leaf)
+        else:
+            assert captured_leaf == fresh_leaf
+    rebuilt = pytree.tree_unflatten(captured_leaves, spec)
+    assert type(rebuilt) is ContextParallelRouting
+    for name in tensor_fields:
+        assert getattr(rebuilt, name) is getattr(captured, name)
+        torch.testing.assert_close(getattr(captured, name), getattr(fresh, name), rtol=0, atol=0)
 
 
 def test_plan_cuts_fragments_at_sequences_and_orders_neighbors():
