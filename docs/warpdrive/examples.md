@@ -525,6 +525,17 @@ experts' weights for batched matmuls. Its floor counts only the routed experts' 
 stays latency-bound like the small dense models: one more dependent phase per layer, routing on
 the critical path, and expert weights that cannot stream before the router finishes.
 
+**Tensor-core engine.** ``QwenMegakernel(..., engine="tcgen05")`` swaps the GEMV engine
+(``TcGen05Gemv``, ``QwenDecodeMegakernelTc``): an MMA warp accumulates each 128-row weight tile
+against the input with tcgen05 swap-AB MMAs (M = 128 weight rows, N = 16 token columns) into
+TMEM, and the compute warps run the same epilogues. Each 16 KB stage is one 128 x 64 SW128
+operand, so a stage is four MMAs; the input stays the contiguous vector the CUDA-core engine
+reads, viewed through a B layout whose core matrices overlap, so batch one needs no zero
+padding. At batch one it is not faster (GB200, ctx 1024, us): 0.6B 465 vs 637, 8B 2959 vs 3048,
+32B 10629 vs 11294, 30B-A3B 2199 vs 2496. The 128-row items give the latency-bound phases fewer
+CTAs (30B-A3B's router is one item). It is the base for batched decoding, where the CUDA-core
+GEMV's work grows with every token.
+
 The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
 which varies about 5x across prompts on the deep models.
@@ -540,7 +551,7 @@ which varies about 5x across prompts on the deep models.
 - **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
   and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
   prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
-  on CUDA cores; weights and KV carry an L2 evict-first hint.
+  on CUDA cores (or tcgen05 MMAs from a tenth warp, above); weights and KV carry an L2 evict-first hint.
 - **Dependencies between CTAs** are raw code: every activation is a 64-bit word
   `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
   (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL

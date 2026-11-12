@@ -25,6 +25,15 @@ from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
 MAX_LEN = 256
 
 
+@pytest.fixture(autouse=True)
+def release_cuda_memory():
+    """Return each test's runners (packed weight copies, up to 64 GB for Qwen3-32B) to the
+    device before the next test, which may load another checkpoint on this worker."""
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
 def require_sm100():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("the megakernel requires an SM100-family GPU")
@@ -68,12 +77,13 @@ def check_moe_step(monkeypatch, runner, weights, caches, token, pos):
             assert top.values[k - 1] - top.values[k] <= noise, layer
 
 
-def test_moe_random_weights(monkeypatch):
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_moe_random_weights(monkeypatch, engine):
     """Routing, expert-gathered gate/up and down, and the folded routing weights on a small MoE.
     No checkpoint needed."""
     require_sm100()
     weights = random_weights(SMALL_MOE)
-    runner = mk.QwenMegakernel(weights, MAX_LEN)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
     for ctx in (100, 200):
         state = make_decode_state(weights, ctx, MAX_LEN, seed=ctx)
         check_moe_step(monkeypatch, runner, weights, *state)
@@ -97,7 +107,8 @@ def test_moe_router_ties_go_to_the_lower_expert():
 
 
 @pytest.mark.xdist_group("qwen-large-checkpoints")
-def test_moe_checkpoint_decode_steps(monkeypatch):
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_moe_checkpoint_decode_steps(monkeypatch, engine):
     """Qwen3-30B-A3B at short and long contexts (see check_moe_step). Skips unless the
     checkpoint is in the local HF cache; never downloads."""
     require_sm100()
@@ -111,14 +122,15 @@ def test_moe_checkpoint_decode_steps(monkeypatch):
     weights = load_qwen3_weights(path)
     for ctx in (127, 1500):
         max_len = (ctx // mk.BLOCK + 1) * mk.BLOCK
-        runner = mk.QwenMegakernel(weights, max_len)
+        runner = mk.QwenMegakernel(weights, max_len, engine=engine)
         state = make_decode_state(weights, ctx, max_len, seed=ctx)
         check_moe_step(monkeypatch, runner, weights, *state)
         del runner
 
 
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
 @pytest.mark.parametrize("normalized", [True, False])
-def test_moe_routing_in_the_kernel(normalized):
+def test_moe_routing_in_the_kernel(normalized, engine):
     """Expert rows alone, from crafted router logits: the published activation of slot r is
     expert e_r's SiLU(gate) * up times its routing weight, so it shows both which rows the load
     warp fetched and the weight the compute warp applied. Layer 0 mixes signs and ties two
@@ -127,7 +139,7 @@ def test_moe_routing_in_the_kernel(normalized):
     require_sm100()
     config = dataclasses.replace(SMALL_MOE, norm_topk_prob=normalized)
     weights = random_weights(config)
-    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.GATEUP,))
+    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.GATEUP,), engine=engine)
     k, experts = config.experts_per_token, config.num_experts
     torch.manual_seed(0)
     logits = torch.zeros(config.num_layers, experts, device="cuda")

@@ -399,13 +399,16 @@ def compare_logits(
     *,
     error_factor: float = 2.0,
 ) -> dict[str, float | bool]:
-    """Error-budget gate against the fp32 oracle: finite, same argmax as eager bf16, and max
-    and RMS error both within ``error_factor`` x eager's plus an fp32 roundoff allowance.
+    """Error-budget gate against the fp32 oracle: finite, max and RMS error both within
+    ``error_factor`` x eager bf16's plus an fp32 roundoff allowance, and a token the oracle
+    scores within that max-error budget of eager's (``argmax_ok``). Eager's argmax itself
+    (``argmax_match``) can differ at a near-tie: two bf16 implementations then pick either token.
 
     ``rel_err`` is max error over max reference magnitude, not a pointwise ratio. The fp32
     oracle must have run on the same token and cache inputs. An empirical gate, not a proof.
     """
     test, bf16, high = (x.double() for x in (test_logits, ref_bf16_logits, ref_fp32_logits))
+    allowance = torch.finfo(torch.float32).eps * max(1.0, high.abs().max().item())
     delta = (test - bf16).abs().max().item()
     test_error, eager_error = test - high, bf16 - high
     test_max, eager_max = test_error.abs().max().item(), eager_error.abs().max().item()
@@ -414,12 +417,14 @@ def compare_logits(
         eager_error.square().mean().sqrt().item(),
     )
     argmax_match = bool(test.argmax() == bf16.argmax())
+    budget = error_factor * eager_max
+    argmax_ok = bool(high[test.argmax()] >= high[bf16.argmax()] - budget)
     finite = bool(torch.isfinite(test).all())
-    allowance = torch.finfo(torch.float32).eps * max(1.0, high.abs().max().item())
     return {
         "max_abs_err": delta,
         "rel_err": delta / max(bf16.abs().max().item(), 1e-30),
         "argmax_match": argmax_match,
+        "argmax_ok": argmax_ok,
         "test_fp32_max_err": test_max,
         "bf16_fp32_max_err": eager_max,
         "test_fp32_rms_err": test_rms,
@@ -427,7 +432,7 @@ def compare_logits(
         "max_error_ratio": test_max / max(eager_max, allowance),
         "rms_error_ratio": test_rms / max(eager_rms, allowance),
         "passed": finite
-        and argmax_match
+        and argmax_ok
         and test_max <= error_factor * eager_max + allowance
         and test_rms <= error_factor * eager_rms + allowance,
     }

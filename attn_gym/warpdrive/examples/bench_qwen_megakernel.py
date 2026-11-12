@@ -253,10 +253,12 @@ def measure_hbm_rooflines(buffer_gb: float = 2.0, iters: int = 100) -> dict[str,
 
 
 @torch.no_grad()
-def trace_megakernel(weights, max_len: int, token, pos: int, caches, path: Path) -> dict:
+def trace_megakernel(
+    weights, max_len: int, token, pos: int, caches, path: Path, engine: str = "cuda_core"
+) -> dict:
     """One warmed megakernel step traced with globaltimer (``qwen_megakernel_trace``): per-layer
     phase spans and median input waits in us, and the Perfetto trace at ``path``."""
-    runner = QwenMegakernel(weights, max_len, trace="globaltimer")
+    runner = QwenMegakernel(weights, max_len, trace="globaltimer", engine=engine)
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
     path.parent.mkdir(parents=True, exist_ok=True)
     with qwen_megakernel_trace.trace_session(runner, trace_path=str(path)) as session:
@@ -297,6 +299,12 @@ def main() -> None:
     parser.add_argument("--skip-roofline", action="store_true")
     parser.add_argument(
         "--skip-megakernel", action="store_true", help="skip the warpdrive decode megakernel"
+    )
+    parser.add_argument(
+        "--engine",
+        choices=("cuda_core", "tcgen05"),
+        default="cuda_core",
+        help="the megakernel's GEMV engine",
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
@@ -371,7 +379,7 @@ def main() -> None:
             profiles["fast"] = profile_step(fast if args.skip_compile else compiled_step)
             print(f"ctx={ctx_len} fast_profile={json.dumps(profiles['fast'])}", flush=True)
         if not args.skip_megakernel:
-            runner = QwenMegakernel(weights, max_len)
+            runner = QwenMegakernel(weights, max_len, engine=args.engine)
             for cache in caches:
                 cache[:, :, pos].fill_(float("nan"))
             metrics = compare_logits(runner(weights, token, pos, *caches), reference, high)
@@ -392,6 +400,7 @@ def main() -> None:
                     pos,
                     caches,
                     args.trace_dir / f"qwen_megakernel_ctx{ctx_len}.pftrace",
+                    args.engine,
                 )
                 print(
                     f"ctx={ctx_len} megakernel_trace={json.dumps(report['traces'][str(ctx_len)])}",

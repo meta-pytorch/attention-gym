@@ -47,17 +47,17 @@ def critical_path(pred: list[mk.RowSpan]) -> list[int]:
     return path[::-1]
 
 
-def _label(words, deps, table_row: int) -> str:
+def _label(words, deps, table_row: int, rows: int) -> str:
     kind, layer, a, b = words
     match kind:
         case mk.QKV:
-            what = f"QKV layer {layer} · rows {a * mk.ROWS}-{a * mk.ROWS + mk.ROWS - 1}"
+            what = f"QKV layer {layer} · rows {a * rows}-{a * rows + rows - 1}"
         case mk.ATTN:
             what = f"ATTN layer {layer} · kv head {a}, split {b}"
         case mk.OPROJ | mk.DOWN:
-            what = f"{mk.OP_NAMES[kind]} layer {layer} · rows {a * mk.ROWS}.. · k split {b}"
+            what = f"{mk.OP_NAMES[kind]} layer {layer} · rows {a * rows}.. · k split {b}"
         case mk.ROUTER:
-            what = f"ROUTER layer {layer} · experts {a * mk.ROWS}-{a * mk.ROWS + mk.ROWS - 1}"
+            what = f"ROUTER layer {layer} · experts {a * rows}-{a * rows + rows - 1}"
         case mk.GATEUP:
             what = f"GATEUP layer {layer} · tile {a}"
         case _:
@@ -72,8 +72,10 @@ def megakernel_view(
     measured: dict | None = None,
     model: QwenConfig = mk.QWEN3_0_6B,
     name: str = "Qwen3-0.6B",
+    engine: str = "cuda_core",
 ) -> str:
-    op = mk.QwenDecodeMegakernel(splits=splits, model=model)
+    kernel = mk.QwenDecodeMegakernelTc if engine == "tcgen05" else mk.QwenDecodeMegakernel
+    op = kernel(splits=splits, model=model)
     splits = op.splits
     rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
     cost = mk.row_cost(op)
@@ -92,7 +94,7 @@ def megakernel_view(
             table_row[t], table_cta[t] = i, cta
     items = [
         Item(
-            _label(words, deps, t),
+            _label(words, deps, t, op.rows),
             mk.OP_NAMES[words[0]],
             shade=words[1] / (op.layers - 1) if words[0] != mk.LMHEAD else 0.0,
             start=pred[i].start,
@@ -189,6 +191,7 @@ def main():
         "--model", default="Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory (its config)"
     )
     parser.add_argument("--timeline", type=Path, help="measured spans (see the docstring)")
+    parser.add_argument("--engine", choices=("cuda_core", "tcgen05"), default="cuda_core")
     args = parser.parse_args()
     model = load_config(args.model)
     if args.splits is None:
@@ -200,7 +203,8 @@ def main():
                 f"the capture ran with {key} = {measured[key]}; pass --{key} {measured[key]}"
             )
     name = Path(args.model).name
-    args.out.write_text(megakernel_view(args.ctas, args.splits, measured, model, name))
+    view = megakernel_view(args.ctas, args.splits, measured, model, name, args.engine)
+    args.out.write_text(view)
     print(args.out)
 
 
