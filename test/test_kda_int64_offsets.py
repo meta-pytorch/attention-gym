@@ -197,23 +197,28 @@ def test_chunk_kda_oversized_singleton_stride_matches_compact():
 
 
 @pytest.mark.skipif(
-    not CUTE_CAPABLE or torch.cuda.get_device_properties(0).total_memory < 60 * 1024**3,
-    reason="the executed-overflow regression peaks near 38 GiB of reserved memory",
+    not CUTE_CAPABLE or torch.cuda.get_device_properties(0).total_memory < 16 * 1024**3,
+    reason="the executed-overflow regression peaks near 5.5 GiB",
 )
-def test_chunk_kda_full_262144_tokens_executes_offsets_past_int32():
+def test_chunk_kda_executes_offsets_past_int32():
     """Actually execute element offsets beyond INT32_MAX, not just accept the ABI.
 
-    A fully active 262144-token run with packed-projection pitch reaches
-    token offsets near 3.2e9 in Q/K/V; the same tokens through compact clones
-    stay below INT32_MAX and take the i32 specializations. Both must agree.
+    A fully active run whose Q/K/V share a padded projection buffer reaches token offsets near
+    2.4e9; the same tokens through compact clones stay below INT32_MAX and take the i32
+    specializations. Both must agree. A projection pitch of 72 makes offsets exceed INT32_MAX
+    with only 8192 tokens. The unused padding stays unwritten; the buffer is 4.5 GiB and peak
+    memory about 5.5 GiB.
     """
     from attn_gym.linear import chunk_kda
 
-    heads, dim, tokens = 32, 128, 262144
+    heads, dim, tokens, pitch = 32, 128, 8192, 72
     torch.manual_seed(17)
-    qkv = torch.randn(1, tokens, 3, heads, dim, device="cuda", dtype=torch.bfloat16) / 8
+    qkv = torch.empty(1, tokens, pitch, heads, dim, device="cuda", dtype=torch.bfloat16)
     packed = tuple(qkv[:, :, i] for i in range(3))
+    for view in packed:
+        view.copy_(torch.randn(view.shape, device="cuda", dtype=torch.bfloat16) / 8)
     compact = tuple(view.contiguous() for view in packed)
+    assert (tokens - 1) * packed[0].stride(1) > torch.iinfo(torch.int32).max
     assert requires_int64_abi(*packed) and not requires_int64_abi(*compact)
 
     gate = -torch.rand(1, tokens, heads, dim, device="cuda")

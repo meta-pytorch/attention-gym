@@ -133,6 +133,16 @@ def test_sm86_launches_fit_shared_memory(heads, head_dim, window, topk, forward_
     assert not over_shared_memory(launches, SM86_MAX_SHARED_MEMORY)
 
 
+def test_launches_after_compile_only_build_real_kernels():
+    """Compile-only builds skip ptxas; afterwards the same launches compile and run locally."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for Triton")
+    inputs = make_inputs(4, 128, topk=8)
+    with compile_only_for_target(SM86_CAPABILITY, SM86_MAX_SHARED_MEMORY):
+        gather_attn(**inputs, sliding_window_size=64, kernel_options={"backend": "triton"})
+    assert_training_matches_reference(inputs, window=64, tolerance=2e-2)
+
+
 @pytest.mark.parametrize(
     "heads,latent_dim,rope_dim",
     [(96, 512, 0), (96, 512, 64), (96, 512, 128), (128, 128, 128)],

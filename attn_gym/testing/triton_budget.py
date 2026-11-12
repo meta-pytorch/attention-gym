@@ -13,6 +13,7 @@ from unittest import mock
 
 import torch
 import triton
+from triton import knobs
 from triton.backends.compiler import GPUTarget
 from triton.runtime.jit import JITFunction
 
@@ -90,6 +91,18 @@ def emulate_device_dispatch(capability: tuple[int, int], max_shared_mem: int) ->
         device_identity.cache_clear()
 
 
+def _skip_cubin_stage(*args):
+    """Stop compile-only builds after PTX: shared and tensor memory are known after LLIR.
+
+    Triton calls the hook without arguments for a cache-key suffix, which keeps these partial
+    builds apart from real ones, and with the backend's stage table when building.
+    """
+    if not args:
+        return "attn-gym-compile-only-ptx", "attn-gym-compile-only-ptx"
+    stages = args[1]
+    stages["cubin"] = lambda src, metadata: b""
+
+
 @contextmanager
 def compile_only_for_target(
     capability: tuple[int, int], max_shared_mem: int
@@ -98,8 +111,9 @@ def compile_only_for_target(
 
     Host dispatch is emulated as in ``emulate_device_dispatch``, but kernels compile for the
     emulated target and never run: outputs stay unwritten and only the recorded shared memory
-    is meaningful. Tuned and pinned ``TritonTuner`` launches record every candidate left
-    after pruning.
+    is meaningful. Builds stop after PTX, so ptxas, the slowest stage, never runs and its
+    rejections for the target go unchecked. Tuned and pinned ``TritonTuner`` launches record
+    every candidate left after pruning.
     """
     target = GPUTarget("cuda", capability[0] * 10 + capability[1], 32)
     launches: list[Launch] = []
@@ -141,6 +155,7 @@ def compile_only_for_target(
         with (
             emulate_device_dispatch(capability, max_shared_mem),
             mock.patch.object(JITFunction, "run", jit_run),
+            mock.patch.object(knobs.runtime, "add_stages_inspection_hook", _skip_cubin_stage),
             mock.patch.object(TritonTuner, "__getitem__", tuner_getitem),
             mock.patch.object(
                 triton.runtime.driver.active, "get_current_target", return_value=target
