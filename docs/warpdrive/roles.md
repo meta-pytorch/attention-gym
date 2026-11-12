@@ -29,7 +29,9 @@ warps=[range(4), range(4, 8)]   instance 0: warps 0–3
 ```
 
 Each instance is a separate execution of the method on a nonempty, contiguous warp range.
-Ranges cannot overlap other roles. Unassigned warps run no user role.
+Ranges cannot overlap other roles. Unassigned warps run no user role. By default each
+instance also compiles its own copy of the method; [shared bodies](#shared-bodies) compile
+one copy for all of them.
 
 ## Arguments
 
@@ -49,7 +51,7 @@ positional signatures also work.
 |---|---|
 | `ab: Producer` / `ab: Consumer` | An end of `self.ab` |
 | `s: Producer[Instance]` / `s: Consumer[Instance]` | An end of `self.s`, bound to this instance's slot |
-| `stage: Instance` | Instance index as a Python int |
+| `stage: Instance` | Instance index: a Python int, or a runtime `Int32` in a [shared body](#shared-bodies) |
 | `me: Local` | This instance's [own indices](#index-the-role-not-the-hardware) and size |
 | `tmem: Tmem` | Kernel's TMEM view |
 | `work: WorkCursor` | Cursor for `self.work` |
@@ -126,6 +128,64 @@ parameters and incompatible context types. Mutable dataclasses are rejected even
 unannotated. String annotations—including all annotations under
 `from __future__ import annotations`—resolve in the role's module globals, so define params
 types at module level.
+
+### Shared bodies
+
+`@role(warps=[...], shared_body=True)` (or `RoleConfig(..., shared_body=True)`) traces the
+method once for all of the role's instances. Each instance then runs the same code, and
+`stage: Instance` is a warp-uniform runtime `Int32` in `0 .. instances - 1` instead of a
+Python int. The layer applies the instance's own values at run time: round-robin
+starting turns, named-channel seeding, `Local` indices, the TMEM allocator warp's teardown,
+and per-instance trace ranges. With one instance the flag changes nothing.
+
+```python
+self.exchange = NamedBarriers(2, threads=128)  # one barrier per instance, by runtime index
+
+@role(warps=[range(4), range(4, 8)], regs=160, shared_body=True)
+@cute.jit
+def cg0(self, params, *, stage: Instance, raw: Consumer, kk: Producer, me: Local):
+    barrier = self.exchange[stage]  # not `self.ex0 if stage == 0 else self.ex1`
+    for local in cutlass.range(stage, n_chunks, 2, unroll=1):  # runtime arithmetic is fine
+        ...
+```
+
+Use it when the instances differ only in values computed at run time. Code that needs the
+index as a Python int (`range_constexpr(stage)`, list indexing, `tmem.ptr(name, stage)`,
+choosing between declarations) keeps the default form. The layer rejects shared bodies whose
+instances differ in ways a runtime index cannot express:
+
+- instances of unequal warp counts (`ValueError`);
+- slot-bound ends (`Producer[Instance]`/`Consumer[Instance]`) and turnstile seats
+  (`ProtocolError`): each instance binds its own slot or seat;
+- instances in different register-budget dispatch branches (`ValueError`).
+
+**Checks still see every instance.** The single trace is registered under each instance
+name, so `describe()`, the epoch-ownership check, the protocol log, alias and fence
+diagnostics and `NamedBarrier` participation list `cg0[0]`, `cg0[1]`, ... as before. A
+`NamedBarriers` index that is the `Instance` value itself counts barrier `i` as used by
+instance `i`; any other runtime index counts as native use of every barrier (participation
+unverified). A body that branches on `stage` has dynamic regions, which the checks treat as
+they do any other dynamic control flow. Errors raised while tracing the body and `unchecked`
+opt-out records name the shared trace, `cg0[*]`, since no single instance is being traced.
+
+**When it pays.** Each copy of a role's loop occupies instruction cache while its instance
+runs it, and all instances run at once. One copy halves that footprint for two instances,
+at the cost of a few runtime index operations. Measured when the frost kernels opted in (GB300,
+CuTeDSL 4.8.1, torch.profiler kernel time, median of interleaved runs on one GPU):
+
+| Kernel, shape | Static SASS (instructions) | Time, per-instance bodies → shared |
+|---|---|---|
+| frost GDN T pass (`gdn_tinv`), 4x4096 H16 | 3848 → 2680 | 23.9 → 23.4 us |
+| frost GDN T pass, 1x131072 H2 | 3848 → 2680 | 26.1 → 25.2 us |
+| frost KDA prefill, 8x4096 H32 d128 | 3448 → 2784 | 447.5 → 446.0 us |
+| frost KDA recompute, 8x4096 H32 d128 | 3232 → 2536 | 565.0 → 559.2 us |
+| frost KDA recompute, 2x8192 H64 d64 | 2640 → 2160 | 360.4 → 369.4 us |
+
+In the KDA prefill the shared body cut instruction-cache misses (ncu
+`sm__icc_requests_lookup_miss`) from 1.78M to 52K per launch, below the upstream kernel's 67K,
+but the kernel was not fetch-bound, so its time moved 0.3%. Smaller code is not faster by
+itself: the d64 recompute got 2.5% slower, so that kernel opts in only at d_k = 128. Measure
+each opt-in.
 
 ## Return the updated state
 
@@ -232,8 +292,8 @@ roles = {
 out, lse = fa4_fwd(q, k, v, roles=roles)
 ```
 
-`RoleConfig` has the decorator's `warps`, `regs`, `cta` and `raw` fields. It copies lists of
-ranges into tuples; `dataclasses.replace` can derive a variant.
+`RoleConfig` has the decorator's `warps`, `regs`, `cta`, `raw` and `shared_body` fields. It
+copies lists of ranges into tuples; `dataclasses.replace` can derive a variant.
 
 The resolved placement gets the same checks as decorators: nonoverlapping contiguous warps,
 one budget per warpgroup, and a fitting register pool. Unknown names or non-`RoleConfig`

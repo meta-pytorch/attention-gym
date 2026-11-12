@@ -47,8 +47,8 @@ class WarpsToy(WarpSpecialized):
     Neither omission is a runtime negative control.
     """
 
-    def __init__(self):
-        self.ch = Ring(2, Warps, Warps, payload=(cutlass.Int32, (N,)))
+    def __init__(self, wait: str = "suspend"):
+        self.ch = Ring(2, Warps, Warps, payload=(cutlass.Int32, (N,)), wait=wait)
 
     @role(warps=range(4))
     @cute.jit
@@ -95,13 +95,23 @@ def compile_toy(op):
     return compile_tvm_ffi(op, out, cutlass.Int32(1), cutlass.Int64(0), name="warpdrive_warps_toy")
 
 
-def test_warps_publish_and_release_whole_warps(requires_blackwell):
-    fn = compile_toy(WarpsToy())
+@pytest.mark.parametrize("wait", ["suspend", "spin"])
+def test_warps_publish_and_release_whole_warps(requires_blackwell, wait):
+    fn = compile_toy(WarpsToy(wait))
     for n in (1, 64):
         out = torch.full((64,), -1, device="cuda", dtype=torch.int32)
         fn(out, n, 20_000)
         torch.cuda.synchronize()
         assert out.tolist() == [0] * 64, n
+
+
+def test_channel_wait_mode_is_declared_and_described():
+    assert "wait spin" in WarpsToy("spin").describe()
+    assert "wait spin" not in WarpsToy().describe()
+    with pytest.raises(ValueError, match="wait must be one of"):
+        Ring(2, Threads, Threads, wait="poll")
+    with pytest.raises(ValueError, match="named channels have none"):
+        Ring(2, Threads, Threads, sync="named", wait="spin")
 
 
 class PairWarpsToy(WarpSpecialized):

@@ -52,6 +52,15 @@ PAIRS_4X2 = Cluster(4, 2, pair=True)
 # Declarations and geometry
 
 
+def test_single_cta_launches_as_a_cluster():
+    assert SingleCta().launch_cluster() == (1, 1, 1)
+
+
+def test_single_cta_cluster_launch_runs(requires_blackwell):
+    """A sub-wave persistent GEMM launched as (1, 1, 1) clusters matches the reference."""
+    check_gemm(SCHEDULES["static"], 640, 1024, 256, max_ctas=7, cluster=SingleCta())
+
+
 def test_cluster_geometry():
     c = PAIRS_2X2
     assert (c.size, c.pair_size, c.launch_cluster()) == (4, 2, (4, 1, 1))

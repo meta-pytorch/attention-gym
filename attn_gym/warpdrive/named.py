@@ -16,7 +16,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from cutlass import cute
+from cutlass import Int32, cute
 from cutlass._mlir import ir
 
 from attn_gym.warpdrive.alias import RoleEvents
@@ -90,21 +90,12 @@ class NamedBarrier:
 
         With wait tracing enabled, records a ``<name>.sync`` range.
         """
-        with wait_range(current_trace(), f"{self.name}.sync"):
-            if aligned:
-                cute.arch.barrier(barrier_id=self._allocated_id(), number_of_threads=self.threads)
-            else:
-                _named_sync(self._allocated_id(), self.threads)
+        _sync(self.name, self._allocated_id(), self.threads, aligned)
         self._record("barrier")
 
     def arrive(self, *, aligned: bool = False):
         """Arrive without waiting; the generation completes when ``threads`` have arrived."""
-        if aligned:
-            cute.arch.barrier_arrive(
-                barrier_id=self._allocated_id(), number_of_threads=self.threads
-            )
-        else:
-            _named_arrive(self._allocated_id(), self.threads)
+        _arrive(self._allocated_id(), self.threads, aligned)
         self._record("barrier_arrive")
 
     def _record(self, kind: str):
@@ -113,6 +104,101 @@ class NamedBarrier:
         trace = current_trace()
         if trace is not None:
             trace.event(kind, threads=self.threads, id=self._allocated_id(), barrier=self)
+
+
+@dataclass(eq=False)
+class NamedBarriers:
+    """``n`` named barriers of ``threads`` arrivals each, with consecutive IDs, so a runtime
+    index can select one: ``self.ex = NamedBarriers(2, threads=128)``, then ``self.ex[i].sync()``.
+
+    A Python int index returns that ``NamedBarrier`` (declared as ``<name>[i]``); a runtime
+    index returns a view that computes the ID at run time. Each barrier gets its own ID and
+    the same participation checks as ``n`` separate ``NamedBarrier`` declarations. A runtime
+    index that is the ``Instance`` of a shared-body role is checked as barrier ``i`` for
+    instance ``i``; any other runtime index counts as native use of every barrier (see
+    ``NamedBarrier.id``), so short participation is unverified rather than an error. A runtime
+    index is not bounds-checked: one past the end names whatever ID follows.
+    """
+
+    n: int
+    threads: int
+    name: str = field(default="", init=False)
+    barriers: tuple[NamedBarrier, ...] = field(default=(), init=False, repr=False)
+
+    def __post_init__(self):
+        if type(self.n) is not int or self.n < 1:
+            raise ValueError(f"NamedBarriers n must be a positive int, got {self.n!r}")
+        self.barriers = tuple(NamedBarrier(self.threads) for _ in range(self.n))
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, index):
+        if isinstance(index, int):
+            if not 0 <= index < self.n:
+                raise ProtocolError(
+                    f"NamedBarriers {self.name}: index {index} not in [0, {self.n})"
+                )
+            return self.barriers[index]
+        return _IndexedBarrier(self, index)
+
+
+@dataclass(frozen=True)
+class ByInstance:
+    """Trace marker: the shared-body instance ``i`` uses ``barriers[i]``."""
+
+    barriers: tuple[NamedBarrier, ...]
+
+
+class _IndexedBarrier:
+    """``NamedBarriers[i]`` for a runtime ``i``: ``sync()``/``arrive()`` as on a
+    ``NamedBarrier``, on the ID ``first + i``."""
+
+    def __init__(self, group: NamedBarriers, index):
+        self._group, self._index = group, index
+
+    def _id(self):
+        return Int32(self._group.barriers[0]._allocated_id()) + self._index
+
+    def sync(self, *, aligned: bool = False):
+        _sync(self._group.name, self._id(), self._group.threads, aligned)
+        self._record("barrier")
+
+    def arrive(self, *, aligned: bool = False):
+        _arrive(self._id(), self._group.threads, aligned)
+        self._record("barrier_arrive")
+
+    def _record(self, kind: str):
+        trace = current_trace()
+        if trace is None:
+            return
+        group = self._group
+        if self._index is trace.instance:  # resolved per instance after the shared trace
+            if group.n < trace.instances:
+                raise ProtocolError(
+                    f"{trace.role_name}: NamedBarriers {group.name} has {group.n} barriers, but "
+                    f"the shared body indexing it by Instance runs {trace.instances} instances"
+                )
+            trace.event(kind, threads=group.threads, id=None, barrier=ByInstance(group.barriers))
+            return
+        for nb in group.barriers:  # any of them: participation is not checkable
+            trace.event("barrier_native", barrier=nb)
+
+
+def _sync(name: str, barrier_id, threads: int, aligned: bool):
+    """Arrive and wait; with wait tracing enabled, inside a ``<name>.sync`` range."""
+    with wait_range(current_trace(), f"{name}.sync"):
+        if aligned:
+            cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
+        else:
+            _named_sync(barrier_id, threads)
+
+
+def _arrive(barrier_id, threads: int, aligned: bool):
+    if aligned:
+        cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads)
+    else:
+        _named_arrive(barrier_id, threads)
 
 
 def _tracing_device_code() -> bool:

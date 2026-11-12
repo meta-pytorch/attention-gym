@@ -58,7 +58,9 @@ from attn_gym.warpdrive.named import (
     MAX_NAMED_BARRIER_ID,
     TMEM_PTR_BARRIER_ID,
     TMEM_TEARDOWN_BARRIER_ID,
+    ByInstance,
     NamedBarrier,
+    NamedBarriers,
 )
 from attn_gym.warpdrive.protocol import (
     ProtocolError,
@@ -124,7 +126,8 @@ class Tmem:
 
 
 class Instance:
-    """Annotation: the role receives its instance index as a Python int (constexpr)."""
+    """Annotation: the role receives its instance index, a Python int (constexpr), or a
+    warp-uniform ``Int32`` in a ``shared_body`` role."""
 
 
 class Local:
@@ -138,11 +141,17 @@ class Local:
     is the TMEM row this thread may access.
     """
 
-    def __init__(self, role_name: str, first_warp: int, warps: int):
+    def __init__(self, role_name: str, first_warp: int | Int32, warps: int):
         self._role_name = role_name
-        self._first_warp = first_warp
+        self._first_warp = first_warp  # a runtime value in a shared body
         self.warps = warps
         self.threads = warps * WARP_SIZE
+
+    def _from_first(self, index, per_warp: int):
+        """``index`` (a thread or warp index) relative to the instance's first one."""
+        if isinstance(self._first_warp, int) and self._first_warp == 0:
+            return index
+        return index - self._first_warp * per_warp
 
     # Holds no DSL values: a loop or branch that captures it carries nothing.
     def __extract_mlir_values__(self):
@@ -154,16 +163,13 @@ class Local:
     @property
     def tid(self) -> Int32:
         """Thread index within the instance, ``0 .. threads - 1``."""
-        tid = cute.arch.thread_idx()[0]
-        return _assume_below(
-            tid - self._first_warp * WARP_SIZE if self._first_warp else tid, self.threads
-        )
+        return _assume_below(self._from_first(cute.arch.thread_idx()[0], WARP_SIZE), self.threads)
 
     @property
     def warp(self) -> Int32:
         """Warp index within the instance, ``0 .. warps - 1`` (warp-uniform)."""
         warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        return _assume_below(warp - self._first_warp if self._first_warp else warp, self.warps)
+        return _assume_below(self._from_first(warp, 1), self.warps)
 
     @property
     def lane(self) -> Int32:
@@ -315,6 +321,7 @@ class RoleInstance:
     cta: str = ALL
     raw: bool = False  # dispatched without ends, protocol log, or trace checks
     keyword_only: frozenset[str] = frozenset()
+    shared: bool = False  # traced once for all instances of its role (RoleConfig.shared_body)
 
     @property
     def warps(self) -> range:
@@ -336,12 +343,15 @@ class RoleConfig:
     ``warps``: an int names one warp, a range a contiguous group, and a sequence of ranges one
     role instance per range; it is stored as a tuple of ranges. ``regs=None`` leaves the
     register budget alone; it does not tune it. All roles in a warpgroup must agree on ``regs``.
+    ``shared_body=True`` compiles one body for all instances, which receive their index at run
+    time (``docs/warpdrive/roles.md``, "Shared bodies"); with one instance it changes nothing.
     """
 
     warps: int | range | list[range] | tuple[range, ...]
     regs: int | None = None
     cta: str = ALL
     raw: bool = False
+    shared_body: bool = False
 
     def __post_init__(self):
         if self.cta not in ROLE_PLACEMENTS:
@@ -354,6 +364,8 @@ class RoleConfig:
             )
         if type(self.raw) is not bool:
             raise ValueError(f"role raw must be a bool, got {self.raw!r}")
+        if type(self.shared_body) is not bool:
+            raise ValueError(f"role shared_body must be a bool, got {self.shared_body!r}")
         if type(self.warps) is int:
             ranges = (range(self.warps, self.warps + 1),)
         elif isinstance(self.warps, range):
@@ -382,6 +394,7 @@ def role(
     regs: int | None = None,
     cta: str = ALL,
     raw: bool = False,
+    shared_body: bool = False,
 ):
     """Mark a method as a warp role with its default placement.
 
@@ -392,8 +405,10 @@ def role(
     build a new instance to change it.
 
     A list of warp ranges instantiates the method once per range; an ``Instance`` parameter
-    receives the index. ``cta="leader"`` runs the role only in each MMA pair's leader (every CTA
-    without pairs); ``"all"`` is the default.
+    receives the index. Each instance compiles its own body, with the index as a Python int;
+    ``shared_body=True`` compiles one body for all of them, with the index as a runtime
+    ``Int32`` (``docs/warpdrive/roles.md``, "Shared bodies"). ``cta="leader"`` runs the role
+    only in each MMA pair's leader (every CTA without pairs); ``"all"`` is the default.
     ``raw=True`` roles take ``Instance``, ``Local``, ``Tmem``, ``Barriers`` and a context, but no
     managed channel ends or work cursors; they still take part in register allocation and TMEM
     teardown.
@@ -401,7 +416,7 @@ def role(
     Put this decorator directly above ``@cute.jit``: CuTeDSL re-applies it when it preprocesses
     the source.
     """
-    declaration = RoleConfig(warps, regs, cta, raw)
+    declaration = RoleConfig(warps, regs, cta, raw, shared_body)
 
     def deco(fn):
         fn._warpdrive = declaration
@@ -561,6 +576,7 @@ class WarpSpecialized(metaclass=_KernelType):
         turns = {k: v for k, v in vars(self).items() if isinstance(v, Turnstile)}
         raw_bars = {k: v for k, v in vars(self).items() if isinstance(v, Barriers)}
         named_bars = {k: v for k, v in vars(self).items() if isinstance(v, NamedBarrier)}
+        groups = {k: v for k, v in vars(self).items() if isinstance(v, NamedBarriers)}
         streams = {k: v for k, v in vars(self).items() if isinstance(v, WorkStream)}
         if len(streams) > 1:
             raise ProtocolError(
@@ -568,7 +584,13 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"{list(streams)}"
             )
         seen = {}
-        declarations = (*chans.items(), *turns.items(), *raw_bars.items(), *named_bars.items())
+        declarations = (
+            *chans.items(),
+            *turns.items(),
+            *raw_bars.items(),
+            *named_bars.items(),
+            *groups.items(),
+        )
         for name, obj in (*declarations, *streams.items()):
             if id(obj) in seen:
                 raise ProtocolError(
@@ -601,7 +623,16 @@ class WarpSpecialized(metaclass=_KernelType):
                             f"WorkStream {name}: attribute {k!r} is reserved for its scheduler"
                         )
                     chans[k] = ch
-        for name, obj in (*chans.items(), *turns.items(), *raw_bars.items(), *named_bars.items()):
+        for name, group in groups.items():  # consecutive IDs: declared as consecutive barriers
+            for i, nb in enumerate(group.barriers):
+                named_bars[f"{name}[{i}]"] = nb
+        for name, obj in (
+            *chans.items(),
+            *turns.items(),
+            *raw_bars.items(),
+            *named_bars.items(),
+            *groups.items(),
+        ):
             obj.name = name
         for ch in chans.values():
             ch.producers.clear()
@@ -625,6 +656,7 @@ class WarpSpecialized(metaclass=_KernelType):
         }
         for name, config in _role_configs(self.roles, declared).items():
             fn = getattr(type(self), name)
+            shared = config.shared_body and len(config.warps) > 1
             if not hasattr(fn, "__wrapped__"):
                 raise TypeError(f"role {name}: put @role(...) directly above @cute.jit")
             signature = inspect.signature(fn)
@@ -661,6 +693,8 @@ class WarpSpecialized(metaclass=_KernelType):
                     f"role {name}: parameters {ctx_params} would all receive the context; "
                     f"{_CTX_RULE}"
                 )
+            if shared:
+                _check_shared_body(name, config.warps, params)
             for idx, wr in enumerate(config.warps):
                 inst = f"{name}[{idx}]" if len(config.warps) > 1 else name
                 ri = RoleInstance(
@@ -675,6 +709,7 @@ class WarpSpecialized(metaclass=_KernelType):
                     cta=config.cta,
                     raw=config.raw,
                     keyword_only=keyword_only,
+                    shared=shared,
                 )
                 roles.append(ri)
                 self._bind(ri, chans, turns)
@@ -988,22 +1023,41 @@ class WarpSpecialized(metaclass=_KernelType):
                     f"register budgets need {total} registers, but {self._ws_num_warps} warps start "
                     f"with {self._ws_default_regs} each ({pool} in all; setmaxnreg can only move them)"
                 )
-        # (regs, warpgroups, role indices): one dispatch branch per run of adjacent warpgroups
-        # with one budget. Non-adjacent warpgroups never share a branch even when their
-        # budgets agree: ptxas allocates a merged branch jointly and can spill one role under
-        # the other's pressure (docs/warpdrive/configuration.md, "Placement and registers").
+        # One dispatch branch per run of adjacent warpgroups with one budget. Non-adjacent
+        # warpgroups never share a branch even when their budgets agree: ptxas allocates a merged
+        # branch jointly and can spill one role under the other's pressure
+        # (docs/warpdrive/configuration.md, "Placement and registers").
+        # (regs, warpgroups, dispatch units): a unit is the indices of the role instances one
+        # traced body runs, one instance or every instance of a shared-body role in declared
+        # (Instance) order.
         self._ws_budget_groups = []
         for regs, run in itertools.groupby(range(len(wg_regs)), key=lambda g: wg_regs[g]):
             wgs = tuple(run)
-            role_ids = tuple(i for i, r in enumerate(roles) if r.first_warp // WARPGROUP in wgs)
-            self._ws_budget_groups.append((regs, wgs, role_ids))
+            units = {}
+            for i, r in enumerate(roles):
+                if r.first_warp // WARPGROUP in wgs:
+                    units.setdefault(r.role if r.shared else i, []).append(i)
+            units = tuple(tuple(sorted(u, key=lambda i: roles[i].index)) for u in units.values())
+            self._ws_budget_groups.append((regs, wgs, units))
+        for role_name in {r.role for r in roles if r.shared}:
+            split = [
+                wgs
+                for _, wgs, units in self._ws_budget_groups
+                if any(roles[u[0]].role == role_name for u in units)
+            ]
+            if len(split) > 1:
+                raise ValueError(
+                    f"role {role_name}: shared_body instances fall in different register-budget "
+                    f"dispatch branches (warpgroups {split}), which cannot share one body; place "
+                    "them in adjacent warpgroups with one budget"
+                )
 
     def role_config_key(self) -> tuple:
         """Resolved role placement and budgets, part of ``__cute_cache_key__``. The first call
         collects and freezes the role configuration."""
         self._collect()
         return tuple(
-            (r.role, r.index, r.first_warp, r.num_warps, r.regs, r.cta, r.raw)
+            (r.role, r.index, r.first_warp, r.num_warps, r.regs, r.cta, r.raw, r.shared)
             for r in self._ws_roles
         )
 
@@ -1563,36 +1617,50 @@ class WarpSpecialized(metaclass=_KernelType):
 
     @cute.jit
     def _dispatch_group(self, group, ctx, warp_idx, rank):
-        regs, _, role_ids = group
+        regs, _, units = group
         self._set_regs(regs)
         size = self.cluster.size
-        for i in cutlass.range_constexpr(len(role_ids)):
-            r = self._ws_roles[role_ids[i]]
+        for i in cutlass.range_constexpr(len(units)):
+            unit = tuple(self._ws_roles[j] for j in units[i])
+            r = unit[0]
             ctas = self.cluster.ctas(r.cta)
-            here = _in_warps(warp_idx, r.first_warp, r.num_warps)
+            here = _in_runs(warp_idx, _runs(sorted(w for ri in unit for w in ri.warps)))
             if cutlass.const_expr(len(ctas) < size):
                 here = here & rank_in(rank, ctas, size)
             # Only a call on `self` inside the dynamic `if`: an assignment through `self`
             # would make the preprocessor carry `self` as an if-result.
             if here:
-                self._dispatch(r, ctx)
+                self._dispatch(unit, ctx)
 
-    def _dispatch(self, r: RoleInstance, ctx):
+    def _dispatch(self, unit: tuple[RoleInstance, ...], ctx):
+        """Trace one role body: one instance, or every instance of a shared-body role, which
+        then sees its index (``instance``) at run time."""
         # Plain Python (no dynamic control flow): runs at trace time inside the role's `if`.
+        r = unit[0]
+        instance = _instance_index(unit) if len(unit) > 1 else None
+        name = f"{r.role}[*]" if instance is not None else r.name
         ranges = None
         if self._ws_trace is not None:
-            ranges = self._ws_trace.role(self._ws_roles.index(r), r.first_warp)
-        trace = RoleTrace(r.name, None if r.raw else self._ws_log, ranges, self.trace_waits)
-        args = self._role_args(r, ctx, trace)
+            ranges = self._ws_trace.role(
+                _by_instance(instance, [self._ws_roles.index(ri) for ri in unit]),
+                _by_instance(instance, [ri.first_warp for ri in unit]),
+            )
+            if instance is not None:
+                ranges.share(instance, {name: [ri.name for ri in unit]})
+        log = None if r.raw else self._ws_log
+        trace = RoleTrace(
+            name, log, ranges, self.trace_waits, instance=instance, instances=len(unit)
+        )
+        args = self._role_args(unit, instance, ctx, trace)
         # A role looping over a WorkStream gets one range per work item (WorkCursor); any
         # other role gets one over its whole body.
         whole_range = ranges is not None and not any(isinstance(arg, WorkCursor) for arg in args)
         if whole_range:
-            ranges.push(r.name)
+            ranges.push(name)
         positional, keywords = [], {}
-        for (name, _), arg in zip(r.params, args):
-            if name in r.keyword_only:
-                keywords[name] = arg
+        for (pname, _), arg in zip(r.params, args):
+            if pname in r.keyword_only:
+                keywords[pname] = arg
             else:
                 positional.append(arg)
         with tracing_role(trace):
@@ -1611,32 +1679,50 @@ class WarpSpecialized(metaclass=_KernelType):
                 if isinstance(end, ProducerEnd) and end.scope.tail:
                     end.tail()
         if whole_range:
-            ranges.pop(r.name)
+            ranges.pop(name)
         if ranges is not None and ranges.names:
-            raise ProtocolError(f"{r.name}: trace ranges {ranges.names} left open at role exit")
-        self._record_role(r, trace)
+            raise ProtocolError(f"{name}: trace ranges {ranges.names} left open at role exit")
+        self._record_role(unit, instance, trace)
         if r.uses_tmem:
-            self._tmem_teardown(r)
+            self._tmem_teardown(unit)
 
-    def _record_role(self, r: RoleInstance, trace: RoleTrace):
-        """Check a traced role and keep its results for ``_finish_trace``'s kernel-wide checks.
-        Host only: it emits no device code."""
+    def _record_role(self, unit: tuple[RoleInstance, ...], instance, trace: RoleTrace):
+        """Check a traced role body and keep its results, under each instance it ran as, for
+        ``_finish_trace``'s kernel-wide checks. Host only: it emits no device code."""
+        r = unit[0]
         if not r.raw:
             check_tma(trace, self.cluster, self._ws_tma)
             trace.finish()
             if self._ws_log is not None:
                 self._ws_log.add(trace)
-        for chan, n in trace.uses_per_item().items():
-            self._ws_uses[(r.name, chan)] = n
-        for name, ch in self._ws_chans.items():
-            if ch.owned_epochs and any(ri is r for ri, _ in ch.producers + ch.consumers):
-                self._ws_epoch_seqs[(name, r.name)] = (
-                    "raw role: its waits are not visible" if r.raw else trace.epoch_sequence(name)
-                )
-        self._ws_role_events.append(RoleEvents.from_trace(trace, r))
+        if instance is not None and trace.log is not None:  # each instance ran these ops
+            for book in (trace.log.ops, trace.log.tmem):
+                if trace.role_name in book:
+                    shared = book.pop(trace.role_name)
+                    book.update({ri.name: copy.copy(shared) for ri in unit})
+        # One trace stands for every instance: they differ only in the instance index, which
+        # the layer applies itself (round-robin offsets, warp indices); a body that branches on
+        # it has dynamic regions, which the checks treat as they do any other.
+        uses = trace.uses_per_item()
+        for j, ri in enumerate(unit):
+            for chan, n in uses.items():
+                self._ws_uses[(ri.name, chan)] = n
+            for chan_name, ch in self._ws_chans.items():
+                if ch.owned_epochs and any(b is ri for b, _ in ch.producers + ch.consumers):
+                    self._ws_epoch_seqs[(chan_name, ri.name)] = (
+                        "raw role: its waits are not visible"
+                        if r.raw
+                        else trace.epoch_sequence(chan_name)
+                    )
+            # The role's regions are live now; the diagnostic keeps plain data only.
+            events = RoleEvents.from_trace(trace, ri)
+            if instance is not None:
+                events.events = [_for_instance(ev, j) for ev in events.events]
+            self._ws_role_events.append(events)
 
-    def _tmem_teardown(self, r: RoleInstance):
+    def _tmem_teardown(self, unit: tuple[RoleInstance, ...]):
         """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp."""
+        r = unit[0]
         # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
         # peer has no leader-only TMEM roles, so its count is smaller).
         users = [u for u in self._ws_roles if u.uses_tmem]
@@ -1648,8 +1734,9 @@ class WarpSpecialized(metaclass=_KernelType):
         # Roles reach this from different code sites after per-lane mbarrier spins, so use
         # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
         _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
-        if r is self._ws_tmem_alloc_role:
+        if self._ws_tmem_alloc_role in unit:
             ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
+            # Only the allocator warp frees (checked inside, so a shared body may call it).
             # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
             self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
 
@@ -1661,23 +1748,26 @@ class WarpSpecialized(metaclass=_KernelType):
         elif regs < self._ws_default_regs:
             cute.arch.setmaxregister_decrease(regs)
 
-    def _role_args(self, r: RoleInstance, ctx, trace: RoleTrace):
+    def _role_args(self, unit: tuple[RoleInstance, ...], instance, ctx, trace: RoleTrace):
+        r = unit[0]
         args = []
         for pname, ann in r.params:
             side = ann.side if isinstance(ann, _Bound) else ann
             if side is Producer or side is Consumer:
                 bound = r.index if isinstance(ann, _Bound) else None
-                args.append(self._make_end(pname, side is Producer, bound, trace, r))
+                args.append(self._make_end(pname, side is Producer, bound, trace, unit, instance))
             elif ann is Tmem:
                 base = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-                args.append(TmemView(base, self.tmem_plan, r.name, trace.log, trace))
+                args.append(TmemView(base, self.tmem_plan, trace.role_name, trace.log, trace))
             elif ann is Barriers:
                 args.append(self._ws_bars[pname])
             elif ann is WorkCursor or ann is _SchedulerCursor:
                 st = self._ws_streams[pname]
                 end = None
                 if st.schedule.broadcast:
-                    end = self._make_end(st._channel_name(pname, "ring"), False, None, trace, r)
+                    end = self._make_end(
+                        st._channel_name(pname, "ring"), False, None, trace, unit, instance
+                    )
                 args.append(
                     WorkCursor.create(
                         st,
@@ -1691,16 +1781,21 @@ class WarpSpecialized(metaclass=_KernelType):
                 st = self._ws_streams[pname]
                 ends = {
                     k: (
-                        self._make_end(st._channel_name(pname, k), True, None, trace, r),
-                        self._make_end(st._channel_name(pname, k), False, None, trace, r),
+                        self._make_end(
+                            st._channel_name(pname, k), True, None, trace, unit, instance
+                        ),
+                        self._make_end(
+                            st._channel_name(pname, k), False, None, trace, unit, instance
+                        ),
                     )
                     for k in self._ws_fetch_keys[pname]
                 }
                 args.append(_Fetch(st.schedule, ends, self._ws_problems[pname]))
             elif ann is Instance:
-                args.append(r.index)
+                args.append(r.index if instance is None else instance)
             elif ann is Local:
-                args.append(Local(r.name, r.first_warp, r.num_warps))
+                first = _by_instance(instance, [ri.first_warp for ri in unit])
+                args.append(Local(trace.role_name, first, r.num_warps))
             elif ann is Turn:
                 ts = self._ws_turns[pname]
                 seat = ts.parties.index(r)
@@ -1711,14 +1806,18 @@ class WarpSpecialized(metaclass=_KernelType):
                 args.append(ctx)
         return args
 
-    def _make_end(self, pname: str, is_prod: bool, bound, trace, ri: RoleInstance):
+    def _make_end(self, pname: str, is_prod: bool, bound, trace, unit, instance):
+        """The end of channel ``pname`` for the instances ``unit`` (several in a shared body,
+        where ``instance`` is the runtime index)."""
+        ri = unit[0]
         chan = self._ws_chans[pname]
         side = "producer" if is_prod else "consumer"
         # Round-robin: instance j of k starts at epoch j and steps k epochs per operation.
         turns = chan.turns(side)
         turn = 0
         if turns > 1:
-            turn = [r for r, _ in chan.bound(side)].index(ri)
+            bound_roles = [r for r, _ in chan.bound(side)]
+            turn = _by_instance(instance, [bound_roles.index(u) for u in unit])
         if chan.fixed:
             # Producers start each slot at phase 1 (a fresh empty barrier passes).
             state = Int32((1 << chan.n) - 1 if is_prod else 0)
@@ -1729,7 +1828,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 else pipeline.PipelineUserType.Consumer,
                 chan.n,
             )
-            if turn:
+            if not isinstance(turn, int) or turn:
                 advance_state(state, turn)
         cls = ProducerEnd if is_prod else ConsumerEnd
         end = cls(
@@ -1747,7 +1846,7 @@ class WarpSpecialized(metaclass=_KernelType):
             if bound is not None:
                 end.seed([bound])
             else:  # seed only the stages this instance takes first (its first turns)
-                end.seed([j for j in range(chan.n) if j % turns == turn])
+                end.seed(range(chan.n), when=lambda j: turn == j % turns)
         return end
 
 
@@ -1980,3 +2079,75 @@ def _in_warps(warp_idx, first: int, count: int):
     if count == 1:
         return warp_idx == first
     return (warp_idx >= first) & (warp_idx < first + count)
+
+
+def _in_runs(warp_idx, runs: list[range]):
+    here = _in_warps(warp_idx, runs[0].start, len(runs[0]))
+    for run in runs[1:]:
+        here = here | _in_warps(warp_idx, run.start, len(run))
+    return here
+
+
+def _check_shared_body(name: str, ranges: tuple[range, ...], params: list):
+    """Reject a ``shared_body`` role whose instances need their index at trace time."""
+    if len({len(r) for r in ranges}) != 1:
+        raise ValueError(
+            f"role {name}: shared_body instances must have equal warp counts, got "
+            f"{[len(r) for r in ranges]}"
+        )
+    for pname, ann in params:
+        if isinstance(ann, _Bound):
+            raise ProtocolError(
+                f"role {name}: shared_body cannot take slot-bound {pname}: "
+                f"{ann.side.__name__}[...] (each instance binds its own slot, a Python int); "
+                "drop shared_body or take the unbound end"
+            )
+        if ann is Turn:
+            raise ProtocolError(
+                f"role {name}: shared_body cannot take the turnstile seat {pname} (each "
+                "instance holds its own seat); drop shared_body"
+            )
+
+
+def _instance_index(unit: tuple[RoleInstance, ...]) -> Int32:
+    """The warp-uniform ``Instance`` index of the executing instance among ``unit`` (in
+    declared order): a division when the instances sit at ascending, evenly spaced warps, a
+    select per instance otherwise."""
+    warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+    firsts = [r.first_warp for r in unit]
+    spacing = firsts[1] - firsts[0]
+    if spacing > 0 and firsts == [firsts[0] + j * spacing for j in range(len(firsts))]:
+        rel = _assume_below(warp - firsts[0] if firsts[0] else warp, spacing * len(unit))
+        index = Int32(Uint32(rel) // spacing)
+    else:
+        index = Int32(0)
+        for j, r in enumerate(unit[1:], 1):
+            index = Int32(
+                cutlass.select_(_in_warps(warp, r.first_warp, r.num_warps), Int32(j), index)
+            )
+    return _assume_below(index, len(unit))
+
+
+def _by_instance(instance, values: list[int]):
+    """``values[instance]``: the value itself when there is no runtime instance or all values
+    agree, an affine expression when they are evenly spaced, a select chain otherwise."""
+    if instance is None or len(set(values)) == 1:
+        return values[0]
+    step = values[1] - values[0]
+    if values == [values[0] + j * step for j in range(len(values))]:
+        out = Int32(instance * step)
+        return Int32(out + values[0]) if values[0] else out
+    out = Int32(values[0])
+    for j in range(1, len(values)):
+        out = Int32(cutlass.select_(instance == j, Int32(values[j]), out))
+    return out
+
+
+def _for_instance(ev, j: int):
+    """A shared body's event as instance ``j`` ran it: an instance-indexed ``NamedBarriers``
+    operation becomes the operation on barrier ``j``."""
+    barriers = ev.data.get("barrier")
+    if not isinstance(barriers, ByInstance):
+        return ev
+    member = barriers.barriers[j]
+    return replace(ev, data={**ev.data, "barrier": member, "id": member._allocated_id()})
