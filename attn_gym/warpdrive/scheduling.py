@@ -531,6 +531,57 @@ class IndexSchedule:
     # OneShot and TilePersistent, which read items from blockIdx, override them; a subclass
     # inherits its kind's answers. ``problem`` is the stream's ``BoundWork``.
 
+    def _check_stream(self, stream):
+        """Host, at declaration (``WorkStream.__post_init__``): reject an incompatible
+        mapping."""
+
+    def _assignment(self, stream, space, max_ctas, decode) -> list[list[tuple]]:
+        """Host: ``WorkStream.assignment``, by running ``first_index``/``next_index`` on a
+        ``_HostProblem`` per work unit."""
+        mapping = stream.mapping
+        if self.broadcast:
+            raise ValueError(
+                f"{self.describe()} claims indices at run time; only a local schedule has a "
+                "host-side assignment"
+            )
+        space = mapping.bind(space)
+        count = int(mapping.count64(space))
+        total = _narrow(count)
+        cs = stream.cluster_size
+        units = int(_launch_units(self, total, max_ctas, cs))
+        if self.index_limit(count, units, cs) > INT32_MAX:
+            raise ValueError(f"the space's {count} items exceed what a launch indexes in Int32")
+        if decode is None and mapping.decodes_any_index:
+
+            def decode(index):
+                keep, words, _ = mapping.decode(index, space, mapping.start(space))
+                return keep, tuple(int(w) for w in words)
+
+        elif decode is None and mapping.skips:
+            raise ValueError(
+                f"{type(mapping).__name__} drops items by data the host cannot read; pass its "
+                "host counterpart as decode=(index -> (keep, item))"
+            )
+        elif decode is None:
+
+            def decode(index):
+                return True, None
+
+        rows = []
+        for unit in range(units):
+            problem = _HostProblem(space, total, cs, units, unit)
+            items = []
+            index = int(self.first_index(problem))
+            for _ in range(total):  # a unit runs each index at most once
+                if index >= total:
+                    break
+                keep, item = decode(index)
+                if keep:
+                    items.append((index, item))
+                index = int(self.next_index(index, problem))
+            rows += [list(items) for _ in range(cs)]
+        return rows
+
     def _index_count(self, count64, space):
         """Host, at bind: how many indices the stream has, from the mapping's item count. The
         kernel receives it narrowed to Int32 (``BoundWork.total``), and ``BoundWork.grid``'s
@@ -623,6 +674,19 @@ class OneShot(IndexSchedule):
 
     def next_index(self, index, problem):
         return problem.total
+
+    def _check_stream(self, stream):
+        if self.grid in ("3d", "2d") and not _tile_grid(stream):
+            raise ValueError(
+                f"OneShot(grid={self.grid!r}) reads the item from blockIdx: it needs OneShot "
+                f"itself and the plain Raster() mapping, not {stream.describe()}"
+            )
+        if self.grid == "1d" and type(stream.mapping) is not Raster:
+            raise ValueError(
+                "OneShot(grid='1d') chooses the grid of a Raster stream; "
+                f"{type(stream.mapping).__name__} always launches the 1-D grid, so leave "
+                "grid='auto'"
+            )
 
     def _grid(self, problem, units):
         if _tile_grid(problem.stream):
@@ -727,6 +791,32 @@ class TilePersistent(IndexSchedule):
         if self.units is not None:
             return index + self.units
         return index + cute.arch.grid_dim()[AXES.index(self.axis)]
+
+    def _check_stream(self, stream):
+        if not _plain_raster(stream.mapping):
+            raise ValueError(
+                f"{self.describe()} reads the item from blockIdx: it needs the plain Raster() "
+                f"mapping, not {stream.describe()}"
+            )
+
+    def _assignment(self, stream, space, max_ctas, decode) -> list[list[tuple]]:
+        # CTAs in launch order (blockIdx.x fastest), each running the items along its axis, with
+        # the total and units the launch computes.
+        if decode is not None:
+            raise ValueError(f"{self.describe()} reads items from blockIdx; drop decode")
+        _check_single_cta(stream, stream.cluster_size)
+        bound = BoundWork(stream, stream.mapping.bind(space), None, max_ctas)
+        total = bound.total
+        k = AXES.index(self.axis)
+        units = _launch_units(self, total, bound.max_ctas, bound.cs)
+        dims = _tile_persistent_dims(bound.space, self.axis, units)
+        rows = []
+        for z, y, x in itertools.product(*(range(d) for d in reversed(dims))):  # x fastest
+            block = (x, y, z)
+            rows.append(
+                [(c, block[:k] + (c,) + block[k + 1 :]) for c in range(block[k], total, units)]
+            )
+        return rows
 
     def _index_count(self, count64, space):
         # The stream's index is the axis coordinate; an empty space has none.
@@ -894,24 +984,7 @@ class WorkStream:
             type(self.schedule.stages) is not int or self.schedule.stages <= 0
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
-        if isinstance(self.schedule, TilePersistent) and not _plain_raster(self.mapping):
-            raise ValueError(
-                f"{self.schedule.describe()} reads the item from blockIdx: it needs the plain "
-                f"Raster() mapping, not {self.describe()}"
-            )
-        if isinstance(self.schedule, OneShot):
-            grid = self.schedule.grid
-            if grid in ("3d", "2d") and not _tile_grid(self):
-                raise ValueError(
-                    f"OneShot(grid={grid!r}) reads the item from blockIdx: it needs OneShot "
-                    f"itself and the plain Raster() mapping, not {self.describe()}"
-                )
-            if grid == "1d" and type(self.mapping) is not Raster:
-                raise ValueError(
-                    "OneShot(grid='1d') chooses the grid of a Raster stream; "
-                    f"{type(self.mapping).__name__} always launches the 1-D grid, so leave "
-                    "grid='auto'"
-                )
+        self.schedule._check_stream(self)
 
     @property
     def cluster_size(self) -> int:
@@ -1060,72 +1133,7 @@ class WorkStream:
         ``TilePersistent`` lists its CTAs in launch order (``blockIdx.x`` fastest, then ``y``,
         ``z``); each runs the items along its axis, and ``index`` is the axis coordinate.
         """
-        schedule, mapping = self.schedule, self.mapping
-        if isinstance(schedule, TilePersistent):
-            if decode is not None:
-                raise ValueError(f"{schedule.describe()} reads items from blockIdx; drop decode")
-            _check_single_cta(self, self.cluster_size)
-            return _tile_persistent_assignment(
-                BoundWork(self, mapping.bind(space), None, max_ctas)
-            )
-        if schedule.broadcast:
-            raise ValueError(
-                f"{schedule.describe()} claims indices at run time; only a local schedule has a "
-                "host-side assignment"
-            )
-        space = mapping.bind(space)
-        count = int(mapping.count64(space))
-        total = _narrow(count)
-        cs = self.cluster_size
-        units = int(_launch_units(schedule, total, max_ctas, cs))
-        if schedule.index_limit(count, units, cs) > INT32_MAX:
-            raise ValueError(f"the space's {count} items exceed what a launch indexes in Int32")
-        if decode is None and mapping.decodes_any_index:
-
-            def decode(index):
-                keep, words, _ = mapping.decode(index, space, mapping.start(space))
-                return keep, tuple(int(w) for w in words)
-
-        elif decode is None and mapping.skips:
-            raise ValueError(
-                f"{type(mapping).__name__} drops items by data the host cannot read; pass its "
-                "host counterpart as decode=(index -> (keep, item))"
-            )
-        elif decode is None:
-
-            def decode(index):
-                return True, None
-
-        rows = []
-        for unit in range(units):
-            problem = _HostProblem(space, total, cs, units, unit)
-            items = []
-            index = int(schedule.first_index(problem))
-            for _ in range(total):  # a unit runs each index at most once
-                if index >= total:
-                    break
-                keep, item = decode(index)
-                if keep:
-                    items.append((index, item))
-                index = int(schedule.next_index(index, problem))
-            rows += [list(items) for _ in range(cs)]
-        return rows
-
-
-def _tile_persistent_assignment(bound) -> list[list[tuple]]:
-    """``WorkStream.assignment`` of a ``TilePersistent`` stream bound to a static space, with the
-    launch's ``total`` and units."""
-    schedule, total = bound.stream.schedule, bound.total
-    k = AXES.index(schedule.axis)
-    units = _launch_units(schedule, total, bound.max_ctas, bound.cs)
-    dims = _tile_persistent_dims(bound.space, schedule.axis, units)
-    rows = []
-    for z, y, x in itertools.product(*(range(d) for d in reversed(dims))):  # x fastest
-        block = (x, y, z)
-        rows.append(
-            [(c, block[:k] + (c,) + block[k + 1 :]) for c in range(block[k], total, units)]
-        )
-    return rows
+        return self.schedule._assignment(self, space, max_ctas, decode)
 
 
 @dataclass(frozen=True)
