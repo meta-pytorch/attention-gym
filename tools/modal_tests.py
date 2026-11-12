@@ -27,9 +27,9 @@ NIGHTLY_CACHE_DATE = datetime.now(UTC).date().isoformat()
 CACHE_VOLUME = modal.Volume.from_name("attention-gym-compile-cache", create_if_missing=True)
 CACHE_VOLUME_PATH = Path("/compile-cache-volume")
 COMPILE_CACHE_PATH = Path("/tmp/compile-cache")
-# Every cache is content-keyed, so pruning costs only recompiles. CuTe and Inductor keys include
-# the torch version, and the nightly changes daily, so older entries are rarely reusable.
-CACHE_MAX_AGE_SECONDS = 3 * 24 * 60 * 60
+# Every cache is content-keyed, so pruning costs only recompiles. Keep entries last read or
+# written within this window; older ones belong to earlier nightlies or source revisions.
+CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 # The first run after the daily nightly rebuild recompiles every kernel; compilation is
 # CPU-bound per pytest worker, so give each worker its own core. Keep the timeout well above a
 # cold run: a timed-out container never saves its compile cache, so the next run is cold again.
@@ -210,9 +210,10 @@ def restore_compile_cache(archive: Path, cache_dir: Path) -> None:
 
 
 def save_compile_cache(cache_dir: Path, archive: Path, max_age_seconds: float) -> None:
-    """Archive artifacts with mtimes within ``max_age_seconds``, replacing ``archive``.
+    """Archive artifacts read or written within ``max_age_seconds``, replacing ``archive``.
 
-    Restoring preserves each file's original mtime, so an entry ages from when it was compiled.
+    Restoring sets each file's atime and mtime to its last archived mtime, and a read advances
+    its atime, so an entry ages from its last use rather than from when it was compiled.
     """
     if not cache_dir.is_dir():
         return
@@ -226,8 +227,15 @@ def save_compile_cache(cache_dir: Path, archive: Path, max_age_seconds: float) -
         local_archive = Path(temp_dir) / archive.name
         with tarfile.open(local_archive, "w") as tar:
             for path in sorted(cache_dir.rglob("*")):
-                if path.is_file() and not path.is_symlink() and path.stat().st_mtime >= cutoff:
-                    tar.add(path, arcname=path.relative_to(cache_dir), recursive=False)
+                if path.is_file() and not path.is_symlink():
+                    status = path.stat()
+                    last_use = max(status.st_atime, status.st_mtime)
+                    if last_use >= cutoff:
+                        # Archive the last use as mtime so the next restore keeps aging from it.
+                        info = tar.gettarinfo(path, arcname=path.relative_to(cache_dir))
+                        info.mtime = last_use
+                        with path.open("rb") as entry:
+                            tar.addfile(info, entry)
         shutil.copyfile(local_archive, staging)
         staging.replace(archive)
     print(
@@ -304,15 +312,28 @@ def run_cudnn_pytest() -> tuple[int, str]:
 
 @app.local_entrypoint()
 def main() -> None:
-    """Publish each suite immediately and stop allocating GPUs after a failed suite."""
-    for suite_name, suite in (("main", run_pytest), ("cudnn", run_cudnn_pytest)):
-        start = time.perf_counter()
-        print(f"requesting {suite_name} at {datetime.now(UTC).isoformat()}", flush=True)
-        return_code, summary = suite.remote()
-        print(f"{suite_name} returned in {time.perf_counter() - start:.1f}s", flush=True)
+    """Run both suites at once on separate GPUs, publish each summary, and fail if either fails.
+
+    Wait for every suite even after one raises, so the other can finish and save its cache.
+    """
+    start = time.perf_counter()
+    print(f"requesting suites at {datetime.now(UTC).isoformat()}", flush=True)
+    calls = {"main": run_pytest.spawn(), "cudnn": run_cudnn_pytest.spawn()}
+    failed = False
+    error = None
+    for suite_name, call in calls.items():
+        try:
+            return_code, summary = call.get()
+        except Exception as exception:  # noqa: BLE001 - re-raised once every suite finished
+            error = error or exception
+            continue
+        print(f"{suite_name} returned after {time.perf_counter() - start:.1f}s", flush=True)
         print(f"\n{summary}", flush=True)
         if summary_path := os.environ.get("GITHUB_STEP_SUMMARY"):
             with Path(summary_path).open("a") as summary_file:
                 summary_file.write(summary)
-        if return_code != 0:
-            raise SystemExit(1)
+        failed |= return_code != 0
+    if error is not None:
+        raise error
+    if failed:
+        raise SystemExit(1)
