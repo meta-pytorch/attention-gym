@@ -11,11 +11,9 @@ import importlib
 
 import torch
 
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._lazy import register_lazy_cuda_impls
-
-_CHUNK_SIZE = 64
-
 
 # Fixed-arity schema pairs avoid optional outputs on hot paths. ``fastmath`` is the trailing
 # defaulted argument so positional callers of the original schema keep working.

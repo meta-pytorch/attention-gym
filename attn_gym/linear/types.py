@@ -11,6 +11,7 @@ from typing import Literal, NamedTuple
 
 import torch
 
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOptions, resolve_impl
 
 
@@ -26,6 +27,29 @@ class ReplayState(NamedTuple):
     gate: torch.Tensor
     beta: torch.Tensor
     count: torch.Tensor
+
+    @staticmethod
+    def slot_layout(
+        num_heads: int, head_dim: int, *, value_dim: int | None = None
+    ) -> tuple[tuple[tuple[int, ...], torch.dtype], ...]:
+        """Return per-slot (shape, dtype) pairs in q, k, v, gate, beta, count order.
+
+        The slot dimension is excluded. Value width defaults to the key width.
+        Count has one element per slot; paged KDA also accepts a flat count vector.
+        """
+        value_dim = head_dim if value_dim is None else value_dim
+        if num_heads < 1 or head_dim < 1 or value_dim < 1:
+            raise ValueError("replay slot head count and dimensions must be positive")
+        token_heads = (DEFAULT_CHUNK_SIZE, num_heads)
+        key = ((*token_heads, head_dim), torch.bfloat16)
+        return (
+            key,
+            key,
+            ((*token_heads, value_dim), torch.bfloat16),
+            (key[0], torch.float32),
+            (token_heads, torch.float32),
+            ((1,), torch.int32),
+        )
 
 
 class BackendOptions(TuningOptions, total=False):
