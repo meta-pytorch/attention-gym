@@ -31,6 +31,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel import (
     OP_NAMES,
     OPROJ,
     QKV,
+    ROUTER,
     QwenDecodeMegakernel,
     row_groups,
 )
@@ -40,7 +41,10 @@ from attn_gym.warpdrive.trace_session import work_item_ranges, write_trace
 
 # The instruction kind each phase waits for; QKV and the LM head wait for the previous layer's
 # down.
-PRODUCER = {QKV: DOWN, ATTN: QKV, OPROJ: ATTN, GATEUP: OPROJ, DOWN: GATEUP, LMHEAD: DOWN}
+PRODUCER = {
+    QKV: DOWN, ATTN: QKV, OPROJ: ATTN, ROUTER: OPROJ, GATEUP: OPROJ, DOWN: GATEUP, LMHEAD: DOWN
+}  # fmt: skip
+MOE_PRODUCER = {**PRODUCER, GATEUP: ROUTER}  # a MoE table's expert rows wait for the router
 
 
 @contextmanager
@@ -112,8 +116,9 @@ def input_edges(
 def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     """Mean us per layer, by instruction kind, from the producer phase's last row done to this
     phase's last row done. QKV counts from layer 1, whose producer is the previous layer's
-    down."""
+    down; a MoE table's GATEUP counts from its ROUTER."""
     rows = table.tolist()
+    producers = MOE_PRODUCER if any(row[0] == ROUTER for row in rows) else PRODUCER
     last: dict[tuple[int, int], int] = {}
     for row, item in work_item_ranges(ranges, "compute").items():
         key = tuple(rows[row][:2])  # (op, layer); the LM head's layer is the layer count
@@ -121,7 +126,7 @@ def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     spans: dict[str, list[int]] = {}
     for (op, layer), end in last.items():
         producer_layer = layer - 1 if op in (QKV, LMHEAD) else layer
-        producer = last.get((PRODUCER[op], producer_layer))
+        producer = last.get((producers[op], producer_layer))
         if producer is not None:
             spans.setdefault(OP_NAMES[op], []).append(end - producer)
     return {name: sum(v) / len(v) / 1e3 for name, v in spans.items()}

@@ -11,14 +11,13 @@ from attn_gym.warpdrive import ProtocolError, RoleConfig
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
 from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
 from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
-    LAYER_TENSORS,
     QwenConfig,
-    QwenWeights,
     compare_logits,
     decode_step_ref,
     forward_tokens,
     load_qwen3_weights,
     make_decode_state,
+    random_weights,
     rms_norm,
     rope,
 )
@@ -226,31 +225,6 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits):
     assert runner.state.tolist() == [6, 0]  # one epoch per launch
 
 
-def random_weights(config: QwenConfig, seed: int = 0) -> QwenWeights:
-    """bf16 weights of ``config``'s shapes: N(0, 1/fan_in) projections, norms near 1."""
-    generator = torch.Generator(device="cuda").manual_seed(seed)
-    q, kv, d = config.num_q_heads, config.num_kv_heads, config.head_dim
-    h, inter = config.hidden_size, config.intermediate_size
-    shapes = {
-        "input_ln": (h,), "post_ln": (h,), "q_norm": (d,), "k_norm": (d,),
-        "q_proj": (q * d, h), "k_proj": (kv * d, h), "v_proj": (kv * d, h),
-        "o_proj": (h, q * d), "gate": (inter, h), "up": (inter, h), "down": (h, inter),
-    }  # fmt: skip
-    assert set(shapes) == set(LAYER_TENSORS)
-
-    def tensor(*shape, norm=False):
-        x = torch.randn(shape, device="cuda", generator=generator)
-        return (1 + 0.1 * x if norm else x * shape[-1] ** -0.5).bfloat16()
-
-    layers = config.num_layers
-    return QwenWeights(
-        embed=torch.randn(config.vocab_size, h, device="cuda", generator=generator).bfloat16(),
-        final_norm=tensor(h, norm=True),
-        config=config,
-        **{name: tensor(layers, *shape, norm=len(shape) == 1) for name, shape in shapes.items()},
-    )
-
-
 def test_odd_gqa_group_random_weights():
     """A GQA group of 3 (like Qwen3-14B's 5) serves one q head per attention row; its o_proj
     splits hold 6 heads, so the combine runs a full and a partial pass. No checkpoint needed."""
@@ -307,13 +281,14 @@ def test_globaltimer_trace(weights_0_6b, tmp_path):
     ctas = runner.max_ctas
     assert all(cta[row] == row % ctas for row in rows)  # the static [slot][cta] layout
     spans = mk_trace.phase_spans(session.ranges, runner.table)
-    assert set(spans) == set(mk.OP_NAMES) and all(v > 0 for v in spans.values())
-    assert set(mk_trace.input_waits(session.ranges, runner.table)) == set(mk.OP_NAMES)
+    ops = {mk.OP_NAMES[op] for op in runner.table[:, 0].tolist() if op >= 0}
+    assert set(spans) == ops and all(v > 0 for v in spans.values())
+    assert set(mk_trace.input_waits(session.ranges, runner.table)) == ops
     slices = read_slices(tmp_path / "step.pftrace")
     flows = [flow for item in slices for flow in item.flows_out]
     # Layer 0's QKV rows wait on nothing.
     assert len(flows) >= len(rows) - runner.op.qkv_rows // mk.ROWS
-    assert {item.name for item in slices if item.track == "compute"} >= set(mk.OP_NAMES)
+    assert {item.name for item in slices if item.track == "compute"} >= ops
 
 
 def test_trace_analysis_on_synthetic_rows():

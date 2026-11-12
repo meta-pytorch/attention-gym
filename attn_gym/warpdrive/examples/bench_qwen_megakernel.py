@@ -60,7 +60,7 @@ def prepare_fast_weights(
     return FastQwenWeights(
         weights,
         torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1),
-        torch.cat((weights.gate, weights.up), dim=1),
+        torch.cat((weights.gate, weights.up), dim=-2),  # MoE: per expert
         angles.cos().to(torch.bfloat16),
         angles.sin().to(torch.bfloat16),
         positions,
@@ -72,6 +72,23 @@ def baseline_linear(x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.T
     # Duplicating the row makes cuBLAS pick a tensor-core GEMM over its slow single-row GEMV;
     # only the first output row is used.
     return F.linear(x.expand(rows, -1).contiguous(), weight)[:1]
+
+
+def moe_mlp_fast(config, packed: FastQwenWeights, layer: int, norm: torch.Tensor) -> torch.Tensor:
+    """One token's routed MLP as batched matmuls over the top-k experts' gathered weights
+    (compile- and CUDA-graph-friendly; the gather copies those experts' weights)."""
+    weights = packed.weights
+    probs = F.softmax(F.linear(norm, weights.router[layer]), dim=-1, dtype=torch.float32)
+    weight, expert = probs.topk(config.experts_per_token, dim=-1)
+    if config.norm_topk_prob:
+        weight = weight / weight.sum(dim=-1, keepdim=True)
+    weight = weight.to(norm.dtype)[0]
+    expert = expert[0]
+    k = config.experts_per_token
+    gate_up = torch.bmm(packed.gate_up[layer][expert], norm.expand(k, -1)[..., None])[..., 0]
+    gate, up = gate_up.chunk(2, dim=-1)
+    y = torch.bmm(weights.down[layer][expert], (F.silu(gate) * up)[..., None])[..., 0]
+    return (y * weight[:, None]).sum(dim=0, keepdim=True)
 
 
 @torch.no_grad()
@@ -112,8 +129,12 @@ def decode_step_fast(
         ).reshape(1, q_heads * head_dim)
         x = x + baseline_linear(attention, weights.o_proj[layer], packed.gemm_rows)
         norm = rms_norm(x, weights.post_ln[layer], config.rms_eps)
-        gate, up = baseline_linear(norm, packed.gate_up[layer], packed.gemm_rows).chunk(2, dim=-1)
-        x = x + baseline_linear(F.silu(gate) * up, weights.down[layer], packed.gemm_rows)
+        if config.is_moe:
+            x = x + moe_mlp_fast(config, packed, layer, norm)
+        else:
+            gate_up = baseline_linear(norm, packed.gate_up[layer], packed.gemm_rows)
+            gate, up = gate_up.chunk(2, dim=-1)
+            x = x + baseline_linear(F.silu(gate) * up, weights.down[layer], packed.gemm_rows)
     x = rms_norm(x, weights.final_norm, config.rms_eps)
     return baseline_linear(x, weights.lm_head, packed.gemm_rows).reshape(-1).float()
 
@@ -203,8 +224,16 @@ def time_step(
 
 
 def bytes_per_step(weights: QwenWeights, ctx_len: int) -> int:
-    weight_bytes = sum(t.numel() * t.element_size() for t in weights.tensors().values())
+    """Logical bytes one decode step must read: every weight once (a MoE layer only its
+    top-k experts), the populated KV cache and the new KV row, and the fp32 logits."""
     config = weights.config
+    tensors = weights.tensors()
+    weight_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+    if config.is_moe:
+        experts = sum(
+            tensors[n].numel() * tensors[n].element_size() for n in ("gate", "up", "down")
+        )
+        weight_bytes -= experts * (1 - config.experts_per_token / config.num_experts)
     kv_bytes = 2 * config.num_layers * config.num_kv_heads * config.head_dim * (ctx_len + 2) * 2
     return weight_bytes + kv_bytes + config.vocab_size * 4
 
@@ -311,17 +340,19 @@ def main() -> None:
         report.setdefault("correctness", {})[str(ctx_len)] = {"reference": error, "fast": metrics}
         print(f"ctx={ctx_len} fast_correctness={json.dumps(metrics)}", flush=True)
         check_budget("fast", metrics)
-        variants = [
-            ("eager", eager, False),
-            ("eager_graph", eager, True),
-            ("fast_graph", fast, True),
-        ]
+        variants = [("eager", eager, False), ("fast_graph", fast, True)]
+        if not weights.config.is_moe:  # the MoE reference syncs to loop over its experts
+            variants.insert(1, ("eager_graph", eager, True))
         if args.profile:
             profiles = report.setdefault("profiles", {}).setdefault(str(ctx_len), {})
-            profiles["reference"] = profile_step(eager)
-            print(
-                f"ctx={ctx_len} reference_profile={json.dumps(profiles['reference'])}", flush=True
-            )
+            if weights.config.is_moe:  # profile_step captures a graph; the reference cannot
+                print(f"ctx={ctx_len} reference_profile skipped: the MoE reference syncs")
+            else:
+                profiles["reference"] = profile_step(eager)
+                print(
+                    f"ctx={ctx_len} reference_profile={json.dumps(profiles['reference'])}",
+                    flush=True,
+                )
         if not args.skip_compile:
             compiled = torch.compile(decode_step_fast, mode=args.compile_mode, fullgraph=True)
             compiled_step = partial(compiled, packed, token, pos, *layer_caches)

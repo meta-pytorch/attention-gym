@@ -56,6 +56,8 @@ def _label(words, deps, table_row: int) -> str:
             what = f"ATTN layer {layer} · kv head {a}, split {b}"
         case mk.OPROJ | mk.DOWN:
             what = f"{mk.OP_NAMES[kind]} layer {layer} · rows {a * mk.ROWS}.. · k split {b}"
+        case mk.ROUTER:
+            what = f"ROUTER layer {layer} · experts {a * mk.ROWS}-{a * mk.ROWS + mk.ROWS - 1}"
         case mk.GATEUP:
             what = f"GATEUP layer {layer} · tile {a}"
         case _:

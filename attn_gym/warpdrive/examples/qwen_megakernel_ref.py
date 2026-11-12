@@ -1,4 +1,4 @@
-"""Batch-one Qwen3 decode oracle with HF's bf16 rounding boundaries.
+"""Batch-one Qwen3 (dense and MoE) decode oracle with HF's bf16 rounding boundaries.
 
 Torch only; no CuTeDSL. Caches are (layer, kv_head, position, head_dim), keys stored after
 head RMSNorm and rotate-half RoPE. Positions are Python ints (torch.compile specializes on
@@ -15,7 +15,10 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class QwenConfig:
-    """A dense Qwen3 shape; the defaults are Qwen3-0.6B's."""
+    """A Qwen3 shape; the defaults are Qwen3-0.6B's. ``num_experts > 0`` makes every layer's MLP a
+    mixture of experts (Qwen3-MoE): ``experts_per_token`` of them, each ``moe_intermediate_size``
+    wide, chosen per token by a softmax router, with top-k weights renormalized when
+    ``norm_topk_prob``. ``intermediate_size`` is then unused."""
 
     hidden_size: int = 1024
     num_layers: int = 28
@@ -26,10 +29,32 @@ class QwenConfig:
     vocab_size: int = 151936
     rms_eps: float = 1e-6
     rope_theta: float = 1e6
+    num_experts: int = 0
+    experts_per_token: int = 0
+    moe_intermediate_size: int = 0
+    norm_topk_prob: bool = True
+
+    @property
+    def is_moe(self) -> bool:
+        return self.num_experts > 0
 
     @classmethod
     def from_hf(cls, config: dict) -> "QwenConfig":
-        """The shape of an HF ``config.json``."""
+        """The shape of an HF ``config.json`` (``qwen3`` or ``qwen3_moe``)."""
+        moe = {}
+        # transformers 5 renames num_experts to num_local_experts.
+        experts = config.get("num_experts") or config.get("num_local_experts")
+        if experts:
+            if config.get("decoder_sparse_step", 1) != 1 or config.get("mlp_only_layers"):
+                raise ValueError(
+                    "only Qwen3-MoE checkpoints with every layer sparse are supported"
+                )
+            moe = {
+                "num_experts": experts,
+                "experts_per_token": config["num_experts_per_tok"],
+                "moe_intermediate_size": config["moe_intermediate_size"],
+                "norm_topk_prob": config.get("norm_topk_prob", True),
+            }
         return cls(
             hidden_size=config["hidden_size"],
             num_layers=config["num_hidden_layers"],
@@ -39,11 +64,14 @@ class QwenConfig:
             intermediate_size=config["intermediate_size"],
             vocab_size=config["vocab_size"],
             rms_eps=config["rms_norm_eps"],
-            rope_theta=config["rope_theta"],
+            # transformers 5 saves it under rope_parameters.
+            rope_theta=config.get("rope_theta") or config["rope_parameters"]["rope_theta"],
+            **moe,
         )
 
 
-# QwenWeights' per-layer fields and their checkpoint names, model.layers.<i>.<name>.weight.
+# QwenWeights' per-layer fields and their checkpoint names, model.layers.<i>.<name>.weight. A MoE
+# checkpoint names the MLP's per expert (EXPERT_TENSORS, expert e) and adds the router (mlp.gate).
 LAYER_TENSORS = {
     "input_ln": "input_layernorm",
     "q_proj": "self_attn.q_proj",
@@ -57,11 +85,18 @@ LAYER_TENSORS = {
     "up": "mlp.up_proj",
     "down": "mlp.down_proj",
 }
+EXPERT_TENSORS = {
+    "gate": "mlp.experts.{e}.gate_proj",
+    "up": "mlp.experts.{e}.up_proj",
+    "down": "mlp.experts.{e}.down_proj",
+}
 
 
 @dataclass(frozen=True)
 class QwenWeights:
-    """Contiguous bf16 checkpoint tensors; layer tensors have a leading layer axis."""
+    """Contiguous bf16 checkpoint tensors; layer tensors have a leading layer axis. For a MoE
+    model ``gate``/``up``/``down`` have an expert axis after it and ``router`` is (layers, experts,
+    hidden)."""
 
     embed: torch.Tensor
     input_ln: torch.Tensor
@@ -77,6 +112,7 @@ class QwenWeights:
     down: torch.Tensor
     final_norm: torch.Tensor
     untied_lm_head: torch.Tensor | None = None  # None: the LM head is the embedding
+    router: torch.Tensor | None = None  # MoE only
     config: QwenConfig = QwenConfig()
 
     @property
@@ -113,16 +149,38 @@ def load_qwen3_weights(
         tensors.update(load_file(str(shard), device=str(device)))
     hf_config = json.loads((checkpoint / "config.json").read_text())
     config = QwenConfig.from_hf(hf_config)
+
     # Pop each layer's tensor as it is stacked: loading peaks near one model, not two.
-    stacked = {
-        name: torch.stack(
+    def stack(suffix: str) -> torch.Tensor:
+        return torch.stack(
             [
                 tensors.pop(f"model.layers.{layer}.{suffix}.weight")
                 for layer in range(config.num_layers)
             ]
         ).to(torch.bfloat16)
+
+    def stack_experts(suffix: str) -> torch.Tensor:
+        experts = range(config.num_experts)
+        return torch.stack(
+            [
+                torch.stack(
+                    [
+                        tensors.pop(f"model.layers.{layer}.{suffix.format(e=e)}.weight")
+                        for e in experts
+                    ]
+                )
+                for layer in range(config.num_layers)
+            ]
+        ).to(torch.bfloat16)
+
+    stacked = {
+        name: stack_experts(EXPERT_TENSORS[name])
+        if config.is_moe and name in EXPERT_TENSORS
+        else stack(suffix)
         for name, suffix in LAYER_TENSORS.items()
     }
+    if config.is_moe:
+        stacked["router"] = stack("mlp.gate")
     tied = hf_config.get("tie_word_embeddings", False)
     return QwenWeights(
         embed=tensors["model.embed_tokens.weight"].to(torch.bfloat16),
@@ -130,6 +188,38 @@ def load_qwen3_weights(
         untied_lm_head=None if tied else tensors["lm_head.weight"].to(torch.bfloat16),
         config=config,
         **stacked,
+    )
+
+
+def random_weights(config: QwenConfig, seed: int = 0, device="cuda") -> QwenWeights:
+    """bf16 weights of ``config``'s shapes: N(0, 1/fan_in) projections, norms near 1. MoE
+    configs get per-expert MLPs, a router and an untied LM head."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    q, kv, d = config.num_q_heads, config.num_kv_heads, config.head_dim
+    h, inter = config.hidden_size, config.intermediate_size
+    experts = (config.num_experts,) if config.is_moe else ()
+    if config.is_moe:
+        inter = config.moe_intermediate_size
+    shapes = {
+        "input_ln": (h,), "post_ln": (h,), "q_norm": (d,), "k_norm": (d,),
+        "q_proj": (q * d, h), "k_proj": (kv * d, h), "v_proj": (kv * d, h), "o_proj": (h, q * d),
+        "gate": (*experts, inter, h), "up": (*experts, inter, h), "down": (*experts, h, inter),
+    }  # fmt: skip
+    assert set(shapes) == set(LAYER_TENSORS)
+    if config.is_moe:
+        shapes["router"] = (config.num_experts, h)
+
+    def tensor(*shape, norm=False):
+        x = torch.randn(shape, device=device, generator=generator)
+        return (1 + 0.1 * x if norm else x * shape[-1] ** -0.5).bfloat16()
+
+    layers = config.num_layers
+    return QwenWeights(
+        embed=torch.randn(config.vocab_size, h, device=device, generator=generator).bfloat16(),
+        final_norm=tensor(h, norm=True),
+        untied_lm_head=tensor(config.vocab_size, h) if config.is_moe else None,
+        config=config,
+        **{name: tensor(layers, *shape, norm=len(shape) == 1) for name, shape in shapes.items()},
     )
 
 
@@ -143,6 +233,46 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
     acc = x.to(acc_dtype)
     normalized = acc * torch.rsqrt(acc.square().mean(-1, keepdim=True) + eps)
     return weight * normalized.to(x.dtype)
+
+
+def swiglu(x: torch.Tensor, gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor):
+    return F.linear(F.silu(F.linear(x, gate)) * F.linear(x, up), down)
+
+
+def mlp(
+    config: QwenConfig,
+    w: dict[str, torch.Tensor],
+    x: torch.Tensor,
+    experts: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The layer's MLP on (tokens, hidden) ``x`` with one layer's weights ``w``. A MoE layer
+    routes as HF's Qwen3MoeSparseMoeBlock: softmax in fp32, top-k (renormalized), weights cast to
+    ``x.dtype``, and expert outputs added in ascending expert order in ``x.dtype``. ``experts``
+    (tokens, k) replaces the top-k choice."""
+    if not config.is_moe:
+        return swiglu(x, w["gate"], w["up"], w["down"])
+    softmax_dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
+    probs = F.softmax(F.linear(x, w["router"]), dim=-1, dtype=softmax_dtype)
+    # A stable descending sort breaks ties toward the lower expert index, as the megakernel
+    # does; HF's topk leaves their order unspecified.
+    if experts is None:
+        weight, expert = probs.sort(dim=-1, descending=True, stable=True)
+        weight, expert = (
+            weight[:, : config.experts_per_token],
+            expert[:, : config.experts_per_token],
+        )
+    else:
+        expert = experts
+        weight = probs.gather(-1, experts)
+    if config.norm_topk_prob:
+        weight = weight / weight.sum(dim=-1, keepdim=True)
+    weight = weight.to(x.dtype)
+    out = torch.zeros_like(x)
+    for e in expert.unique().tolist():  # ascending
+        token, slot = (expert == e).nonzero(as_tuple=True)
+        y = swiglu(x[token], w["gate"][e], w["up"][e], w["down"][e])
+        out.index_add_(0, token, y * weight[token, slot, None])
+    return out
 
 
 def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
@@ -168,8 +298,14 @@ def forward_tokens(
     *,
     dtype: torch.dtype,
     query_chunk: int = 256,
+    experts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Prefill or decode; returns the last token's fp32 logits.
+
+    ``experts``: MoE only, (layers, tokens, experts_per_token) expert indices to use instead of
+    the router's top-k (their weights still come from this run's router). Near-tied router
+    logits make the top-k flip between implementations at bf16 noise; forcing one choice
+    compares the rest of the numerics.
 
     ``dtype`` is the activation dtype; weights are upcast to it a layer at a time (exactly,
     from bf16). Caches of that dtype give a fully upcast oracle; bf16 caches score one step on
@@ -184,7 +320,8 @@ def forward_tokens(
     group = config.num_q_heads // config.num_kv_heads  # q heads per kv head
     for layer in range(config.num_layers):
         # Upcast one layer at a time: an fp32 oracle of a 32B model fits beside its bf16 weights.
-        w = {name: getattr(weights, name)[layer].to(dtype) for name in LAYER_TENSORS}
+        names = [*LAYER_TENSORS, "router"] if config.is_moe else LAYER_TENSORS
+        w = {name: getattr(weights, name)[layer].to(dtype) for name in names}
         norm = rms_norm(x, w["input_ln"], config.rms_eps)
         q = F.linear(norm, w["q_proj"]).view(count, config.num_q_heads, config.head_dim)
         k = F.linear(norm, w["k_proj"]).view(count, config.num_kv_heads, config.head_dim)
@@ -209,8 +346,7 @@ def forward_tokens(
         attention = torch.cat(outputs, dim=1).transpose(0, 1).reshape(count, -1)
         x = x + F.linear(attention, w["o_proj"])
         norm = rms_norm(x, w["post_ln"], config.rms_eps)
-        mlp = F.silu(F.linear(norm, w["gate"])) * F.linear(norm, w["up"])
-        x = x + F.linear(mlp, w["down"])
+        x = x + mlp(config, w, norm, None if experts is None else experts[layer])
     x = rms_norm(x[-1:], weights.final_norm.to(dtype), config.rms_eps)
     return F.linear(x, weights.lm_head.to(dtype)).reshape(-1).float()
 
@@ -224,10 +360,11 @@ def decode_step_ref(
     v_cache: torch.Tensor,
     *,
     dtype: torch.dtype = torch.bfloat16,
+    experts: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """One decode step: writes K/V at ``pos`` in place (the caches must have room for it) and
-    returns fp32 logits."""
-    return forward_tokens(weights, token, pos, k_cache, v_cache, dtype=dtype)
+    returns fp32 logits. ``experts``: as for ``forward_tokens``."""
+    return forward_tokens(weights, token, pos, k_cache, v_cache, dtype=dtype, experts=experts)
 
 
 def prompt_tokens(weights: QwenWeights, ctx_len: int, seed: int) -> torch.Tensor:
