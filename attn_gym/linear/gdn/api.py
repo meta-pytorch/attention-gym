@@ -53,6 +53,11 @@ def chunk_gdn(
     reads the updated state. Chunking changes only the decomposition and floating-point order of
     that recurrence. FP16 and BF16 inputs use FP32 recurrence math and state.
 
+    Gates must be finite and nonpositive. Chunk backends accumulate gates in FP32 within each
+    64-token chunk, so the prefix sums must stay finite and keep later decay differences: avoid
+    isolated gates of magnitude ``1e5`` or larger among ordinary-sized gates. Gates are neither
+    clamped nor checked; see ``docs/linear.md`` for the measured error ranges.
+
     Args:
         q: Queries shaped ``[B, T, HK, K]``. ``HK`` may divide the value head count ``H``
             for grouped-head attention: each block of ``H // HK`` consecutive value heads
