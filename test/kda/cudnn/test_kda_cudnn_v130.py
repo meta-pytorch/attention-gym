@@ -10,7 +10,7 @@ from attn_gym.testing.kda import (
     make_kda_test_inputs,
 )
 
-pytest.importorskip("cutlass.experimental")
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
     reason="cuDNN KDA requires SM100 or SM103",
@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("scheme", ["uncut", "prep", "chain", "warmup"])
 def test_v130_plans_match_reference(monkeypatch, scheme):
     """Exercise every launch host with real state/gradients, not just the default selector."""
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.frost.drivers import kda as driver
 
     inputs = make_kda_test_inputs(128, heads=2, seed=827, normalize_qk=True, dtype=torch.bfloat16)
     packed = tuple(t[0] for t in inputs)
@@ -32,10 +32,10 @@ def test_v130_plans_match_reference(monkeypatch, scheme):
     pieces = 2 if scheme == "chain" else 0
     tiles = 2 if scheme == "prep" else 1
     monkeypatch.setattr(
-        driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(pieces, 2, tiles, num_sm)
+        driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(pieces, tiles, num_sm)
     )
     monkeypatch.setattr(
-        driver.BackwardPlan, "build", lambda *args: driver.BackwardPlan(pieces, 2, num_sm)
+        driver.BackwardPlan, "build", lambda *args: driver.BackwardPlan(pieces, num_sm)
     )
     split = scheme == "warmup"
     state = None if split else state
@@ -84,14 +84,14 @@ def test_v130_changing_shapes_reuses_only_static_configuration():
     """A prior launch must not freeze the next call's sequence/head geometry or scratch size,
     and repeating a shape must relaunch the compiled hosts instead of compiling again."""
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
-        kda_warmup_backward_f16,
-        kda_warmup_forward_f16,
+    from attn_gym.linear._delta_rule.frost.bundles import (
+        kda_warmup_backward,
+        kda_warmup_forward,
     )
 
     compile_fns = (
-        kda_warmup_forward_f16._compile_warmup_forward,
-        kda_warmup_backward_f16._compile_warmup_backward,
+        kda_warmup_forward._compile_warmup_forward,
+        kda_warmup_backward._compile_warmup_backward,
     )
     sizes = []
     # A head count/sequence-count change shares some kernel configs but changes work-table sizes.
@@ -130,15 +130,15 @@ def test_v130_token_count_across_scan_buckets_reuses_uncut_compiles(monkeypatch)
     """The uncut (``split=False``) hosts never launch the split-table scan, so the scan's
     per-warp row bucket, which grows with the token count, must not key their compiles."""
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
-    from attn_gym.linear._delta_rule.cudnn_fe import plan
-    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
+    from attn_gym.linear._delta_rule.frost.bundles import (
+        kda_warmup_backward,
+        kda_warmup_forward,
+    )
+    from attn_gym.linear._delta_rule.frost.drivers import kda as driver
+    from attn_gym.linear._delta_rule.frost.drivers import plan
+    from attn_gym.linear._delta_rule.frost.work_tables import (
         chunk_scratch_rows,
         scan_rows_per_warp,
-    )
-    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
-        kda_warmup_backward_f16,
-        kda_warmup_forward_f16,
     )
 
     # A small SM count makes tiny totals cross the scan thresholds (the split scan shrinks its
@@ -153,8 +153,8 @@ def test_v130_token_count_across_scan_buckets_reuses_uncut_compiles(monkeypatch)
     }
     assert buckets == {1, 2, 4}, buckets
     compile_fns = (
-        kda_warmup_forward_f16._compile_warmup_forward,
-        kda_warmup_backward_f16._compile_warmup_backward,
+        kda_warmup_forward._compile_warmup_forward,
+        kda_warmup_backward._compile_warmup_backward,
     )
 
     before = [fn.cache_info() for fn in compile_fns]
@@ -202,7 +202,7 @@ def test_v130_forward_plans_keep_delta_residual_in_fp32(monkeypatch, scheme, wit
     (or the residual) to the I/O dtype first loses the ``-2`` and gives 2.0 at tokens 16 and
     32 instead of 1.5. The chain's second piece re-enters through the summary kernel.
     """
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.frost.drivers import kda as driver
 
     tokens = 64
     q = torch.zeros(tokens, 1, 128, device="cuda", dtype=dtype)
@@ -220,7 +220,7 @@ def test_v130_forward_plans_keep_delta_residual_in_fp32(monkeypatch, scheme, wit
     pieces = 2 if scheme == "chain" else 0
     tiles = 2 if scheme in ("dv", "prep") else 1
     monkeypatch.setattr(
-        driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(pieces, 1, tiles, num_sm)
+        driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(pieces, tiles, num_sm)
     )
     monkeypatch.setattr(driver, "PREP_TILE_FRACTION", 1.0 if scheme == "prep" else 0.0)
     state = torch.zeros(1, 1, 128, 128, device="cuda") if with_state else None
@@ -236,7 +236,7 @@ def test_v130_forward_plans_keep_delta_residual_in_fp32(monkeypatch, scheme, wit
 def test_cudnn_compaction_keeps_empty_state_cotangents(monkeypatch, with_exit):
     """Compaction drops empty intervals from the work table (the count stays at 4 items) while
     their states pass through the forward and their exit cotangents through the backward."""
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.frost.drivers import kda as driver
 
     inputs = tuple(t[0] for t in make_kda_test_inputs(32, heads=2, seed=433, normalize_qk=True))
     state = torch.randn(4, 2, 128, 128, device="cuda") / 100
@@ -245,10 +245,8 @@ def test_cudnn_compaction_keeps_empty_state_cotangents(monkeypatch, with_exit):
     keep = torch.tensor([True, False, True, False], device="cuda")
     counts = []
     sms = torch.cuda.get_device_properties().multi_processor_count
-    monkeypatch.setattr(
-        driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(0, 1, 1, sms)
-    )
-    monkeypatch.setattr(driver.BackwardPlan, "build", lambda *args: driver.BackwardPlan(0, 1, sms))
+    monkeypatch.setattr(driver.ForwardPlan, "build", lambda *args: driver.ForwardPlan(0, 1, sms))
+    monkeypatch.setattr(driver.BackwardPlan, "build", lambda *args: driver.BackwardPlan(0, sms))
 
     def work_count(device):
         count = torch.empty(1, device=device, dtype=torch.int32)

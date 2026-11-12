@@ -10,7 +10,7 @@ from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_suppo
 from attn_gym._backends.cute.utils import initialized_cuda_device
 from attn_gym.linear._delta_rule.validation import resolve_scale
 
-from ..cudnn_fe.kda import kda_backward
+from ..frost.drivers.kda import kda_backward
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 

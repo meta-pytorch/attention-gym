@@ -1,4 +1,4 @@
-"""Private forward validation for the CuTeDSL 4.7 scalar-GDN kernel."""
+"""Private forward validation for the cuDNN scalar-GDN kernel."""
 
 from __future__ import annotations
 
@@ -7,10 +7,7 @@ from typing import Literal
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 GDN path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear import chunk_gdn
 from attn_gym.linear._delta_rule.cudnn.gdn_forward import run_forward
@@ -20,7 +17,7 @@ from attn_gym.testing.kda import assert_matches_low_precision_reference
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 GDN path requires SM100 or SM103",
+    reason="the cuDNN GDN path requires SM100 or SM103",
 )
 
 StateMode = Literal["none", "initial", "final", "initial_final"]

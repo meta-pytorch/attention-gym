@@ -6,14 +6,14 @@ Forward maps pack [B; A] for ``exit = entry @ A + B``; reverse maps pack [C; R] 
 ``d_entry = d_exit @ R + C``. Native state/operand rounding makes these approximate affine
 maps, not bitwise reconstruction of an ordinary unsharded cuDNN run. The v1.30 summary kernels
 run every sequence uncut, so the arithmetic is independent of sequence ownership and packed
-token count (:mod:`attn_gym.linear._delta_rule.cudnn_fe.summary`).
+token count (:mod:`attn_gym.linear._delta_rule.frost.drivers.summary`).
 """
 
 from __future__ import annotations
 
 import torch
 
-from ..cudnn_fe import summary
+from ..frost.drivers import summary
 from .forward import validate_available
 
 

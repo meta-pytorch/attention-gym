@@ -100,7 +100,7 @@ wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM
 portable Triton kernels on other supported architectures. The `K = V = 64` backward uses portable
 Triton on every architecture.
 
-The cuDNN chunk backend requires the optional `cudnn` dependencies and SM100/SM103,
+The cuDNN chunk backend requires the optional `linear` dependencies and SM100/SM103,
 FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
 gate without a lower bound and uses exact execution by default.
 
@@ -443,7 +443,8 @@ stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[n
 `chunk_kda(..., kernel_options={"backend": "cudnn"})` selects an opt-in SM100/SM103
 FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
-public CuTeDSL 4.7 primitives and has no cuDNN Frontend runtime dependency. Like the other
+warpdrive CuTeDSL kernels (CuTeDSL 4.6.2 or newer, the `[linear]` extra) and has no cuDNN Frontend
+runtime dependency. Like the other
 implementations, it returns `(output, final_state)`; request the latter with
 `output_final_state=True`. Dense no-state calls with complete 64-token chunks use the dense kernels
 and partial tails take the packed path with synthesized boundaries; packed/stateful calls pass
@@ -461,13 +462,13 @@ warmup window. Gates that never forget produce no cuts and reproduce the unsplit
 cuts are accepted the result stays within the low-precision error budget while exposing several
 times the parallel work. The threshold is a margin of bits past the output dtype's half-ulp, not an
 underflow; see the module docstring and `DEFAULT_LOG2_THRESHOLD` in
-`attn_gym/linear/_delta_rule/cudnn_fe/common/split_k.py`. `split_forward` affects only the
+`attn_gym/linear/_delta_rule/frost/work_tables.py`. `split_forward` affects only the
 forward recurrence: unless `split_backward` is also enabled, backward computes the exact unsplit
 recurrence's gradient rather than the derivative of the split forward. The implementation chooses
 the split count from the input geometry; no public split-size knob is exposed. Split schedules
 currently require a no-state call, so context parallelism never uses them. `paged_chunk_kda(..., kernel_options={"backend": "cudnn"})` uses the
 same unsplit forward while updating selected cache slots directly; paged execution never uses
-forgetting-horizon splitting. Install the `cudnn` extra to use this backend.
+forgetting-horizon splitting. Install the `linear` extra to use this backend.
 
 `kernel_options={"schedule": "persistent"}` is for CUDA graphs whose replays can carry far fewer
 tokens than the capacity they were captured for. The default static grid launches one CTA per

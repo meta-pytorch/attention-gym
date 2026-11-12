@@ -3,13 +3,10 @@ import math
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 KDA path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear._delta_rule.cudnn.forward import run_forward
-from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
+from attn_gym.linear._delta_rule.frost.work_tables import (
     WORK_ITEM_FIELDS,
     build_split_table,
     chunk_scratch_rows,
@@ -23,7 +20,7 @@ from attn_gym.testing.kda import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 KDA path requires SM100 or SM103",
+    reason="the cuDNN KDA path requires SM100 or SM103",
 )
 
 
@@ -125,40 +122,32 @@ def test_cudnn_forward_packed_tail_empty_and_deterministic(dtype: torch.dtype) -
     )
 
 
+def _split_buffers(tokens, heads, rows):
+    return {
+        "chunk_scratch": torch.empty(
+            chunk_scratch_rows(tokens, 1, 16), heads, dtype=torch.float32, device="cuda"
+        ),
+        "staging": torch.empty(rows, WORK_ITEM_FIELDS, dtype=torch.int32, device="cuda"),
+        "work_count": torch.empty(1, dtype=torch.int32, device="cuda"),
+    }
+
+
 def test_cudnn_split_table_rejects_misaligned_vector_gate_rows() -> None:
     tokens, heads, dim = 16, 2, 128
     gate = torch.empty(tokens, heads, dim + 1, device="cuda")[..., :dim]
     assert gate.data_ptr() % 16 == 0
     assert gate.stride(-1) == 1
-
     cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
-    work_items = torch.empty(16, WORK_ITEM_FIELDS, dtype=torch.int32, device="cuda")
-    item_scratch = torch.empty_like(work_items)
-    work_count = torch.empty(1, dtype=torch.int32, device="cuda")
-    chunk_scratch = torch.empty(
-        chunk_scratch_rows(tokens, 1, 16),
-        heads,
-        dtype=torch.float32,
-        device="cuda",
-    )
 
     with pytest.raises(ValueError, match="rows and head slices must be 16-byte aligned"):
         build_split_table(
             gate,
             cu_seqlens,
-            work_items,
-            work_count,
-            ideal_chunks=1,
+            **_split_buffers(tokens, heads, 16),
             n_tiles=heads,
+            ideal_chunks=1,
             num_sms=1,
             b_t=16,
-            chunk_scratch=chunk_scratch,
-            item_scratch=item_scratch,
-            log_gate=True,
-            scheduler_counter=None,
-            split=True,
-            opt_level=2,
-            stream=torch.cuda.current_stream().cuda_stream,
         )
 
 
@@ -166,44 +155,15 @@ def test_cudnn_split_table_rejects_invalid_geometry_and_capacity() -> None:
     tokens, heads, dim = 16, 2, 128
     gate = torch.zeros(tokens, heads, dim, device="cuda")
     cu_seqlens = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
-    work_count = torch.empty(1, dtype=torch.int32, device="cuda")
-    stream = torch.cuda.current_stream().cuda_stream
+    geometry = {"ideal_chunks": 1, "num_sms": 1, "b_t": 16}
 
-    with pytest.raises(ValueError, match="n_tiles must equal"):
+    with pytest.raises(ValueError, match="n_tiles must be sequences"):
         build_split_table(
-            gate,
-            cu_seqlens,
-            torch.empty(heads, WORK_ITEM_FIELDS, dtype=torch.int32, device="cuda"),
-            work_count,
-            n_tiles=heads - 1,
-            num_sms=1,
-            b_t=16,
-            scheduler_counter=None,
-            split=False,
-            opt_level=2,
-            stream=stream,
+            gate, cu_seqlens, **_split_buffers(tokens, heads, 16), n_tiles=heads - 1, **geometry
         )
-
-    work_items = torch.empty(1, WORK_ITEM_FIELDS, dtype=torch.int32, device="cuda")
-    with pytest.raises(ValueError, match="requires at least"):
+    with pytest.raises(ValueError, match="needs at least"):
         build_split_table(
-            gate,
-            cu_seqlens,
-            work_items,
-            work_count,
-            ideal_chunks=1,
-            n_tiles=heads,
-            num_sms=1,
-            b_t=16,
-            chunk_scratch=torch.empty(
-                chunk_scratch_rows(tokens, 1, 16), heads, dtype=torch.float32, device="cuda"
-            ),
-            item_scratch=torch.empty_like(work_items),
-            log_gate=True,
-            scheduler_counter=None,
-            split=True,
-            opt_level=2,
-            stream=stream,
+            gate, cu_seqlens, **_split_buffers(tokens, heads, 1), n_tiles=heads, **geometry
         )
 
 

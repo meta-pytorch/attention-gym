@@ -71,7 +71,7 @@ def configure_local_image(
             )
         )
     else:
-        # Tool tests also inspect vendored notices and the generated maintenance ledger.
+        # Without a wheel, tests import attn_gym from the mounted sources.
         configured = configured.add_local_dir(ROOT_PATH / "attn_gym", remote_path="/root/attn_gym")
     # tools/ also ships this runner, which Modal imports remotely as tools.modal_tests.
     # test_examples_layout checks README.md and docs/ against examples/, so ship them too.
@@ -89,7 +89,7 @@ def configure_local_image(
 
 if modal.is_local():
     image = configure_local_image(image, ["tests"])
-    cudnn_image = configure_local_image(cudnn_image.pip_install("pytest-xdist"), ["cudnn", "dev"])
+    cudnn_image = configure_local_image(cudnn_image.pip_install("pytest-xdist"), ["linear", "dev"])
 
 app = modal.App("attention-gym-modal-tests", image=image)
 
@@ -300,8 +300,8 @@ def run_pytest() -> tuple[int, str]:
     volumes={CACHE_VOLUME_PATH: CACHE_VOLUME},
 )
 def run_cudnn_pytest() -> tuple[int, str]:
-    """Run the CuTeDSL 4.7+ GDN/KDA cuDNN suites in their compatible environment."""
-    # The cuDNN image pins a different CuTeDSL, so it keeps a separate archive.
+    """Run the GDN/KDA cuDNN suites with the ``[linear]`` dependencies."""
+    # The [linear] image resolves its own CuTeDSL, not FA4's, so it keeps a separate archive.
     with persistent_compile_cache("cudnn"):
         return execute_pytest(
             ["test/gdn/cudnn", "test/kda/cudnn"],

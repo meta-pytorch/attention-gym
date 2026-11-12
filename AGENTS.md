@@ -8,7 +8,7 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
   [`docs/masks.md`](docs/masks.md) for the full list.
 - **Score mods** (`attn_gym/mods/`) — `score_mod` functions; see [`docs/mods.md`](docs/mods.md).
 - **Linear attention** (`attn_gym/linear/`) — KDA and GDN chunked/recurrent operators and short
-  convolution, with reference, Triton, CuTeDSL, and vendored cuDNN backends; see
+  convolution, with reference, Triton, CuTeDSL, and cuDNN-derived (frost) backends; see
   [`docs/linear.md`](docs/linear.md).
 - **Sparse attention** (`attn_gym/sparse/`) — `lightning_indexer` Top-K selection and
   `gather_attn`; see [`docs/sparse.md`](docs/sparse.md).
@@ -212,17 +212,6 @@ landing core synchronization/scheduling changes.
   seven standard configs; `compare BEFORE AFTER` gates on PTX and compiler identity and prints
   SASS diffs (`--strict-sass` also requires identical SASS). ptxas can assign registers
   differently from identical PTX, so a SASS-only diff with identical PTX is not a code change.
-
-## cuDNN Vendor Maintenance
-
-`tools/cudnn_fe/` contains the GDN/KDA vendor/import tools, mechanical restyle and audit,
-SASS comparison, CUTracer stress, benchmark gates, and the machine-readable fix ledger.
-The CPU audit tests (`test/test_cudnn_fe_tools_*.py`) guard edits to the vendored kernels;
-run them through this checkout's editable install, including from outside the repository root.
-Read `attn_gym/linear/_delta_rule/cudnn_fe/MAINTENANCE.md` for the upgrade procedure and
-`WORKLOG.md` beside it for evidence and replay notes. `tools/cudnn_fe/fixes.toml` is the ledger
-source; regenerate its documentation index with
-`python -m tools.cudnn_fe.verify_fixes --write-ledger`.
 
 ## Project-local Agent Skills
 

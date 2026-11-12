@@ -105,7 +105,7 @@ def _forward_backend() -> object:
     try:
         return importlib.import_module("attn_gym.linear._delta_rule.cudnn.gdn_forward")
     except ImportError as error:
-        raise ImportError("the cuDNN GDN backend requires CUDA and attn-gym[cudnn]") from error
+        raise ImportError("the cuDNN GDN backend requires CUDA and attn-gym[linear]") from error
 
 
 def _backward_backend() -> object:
@@ -113,7 +113,7 @@ def _backward_backend() -> object:
     try:
         return importlib.import_module("attn_gym.linear._delta_rule.cudnn.gdn_backward")
     except ImportError as error:
-        raise ImportError("the cuDNN GDN backend requires CUDA and attn-gym[cudnn]") from error
+        raise ImportError("the cuDNN GDN backend requires CUDA and attn-gym[linear]") from error
 
 
 def validate_cudnn_available(q: Tensor) -> None:

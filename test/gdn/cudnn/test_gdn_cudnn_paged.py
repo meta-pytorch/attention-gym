@@ -5,22 +5,18 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 GDN path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear import chunk_gdn, paged_chunk_gdn
-from attn_gym.linear._delta_rule.cudnn import gdn_forward as gdn_forward_adapter
-from attn_gym.linear._delta_rule.cudnn_fe import gdn as gdn_driver
-from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import ORDER_CAPACITY
-from attn_gym.linear._delta_rule.cudnn_fe.kernel import gdn_warmup_forward_f16
+from attn_gym.linear._delta_rule.frost.bundles import gdn_warmup_forward
+from attn_gym.linear._delta_rule.frost.drivers import gdn as gdn_driver
+from attn_gym.linear._delta_rule.frost.work_tables import ORDER_CAPACITY
 from attn_gym.linear.gdn.impl.cudnn_ops import chunk_gdn_cudnn_packed_fwd_paged_op
 from attn_gym.testing import make_gdn_test_inputs, strided_state_pool
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 GDN path requires SM100 or SM103",
+    reason="the cuDNN GDN path requires SM100 or SM103",
 )
 
 _CUDNN = {"backend": "cudnn"}
@@ -258,16 +254,15 @@ def _paged(inputs, pool, state_indices, cu_seqlens, has_initial_state=None):
 
 
 def test_cudnn_paged_runs_the_v130_work_table() -> None:
-    """The paged route compiles through the v1.30 warmup host, not a separate legacy kernel."""
-    assert not hasattr(gdn_forward_adapter, "kernel")
+    """The paged route compiles through the warmup forward bundle."""
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64, 32), key_heads=1, value_heads=2, seed=2
     )
     pool = torch.zeros(3, 2, 128, 128, device="cuda")
     state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
-    before = gdn_warmup_forward_f16._compile_warmup_forward.cache_info()
+    before = gdn_warmup_forward._compile_warmup_forward.cache_info()
     _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens)
-    after = gdn_warmup_forward_f16._compile_warmup_forward.cache_info()
+    after = gdn_warmup_forward._compile_warmup_forward.cache_info()
     assert after.hits + after.misses == before.hits + before.misses + 1
 
 

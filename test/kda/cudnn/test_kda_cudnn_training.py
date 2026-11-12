@@ -1,4 +1,4 @@
-"""Training integration for the CuTeDSL 4.7 KDA kernels."""
+"""Training integration for the cuDNN KDA kernels."""
 
 from __future__ import annotations
 
@@ -18,14 +18,11 @@ from attn_gym.testing.kda import (
     make_kda_test_inputs,
 )
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 KDA path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 KDA path requires SM100 or SM103",
+    reason="the cuDNN KDA path requires SM100 or SM103",
 )
 
 D = 128
@@ -683,7 +680,7 @@ def _split_forward_pair(
     Returns the inputs, both outputs, and the number of work items the split schedule emitted.
     """
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.frost.drivers import kda as driver
 
     inputs = make_kda_test_inputs(
         8192, seed=107, normalize_qk=True, sigmoid_beta=True, dtype=dtype, **gate
@@ -717,12 +714,12 @@ def test_cudnn_split_forward_places_no_cuts_when_the_gate_never_forgets(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_cudnn_split_forward_matches_reference_on_a_contracting_gate(monkeypatch, dtype) -> None:
     """Cuts land only where the gate has saturated, so the result stays within the budget."""
-    from attn_gym.linear._delta_rule.cudnn_fe import kda as driver
+    from attn_gym.linear._delta_rule.frost.drivers import kda as driver
 
     # Pin the uncut plan: the automatic d_v split also emits two work items per tile, which would
     # satisfy the count below even if the split option were ignored.
     sms = torch.cuda.get_device_properties().multi_processor_count
-    monkeypatch.setattr(driver.ForwardPlan, "build", lambda *_: driver.ForwardPlan(0, 1, 1, sms))
+    monkeypatch.setattr(driver.ForwardPlan, "build", lambda *_: driver.ForwardPlan(0, 1, sms))
     inputs, _, split, work_items = _split_forward_pair(
         monkeypatch, dtype, gate_scale=math.log(2.0)
     )
@@ -749,7 +746,7 @@ def test_cudnn_cpu_inputs_fail_before_dispatch() -> None:
 
 def test_cudnn_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> None:
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear._delta_rule.cudnn_fe import plan
+    from attn_gym.linear._delta_rule.frost.drivers import plan
     from attn_gym.linear.kda.impl import cudnn as backend
 
     local_backward = backend.chunk_cudnn_packed_local_bwd_op
@@ -991,7 +988,7 @@ def test_cudnn_backward_past_sort_capacity_runs_empty_work_items() -> None:
     nor touch its neighbours: the native stateful backward equals the compacted run over the
     nonempty sequences and empty sequences pass their state cotangent straight through.
     """
-    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import ORDER_CAPACITY
+    from attn_gym.linear._delta_rule.frost.work_tables import ORDER_CAPACITY
     from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_bwd_with_state_op
 
     heads = 2
@@ -1229,11 +1226,11 @@ def test_cudnn_tma_validation_routes_oversized_singleton_stride_to_int64() -> No
 
 
 def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
-    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
-        kda_bprop_f16,
-        kda_chain_forward_f16,
-        kda_recompute_f16,
-        kda_warmup_forward_f16,
+    from attn_gym.linear._delta_rule.frost.bundles import (
+        kda_chain_backward,
+        kda_chain_forward,
+        kda_warmup_backward,
+        kda_warmup_forward,
     )
 
     expected_inputs = _make_inputs(requires_grad=True, dtype=torch.float16)
@@ -1244,10 +1241,10 @@ def test_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
     expected_grads = torch.autograd.grad(expected, expected_inputs[:5], d_output)
     forced_calls = []
     for module in (
-        kda_warmup_forward_f16,
-        kda_chain_forward_f16,
-        kda_recompute_f16,
-        kda_bprop_f16,
+        kda_warmup_forward,
+        kda_chain_forward,
+        kda_warmup_backward,
+        kda_chain_backward,
     ):
 
         def force_wide(*tensors, name=module.__name__):

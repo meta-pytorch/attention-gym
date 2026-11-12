@@ -32,7 +32,7 @@ def runner(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
     return module
 
 
-@pytest.mark.parametrize("extras", [["tests"], ["cudnn", "dev"]])
+@pytest.mark.parametrize("extras", [["tests"], ["linear", "dev"]])
 def test_image_ships_runner_with_requested_dependencies(runner: ModuleType, extras: list[str]):
     """Keep runner regression tests mounted and the two dependency environments separate."""
     image = Mock()
@@ -43,7 +43,7 @@ def test_image_ships_runner_with_requested_dependencies(runner: ModuleType, extr
 
     assert runner.configure_local_image(image, extras) is image
 
-    # tools/ ships the runner itself plus the maintenance tests' data files.
+    # tools/ ships the runner itself.
     image.add_local_dir.assert_any_call(runner.ROOT_PATH / "tools", remote_path="/root/tools")
     image.add_local_dir.assert_any_call(
         runner.ROOT_PATH / "attn_gym", remote_path="/root/attn_gym"

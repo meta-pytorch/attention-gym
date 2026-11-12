@@ -9,10 +9,7 @@ import sys
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 GDN path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear import chunk_gdn as public_chunk_gdn
 from attn_gym.linear.gdn.impl.cudnn_ops import (
@@ -31,7 +28,7 @@ from attn_gym.testing.kda import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 GDN path requires SM100 or SM103",
+    reason="the cuDNN GDN path requires SM100 or SM103",
 )
 
 _CUDNN_KERNEL_OPTIONS = {"backend": "cudnn"}
@@ -724,7 +721,7 @@ def test_gdn_cudnn_split_schedules_reject_stateful_calls(option: str) -> None:
 
 def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]:
     """Run exact and split cuDNN GDN fwd+bwd on one long stream; record split work items."""
-    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+    from attn_gym.linear._delta_rule.frost.drivers import gdn as gdn_driver
 
     q, k, value, gate, beta, _state, _ = make_gdn_test_inputs(
         8192, gate_pattern=gate_pattern, seed=337
@@ -742,7 +739,7 @@ def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]
         return (output, *torch.autograd.grad(output, inputs, d_output))
 
     exact = run({"backend": "cudnn"})
-    monkeypatch.setattr(fe_gdn, "_work_count", recording_work_count)
+    monkeypatch.setattr(gdn_driver, "_work_count", recording_work_count)
     split = run({"backend": "cudnn", "split_forward": True, "split_backward": True})
     return (exact, split), [int(count.item()) for count in work_counts]
 
@@ -767,7 +764,7 @@ def test_gdn_cudnn_split_places_no_cuts_when_the_gate_never_forgets(monkeypatch)
 
 def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> None:
     """Empty cu_seqlens intervals change neither gradients nor the number of work items."""
-    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+    from attn_gym.linear._delta_rule.frost.drivers import gdn as gdn_driver
 
     q, k, value, gate, beta, _, compact = make_gdn_test_inputs(
         (65, 63), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=433
@@ -785,7 +782,7 @@ def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> No
         work_counts.append(torch.empty(1, dtype=torch.int32, device=device))
         return work_counts[-1]
 
-    monkeypatch.setattr(fe_gdn, "_work_count", recording_work_count)
+    monkeypatch.setattr(gdn_driver, "_work_count", recording_work_count)
     results = []
     for cu_seqlens in (compact, padded):
         inputs = tuple(t.detach().clone().requires_grad_() for t in (q, k, value, gate, beta))
@@ -799,7 +796,7 @@ def test_gdn_cudnn_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> No
     # count, so the compact and padded plans may differ, but neither emits empty-sequence work.
     real_items = 2 * value.shape[2]
     forward_tiles = [
-        fe_gdn.ForwardPlan.build(
+        gdn_driver.ForwardPlan.build(
             q.shape[1], cu_seqlens.numel() - 1, value.shape[2], value.shape[3], q.device
         ).tiles_per_head
         for cu_seqlens in (compact, padded)
@@ -837,15 +834,15 @@ def test_gdn_cudnn_changing_batch_shape_in_one_process_matches_default(split: bo
 def test_gdn_cudnn_token_count_across_scan_buckets_reuses_uncut_compiles(monkeypatch) -> None:
     """The uncut (``split=False``) hosts never launch the split-table scan, so the scan's
     per-warp row bucket, which grows with the token count, must not key their compiles."""
-    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
-    from attn_gym.linear._delta_rule.cudnn_fe import plan
-    from attn_gym.linear._delta_rule.cudnn_fe.common.split_k import (
+    from attn_gym.linear._delta_rule.frost.bundles import (
+        gdn_warmup_backward,
+        gdn_warmup_forward,
+    )
+    from attn_gym.linear._delta_rule.frost.drivers import gdn as gdn_driver
+    from attn_gym.linear._delta_rule.frost.drivers import plan
+    from attn_gym.linear._delta_rule.frost.work_tables import (
         chunk_scratch_rows,
         scan_rows_per_warp,
-    )
-    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
-        gdn_warmup_backward_f16,
-        gdn_warmup_forward_f16,
     )
 
     # A small SM count makes tiny totals cross the scan thresholds (the split scan shrinks its
@@ -853,13 +850,15 @@ def test_gdn_cudnn_token_count_across_scan_buckets_reuses_uncut_compiles(monkeyp
     num_sm, lengths_by_total = 2, ([65, 63], [257, 191], [513, 447])
     monkeypatch.setattr(plan, "_num_sm", lambda device: num_sm)
     buckets = {
-        scan_rows_per_warp(chunk_scratch_rows(sum(lengths), len(lengths), fe_gdn.B_T), 1, num_sm)
+        scan_rows_per_warp(
+            chunk_scratch_rows(sum(lengths), len(lengths), gdn_driver.B_T), 1, num_sm
+        )
         for lengths in lengths_by_total
     }
     assert buckets == {1, 2, 4}, buckets
     compile_fns = (
-        gdn_warmup_forward_f16._compile_warmup_forward,
-        gdn_warmup_backward_f16._compile_warmup_backward,
+        gdn_warmup_forward._compile_warmup_forward,
+        gdn_warmup_backward._compile_warmup_backward,
     )
 
     before = [fn.cache_info() for fn in compile_fns]
@@ -889,15 +888,15 @@ def test_gdn_cudnn_token_count_across_scan_buckets_reuses_uncut_compiles(monkeyp
 def test_gdn_cudnn_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
     """A long stream on few tiles runs as an exact piece chain in both directions; it must agree
     with the uncut plan on output, final state, and every gradient, including the state ones."""
-    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+    from attn_gym.linear._delta_rule.frost.drivers import gdn as gdn_driver
 
     q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
         24576, key_heads=16, value_heads=48, seed=449
     )
     tokens, heads = q.shape[1], value.shape[2]
-    if not fe_gdn.ForwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain:
+    if not gdn_driver.ForwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain:
         pytest.skip("this device has too many (sequence, head) tiles per SM to chain")
-    assert fe_gdn.BackwardPlan.build(tokens, 1, heads, q.device).chain
+    assert gdn_driver.BackwardPlan.build(tokens, 1, heads, q.device).chain
     inputs = (q, k, value, gate, beta, state)
     cotangents = (torch.randn_like(value), torch.randn_like(state))
 
@@ -912,8 +911,8 @@ def test_gdn_cudnn_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
         return (*output, *torch.autograd.grad(output, leaves, cotangents))
 
     chain = run()
-    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 1 << 40)
-    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 1 << 40)
+    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 1 << 40)
+    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 1 << 40)
     uncut = run()
     for actual, expected in zip(chain, uncut, strict=True):
         assert actual.isfinite().all()

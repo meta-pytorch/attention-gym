@@ -29,7 +29,7 @@ pytestmark = pytest.mark.skipif(
 
 def _cudnn_available() -> bool:
     try:
-        import cutlass.experimental  # noqa: F401
+        import cutlass.cute  # noqa: F401
     except ImportError:
         return False
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
@@ -37,7 +37,7 @@ def _cudnn_available() -> bool:
 
 _CUDNN_SKIP = pytest.mark.skipif(
     not _cudnn_available(),
-    reason="the cuDNN backend requires nvidia-cutlass-dsl>=4.7 on SM100/SM103",
+    reason="the cuDNN backend requires CuTeDSL on SM100/SM103",
 )
 # Documented limitations: only the contract assertions may fail, and they must keep failing.
 _FP16_STATE_RANGE = pytest.mark.xfail(

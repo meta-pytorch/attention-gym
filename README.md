@@ -99,5 +99,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 
 ## ⚖️ License
 
-Attention Gym-authored code is released under the BSD 3-Clause License. Vendored third-party
-components retain the licenses and notices included alongside their source.
+Attention Gym-authored code is released under the BSD 3-Clause License. Code derived from
+third-party projects retains the licenses and notices included alongside its source, such as the
+cuDNN-frontend-derived kernels described in
+[`attn_gym/linear/_delta_rule/frost/LICENSING.md`](attn_gym/linear/_delta_rule/frost/LICENSING.md).

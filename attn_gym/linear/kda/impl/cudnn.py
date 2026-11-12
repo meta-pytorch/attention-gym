@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Autograd integration for the experimental CuTeDSL 4.7 KDA kernels."""
+"""Autograd integration for the cuDNN KDA kernels."""
 
 from __future__ import annotations
 
