@@ -1304,8 +1304,10 @@ def _keep_words(mapping, index, space, state):
 
 
 def _decode(stream, index, problem, state):
-    """``(words, state)`` of ``index``: decoded for a valid index, zeros (and ``state``) past the
-    end. Only a mapping with ``decodes_any_index`` is evaluated unconditionally (no branch)."""
+    """``(words, state)`` of ``index``. A tile-grid stream takes the prologue's item words, and
+    ``TilePersistent`` those words with its axis coordinate replaced by ``index``. Any other
+    stream decodes a valid index and returns zeros (and ``state``) past the end; only a mapping
+    with ``decodes_any_index`` is evaluated unconditionally (no branch)."""
     mapping = stream.mapping
     if _tile_grid(stream):
         return problem.first_words, state
@@ -1360,14 +1362,12 @@ def _local_item(stream, index, problem, state):
 def _local_start(stream, first, problem):
     """``(problem, index, words, state)`` a local-mode role starts with, from the unit's first
     index. The readiness hook runs before the limit read, ``start`` and any decode; the returned
-    problem carries the limited total. A tile-grid stream takes the prologue's words. The cursor
-    and ``single_item`` share this, so a raw role sees what a managed role would."""
+    problem carries the limited total. The cursor and ``single_item`` share this, so a raw role
+    sees what a managed role would."""
     if stream.ready is not None:
         stream.ready.wait()
     problem = problem._limited()
     state = _start(stream.mapping, problem.space)
-    if _tile_grid(stream) or _tile_persistent(stream):
-        return problem, first, _decode(stream, first, problem, state)[0], state
     if _flat_raster(stream):
         words = _unsigned_raster_words(stream.mapping, first, problem.space)
         return problem, first, words, state
