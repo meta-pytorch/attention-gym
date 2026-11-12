@@ -21,6 +21,7 @@ from typing import Literal
 import torch
 
 from attn_gym._backends.autotune import should_autotune
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
@@ -47,7 +48,6 @@ from attn_gym.linear.types import (
 )
 from attn_gym.types import validate_kernel_options
 
-_CHUNK_SIZE = 64
 _DECODE_GATE_TRANSFORMS = {
     "bounded": True,
     "softplus": False,
@@ -288,25 +288,11 @@ def paged_chunk_kda(
         if options.backend != "fused":
             raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
         num_slots = state_cache.shape[0]
-        for name, tensor, expected_dtype, expected_shape in zip(
-            ("q", "k", "v", "gate", "beta"),
-            replay_state[:-1],
-            (
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.bfloat16,
-                torch.float32,
-                torch.float32,
-            ),
-            (
-                (num_slots, _CHUNK_SIZE, *q.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *k.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *v.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *gate.shape[2:]),
-                (num_slots, _CHUNK_SIZE, *beta.shape[2:]),
-            ),
-            strict=True,
+        layout = ReplayState.slot_layout(q.shape[2], q.shape[3], value_dim=v.shape[3])
+        for name, tensor, (slot_shape, expected_dtype) in zip(
+            ReplayState._fields[:-1], replay_state[:-1], layout[:-1], strict=True
         ):
+            expected_shape = (num_slots, *slot_shape)
             if tensor.shape != expected_shape:
                 raise ValueError(
                     f"replay_state {name} tensor must have shape {expected_shape}, "
@@ -325,12 +311,13 @@ def paged_chunk_kda(
                 raise ValueError(f"replay_state {name} tensor must have dense per-token rows")
             if num_slots > 1 and tensor.stride(0) < _CHUNK_SIZE * expected_stride:
                 raise ValueError(f"replay_state {name} tensor slots must not overlap")
-        if replay_state.count.shape not in ((num_slots,), (num_slots, 1)):
+        count_shape, count_dtype = layout[-1]
+        if replay_state.count.shape not in ((num_slots,), (num_slots, *count_shape)):
             raise ValueError(
                 f"replay_state count tensor must have shape ({num_slots},) or "
                 f"({num_slots}, 1), got {tuple(replay_state.count.shape)}"
             )
-        if replay_state.count.dtype != torch.int32 or replay_state.count.device != q.device:
+        if replay_state.count.dtype != count_dtype or replay_state.count.device != q.device:
             raise TypeError("replay_state count tensor must be int32 on the input device")
         if num_slots > 1 and replay_state.count.stride(0) == 0:
             raise ValueError("replay_state count tensor slots must not overlap")

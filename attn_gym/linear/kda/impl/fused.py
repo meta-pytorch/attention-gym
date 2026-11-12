@@ -11,6 +11,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
     ScheduleRequest,
     prepare_ragged_chunk_metadata,
 )
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear.kda.ops import (
@@ -29,7 +30,6 @@ from attn_gym.linear.kda.ops import (
 )
 from attn_gym.linear.types import ReplayState
 
-_CHUNK_SIZE = 64
 _HEAD_DIM = 128
 
 

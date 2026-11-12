@@ -422,6 +422,24 @@ training, so decode drifts from training numerics.
 replays the current partial chunk with `chunk_kda` from the last FP32 boundary state, which
 makes decode output bitwise-identical to training.
 
+For replay-backed `paged_chunk_kda`, a serving engine can plan its pool before allocating
+device memory. `ReplayState.slot_layout(num_heads, head_dim)` returns the per-slot shape and
+dtype of each cache in constructor order. To initialize empty slots, only the counts need to be zero:
+
+```python
+import torch
+from attn_gym.linear import ReplayState
+
+layout = ReplayState.slot_layout(local_num_heads, head_dim)
+replay_state = ReplayState(
+    *(torch.empty((num_slots, *shape), dtype=dtype, device=device) for shape, dtype in layout)
+)
+replay_state.count.zero_()
+```
+
+The current fused KDA kernel requires key and value dimensions of 128. A pool may pad the
+stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[num_slots]`.
+
 `chunk_kda(..., kernel_options={"backend": "cudnn"})` selects an opt-in SM100/SM103
 FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses

@@ -1554,9 +1554,13 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
     expected[padding] = 0
     num_slots = max(slots) + 1
     state_cache = torch.randn(num_slots, 2, 128, 128, device="cuda")
-    replay_state = tuple(
-        tensor.new_zeros((num_slots, 64, *tensor.shape[2:])) for tensor in (q, k, v, gate, beta)
-    ) + (torch.zeros(num_slots, device=q.device, dtype=torch.int32),)
+    layout = ReplayState.slot_layout(q.shape[2], q.shape[3])
+    replay_state = ReplayState(
+        *(
+            torch.zeros((num_slots, *shape), device=q.device, dtype=dtype)
+            for shape, dtype in layout
+        )
+    )
     for cache in replay_state[1:3]:
         cache.normal_()
     replay_state[3].uniform_(-1.0, 0.0)
@@ -1599,7 +1603,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
     completed_tokens = total_tokens // 64 * 64
     active_slots = state_indices[state_indices > 0].long()
     assert torch.equal(
-        replay_state[-1][active_slots],
+        replay_state.count[active_slots, 0],
         replay_state[-1].new_full((active_slots.numel(),), total_tokens % 64),
     )
     if completed_tokens:

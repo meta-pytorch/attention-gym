@@ -20,10 +20,11 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
+from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
 
 # Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as
 # compile-time constants even in runtime argument slots; cast such sizes with ``int()``.
-_CHUNK_SIZE = tl.constexpr(64)
+_CHUNK_SIZE = tl.constexpr(DEFAULT_CHUNK_SIZE)
 
 
 def _int64_offset_heuristic(*tensor_names: str):
