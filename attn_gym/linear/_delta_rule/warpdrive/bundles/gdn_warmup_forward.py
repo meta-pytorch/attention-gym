@@ -105,6 +105,7 @@ def warmup_forward_host(
     work_tables.launch_work_table(
         gdn_prefill.B_T,
         cutlass.Int32(gate.shape[1]) * cutlass.Int32(tiles_per_head),
+        cutlass.Int32(gate.shape[0]),
         cu_seqlens,
         item_scratch,
         work_count,

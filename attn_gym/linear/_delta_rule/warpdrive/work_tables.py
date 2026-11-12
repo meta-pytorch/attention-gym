@@ -44,6 +44,11 @@ saturate on both sides of the cut, so no state crosses it:
    Thread 0 emits every saturating cut into the staging table. Emission order is the atomic
    counter's, so the staged rows are a set; the order phase fixes their order.
 
+Every prologue kernel that reads ``cu_seqlens`` (the split plan, the work table, the chain
+prologue and the GDN T-pass row table) first checks it on the device
+(:func:`check_packed_offsets`). Each warpdrive call starts with one of them, so invalid offsets
+abort the call before any kernel reads through them.
+
 The order phase (:func:`order_body`, launched by :func:`launch_work_table` or the chain
 prologue) bitonic-sorts the rows into ``work_items``, longest ``[compute_start, compute_end)``
 first, so the claim scheduler runs LPT, and zeroes the scheduler counters. Without a split it
@@ -60,6 +65,9 @@ import cutlass
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.ffi import ffi, mangle
 
 from attn_gym.warpdrive.cache import (
     compile_tvm_ffi,
@@ -267,6 +275,62 @@ def cu_at(cu_seqlens, i):
 def chunks_of(b_t: cutlass.Constexpr[int], cu_seqlens, b):
     """Chunks of sequence ``b``."""
     return cute.ceil_div(cu_at(cu_seqlens, b + 1) - cu_at(cu_seqlens, b), b_t)
+
+
+def _string_constant(text: str) -> ir.Value:
+    """Pointer to ``text`` as a NUL-terminated constant of the enclosing ``gpu.module``."""
+    module = ir.InsertionPoint.current.block.owner
+    while module.name != "gpu.module":
+        module = module.parent
+    data = text + "\0"
+    symbol = "wd_str_" + mangle(text)
+    if symbol not in ir.SymbolTable(module.operation):
+        with ir.InsertionPoint(module.regions[0].blocks[0]):
+            llvm.GlobalOp(
+                sym_name=symbol,
+                global_type=ir.Type.parse(f"!llvm.array<{len(data)} x i8>"),
+                linkage=ir.Attribute.parse("#llvm.linkage<internal>"),
+                constant=True,
+                value=ir.StringAttr.get(data),
+            )
+    return llvm.AddressOfOp(llvm.PointerType.get(), symbol).result
+
+
+def assert_fail(message: str, function: str) -> None:
+    """CUDA's failed ``assert``: print ``message`` to stderr and abort the context with
+    ``CUDA_ERROR_ASSERT``. CuTeDSL drops its own device asserts unless the whole module is
+    compiled with assertions enabled, so this calls the driver's ``__assertfail`` directly."""
+    ptr = llvm.PointerType.get()
+    fail = ffi(name="__assertfail", params_types=[ptr, ptr, Int32, ptr, Int64], inline=False)
+    fail(
+        _string_constant(message),
+        _string_constant(__name__),
+        Int32(0),
+        _string_constant(function),
+        Int64(1),
+    )
+
+
+@cute.jit
+def check_packed_offsets(cu_seqlens, tokens: Int32, tidx, n_threads: cutlass.Constexpr[int]):
+    """Abort the launch (``invalid packed cu_seqlens``) unless ``cu_seqlens`` starts at 0, never
+    decreases and ends within ``tokens``. Every thread of the CTA calls it; the closing barrier
+    keeps any of them from addressing through the offsets before all of them passed. Each
+    warpdrive call starts with a prologue kernel that runs it (the native KDA summaries instead
+    run the same check in their Triton work selector), so no later launch of the call reads
+    ``q``/``k``/``v`` through invalid offsets."""
+    n_batch = Int32(cu_seqlens.shape[0]) - Int32(1)
+    for b in cutlass.range(tidx, n_batch, n_threads, unroll=1):
+        begin = cu_at(cu_seqlens, b)
+        end = cu_at(cu_seqlens, b + Int32(1))
+        invalid = begin > end
+        if b == Int32(0):
+            invalid = invalid or begin != Int32(0)
+        if b == n_batch - Int32(1):
+            invalid = invalid or end > tokens
+        if invalid:
+            assert_fail("invalid packed cu_seqlens", "check_packed_offsets")
+    cute.arch.barrier()
 
 
 @cute.jit
@@ -567,15 +631,18 @@ def split_plan_kernel(
     n_tiles: Int32,
     ideal_chunks: Int32,
     batch_size: Int32,
+    tokens: Int32,
     mCuSeqlens: cute.Tensor,
     mChunkVals: cute.Tensor,
     mCount: cute.Tensor,
 ):
-    """One CTA: settle the batch-wide span once, leave it in the chunk scratch's last row (-1
-    when no tile of the batch admits a cut) and zero the item count."""
+    """One CTA: check the offsets against ``tokens``, settle the batch-wide span once, leave it in
+    the chunk scratch's last row (-1 when no tile of the batch admits a cut) and zero the item
+    count."""
     cute.arch.griddepcontrol_wait()
     cute.arch.griddepcontrol_launch_dependents()
     tidx = Int32(cute.arch.thread_idx()[0])
+    check_packed_offsets(mCuSeqlens, tokens, tidx, PLAN_THREADS)
     sCut = SmemAllocator().allocate_tensor(Int32, cute.make_layout(1), 8)
     if tidx == 0:
         sCut[0] = Int32(0)
@@ -1099,6 +1166,7 @@ def launch_split_table(
         n_tiles,
         ideal_chunks,
         batch_size,
+        Int32(gate.shape[0]),
         cu_seqlens,
         chunk_scratch,
         work_count,
@@ -1575,6 +1643,7 @@ def work_table_kernel(
     num_ctas: cutlass.Constexpr[int],
     rows_b_t: cutlass.Constexpr[int],
     n_heads_out: Int32,
+    tokens: Int32,
     cu_seqlens: cute.Tensor,
     staging: cute.Tensor | None,
     work_count: cute.Tensor,
@@ -1585,11 +1654,13 @@ def work_table_kernel(
     rows: cute.Tensor | None,
     row_count: cute.Tensor | None,
 ):
-    """Block 0 orders the table (:func:`order_body`); block 1, when ``rows`` is bound, builds
-    the chunk row table of ``rows_b_t``-token chunks on its first warp."""
+    """Every block checks the offsets against ``tokens``; block 0 then orders the table
+    (:func:`order_body`), block 1 (bound ``rows``) builds the chunk row table of
+    ``rows_b_t``-token chunks on its first warp."""
     cute.arch.griddepcontrol_wait()
     cute.arch.griddepcontrol_launch_dependents()
     tidx = Int32(cute.arch.thread_idx()[0])
+    check_packed_offsets(cu_seqlens, tokens, tidx, ORDER_THREADS)
     n_batch = Int32(cu_seqlens.shape[0]) - Int32(1)
     if Int32(cute.arch.block_idx()[0]) == Int32(0):
         sKey, sIdx, sSpread = order_storage()
@@ -1621,6 +1692,7 @@ def work_table_kernel(
 def launch_work_table(
     b_t: cutlass.Constexpr[int],
     n_heads_out: Int32,
+    tokens: Int32,
     cu_seqlens: cute.Tensor,
     staging: cute.Tensor | None,
     work_count: cute.Tensor,
@@ -1635,7 +1707,8 @@ def launch_work_table(
     row_count: cute.Tensor | None = None,
     rows_b_t: cutlass.Constexpr[int] = 0,
 ) -> None:
-    """The main kernels' table prologue: order ``staging`` (the split rows; ``None`` for the
+    """The main kernels' table prologue: check ``cu_seqlens`` against the ``tokens`` packed
+    tokens (:func:`check_packed_offsets`), order ``staging`` (the split rows; ``None`` for the
     uncut table from ``cu_seqlens``) into ``work_items`` / ``work_count`` for ``n_heads_out``
     tile heads, zero ``scheduler``, and optionally build a chunk row table. Callable from a
     launch bundle's ``@cute.jit`` host; the next launch waits on it through PDL."""
@@ -1645,6 +1718,7 @@ def launch_work_table(
         num_ctas,
         rows_b_t,
         n_heads_out,
+        tokens,
         cu_seqlens,
         staging,
         work_count,
@@ -1777,11 +1851,23 @@ def compile_work_table(
 
     @cute.jit
     def entry(
-        n_heads_out, cu, staging, count, items, sched, routes, seeds, rows, row_count, stream
+        n_heads_out,
+        tokens,
+        cu,
+        staging,
+        count,
+        items,
+        sched,
+        routes,
+        seeds,
+        rows,
+        row_count,
+        stream,
     ):
         launch_work_table(
             b_t,
             n_heads_out,
+            tokens,
             cu,
             staging,
             count,
@@ -1800,6 +1886,7 @@ def compile_work_table(
     seqs = sym()
     return compile_tvm_ffi(
         entry,
+        Int32(0),
         Int32(0),
         _int32_table(sym()),
         _int32_table(sym(), WORK_ITEM_FIELDS) if staged else None,
@@ -1833,10 +1920,12 @@ def build_work_table(
     rows: torch.Tensor | None = None,
     row_count: torch.Tensor | None = None,
     rows_b_t: int = 0,
+    tokens: int = INT32_MAX,
     use_int64_offsets: bool = False,
 ) -> None:
     """Run :func:`launch_work_table` standalone. With ``staging`` the split rows (``work_count``
-    holds their count) are ordered; without it the uncut table is built from ``cu_seqlens``."""
+    holds their count) are ordered; without it the uncut table is built from ``cu_seqlens``.
+    ``tokens`` bounds ``cu_seqlens[-1]``; the default bounds nothing."""
     if (state_indices is None) != (has_initial_state is None):
         raise ValueError("paged routing needs both state_indices and has_initial_state")
     if (rows is None) != (rows_b_t == 0) or (rows is None) != (row_count is None):
@@ -1861,6 +1950,7 @@ def build_work_table(
     )
     fn(
         n_heads_out,
+        tokens,
         cu_seqlens,
         staging,
         work_count,

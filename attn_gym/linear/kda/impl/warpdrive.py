@@ -62,7 +62,6 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         beta: torch.Tensor,
         initial_state: torch.Tensor | None,
         cu_seqlens: torch.Tensor,
-        chunk_offsets: torch.Tensor,
         scale: float,
         split_backward: bool,
         split_forward: bool,
@@ -82,7 +81,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
             output = chunk_warpdrive_packed_fwd_with_initial_state_op(
                 q, k, value, gate, beta, initial_state, cu_seqlens, scale
             )
-        ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens, chunk_offsets)
+        ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
         ctx.set_materialize_grads(False)
         if output_final_state:
             return output, final_state
@@ -91,7 +90,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, d_output: torch.Tensor | None, d_final_state: torch.Tensor | None = None):
-        q, k, value, gate, beta, initial_state, cu_seqlens, chunk_offsets = ctx.saved_tensors
+        q, k, value, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
         d_output = normalize_output_grad(d_output, value)
         if initial_state is None:
             dq, dk, dv, d_gate, d_beta = chunk_warpdrive_packed_local_bwd_op(
@@ -100,6 +99,10 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
             d_initial_state = None
         else:
             beta = _compact_beta(beta)
+            # The fused stateful backward chunks each subsequence on its own 64-token grid.
+            chunk_offsets = prepare_ragged_chunk_metadata(
+                cu_seqlens, q.shape[1], _CHUNK_SIZE
+            ).chunk_offsets
             cumulative_gate = _plain_gate_scan_op(gate, cu_seqlens, chunk_offsets, False)
             dq, dk, dv, d_cumulative, d_beta, d_initial_state = (
                 chunk_bwd_recompute_factors_with_state_grad_op(
@@ -122,7 +125,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
             d_gate = _plain_gate_scan_op(
                 d_cumulative.contiguous(), cu_seqlens, chunk_offsets, True
             )
-        return dq, dk, dv, d_gate, d_beta, d_initial_state, None, None, None, None, None, None
+        return dq, dk, dv, d_gate, d_beta, d_initial_state, None, None, None, None, None
 
 
 def validate_warpdrive_constraints(
@@ -194,8 +197,6 @@ def chunk_forward(
             device=q.device,
         )
     validate_warpdrive_constraints(q, k, value, gate, beta, initial_state, cu_seqlens)
-    # The fused stateful backward chunks each subsequence on its own 64-token grid.
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], _CHUNK_SIZE)
     result = ChunkKdaWarpdrive.apply(
         q,
         k,
@@ -203,8 +204,7 @@ def chunk_forward(
         gate,
         beta,
         initial_state,
-        metadata.cu_seqlens,
-        metadata.chunk_offsets,
+        cu_seqlens,
         scale,
         split_backward,
         split_forward,

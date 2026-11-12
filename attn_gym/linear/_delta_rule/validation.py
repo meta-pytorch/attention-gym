@@ -81,6 +81,20 @@ def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str)
         raise RuntimeError(message)
 
 
+def validate_packed_offsets_tensor(cu_seqlens: torch.Tensor, device) -> None:
+    """Check that packed offsets are an int32 ``[N + 1]`` vector on ``device``. Their values (a
+    zero start, nondecreasing, an end within the tokens) are checked on the device by the first
+    kernel that reads them (the warpdrive prologues, ``invalid packed cu_seqlens``)."""
+    if (
+        cu_seqlens.ndim != 1
+        or cu_seqlens.shape[0] < 2
+        or cu_seqlens.dtype != torch.int32
+        or not cu_seqlens.is_cuda
+        or cu_seqlens.device != device
+    ):
+        raise TypeError("cu_seqlens must be a contiguous int32 vector on q.device")
+
+
 @functools.cache
 def warn_cudnn_backend_renamed() -> None:
     """Warn once per process that ``backend="cudnn"`` is the deprecated name of ``"warpdrive"``."""
@@ -237,5 +251,6 @@ __all__ = [
     "validate_decode_inputs",
     "validate_delta_rule_inputs",
     "validate_has_initial_state",
+    "validate_packed_offsets_tensor",
     "validate_paged_state",
 ]

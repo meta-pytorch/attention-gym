@@ -24,7 +24,8 @@ and columns.
 
 The row table ``rows[r] = (chunk, batch, batch_start, batch_end)`` lists every valid chunk in
 order and ``row_count[0]`` counts them; the recompute and backward summary read both. A one-warp
-kernel builds them before the main launch.
+kernel checks ``cu_seqlens`` (``work_tables.check_packed_offsets``) and builds them before the
+main launch.
 
 Work: tiles ``t = r * heads + head`` run in pairs ``(2p, 2p + 1)``: one ``M = N = 128`` KK GEMM
 ``[K0; K1] @ [K0; K1]^T`` per pair, whose diagonal blocks are the two members' ``K K^T``.
@@ -109,7 +110,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
-from .work_tables import emit_chunk_rows
+from .work_tables import check_packed_offsets, emit_chunk_rows
 
 B_T = 64
 KEY_DIMS = (64, 128)
@@ -699,7 +700,7 @@ class GdnTinv(WarpSpecialized):
             cpasync.CopyBulkTensorTileS2GOp(), mTinv, box_layout, (B_T, B_T)
         )
         if cutlass.const_expr(emit_row_table):
-            emit_rows(cu_seqlens, rows, row_count).launch(
+            emit_rows(cu_seqlens, Int32(k.shape[0]), rows, row_count).launch(
                 grid=(1, 1, 1), block=(32, 1, 1), stream=stream
             )
         # One CTA per SM, each owning a contiguous block of the (device-counted) tiles.
@@ -727,9 +728,12 @@ class GdnTinv(WarpSpecialized):
 
 
 @cute.kernel
-def emit_rows(cu_seqlens: cute.Tensor, rows: cute.Tensor, row_count: cute.Tensor):
-    """One warp: the row table of 64-token chunks (``work_tables.emit_chunk_rows``)."""
-    emit_chunk_rows(B_T, cu_seqlens, rows, row_count, Int32(cute.arch.thread_idx()[0]))
+def emit_rows(cu_seqlens: cute.Tensor, tokens: Int32, rows: cute.Tensor, row_count: cute.Tensor):
+    """One warp: check ``cu_seqlens`` against ``tokens``, then the row table of 64-token chunks
+    (``work_tables.emit_chunk_rows``)."""
+    lane = Int32(cute.arch.thread_idx()[0])
+    check_packed_offsets(cu_seqlens, tokens, lane, 32)
+    emit_chunk_rows(B_T, cu_seqlens, rows, row_count, lane)
 
 
 def bundle_hook(io_dtype, d_k: int, num_sm: int, log_gate: bool) -> tuple[GdnTinv, int]:

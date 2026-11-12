@@ -109,7 +109,15 @@ def warmup_backward_host(
             stream,
         )
     work_tables.launch_work_table(
-        B_T, heads_out, cu_seqlens, item_scratch, work_count, work_items, scheduler_all, stream
+        B_T,
+        heads_out,
+        cutlass.Int32(gate.shape[0]),
+        cu_seqlens,
+        item_scratch,
+        work_count,
+        work_items,
+        scheduler_all,
+        stream,
     )
     recompute_op.launch(
         k,

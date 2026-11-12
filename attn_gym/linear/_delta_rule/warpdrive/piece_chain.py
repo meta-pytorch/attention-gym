@@ -54,10 +54,12 @@ from attn_gym.warpdrive.compat import SmemAllocator
 
 from .ptx import f16x2_to_f32, ld_global_v, ld_shared_f32, st_global_v, st_shared_f32
 from .work_tables import (
+    INT32_MAX,
     OPT_LEVEL,
     ORDER_THREADS,
     WORK_ITEM_FIELDS,
     ceil_div,
+    check_packed_offsets,
     emit_chunk_rows,
     order_body,
     order_storage,
@@ -323,6 +325,7 @@ def chain_table_kernel(
     pieces: Int32,
     heads_out: Int32,
     num_seqs: Int32,
+    tokens: Int32,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
     main_rows: cute.Tensor,
@@ -335,12 +338,13 @@ def chain_table_kernel(
     rows: cute.Tensor | None,
     row_count: cute.Tensor | None,
 ):
-    """Every block builds the piece table; block 0 then orders the main (and summary) work
-    tables and zeroes the scheduler counters, block 1 (bound ``rows``) builds the chunk row
-    table of the pieces on its first warp."""
+    """Every block checks ``cu_seqlens`` against ``tokens`` and builds the piece table; block 0
+    then orders the main (and summary) work tables and zeroes the scheduler counters, block 1
+    (bound ``rows``) builds the chunk row table of the pieces on its first warp."""
     cute.arch.griddepcontrol_wait()
     cute.arch.griddepcontrol_launch_dependents()
     tidx = Int32(cute.arch.thread_idx()[0])
+    check_packed_offsets(cu_seqlens, tokens, tidx, ORDER_THREADS)
     piece_table_body(
         pieces, b_t, heads_out, tidx, num_seqs, cu_seqlens, cu_pieces, main_rows, summary_rows
     )
@@ -394,6 +398,7 @@ def launch_chain_tables(
     b_t: cutlass.Constexpr[int],
     pieces: Int32,
     heads_out: Int32,
+    tokens: Int32,
     cu_seqlens: cute.Tensor,
     cu_pieces: cute.Tensor,
     main_rows: cute.Tensor,
@@ -409,15 +414,18 @@ def launch_chain_tables(
     row_count: cute.Tensor | None = None,
     rows_b_t: cutlass.Constexpr[int] = 0,
 ) -> None:
-    """The chain prologue: the piece table of ``cu_seqlens``, its work tables and, with
-    ``rows``, the chunk row table of ``rows_b_t``-token chunks of the pieces. Callable from a
-    launch bundle's ``@cute.jit`` host; the next launch waits on it through PDL."""
+    """The chain prologue: check ``cu_seqlens`` against the ``tokens`` packed tokens
+    (:func:`~work_tables.check_packed_offsets`), then the piece table of ``cu_seqlens``, its
+    work tables and, with ``rows``, the chunk row table of ``rows_b_t``-token chunks of the
+    pieces. Callable from a launch bundle's ``@cute.jit`` host; the next launch waits on it
+    through PDL."""
     chain_table_kernel(
         b_t,
         rows_b_t,
         pieces,
         heads_out,
         Int32(cu_seqlens.shape[0] - 1),
+        tokens,
         cu_seqlens,
         cu_pieces,
         main_rows,
@@ -768,6 +776,7 @@ def compile_chain_tables(b_t: int, summary: bool, rows_b_t: int, use_int64_offse
     def entry(
         pieces,
         heads_out,
+        tokens,
         cu,
         cu_pieces,
         main_rows,
@@ -785,6 +794,7 @@ def compile_chain_tables(b_t: int, summary: bool, rows_b_t: int, use_int64_offse
             b_t,
             pieces,
             heads_out,
+            tokens,
             cu,
             cu_pieces,
             main_rows,
@@ -805,6 +815,7 @@ def compile_chain_tables(b_t: int, summary: bool, rows_b_t: int, use_int64_offse
 
     return compile_tvm_ffi(
         entry,
+        Int32(0),
         Int32(0),
         Int32(0),
         *(_int32_vector(sym) for _ in range(6)),
@@ -830,16 +841,19 @@ def build_chain_tables(
     rows: torch.Tensor | None = None,
     row_count: torch.Tensor | None = None,
     rows_b_t: int = 0,
+    tokens: int = INT32_MAX,
     use_int64_offsets: bool = False,
 ) -> None:
     """Run :func:`launch_chain_tables` standalone over the ``piece_table`` buffers (keys
     ``cu_pieces``, ``main_rows``, ``summary_rows``, ``main_count``, ``summary_count``,
-    ``work_items``, optional ``work_items_summary``, ``scheduler``)."""
+    ``work_items``, optional ``work_items_summary``, ``scheduler``). ``tokens`` bounds
+    ``cu_seqlens[-1]``; the default bounds nothing."""
     summary = piece_table.get("work_items_summary")
     fn = compile_chain_tables(b_t, summary is not None, rows_b_t, use_int64_offsets)
     fn(
         pieces,
         heads_out,
+        tokens,
         cu_seqlens,
         piece_table["cu_pieces"],
         piece_table["main_rows"],

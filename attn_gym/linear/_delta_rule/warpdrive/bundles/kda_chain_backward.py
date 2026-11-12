@@ -99,6 +99,7 @@ def chain_backward_host(
         B_T,
         pieces,
         heads_out,
+        cutlass.Int32(gate.shape[0]),
         cu_seqlens,
         cu_pieces,
         main_rows,
