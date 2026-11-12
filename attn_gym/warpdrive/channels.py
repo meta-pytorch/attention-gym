@@ -543,7 +543,7 @@ class Channel:
     @property
     def owned_epochs(self) -> bool:
         """Some side gives each epoch one owner (round-robin or exclusive) instead of joining;
-        the kernel checks the traced ownership (``WarpSpecialized._check_ownership``)."""
+        the kernel checks the traced ownership (``ownership.check``)."""
         return (self.producer_sharing, self.consumer_sharing) != (Sharing.JOIN, Sharing.JOIN)
 
     @property

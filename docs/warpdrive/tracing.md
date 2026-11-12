@@ -124,7 +124,8 @@ checks.aliases  # {("P", "S"): "no hazard found", ...} for declared overlaps
 | `liveness` | `"verified"`, `"no deadlock found"`, `"unverified"`, `"possible deadlock"`, `"error"`; `None` before compilation or with `liveness_check="off"` | `liveness` |
 
 `describe()` supplies the evidence: copy sites, byte counts, epoch shares and findings.
-`"not checked yet"` means the instance has neither compiled nor restored a report.
+`"not checked yet"` means no report is available for that check, including after a trace
+fails before producing it.
 
 ## Tracing backends
 
