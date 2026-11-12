@@ -20,21 +20,21 @@ requires_blackwell = pytest.mark.skipif(
 )
 
 
-def test_cudnn_precision_request_is_rejected_before_cuda_dispatch(monkeypatch):
-    cudnn = importlib.import_module("attn_gym.linear.kda.impl.cudnn")
+def test_warpdrive_precision_request_is_rejected_before_cuda_dispatch(monkeypatch):
+    warpdrive = importlib.import_module("attn_gym.linear.kda.impl.warpdrive")
 
     def reached_native(_q):
-        raise RuntimeError("reached native cuDNN dispatch")
+        raise RuntimeError("reached native warpdrive dispatch")
 
-    monkeypatch.setattr(cudnn, "validate_cudnn_available", reached_native)
+    monkeypatch.setattr(warpdrive, "validate_warpdrive_available", reached_native)
     q = torch.zeros(1, 64, 1, 128, dtype=torch.bfloat16)
     beta = torch.ones(1, 64, 1)
     gate = torch.zeros_like(q, dtype=torch.float32)
-    with pytest.raises(ValueError, match="cuDNN KDA cannot honor fastmath=False"):
-        chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "cudnn"}, fastmath=False)
+    with pytest.raises(ValueError, match="warpdrive KDA cannot honor fastmath=False"):
+        chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "warpdrive"}, fastmath=False)
     for kwargs in ({}, {"fastmath": True}):
-        with pytest.raises(RuntimeError, match="reached native cuDNN dispatch"):
-            chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "cudnn"}, **kwargs)
+        with pytest.raises(RuntimeError, match="reached native warpdrive dispatch"):
+            chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "warpdrive"}, **kwargs)
 
 
 @requires_blackwell

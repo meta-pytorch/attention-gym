@@ -100,7 +100,7 @@ epoch for round-robin, or one owner per epoch for [exclusive consumers](#exclusi
 Blocking acquires and waits default to `wait="suspend"`: CuTeDSL's `mbarrier.try_wait.parity`
 with a suspend-time hint, which ptxas lowers to a `NANOSLEEP.SYNCS` fallback. `wait="spin"`
 retries a hint-less `try_wait` instead, the loop CUTLASS's C++ `ClusterBarrier::wait` and the
-cuDNN-frontend Frost kernels use:
+cuDNN-frontend GDN/KDA kernels use:
 
 ```python
 self.trip = Ring(1, Umma, Threads, wait="spin")  # a serial MMA <-> CUDA-core handoff

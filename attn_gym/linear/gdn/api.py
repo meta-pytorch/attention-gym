@@ -13,9 +13,9 @@ from attn_gym.linear._delta_rule.validation import (
     validate_decode_inputs,
     validate_paged_state,
 )
-from attn_gym.linear.gdn.impl.cudnn import chunk_forward as cudnn_chunk_forward
-from attn_gym.linear.gdn.impl.cudnn import paged_chunk_forward as cudnn_paged_chunk_forward
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
+from attn_gym.linear.gdn.impl.warpdrive import chunk_forward as warpdrive_chunk_forward
+from attn_gym.linear.gdn.impl.warpdrive import paged_chunk_forward as warpdrive_paged_chunk_forward
 from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
@@ -78,7 +78,7 @@ def chunk_gdn(
             capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
             ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
-            default; ``{"backend": "cudnn"}`` selects the optional cuDNN backend.
+            default; ``{"backend": "warpdrive"}`` selects the optional warpdrive backend.
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
             for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
@@ -86,7 +86,7 @@ def chunk_gdn(
             kernels; winners are cached and reused. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
             fixed configurations, so bits repeat across processes and winner-cache states on
-            one GPU model and software stack. The cuDNN backend always uses its fixed schedule.
+            one GPU model and software stack. The warpdrive backend always uses its fixed schedule.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -96,8 +96,8 @@ def chunk_gdn(
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if options["backend"] == "cudnn":
-            return cudnn_chunk_forward(
+        if options["backend"] == "warpdrive":
+            return warpdrive_chunk_forward(
                 q,
                 k,
                 v,
@@ -164,7 +164,7 @@ def paged_chunk_gdn(
         beta: Floating per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
             Recurrence math remains FP32; BF16 affects persistent storage only. The optional
-            cuDNN backend requires FP32.
+            warpdrive backend requires FP32.
         state_indices: Contiguous int32 slot indices, one per logical sequence. Positive,
             unique indices select slots to advance; non-positive indices produce zero output
             and leave the cache untouched.
@@ -176,12 +176,12 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "cudnn"}`` selects the optional cuDNN backend, which
+            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend, which
             requires 16-byte-aligned pool bases and slot origins. Split schedules are not
             supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
             of the repo-local factor and output kernels. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
-            The recurrence that advances ``state_cache`` and the cuDNN backend always use
+            The recurrence that advances ``state_cache`` and the warpdrive backend always use
             fixed configurations.
 
     Returns:
@@ -202,8 +202,8 @@ def paged_chunk_gdn(
         has_initial_state,
     )
     scale = resolve_scale(scale, q.shape[-1])
-    if options["backend"] == "cudnn":
-        return cudnn_paged_chunk_forward(
+    if options["backend"] == "warpdrive":
+        return warpdrive_paged_chunk_forward(
             q,
             k,
             v,

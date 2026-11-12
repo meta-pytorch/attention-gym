@@ -30,10 +30,12 @@ from attn_gym.linear._delta_rule.validation import (
     validate_paged_state,
 )
 from attn_gym.linear.kda.constants import LOG2_E
-from attn_gym.linear.kda.impl.cudnn import chunk_forward as _cudnn_chunk_forward
-from attn_gym.linear.kda.impl.cudnn import paged_chunk_forward as _cudnn_paged_chunk_forward
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
 from attn_gym.linear.kda.impl.fused import paged_chunk_forward as _fused_paged_chunk_forward
+from attn_gym.linear.kda.impl.warpdrive import chunk_forward as _warpdrive_chunk_forward
+from attn_gym.linear.kda.impl.warpdrive import (
+    paged_chunk_forward as _warpdrive_paged_chunk_forward,
+)
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
@@ -91,11 +93,11 @@ def chunk_kda(
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
             are internal. The repo-local fused implementation requires approximately
-            ``[-5.914, 0]``. cuDNN BF16 instead requires every aligned 16-token
+            ``[-5.914, 0]``. warpdrive BF16 instead requires every aligned 16-token
             per-channel sum to exceed ``-126 * ln(2)``; a uniform
             ``lower_bound >= -5.45`` is safe, including
-            the common ``-5`` bound. cuDNN stages these MMA operands in the Q/K dtype rather
-            than TF32, so cuDNN FP16 does not support usual model-range gates. These limits
+            the common ``-5`` bound. warpdrive stages these MMA operands in the Q/K dtype rather
+            than TF32, so warpdrive FP16 does not support usual model-range gates. These limits
             are not checked at runtime and do not apply to reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
@@ -115,7 +117,7 @@ def chunk_kda(
             gradients, especially with strong negative gates, try ``False`` and compare
             against the reference. It can preserve small contributions that fast math
             drops when intermediate values fall into the subnormal range.
-            The reference backend uses normal PyTorch math for either value; native cuDNN
+            The reference backend uses normal PyTorch math for either value; native warpdrive
             requires ``True``. Configure gate production separately with ``bound_gate`` or
             ``gate_transform``.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
@@ -126,7 +128,7 @@ def chunk_kda(
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
             See :class:`attn_gym.linear.types.KernelOptions`. ``"autotune"`` (default
-            ``True``) benchmarks candidate fused-kernel configurations; cuDNN accepts the
+            ``True``) benchmarks candidate fused-kernel configurations; warpdrive accepts the
             option but uses its fixed schedule.
 
     Returns:
@@ -149,8 +151,8 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if options.backend == "cudnn":
-            return _cudnn_chunk_forward(
+        if options.backend == "warpdrive":
+            return _warpdrive_chunk_forward(
                 q,
                 k,
                 v,
@@ -221,7 +223,7 @@ def paged_chunk_kda(
         beta: Per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
             Recurrence math remains FP32; BF16 affects persistent storage only. The optional
-            cuDNN backend requires FP32.
+            warpdrive backend requires FP32.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence.
             Positive, unique indices select cache slots to read and advance;
             non-positive indices produce zero output and leave the cache untouched.
@@ -232,12 +234,12 @@ def paged_chunk_kda(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
-        kernel_options: Backend-specific options. ``{"backend": "cudnn"}`` selects
-            the optional cuDNN backend. ``split_backward`` and
+        kernel_options: Backend-specific options. ``{"backend": "warpdrive"}`` selects
+            the optional warpdrive backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
             applies to the fused backend as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the repo-local fused kernels;
-            cuDNN uses its fixed schedule.
+            warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five
             token caches have shape ``[num_slots, 64, ...]``; every count must remain in
@@ -322,8 +324,8 @@ def paged_chunk_kda(
         if num_slots > 1 and replay_state.count.stride(0) == 0:
             raise ValueError("replay_state count tensor slots must not overlap")
         # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
-    if options.backend == "cudnn":
-        return _cudnn_paged_chunk_forward(
+    if options.backend == "warpdrive":
+        return _warpdrive_paged_chunk_forward(
             q,
             k,
             v,

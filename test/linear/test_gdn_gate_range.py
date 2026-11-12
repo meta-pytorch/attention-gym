@@ -17,11 +17,11 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-@pytest.mark.parametrize("backend", ["fused", "cudnn"])
+@pytest.mark.parametrize("backend", ["fused", "warpdrive"])
 @pytest.mark.parametrize("pattern", ["isolated_minus_1e4", "uniform_minus_1e30"])
 @torch.no_grad()
 def test_supported_large_negative_gates_match_recurrent_reference(backend: str, pattern: str):
-    if backend == "cudnn":
+    if backend == "warpdrive":
         pytest.importorskip("cutlass.experimental")
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("the cuDNN backend requires SM100/SM103")

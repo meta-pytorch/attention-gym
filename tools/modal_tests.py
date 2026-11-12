@@ -49,7 +49,7 @@ base_image = (
     .pip_install("pytest-instafail")
 )
 image = base_image
-cudnn_image = base_image
+warpdrive_image = base_image
 
 
 def configure_local_image(
@@ -89,7 +89,9 @@ def configure_local_image(
 
 if modal.is_local():
     image = configure_local_image(image, ["tests"])
-    cudnn_image = configure_local_image(cudnn_image.pip_install("pytest-xdist"), ["linear", "dev"])
+    warpdrive_image = configure_local_image(
+        warpdrive_image.pip_install("pytest-xdist"), ["linear", "dev"]
+    )
 
 app = modal.App("attention-gym-modal-tests", image=image)
 
@@ -293,20 +295,20 @@ def run_pytest() -> tuple[int, str]:
 
 
 @app.function(
-    image=cudnn_image,
+    image=warpdrive_image,
     gpu="B200",
     cpu=float(PYTEST_WORKERS),
     timeout=SUITE_TIMEOUT_SECONDS,
     volumes={CACHE_VOLUME_PATH: CACHE_VOLUME},
 )
-def run_cudnn_pytest() -> tuple[int, str]:
-    """Run the GDN/KDA cuDNN suites with the ``[linear]`` dependencies."""
+def run_warpdrive_pytest() -> tuple[int, str]:
+    """Run the GDN/KDA warpdrive suites with the ``[linear]`` dependencies."""
     # The [linear] image resolves its own CuTeDSL, not FA4's, so it keeps a separate archive.
-    with persistent_compile_cache("cudnn"):
+    with persistent_compile_cache("warpdrive"):
         return execute_pytest(
-            ["test/gdn/cudnn", "test/kda/cudnn"],
-            Path("/tmp/cudnn-pytest-report.xml"),
-            "B200 cuDNN pytest summary",
+            ["test/gdn/wd", "test/kda/wd"],
+            Path("/tmp/warpdrive-pytest-report.xml"),
+            "B200 warpdrive pytest summary",
         )
 
 
@@ -318,7 +320,7 @@ def main() -> None:
     """
     start = time.perf_counter()
     print(f"requesting suites at {datetime.now(UTC).isoformat()}", flush=True)
-    calls = {"main": run_pytest.spawn(), "cudnn": run_cudnn_pytest.spawn()}
+    calls = {"main": run_pytest.spawn(), "warpdrive": run_warpdrive_pytest.spawn()}
     failed = False
     error = None
     for suite_name, call in calls.items():

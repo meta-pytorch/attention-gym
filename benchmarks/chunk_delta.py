@@ -155,7 +155,7 @@ def operation_forward(
         beta,
         cu_seqlens=cu_seqlens,
         impl="fused",
-        kernel_options={"backend": "cudnn", "autotune": False},
+        kernel_options={"backend": "warpdrive", "autotune": False},
     )[0]
 
 

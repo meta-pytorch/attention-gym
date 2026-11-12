@@ -122,7 +122,7 @@ class CoreBackendOption(str, Enum):
     """Chunk-core kernel families selectable through ``kernel_options``."""
 
     FUSED = "fused"
-    CUDNN = "cudnn"
+    WARPDRIVE = "warpdrive"
 
 
 def packed_sequence_metadata(
@@ -173,9 +173,9 @@ class DeltaRuleAttention(nn.Module):
     and the bounded ``gate_transform``; ``variant="gdn"`` learns one softplus log decay per head
     through ``a_proj``. ``lower_bound`` applies to the KDA gate only; ``fastmath`` applies to
     both fused gates and to the KDA core. Its default ``True`` permits approximate math;
-    reference execution keeps ordinary PyTorch math, and native cuDNN KDA rejects ``False``.
+    reference execution keeps ordinary PyTorch math, and native warpdrive KDA rejects ``False``.
     ``kernel_options`` are passed through to the chunk
-    core (``{"backend": "cudnn"}`` selects the SM100 cuDNN kernels for either variant).
+    core (``{"backend": "warpdrive"}`` selects the SM100 warpdrive kernels for either variant).
 
     Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
@@ -906,13 +906,13 @@ def main(
     ] = None,
     core_backend: Annotated[
         CoreBackendOption,
-        typer.Option(help="Chunk kernels for the fused backend: repo-local or cuDNN (SM100)."),
+        typer.Option(help="Chunk kernels for the fused backend: repo-local or warpdrive (SM100)."),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
         bool,
         typer.Option(
             help="Permit approximate gating math (default); --no-fastmath requests non-fast "
-            "math and is unsupported by native cuDNN KDA. Reference math is unchanged."
+            "math and is unsupported by native warpdrive KDA. Reference math is unchanged."
         ),
     ] = True,
     steps: Annotated[int, typer.Option(min=1, help="Number of optimizer steps.")] = 2,
@@ -965,7 +965,9 @@ def main(
         backend=backend.value,
         fastmath=fastmath,
         kernel_options=(
-            {"backend": core_backend.value} if core_backend is CoreBackendOption.CUDNN else None
+            {"backend": core_backend.value}
+            if core_backend is CoreBackendOption.WARPDRIVE
+            else None
         ),
         compute_dtype=(None if compute_dtype is None else getattr(torch, compute_dtype.value)),
         device=device,

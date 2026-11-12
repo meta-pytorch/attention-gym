@@ -49,7 +49,7 @@ def test_example_validates_public_gate_configuration():
     with pytest.raises(ValueError, match="variant must be"):
         make(variant="mamba")
     with pytest.raises(ValueError, match="kernel_options apply only"):
-        make(kernel_options={"backend": "cudnn"}, backend="reference")
+        make(kernel_options={"backend": "warpdrive"}, backend="reference")
     with pytest.raises(ValueError, match="takes only the autotune kernel option"):
         ContextParallelDeltaRuleAttention(
             hidden_size=128,
@@ -57,7 +57,7 @@ def test_example_validates_public_gate_configuration():
             head_dim=128,
             variant="gdn",
             backend="fused",
-            kernel_options={"backend": "cudnn"},
+            kernel_options={"backend": "warpdrive"},
             group=None,
         )
 

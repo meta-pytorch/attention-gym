@@ -240,13 +240,13 @@ def test_compile_cache_ages_entries_from_their_last_read(runner: ModuleType, tmp
     assert (again / "triton" / "read.cubin").read_bytes() == b"read.cubin"
 
 
-@pytest.mark.parametrize(("main_code", "cudnn_code"), [(0, 0), (1, 0), (0, -9)])
+@pytest.mark.parametrize(("main_code", "warpdrive_code"), [(0, 0), (1, 0), (0, -9)])
 def test_main_runs_suites_together_and_fails_if_either_fails(
     runner: ModuleType,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     main_code: int,
-    cudnn_code: int,
+    warpdrive_code: int,
 ):
     """Request both GPUs before waiting on either, then publish both summaries."""
     summary_file = tmp_path / "summary.md"
@@ -265,16 +265,16 @@ def test_main_runs_suites_together_and_fails_if_either_fails(
         return SimpleNamespace(spawn=spawn)
 
     monkeypatch.setattr(runner, "run_pytest", suite("main", main_code))
-    monkeypatch.setattr(runner, "run_cudnn_pytest", suite("cudnn", cudnn_code))
+    monkeypatch.setattr(runner, "run_warpdrive_pytest", suite("warpdrive", warpdrive_code))
 
-    with pytest.raises(SystemExit) if main_code or cudnn_code else contextlib.nullcontext():
+    with pytest.raises(SystemExit) if main_code or warpdrive_code else contextlib.nullcontext():
         runner.main()
 
-    assert events == ["spawn main", "spawn cudnn", "get main", "get cudnn"]
-    assert summary_file.read_text() == "maincudnn"
+    assert events == ["spawn main", "spawn warpdrive", "get main", "get warpdrive"]
+    assert summary_file.read_text() == "mainwarpdrive"
 
 
-@pytest.mark.parametrize("timed_out_suite", ["run_pytest", "run_cudnn_pytest"])
+@pytest.mark.parametrize("timed_out_suite", ["run_pytest", "run_warpdrive_pytest"])
 def test_main_publishes_finished_suite_when_the_other_times_out(
     runner: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timed_out_suite: str
 ):
@@ -285,7 +285,7 @@ def test_main_publishes_finished_suite_when_the_other_times_out(
     def timed_out():
         raise TimeoutError("remote deadline")
 
-    for name in ("run_pytest", "run_cudnn_pytest"):
+    for name in ("run_pytest", "run_warpdrive_pytest"):
         get = timed_out if name == timed_out_suite else lambda: (0, "finished summary\n")
         monkeypatch.setattr(
             runner, name, SimpleNamespace(spawn=lambda get=get: SimpleNamespace(get=get))

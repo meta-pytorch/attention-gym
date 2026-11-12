@@ -52,19 +52,19 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd import (
     _finish_chunk_kda_fwd,
     _prepare_chunk_kda_fwd,
 )
-from attn_gym.linear.kda.impl.cudnn import validate_cudnn_constraints
-from attn_gym.linear.kda.impl.cudnn_ops import (
-    chunk_cudnn_packed_bwd_with_exit_cotangent_op,
-    chunk_cudnn_packed_bwd_with_state_op,
-    chunk_cudnn_packed_fwd_with_initial_state_op,
-    chunk_cudnn_packed_fwd_with_state_op,
-    validate_cudnn_available,
-)
 from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
+from attn_gym.linear.kda.impl.warpdrive import validate_warpdrive_constraints
+from attn_gym.linear.kda.impl.warpdrive_ops import (
+    chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
+    chunk_warpdrive_packed_bwd_with_state_op,
+    chunk_warpdrive_packed_fwd_with_initial_state_op,
+    chunk_warpdrive_packed_fwd_with_state_op,
+    validate_warpdrive_available,
+)
 from attn_gym.linear.kda.validation import (
     resolve_kernel_options,
-    validate_cudnn_fastmath,
     validate_kda_inputs,
+    validate_warpdrive_fastmath,
 )
 from attn_gym.linear.types import KernelOptions
 
@@ -88,12 +88,12 @@ class ChunkKDASaved(NamedTuple):
     chunk_offsets: torch.Tensor | None
 
 
-class ChunkKDACudnnSaved(NamedTuple):
-    """Forward tensors a cuDNN ``chunk_kda_prepare`` stores for ``chunk_kda_prepare_backward``.
+class ChunkKDAWarpdriveSaved(NamedTuple):
+    """Forward tensors a warpdrive ``chunk_kda_prepare`` stores for ``chunk_kda_prepare_backward``.
 
-    cuDNN's backward reads the raw ``gate`` and keeps its factors on chip, so the tape carries the
-    gate instead of WY factors; ``cumulative_gate`` only feeds the fused factor pass behind
-    arbitrary-range summaries. cuDNN always runs packed, so the offsets are never ``None``.
+    warpdrive's backward reads the raw ``gate`` and keeps its factors on chip, so the tape carries
+    the gate instead of WY factors; ``cumulative_gate`` only feeds the fused factor pass behind
+    arbitrary-range summaries. warpdrive always runs packed, so the offsets are never ``None``.
     """
 
     q: torch.Tensor
@@ -113,10 +113,10 @@ class ChunkKDACudnnSaved(NamedTuple):
 # order and selection; ``start == stop`` is the identity map. That is what the context-parallel
 # routing produces: a rank summarizes its whole piece of a document, never part of it. The fused
 # kernels would also sum an interior run of 64-token chunks of one subsequence, but that is not
-# part of the contract and cuDNN's kernels cannot do it. The values are not checked: they live on
-# the device so the launch replays under CUDA Graph capture, and reading them back would sync; a
-# row that matches no subsequence is filled with NaN on cuDNN and returns a plausible but wrong map
-# on the fused kernels.
+# part of the contract and warpdrive's kernels cannot do it. The values are not checked: they live
+# on the device so the launch replays under CUDA Graph capture, and reading them back would sync; a
+# row that matches no subsequence is filled with NaN on warpdrive and returns a plausible but wrong
+# map on the fused kernels.
 
 
 def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
@@ -131,8 +131,8 @@ def _normalize_state(state: torch.Tensor | None) -> torch.Tensor | None:
     return state if state.stride(-1) == 1 else state.contiguous()
 
 
-def _normalize_cudnn_state(state: torch.Tensor | None) -> torch.Tensor | None:
-    """FP32 state as cuDNN's launchers read it through TMA.
+def _normalize_warpdrive_state(state: torch.Tensor | None) -> torch.Tensor | None:
+    """FP32 state as warpdrive's launchers read it through TMA.
 
     Unit-stride keys and 16-byte-aligned outer strides suffice, so only other layouts are copied.
     """
@@ -196,29 +196,34 @@ class ChunkKDAPrepared:
 
 
 @dataclass
-class ChunkKDACudnnPrepared:
-    """cuDNN forward handle: ``run`` is cuDNN's with-state kernel and summaries are cuDNN's too.
+class ChunkKDAWarpdrivePrepared:
+    """Forward handle: ``run`` is the warpdrive with-state kernel and the summaries are warpdrive's
+    too.
 
-    cuDNN keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from two runs
-    of cuDNN's state-only pass over it (from a zero entry state for ``B``, from the identity with
-    the value term disabled for ``A``). The backward handle is :class:`ChunkKDACudnnBackward`.
+    warpdrive keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from two
+    runs of warpdrive's state-only pass over it (from a zero entry state for ``B``, from the
+    identity with the value term disabled for ``A``). The backward handle is
+    :class:`ChunkKDAWarpdriveBackward`.
     """
 
-    saved: ChunkKDACudnnSaved
+    saved: ChunkKDAWarpdriveSaved
     metadata: RaggedChunkMetadata
     scale: float
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
 
-        Rows follow NOTE [Summary ranges are subsequences]. The maps carry cuDNN's 16-token-chunk
-        rounding, which differs from the fused maps and from an unsharded cuDNN pass.
+        Rows follow NOTE [Summary ranges are subsequences]. The maps carry warpdrive's
+        16-token-chunk rounding, which differs from the fused maps and from an unsharded warpdrive
+        pass.
         """
-        # Lazy import keeps the optional cuDNN backend out of the fused import path.
-        from attn_gym.linear._delta_rule.cudnn.state_summary import build_cudnn_state_summaries
+        # Lazy import keeps the optional warpdrive backend out of the fused import path.
+        from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
+            build_warpdrive_state_summaries,
+        )
 
         saved = self.saved
-        return build_cudnn_state_summaries(
+        return build_warpdrive_state_summaries(
             saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
         )
 
@@ -228,12 +233,12 @@ class ChunkKDACudnnPrepared:
         *,
         output_final_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run cuDNN's with-state kernel from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
+        """Run the with-state kernel from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
         saved = self.saved
         if initial_state is None:
             initial_state = zero_state(saved.q, saved.v, self.metadata)
         else:
-            initial_state = _normalize_cudnn_state(initial_state)
+            initial_state = _normalize_warpdrive_state(initial_state)
         args = (
             saved.q,
             saved.k,
@@ -245,8 +250,8 @@ class ChunkKDACudnnPrepared:
             self.scale,
         )
         if output_final_state:
-            return chunk_cudnn_packed_fwd_with_state_op(*args)
-        return chunk_cudnn_packed_fwd_with_initial_state_op(*args), None
+            return chunk_warpdrive_packed_fwd_with_state_op(*args)
+        return chunk_warpdrive_packed_fwd_with_initial_state_op(*args), None
 
 
 def chunk_kda_prepare(
@@ -260,7 +265,7 @@ def chunk_kda_prepare(
     scale: float | None = None,
     fastmath: bool = True,
     kernel_options: KernelOptions | None = None,
-) -> ChunkKDAPrepared | ChunkKDACudnnPrepared:
+) -> ChunkKDAPrepared | ChunkKDAWarpdrivePrepared:
     """Run the factor half of ``chunk_kda`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_kda`` with two restrictions: ``q``/``k``/``v`` must already share a
@@ -268,16 +273,16 @@ def chunk_kda_prepare(
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
-    Pass the same value to ``chunk_kda_prepare_backward``. Native cuDNN requires ``True``.
-    ``kernel_options={"backend": "cudnn"}`` runs the local pass and both summaries with cuDNN's
-    kernels. Split schedules are not available with entry states. ``"autotune"`` follows
-    ``chunk_kda``.
+    Pass the same value to ``chunk_kda_prepare_backward``. Native warpdrive requires ``True``.
+    ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both summaries with
+    warpdrive's kernels. Split schedules are not available with entry states. ``"autotune"``
+    follows ``chunk_kda``.
     """
     backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
         kernel_options, op_name="chunk_kda_prepare"
     )
-    if backend == "cudnn":
-        validate_cudnn_fastmath(fastmath)
+    if backend == "warpdrive":
+        validate_warpdrive_fastmath(fastmath)
     if split_backward or split_forward:
         raise ValueError("split schedules are not supported by chunk_kda_prepare")
     validate_kda_inputs(
@@ -288,23 +293,25 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
-    if backend == "cudnn":
-        validate_cudnn_available(q)
+    if backend == "warpdrive":
+        validate_warpdrive_available(q)
         if cu_seqlens is None:
-            # cuDNN's with-state kernels are packed-only, so it always gets explicit boundaries;
-            # arange keeps the launch capture-safe.
+            # warpdrive's with-state kernels are packed-only, so it always gets explicit
+            # boundaries; arange keeps the launch capture-safe.
             cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
     q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
         q, k, v, beta, cu_seqlens=cu_seqlens, scale=scale
     )
     gate = gate.float()
     cumulative_gate = _plain_gate_scan_op(gate, cu_seqlens, chunk_offsets, False)
-    if backend == "cudnn":
+    if backend == "warpdrive":
         assert metadata is not None and cu_seqlens is not None and chunk_offsets is not None
         gate = normalize_compact_tensor(gate)
-        validate_cudnn_constraints(q, k, v, gate, beta, None, cu_seqlens)
-        saved = ChunkKDACudnnSaved(q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets)
-        return ChunkKDACudnnPrepared(saved, metadata, scale)
+        validate_warpdrive_constraints(q, k, v, gate, beta, None, cu_seqlens)
+        saved = ChunkKDAWarpdriveSaved(
+            q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets
+        )
+        return ChunkKDAWarpdrivePrepared(saved, metadata, scale)
     factors = _prepare_chunk_kda_fwd(
         q,
         k,
@@ -399,16 +406,17 @@ class ChunkKDABackward:
 
 
 @dataclass
-class ChunkKDACudnnBackward:
-    """cuDNN backward handle: ``run`` is cuDNN's stateful backward and the reverse maps are cuDNN's.
+class ChunkKDAWarpdriveBackward:
+    """Backward handle: ``run`` is the warpdrive stateful backward; the reverse maps are
+    warpdrive's.
 
-    Each subsequence's ``[C; R]`` map is the entry cotangent of cuDNN's backward run with a zero
-    exit cotangent (``C``) and the forward transition transposed (``R``, the exact adjoint; a
+    Each subsequence's ``[C; R]`` map is the entry cotangent of warpdrive's backward run with a
+    zero exit cotangent (``C``) and the forward transition transposed (``R``, the exact adjoint; a
     natively probed adjoint would round differently). Nothing is consumed, so ``run`` and
     ``state_grad_summaries`` may be called in either order.
     """
 
-    saved: ChunkKDACudnnSaved
+    saved: ChunkKDAWarpdriveSaved
     d_output: torch.Tensor
     initial_state: torch.Tensor | None
     scale: float
@@ -418,12 +426,12 @@ class ChunkKDACudnnBackward:
 
         Rows follow NOTE [Summary ranges are subsequences].
         """
-        from attn_gym.linear._delta_rule.cudnn.state_summary import (
-            build_cudnn_state_grad_summaries,
+        from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
+            build_warpdrive_state_grad_summaries,
         )
 
         saved = self.saved
-        return build_cudnn_state_grad_summaries(
+        return build_warpdrive_state_grad_summaries(
             saved.q,
             saved.k,
             saved.v,
@@ -446,34 +454,34 @@ class ChunkKDACudnnBackward:
         torch.Tensor,
         torch.Tensor | None,
     ]:
-        """Run cuDNN's backward from one FP32 ``[N, HV, V, K]`` exit cotangent per sequence.
+        """Run warpdrive's backward from one FP32 ``[N, HV, V, K]`` exit cotangent per sequence.
 
         Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)``; the last is ``None`` when the
         forward ran without an entry state. An absent ``d_final_state`` skips the cotangent load
         and gives the token gradients of an explicit zero.
         """
         saved = self.saved
-        d_final_state = _normalize_cudnn_state(d_final_state)
+        d_final_state = _normalize_warpdrive_state(d_final_state)
         operands = (saved.q, saved.k, saved.v, saved.gate, saved.beta, self.d_output)
         if self.initial_state is None:
-            grads = chunk_cudnn_packed_bwd_with_exit_cotangent_op(
+            grads = chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
                 *operands, saved.cu_seqlens, d_final_state, self.scale
             )
             return (*grads, None)
-        return chunk_cudnn_packed_bwd_with_state_op(
+        return chunk_warpdrive_packed_bwd_with_state_op(
             *operands, saved.cu_seqlens, self.initial_state, d_final_state, self.scale
         )
 
 
 def chunk_kda_prepare_backward(
-    saved: ChunkKDASaved | ChunkKDACudnnSaved,
+    saved: ChunkKDASaved | ChunkKDAWarpdriveSaved,
     d_output: torch.Tensor | None,
     initial_state: torch.Tensor | None,
     *,
     scale: float,
     fastmath: bool = True,
     kernel_options: KernelOptions | None = None,
-) -> ChunkKDABackward | ChunkKDACudnnBackward:
+) -> ChunkKDABackward | ChunkKDAWarpdriveBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the
@@ -481,8 +489,9 @@ def chunk_kda_prepare_backward(
     re-derived scale would corrupt every gradient. Both live outside ``saved`` because the
     caller's autograd function owns them. Pass the forward's ``fastmath`` and
     ``kernel_options`` for matching factors, launch geometry (``"schedule"``), and tuning
-    (``"autotune"``). The tape selects the backend: a cuDNN tape (:class:`ChunkKDACudnnSaved`)
-    returns :class:`ChunkKDACudnnBackward` and requires ``fastmath=True``.
+    (``"autotune"``). The tape selects the backend: a warpdrive tape
+    (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward` and requires
+    ``fastmath=True``.
     """
     if d_output is None:
         d_output = torch.zeros_like(saved.v)
@@ -490,9 +499,11 @@ def chunk_kda_prepare_backward(
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
     options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare_backward")
-    if isinstance(saved, ChunkKDACudnnSaved):
-        validate_cudnn_fastmath(fastmath)
-        return ChunkKDACudnnBackward(saved, d_output, _normalize_cudnn_state(initial_state), scale)
+    if isinstance(saved, ChunkKDAWarpdriveSaved):
+        validate_warpdrive_fastmath(fastmath)
+        return ChunkKDAWarpdriveBackward(
+            saved, d_output, _normalize_warpdrive_state(initial_state), scale
+        )
     metadata = None
     if saved.cu_seqlens is not None:
         assert saved.chunk_offsets is not None
@@ -522,6 +533,11 @@ def chunk_kda_prepare_backward(
     )
 
 
+# Deprecated aliases from the ``cudnn`` backend name.
+ChunkKDACudnnSaved = ChunkKDAWarpdriveSaved
+ChunkKDACudnnPrepared = ChunkKDAWarpdrivePrepared
+ChunkKDACudnnBackward = ChunkKDAWarpdriveBackward
+
 __all__ = [
     "ChunkKDABackward",
     "ChunkKDACudnnBackward",
@@ -529,6 +545,9 @@ __all__ = [
     "ChunkKDACudnnSaved",
     "ChunkKDAPrepared",
     "ChunkKDASaved",
+    "ChunkKDAWarpdriveBackward",
+    "ChunkKDAWarpdrivePrepared",
+    "ChunkKDAWarpdriveSaved",
     "chunk_kda_prepare",
     "chunk_kda_prepare_backward",
 ]

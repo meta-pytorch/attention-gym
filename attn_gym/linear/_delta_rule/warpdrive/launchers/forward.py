@@ -1,0 +1,148 @@
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Validated KDA launchers over the v1.30 kernels, including paged recurrent state."""
+
+from __future__ import annotations
+
+import torch
+
+from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
+from attn_gym._backends.cute.utils import get_device_properties
+from attn_gym.linear._delta_rule.paged_state import PagedState
+from attn_gym.linear._delta_rule.validation import resolve_scale
+
+from ..drivers.kda import kda_forward
+
+_SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
+
+
+def validate_available(q: torch.Tensor) -> None:
+    """Validate the device contract without launching asynchronous work."""
+    if not q.is_cuda:
+        raise ValueError("the warpdrive KDA backend requires CUDA tensors")
+    properties = get_device_properties(q.device)
+    if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
+        raise ValueError("the warpdrive KDA backend requires SM100 or SM103")
+
+
+def run_forward_on_current_device(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state: torch.Tensor | PagedState | None,
+    *,
+    scale: float | None,
+    output_final_state: bool,
+    split: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Validate and launch one packed forward invocation.
+
+    ``split`` enables the forgetting-horizon work table: long sequences are cut where the gate has
+    saturated and each cut item rebuilds its entry state from zero over a warmup window, so it is
+    approximate and only offered for calls without recurrent state.
+    """
+    paged_state = state if isinstance(state, PagedState) else None
+    if split and (state is not None or output_final_state):
+        raise ValueError("the split forward schedule requires a no-state call")
+    initial_state = paged_state.cache if paged_state is not None else state
+    scale = resolve_scale(scale, q.shape[-1])
+    validate_available(q)
+    if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
+        raise ValueError("q must have shape [1, T, H, 128]")
+    if k.shape != q.shape or gate.shape != q.shape:
+        raise ValueError("k and gate must match q")
+    heads = q.shape[2]
+    if value.shape != q.shape:
+        raise ValueError("value must match q")
+    if beta.shape != q.shape[:3]:
+        raise ValueError("beta must have shape [1, T, H]")
+    if q.dtype not in _SUPPORTED_IO_DTYPES or k.dtype != q.dtype or value.dtype != q.dtype:
+        raise TypeError("q, k, and value must share dtype float16 or bfloat16")
+    if gate.dtype != torch.float32 or beta.dtype != torch.float32:
+        raise TypeError("gate and beta must be float32")
+    inputs = (q, k, value, gate, beta)
+    if any(not tensor.is_cuda for tensor in inputs):
+        raise ValueError("all inputs must be CUDA tensors")
+    if any(tensor.device != q.device for tensor in inputs[1:]):
+        raise ValueError("all inputs must be on q.device")
+    if any(not tensor_supports_tma(tensor) for tensor in (q, k, value, gate)):
+        raise TypeError("q, k, value, and gate require a TMA-compatible inner mode")
+    if not tensor_supports_contiguous_dim(beta, alignment_bytes=4):
+        raise TypeError("beta requires a contiguous, element-aligned inner mode")
+    if (
+        cu_seqlens.ndim != 1
+        or cu_seqlens.shape[0] < 2
+        or cu_seqlens.dtype != torch.int32
+        or not cu_seqlens.is_contiguous()
+    ):
+        raise TypeError("cu_seqlens must be a contiguous int32 vector")
+    if not cu_seqlens.is_cuda or cu_seqlens.device != q.device:
+        raise ValueError("cu_seqlens must be on the input CUDA device")
+
+    num_sequences = cu_seqlens.shape[0] - 1
+    if paged_state is not None:
+        if output_final_state:
+            raise ValueError("paged state advances the pool in place; drop output_final_state")
+    elif initial_state is not None:
+        expected_state = (num_sequences, heads, 128, 128)
+        if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
+            raise TypeError(f"initial_state must be float32 with shape {expected_state}")
+        if not initial_state.is_cuda or initial_state.device != q.device:
+            raise ValueError("initial_state must be on the input CUDA device")
+        if not tensor_supports_tma(initial_state):
+            raise TypeError("initial_state requires a TMA-compatible inner mode")
+    if output_final_state and initial_state is None:
+        raise ValueError("output_final_state requires an initial_state buffer")
+
+    output, final_state = kda_forward(
+        q[0],
+        k[0],
+        value[0],
+        gate[0],
+        beta[0],
+        cu_seqlens,
+        scale=scale,
+        initial_state=initial_state,
+        output_final_state=output_final_state,
+        split=split,
+        state_indices=None if paged_state is None else paged_state.indices,
+        has_initial_state=None if paged_state is None else paged_state.byte_mask,
+    )
+    return output.unsqueeze(0), final_state
+
+
+def run_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state: torch.Tensor | PagedState | None,
+    *,
+    scale: float | None,
+    output_final_state: bool,
+    split: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """Launch under the input tensor's CUDA device guard."""
+    if not q.is_cuda:
+        raise ValueError("q must be a CUDA tensor")
+    with torch.cuda.device(q.device):
+        return run_forward_on_current_device(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            cu_seqlens,
+            state,
+            scale=scale,
+            output_final_state=output_final_state,
+            split=split,
+        )
+
+
+__all__ = ["run_forward", "validate_available"]
