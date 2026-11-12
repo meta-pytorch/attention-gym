@@ -121,6 +121,32 @@ def test_custom_protocol_errors_at_declaration():
             WorkStream(**kwargs)
 
 
+def test_a_schedule_has_one_kind():
+    """A schedule has one kind: the layer takes its grid, first item and decode from that kind."""
+    with pytest.raises(
+        TypeError, match="TileOneShot derives from the schedules TilePersistent, OneShot; a "
+    ):
+
+        class TileOneShot(TilePersistent, OneShot):
+            pass
+
+    with pytest.raises(
+        TypeError, match="ReverseShot derives from the schedules ReverseStatic, OneShot; a "
+    ):
+
+        class ReverseShot(ReverseStatic, OneShot):
+            pass
+
+    # Deriving from one kind, at any depth, stays a schedule of that kind.
+    class Bounded(StaticPersistent):
+        pass
+
+    class Deeper(Bounded):
+        pass
+
+    assert WorkStream(schedule=Deeper()).get_key() == "deeper0_m1"
+
+
 @dataclass(frozen=True)
 class Strided(IndexSchedule):
     """A schedule with a compile-time field: the default key must name it."""

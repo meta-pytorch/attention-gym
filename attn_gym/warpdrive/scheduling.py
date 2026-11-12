@@ -421,6 +421,10 @@ class IndexSchedule:
     ``>= problem.total``; never negative. Once a unit returns a terminal index its stream has
     ended.
 
+    A schedule's kind is the direct ``IndexSchedule`` subclass it derives from: a built-in, or
+    a custom schedule that subclasses ``IndexSchedule`` itself. A class deriving from two kinds
+    raises a ``TypeError`` where it is defined.
+
     Class attributes:
 
     * ``persistent``: a unit may run more than one item, so every managed role must loop. With
@@ -477,6 +481,18 @@ class IndexSchedule:
     stages = 0
     uses_max_ctas = True
     uses_workspace = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        # A schedule's kind is the direct IndexSchedule subclass it derives from: a built-in or
+        # a custom schedule. The layer derives a stream's grid, first item and decode from that
+        # kind, so a class of two kinds would mix the answers of both.
+        kinds = [k.__name__ for k in cls.__mro__ if IndexSchedule in k.__bases__]
+        if len(kinds) > 1:
+            raise TypeError(
+                f"{cls.__name__} derives from the schedules {', '.join(kinds)}; a schedule "
+                "subclasses exactly one of them (or IndexSchedule itself)"
+            )
 
     def launch_units(self, total, max_units):
         if max_units is None:  # uses_max_ctas = False: one unit per item
