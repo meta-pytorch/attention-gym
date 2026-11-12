@@ -590,6 +590,10 @@ class KdaSummary(WarpSpecialized):
                     s_gate + 2 * (gate_offsets[row % 8] + row * 64), self.gate_dtype
                 )
             g[row] = raw_g * Float32(LOG2_E)
+        if cutlass.const_expr(self.gate == "fp32"):
+            # The exp2(g) stores below go in place over this raw gate stage, into slots that
+            # only this warp read: the warp sync orders every lane's reads before them.
+            cute.arch.sync_warp()
         ragged = chunk_start + B_T > seqlen
         if ragged:  # padded rows carry no decay
             for row in cutlass.range_constexpr(B_T):
@@ -1116,6 +1120,9 @@ class KdaSummary(WarpSpecialized):
                                     addr + (kb + g * 4) * 4,
                                     [as_i32(vals[g * 4 + t]) for t in range(4)],
                                 )
+                # The CTA's last piece has no later TMEM store to order these loads before
+                # teardown frees TMEM.
+                cute.arch.fence_view_async_tmem_load()
         else:
             for _chain, out, row, valid in outs:
                 if valid:  # cold: empty pieces

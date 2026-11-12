@@ -421,10 +421,24 @@ conversion because recurrence consumes one token decay at a time. This keeps chu
 of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The repo-local fused
 backend requires approximately `[-5.914, 0]`. warpdrive BF16 instead requires every aligned
-16-token per-channel sum to exceed `-126 * ln(2)`; a uniform `lower_bound >= -5.45` is safe,
-including the common `-5` bound. warpdrive stages these MMA operands in the Q/K dtype rather than
-TF32, so warpdrive FP16 does not support usual model-range gates. These limits are not checked at
-runtime. The training example uses the Kimi-style FP32 transform
+16-token per-channel sum to exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
+results are not finite. That bound keeps the forward finite; gradients need more margin. The
+backward stages `Q_decay = scale * q * exp(in-chunk cumulative decay)` as a BF16 MMA operand,
+which flushes to zero once `scale * |q| * exp(16-token sum)` falls below about `2^-126`, and dv,
+dgate and dbeta then lose precision. Measured as relative RMS error against FP64 (one BF16
+sequence of `T=512`, `H=2`, normalized q/k, default scale), a constant per-token gate of `-5.0`
+gave 0.4-0.7% on dv, dgate and dbeta, comparable to the fused backend; `-5.3` gave 0.7-2% and
+`-5.45` 6-20%. About `-5.25` is therefore an empirical guideline for uniform gates in training,
+not a guarantee: the margin depends on the scale and magnitude of q. Kimi-style
+`lower_bound * sigmoid(...)` gates with `lower_bound = -5.45` stayed at 0.6% (maximum absolute
+error over the FP64 gradient's maximum, ragged `H=2` sequences), because few 16-token sums reach
+the bound. On the same relative-RMS workload the forward error also roughly doubles at `-5.45`,
+from a separate, milder factor. A sum concentrated on the first token of its 16-token box leaves
+the backward no headroom: with the whole decay on one token of a 48-token sequence, dq and dgate
+were non-finite for 0 of 20 seeds at `-86.5`, 1 of 20 at `-86.9` and 10 of 20 at `-87.3`.
+Upstream cuDNN Frontend behaves identically. warpdrive stages these MMA operands in the Q/K dtype
+rather than TF32, so warpdrive FP16 does not support usual model-range gates. These limits are not
+checked at runtime. The training example uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
@@ -718,6 +732,21 @@ else is required: no flag, no tiling, no change to the kernels. `document_aligne
 to ranks, longest first onto the least-loaded rank, so ranks stay within one document's length of
 each other. What it cannot do is split a document that does not fit on one rank; that is what
 the summaries above are for.
+
+This holds for the fused backend, not for warpdrive. warpdrive picks its plan from the packed
+shape and the SM count, so a document's bits can change with how many others share its rank:
+any plan change can move KDA forward bits. For example, KDA's forward takes the d_v-split prep
+path while `num_seqs * heads` stays below about half the SM count, and a long document can leave
+the forward piece chain for it when packed with a single other one. On a 152-SM GB300 with two
+heads, packing a document with 40 others instead of at most one moved about 62% of its output
+elements by one bf16 ulp (relative L2 4.5e-3, within the 1% that the plan tests allow). In those
+public calls without states, its gradients stayed bitwise equal, including through the backward
+piece chain; that observation does not cover the stateful staged gradients of a full context
+parallel step. GDN's staged entry points have no warpdrive backend, so its recipe is
+unaffected. The public warpdrive `chunk_gdn`
+forward stayed bitwise across the d_v split and the forward piece chain. Its backward piece chain
+did not: taken for a few long documents, it changed dk, dv, dgate and dbeta at rounding level
+(relative L2 at most 2.3e-4), while dq stayed bitwise.
 
 ### warpdrive local execution
 

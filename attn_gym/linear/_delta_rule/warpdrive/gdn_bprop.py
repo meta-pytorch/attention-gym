@@ -1040,6 +1040,9 @@ class GdnBprop(WarpSpecialized):
                 off = store_row * B_T + swizzle_xor_128b(store_row, store_col + c * 16)
                 stmatrix(kk_base + off * 2, l_pack[c * 4 : c * 4 + 4])
                 stmatrix(dm_base + off * 2, kk_pack[c * 4 : c * 4 + 4])
+            # cg0 never stores to TMEM, so each accumulator read completes (tcgen05.wait::ld)
+            # before the signal that lets the MMA rewrite it, and before teardown frees TMEM.
+            cute.arch.fence_view_async_tmem_load()
             if has_state:
                 _arrive(sig, "kk_free")
             # ---- A epilogue: A = QK * decay * scale -> sA ----------------------------------
@@ -1054,6 +1057,7 @@ class GdnBprop(WarpSpecialized):
                 a_pack = self._mask_rows(a_pack, warp, lane, n_valid)
             ah = a.acquire()
             self._store_frags(a_base, store_row, store_col, a_pack)
+            cute.arch.fence_view_async_tmem_load()
             ah.commit()
             # ---- blockwise inverse in place in sDm: T = (I + M_kk)^-1 ----------------------
             self.cg0_sync.sync(aligned=True)
@@ -1106,6 +1110,7 @@ class GdnBprop(WarpSpecialized):
                 da_pack = self._mask_rows(da_pack, warp, lane, n_valid)
             dah = a.acquire()
             self._store_frags(a_base, store_row, store_col, da_pack)
+            cute.arch.fence_view_async_tmem_load()
             dah.commit()
             # ---- dM epilogue: sDm = -Beta[i] strict * (Z U^T) (T's reader, the Z GEMM, ------
             # ---- completed before dm_acc_full). FP16 stages s Z (s = max(Beta, 2^-10)), so ---
@@ -1139,6 +1144,7 @@ class GdnBprop(WarpSpecialized):
                 dm_pack.append(fp32_to_fp16(v0, v1, dtype=io))
             mh = dm.acquire()
             self._store_frags(dm_base, store_row, store_col, dm_pack)
+            cute.arch.fence_view_async_tmem_load()
             mh.commit()
             # ---- dBeta/dGate M-terms: E = dM core * L ------------------------------------------
             kk_frag = self._load_frags(kk_base, store_row, store_col)
@@ -1949,7 +1955,13 @@ class GdnBprop(WarpSpecialized):
                 self._dstate_to_smem(lane0, dstate_col, state_row, row_valid)
                 _arrive(sig, "dstate_smem_full")
             else:
-                ph = ph ^ Int64(1 << SIG["state_dot_done"])  # cg0's last-chunk arrival
+                # cg0's last-chunk arrival goes unwaited; flipping the parity counts it. Its
+                # sDstate read still precedes this group's next write (the next item's seed or
+                # chunk): cg0 reads, then arrives dgate_cg0, which cg1 waits for before the
+                # dgate_cg1 this group waits for below. cg0 cannot lap a waited phase either:
+                # the arrival after one is for a later chunk of the same item, and cg0 waits
+                # first for the dstate_smem_full this group arrives after that wait.
+                ph = ph ^ Int64(1 << SIG["state_dot_done"])
             # ---- dGate fold ----------------------------------------------------------------------
             ph = _wait(sig, ph, "dgate_cg1")
             self.cg2_sync.sync(aligned=True)
@@ -2014,6 +2026,8 @@ class GdnBprop(WarpSpecialized):
                             self._store_state_row(
                                 params.dstate0, dst, it.head, state_row, i * 32, vec
                             )
+                    # Before dstate_scaled lets the MMA rewrite dS, or teardown frees TMEM.
+                    cute.arch.fence_view_async_tmem_load()
             if cutlass.const_expr(not self.use_dstate_in):
                 _arrive(sig, "dstate_scaled")
         else:

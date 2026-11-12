@@ -94,11 +94,14 @@ def chunk_kda(
             Pass per-token values, not cumulative gates; chunking and log-base conversion
             are internal. The repo-local fused implementation requires approximately
             ``[-5.914, 0]``. warpdrive BF16 instead requires every aligned 16-token
-            per-channel sum to exceed ``-126 * ln(2)``; a uniform
-            ``lower_bound >= -5.45`` is safe, including
-            the common ``-5`` bound. warpdrive stages these MMA operands in the Q/K dtype rather
-            than TF32, so warpdrive FP16 does not support usual model-range gates. These limits
-            are not checked at runtime and do not apply to reference or recurrent execution.
+            per-channel sum to exceed ``-126 * ln(2)`` (a uniform ``lower_bound >= -5.45``)
+            for finite results. Gradients need more margin: their error grows quickly past a
+            uniform gate of about ``-5.25``, an empirical training guideline, while the common
+            ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
+            ``docs/linear.md`` gives the measurements). warpdrive stages these MMA operands in
+            the Q/K dtype rather than TF32, so warpdrive FP16 does not support usual
+            model-range gates. These limits are not checked at runtime and do not apply to
+            reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.

@@ -1080,6 +1080,9 @@ class GdnPrefill(WarpSpecialized):
                         cute.make_layout(vw),
                     )
                     cute.autovec_copy(frag, dst)
+        # The CTA's last item has no later TMEM store to order these loads before teardown
+        # frees TMEM.
+        cute.arch.fence_view_async_tmem_load()
 
     @cute.jit
     def empty_state(

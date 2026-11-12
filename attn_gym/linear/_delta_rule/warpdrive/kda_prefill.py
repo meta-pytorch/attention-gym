@@ -175,6 +175,11 @@ assert QS_STAGES >= 2, "CG1's late o_acc release needs two O accumulator slots"
 #   UIN    U operand (CG1) and the left-half state decay (CG0 instance): 4 + 4 arrivals; MMA
 #          waits before the state update.
 #   SACC_L / SACC_R (2 stages)  left / right state update committed; CG0 / CG1 read the state.
+# The TMEM loads need no tcgen05.wait::ld where the same warp issues a tcgen05.st after them
+# and completes it (wait::st) before the signal that lets the MMA overwrite their columns: a
+# warp's ld -> st pair is pipelined (PTX ISA 9.7.18.6.2), while a register dependency orders no
+# memory (9.7.18.6.4.5). Each load names its store; drain_o and final_state have none and wait
+# for their loads (final_state's can be the role's last TMEM access before teardown frees TMEM).
 SIN_L, SIN_R, KS, U, YIN, UIN, SACC_L, SACC_R = 0, 1, 2, 3, 4, 5, 6, 8
 TSTATE_COUNTS = (4, 4, 1, 1, 4, 8, 1, 1, 1, 1)
 
@@ -673,6 +678,10 @@ class KdaPrefill(WarpSpecialized):
                     s_gate + 2 * (gate_offsets[row % 8] + row * 64), self.gate_dtype
                 )
             g[row] = raw_g * Float32(LOG2_E)
+        if cutlass.const_expr(self.gate == "fp32"):
+            # The exp2(g) stores below go in place over this raw gate stage, into slots that
+            # only this warp read: the warp sync orders every lane's reads before them.
+            cute.arch.sync_warp()
         ragged = chunk_start + B_T > seqlen
         if ragged:  # padded rows carry no decay
             for row in cutlass.range_constexpr(B_T):
@@ -798,6 +807,7 @@ class KdaPrefill(WarpSpecialized):
                 spin_wait(tstate + SACC_L + ((c - 1) & 1), ((c - 1) >> 1) & 1)
         if local > 0:
             state = cute.make_rmem_tensor((d_k // 2,), Float32)
+            # Ordered before the state update (UIN) by the SIN store below and its wait::st.
             if cutlass.const_expr(self.d_v == 128):
                 blocks = [tmem_ld("32x32b", 32, state_col + b * 32) for b in range(dk_halves)]
                 for b in cutlass.range_constexpr(dk_halves):
@@ -1032,6 +1042,7 @@ class KdaPrefill(WarpSpecialized):
             with self.trace_region("ks.wait"):
                 spin_wait(tstate + KS, n_ks & 1)
             n_ks += 1
+            # Ordered before KS(c+1) by stage_y's Y store and its wait::st.
             ks_lo = tmem_ld("16x256b", 2, lane_base + cols["ks"])
             for r in cutlass.range_constexpr(4):
                 y_lo[r] = beta_residual(
@@ -1133,6 +1144,7 @@ class KdaPrefill(WarpSpecialized):
         _l, lane_base, cols, _lo, _hi, _pc, _pcx, _vd, _rv = geo
         with self.trace_region("u.wait"):
             spin_wait(tstate + U, n_u & 1)
+        # Ordered before U(c+1) by the UIN store below and its wait::st.
         vals = tmem_ld("32x32b", B_T, lane_base + cols["u"])
         words = [fp32_to_fp16(vals[2 * i], vals[2 * i + 1], dtype=self.io_dtype) for i in range(8)]
         tmem_st("32x32b", lane_base + cols["uin"], words)
@@ -1169,6 +1181,7 @@ class KdaPrefill(WarpSpecialized):
             spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1)
         n_upd += 1
         state = cute.make_rmem_tensor((d_k // 2,), Float32)
+        # Ordered before the state update (UIN) by the SIN store below and its wait::st.
         if cutlass.const_expr(self.d_v == 128):
             for j in cutlass.range_constexpr(half_blocks):
                 vals = tmem_ld("32x32b", 16, lane_base + cols["state"] + (half_blocks + j) * 16)
@@ -1231,6 +1244,7 @@ class KdaPrefill(WarpSpecialized):
         cute.arch.fence_view_async_tmem_store()
         warp_arrive(tstate + SIN_R)
         oa = o_acc.wait()
+        # Ordered before oa.release() by the state store below and stage_y's wait::st.
         o_lo = tmem_ld("16x256b", 2, lane_base + cols["qs"] + oa.index * B_T)
         o_hi = [Float32(0.0)] * 8
         if cutlass.const_expr(self.d_v == 128):
@@ -1255,6 +1269,7 @@ class KdaPrefill(WarpSpecialized):
         with self.trace_region("ks.wait"):
             spin_wait(tstate + KS, n_ks & 1)
         n_ks += 1
+        # Ordered before KS(c+1) by stage_y's Y store and its wait::st.
         ks_lo = tmem_ld("16x256b", 2, lane_base + cols["ks"])
         ks_hi = [Float32(0.0)] * 8
         if cutlass.const_expr(self.d_v == 128):
@@ -1315,6 +1330,8 @@ class KdaPrefill(WarpSpecialized):
             o_hi = tmem_ld("16x256b", 2, lane_base + (16 << 16) + cols["qs"] + oa.index * B_T)
         with o_smem.produce() as oh:
             self.stage_o(params, oh, o_lo, o_hi, ov_lo, ov_hi, active)
+        # Unlike cg1_chunk, no TMEM store follows these loads before the release: wait for them.
+        cute.arch.fence_view_async_tmem_load()
         oa.release()
         return o_acc, o_smem
 
@@ -1356,6 +1373,9 @@ class KdaPrefill(WarpSpecialized):
                                     for t in range(4)
                                 ]
                                 stg_v4(addr + (kb + g * 8) * obytes, words)
+                # The CTA's last item has no later TMEM store to order these loads before
+                # teardown frees TMEM.
+                cute.arch.fence_view_async_tmem_load()
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:
