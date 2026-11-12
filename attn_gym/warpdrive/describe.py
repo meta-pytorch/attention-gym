@@ -11,7 +11,7 @@ import textwrap
 from dataclasses import dataclass
 from typing import Literal
 
-from attn_gym.warpdrive.channels import Threads, Tma, Umma, Warps
+from attn_gym.warpdrive.channels import SIDES, Threads, Tma, Umma, Warps
 from attn_gym.warpdrive.fences import FenceStatus
 from attn_gym.warpdrive.scheduling import _tile_grid, scheduler_role
 
@@ -309,10 +309,7 @@ def _channels(kernel) -> str:
     lines = ["Channels"]
     for name, ch in chans.items():
         head = f"  {name:<{width}}  {channel_kind(ch):<9}"
-        sides = [
-            "raw code" if side == ch.external else _bound(bound)
-            for side, bound in (("producer", ch.producers), ("consumer", ch.consumers))
-        ]
+        sides = ["raw code" if side == ch.external else _bound(ch.bound(side)) for side in SIDES]
         flow = " -> ".join(sides)
         lines += textwrap.wrap(
             flow,
@@ -462,7 +459,9 @@ def _streams(kernel) -> str:
         lines.append(f"  {name}  {st.describe()}")
         sched = next((r for r in kernel._ws_roles if r.fn is scheduler_role), None)
         if sched is not None:
-            lines.append(f"{pad}scheduler warp {sched.first_warp} broadcasts over {name}_ring")
+            lines.append(
+                f"{pad}scheduler warp {sched.first_warp} broadcasts over {st._channel_name(name, 'ring')}"
+            )
         else:
             grid = ""
             if _tile_grid(st):

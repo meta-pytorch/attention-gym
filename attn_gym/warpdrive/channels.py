@@ -528,6 +528,10 @@ class Channel:
         """A TMA producer the layer runs and whose copies it checks (``tma.py``)."""
         return isinstance(self.producer, Tma) and not self.internal and self.external != "producer"
 
+    def bound(self, side: str) -> list:
+        """Bound ``(role instance, slot)`` pairs on ``side`` ('producer' or 'consumer')."""
+        return self.producers if side == "producer" else self.consumers
+
     def sharing(self, side: str) -> Sharing:
         return self.producer_sharing if side == "producer" else self.consumer_sharing
 
@@ -554,11 +558,11 @@ class Channel:
 
     def turns(self, side: str) -> int:
         """Instances taking turns on ``side``: ``k`` for a round-robin side, else 1."""
-        bound = self.producers if side == "producer" else self.consumers
+        bound = self.bound(side)
         return len(bound) if self.sharing(side) is Sharing.ROUND_ROBIN and bound else 1
 
     def slot_counts(self, side: str) -> list[int]:
-        bound = self.producers if side == "producer" else self.consumers
+        bound = self.bound(side)
 
         def contribution(ri):
             return arrivals(self.mechanism(side, ri.role), ri.num_threads)
@@ -814,6 +818,14 @@ class Handle(_Stage):
         return self._end._handed_full(self.index, self.rec if self._is_producer else None)
 
     barrier = full_barrier
+
+    @property
+    def _transaction_ctas(self) -> tuple[int, ...] | None:
+        """CTAs whose full barriers complete by transaction bytes, or None for arrivals."""
+        chan = self._end._chan
+        if not isinstance(chan.producer, Tma):
+            return None
+        return chan.scope.full_ctas if chan.scope.pair else (0,)
 
     @property
     def empty_barrier(self):

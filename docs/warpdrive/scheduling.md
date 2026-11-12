@@ -428,10 +428,10 @@ kernel, it drops excess splits after `PdlWait()`.
 
 ## Custom index schedules
 
-An `IndexSchedule` selects indices, not items. A schedule's kind is the direct
-`IndexSchedule` subclass it derives from, such as `StaticPersistent` or a custom schedule like
-the one below; a class deriving from two kinds raises a `TypeError` where it is defined. This
-local example visits each static sequence backwards:
+An `IndexSchedule` selects indices, not items. Subclass one built-in schedule or define a
+custom schedule as below. Mixing distinct schedule kinds raises a `TypeError` where the class
+is defined; a redundant `IndexSchedule` base is allowed. The `IndexSchedule` docstring defines
+kinds and the full protocol. This local example visits each static sequence backwards:
 
 ```python
 from dataclasses import dataclass

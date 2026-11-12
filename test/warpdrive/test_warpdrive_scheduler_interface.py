@@ -146,6 +146,23 @@ def test_a_schedule_has_one_kind():
 
     assert WorkStream(schedule=Deeper()).get_key() == "deeper0_m1"
 
+    class ExplicitProtocol(StaticPersistent, IndexSchedule):
+        pass
+
+    assert WorkStream(schedule=ExplicitProtocol()).get_key() == "explicitprotocol0_m1"
+
+    class InheritedProtocol(ExplicitProtocol):
+        pass
+
+    assert WorkStream(schedule=InheritedProtocol()).get_key() == "inheritedprotocol0_m1"
+
+    with pytest.raises(
+        TypeError, match="MixedProtocol derives from the schedules StaticPersistent, OneShot; a "
+    ):
+
+        class MixedProtocol(ExplicitProtocol, OneShot):
+            pass
+
 
 @dataclass(frozen=True)
 class Strided(IndexSchedule):
