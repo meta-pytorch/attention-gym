@@ -581,6 +581,14 @@ class WarpSpecialized(metaclass=_KernelType):
         fetch_keys = {}
         for name, st in streams.items():
             st.name = name
+            if st.owner is not None and st.owner is not self:
+                # The stream sizes its work unit from its owner's cluster and looks its problem
+                # up there, so a second kernel would read this one's.
+                raise ProtocolError(
+                    f"{type(self).__name__}.{name}: this WorkStream now belongs to a "
+                    f"{type(st.owner).__name__}; a stream belongs to one kernel (create it in "
+                    "__init__)"
+                )
             st.owner = self
             if st.schedule.broadcast:
                 generated = {st._channel_name(name, "ring"): st.channel()}
