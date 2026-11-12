@@ -7,16 +7,22 @@ import torch
 
 pytest.importorskip("cutlass.cute")  # the bench module imports the megakernel
 
+import torch.nn.functional as F
+
+from attn_gym.warpdrive.examples import qwen_megakernel_ref as ref_module
 from attn_gym.warpdrive.examples.bench_qwen_megakernel import (
     decode_step_fast,
+    decode_step_fast_batch,
     prepare_fast_weights,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+    QwenConfig,
     compare_logits,
     decode_step_ref,
     load_qwen3_weights,
     make_decode_state,
     prompt_tokens,
+    random_weights,
     validate_against_hf,
 )
 
@@ -113,3 +119,65 @@ def test_compare_logits_accepts_either_token_of_a_near_tie():
     assert not metrics["argmax_match"] and metrics["argmax_ok"] and metrics["passed"], metrics
     wrong = torch.tensor([7.9, 7.95, 8.05, 1.0])
     assert not compare_logits(wrong, eager, high)["argmax_ok"]
+
+
+def router_rank_gap(weights, token, pos, caches) -> float:
+    """The reference's smallest gap between its 8th and 9th router logits over the layers."""
+    recorded, original = [], ref_module.mlp
+
+    def spy(config, w, x, forced=None):
+        recorded.append(F.linear(x, w["router"]).float()[0])
+        return original(config, w, x, forced)
+
+    ref_module.mlp = spy
+    try:
+        decode_step_ref(weights, token, pos, *[c.clone() for c in caches])
+    finally:
+        ref_module.mlp = original
+    k = weights.config.experts_per_token
+    return min((r.sort(descending=True).values[k - 1] - r.sort(descending=True).values[k]).item()
+               for r in recorded)  # fmt: skip
+
+
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_batched_baseline_matches_the_reference_per_sequence(moe):
+    """decode_step_fast_batch: 5 sequences at different positions, each within the bf16 budget
+    of its own reference step, with only its cache row pos written. A MoE sequence may route
+    differently only at a near-tie of the reference's 8th and 9th router logits (the batched
+    router GEMM rounds differently from the reference's single-row one)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    config = QwenConfig(
+        hidden_size=1024, num_layers=2, num_q_heads=32 if moe else 16,
+        num_kv_heads=4 if moe else 8, intermediate_size=1024 if moe else 3072, vocab_size=4096,
+        **({"num_experts": 128, "experts_per_token": 8, "moe_intermediate_size": 256} if moe else {}),
+    )  # fmt: skip
+    weights = random_weights(config)
+    batch, max_len = 5, 512
+    states = [make_decode_state(weights, 60 + 37 * b, max_len, seed=b) for b in range(batch)]
+    k = torch.stack([s[0][0] for s in states])
+    v = torch.stack([s[0][1] for s in states])
+    for b, (_, _, pos) in enumerate(states):  # masked SDPA reads the unused rows: zero them
+        k[b][:, :, pos:] = 0
+        v[b][:, :, pos:] = 0
+    tokens = torch.stack([s[1].reshape(()) for s in states])
+    positions = torch.tensor([s[2] for s in states], device="cuda")
+    ours_k, ours_v = k.clone(), v.clone()
+    layers = range(config.num_layers)
+    logits = decode_step_fast_batch(
+        prepare_fast_weights(weights, max_len), tokens, positions,
+        tuple(ours_k[:, layer] for layer in layers), tuple(ours_v[:, layer] for layer in layers),
+    )  # fmt: skip
+    for b, (_, _, pos) in enumerate(states):
+        caches = (k[b], v[b])
+        theirs = decode_step_ref(weights, tokens[b], pos, *[c.clone() for c in caches])
+        high = decode_step_ref(
+            weights, tokens[b], pos, *[c.clone() for c in caches], dtype=torch.float32
+        )
+        metrics = compare_logits(logits[b], theirs, high)
+        if not metrics["passed"] and moe:
+            assert router_rank_gap(weights, tokens[b], pos, caches) <= 2**-6, (b, metrics)
+        else:
+            assert metrics["passed"], (b, metrics)
+        assert torch.equal(ours_k[b][:, :, :pos], k[b][:, :, :pos])
+        assert torch.equal(ours_k[b][:, :, pos + 1 :], k[b][:, :, pos + 1 :])

@@ -139,6 +139,86 @@ def decode_step_fast(
     return baseline_linear(x, weights.lm_head, packed.gemm_rows).reshape(-1).float()
 
 
+def batch_linear(x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
+    """F.linear of a (B, K) batch; below ``rows`` the batch is zero-padded to ``rows`` so cuBLAS
+    picks a tensor-core GEMM (as ``baseline_linear`` does for one row)."""
+    if x.shape[0] >= rows:
+        return F.linear(x, weight)
+    return F.linear(F.pad(x, (0, 0, 0, rows - x.shape[0])), weight)[: x.shape[0]]
+
+
+def moe_mlp_batch(config, packed: FastQwenWeights, layer: int, norm: torch.Tensor) -> torch.Tensor:
+    """A batch's routed MLP with grouped GEMMs: the (token, expert) pairs sorted by expert, one
+    F.grouped_mm over every expert for gate/up and one for down, then the outputs unsorted and
+    summed over each token's k experts in rank order (deterministic: no atomics). Shapes stay
+    static (no host sync), so it compiles and graph-captures."""
+    weights = packed.weights
+    k, experts = config.experts_per_token, config.num_experts
+    probs = F.softmax(F.linear(norm, weights.router[layer]), dim=-1, dtype=torch.float32)
+    # Ties go to the lower expert, as in the reference's stable sort (topk leaves them unordered).
+    weight, expert = (t[:, :k] for t in probs.sort(dim=-1, descending=True, stable=True))
+    if config.norm_topk_prob:
+        weight = weight / weight.sum(dim=-1, keepdim=True)
+    weight = weight.to(norm.dtype)
+    flat = expert.reshape(-1)
+    order = flat.argsort(stable=True)
+    counts = torch.zeros(experts, dtype=torch.int32, device=norm.device)
+    counts.scatter_add_(0, flat.int(), torch.ones_like(flat, dtype=torch.int32))
+    offs = counts.cumsum(0, dtype=torch.int32)
+    tokens = order // k
+    x = norm[tokens]  # (batch * k, hidden), grouped by expert
+    gate_up = F.grouped_mm(x, packed.gate_up[layer].transpose(-2, -1), offs=offs)
+    gate, up = gate_up.chunk(2, dim=-1)
+    y = F.grouped_mm(F.silu(gate) * up, weights.down[layer].transpose(-2, -1), offs=offs)
+    unsorted = torch.empty_like(y)
+    unsorted[order] = y  # back to (token, rank) order
+    return (unsorted.view(-1, k, y.shape[-1]) * weight[..., None]).sum(dim=1)
+
+
+@torch.no_grad()
+def decode_step_fast_batch(
+    packed: FastQwenWeights,
+    tokens: torch.Tensor,
+    positions: torch.Tensor,
+    k_cache: tuple[torch.Tensor, ...],
+    v_cache: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """``decode_step_fast`` for a batch: sequence b decodes ``tokens[b]`` at ``positions[b]``
+    (a device tensor) into its own cache. Caches are per-layer (batch, kv heads, max_len, head
+    dim) views. Weights are read once for the batch; attention is SDPA over each sequence's
+    cache with a length mask, so sequences may sit at different positions. Cache rows past a
+    sequence's position must be finite (zeroed caches): masked scores are zero, but 0 * NaN is not."""
+    weights, config = packed.weights, packed.weights.config
+    batch, rows = tokens.shape[0], packed.gemm_rows
+    q_heads, kv_heads, head_dim = config.num_q_heads, config.num_kv_heads, config.head_dim
+    max_len = k_cache[0].shape[2]
+    x = F.embedding(tokens, weights.embed)
+    cos, sin = packed.cos[positions][:, None], packed.sin[positions][:, None]  # (batch, 1, hd)
+    seq = torch.arange(batch, device=tokens.device)
+    mask = (packed.positions[None, :max_len] <= positions[:, None])[:, None, None]
+    for layer in range(config.num_layers):
+        norm = rms_norm(x, weights.input_ln[layer], config.rms_eps)
+        qkv = batch_linear(norm, packed.qkv[layer], rows)
+        q, k, v = qkv.split((q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), -1)
+        q = rms_norm(q.reshape(batch, q_heads, head_dim), weights.q_norm[layer], config.rms_eps)
+        k = rms_norm(k.reshape(batch, kv_heads, head_dim), weights.k_norm[layer], config.rms_eps)
+        q, k = rope(q, cos, sin), rope(k, cos, sin)
+        k_cache[layer][seq, :, positions] = k
+        v_cache[layer][seq, :, positions] = v.reshape(batch, kv_heads, head_dim)
+        attention = F.scaled_dot_product_attention(
+            q[:, :, None], k_cache[layer], v_cache[layer], attn_mask=mask, enable_gqa=True
+        ).reshape(batch, q_heads * head_dim)
+        x = x + batch_linear(attention, weights.o_proj[layer], rows)
+        norm = rms_norm(x, weights.post_ln[layer], config.rms_eps)
+        if config.is_moe:
+            x = x + moe_mlp_batch(config, packed, layer, norm)
+        else:
+            gate, up = batch_linear(norm, packed.gate_up[layer], rows).chunk(2, dim=-1)
+            x = x + batch_linear(F.silu(gate) * up, weights.down[layer], rows)
+    x = rms_norm(x, weights.final_norm, config.rms_eps)
+    return batch_linear(x, weights.lm_head, rows).float()
+
+
 @torch.no_grad()
 def profile_step(fn: Callable[[], torch.Tensor]) -> dict:
     for _ in range(3):

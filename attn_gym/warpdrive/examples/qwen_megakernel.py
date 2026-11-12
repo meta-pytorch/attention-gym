@@ -114,6 +114,8 @@ ATTN_ROWS, MIN_SPLITS = 128, 8
 SMEM_BYTES = 232448  # SM100 per-block shared memory (227 KB)
 SMEM_HEADROOM = 1024
 FETCH_ELEMENTS = 8  # residual elements per thread fetched in one poll (bounds registers)
+REDUCE_TOKENS = 4  # batched residual reduce: tokens per poll
+POLL_CHUNKS = 4  # batched prologue: 8-column chunks per poll
 COMPUTE_WARPS = 8
 ROWS_PER_WARP = ROWS // COMPUTE_WARPS
 COMPUTE_THREADS = 32 * COMPUTE_WARPS
@@ -153,20 +155,22 @@ def attention_groups(model: QwenConfig) -> tuple[int, int]:
 class ScratchLayout:
     """Offsets (in 64-bit words) of the tagged per-step intermediates."""
 
-    def __init__(self, model: QwenConfig, splits: int):
+    def __init__(self, model: QwenConfig, splits: int, batch: int = 1):
         layers, hidden = model.num_layers, model.hidden_size
         groups, per_row = attention_groups(model)
+        # Every buffer has a leading token axis (``batch`` sequences decoded together).
         self.shapes = {
-            "h_in": (layers + 1, hidden),  # layer inputs (residual); [layers]: LM head's
-            "qkv": (layers, qkv_rows(model)),
+            "h_in": (batch, layers + 1, hidden),  # layer inputs (residual); [layers]: LM head's
+            "qkv": (batch, layers, qkv_rows(model)),
             # Per attention row group (per_row q heads of one kv head) and KV split.
-            "attn_o": (layers, groups, splits, per_row, HEAD_DIM),  # unnormalized partial O
-            "attn_ml": (layers, groups, per_row, splits, 2),  # (m, l) per head, split; log2 m
-            "o_part": (layers, O_SPLITS, hidden),
-            "h_mid": (layers, hidden),  # residual after attention
-            "act": (layers, mlp_width(model)),
-            "d_part": (layers, DOWN_SPLITS, hidden),
-            "router_logits": (layers, model.num_experts or ROWS),  # MoE only
+            "attn_o": (batch, layers, groups, splits, per_row, HEAD_DIM),  # unnormalized O
+            "attn_ml": (batch, layers, groups, per_row, splits, 2),  # (m, l); log2 m
+            "o_part": (batch, layers, O_SPLITS, hidden),
+            # The residual after attention; h_in's per-token stride (layer [layers] unused).
+            "h_mid": (batch, layers + 1, hidden),
+            "act": (batch, layers, mlp_width(model)),
+            "d_part": (batch, layers, DOWN_SPLITS, hidden),
+            "router_logits": (batch, layers, model.num_experts or ROWS),  # MoE only
         }
         self.offsets, offset = {}, 0
         for name, shape in self.shapes.items():
@@ -409,8 +413,9 @@ class CudaCoreGemv:
 
     @cute.jit
     def tile(self, p: MegakernelParams, chans, env, xbuf, k_tiles, warp, lane):
-        """``(value, row, chans)``: one tile's dot products against ``xs[xbuf]``, this lane's
-        tile row and the advanced channel ends (``chans[0]`` is the weight ring)."""
+        """``(values, row, chans)``: one tile's dot products against ``xs[xbuf]`` (one per token:
+        this engine runs batch one), this lane's tile row and the advanced channel ends
+        (``chans[0]`` is the weight ring)."""
         w = chans[0]
         xs = p.xs[xbuf, None]
         acc = cute.make_rmem_tensor((ROWS_PER_WARP, 2), Float32)
@@ -439,7 +444,7 @@ class CudaCoreGemv:
         for r in cutlass.range_constexpr(ROWS_PER_WARP):
             acc[r, 0] = acc[r, 0] + acc[r, 1]
         v = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
-        return v, warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP), (w, *chans[1:])
+        return [v], warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP), (w, *chans[1:])
 
     def owns_row(self, warp, lane):
         return lane % (32 // ROWS_PER_WARP) == 0
@@ -457,6 +462,8 @@ class CudaCoreGemv:
 class QwenDecodeMegakernel(WarpSpecialized):
     rows, tile_k = ROWS, TILE_K  # a weight stage and work-item tile: rows x columns (16 KB)
     x_tail = 0  # bf16 elements after each GEMV input that an engine may read
+    x_buffers = 2  # GEMV input buffers: the next row's input is written while one is read
+    max_batch = 1
 
     def __init__(
         self,
@@ -465,6 +472,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         schedule: str = "static",
         roles: dict[str, RoleConfig] | None = None,
         model: QwenConfig = QWEN3_0_6B,
+        batch: int = 1,
     ):
         """``stages``: weight/KV ring depth in 16 KB stages; by default the most that fit in
         shared memory, up to ``MAX_STAGES``.
@@ -478,8 +486,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
         over a ``[slot][cta]`` table; needs every CTA resident), ``"atomic"`` claims rows in
         dependency order (``AtomicPersistent``, one row decoded ahead).
         ``roles``: placement by role name over the ``@role`` defaults.
-        ``model``: the Qwen3 shape (default Qwen3-0.6B); see ``check_model``."""
+        ``model``: the Qwen3 shape (default Qwen3-0.6B); see ``check_model``.
+        ``batch``: sequences decoded per launch, one token each (up to the engine's
+        ``max_batch``; dense models only)."""
         check_model(model)
+        if not 1 <= batch <= self.max_batch:
+            raise ValueError(
+                f"batch must be in [1, {self.max_batch}] for this engine, got {batch}"
+            )
+        if batch > 1 and model.is_moe:
+            raise ValueError("batched decoding supports dense models only")
+        self.batch = batch
+        # GEMV input rows stored in SMEM, S = batch: row t, column k at
+        # (k // 8) * S * 8 + t * 8 + k % 8. An MMA's B rows past the batch read the next column
+        # group (their D columns are discarded); see TcGen05Gemv.
+        self.x_rows = batch
         self.model = model
         self.layers, self.hidden = model.num_layers, model.hidden_size
         self.inter, self.vocab = mlp_width(model), model.vocab_size
@@ -512,7 +533,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             )
         self.roles = roles
         if splits is None:
-            splits = max(MIN_SPLITS, ATTN_ROWS // self.attn_groups)
+            # A batch multiplies the attention rows: split each sequence's KV that much less.
+            splits = max(1, max(MIN_SPLITS, ATTN_ROWS // self.attn_groups) // batch)
         if not 1 <= splits <= 32:
             raise ValueError(f"splits must be in [1, 32], got {splits}")
         self.splits = splits
@@ -522,7 +544,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if not 2 <= stages <= fit:
             raise ValueError(f"stages must be in [2, {fit}] for this model, got {stages}")
         self.stages = stages
-        self.scratch_layout = ScratchLayout(model, splits)
+        self.scratch_layout = ScratchLayout(model, splits, batch)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         kv = self.smem_plan.buffer("KV", BFloat16, align=1024, overlaps=w)
@@ -555,8 +577,22 @@ class QwenDecodeMegakernel(WarpSpecialized):
             + self.heads_per_split * self.splits * 2  # MLS
             + self.route_floats  # ROUTE
         )
-        x_bytes = 2 * 2 * (self.x_width + self.x_tail)
+        x_bytes = 2 * self.x_buffers * self.x_stride
         return x_bytes + 4 * floats + SMEM_HEADROOM
+
+    @property
+    def x_stride(self) -> int:
+        """bf16 elements of one GEMV input buffer: x_rows rows of x_width, plus the tail."""
+        return self.x_rows * self.x_width + self.x_tail
+
+    def x_index(self, t, k):
+        """Element of GEMV input row t, column k (see x_rows)."""
+        if cutlass.const_expr(self.x_rows == 1):
+            return k
+        return (k // 8) * (self.x_rows * 8) + t * 8 + k % 8
+
+    def x_buffer(self, p: MegakernelParams, xbuf):
+        return p.xs[xbuf % self.x_buffers, None]
 
     @property
     def route_floats(self) -> int:
@@ -576,7 +612,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
     def get_name(self) -> str:
         return (
             f"warpdrive_qwen_decode_h{self.hidden}{f'_moe{self.experts}' if self.moe else ''}"
-            f"_s{self.stages}_kv{self.splits}_"
+            f"_s{self.stages}_kv{self.splits}{f'_b{self.batch}' if self.batch > 1 else ''}_"
             f"{self.work.get_key()}{self.trace_key()}"
         )
 
@@ -588,8 +624,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         w = w.views(W=p.sW, KV=p.sKV)
         tma_qkv, tma_o, tma_gu, tma_d, tma_lm, tma_router, tma_k, tma_v = p.tma
         g_qkv, g_o, g_gu, g_d, g_lm, g_router, g_k, g_v = p.gmem
-        pos = p.step[1]
-        max_len = p.k_cache.shape[0] // (self.layers * self.kv_heads)
+        max_len = p.k_cache.shape[0] // (self.batch * self.layers * self.kv_heads)
         # MoE: the expert rows to load follow the layer's routing, recomputed once per layer.
         epoch = p.state[0] + 1
         lane = cute.arch.lane_idx()
@@ -602,8 +637,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     self.route(p, layer, lane, epoch, chosen)
                     routed_layer = layer
             if op == ATTN:
-                blk0, blk1 = self.split_blocks(pos, b)
-                row0 = (layer * self.kv_heads + self.kv_head(a)) * (max_len // BLOCK)
+                t, split = self.attn_token(b)
+                blk0, blk1 = self.split_blocks(p.step[t, 1], split)
+                head = (t * self.layers + layer) * self.kv_heads + self.kv_head(a)
+                row0 = head * (max_len // BLOCK)
                 for blk in cutlass.range(blk0, blk1, unroll=1):
                     w = self.load_tiles(w, tma_k, g_k, row0 + blk, 0, 1, "KV")
                     w = self.load_tiles(w, tma_v, g_v, row0 + blk, 0, 1, "KV")
@@ -751,26 +788,46 @@ class QwenDecodeMegakernel(WarpSpecialized):
         the channel ends and the cursor."""
         tid, warp, lane = me.tid, me.warp, me.lane
         ctas = cute.arch.grid_dim()[0]
-        pos = p.step[1]
-        token = p.step[0]
         epoch = p.state[0] + 1
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
             op, layer, a, b, row = work.item
             if op == ATTN:
-                w = self.attention(p, chans[0], layer, a, b, pos, epoch, tid, warp, lane, row)
+                t, split = self.attn_token(b)
+                pos = p.step[t, 1]
+                w = self.attention(
+                    p, chans[0], layer, a, split, t, pos, epoch, tid, warp, lane, row
+                )
                 chans = (w, *chans[1:])
             else:
                 new, xkey, xbuf = self.next_input(op, layer, a, b, xkey, xbuf)
                 if new:
                     ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
-                    self.prologue(p, op, layer, a, ks, token, epoch, xbuf, tid, warp, lane, row)
+                    if cutlass.const_expr(self.batch > 1):
+                        self.prologue_by_warp(
+                            p, op, layer, a, ks, epoch, xbuf, tid, warp, lane, row
+                        )
+                    else:
+                        self.prologue(p, op, layer, a, ks, epoch, xbuf, tid, warp, lane, row)
                     self.csync.sync()
                 chans = self.engine.input_ready(chans)
                 chans = self.gemv(p, chans, env, op, layer, a, b, epoch, xbuf, warp, lane, row)
-                if (op == DOWN) & (b == DOWN_SPLITS - 1) & (tid < self.rows):
-                    self.reduce_down(p, layer, a * self.rows + tid, epoch, row)
+                # The last split publishes the residual its consumers read: down's always, o_proj's
+                # (h_mid) when batched, so a batch's gate/up rows read one word per element.
+                last = b == DOWN_SPLITS - 1
+                reduces = op == DOWN
+                if cutlass.const_expr(self.batch > 1):
+                    reduces = reduces | (op == OPROJ)
+                if cutlass.const_expr(self.batch == 1):
+                    if reduces & last & (tid < self.rows):
+                        col = a * self.rows + tid
+                        self.reduce_residual(p, op, layer, col, 0, 1, epoch, row)
+                elif reduces & last:
+                    # Every compute thread: column tid % rows, token group tid // rows.
+                    col = a * self.rows + tid % self.rows
+                    groups = COMPUTE_THREADS // self.rows
+                    self.reduce_residual(p, op, layer, col, tid // self.rows, groups, epoch, row)
             work.advance()
         # Every CTA has read the epoch by the time it finishes; the last one advances it.
         if tid == 0:
@@ -791,6 +848,12 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return blocks, (blocks + self.splits - 1) // self.splits
 
     @cute.jit
+    def attn_token(self, b):
+        """An attention row's (token, KV split) from its b word, t * splits + split."""
+        t = b // self.splits
+        return t, b - t * self.splits
+
+    @cute.jit
     def split_blocks(self, pos, split):
         """KV blocks ``[blk0, blk1)`` of positions ``[0, pos)`` that ``split`` reads."""
         blocks, per = self.kv_blocks(pos)
@@ -799,13 +862,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return blk0, cutlass.max(blk1, blk0)
 
     @cute.jit
-    def prologue(
-        self, p: MegakernelParams, op, layer, a, ks, token, epoch, xbuf, tid, warp, lane, row
-    ):
-        """Fetch the row's inputs and write its GEMV input to ``xs[xbuf]``; the caller syncs.
-        The norm weight loads before the poll; the ``poll`` region ends when the inputs are
-        ready."""
-        xs = p.xs[xbuf, None]
+    def prologue(self, p: MegakernelParams, op, layer, a, ks, epoch, xbuf, tid, warp, lane, row):
+        """Fetch the row's inputs and write its GEMV input, one row per token, to ``xs[xbuf]``;
+        the caller syncs. The norm weight loads before the poll; the ``poll`` region ends when the
+        inputs are ready."""
+        xs = self.x_buffer(p, xbuf)
         n = self.per_thread
         norm_weight = cute.make_rmem_tensor((n,), Float32)
         if op == QKV:
@@ -814,69 +875,183 @@ class QwenDecodeMegakernel(WarpSpecialized):
             load_into(norm_weight, p.ln_post[layer, None], n * tid, n)
         elif op == LMHEAD:
             load_into(norm_weight, p.final_norm, n * tid, n)
-        x = cute.make_rmem_tensor((n,), Float32)
-        if op == QKV:
-            if layer == 0:
-                load_into(x, p.embed[token, None], n * tid, n)
-                if a == 0:
-                    for e in cutlass.range_constexpr(n):
-                        publish(p.h_in, self.hidden_index(0, n * tid + e), x[e], epoch)
+        for t in cutlass.range(self.batch, unroll=1):
+            x = cute.make_rmem_tensor((n,), Float32)
+            if op == QKV:
+                if layer == 0:
+                    load_into(x, p.embed[p.step[t, 0], None], n * tid, n)
+                    if a == 0:
+                        for e in cutlass.range_constexpr(n):
+                            index = self.hidden_index(t, 0, n * tid + e)
+                            publish(p.h_in, index, x[e], epoch)
+                else:
+                    self.published_residual(x, p.h_in, t, layer, epoch, tid, row)
+                self.rms_norm(p, x, norm_weight, xs, t, tid, warp, lane)
+            elif (op == GATEUP) | (op == ROUTER):
+                # The MLP input: RMSNorm of the residual after attention. For MoE the router runs
+                # first and its row 0 publishes h_mid; the expert rows read it back and route.
+                if cutlass.const_expr(self.moe) and op == GATEUP:
+                    self.published_residual(x, p.h_mid, t, layer, epoch, tid, row)
+                else:
+                    self.residual(x, p.h_in, p.o_part, t, layer, epoch, tid, row)
+                    if a == 0:
+                        for e in cutlass.range_constexpr(n):
+                            index = self.hidden_index(t, layer, n * tid + e)
+                            publish(p.h_mid, index, x[e], epoch)
+                self.rms_norm(p, x, norm_weight, xs, t, tid, warp, lane)
+            elif op == LMHEAD:
+                self.published_residual(x, p.h_in, t, layer, epoch, tid, row)  # layer == layers
+                self.rms_norm(p, x, norm_weight, xs, t, tid, warp, lane)
+            elif op == DOWN:
+                span = self.inter // DOWN_SPLITS
+                count = span // COMPUTE_THREADS
+                vals = cute.make_rmem_tensor((count,), Float32)
+                segments = []
+                for i in cutlass.range_constexpr(count):
+                    index = self.act_index(t, layer, ks * span + i * COMPUTE_THREADS + tid)
+                    segments.append((p.act, index, 1))
+                with self.trace_region("poll", payload=row):
+                    fetch(segments, vals, epoch)
+                for i in cutlass.range_constexpr(count):
+                    xs[self.x_index(t, i * COMPUTE_THREADS + tid)] = BFloat16(vals[i])
             else:
-                self.published_residual(x, p.h_in, layer, epoch, tid, row)
-            self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
-        elif (op == GATEUP) | (op == ROUTER):
-            # The MLP input: RMSNorm of the residual after attention. For MoE the router runs
-            # first and its row 0 publishes h_mid; the expert rows read it back and route.
-            if cutlass.const_expr(self.moe) and op == GATEUP:
-                self.published_residual(x, p.h_mid, layer, epoch, tid, row)
-            else:
-                self.residual(x, p.h_in, p.o_part, layer, epoch, tid, row)
-                if a == 0:
-                    for e in cutlass.range_constexpr(n):
-                        publish(p.h_mid, self.hidden_index(layer, n * tid + e), x[e], epoch)
-            self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
-            if cutlass.const_expr(self.moe):
-                if (op == GATEUP) & (warp == 0):
-                    chosen = cute.make_rmem_tensor((self.top_k,), Int32)
-                    self.route(p, layer, lane, epoch, chosen, p.route[xbuf, None])
-        elif op == LMHEAD:
-            self.published_residual(x, p.h_in, layer, epoch, tid, row)  # layer == layers
-            self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
+                self.combine_attention(p, layer, ks, t, epoch, xs, tid, row)
+            if cutlass.const_expr(self.batch > 1):
+                self.csync.sync()  # the next token rewrites red and mls
+        if cutlass.const_expr(self.moe):
+            if (op == GATEUP) & (warp == 0):
+                chosen = cute.make_rmem_tensor((self.top_k,), Int32)
+                self.route(p, layer, lane, epoch, chosen, p.route[xbuf, None])
+
+    @cute.jit
+    def prologue_by_warp(
+        self, p: MegakernelParams, op, layer, a, ks, epoch, xbuf, tid, warp, lane, row
+    ):
+        """``prologue`` with each warp building whole tokens' inputs (token t on warp t % 8), so
+        a batch needs no block barriers: lane l owns 8-column chunks l, l + 32, ..., polled
+        POLL_CHUNKS at a time. A first pass writes the raw input row and its sum of squares, a
+        second normalizes it in place."""
+        xs = self.x_buffer(p, xbuf)
+        if op == OPROJ:
+            for t in cutlass.range(warp, self.batch, COMPUTE_WARPS, unroll=1):
+                self.combine_attention_by_warp(p, layer, ks, t, epoch, xs, lane, row)
         elif op == DOWN:
             span = self.inter // DOWN_SPLITS
-            count = span // COMPUTE_THREADS
-            vals = cute.make_rmem_tensor((count,), Float32)
-            segments = []
-            for i in cutlass.range_constexpr(count):
-                index = self.act_index(layer, ks * span + i * COMPUTE_THREADS + tid)
-                segments.append((p.act, index, 1))
+            for t in cutlass.range(warp, self.batch, COMPUTE_WARPS, unroll=1):
+                base = self.act_index(t, layer, ks * span)
+                self.poll_chunks(p.act, base, span // 256, xs, t, lane, epoch, row)
+        else:
+            norm_weight = p.final_norm
+            if op == QKV:
+                norm_weight = p.ln_in[layer, None]
+            elif op == GATEUP:
+                norm_weight = p.ln_post[layer, None]
+            chunks = self.hidden // 256
+            for t in cutlass.range(warp, self.batch, COMPUTE_WARPS, unroll=1):
+                if (op == QKV) & (layer == 0):
+                    for c in cutlass.range_constexpr(chunks):
+                        k0 = c * 256 + lane * 8
+                        x = cute.make_rmem_tensor((8,), Float32)
+                        load_into(x, p.embed[p.step[t, 0], None], k0, 8)
+                        if a == 0:
+                            for e in cutlass.range_constexpr(8):
+                                publish(p.h_in, self.hidden_index(t, 0, k0 + e), x[e], epoch)
+                        store_vec(xs, self.x_index(t, k0), x, 8)
+                else:
+                    # QKV past layer 0 and the LM head read h_in; gate/up reads h_mid, which
+                    # o_proj's last split publishes (``reduce_residual``).
+                    buf = p.h_mid if op == GATEUP else p.h_in
+                    base = self.hidden_index(t, layer, 0)
+                    self.poll_chunks(buf, base, chunks, xs, t, lane, epoch, row)
+                ss = Float32(0.0)
+                for c in cutlass.range_constexpr(chunks):
+                    x = load_vec(xs, self.x_index(t, c * 256 + lane * 8), 8)
+                    for e in cutlass.range_constexpr(8):
+                        ss = ss + x[e] * x[e]
+                ss = group_sum(ss, 32)
+                rinv = cute.math.rsqrt(ss / self.hidden + self.model.rms_eps)
+                for c in cutlass.range_constexpr(chunks):
+                    k0 = c * 256 + lane * 8
+                    x = load_vec(xs, self.x_index(t, k0), 8)
+                    wv = load_vec(norm_weight, k0, 8)
+                    for e in cutlass.range_constexpr(8):
+                        x[e] = bf16_round(wv[e] * bf16_round(x[e] * rinv))
+                    store_vec(xs, self.x_index(t, k0), x, 8)
+
+    @cute.jit
+    def poll_chunks(self, buf, base, chunks: cutlass.Constexpr, xs, t, lane, epoch, row):
+        """Columns base + 256c + 8 lane + (0..7) of a tagged buffer into GEMV input row t, for
+        c < chunks, POLL_CHUNKS chunks per poll."""
+        for c0 in cutlass.range_constexpr(0, chunks, POLL_CHUNKS):
+            n = min(POLL_CHUNKS, chunks - c0)
+            vals = cute.make_rmem_tensor((8 * n,), Float32)
+            segments = [(buf, base + (c0 + c) * 256 + lane * 8, 8) for c in range(n)]
             with self.trace_region("poll", payload=row):
                 fetch(segments, vals, epoch)
-            for i in cutlass.range_constexpr(count):
-                xs[i * COMPUTE_THREADS + tid] = BFloat16(vals[i])
-        else:
-            self.combine_attention(p, layer, ks, epoch, xs, tid, row)
+            for c in cutlass.range_constexpr(n):
+                x = cute.make_rmem_tensor((8,), Float32)
+                for e in cutlass.range_constexpr(8):
+                    x[e] = vals[8 * c + e]
+                store_vec(xs, self.x_index(t, (c0 + c) * 256 + lane * 8), x, 8)
+
+    @cute.jit
+    def combine_attention_by_warp(self, p: MegakernelParams, layer, ks, t, epoch, xs, lane, row):
+        """Token t's o_proj input slice ``ks`` on one warp: lane l merges dim pairs l and l + 32
+        of each of the slice's heads from their KV-split partials, one poll per head (the same
+        arithmetic as ``combine_attention``, without SMEM or block barriers)."""
+        splits = self.splits
+        for hh in cutlass.range_constexpr(self.heads_per_split):
+            q_head = ks * self.heads_per_split + hh
+            group = q_head // self.per_row
+            head = q_head % self.per_row
+            # (m, l) per split, then dims (2 lane, 2 lane + 1) and (64 + 2 lane, ...) per split.
+            ml_base = self.attn_ml_index(t, layer, group, head, 0, 0)
+            segments = [(p.attn_ml, ml_base + 2 * sp, 2) for sp in range(splits)]
+            for half in cutlass.range_constexpr(2):
+                d = (lane + 32 * half) * 2
+                for sp in cutlass.range_constexpr(splits):
+                    segments.append((p.attn_o, self.attn_o_index(t, layer, group, sp, head, d), 2))
+            vals = cute.make_rmem_tensor((6 * splits,), Float32)
+            with self.trace_region("poll", payload=row):
+                fetch(segments, vals, epoch)
+            m = Float32(-1e30)
+            for sp in cutlass.range_constexpr(splits):
+                m = cutlass.max(m, vals[2 * sp])
+            den = Float32(0.0)
+            for sp in cutlass.range_constexpr(splits):
+                den = den + vals[2 * sp + 1] * cute.math.exp2(vals[2 * sp] - m)
+            for half in cutlass.range_constexpr(2):
+                d = (lane + 32 * half) * 2
+                num0 = Float32(0.0)
+                num1 = Float32(0.0)
+                for sp in cutlass.range_constexpr(splits):
+                    scale = cute.math.exp2(vals[2 * sp] - m)
+                    o = 2 * splits + (half * splits + sp) * 2
+                    num0 = num0 + vals[o] * scale
+                    num1 = num1 + vals[o + 1] * scale
+                xs[self.x_index(t, hh * HEAD_DIM + d)] = BFloat16(num0 / den)
+                xs[self.x_index(t, hh * HEAD_DIM + d + 1)] = BFloat16(num1 / den)
 
     def kv_head(self, group):
         """The kv head of attention row group ``group`` (q heads ``group * per_row``, ...)."""
         return group * self.per_row // self.group_size
 
-    def qkv_index(self, layer, i):
-        return layer * self.qkv_rows + i
+    def qkv_index(self, t, layer, i):
+        return (t * self.layers + layer) * self.qkv_rows + i
 
-    def hidden_index(self, layer, i):
+    def hidden_index(self, t, layer, i):
         """h_in, h_mid."""
-        return layer * self.hidden + i
+        return (t * (self.layers + 1) + layer) * self.hidden + i
 
-    def part_index(self, layer, split, i):
+    def part_index(self, t, layer, split, i):
         """o_part, d_part."""
-        return (layer * O_SPLITS + split) * self.hidden + i
+        return ((t * self.layers + layer) * O_SPLITS + split) * self.hidden + i
 
-    def act_index(self, layer, i):
-        return layer * self.inter + i
+    def act_index(self, t, layer, i):
+        return (t * self.layers + layer) * self.inter + i
 
     @cute.jit
-    def residual(self, x, base, parts, layer, epoch, tid, row):
+    def residual(self, x, base, parts, t, layer, epoch, tid, row):
         """x = bf16(base + bf16(sum of split-K partials)) for this thread's elements, polled
         ``FETCH_ELEMENTS`` at a time: all of them at once would spill past 8 per thread."""
         splits = O_SPLITS
@@ -885,9 +1060,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
             for c0 in cutlass.range_constexpr(0, n, FETCH_ELEMENTS):
                 chunk = min(FETCH_ELEMENTS, n - c0)
                 vals = cute.make_rmem_tensor((chunk * (splits + 1),), Float32)
-                segments = [(base, self.hidden_index(layer, n * tid + c0), chunk)]
+                segments = [(base, self.hidden_index(t, layer, n * tid + c0), chunk)]
                 for k in cutlass.range_constexpr(splits):
-                    segments.append((parts, self.part_index(layer, k, n * tid + c0), chunk))
+                    segments.append((parts, self.part_index(t, layer, k, n * tid + c0), chunk))
                 fetch(segments, vals, epoch)
                 for e in cutlass.range_constexpr(chunk):
                     total = vals[chunk + e]
@@ -896,34 +1071,58 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     x[c0 + e] = bf16_round(vals[e] + bf16_round(total))
 
     @cute.jit
-    def published_residual(self, x, buf, layer, epoch, tid, row):
+    def published_residual(self, x, buf, t, layer, epoch, tid, row):
         """This thread's elements of the finished residual ``buf[layer]``."""
         n = self.per_thread
         with self.trace_region("poll", payload=row):
-            fetch([(buf, self.hidden_index(layer, n * tid), n)], x, epoch)
+            fetch([(buf, self.hidden_index(t, layer, n * tid), n)], x, epoch)
 
     @cute.jit
-    def reduce_down(self, p: MegakernelParams, layer, col, epoch, row):
+    def reduce_residual(self, p: MegakernelParams, op, layer, col, group, groups, epoch, row):
         """Publish the next layer's residual column ``col`` = bf16(h_mid + bf16(sum of the
         down partials)), summed in split order like ``residual``.
 
         The last down split runs it after publishing its own partial: that split finishes
         last (its GATEUP rows are the second wave), and QKV and the LM head then fetch 1 word
         per element instead of 5."""
-        vals = cute.make_rmem_tensor((DOWN_SPLITS + 1,), Float32)
-        segments = [(p.h_mid, self.hidden_index(layer, col), 1)]
-        for k in cutlass.range_constexpr(DOWN_SPLITS):
-            segments.append((p.d_part, self.part_index(layer, k, col), 1))
-        with self.trace_region("reduce.poll", payload=row):
-            fetch(segments, vals, epoch)
-        total = vals[1]
-        for k in cutlass.range_constexpr(2, DOWN_SPLITS + 1):
-            total = total + vals[k]
-        h = bf16_round(vals[0] + bf16_round(total))
-        publish(p.h_in, self.hidden_index(layer + 1, col), h, epoch)
+        base, parts, out, out_layer = p.h_mid, p.d_part, p.h_in, layer + 1
+        if op == OPROJ:
+            base, parts, out, out_layer = p.h_in, p.o_part, p.h_mid, layer
+        if cutlass.const_expr(self.batch == 1):
+            self.reduce_tokens(p, base, parts, out, layer, out_layer, col, 0, 1, epoch, row)
+        else:
+            # Token group ``group`` of ``groups`` takes REDUCE_TOKENS tokens per poll (one round
+            # trip for all their words), every ``groups``-th such run.
+            step = groups * REDUCE_TOKENS
+            for t in cutlass.range(group * REDUCE_TOKENS, self.batch, step, unroll=1):
+                self.reduce_tokens(
+                    p, base, parts, out, layer, out_layer, col, t, REDUCE_TOKENS, epoch, row
+                )
 
     @cute.jit
-    def rms_norm(self, p: MegakernelParams, x, wv, xs, tid, warp, lane):
+    def reduce_tokens(
+        self, p, base, parts, out, layer, out_layer, col, t0, count: cutlass.Constexpr, epoch, row
+    ):
+        """Residual column col of tokens t0 .. t0 + count - 1 (those below the batch)."""
+        vals = cute.make_rmem_tensor((count * (DOWN_SPLITS + 1),), Float32)
+        segments = []
+        for i in cutlass.range_constexpr(count):
+            t = cutlass.min(t0 + i, self.batch - 1)
+            segments.append((base, self.hidden_index(t, layer, col), 1))
+            for k in cutlass.range_constexpr(DOWN_SPLITS):
+                segments.append((parts, self.part_index(t, layer, k, col), 1))
+        with self.trace_region("reduce.poll", payload=row):
+            fetch(segments, vals, epoch)
+        for i in cutlass.range_constexpr(count):
+            total = vals[i * (DOWN_SPLITS + 1) + 1]
+            for k in cutlass.range_constexpr(2, DOWN_SPLITS + 1):
+                total = total + vals[i * (DOWN_SPLITS + 1) + k]
+            h = bf16_round(vals[i * (DOWN_SPLITS + 1)] + bf16_round(total))
+            if t0 + i < self.batch:
+                publish(out, self.hidden_index(t0 + i, out_layer, col), h, epoch)
+
+    @cute.jit
+    def rms_norm(self, p: MegakernelParams, x, wv, xs, t, tid, warp, lane):
         """HF RMSNorm of the hidden vector held ``per_thread`` per thread:
         bf16(w * bf16(x * rsqrt)), to xs."""
         n = self.per_thread
@@ -940,20 +1139,24 @@ class QwenDecodeMegakernel(WarpSpecialized):
         rinv = cute.math.rsqrt(total / self.hidden + self.model.rms_eps)
         for e in cutlass.range_constexpr(n):
             x[e] = bf16_round(wv[e] * bf16_round(x[e] * rinv))
-        store_vec(xs, n * tid, x, n)
+        if cutlass.const_expr(self.x_rows == 1):
+            store_vec(xs, n * tid, x, n)
+        else:
+            for e in cutlass.range_constexpr(n):
+                xs[self.x_index(t, n * tid + e)] = BFloat16(x[e])
 
-    def attn_o_index(self, layer, group, split, head, d):
+    def attn_o_index(self, t, layer, group, split, head, d):
         """``head``: within the attention row group."""
-        index = (layer * self.attn_groups + group) * self.splits + split
+        index = ((t * self.layers + layer) * self.attn_groups + group) * self.splits + split
         return (index * self.per_row + head) * HEAD_DIM + d
 
-    def attn_ml_index(self, layer, group, head, split, k):
+    def attn_ml_index(self, t, layer, group, head, split, k):
         """k = 0: m (log2 domain), 1: l. Consecutive q heads' words are contiguous."""
-        index = (layer * self.attn_groups + group) * self.per_row + head
+        index = ((t * self.layers + layer) * self.attn_groups + group) * self.per_row + head
         return (index * self.splits + split) * 2 + k
 
     @cute.jit
-    def combine_attention(self, p: MegakernelParams, layer, ks, epoch, xs, tid, row):
+    def combine_attention(self, p: MegakernelParams, layer, ks, t, epoch, xs, tid, row):
         """o_proj input slice ``ks``: its ``heads_per_split`` q heads merged from their KV-split
         partials.
 
@@ -961,7 +1164,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         (m, l) words are contiguous; the first pass's poll also fetches them into SMEM."""
         pairs = 2 * self.splits  # (m, l) words per head
         ml_words = self.heads_per_split * pairs
-        ml_base = self.attn_ml_index(layer, 0, 0, 0, 0) + ks * ml_words
+        ml_base = self.attn_ml_index(t, layer, 0, 0, 0, 0) + ks * ml_words
         ml_fetches = (ml_words + COMPUTE_THREADS - 1) // COMPUTE_THREADS
         dim_pairs = self.heads_per_split * HEAD_DIM // 2
         for c in cutlass.range_constexpr((dim_pairs + COMPUTE_THREADS - 1) // COMPUTE_THREADS):
@@ -978,7 +1181,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     segments.append((p.attn_ml, ml_base + word, 1))
             first = len(segments)
             for sp in cutlass.range_constexpr(self.splits):
-                segments.append((p.attn_o, self.attn_o_index(layer, group, sp, head, d), 2))
+                segments.append((p.attn_o, self.attn_o_index(t, layer, group, sp, head, d), 2))
             vals = cute.make_rmem_tensor((first + 2 * self.splits,), Float32)
             with self.trace_region("poll", payload=row):
                 fetch(segments, vals, epoch)
@@ -999,8 +1202,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 num0 = num0 + vals[first + 2 * sp] * scale
                 num1 = num1 + vals[first + 1 + 2 * sp] * scale
             if tid + c * COMPUTE_THREADS < dim_pairs:
-                xs[hh * HEAD_DIM + d] = BFloat16(num0 / den)
-                xs[hh * HEAD_DIM + d + 1] = BFloat16(num1 / den)
+                xs[self.x_index(t, hh * HEAD_DIM + d)] = BFloat16(num0 / den)
+                xs[self.x_index(t, hh * HEAD_DIM + d + 1)] = BFloat16(num1 / den)
 
     @cute.jit
     def gemv(
@@ -1011,8 +1214,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         k_tiles, row_tiles = self.gemv_tiles(op, b)
         for t in cutlass.range(row_tiles, unroll=1):
             with self.trace_region("stream", payload=row_index):
-                v, row, chans = self.engine.tile(p, chans, env, xbuf, k_tiles, warp, lane)
-            self.epilogue(p, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane)
+                vals, row, chans = self.engine.tile(p, chans, env, xbuf, k_tiles, warp, lane)
+            self.epilogue(p, op, layer, a, b, t, vals, row, epoch, xbuf, warp, lane)
         return chans
 
     @cute.jit
@@ -1026,40 +1229,58 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return k_tiles, cutlass.select_(op == LMHEAD, b, 1)
 
     @cute.jit
-    def epilogue(self, p: MegakernelParams, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane):
-        """Publish one tile's results: ``v`` is the dot product of tile row ``row``, valid on the
-        lanes the engine says own it."""
-        if op == GATEUP:
-            # Tile rows alternate gate, up: the owner of gate row 2j gets up row 2j + 1's value.
-            up = self.engine.pair_value(v)
-            if self.engine.owns_pair(warp, lane):
-                g = bf16_round(v)
-                silu = bf16_round(g / (1.0 + cute.math.exp2(-g * LOG2E)))
-                out = bf16_round(silu * bf16_round(up))
-                if cutlass.const_expr(self.moe):
-                    # Fold slot s's routing weight in here, so down sums plain partials.
-                    slot = a // (2 * self.expert_inter // self.rows)
-                    out = bf16_round(out * p.route[xbuf, slot])
-                publish(p.act, self.act_index(layer, a * (self.rows // 2) + row // 2), out, epoch)
-        elif self.engine.owns_row(warp, lane):
-            if op == QKV:
-                publish(p.qkv, self.qkv_index(layer, a * self.rows + row), bf16_round(v), epoch)
-            elif op == OPROJ:
-                publish(p.o_part, self.part_index(layer, b, a * self.rows + row), v, epoch)
-            elif op == DOWN:
-                publish(p.d_part, self.part_index(layer, b, a * self.rows + row), v, epoch)
-            elif op == ROUTER:
-                index = layer * self.experts + a * self.rows + row
-                publish(p.router_logits, index, bf16_round(v), epoch)
-            else:
-                p.logits[(a + t) * self.rows + row] = bf16_round(v)
+    def epilogue(
+        self, p: MegakernelParams, op, layer, a, b, tile, vals, row, epoch, xbuf, warp, lane
+    ):
+        """Publish one tile's results: ``vals[t]`` is token t's dot product of tile row ``row``,
+        valid on the lanes the engine says own it."""
+        for t in cutlass.range_constexpr(self.batch):
+            v = vals[t]
+            if op == GATEUP:
+                # Tile rows alternate gate, up: the owner of gate row 2j gets up row 2j + 1's.
+                up = self.engine.pair_value(v)
+                if self.engine.owns_pair(warp, lane):
+                    g = bf16_round(v)
+                    silu = bf16_round(g / (1.0 + cute.math.exp2(-g * LOG2E)))
+                    out = bf16_round(silu * bf16_round(up))
+                    if cutlass.const_expr(self.moe):
+                        # Fold slot s's routing weight in here, so down sums plain partials.
+                        slot = a // (2 * self.expert_inter // self.rows)
+                        out = bf16_round(out * p.route[xbuf, slot])
+                    index = self.act_index(t, layer, a * (self.rows // 2) + row // 2)
+                    publish(p.act, index, out, epoch)
+            elif self.engine.owns_row(warp, lane):
+                if op == QKV:
+                    index = self.qkv_index(t, layer, a * self.rows + row)
+                    publish(p.qkv, index, bf16_round(v), epoch)
+                elif op == OPROJ:
+                    publish(p.o_part, self.part_index(t, layer, b, a * self.rows + row), v, epoch)
+                elif op == DOWN:
+                    publish(p.d_part, self.part_index(t, layer, b, a * self.rows + row), v, epoch)
+                elif op == ROUTER:
+                    index = layer * self.experts + a * self.rows + row
+                    publish(p.router_logits, index, bf16_round(v), epoch)
+                else:
+                    p.logits[t, (a + tile) * self.rows + row] = bf16_round(v)
 
     @cute.jit
     def attention(
-        self, p: MegakernelParams, w, layer, group, split, pos, epoch, tid, warp, lane, row_index
+        self,
+        p: MegakernelParams,
+        w,
+        layer,
+        group,
+        split,
+        t,
+        pos,
+        epoch,
+        tid,
+        warp,
+        lane,
+        row_index,
     ):
-        """Flash-decoding partial of attention row group ``group`` (``per_row`` q heads of one
-        kv head) over one KV split.
+        """Flash-decoding partial of token ``t``'s attention row group ``group`` (``per_row`` q
+        heads of one kv head) over one KV split.
 
         The new token's q heads, k and v are fetched once into SMEM. Warp w scores
         positions 8w + 4i + g (i = 0, 1) of each 64-position block: lane group g = lane // 8
@@ -1071,7 +1292,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         d0 = 8 * j
         heads = self.per_row
         kvh = self.kv_head(group)
-        max_len = p.k_cache.shape[0] // (self.layers * self.kv_heads)
+        max_len = p.k_cache.shape[0] // (self.batch * self.layers * self.kv_heads)
         # Warps 0 .. heads - 1 norm and rotate the q heads, warp ``heads`` k: lane l owns dims
         # 2l, 2l + 1 and their rotate-half partners 64 + 2l, 65 + 2l. Norm weights and RoPE
         # depend on no other row, so they load before the fetch.
@@ -1101,7 +1322,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         column = cutlass.select_(word >= q_words + HEAD_DIM, v_column, column)
         raw = cute.make_rmem_tensor((2,), Float32)
         with self.trace_region("poll", payload=row_index):
-            fetch([(p.qkv, self.qkv_index(layer, column), 2)], raw, epoch)
+            fetch([(p.qkv, self.qkv_index(t, layer, column), 2)], raw, epoch)
         if cutlass.const_expr(q_words + 2 * HEAD_DIM < 2 * COMPUTE_THREADS):
             if 2 * tid == word:
                 p.qkvs[word] = raw[0]
@@ -1133,9 +1354,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 with w.consume() as h:
                     sK = h.data["KV"]
                     for i in cutlass.range_constexpr(2):
-                        t = 8 * warp + 4 * i + g
-                        kv = self.stage_row(sK, t, d0)
-                        valid = blk * BLOCK + t < pos
+                        pt = 8 * warp + 4 * i + g
+                        kv = self.stage_row(sK, pt, d0)
+                        valid = blk * BLOCK + pt < pos
                         for hq in cutlass.range_constexpr(heads):
                             dot = Float32(0.0)
                             for e in cutlass.range_constexpr(16):
@@ -1159,9 +1380,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 with w.consume() as h:
                     sV = h.data["KV"]
                     for i in cutlass.range_constexpr(2):
-                        t = 8 * warp + 4 * i + g
-                        if blk * BLOCK + t < pos:  # masked: p is 0 but stale v may be NaN
-                            vv = self.stage_row(sV, t, d0)
+                        pt = 8 * warp + 4 * i + g
+                        if blk * BLOCK + pt < pos:  # masked: p is 0 but stale v may be NaN
+                            vv = self.stage_row(sV, pt, d0)
                             for hq in cutlass.range_constexpr(heads):
                                 for e in cutlass.range_constexpr(16):
                                     o[hq, e] = o[hq, e] + pr[hq, i] * vv[e]
@@ -1174,15 +1395,20 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # pos (K scores select -inf, V is skipped), so the racing store's value never matters.
         if (split == writer) & (group * heads % self.group_size == 0):
             if tid < 8:  # warp 0, lane group 0
-                row = (layer * self.kv_heads + kvh) * max_len + pos
+                row = ((t * self.layers + layer) * self.kv_heads + kvh) * max_len + pos
+                # A batch's caches can pass 2^31 elements: offset the row in 64 bits.
+                offset = Int64(row) * HEAD_DIM
+                row_layout = cute.make_layout((HEAD_DIM,))
+                k_row = cute.make_tensor(p.k_cache.iterator + offset, row_layout)
+                v_row = cute.make_tensor(p.v_cache.iterator + offset, row_layout)
                 for half in cutlass.range_constexpr(2):
                     kf = cute.make_rmem_tensor((8,), Float32)
                     vf = cute.make_rmem_tensor((8,), Float32)
                     for e in cutlass.range_constexpr(8):
                         kf[e] = k_new[half * 8 + e]
                         vf[e] = v_new[half * 8 + e]
-                    store_vec(p.k_cache[row, None], d0 + 64 * half, kf, 8)
-                    store_vec(p.v_cache[row, None], d0 + 64 * half, vf, 8)
+                    store_vec(k_row, d0 + 64 * half, kf, 8)
+                    store_vec(v_row, d0 + 64 * half, vf, 8)
         # Merge the four lane groups (they share m), then publish this warp's state to SMEM.
         for hq in cutlass.range_constexpr(heads):
             lsum[hq] = lsum[hq] + cute.arch.shuffle_sync_bfly(lsum[hq], offset=8)
@@ -1221,14 +1447,14 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # HEAD_DIM.. sit out (their head's ATT columns do not exist).
         if cutlass.const_expr(heads * HEAD_DIM < COMPUTE_THREADS):
             if tid < heads * HEAD_DIM:
-                self.merge_partials(p, layer, group, split, last, tid, epoch)
+                self.merge_partials(p, layer, group, split, t, last, tid, epoch)
         else:
-            self.merge_partials(p, layer, group, split, last, tid, epoch)
+            self.merge_partials(p, layer, group, split, t, last, tid, epoch)
         self.csync.sync()  # the next attention row rewrites att and qkvs
         return w
 
     @cute.jit
-    def merge_partials(self, p: MegakernelParams, layer, group, split, last, tid, epoch):
+    def merge_partials(self, p: MegakernelParams, layer, group, split, t, last, tid, epoch):
         """Merge the warps' online-softmax states in ATT (plus the new token's in the last split)
         into this split's partial O, m and l for dim ``tid % HEAD_DIM`` of q head
         ``tid // HEAD_DIM``, and publish them."""
@@ -1252,10 +1478,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
             scale = cute.math.exp2(att[COMPUTE_WARPS, heads * HEAD_DIM + hq] - mx)
             num = num + att[COMPUTE_WARPS, hq * HEAD_DIM + d] * scale
             den = den + att[COMPUTE_WARPS, heads * HEAD_DIM + heads + hq] * scale
-        publish(p.attn_o, self.attn_o_index(layer, group, split, hq, d), num, epoch)
+        publish(p.attn_o, self.attn_o_index(t, layer, group, split, hq, d), num, epoch)
         if d == 0:
-            publish(p.attn_ml, self.attn_ml_index(layer, group, hq, split, 0), mx, epoch)
-            publish(p.attn_ml, self.attn_ml_index(layer, group, hq, split, 1), den, epoch)
+            publish(p.attn_ml, self.attn_ml_index(t, layer, group, hq, split, 0), mx, epoch)
+            publish(p.attn_ml, self.attn_ml_index(t, layer, group, hq, split, 1), den, epoch)
 
     @cute.jit
     def head_vec(self, src, base, d0):
@@ -1305,13 +1531,13 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
     @cute.kernel
     def kernel(self, tma, gtensors, scratch, tensors, bound, engine_args):
-        x_stride = self.x_width + self.x_tail
+        x_stride = self.x_stride
         layouts = {
             "W": self.weight_stage_layout(),
             "KV": cute.make_layout(
                 (BLOCK, HEAD_DIM, self.stages), stride=(HEAD_DIM, 1, BLOCK * HEAD_DIM)
             ),
-            "X": cute.make_layout((2, x_stride), stride=(x_stride, 1)),
+            "X": cute.make_layout((self.x_buffers, x_stride), stride=(x_stride, 1)),
             "RED": cute.make_layout((COMPUTE_WARPS,)),
             "ATT": cute.make_layout(
                 (COMPUTE_WARPS + 1, self.att_stride), stride=(self.att_stride, 1)
@@ -1412,7 +1638,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
 # ------------------------------------------------------------ tcgen05 engine
 
-TC_N = 16  # MMA N: tokens (batch 1 uses column 0; the others read shifted copies of x)
+TC_MIN_N = 16  # MMA N >= 16 at M = 128; batch one uses column 0 (the others: shifted x)
 TC_ROWS, TC_TILE_K = 128, 64  # a stage: one 128 x 64 SW128 K-major MMA operand (16 KB)
 
 
@@ -1425,19 +1651,24 @@ class TcParams(MegakernelParams):
 
 
 class TcGen05Gemv:
-    """The GEMV engine on tcgen05 tensor cores, swap-AB: D (128 x 16) = W x X^T with a 128-row
-    weight tile as A and the GEMV input as B, accumulated in TMEM by the one-warp mma role.
+    """The GEMV engine on tcgen05 tensor cores, swap-AB: D (128 x N) = W x X^T with a 128-row
+    weight tile as A and the GEMV inputs (one row per token) as B, accumulated in TMEM by the
+    one-warp mma role; N is the batch rounded up to a power of two, at least 16.
 
     A: a weight stage is one 128 x 64 SW128 K-major operand, so a stage is four K=16 MMAs.
-    B: SWIZZLE_NONE K-major with a 16-byte leading-dimension offset, so its core matrices overlap
-    and row n is the input shifted by 8n elements; row 0 is the input itself. The input stays the
-    contiguous ``xs[xbuf]`` the CUDA-core engine reads, plus a tail; columns 1..15 of D are
-    discarded.
+    B: SWIZZLE_NONE K-major over ``xs[xbuf]``, row t, column k at (k // 8) * S * 8 + 8t + k % 8
+    with S = batch (``x_index``): core matrices 16 B * S apart. Rows past the batch read into the
+    next column group; their D columns are discarded. At batch one the input is the contiguous
+    vector the CUDA-core engine reads, row n is it shifted by 8n elements, and only column 0
+    is used.
     D: TMEM lane i holds row i. Compute warps 0-3 load the tile: the one on TMEM subpartition
     s (hardware warp index % 4) loads rows 32s .. 32s + 31, lane l holding row 32s + l.
 
     Channels ``(w, xin, acc)``: ``xin`` hands each GEMV row's input to the mma warp, ``acc`` each
     tile's accumulator back. The compute warps release the weight stages without reading them."""
+
+    def __init__(self, n: int):
+        self.n = n  # MMA N: column t of D is token t
 
     def input_ready(self, chans):
         w, xin, acc = chans
@@ -1452,21 +1683,23 @@ class TcGen05Gemv:
         for _ in cutlass.range(k_tiles, unroll=1):
             with w.consume():
                 pass
-        v = Float32(0.0)
+        vals = cute.make_rmem_tensor((self.n,), Float32)
+        vals.fill(0.0)
         # A warp reaches TMEM lanes 32 * (its hardware warp % 4) ..: role-local warps 0-3 are
         # four consecutive warps, so they cover the four subpartitions wherever the role sits.
         row = 32 * (cute.arch.warp_idx() % 4) + lane
         with acc.consume() as h:
             if warp < 4:
                 t2r = tcgen05.make_tmem_copy(
-                    cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(TC_N)), Float32),
+                    cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(self.n)), Float32),
                     p.acc_fake,
                 ).get_slice(row)
                 src = t2r.partition_S(t_acc[None, None, None, h.index])
-                vals = cute.make_rmem_tensor(t2r.partition_D(p.acc_fake).shape, Float32)
-                cute.copy(t2r, src, vals)
-                v = vals[0]
-        return v, row, (w, xin, acc)
+                loaded = cute.make_rmem_tensor(t2r.partition_D(p.acc_fake).shape, Float32)
+                cute.copy(t2r, src, loaded)
+                for c in cutlass.range_constexpr(self.n):
+                    vals[c] = loaded[c]
+        return vals, row, (w, xin, acc)
 
     def owns_row(self, warp, lane):
         return warp < 4
@@ -1486,15 +1719,26 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
     CUDA-core kernel's."""
 
     rows, tile_k = TC_ROWS, TC_TILE_K
-    x_tail = 8 * (TC_N - 1) + 8  # B row n reads 8n elements past the input
+    x_buffers = 1  # a row's MMAs finish before the compute warps write the next input
+    max_batch = 64
+
+    @property
+    def tc_n(self) -> int:
+        """MMA N: the batch rounded up to a power of two (the TMEM load's column count), >= 16."""
+        return max(TC_MIN_N, 1 << (self.batch - 1).bit_length())
+
+    @property
+    def x_tail(self) -> int:
+        """B rows past the stored ones read up to 8 elements per row into the next column group."""
+        return max(self.tc_n - self.x_rows, 0) * 8 + 8
 
     def __init__(self, *args, model: QwenConfig = QWEN3_0_6B, **kwargs):
         check_tc_model(model)
         super().__init__(*args, model=model, **kwargs)
-        self.engine = TcGen05Gemv()
+        self.engine = TcGen05Gemv(self.tc_n)
         self.xin = Ring(2, Warps, Umma, commit_fence="smem_async")
         self.acc = Ring(2, Umma, Warps, release_fence="tmem_load")
-        self.tmem_plan = TmemPlan().region("acc", TC_N, 2)
+        self.tmem_plan = TmemPlan().region("acc", self.tc_n, 2)
 
     def weight_consumers(self):
         return {"mma": Umma, "compute": Warps}
@@ -1518,14 +1762,14 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
         op = tcgen05.MmaF16BF16Op(
             BFloat16,
             Float32,
-            (self.rows, TC_N, 16),
+            (self.rows, self.tc_n, 16),
             tcgen05.CtaGroup.ONE,
             tcgen05.OperandSource.SMEM,
             cute.nvgpu.OperandMajorMode.K,
             cute.nvgpu.OperandMajorMode.K,
         )
         tiled_mma = cute.make_tiled_mma(op)
-        tile = (self.rows, TC_N, self.tile_k)
+        tile = (self.rows, self.tc_n, self.tile_k)
         a_layout = sm100_utils.make_smem_layout_a(tiled_mma, tile, BFloat16, 1)
         a_layout = cute.select(a_layout, mode=[0, 1, 2])
         w_smem = cute.make_composed_layout(
@@ -1536,7 +1780,7 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
 
     def make_params(self, fields, engine_args):
         tiled_mma, a_layout = engine_args
-        acc_shape = tiled_mma.partition_shape_C((self.rows, TC_N))
+        acc_shape = tiled_mma.partition_shape_C((self.rows, self.tc_n))
         return TcParams(
             **fields,
             tiled_mma=tiled_mma,
@@ -1580,16 +1824,19 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
         t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
         w_base = self.buffer("W").iterator
         x_base = p.xs.iterator
-        x_stride = self.x_width + self.x_tail
-        # B row n, column k at element 8n + k of the input (core matrices 16 bytes apart).
-        b_layout = cute.make_layout((((8, 2), 16), 1, 1), stride=(((8, 64), 1), 0, 0))
-        pos = p.step[1]
+        x_stride, s_rows = self.x_stride, self.x_rows
+        # B row n, column k at element (k // 8) * S * 8 + 8n + k % 8 (``x_index``). With one stored
+        # row (S = 1) the core matrices overlap and row n is the input shifted by 8n elements.
+        b_layout = cute.make_layout(
+            (((8, self.tc_n // 8), (8, 2)), 1, 1), stride=(((8, 64), (1, 8 * s_rows)), 0, 0)
+        )
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
             op, layer, a, b, _row = work.item
             if op == ATTN:
-                blk0, blk1 = self.split_blocks(pos, b)
+                t, split = self.attn_token(b)
+                blk0, blk1 = self.split_blocks(p.step[t, 1], split)
                 for _ in cutlass.range(2 * (blk1 - blk0), unroll=1):
                     with w.consume():
                         pass
@@ -1611,9 +1858,10 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
                                     frag_a = tiled_mma.make_fragment_A(
                                         cute.make_tensor(ptr, p.a_layout.outer)
                                     )
-                                    col = xbuf * x_stride + kt * self.tile_k
+                                    col = (xbuf % self.x_buffers) * x_stride
                                     for kb in cutlass.range_constexpr(self.tile_k // 16):
-                                        sb = cute.make_tensor(x_base + col + kb * 16, b_layout)
+                                        k0 = kt * self.tile_k + kb * 16
+                                        sb = cute.make_tensor(x_base + col + k0 * s_rows, b_layout)
                                         frag_b = tiled_mma.make_fragment_B(sb)
                                         cute.gemm(
                                             tiled_mma,
@@ -1710,9 +1958,9 @@ def compile_megakernel(op: QwenDecodeMegakernel):
         make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
         make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
         make_fake_compact_tensor(Int64, (op.scratch_layout.size,)),
-        make_fake_compact_tensor(Float32, (vocab,)),
+        make_fake_compact_tensor(Float32, (op.batch, vocab)),
         make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+        make_fake_compact_tensor(Int32, (op.batch, 2), assumed_align=4),
         make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer; globaltimer only
         make_fake_compact_tensor(bf16, (layers, hidden)),
         make_fake_compact_tensor(bf16, (layers, hidden)),
@@ -1815,9 +2063,10 @@ def instruction_rows(op: QwenDecodeMegakernel, ops: tuple[int, ...] = ALL_OPS) -
     for layer in range(op.layers):
         for t in range(op.qkv_rows // op.rows):
             add(QKV, layer, t, 0)
-        for group in range(op.attn_groups):
-            for split in range(op.splits):
-                add(ATTN, layer, group, split)
+        for token in range(op.batch):
+            for group in range(op.attn_groups):
+                for split in range(op.splits):
+                    add(ATTN, layer, group, token * op.splits + split)
         for ks in range(O_SPLITS):
             for t in range(op.hidden // op.rows):
                 add(OPROJ, layer, t, ks)
@@ -1985,9 +2234,14 @@ class QwenMegakernel:
         self.weights = weights
         self.rope = rope_table(max_len, device, weights.config.rope_theta)
         self.scratch = torch.zeros(op.scratch_layout.size, device=device, dtype=torch.int64)
-        self.logits = torch.zeros(op.vocab, device=device)
+        self.batch = op.batch
+        # (batch, vocab); ``logits`` is token 0's row at batch one, the whole tensor otherwise.
+        self.all_logits = torch.zeros(op.batch, op.vocab, device=device)
+        self.logits = self.all_logits[0] if op.batch == 1 else self.all_logits
         self.state = torch.zeros(2, device=device, dtype=torch.int32)
-        self.step_info = torch.zeros(2, device=device, dtype=torch.int32)
+        # (batch, 2) [token, pos]; ``step_info`` is token 0's ``(2,)`` row at batch one, as before.
+        self.all_steps = torch.zeros(op.batch, 2, device=device, dtype=torch.int32)
+        self.step_info = self.all_steps[0] if op.batch == 1 else self.all_steps
         # Placeholder; trace_session swaps in the real globaltimer buffer for a traced launch.
         self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
         self.fn = compile_megakernel(self.op)
@@ -1997,7 +2251,10 @@ class QwenMegakernel:
         layout = self.op.scratch_layout
         shape = layout.shapes[name]
         offset = layout.offsets[name]
-        return self.scratch[offset : offset + math.prod(shape)].view(shape)
+        words = self.scratch[offset : offset + math.prod(shape)].view(shape)
+        if name == "h_mid":
+            words = words[:, : self.op.layers]
+        return words[0] if self.batch == 1 else words
 
     def values(self, name: str) -> torch.Tensor:
         """A tagged buffer's fp32 values, ignoring the tags."""
@@ -2018,10 +2275,14 @@ class QwenMegakernel:
         words[..., 1::2] = self.state[0] + 1
 
     def launch(self, k_cache: torch.Tensor, v_cache: torch.Tensor):
-        """One decode step for the token and position in ``step_info``. Both are read on the
-        device, so the caller keeps ``0 < pos < max_len`` and the token in the vocabulary, and
-        runs one launch at a time: the scratch and epoch state belong to this runner."""
+        """One decode step for the tokens and positions in ``all_steps`` (``(batch, 2)``). Both are
+        read on the device, so the caller keeps ``0 < pos < max_len`` and the tokens in the
+        vocabulary, and runs one launch at a time: the scratch and epoch state belong to this
+        runner. Caches: ``(layers, kv_heads, max_len, head_dim)`` at batch one, else with a
+        leading batch axis."""
         shape = (self.op.layers, self.op.kv_heads, self.max_len, HEAD_DIM)
+        if self.batch > 1:
+            shape = (self.batch, *shape)
         for cache in (k_cache, v_cache):
             if cache.shape != shape or cache.dtype != torch.bfloat16 or not cache.is_contiguous():
                 raise ValueError(f"caches must be contiguous bf16 {shape}, got {cache.shape}")
@@ -2039,9 +2300,9 @@ class QwenMegakernel:
             k_cache.view(-1, HEAD_DIM),
             v_cache.view(-1, HEAD_DIM),
             self.scratch,
-            self.logits,
+            self.all_logits,
             self.state,
-            self.step_info,
+            self.all_steps,
             self.trace_buffer,
             w.input_ln,
             w.post_ln,
@@ -2061,7 +2322,24 @@ class QwenMegakernel:
             raise ValueError("weights must be the ones this QwenMegakernel was built from")
         if not 0 < pos < self.max_len:
             raise ValueError(f"need 0 < pos < max_len = {self.max_len}, got {pos}")
+        if self.batch != 1:
+            raise ValueError("a batched runner decodes with decode(tokens, positions, ...)")
         self.step_info[0] = token
         self.step_info[1] = pos
         self.launch(k_cache, v_cache)
         return self.logits.clone()
+
+    def decode(self, tokens, positions, k_cache, v_cache) -> torch.Tensor:
+        """One step of ``batch`` sequences: sequence b decodes ``tokens[b]`` at ``positions[b]``
+        (each in ``(0, max_len)``) and writes its K/V there; returns ``(batch, vocab)`` fp32
+        logits."""
+        positions = [int(pos) for pos in positions]
+        if len(positions) != self.batch or len(tokens) != self.batch:
+            raise ValueError(f"need {self.batch} tokens and positions")
+        if not all(0 < pos < self.max_len for pos in positions):
+            raise ValueError(f"need 0 < pos < max_len = {self.max_len}, got {positions}")
+        # Tokens may be device tensors (a previous step's argmax): copy, never read back.
+        self.all_steps[:, 0].copy_(torch.as_tensor(tokens).reshape(-1), non_blocking=True)
+        self.all_steps[:, 1].copy_(torch.tensor(positions, dtype=torch.int32), non_blocking=True)
+        self.launch(k_cache, v_cache)
+        return self.all_logits.clone()
