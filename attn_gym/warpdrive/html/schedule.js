@@ -7,11 +7,12 @@ const slotOf = new Int32Array(N);
 D.rows.forEach((row, c) => row.forEach((i, s) => { ctaOf[i] = c; slotOf[i] = s; }));
 const SLOTS = D.rows.reduce((m, r) => Math.max(m, r.length), 1);
 const critical = new Set(D.critical);
-const state = { colorBy: D.colorBy, critical: false, timing: D.measured ? "both" : "predicted",
-  focus: new Set(), hover: -1, window: null, drag: null };
+const state = { colorBy: D.colorBy, critical: false, timing: D.measured ? "measured" : "predicted",
+  focus: new Set(), hover: -1, spanAt: null, window: null, drag: null };
 const tip = document.getElementById("tip");
 const views = [];
-const LABEL_W = 62;
+let LABEL_W = 62; // widened in setup() to fit track names
+const TRACK_H = 14;
 const css = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 function rgb(hex) {
   const v = parseInt(hex.slice(1), 16);
@@ -55,6 +56,12 @@ if (D.start) {
     }
     rows.forEach((r) => r.sort((a, b) => span(a, mode).start - span(b, mode).start));
     timedRows[mode] = rows;
+  }
+}
+// Tracks may reach outside the items' extent (a load before the first compute): zoom must reach them.
+for (const lanes of Object.values(D.tracks || {})) {
+  for (const [, spans] of lanes) {
+    for (const [, s, e] of spans) { timeMin = Math.min(timeMin, s); timeMax = Math.max(timeMax, e); }
   }
 }
 const timeWindow = () => state.window || [timeMin, timeMax];
@@ -117,26 +124,40 @@ function resetView() {
   state.window = null; state.focus.clear(); state.drag = null;
   hover(-1); changed();
 }
+// Rows top to bottom: each shown CTA's lanes (height rh), then its tracks while it is focused.
+function layoutRows(v, rh) {
+  v.rh = rh; v.top = 6; v.rows = []; v.rowByCta = new Map();
+  let y = v.top;
+  for (const cta of shownCTAs()) {
+    const tracks = (state.focus.has(cta) && D.tracks && D.tracks[cta]) || [];
+    const row = { cta, top: y, h: rh + (tracks.length ? 3 + tracks.length * TRACK_H : 0), tracks };
+    v.rows.push(row); v.rowByCta.set(cta, row);
+    y += row.h;
+  }
+  v.bottom = y;
+}
+const rowAt = (v, y) => v.rows.find((row) => row.top <= y && y < row.top + row.h);
+const trackY = (v, row, k) => row.top + v.rh + 3 + k * TRACK_H;
 function rowLabels(ctx, v) {
   const every = Math.max(1, Math.ceil(12 / v.rh));
   ctx.fillStyle = palette.muted;
   ctx.textBaseline = "middle";
   // With two timing lanes per CTA, tall rows name each lane: both lanes are the same work list.
   const lanes = v.lh && v.lh >= 9 && v.lh < v.rh ? modes() : null;
-  v.ctas.forEach((c, row) => {
+  v.rows.forEach((row, n) => {
     if (lanes) {
-      lanes.forEach((mode, lane) => ctx.fillText(`${c} ${mode === "predicted" ? "pred" : "meas"}`,
-        2, v.top + row * v.rh + lane * v.lh + v.lh / 2));
-    } else if (row % every === 0) ctx.fillText(`CTA ${c}`, 2, v.top + row * v.rh + v.rh / 2);
+      lanes.forEach((mode, lane) => ctx.fillText(`${row.cta} ${mode === "predicted" ? "pred" : "meas"}`,
+        2, row.top + lane * v.lh + v.lh / 2));
+    } else if (n % every === 0 || row.tracks.length) ctx.fillText(`CTA ${row.cta}`, 2, row.top + v.rh / 2);
+    row.tracks.forEach(([name], k) => ctx.fillText(name, 8, trackY(v, row, k) + TRACK_H / 2 - 1));
   });
 }
-function rowIndex(v, cta) { return v.ctas.indexOf(cta); }
 function highlightRow(ctx, v, cta) {
-  const row = rowIndex(v, cta);
-  if (row < 0) return;
+  const row = v.rowByCta.get(cta);
+  if (!row) return;
   ctx.strokeStyle = palette.amber;
   ctx.lineWidth = 1;
-  ctx.strokeRect(LABEL_W - 2, v.top + row * v.rh - 0.5, v.w - LABEL_W + 1, v.rh + 1);
+  ctx.strokeRect(LABEL_W - 2, row.top - 0.5, v.w - LABEL_W + 1, row.h + 1);
 }
 function niceStep(x) {
   const p = 10 ** Math.floor(Math.log10(x));
@@ -162,17 +183,17 @@ function timeline(parent) {
   const v = addView(parent, "Timeline", "timeline");
   v.x = (t) => LABEL_W + (t - v.lo) / (v.hi - v.lo) * (v.w - LABEL_W - 6);
   v.time = (x) => v.lo + (x - LABEL_W) / (v.w - LABEL_W - 6) * (v.hi - v.lo);
-  v.y = (s, lane) => v.top + rowIndex(v, s.cta) * v.rh + lane * v.lh;
+  v.y = (s, lane) => v.rowByCta.get(s.cta).top + lane * v.lh;
   v.base = () => {
-    v.ctas = shownCTAs(); v.rh = rowH(v.ctas.length) * (state.timing === "both" ? 2 : 1);
-    v.lh = v.rh / modes().length; v.top = 6;
-    v.w = Math.max(180, v.el.clientWidth - 26); v.h = v.top + v.ctas.length * v.rh + 28;
+    layoutRows(v, rowH(shownCTAs().length) * (state.timing === "both" ? 2 : 1));
+    v.lh = v.rh / modes().length;
+    v.w = Math.max(180, v.el.clientWidth - 26); v.h = v.bottom + 28;
     [v.lo, v.hi] = timeWindow();
     const ctx = sizeCanvas(v.cache, v.w, v.h);
     v.el.querySelector(".figlabel").textContent = "Timeline · " + (state.timing === "both"
       ? "top lane predicted, bottom lane measured" : state.timing);
     ctx.save(); ctx.beginPath(); ctx.rect(LABEL_W, v.top, v.w - LABEL_W - 6, v.h - v.top - 28); ctx.clip();
-    modes().forEach((mode, lane) => v.ctas.forEach((c) => {
+    modes().forEach((mode, lane) => v.rows.forEach(({ cta: c }) => {
       const row = timedRows[mode][c];
       for (let j = firstVisible(row, mode, v.lo); j < row.length; j++) {
         const i = row[j], s = span(i, mode);
@@ -184,9 +205,25 @@ function timeline(parent) {
       }
     }));
     ctx.globalAlpha = 1;
+    // A focused CTA's measured tracks; omit span labels on narrow boxes.
+    ctx.textBaseline = "middle";
+    v.rows.forEach((row) => row.tracks.forEach(([, spans], k) => {
+      const y = trackY(v, row, k);
+      for (const [name, start, end, i] of spans) {
+        if (end < v.lo || start > v.hi) continue;
+        const x = v.x(start), w = Math.max(1, v.x(end) - x - 0.4);
+        ctx.fillStyle = i >= 0 ? color(i) : palette.muted;
+        ctx.fillRect(x, y, w, TRACK_H - 2);
+        const left = Math.max(x, LABEL_W), shown = x + w - left; // the part right of the labels
+        if (shown > 28) {
+          ctx.fillStyle = "#fff";
+          ctx.fillText(name, left + 2, y + TRACK_H / 2 - 1, shown - 4);
+        }
+      }
+    }));
     if (state.critical && state.timing !== "measured") {
       // Outline each critical item; an arrow runs from each one's end to the next one's start.
-      const shown = (s) => rowIndex(v, s.cta) >= 0 && s.end >= v.lo && s.start <= v.hi;
+      const shown = (s) => v.rowByCta.has(s.cta) && s.end >= v.lo && s.start <= v.hi;
       let prev = null;
       D.critical.forEach((i) => {
         const s = span(i, "predicted");
@@ -213,17 +250,25 @@ function timeline(parent) {
     if (state.hover >= 0) {
       modes().forEach((mode, lane) => {
         const i = state.hover, s = span(i, mode);
-        if (!s || rowIndex(v, s.cta) < 0) return;
+        if (!s || !v.rowByCta.has(s.cta)) return;
         highlightRow(ctx, v, s.cta);
         ctx.save(); ctx.beginPath(); ctx.rect(LABEL_W, v.top, v.w - LABEL_W - 6, v.h - v.top - 28); ctx.clip();
         for (const d of (D.deps && D.deps[i]) || []) {
           const p = span(d, mode);
-          if (p && rowIndex(v, p.cta) >= 0) arrow(ctx, v.x(p.end), v.y(p, lane) + v.lh / 2, v.x(s.start), v.y(s, lane) + v.lh / 2);
+          if (p && v.rowByCta.has(p.cta)) arrow(ctx, v.x(p.end), v.y(p, lane) + v.lh / 2, v.x(s.start), v.y(s, lane) + v.lh / 2);
         }
         ctx.strokeStyle = palette.ink; ctx.lineWidth = 1.5;
         ctx.strokeRect(v.x(s.start) - 1, v.y(s, lane) - 1, Math.max(2, v.x(s.end) - v.x(s.start)) + 2, v.lh + 1);
         ctx.restore();
       });
+    }
+    const at = state.spanAt, row = at && v.rowByCta.get(at.cta);
+    if (row && row.tracks[at.k]) {
+      ctx.save(); ctx.beginPath(); ctx.rect(LABEL_W, v.top, v.w - LABEL_W - 6, v.h - v.top - 28); ctx.clip();
+      ctx.strokeStyle = palette.ink; ctx.lineWidth = 1.5;
+      const x = v.x(at.span[1]);
+      ctx.strokeRect(x - 1, trackY(v, row, at.k) - 1, Math.max(2, v.x(at.span[2]) - x) + 2, TRACK_H);
+      ctx.restore();
     }
     if (state.drag && state.drag.view === v) {
       const { start, end } = state.drag;
@@ -232,12 +277,17 @@ function timeline(parent) {
       ctx.globalAlpha = 1;
     }
   };
-  v.ctaAt = (y) => v.ctas[Math.floor((y - v.top) / v.rh)];
   v.hit = (px, py) => {
-    const c = v.ctaAt(py);
-    if (c === undefined || px < LABEL_W || px > v.w - 6) return -1;
-    const lane = Math.floor(((py - v.top) % v.rh) / v.lh);
-    const mode = modes()[lane], t = v.time(px), row = timedRows[mode][c];
+    const at = rowAt(v, py);
+    if (!at || px < LABEL_W || px > v.w - 6) return -1;
+    const t = v.time(px), c = at.cta;
+    if (py >= at.top + v.rh) {
+      const k = Math.floor((py - trackY(v, at, 0)) / TRACK_H), lane = at.tracks[k];
+      const hit = lane && lane[1].find(([, start, end]) => start <= t && t <= end);
+      return hit ? { i: hit[3], span: hit, cta: c, k } : -1;
+    }
+    const lane = Math.floor((py - at.top) / v.lh);
+    const mode = modes()[lane], row = timedRows[mode][c];
     const j = firstVisible(row, mode, t);
     for (let k = j; k < Math.min(j + 2, row.length); k++) {
       const s = span(row[k], mode);
@@ -245,11 +295,18 @@ function timeline(parent) {
     }
     return -1;
   };
-  v.canvas.title = "Drag horizontally to zoom; double-click to reset. Ctrl/pinch-wheel zooms at the cursor. Shift-wheel or horizontal scroll pans. Click a CTA to focus; Shift-click selects several.";
+  v.canvas.title = "Drag horizontally to zoom; double-click to reset. W/S or Ctrl/pinch-wheel zoom at the cursor; A/D, Shift-wheel or horizontal scroll pan. Click a CTA to focus; Shift-click selects several.";
+  // W/S zoom around the cursor's time while it is over the timeline, else the window's centre.
+  v.canvas.addEventListener("pointermove", (ev) => {
+    const x = ev.clientX - v.canvas.getBoundingClientRect().left;
+    state.anchor = Math.max(0, Math.min(1, (x - LABEL_W) / (v.w - LABEL_W - 6)));
+  });
+  v.canvas.addEventListener("pointerleave", () => { state.anchor = null; });
   v.canvas.addEventListener("pointerdown", (ev) => {
     if (ev.button !== 0) return;
     const r = v.canvas.getBoundingClientRect(), px = ev.clientX - r.left;
-    state.drag = { view: v, start: Math.max(LABEL_W, Math.min(v.w - 6, px)), end: Math.max(LABEL_W, Math.min(v.w - 6, px)), cta: v.ctaAt(ev.clientY - r.top), label: px < LABEL_W };
+    const y = ev.clientY - r.top, row = rowAt(v, y);
+    state.drag = { view: v, start: Math.max(LABEL_W, Math.min(v.w - 6, px)), end: Math.max(LABEL_W, Math.min(v.w - 6, px)), cta: row?.cta, track: Boolean(row && y >= row.top + v.rh), label: px < LABEL_W };
     v.canvas.setPointerCapture(ev.pointerId); hover(-1);
   });
   v.canvas.addEventListener("pointerup", (ev) => {
@@ -258,7 +315,7 @@ function timeline(parent) {
     state.drag = null;
     v.canvas.releasePointerCapture(ev.pointerId);
     if (!drag.label && Math.abs(drag.end - drag.start) > 5) setWindow(v.time(Math.min(drag.start, drag.end)), v.time(Math.max(drag.start, drag.end)));
-    else focusCTA(drag.cta, ev.shiftKey);
+    else if (!drag.track) focusCTA(drag.cta, ev.shiftKey); // a click inside a track keeps the CTA open
     draw();
   });
   v.canvas.addEventListener("pointercancel", () => { state.drag = null; draw(); });
@@ -365,13 +422,13 @@ function arrow(ctx, x0, y0, x1, y1) {
 function grid(parent) {
   const v = addView(parent, "Work order per CTA · columns are order, not time", "grid");
   v.base = () => {
-    v.ctas = shownCTAs(); v.rh = rowH(v.ctas.length); v.top = 6;
+    layoutRows(v, rowH(shownCTAs().length));
     v.cw = Math.max(0.1, Math.min(40, (v.el.clientWidth - 26 - LABEL_W - 6) / SLOTS));
-    v.w = LABEL_W + v.cw * SLOTS + 6; v.h = v.top + v.ctas.length * v.rh + 24;
+    v.w = LABEL_W + v.cw * SLOTS + 6; v.h = v.bottom + 24;
     const ctx = sizeCanvas(v.cache, v.w, v.h);
-    v.ctas.forEach((c, row) => D.rows[c].forEach((i, s) => {
+    v.rows.forEach((row) => D.rows[row.cta].forEach((i, s) => {
       ctx.fillStyle = color(i);
-      ctx.fillRect(LABEL_W + s * v.cw, v.top + row * v.rh, Math.max(0.5, v.cw - (v.cw > 4)), v.rh - (v.rh > 4));
+      ctx.fillRect(LABEL_W + s * v.cw, row.top, Math.max(0.5, v.cw - (v.cw > 4)), v.rh - (v.rh > 4));
     }));
     rowLabels(ctx, v); ctx.fillStyle = palette.muted; ctx.textBaseline = "top";
     const every = Math.max(1, Math.ceil(36 / v.cw));
@@ -379,11 +436,12 @@ function grid(parent) {
   };
   v.overlay = (ctx) => {
     const i = state.hover;
-    if (i < 0 || rowIndex(v, ctaOf[i]) < 0) return;
+    const row = i >= 0 && v.rowByCta.get(ctaOf[i]);
+    if (!row) return;
     highlightRow(ctx, v, ctaOf[i]); ctx.strokeStyle = palette.ink; ctx.lineWidth = 1.5;
-    ctx.strokeRect(LABEL_W + slotOf[i] * v.cw - 1, v.top + rowIndex(v, ctaOf[i]) * v.rh - 1, v.cw + 1, v.rh + 1);
+    ctx.strokeRect(LABEL_W + slotOf[i] * v.cw - 1, row.top - 1, v.cw + 1, v.rh + 1);
   };
-  v.ctaAt = (y) => v.ctas[Math.floor((y - v.top) / v.rh)];
+  v.ctaAt = (y) => rowAt(v, y)?.cta;
   v.hit = (px, py) => {
     const c = v.ctaAt(py), s = Math.floor((px - LABEL_W) / v.cw);
     return c !== undefined && s >= 0 && s < D.rows[c].length ? D.rows[c][s] : -1;
@@ -428,27 +486,52 @@ function escapeText(s) {
   return String(s).replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]);
 }
 const signed = (n) => `${n >= 0 ? "+" : ""}${n.toFixed(2)}`;
-function hover(i, ev) {
-  if (i === state.hover) { if (i >= 0 && ev) place(ev); return; }
-  state.hover = i; draw();
-  if (i < 0) { tip.hidden = true; return; }
-  const [head, ...rest] = D.label[i].split("\n");
-  const lines = [...rest, `CTA ${ctaOf[i]} · slot ${slotOf[i]} (execution order)`];
-  if (D.start) lines.push(`Predicted (model): ${D.start[i].toFixed(2)} → ${D.end[i].toFixed(2)} ${D.unit}; duration ${(D.end[i] - D.start[i]).toFixed(2)} ${D.unit}`);
-  const m = D.measured && D.measured[i];
-  if (m) {
-    lines.push(`Measured (real launch): ${m[1].toFixed(2)} → ${m[2].toFixed(2)} ${D.unit}; duration ${(m[2] - m[1]).toFixed(2)} ${D.unit} · CTA ${m[0]}`);
-    lines.push(`Measured − predicted: start shift ${signed(m[1] - D.start[i])} ${D.unit}; duration delta ${signed((m[2] - m[1]) - (D.end[i] - D.start[i]))} ${D.unit}`);
-  } else if (D.measured) lines.push("Measured: no captured span for this item");
-  if (critical.has(i)) lines.push("On the predicted critical path (model only)");
+// `target` is an item position, or a track span `{ i, span, cta, k }` (i is -1 without an item).
+function hover(target, ev) {
+  const at = typeof target === "number" ? null : target, i = at ? at.i : target;
+  if (i === state.hover && at?.span === state.spanAt?.span) {
+    if ((i >= 0 || at) && ev) place(ev);
+    return;
+  }
+  state.hover = i; state.spanAt = at; draw();
+  if (i < 0 && !at) { tip.hidden = true; return; }
+  let [head, ...lines] = i >= 0 ? itemLines(i) : [];
+  if (at) {
+    const [name, start, end] = at.span;
+    if (head !== undefined) lines.unshift(head);
+    head = `${name} · ${(end - start).toFixed(2)} ${D.unit}`;
+    lines.unshift(`${D.tracks[at.cta][at.k][0]} on CTA ${at.cta} (measured): ${start.toFixed(2)} → ${end.toFixed(2)} ${D.unit}`);
+  }
   const title = document.createElement("b");
   title.textContent = head;
   tip.replaceChildren(title, lines.join("\n"));
   tip.hidden = false; if (ev) place(ev);
 }
+// Item i's hover text, its label's first line first.
+function itemLines(i) {
+  const lines = [...D.label[i].split("\n"), `CTA ${ctaOf[i]} · slot ${slotOf[i]} (execution order)`];
+  // Timing lines follow the Show toggle; the comparison needs both sources shown.
+  const shown = D.start ? modes() : [];
+  if (shown.includes("predicted")) lines.push(`Predicted (model): ${D.start[i].toFixed(2)} → ${D.end[i].toFixed(2)} ${D.unit}; duration ${(D.end[i] - D.start[i]).toFixed(2)} ${D.unit}`);
+  const m = D.measured && D.measured[i];
+  if (shown.includes("measured")) {
+    if (m) lines.push(`Measured (real launch): ${m[1].toFixed(2)} → ${m[2].toFixed(2)} ${D.unit}; duration ${(m[2] - m[1]).toFixed(2)} ${D.unit}`);
+    else lines.push("Measured: no captured span for this item");
+  }
+  if (m && shown.length === 2) lines.push(`Measured − predicted: start shift ${signed(m[1] - D.start[i])} ${D.unit}; duration delta ${signed((m[2] - m[1]) - (D.end[i] - D.start[i]))} ${D.unit}`);
+  if (critical.has(i) && shown.includes("predicted")) lines.push("On the predicted critical path (model only)");
+  return lines;
+}
+// The tip is fixed to the viewport: placed in page flow it can lengthen a short page, toggling
+// the scrollbar, which resizes and redraws the canvases under the cursor.
 function place(ev) {
-  const left = Math.min(ev.pageX + 14, window.scrollX + document.documentElement.clientWidth - tip.offsetWidth - 8);
-  tip.style.left = `${Math.max(8, left)}px`; tip.style.top = `${ev.pageY + 16}px`;
+  const view = document.documentElement;
+  const left = Math.min(ev.clientX + 14, view.clientWidth - tip.offsetWidth - 8);
+  const below = ev.clientY + 16, above = ev.clientY - 12 - tip.offsetHeight;
+  const top = below + tip.offsetHeight <= view.clientHeight - 8 || above < 8 ? below : above;
+  // Fitting neither side, it slides up until its bottom is on screen (its top first, if taller).
+  const lowest = view.clientHeight - tip.offsetHeight - 8;
+  tip.style.left = `${Math.max(8, left)}px`; tip.style.top = `${Math.max(8, Math.min(top, lowest))}px`;
 }
 function legend() {
   const el = document.getElementById("legend");
@@ -478,27 +561,40 @@ function readout() {
 }
 function setup() {
   refreshPalette();
+  if (D.tracks) {
+    const names = Object.values(D.tracks).flatMap((lanes) => lanes.map(([name]) => name));
+    LABEL_W = Math.max(LABEL_W, 14 + 6.2 * Math.max(...names.map((name) => name.length)));
+  }
   const root = document.getElementById("views");
+  // Use the timeline instead of duplicating work items in a slot grid.
   if (D.start) timeline(root);
   const holder = D.coord ? Object.assign(document.createElement("div"), { className: "pair" }) : root;
   if (D.coord) root.appendChild(holder);
-  grid(holder); if (D.coord) map(holder);
+  if (!D.start) grid(holder);
+  if (D.coord) map(holder);
+  const b = document.getElementById("critical");
+  const setCritical = (on) => {
+    state.critical = on; b.setAttribute("aria-pressed", String(on)); criticalPanel();
+  };
+  const select = (id, key, value) => {
+    state[key] = value;
+    document.querySelectorAll(`#${id} button`).forEach((o) => o.setAttribute("aria-pressed", String(o.dataset.v === value)));
+  };
   for (const [id, key] of [["color-by", "colorBy"], ["timing", "timing"]]) {
-    document.querySelectorAll(`#${id} button`).forEach((b) => {
-      b.setAttribute("aria-pressed", String(b.dataset.v === state[key]));
-      b.addEventListener("click", () => {
-        state[key] = b.dataset.v;
-        document.querySelectorAll(`#${id} button`).forEach((o) => o.setAttribute("aria-pressed", String(o === b)));
-        hover(-1); legend(); changed();
-      });
-    });
+    select(id, key, state[key]);
+    document.querySelectorAll(`#${id} button`).forEach((o) => o.addEventListener("click", () => {
+      select(id, key, o.dataset.v);
+      // The critical path is predicted: it is not drawn, and its segments are not, in measured-only time.
+      if (state.timing === "measured" && state.critical) setCritical(false);
+      hover(-1); legend(); changed();
+    }));
   }
   document.getElementById("timing-controls").hidden = !D.measured;
-  const b = document.getElementById("critical");
-  b.hidden = !D.start || !D.critical.length; b.setAttribute("aria-pressed", "false");
+  b.hidden = !D.start || !D.critical.length;
+  setCritical(false);
   b.addEventListener("click", () => {
-    state.critical = !state.critical; b.setAttribute("aria-pressed", String(state.critical));
-    criticalPanel(); changed();
+    if (!state.critical && state.timing === "measured") select("timing", "timing", "both");
+    setCritical(!state.critical); hover(-1); changed();
   });
   document.getElementById("reset-view").addEventListener("click", resetView);
   document.getElementById("add-cta").addEventListener("change", (ev) => {
@@ -509,10 +605,38 @@ function setup() {
 setup();
 window.addEventListener("resize", draw);
 document.addEventListener("themechange", () => { refreshPalette(); changed(); });
+// WASD as in Perfetto: held keys zoom (W in, S out) and pan (A left, D right) each animation
+// frame, at rates per second so the speed does not depend on key repeat or frame rate.
+const held = new Set();
+let lastFrame = null, frame = 0; // frame: the pending callback's id; at most one is ever queued
+function navigate(now) {
+  frame = 0;
+  if (!held.size) { lastFrame = null; return; }
+  const dt = Math.min(0.05, lastFrame === null ? 0 : (now - lastFrame) / 1000);
+  lastFrame = now;
+  const [lo, hi] = timeWindow(), width = hi - lo;
+  const zoom = Math.exp(3 * dt * ((held.has("s") ? 1 : 0) - (held.has("w") ? 1 : 0)));
+  const pan = 0.8 * dt * width * ((held.has("d") ? 1 : 0) - (held.has("a") ? 1 : 0));
+  if (zoom !== 1 || pan) {
+    const f = state.anchor ?? 0.5, anchor = lo + f * width;
+    setWindow(anchor - f * width * zoom + pan, anchor + (1 - f) * width * zoom + pan);
+  }
+  frame = requestAnimationFrame(navigate);
+}
+document.addEventListener("keyup", (ev) => held.delete(ev.key.toLowerCase()));
+window.addEventListener("blur", () => held.clear());
 document.addEventListener("keydown", (ev) => {
+  const key = ev.key.toLowerCase();
+  if (D.start && key.length === 1 && "wasd".includes(key) && !ev.ctrlKey && !ev.metaKey &&
+      !ev.altKey && !(ev.target instanceof Element && ev.target.closest("input, select, textarea"))) {
+    ev.preventDefault();
+    held.add(key);
+    if (!frame) frame = requestAnimationFrame(navigate);
+    return;
+  }
   if (ev.key === "Escape") {
     if (state.drag) { state.drag = null; draw(); }
-    else if (state.hover >= 0) hover(-1);
+    else if (state.hover >= 0 || state.spanAt) hover(-1);
     else resetView();
   }
 });

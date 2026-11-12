@@ -252,6 +252,9 @@ across CTAs.
 `work_item_ranges(session.ranges, role)` keys each work item's range of `role` by its payload,
 the work index; `work_item_spans(session.ranges, role)` turns them into `[item, cta, start,
 end]` in us from the earliest start, the measured spans `schedule_html` draws.
+`role_tracks(session.ranges, op, origin_ns)` lists every range as `[cta, track, name, payload,
+start, end]` by recording role: for example, work items on `"compute w0-7"` and regions nested
+one level inside them on `"compute +1"`. These are the per-CTA tracks `schedule_html` expands.
 
 ## Draw the pipeline
 
@@ -430,16 +433,17 @@ rows[0]  # [(0, (0, 0, 0)), (148, (18, 4, 0)), ...]: CTA 0's tiles, in order
 ```
 
 `schedule_html` draws a CTA × slot grid; a ragged last column shows wave quantization.
-Items with predicted spans also get a timeline (drag to zoom, click a row to focus a CTA),
-dependency arrows on hover, a critical path with a per-segment table, and an optional measured
-overlay drawn as a second lane per CTA. Items with 2-D coordinates get a work-space map.
+Items with predicted spans get a timeline instead (drag or W/S to zoom, A/D to pan, click a row
+to focus a CTA), with dependency arrows on hover, a critical path with a per-segment table, and
+an optional measured overlay drawn as a second lane per CTA. Measured `tracks` (for example each role's
+ranges) expand under a CTA when it is focused. Items with 2-D coordinates get a work-space map.
 Two examples use it:
 
 ```bash
 # persistent GEMM tiles per CTA and a grouped GEMM's groups
 python -m attn_gym.warpdrive.examples.schedule_views OUTDIR --ctas 152
 # the Qwen megakernel's instruction table under its latency model; --timeline overlays a
-# trace="globaltimer" capture (overlay() in the module docstring writes it)
+# trace="globaltimer" capture with per-role tracks (overlay() in the module docstring writes it)
 python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html --model Qwen/Qwen3-32B --ctas 152
 ```
 
