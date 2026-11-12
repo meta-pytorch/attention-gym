@@ -55,7 +55,7 @@ def _table(lens, heads, cu, warmup=None):
     return torch.tensor(rows, dtype=torch.int32, device="cuda").reshape(-1, 10)
 
 
-def _run(k, v, gate, beta, cu, lens, state, items):
+def _run(k, v, gate, beta, cu, lens, state, items, max_ctas=None):
     from attn_gym.linear._delta_rule.frost import gdn_recompute, gdn_tinv
 
     heads, d_k, d_v = gate.shape[1], k.shape[2], v.shape[2]
@@ -68,7 +68,9 @@ def _run(k, v, gate, beta, cu, lens, state, items):
     ckpt = torch.empty(ckpt_rows, heads, d_v, d_k, dtype=k.dtype, device="cuda")
     ckpt.view(torch.int16).fill_(POISON)
     n_items = torch.tensor([items.shape[0]], dtype=torch.int32, device="cuda")
-    gdn_recompute.gdn_recompute(k, v, gate, tinv, items, n_items, ckpt, state_in=state)
+    gdn_recompute.gdn_recompute(
+        k, v, gate, tinv, items, n_items, ckpt, state_in=state, max_ctas=max_ctas
+    )
     return ckpt
 
 
@@ -152,6 +154,38 @@ def test_gdn_recompute_split_items_start_from_zero_and_write_only_their_range():
     starts = items[::heads, 4].tolist()
     ref = _reference(k, v, gate, beta, lens, heads, None, starts=starts)
     _check(ckpt, ref, lens, torch.bfloat16, skip_before=items[::heads, 2].tolist())
+
+
+@pytest.mark.parametrize(
+    ("dims", "dtype", "state_dtype"),
+    [
+        ((64, 64), torch.bfloat16, None),
+        ((128, 128), torch.float16, torch.float32),
+        ((128, 64), torch.bfloat16, torch.bfloat16),
+    ],
+    ids=["d64-zero-seeded", "fp16-fp32-state", "dv64-bf16-state"],
+)
+def test_gdn_recompute_one_cta_carries_signal_phases_across_mixed_items(dims, dtype, state_dtype):
+    """One CTA runs every item in turn: one-chunk, odd and even chunk counts, empty rows and
+    split warmups. The one-way TMEM signals' parities carry across items, and each item's
+    final state wait must drain KV before the next item seeds; resetting a parity at an item
+    boundary or dropping that drain breaks the series. The single-CTA result must also equal
+    a launch with one CTA per item bit for bit."""
+    lens = (64, 0, 65, 321, 129, 0, 63, 257)
+    compute_starts = (0, 0, 0, 1, 0, 0, 0, 2)
+    write_starts = (0, 0, 0, 2, 0, 0, 0, 3)
+    heads = 1
+    k, v, gate, beta, cu, state = _inputs(lens, heads, heads, *dims, dtype, state_dtype)
+    rows = [
+        [b, 0, ws, _chunks(n), cs, _chunks(n), cu[b].item(), cu[b + 1].item(), -1, -1]
+        for b, (n, cs, ws) in enumerate(zip(lens, compute_starts, write_starts, strict=True))
+    ]
+    items = torch.tensor(rows, dtype=torch.int32, device="cuda")
+    one = _run(k, v, gate, beta, cu, lens, state, items, max_ctas=1)
+    ref = _reference(k, v, gate, beta, lens, heads, state, starts=compute_starts)
+    _check(one, ref, lens, dtype, skip_before=write_starts)
+    spread = _run(k, v, gate, beta, cu, lens, state, items, max_ctas=len(lens))
+    assert torch.equal(one.view(torch.int16), spread.view(torch.int16))
 
 
 def test_gdn_recompute_checkpoint_rows_are_closed_form():
