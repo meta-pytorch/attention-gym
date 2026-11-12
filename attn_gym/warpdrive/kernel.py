@@ -83,7 +83,7 @@ from attn_gym.warpdrive.storage import (
 from attn_gym.warpdrive.tma import TmaReport, clear_multicast_masks
 from attn_gym.warpdrive.tma import check_role as check_tma
 from attn_gym.warpdrive.tmem import TmemPlan, TmemView
-from attn_gym.warpdrive.tracing import IketRanges, IketTrace, pop_if
+from attn_gym.warpdrive.tracing import IketRanges, IketTrace
 
 WARP_SIZE = 32
 WARPGROUP = 4
@@ -578,14 +578,15 @@ class WarpSpecialized(metaclass=_KernelType):
                 )
             seen[id(obj)] = name
         cluster = self.cluster
+        fetch_keys = {}
         for name, st in streams.items():
             st.name = name
             st.owner = self
             if st.schedule.broadcast:
-                generated = {f"{name}_ring": st.channel()}
-                generated.update(
-                    {f"{name}_{k}": ch for k, ch in st.schedule.fetch_channels().items()}
-                )
+                generated = {st._channel_name(name, "ring"): st.channel()}
+                fetch = st.schedule.fetch_channels()
+                fetch_keys[name] = tuple(fetch)
+                generated.update({st._channel_name(name, k): ch for k, ch in fetch.items()})
                 for k, ch in generated.items():
                     if k in vars(self):
                         raise ProtocolError(
@@ -671,7 +672,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 self._bind(ri, chans, turns)
         self._ws_ctx_type, self._ws_ctx_site = _context_type(ctx_types)
         for name, st in streams.items():
-            self._bind_stream(name, st, roles, chans, cluster)
+            self._bind_stream(name, st, roles, chans, cluster, fetch_keys.get(name, ()))
         roles.sort(key=lambda r: r.first_warp)
         self._validate(chans, turns, roles)
         self._plan_registers(roles)
@@ -687,6 +688,7 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_raw_bars = raw_bars
         self._ws_named_bars = named_bars
         self._ws_streams = streams
+        self._ws_fetch_keys = fetch_keys
         self._reset_trace()
 
     def _reset_trace(self):
@@ -716,7 +718,9 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_raw_barrier_access = ""
 
     @staticmethod
-    def _bind_stream(name: str, st: WorkStream, roles: list, chans: dict, cluster):
+    def _bind_stream(
+        name: str, st: WorkStream, roles: list, chans: dict, cluster, fetch_keys: tuple[str, ...]
+    ):
         """Check the stream's users. A broadcast schedule also gets the scheduler role, the work
         ring's producer; the scheduler and every stream user consume the ring."""
         users = [r for r in roles if any(a is WorkCursor for _, a in r.params)]
@@ -747,8 +751,8 @@ class WarpSpecialized(metaclass=_KernelType):
             regs = budgets.pop() if len(budgets) == 1 else min(b for b in budgets if b is not None)
         else:
             regs = min(any_regs) if any_regs else None
-        ring = f"{name}_ring"
-        fetch = [f"{name}_{k}" for k in st.schedule.fetch_channels()]
+        ring = st._channel_name(name, "ring")
+        fetch = [st._channel_name(name, k) for k in fetch_keys]
         params = [(ring, Producer), (name, _SchedulerCursor), (name, _SchedulerFetch)]
         # In a cluster only rank 0 claims, and it publishes each item into every CTA. When rank
         # 0 is the only leader (a CTA pair), the role keeps the leader placement.
@@ -817,8 +821,8 @@ class WarpSpecialized(metaclass=_KernelType):
         leaders = set(cluster.ctas(LEADER))
         if cluster.size > 1:
             for name, ch in chans.items():
-                for side, bound in (("producer", ch.producers), ("consumer", ch.consumers)):
-                    for ri, _ in bound:
+                for side in SIDES:
+                    for ri, _ in ch.bound(side):
                         commits = ch.mechanism(side, ri.role) is Umma
                         if commits and cluster.pair and not set(cluster.ctas(ri.cta)) <= leaders:
                             raise ProtocolError(
@@ -881,7 +885,7 @@ class WarpSpecialized(metaclass=_KernelType):
                         "every key of the consumer dict must bind one"
                     )
             for side in SIDES:
-                bound = chan.producers if side == "producer" else chan.consumers
+                bound = chan.bound(side)
                 if side == chan.external:
                     if bound:
                         raise ProtocolError(
@@ -1591,10 +1595,9 @@ class WarpSpecialized(metaclass=_KernelType):
                 if isinstance(arg, _ROLE_STATE_TYPES)
             ]
             final = _returned_state(r, result, state_args)
-            if ranges is not None:
-                for cur in final:
-                    if isinstance(cur, WorkCursor):
-                        pop_if(ranges, cur.index < cur._problem.total, r.name, cur.index)
+            for cur in final:
+                if isinstance(cur, WorkCursor):
+                    cur._exit_item()
             for end in final:
                 if isinstance(end, ProducerEnd) and end.scope.tail:
                     end.tail()
@@ -1665,7 +1668,7 @@ class WarpSpecialized(metaclass=_KernelType):
                 st = self._ws_streams[pname]
                 end = None
                 if st.schedule.broadcast:
-                    end = self._make_end(f"{pname}_ring", False, None, trace, r)
+                    end = self._make_end(st._channel_name(pname, "ring"), False, None, trace, r)
                 args.append(
                     WorkCursor.create(
                         st,
@@ -1679,10 +1682,10 @@ class WarpSpecialized(metaclass=_KernelType):
                 st = self._ws_streams[pname]
                 ends = {
                     k: (
-                        self._make_end(f"{pname}_{k}", True, None, trace, r),
-                        self._make_end(f"{pname}_{k}", False, None, trace, r),
+                        self._make_end(st._channel_name(pname, k), True, None, trace, r),
+                        self._make_end(st._channel_name(pname, k), False, None, trace, r),
                     )
-                    for k in st.schedule.fetch_channels()
+                    for k in self._ws_fetch_keys[pname]
                 }
                 args.append(_Fetch(st.schedule, ends, self._ws_problems[pname]))
             elif ann is Instance:
@@ -1706,7 +1709,7 @@ class WarpSpecialized(metaclass=_KernelType):
         turns = chan.turns(side)
         turn = 0
         if turns > 1:
-            turn = [r for r, _ in (chan.producers if is_prod else chan.consumers)].index(ri)
+            turn = [r for r, _ in chan.bound(side)].index(ri)
         if chan.fixed:
             # Producers start each slot at phase 1 (a fresh empty barrier passes).
             state = Int32((1 << chan.n) - 1 if is_prod else 0)
@@ -1874,7 +1877,7 @@ def _check_named_turns(name: str, chan, turns: dict):
         k = chan.turns(side)
         if k == 1 or chan.n % k == 0:
             continue
-        bound = {r.name for r, _ in (chan.producers if side == "producer" else chan.consumers)}
+        bound = {r.name for r, _ in chan.bound(side)}
         ts = turns.get(chan.turnstile)
         if ts is None or not ts.enabled or {r.name for r in ts.parties} != bound:
             raise ProtocolError(

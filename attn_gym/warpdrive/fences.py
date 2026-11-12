@@ -224,7 +224,7 @@ def _other_handoff(s: alias.Access, t: alias.Access | None, chan, kind: str) -> 
 def _counterparts(s: alias.Access, rec, other: str, theirs, pairs, res: FenceResult):
     chan = rec.chan
     matches = []
-    for ri, slot in chan.consumers if other == "consumer" else chan.producers:
+    for ri, slot in chan.bound(other):
         # An end bound to one slot never touches the others.
         if ri.raw or (slot is not None and slot != rec.slot):
             continue
@@ -298,7 +298,7 @@ def _check_side(kernel, chan, side: str, roles: list[alias.RoleEvents], pairs) -
         return res
     signalling = {
         ri.name
-        for ri, _ in (chan.producers if producer else chan.consumers)
+        for ri, _ in chan.bound(side)
         if default_access(chan.mechanism(side, ri.role), side).agent == "threads"
     }
     if not signalling:
@@ -319,7 +319,7 @@ def _check_side(kernel, chan, side: str, roles: list[alias.RoleEvents], pairs) -
                 continue
             matches = _counterparts(s, rec, other, theirs, pairs, res)
             _check_handoff(s, rec, other, matches, res)
-    involved = signalling | {ri.name for ri, _ in (chan.consumers if producer else chan.producers)}
+    involved = signalling | {ri.name for ri, _ in chan.bound(other)}
     for role in roles:
         if role.name not in involved:
             continue

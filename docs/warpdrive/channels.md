@@ -38,6 +38,7 @@ with ab.consume() as h:
 ```
 
 These are separate producer and consumer excerpts. Return the updated end from the role.
+After collection, `channel.bound(side)` gives `(role instance, slot)` pairs for either side.
 
 ## Stages and phases
 

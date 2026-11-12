@@ -102,7 +102,7 @@ from attn_gym.warpdrive.protocol import (
     current_block,
     user_site,
 )
-from attn_gym.warpdrive.tracing import push_if
+from attn_gym.warpdrive.tracing import pop_if, push_if
 
 AXES = ("m", "n", "l")
 INT32_MAX = 2**31 - 1
@@ -420,9 +420,10 @@ class IndexSchedule:
     ``>= problem.total``; never negative. Once a unit returns a terminal index its stream has
     ended.
 
-    A schedule's kind is the direct ``IndexSchedule`` subclass it derives from: a built-in, or
-    a custom schedule that subclasses ``IndexSchedule`` itself. A class deriving from two kinds
-    raises a ``TypeError`` where it is defined.
+    A schedule kind subclasses ``IndexSchedule`` without another schedule among its bases.
+    Built-ins and direct custom schedules are kinds; a redundant ``IndexSchedule`` base does
+    not introduce a new one. Deriving from two kinds raises a ``TypeError`` where the class is
+    defined.
 
     Class attributes:
 
@@ -483,10 +484,13 @@ class IndexSchedule:
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
-        # A schedule's kind is the direct IndexSchedule subclass it derives from: a built-in or
-        # a custom schedule. The layer derives a stream's grid, first item and decode from that
-        # kind, so a class of two kinds would mix the answers of both.
-        kinds = [k.__name__ for k in cls.__mro__ if IndexSchedule in k.__bases__]
+        # Mixing kinds would combine incompatible grid, first-item and decode rules.
+        kinds = []
+        for base in cls.__mro__:
+            if IndexSchedule in base.__bases__:
+                parents = [p for p in base.__bases__ if p is not IndexSchedule]
+                if not any(issubclass(p, IndexSchedule) for p in parents):
+                    kinds.append(base.__name__)
         if len(kinds) > 1:
             raise TypeError(
                 f"{cls.__name__} derives from the schedules {', '.join(kinds)}; a schedule "
@@ -800,8 +804,6 @@ class TilePersistent(IndexSchedule):
             )
 
     def _assignment(self, stream, space, max_ctas, decode) -> list[list[tuple]]:
-        # CTAs in launch order (blockIdx.x fastest), each running the items along its axis, with
-        # the total and units the launch computes.
         if decode is not None:
             raise ValueError(f"{self.describe()} reads items from blockIdx; drop decode")
         _check_single_cta(stream, stream.cluster_size)
@@ -809,7 +811,7 @@ class TilePersistent(IndexSchedule):
         total = bound.total
         k = AXES.index(self.axis)
         units = _launch_units(self, total, bound.max_ctas, bound.cs)
-        dims = _tile_persistent_dims(bound.space, self.axis, units)
+        dims = self._grid(bound, units)
         rows = []
         for z, y, x in itertools.product(*(range(d) for d in reversed(dims))):  # x fastest
             block = (x, y, z)
@@ -995,6 +997,10 @@ class WorkStream:
     def payload_words(self) -> int:
         """Broadcast payload per stage: ``[index, item words]`` padded to 16 bytes."""
         return -(-(1 + self.mapping.words) // 4) * 4
+
+    @staticmethod
+    def _channel_name(name: str, key: str) -> str:
+        return f"{name}_{key}"
 
     def channel(self) -> Ring:
         """The broadcast work ring.
@@ -1716,6 +1722,12 @@ class WorkCursor:
         if trace.ranges is not None:  # one range per work item, named after the role
             push_if(trace.ranges, self.index < self._problem.total, trace.role_name)
 
+    def _exit_item(self):
+        """Close this item's trace range when the role exits."""
+        trace = self._rec.trace
+        if trace.ranges is not None:
+            pop_if(trace.ranges, self.index < self._problem.total, trace.role_name, self.index)
+
     def __extract_mlir_values__(self):
         values = [self.index.ir_value()] + [w.ir_value() for w in self._words]
         if self._state is not None:
@@ -1897,9 +1909,8 @@ class _Fetch:
 
 
 def _publish(h, index, words, total):
-    chan = h._end._chan
-    if isinstance(chan.producer, Tma):  # a cluster's ring: the bytes complete each full barrier
-        targets = chan.scope.full_ctas if chan.scope.pair else (0,)  # local: leader-only users
+    targets = h._transaction_ctas
+    if targets is not None:  # a cluster's ring: the bytes complete each full barrier
         _publish_cluster(h.data.iterator, h.barrier, [index, *words], targets)
     else:
         _publish_local(h, index, words, total)

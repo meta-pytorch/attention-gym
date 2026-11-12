@@ -30,13 +30,12 @@ def check(kernel, epoch_seqs: dict) -> dict[str, str]:
 
 def _epoch_ownership(name: str, ch, epoch_seqs: dict, persistent: bool) -> str:
     """``check``'s verdict for one channel."""
-    bound = {"producer": ch.producers, "consumer": ch.consumers}
     joined = [side for side in SIDES if ch.sharing(side) is Sharing.JOIN]
     if not joined:
         return "unverified (both sides take turns)"
-    if len(bound[joined[0]]) != 1:
+    if len(ch.bound(joined[0])) != 1:
         return f"unverified (several joining {joined[0]}s)"
-    names = {side: [ri.name for ri, _ in bound[side]] for side in SIDES}
+    names = {side: [ri.name for ri, _ in ch.bound(side)] for side in SIDES}
     traced = {who: epoch_seqs[(name, who)] for who in names["producer"] + names["consumer"]}
     dynamic = [seq for seq in traced.values() if isinstance(seq, str)]
     if dynamic:

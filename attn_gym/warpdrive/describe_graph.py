@@ -178,7 +178,10 @@ def _streams(kernel, graph: Graph, roles: dict) -> None:
         # The work ring already connects broadcast users. Local decoding by every role
         # needs no separate stream edges.
         if sched is not None:
-            how, targets = f"claimed by {sched}, broadcast over {name}_ring", [sched]
+            how, targets = (
+                f"claimed by {sched}, broadcast over {st._channel_name(name, 'ring')}",
+                [sched],
+            )
         elif set(users) == set(roles):
             how, targets = "decoded locally in every role", []
         else:
@@ -227,8 +230,7 @@ def _ends(graph: Graph, roles: dict, name: str, ch, side: str) -> list[tuple[str
     """``(node, bound slot)`` of each end on ``side``: its roles, or a raw-code node."""
     if ch.external == side:
         return [(graph.add("external", f"{name}_{side}", ["raw code", f"{name} {side}"]), None)]
-    bound = ch.producers if side == "producer" else ch.consumers
-    return [(roles[r.name], slot) for r, slot in bound]
+    return [(roles[r.name], slot) for r, slot in ch.bound(side)]
 
 
 def _channel_facts(kernel, name: str, ch) -> tuple[str, ...]:
