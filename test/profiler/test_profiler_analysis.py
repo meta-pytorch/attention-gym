@@ -9,6 +9,7 @@ pytest.importorskip("cutlass")  # attn_gym.warpdrive.profiler imports CuTeDSL
 import torch
 
 from attn_gym.testing.perfetto_trace import read_slices
+from attn_gym.warpdrive import profiler
 from attn_gym.warpdrive.cache._key import module_closure
 from attn_gym.warpdrive.profiler import (
     Range,
@@ -243,7 +244,7 @@ def test_join_treats_compact_ranges_as_one_recorder_per_role():
         join(ranges, warp_plan().schedule(iterations=2))
 
 
-PROFILER = Path(__file__).resolve().parents[2] / "attn_gym" / "warpdrive" / "profiler"
+PROFILER = Path(profiler.__file__).resolve().parent
 
 
 def test_recording_kernels_key_only_the_profilers_device_code():
