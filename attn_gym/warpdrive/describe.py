@@ -388,6 +388,8 @@ def _overrides(ch, cluster) -> list[str]:
         out.append(
             f"{key} {_fmt_value(key, ours, cluster)} -> {_fmt_value(key, theirs, cluster)}{note}"
         )
+    if ch.wait != "suspend":
+        out.append(f"wait {ch.wait}")
     if ch.remote_scope_overridden:
         ours, theirs = ch.derived_remote_scope, ch.remote_scope
         note = "  (differs from derived)" if ours != theirs else ""

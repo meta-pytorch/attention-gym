@@ -10,9 +10,12 @@ B uses the group coordinate of an ``(N, K, G)`` view. No device-side descriptor 
 is needed. Roles and channels follow ``persistent_gemm.py``.
 
 TMA clips at tensor edges, not group boundaries. Output uses a ragged TMA view of shape
-``(2^30, N, 2^31 - 1)``: the first mode supplies the clipping edge, and the third has stride N
-to select the real row. A tile with ``rows`` valid rows ending at ``end`` starts at
-``(2^30 - rows, n, end)``. Stores past the group's end fall outside the view and are dropped.
+``(EDGE_ROWS, N, 2^31 - 1)``, its base ``EDGE_ROWS`` (one MMA tile) rows before C: the first
+mode supplies the clipping edge, and the third has stride N to select the real row. A tile with
+``rows`` valid rows ending at ``end`` starts at ``(EDGE_ROWS - rows, n, end)``. Stores past the
+group's end fall outside the view and are dropped. The base stays within one tile of C: a base
+``2^30`` rows early faulted on stores whenever another context's exception preempted the kernel
+(see ``attn_gym/linear/_delta_rule/frost/ragged.py``).
 Ragged A loads can read the next group's rows, but only into accumulator rows never stored.
 """
 
@@ -66,11 +69,11 @@ from attn_gym.warpdrive.examples.persistent_gemm import (
 )
 from attn_gym.warpdrive.examples.tma_tiles import tma_partition_tiles
 
-RAGGED_ROWS = 2**30  # the row extent of the ragged output view; TMA clips there
-RAGGED_SELECT = 2**31 - 1  # extent of its row-selecting third mode
+RAGGED_SELECT = 2**31 - 1  # extent of the ragged output view's row-selecting third mode
 INT32_MAX = 2**31 - 1
 LOOKAHEAD = 8  # groups a decode tests at once past its last group
 MAX_TILE_M = 2 * CTA_TILE_M  # a CTA pair's MMA tile
+EDGE_ROWS = MAX_TILE_M  # the ragged output view's row extent; TMA clips there
 
 
 class Window(NamedTuple):
@@ -189,7 +192,7 @@ class GroupedGemmParams:
     acc_layout: cute.Layout  # all accumulator stages
     epi_tile: cute.Tile
     tma_c: cute.CopyAtom
-    mC_tma: cute.Tensor  # ragged TMA coordinate tensor of the output (RAGGED_ROWS, N, SELECT)
+    mC_tma: cute.Tensor  # ragged TMA coordinate tensor of the output (EDGE_ROWS, N, SELECT)
     mC: cute.Tensor  # the output itself (total_M, N), for the fragment layouts
     sC: cute.Tensor  # epilogue staging buffers
 
@@ -373,10 +376,10 @@ class GroupedGemm(WarpSpecialized):
             # This CTA's rows of the MMA tile; a pair's peer may hold none of a ragged tile.
             rows = cutlass.max(cutlass.min(rows - CTA_TILE_M * rank, CTA_TILE_M), 0)
             end = row0 + CTA_TILE_M * rank + rows
-            # The ragged view's rows [RAGGED_ROWS - rows, RAGGED_ROWS) alias C's rows
+            # The ragged view's rows [EDGE_ROWS - rows, EDGE_ROWS) alias C's rows
             # [end - rows, end); the MMA-tile partition below adds this CTA's row offset.
             mC_item = cute.domain_offset(
-                (RAGGED_ROWS - rows - CTA_TILE_M * rank, 0), params.mC_tma[None, None, end]
+                (EDGE_ROWS - rows - CTA_TILE_M * rank, 0), params.mC_tma[None, None, end]
             )
             gC_tma = cute.flat_divide(
                 transform_partitioned_tensor_layout(
@@ -493,13 +496,13 @@ class GroupedGemm(WarpSpecialized):
         c_layout = sm100_utils.make_smem_layout_epi(
             self.dtype, self.c_layout, self.epi_tile, self.c_stages
         )
-        # The ragged output view (see the module docstring); its base lies RAGGED_ROWS rows
-        # before C, which a store-only descriptor tolerates.
+        # The ragged output view (see the module docstring); its base lies EDGE_ROWS rows
+        # before C.
         row_stride = c.stride[0]
         c_ragged = cute.make_tensor(
-            cute.domain_offset((-RAGGED_ROWS, 0), c).iterator,
+            cute.domain_offset((-EDGE_ROWS, 0), c).iterator,
             cute.make_layout(
-                (RAGGED_ROWS, c.shape[1], RAGGED_SELECT), stride=(row_stride, 1, row_stride)
+                (EDGE_ROWS, c.shape[1], RAGGED_SELECT), stride=(row_stride, 1, row_stride)
             ),
         )
         tma_c, mC_tma = cpasync.make_tiled_tma_atom(

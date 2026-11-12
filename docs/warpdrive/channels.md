@@ -95,6 +95,24 @@ SMEM, whichever CTA issues the copies. See [multicast](clusters.md#multicast) fo
 A single-mechanism TMA or UMMA side binds to one single-warp role: one active instance per
 epoch for round-robin, or one owner per epoch for [exclusive consumers](#exclusive-consumers).
 
+## Wait mode
+
+Blocking acquires and waits default to `wait="suspend"`: CuTeDSL's `mbarrier.try_wait.parity`
+with a suspend-time hint, which ptxas lowers to a `NANOSLEEP.SYNCS` fallback. `wait="spin"`
+retries a hint-less `try_wait` instead, the loop CUTLASS's C++ `ClusterBarrier::wait` and the
+cuDNN-frontend Frost kernels use:
+
+```python
+self.trip = Ring(1, Umma, Threads, wait="spin")  # a serial MMA <-> CUDA-core handoff
+```
+
+Spinning can shorten a serial chain of handoffs that are usually satisfied quickly (GDN's
+backward summary reached parity with cuDNN only this way), but the spinning warps compete for
+issue slots with co-resident warps (spinning every wait made the KDA prefill ~1% slower).
+Choose it per channel and measure. It applies to `acquire`/`wait`, span `begin` and
+`peek`; probes, producer tails and named channels are unaffected. `describe()` lists
+`wait spin` under the channel.
+
 ## CUTLASS crosswalk
 
 CUTLASS's state-taking calls leave advancement to the caller. Warpdrive's `acquire()`/`wait()`
@@ -234,6 +252,17 @@ Explicit values **replace**, not extend, defaults. Include `"smem_async"` when a
 `"tmem_store"`, as single-CTA FA4 backward's `ds` does with `("tmem_store", "smem_async")`.
 `describe()` shows replacements as `override  commit_fence smem_async -> ...` or
 `override  release_fence smem_async -> ...`.
+
+A joining consumer that does not read an epoch (another instance or role processes it) can
+pass over it with `end.consume_unread()`: it waits for the epoch and releases it at once,
+without the release fences. Nothing runs between that wait and release, so the end's reads
+of the stage all precede an earlier release, whose fence ordered them; a previewed epoch
+keeps its fences. Accesses to the same storage through another channel (aliased buffers)
+are not covered: order those yourself. The fence check and alias diagnostic treat the pass
+as an unfenced release. The KDA prefill's two `cg0` instances join every `raw` epoch but
+read alternate ones; passing over the other instance's epochs this way dropped one
+`fence.proxy.async` per chunk and made the kernel 0.9-1.7% faster (GB300, CuTeDSL 4.8.1,
+8x4096 H32: 451.3 → 447.1 us with per-instance bodies, 453.5 → 445.9 us with a shared body).
 
 `commit(signal=False)` and `release(signal=False)` omit **the signal and all its fences**,
 including defaults. Other async work, including TMA stores and TMEM aliases, still needs
@@ -595,6 +624,13 @@ completes after `threads` arrivals through `sync()` or `arrive()`.
 The count is a multiple of 32, at most 1024 and at most the kernel's thread count. A role
 may use only some warps. See the [named-barrier contract](guarantees.md#named-barriers) for
 participation, liveness and alias checks.
+
+`NamedBarriers(n, threads=N)` declares `n` such barriers with consecutive IDs. `bars[i]` with
+a Python int is the `NamedBarrier` named `<name>[i]`; with a runtime index it returns a view
+whose `sync()`/`arrive()` compute the ID at run time. Each barrier is allocated and checked
+like a separate declaration. A [shared-body](roles.md#shared-bodies) role indexing with its
+`Instance` value is checked as instance `i` using barrier `i`; any other runtime index
+counts as native use of every barrier, so short participation is unverified.
 
 ### One-shot done flag
 

@@ -189,6 +189,7 @@ class Sharing(Enum):
 
 
 SYNC_KINDS = ("mbarrier", "named")
+WAIT_KINDS = ("suspend", "spin")
 SIDES = ("producer", "consumer")
 
 
@@ -256,6 +257,14 @@ class Channel:
     module docstring. A named channel takes no override and must stay CTA-local; after
     collection, ``full_barriers``/``empty_barriers`` hold its ``NamedBarrier`` per slot.
 
+    ``wait``: how this channel's blocking acquires, waits, span begins and previews poll their
+    mbarrier. ``"suspend"`` (the default) is CuTeDSL's ``mbarrier.try_wait.parity`` with a
+    suspend-time hint, which ptxas lowers to a ``NANOSLEEP.SYNCS`` fallback; ``"spin"`` retries
+    a hint-less ``try_wait`` (the C++ ``ClusterBarrier::wait`` loop). Spinning can shorten a
+    serial handoff chain whose waits are usually satisfied quickly, but it competes for issue
+    slots with co-resident warps, so measure per channel. Probes, tails and named channels are
+    unaffected.
+
     ``external``: ``"producer"`` or ``"consumer"`` when raw code (a raw role, or kernel code)
     drives that side through ``WarpSpecialized.barrier_ptr``. No role binds that side, so
     ``override`` must give its counts (``full_counts`` for an external producer,
@@ -280,6 +289,7 @@ class Channel:
     sync: str = "mbarrier"
     turnstile: str | None = None
     external: str | None = None
+    wait: str = "suspend"
     name: str = field(default="", init=False)
     fixed: bool = field(default=False, init=False)
     producers: list = field(default_factory=list, init=False)  # (RoleInstance, slot | None)
@@ -363,6 +373,10 @@ class Channel:
                 )
         if self.sync not in SYNC_KINDS:
             raise ValueError(f"channel sync must be one of {SYNC_KINDS}, got {self.sync!r}")
+        if self.wait not in WAIT_KINDS:
+            raise ValueError(f"channel wait must be one of {WAIT_KINDS}, got {self.wait!r}")
+        if self.wait != "suspend" and self.sync == "named":
+            raise ValueError("wait='spin' selects an mbarrier wait; named channels have none")
         if self.per_role:
             self._check_per_role()
         if self.turnstile is not None and not (self.named and self.rotates):
@@ -895,7 +909,14 @@ class Handle(_Stage):
         if signal:
             self._end._signal(self.index)
 
-    def _close(self, producer: bool, op: str, once: str | None = None, hint: str = ""):
+    def _close(
+        self,
+        producer: bool,
+        op: str,
+        once: str | None = None,
+        hint: str = "",
+        fenced: bool = True,
+    ):
         trace = self._end._trace
         if producer != self._is_producer:
             raise ProtocolError(
@@ -912,6 +933,7 @@ class Handle(_Stage):
             signal=op in ("commit", "release"),
             retire=op == "retire",
             once=once,
+            fenced=fenced,  # False: the signal runs without the channel's fences
         )
         if producer and isinstance(self._end._chan.producer, Tma):
             stage_closed(trace, self.rec)
@@ -999,7 +1021,7 @@ class Span(Handle):
         def wait():
             bar = end._empty(self.index) if self._is_producer else end._full(self.index)
             with wait_range(end._trace, f"{end._chan.name}.{op}"):
-                cute.arch.mbarrier_wait(bar, self.phase)
+                _parity_wait(bar, self.phase, end._chan.wait)
 
         if_generate(i == 0, wait)
 
@@ -1360,11 +1382,17 @@ class _End:
                 "a barrier and must take it in turn"
             )
 
-    def seed(self, slots):
+    def seed(self, slots, when=None):
         """Named channel, consumer: arrive once on the empty barriers of ``slots``. The layer
-        emits this at role start, the equivalent of mbarriers starting empty."""
+        emits this at role start, the equivalent of mbarriers starting empty. ``when(j)``: a
+        condition on each arrival, a Python bool or a runtime one (a shared body's turns)."""
         for j in slots:
-            self._named_arrive(self._chan.empty_barriers, j)
+            cond = True if when is None else when(j)
+            if isinstance(cond, bool):
+                if cond:
+                    self._named_arrive(self._chan.empty_barriers, j)
+            else:
+                _named_arrive_if(cond, *self._named(self._chan.empty_barriers, j))
 
     def _full(self, index):
         return self._bars + index
@@ -1461,14 +1489,15 @@ class _End:
         table = sc.full_targets if isinstance(self, ProducerEnd) else sc.empty_targets
         return {r: table.get(r, ()) for r in self.ctas}
 
-    def _signal(self, index):
+    def _signal(self, index, fenced: bool = True):
+        """Signal stage ``index``; ``fenced=False`` skips the channel's fences."""
         chan = self._chan
         producer = isinstance(self, ProducerEnd)
         side = "producer" if producer else "consumer"
         mech = chan.mechanism(side, self._role)
         if isinstance(mech, Tma):
             return  # completed by the TMA transaction count
-        fence = chan.fences(side, self._role)
+        fence = chan.fences(side, self._role) if fenced else ()
         if chan.named:
             _fence(fence)
             self._named_arrive(chan.full_barriers if producer else chan.empty_barriers, index)
@@ -1747,7 +1776,8 @@ class _End:
             self._named_wait(chan.empty_barriers if producer else chan.full_barriers, index, op)
         else:
             with wait_range(self._trace, f"{chan.name}.{op}"):
-                _wait(self._empty(index) if producer else self._full(index), phase, ready)
+                bar = self._empty(index) if producer else self._full(index)
+                _wait(bar, phase, ready, chan.wait)
         return index, phase, label
 
 
@@ -1831,6 +1861,17 @@ class ConsumerEnd(_End):
 
     consume = wait
 
+    def consume_unread(self, slot=None):
+        """Wait for the next epoch and release it at once, without accessing it: a joining
+        consumer passing over an epoch another role or instance processes. The release runs
+        no fence, because the end made no access to order: between the wait and the release
+        nothing runs, so this end's reads of the stage all precede an earlier, fenced release.
+        A previewed epoch was read through its preview, so its release keeps the fences."""
+        previewed = any(p._key == slot for p in self._rec.previews)
+        handle = self.wait(slot)
+        handle._close(False, "release", fenced=previewed)
+        self._signal(handle.index, fenced=previewed)
+
     def span(self, slot=None) -> Span:
         """Take the next stage without waiting, to read it across the iterations of a counted
         loop: ``begin(i)`` waits until it is full in the first iteration, ``release(i)`` hands
@@ -1878,7 +1919,7 @@ class ConsumerEnd(_End):
         self._check_hold(slot, "peek")
         self._trace.record(self._chan.name, "peek", label)
         with wait_range(self._trace, f"{self._chan.name}.peek"):
-            cute.arch.mbarrier_wait(self._full(index), phase)
+            _parity_wait(self._full(index), phase, self._chan.wait)
         preview = Preview(self, index, phase, slot)
         self._rec.previews.append(preview)
         self._trace.opened(preview._life)
@@ -1967,12 +2008,30 @@ def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline
 # Channels omit tcgen05 thread-sync fences, relying on execution and compiler
 # ordering. Roles can emit nvvm.tcgen05_fence explicitly; see
 # docs/warpdrive/guarantees.md, Hardware assumptions.
-def _wait(bar, phase, ready):
+def _wait(bar, phase, ready, mode: str):
     """Blocking parity wait on ``bar``; with a probe's ``ready``, only if the probe failed."""
     if ready is None:
-        cute.arch.mbarrier_wait(bar, phase)
+        _parity_wait(bar, phase, mode)
     else:
-        if_generate(ready == 0, lambda: cute.arch.mbarrier_wait(bar, phase))
+        if_generate(ready == 0, lambda: _parity_wait(bar, phase, mode))
+
+
+def _parity_wait(bar, phase, mode: str):
+    """Wait for ``bar`` to complete phase ``phase``: ``"suspend"`` with the suspend-time hint,
+    ``"spin"`` by retrying a hint-less ``try_wait`` (``Channel.wait``)."""
+    if mode == "spin":
+        _spin_wait(bar, phase)
+    else:
+        cute.arch.mbarrier_wait(bar, phase)
+
+
+@cute.jit
+def _spin_wait(bar, phase):
+    # The peeled first probe is the fast path of a satisfied wait: a single-site loop is smaller
+    # but made the GDN backward summary 4% slower (229.0 vs 220.9 us at 1x131072 H2).
+    ready = cute.arch.mbarrier_try_wait(bar, phase)
+    while not ready:
+        ready = cute.arch.mbarrier_try_wait(bar, phase)
 
 
 def _named_sync(barrier_id, threads: int):
@@ -1986,6 +2045,12 @@ def _named_sync(barrier_id, threads: int):
 
 def _named_arrive(barrier_id, threads: int):
     cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads, aligned=False)
+
+
+@cute.jit
+def _named_arrive_if(cond, barrier_id: cutlass.Constexpr, threads: cutlass.Constexpr):
+    if cond:
+        _named_arrive(barrier_id, threads)
 
 
 def cluster_rank():

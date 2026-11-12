@@ -199,7 +199,7 @@ def _modes(access: alias.Access) -> list[Access]:
 def _event_fences(ev: Event) -> tuple[str, ...]:
     if ev.kind == "fence":
         return (ev.data["kind"],)
-    if ev.kind == "close" and ev.data["signal"]:
+    if ev.kind == "close" and ev.data["signal"] and ev.data["fenced"]:
         rec = ev.data["handle"]
         return rec.chan.fences("producer" if rec.producer else "consumer", rec.role)
     return ()

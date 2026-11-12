@@ -244,6 +244,32 @@ def view_endpoint_stage():
     Handle.view = lambda self, *args, **kwargs: view(at_endpoint(self), *args, **kwargs)
 
 
+def shared_instance_static():
+    """A shared body passes ``Instance`` the first instance's static index instead of the
+    runtime one (the round-robin turns stay right)."""
+    orig = kernel.WarpSpecialized._role_args
+
+    def _role_args(self, unit, instance, ctx, trace):
+        args = orig(self, unit, instance, ctx, trace)
+        return [
+            unit[0].index if ann is kernel.Instance else a
+            for (_, ann), a in zip(unit[0].params, args)
+        ]
+
+    kernel.WarpSpecialized._role_args = _role_args
+
+
+def unread_no_wait():
+    """``consume_unread()`` releases without waiting: its arrival lands in the previous
+    epoch's phase, so the producer refills a stage the other consumer still reads."""
+
+    def consume_unread(self, slot=None):
+        index, _, _ = self._next(slot, "wait")
+        self._signal(index, fenced=False)
+
+    ConsumerEnd.consume_unread = consume_unread
+
+
 # mutant -> (patch, test file in test/warpdrive, test that fails or hangs with it applied)
 MUTANTS = {
     "join_short": (join_short, "test_warpdrive.py", "test_multi_warp_arrival_counts"),
@@ -323,6 +349,16 @@ MUTANTS = {
         view_endpoint_stage,
         "test_warpdrive_storage.py",
         "test_buffer_views_project_each_handles_stage",
+    ),
+    "shared_instance_static": (
+        shared_instance_static,
+        "test_warpdrive_shared_body.py",
+        "test_shared_body_matches_static_instances[True-ascending]",
+    ),
+    "unread_no_wait": (
+        unread_no_wait,
+        "test_warpdrive_consume_unread.py",
+        "test_consume_unread_passes_over_epochs[unread]",
     ),
 }
 

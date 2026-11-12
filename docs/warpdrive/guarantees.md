@@ -107,7 +107,9 @@ What the layer supplies, checks and leaves to you:
     group-TWO/multicast G2S atoms; it neither walks nested objects nor obeys `unchecked("tma")`.
     See [TMA checks](tracing.md#tma-checks) for pointer/atom spellings.
 
-7. <a id="fences"></a>**Fences.** Managed signals emit the declared fences. Defaults order
+7. <a id="fences"></a>**Fences.** Managed signals emit the declared fences, except the release
+    of `consume_unread()`, which follows its wait with nothing in between and so has no access
+    to order ([storage and fences](channels.md#storage-and-fences)). Defaults order
     generic SMEM reads before a TMA refill and generic SMEM writes before an UMMA read;
     [explicit values replace defaults](channels.md#storage-and-fences). The fence check compares
     explicit overrides against annotated accesses while handles were open, including a ring

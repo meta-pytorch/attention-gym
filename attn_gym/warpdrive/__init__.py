@@ -32,7 +32,8 @@ Channels support these handoffs (``channels.py``):
 * ``span()`` holds a stage across a counted loop: ``begin(i)`` waits in the first iteration,
   ``commit(i)``/``release(i)`` signal in the last.
 * ``NamedBarrier(threads=N)`` allocates a named barrier for intra-role syncs or one-shot
-  flags between roles (``named.py``).
+  flags between roles; ``NamedBarriers(n, threads=N)`` allocates ``n`` that a runtime index
+  selects (``named.py``).
 
 Declare ``self.work = WorkStream(mapping=..., schedule=...)`` and bind ``work: WorkCursor``.
 Schedules are ``OneShot``, ``StaticPersistent``, ``TilePersistent``, ``AtomicPersistent``,
@@ -125,7 +126,7 @@ _EXPORTS = {
         "WarpSpecialized",
         "role",
     ),
-    "attn_gym.warpdrive.named": ("NamedBarrier",),
+    "attn_gym.warpdrive.named": ("NamedBarrier", "NamedBarriers"),
     "attn_gym.warpdrive.protocol": ("ProtocolError", "unchecked"),
     "attn_gym.warpdrive.scheduling": (
         "AtomicPersistent",
@@ -165,6 +166,7 @@ __all__ = [
     "Limit",
     "Local",
     "NamedBarrier",
+    "NamedBarriers",
     "OneShot",
     "PdlWait",
     "Preview",

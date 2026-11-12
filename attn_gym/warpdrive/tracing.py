@@ -45,6 +45,14 @@ class Ranges:
 
     def __init__(self):
         self.names: list[str] = []  # the open ranges, innermost last
+        # A shared-body role (``roles.md``): its runtime instance index and, per range name the
+        # body records, the name each instance records instead (``{"cg0[*]": ["cg0[0]", ...]}``).
+        self.instance = None
+        self.aliases: dict[str, list[str]] = {}
+
+    def share(self, instance, aliases: dict[str, list[str]]) -> None:
+        """Record ``aliases[name][instance]`` in place of each aliased range ``name``."""
+        self.instance, self.aliases = instance, aliases
 
     def open_range(self, name: str) -> int:
         """Record a push; return its depth."""
@@ -74,10 +82,12 @@ class IketRanges(Ranges):
 
     def push(self, name: str, payload=None) -> None:
         self.open_range(name)
-        if payload is None:
-            iket.range_push(name)
-        else:
-            iket.range_push(name, payload)
+        names = self.aliases.get(name)
+        if names is None:
+            _iket_push(name, payload)
+            return
+        for j in range(len(names)):  # IKET names are static strings
+            _iket_push_if(self.instance == j, names[j], payload)
 
     def pop(self, name: str, payload=None) -> None:
         """IKET records a range's payload at its push (work items push none)."""
@@ -85,10 +95,23 @@ class IketRanges(Ranges):
         iket.range_pop()
 
 
+def _iket_push(name: str, payload) -> None:
+    if payload is None:
+        iket.range_push(name)
+    else:
+        iket.range_push(name, payload)
+
+
+@cute.jit
+def _iket_push_if(cond, name: cutlass.Constexpr, payload):
+    if cond:
+        _iket_push(name, payload)
+
+
 class IketTrace:
     """Stateless IKET backend."""
 
-    def role(self, ordinal: int, first_warp: int) -> IketRanges:
+    def role(self, ordinal: int | Int32, first_warp: int | Int32) -> IketRanges:
         return IketRanges()
 
 
@@ -118,7 +141,7 @@ class GlobaltimerTrace:
             self.tags.append(name)
         return self.tags.index(name)
 
-    def role(self, ordinal: int, first_warp: int) -> GlobaltimerRanges:
+    def role(self, ordinal: int | Int32, first_warp: int | Int32) -> GlobaltimerRanges:
         return GlobaltimerRanges(self, ordinal, first_warp)
 
 
@@ -132,7 +155,8 @@ class GlobaltimerRanges(Ranges):
     ranges are dropped.
     """
 
-    def __init__(self, trace: GlobaltimerTrace, ordinal: int, first_warp: int):
+    def __init__(self, trace: GlobaltimerTrace, ordinal: int | Int32, first_warp: int | Int32):
+        """``ordinal``, ``first_warp``: the role instance's; runtime values in a shared body."""
         super().__init__()
         self.trace = trace
         self.first_warp = first_warp  # the record's tid, like IKET's warp of a range
@@ -162,7 +186,7 @@ class GlobaltimerRanges(Ranges):
             slot,
             self.starts,
             depth,
-            trace.tag(name),
+            self._tag(name),
             self.first_warp,
             self.base,
             trace.events_per_role,
@@ -170,6 +194,15 @@ class GlobaltimerRanges(Ranges):
             payload,
             self.recorder(),
         )
+
+    def _tag(self, name: str):
+        names = self.aliases.get(name)
+        if names is None:
+            return self.trace.tag(name)
+        tag = Int32(self.trace.tag(names[0]))
+        for j in range(1, len(names)):
+            tag = cutlass.select_(self.instance == j, Int32(self.trace.tag(names[j])), tag)
+        return tag
 
 
 @cute.jit
@@ -185,9 +218,9 @@ def end_range(
     slot,
     starts,
     depth: cutlass.Constexpr,
-    tag: cutlass.Constexpr,
-    tid: cutlass.Constexpr,
-    base: cutlass.Constexpr,
+    tag,
+    tid,
+    base,
     capacity: cutlass.Constexpr,
     max_events: cutlass.Constexpr,
     payload,

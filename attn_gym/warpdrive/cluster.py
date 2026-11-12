@@ -74,6 +74,12 @@ class Cluster:
     ``(V, M, N, K)`` cluster layout of the CUTLASS SM100 GEMMs. The launch cluster is
     ``(m * n, 1, 1)`` CTAs, whose hardware ranks follow the same order, so a work unit is a run
     of consecutive ``blockIdx.x``.
+
+    Every kernel launches with a cluster, a single CTA as ``(1, 1, 1)``, as the CUTLASS and cuDNN
+    kernels do. The cluster launch path places CTAs on SMs differently from a plain launch: on
+    GB300, sub-wave grids of the cuDNN-derived linear-attention kernels ran CTAs on some TPC
+    positions ~15% slower per step under a plain launch (GDN backward 970 -> 860 us, KDA backward
+    chain 879 -> 721 us). A full-wave persistent GEMM measured ~2% slower clustered.
     """
 
     m: int = 1
@@ -157,7 +163,7 @@ class Cluster:
         return tuple(sorted({rank}.union(*(self.line(rank, mode) for mode in modes))))
 
     def launch_cluster(self):
-        return None if self.size == 1 else (self.size, 1, 1)
+        return (self.size, 1, 1)
 
     def get_key(self) -> str:
         if self.size == 1:
@@ -232,7 +238,7 @@ def _check_mode(mode):
 
 
 class SingleCta(Cluster):
-    """No cluster: one CTA per work item, ``CtaGroup.ONE`` MMAs."""
+    """One CTA per work item, ``CtaGroup.ONE`` MMAs, launched as a ``(1, 1, 1)`` cluster."""
 
     def __init__(self):
         super().__init__(1, 1, False)

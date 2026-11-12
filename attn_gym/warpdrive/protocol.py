@@ -334,7 +334,15 @@ class Lifetime:
 class RoleTrace:
     """Live-resource and event bookkeeping for one traced role instance."""
 
-    def __init__(self, role_name: str, log: ProtocolLog | None, ranges=None, waits: bool = True):
+    def __init__(
+        self,
+        role_name: str,
+        log: ProtocolLog | None,
+        ranges=None,
+        waits: bool = True,
+        instance=None,
+        instances: int = 1,
+    ):
         self.role_name = role_name
         self.log = log
         self.ranges = ranges  # the trace backend's ranges of this role (tracing.py), or None
@@ -346,6 +354,8 @@ class RoleTrace:
         # One record for the trace checks: channel ops, handle lifetimes, accesses and ordering.
         self.events: list[Event] = []
         self.open_turns: set[str] = set()  # turnstiles whose turn this role holds here
+        self.instance = instance  # a shared body's runtime instance index (kernel._dispatch)
+        self.instances = instances  # the instances this trace stands for
         self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
 
