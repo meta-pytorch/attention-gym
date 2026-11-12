@@ -121,6 +121,32 @@ def test_custom_protocol_errors_at_declaration():
             WorkStream(**kwargs)
 
 
+def test_a_schedule_has_one_kind():
+    """A schedule has one kind: the layer takes its grid, first item and decode from that kind."""
+    with pytest.raises(
+        TypeError, match="TileOneShot derives from the schedules TilePersistent, OneShot; a "
+    ):
+
+        class TileOneShot(TilePersistent, OneShot):
+            pass
+
+    with pytest.raises(
+        TypeError, match="ReverseShot derives from the schedules ReverseStatic, OneShot; a "
+    ):
+
+        class ReverseShot(ReverseStatic, OneShot):
+            pass
+
+    # Deriving from one kind, at any depth, stays a schedule of that kind.
+    class Bounded(StaticPersistent):
+        pass
+
+    class Deeper(Bounded):
+        pass
+
+    assert WorkStream(schedule=Deeper()).get_key() == "deeper0_m1"
+
+
 @dataclass(frozen=True)
 class Strided(IndexSchedule):
     """A schedule with a compile-time field: the default key must name it."""
@@ -1322,6 +1348,32 @@ def test_tile_persistent_units_fix_the_grid_and_stride():
     for units in (0, -1, 2.0):
         with pytest.raises(ValueError, match="units must be a positive int"):
             TilePersistent("m", units=units)
+
+
+def test_tile_persistent_assignment_follows_the_launch():
+    """``assignment`` uses the launch's units: one row per CTA of the launch grid, every tile
+    once, also for a subclass that changes whether ``max_ctas`` is read. It reads no launch
+    resources."""
+
+    class Uncapped(TilePersistent):
+        uses_max_ctas = False  # one unit per axis coordinate
+
+    class WithWorkspace(TilePersistent):
+        uses_workspace = True
+
+    space = (5, 4, 3)
+    for schedule, max_ctas in [
+        (TilePersistent("n"), 2),
+        (TilePersistent("l", units=2), None),
+        (Uncapped("m"), None),
+    ]:
+        stream = WorkStream(schedule=schedule)
+        rows = stream.assignment(space, max_ctas)
+        assert len(rows) == math.prod(stream.bind(space, max_ctas=max_ctas).grid())
+        items = sorted(item for row in rows for _, item in row)
+        assert items == sorted(itertools.product(*map(range, space)))
+    reference = WorkStream(schedule=TilePersistent("m")).assignment(space, 2)
+    assert WorkStream(schedule=WithWorkspace("m")).assignment(space, 2) == reference
 
 
 def test_tile_persistent_rejections():
