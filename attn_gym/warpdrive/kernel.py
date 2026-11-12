@@ -1299,7 +1299,8 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"got {sorted(problems)}"
             )
         self._ws_problems = problems
-        for problem in problems.values():
+        for name, problem in problems.items():
+            self._ws_streams[name]._bound = problem
             problem.start()  # per-CTA start values, computed once ahead of role dispatch
         smem = SmemAllocator()
         plan, total = self._barrier_plan()
