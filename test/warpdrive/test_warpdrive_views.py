@@ -52,6 +52,22 @@ def test_schedule_page_carries_each_item_once():
         schedule_html("t", "s", [Item("a"), Item("b")], [[0], [1]], measured={0: (0, 0.0, 1.0)})
 
 
+def test_schedule_preserves_both_timing_sources_and_partial_capture():
+    items = [
+        Item("first", start=0, end=2, coord=(0, 0)),
+        Item("second", start=3, end=5, coord=(0, 1)),
+    ]
+    data = page_data(
+        schedule_html(
+            "Comparison", "One static table", items, [[0, 1]], measured={1: (0, 4.5, 8.0)}
+        )
+    )
+    assert data["start"] == [0, 3] and data["end"] == [2, 5]
+    assert data["measured"] == {"1": [0, 4.5, 8.0]}
+    assert data["coord"] == [[0, 0], [0, 1]] and data["unit"] == "us"
+    assert data["rows"] == [[0, 1]]
+
+
 def test_labels_cannot_break_out_of_the_page_data():
     label = 'a</script><!--<script>alert(1)</script>"'
     data = page_data(schedule_html("t", "s", [Item(label)], [[0]]))

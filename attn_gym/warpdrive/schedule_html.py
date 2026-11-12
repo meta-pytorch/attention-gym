@@ -3,9 +3,9 @@
 The caller converts ``WorkStream.assignment`` results to ``Item`` objects.
 ``rows[cta]`` lists their positions in execution order. The page draws a CTA-by-slot grid,
 a timeline if all items have predicted spans, and a work-space map if all have 2-D
-coordinates. Timeline hover shows dependencies; toggles show the predicted critical path
-or measured capture spans. Hover highlights the item's CTA across views. Colours follow
-item kind, slot or CTA.
+coordinates. Drag the timeline to zoom and click a CTA to focus it across views. Predicted
+and measured spans can be compared on one axis; hover shows dependencies and timing deltas.
+Colours follow item kind or list position.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ from dataclasses import dataclass
 
 from attn_gym.warpdrive.html_page import asset, page
 
-COLOR_BY = ("kind", "slot", "cta")
+COLOR_BY = ("kind", "slot")
 # Reserve red for problems, not item kinds.
 PALETTE = (
     "#3f7d5c",
@@ -67,8 +67,10 @@ def schedule_html(
 
     ``rows[cta]`` gives positions in ``items``, in run order. ``critical`` lists the
     predicted critical path in order. ``measured`` maps item positions to
-    ``(cta, start, end)`` and replaces predicted spans when toggled. Both require all
-    items to have predicted spans. ``notes`` appear below the figures for provenance.
+    ``(cta, start, end)`` from a capture of the same static table, in the same units and
+    relative to a comparable origin as the prediction. The viewer can show either timing
+    source or both; spans within each CTA and timing source must not overlap. Both require
+    all items to have predicted spans. ``notes`` appear below the figures for provenance.
     ``kinds`` sets legend/colour order; unlisted kinds follow in order of appearance.
     """
     if color_by not in COLOR_BY:
@@ -103,18 +105,51 @@ def schedule_html(
         "measured": {str(k): list(v) for k, v in measured.items()} if measured else None,
         "colorBy": color_by,
     }
-    notes_html = "".join(f"<li>{html.escape(line)}</li>" for line in notes)
-    body = f"""<div class="controls">
-<span class="figlabel">colour by</span>
-<span class="seg" id="color-by">{
-        "".join(f'<button type="button" data-v="{c}">{c}</button>' for c in COLOR_BY)
-    }</span>
-<button type="button" id="critical" hidden>critical path</button>
-<button type="button" id="measured" hidden>measured</button>
-<span class="readout" id="readout"></span>
+    about = []
+    if timed:
+        about.append(
+            "Predicted: the host scheduler's cost model (estimated time per item plus a fixed "
+            "wait per dependency). An estimate, not a measurement."
+        )
+    if measured:
+        about.append(
+            "Measured: timestamps recorded on the GPU during a real launch of this same "
+            "schedule. This is the real timing."
+        )
+    about.append("Each row is one CTA (thread block); each box is one work item.")
+    notes_html = "".join(f"<li>{html.escape(line)}</li>" for line in [*about, *notes])
+    colors = {"kind": "Kind", "slot": "Order"}
+    hint = "Hover for details · click a row to show only that CTA (shift-click adds)"
+    if timed:
+        hint = (
+            "Drag across the timeline to zoom · double-click to zoom out · "
+            + hint[0].lower()
+            + hint[1:]
+        )
+    body = f"""<div class="toolbar">
+<span class="group" id="timing-controls" hidden><span class="label">Show</span>
+<span class="seg" id="timing" role="group" aria-label="Timing">
+<button type="button" data-v="predicted" title="Scheduler estimate">Predicted</button>
+<button type="button" data-v="measured" title="Real launch">Measured</button>
+<button type="button" data-v="both" title="Two lanes per CTA: predicted on top">Both</button>
+</span></span>
+<span class="group"><span class="label">Colour</span>
+<span class="seg" id="color-by" role="group" aria-label="Colour by">{
+        "".join(
+            f'<button type="button" data-v="{c}">{label}</button>' for c, label in colors.items()
+        )
+    }</span></span>
+<button type="button" id="critical" hidden title="Highlight the predicted critical path">
+Critical path</button>
+<select id="add-cta" aria-label="Add a CTA" hidden></select>
+<button type="button" id="reset-view" hidden>Reset view</button>
+<span class="spacer"></span>
+<span class="readout" id="readout" aria-live="polite"></span>
 </div>
 <div class="legend" id="legend"></div>
+<div class="path" id="path" hidden></div>
+<p class="hint">{hint}</p>
 <div id="views"></div>
-<div class="notes"><section><p class="figlabel">notes</p><ul>{notes_html}</ul></section></div>
+<details class="about"><summary>What am I looking at?</summary><ul>{notes_html}</ul></details>
 <div id="tip" role="status" hidden></div>"""
     return page(title, subtitle, body, asset("schedule.js"), data, asset("schedule.css"))

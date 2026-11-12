@@ -429,8 +429,9 @@ rows[0]  # [(0, (0, 0, 0)), (148, (18, 4, 0)), ...]: CTA 0's tiles, in order
 ```
 
 `schedule_html` draws a CTA × slot grid; a ragged last column shows wave quantization.
-Items with predicted spans also get a timeline, dependency arrows on hover, a critical path
-and an optional measured overlay. Items with 2-D coordinates get a work-space map.
+Items with predicted spans also get a timeline (drag to zoom, click a row to focus a CTA),
+dependency arrows on hover, a critical path with a per-segment table, and an optional measured
+overlay drawn as a second lane per CTA. Items with 2-D coordinates get a work-space map.
 Two examples use it:
 
 ```bash

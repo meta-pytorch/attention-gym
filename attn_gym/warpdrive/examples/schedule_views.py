@@ -46,17 +46,23 @@ def persistent_gemm_view(m: int, n: int, ctas: int) -> str:
     rows = _rows(op.work.assignment(space, max_ctas=ctas), items, tile)
     tiles = len(items)
     return schedule_html(
-        f"PersistentGemm {m} x {n}: {tiles} tiles on {len(rows)} CTAs",
-        f"{op.work.describe()} · {tile_m} x {tile_n} tiles · {tiles / len(rows):.2f} waves",
+        f"Persistent GEMM {m} × {n}: {tiles} output tiles on {len(rows)} CTAs",
+        f"Static work assignment, not timing · {tile_m} × {tile_n} elements per tile "
+        f"· {tiles / len(rows):.2f} tiles per CTA on average · {op.work.describe()}",
         items,
         rows,
         color_by="slot",
         notes=[
             (
-                "WorkStream.assignment: StaticPersistent gives CTA b the indices b, b + G, ...; "
-                "Raster decodes each index to its output tile."
+                "Each CTA is one persistent thread block. With G CTAs, StaticPersistent gives "
+                "CTA b work indices b, b + G, and so on. Raster maps each index to an output "
+                "tile. These are the assignments returned by WorkStream.assignment."
             ),
-            f"max_ctas = {ctas} (the launch caps the grid at it).",
+            (
+                "The grid shows list order, not elapsed time. An empty final slot means that CTA "
+                "has no tile left. The map shows output-tile coordinates after the raster swizzle."
+            ),
+            f"The launch uses at most {ctas} CTAs (max_ctas). No timing capture is included.",
         ],
     )
 
@@ -100,22 +106,24 @@ def grouped_gemm_view(sizes: list[int], n: int, ctas: int) -> str:
 
     rows = _rows(op.work.assignment(space, max_ctas=ctas, decode=decode), items, tile)
     return schedule_html(
-        f"GroupedGemm: {len(sizes)} groups, {len(items)} tiles on {len(rows)} CTAs",
-        f"{op.work.describe()} · {tile_m} x {tile_n} tiles · group rows {sizes}",
+        f"Grouped GEMM: {len(sizes)} groups, {len(items)} output tiles on {len(rows)} CTAs",
+        f"Static work assignment, not timing · {tile_m} × {tile_n} elements per tile "
+        f"· rows per group {sizes} · {op.work.describe()}",
         items,
         rows,
         kinds=[f"group {g}" for g in range(len(sizes))],
         notes=[
             (
-                "The index space pads every group by one m-tile (the host cannot count tiles "
-                "before the launch); the padding indices are dropped, so their CTAs run fewer "
-                "items."
+                "Each CTA is one persistent thread block. The work-index space reserves one "
+                "extra row tile per group because the host does not know each group's tile "
+                "count before launch. Padding indices are skipped, so some CTAs get fewer tiles."
             ),
             (
-                "Items decoded on the host by grouped_tiles_decode, which walks the offsets like "
-                "the device decode."
+                "This page uses grouped_tiles_decode on the host to walk the same group "
+                "offsets as the device decoder. Colours identify groups; the map uses the "
+                "concatenated row-tile coordinates. Grid slots show order, not elapsed time."
             ),
-            f"max_ctas = {ctas}.",
+            f"The launch uses at most {ctas} CTAs (max_ctas). No timing capture is included.",
         ],
     )
 
