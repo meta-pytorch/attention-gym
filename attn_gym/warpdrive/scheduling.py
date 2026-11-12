@@ -952,6 +952,8 @@ class WorkStream:
     roles: list = field(default_factory=list, init=False)
     # The declaring kernel (set on attribute assignment); its cluster fixes CTAs per work unit.
     owner: object = field(default=None, init=False, repr=False, compare=False)
+    # This trace's problem, handed over by the owner's begin_roles; single_item() reads it.
+    _bound: BoundWork | None = field(default=None, init=False, repr=False, compare=False)
     _workspaces: dict = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self):
@@ -1069,13 +1071,12 @@ class WorkStream:
         Call it after ``begin_roles``.
         """
         _check_single_item(self)
-        problems = getattr(self.owner, "_ws_problems", {})
-        if self.name not in problems:
+        if self._bound is None:
             raise ProtocolError(
                 f"WorkStream {self.name or '?'}: call single_item() inside a role, after "
                 "begin_roles()"
             )
-        return _single_item(self, problems[self.name])
+        return _single_item(self, self._bound)
 
     # ---- host, plain Python ------------------------------------------------ #
 
