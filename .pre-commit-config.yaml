@@ -7,9 +7,9 @@ repos:
       - id: trailing-whitespace
         # Upstream license and notice texts are vendored verbatim; draft patches keep the
         # whitespace of their blank context lines.
-        exclude: '^(attn_gym/linear/_delta_rule/cudnn_fe/(LICENSE[^/]*|LICENSING\.md|NOTICE|THIRD_PARTY_LICENSES\.txt)|tools/cudnn_fe/upstream/.*\.patch)$'
+        exclude: '^(attn_gym/linear/_delta_rule/(cudnn_fe/(LICENSE[^/]*|LICENSING\.md|NOTICE|THIRD_PARTY_LICENSES\.txt)|frost/(LICENSE[^/]*|NOTICE))|tools/cudnn_fe/upstream/.*\.patch)$'
       - id: end-of-file-fixer
-        exclude: '^(attn_gym/linear/_delta_rule/cudnn_fe/(LICENSE[^/]*|LICENSING\.md|NOTICE|THIRD_PARTY_LICENSES\.txt)|tools/cudnn_fe/upstream/.*\.patch)$'
+        exclude: '^(attn_gym/linear/_delta_rule/(cudnn_fe/(LICENSE[^/]*|LICENSING\.md|NOTICE|THIRD_PARTY_LICENSES\.txt)|frost/(LICENSE[^/]*|NOTICE))|tools/cudnn_fe/upstream/.*\.patch)$'
       - id: check-yaml
       - id: check-added-large-files
         exclude: '(^docs/assets/traces/hello_world_training_loop_comparison\.pftrace$|^docs/assets/widgets/cuda-graph-memory/max-vs-four-shared-buckets\.html$)'
