@@ -10,6 +10,7 @@ query list. Every program exclusively owns its output rows, so the result is det
 import torch
 import triton
 import triton.language as tl
+from triton.language.standard import _elementwise_max
 
 from attn_gym._backends.triton.utils import ptr_offset
 
@@ -350,7 +351,7 @@ def _query_tile_pairs(
             )
             starts, new_tile = _query_pair_starts(keys, slots, TILE)
             pair = tl.cumsum(starts.to(tl.int32))
-            first_pair = tl.associative_scan(tl.where(new_tile, pair, 0), 0, _maximum)
+            first_pair = tl.associative_scan(tl.where(new_tile, pair, 0), 0, _elementwise_max)
             next_start = tl.gather(starts, tl.minimum(slots + 1, BLOCK_K - 1), axis=0)
             ends = (slots < count) & (next_start | (slots == count - 1))
             bits = tl.full((BLOCK_K,), 1, tl.uint32) << (keys % TILE)
@@ -367,11 +368,6 @@ def _query_tile_pairs(
             destination = batch * ENTRIES + tile_start + query_start + pair - first_pair
             tl.store(pair_queries_ptr + destination, query.to(tl.int32), mask=ends)
             tl.store(pair_masks_ptr + destination, bits.to(tl.int32), mask=ends)
-
-
-@triton.jit
-def _maximum(a, b):
-    return tl.maximum(a, b)
 
 
 def _build_prefix_tile_query_map(selected_rows, counts, sparse_seq_len, tile):
