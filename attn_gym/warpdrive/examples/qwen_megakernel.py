@@ -389,6 +389,67 @@ def store_vec(dst, offset, frag, n: cutlass.Constexpr):
     cute.autovec_copy(cast, cute.local_tile(dst, (n,), (offset // n,)))
 
 
+class CudaCoreGemv:
+    """The GEMV engine on CUDA cores, for one token: warp w owns rows ROWS_PER_WARP * w .. of each
+    32 x 256 weight stage and lane l its columns 8l .. 8l + 7; even and odd columns accumulate
+    separately in packed FFMA2s. A warp transpose-reduce then leaves row r's sum on lane
+    (r % ROWS_PER_WARP) * (32 // ROWS_PER_WARP) of warp r // ROWS_PER_WARP.
+
+    ``compute_loop`` calls ``input_ready`` per GEMV row, ``gemv`` calls ``tile`` per 32-row tile
+    and ``epilogue`` asks ``owns_row``, ``owns_pair`` and ``pair_value``: another engine
+    supplies the same five."""
+
+    def input_ready(self, chans):
+        """Called by every compute thread once ``xs`` holds the row's input (synced)."""
+        return chans
+
+    @cute.jit
+    def tile(self, p: MegakernelParams, chans, xbuf, k_tiles, warp, lane):
+        """``(value, row, chans)``: one tile's dot products against ``xs[xbuf]``, this lane's
+        tile row and the advanced channel ends (``chans[0]`` is the weight ring)."""
+        w = chans[0]
+        xs = p.xs[xbuf, None]
+        acc = cute.make_rmem_tensor((ROWS_PER_WARP, 2), Float32)
+        acc.fill(0.0)
+        # Fully unrolled: the rolled loop kept acc in a 32-byte stack frame.
+        for kt in cutlass.range(k_tiles, unroll_full=True):
+            with w.consume() as h:
+                sW = h.data["W"]
+                wf = []
+                for r in cutlass.range_constexpr(ROWS_PER_WARP):
+                    frag = cute.make_rmem_tensor((8,), BFloat16)
+                    row_w = sW[warp * ROWS_PER_WARP + r, None]
+                    cute.autovec_copy(cute.local_tile(row_w, (8,), (lane,)), frag)
+                    wf.append(frag)
+                xh = cute.make_rmem_tensor((8,), BFloat16)
+                cute.autovec_copy(cute.local_tile(xs, (8,), (kt * 32 + lane,)), xh)
+                xv = bf16x8_to_f32(xh)
+                for r in cutlass.range_constexpr(ROWS_PER_WARP):
+                    wv = bf16x8_to_f32(wf[r])
+                    a0, a1 = acc[r, 0], acc[r, 1]
+                    for e in cutlass.range_constexpr(0, 8, 2):
+                        a0, a1 = cute.arch.fma_packed_f32x2(
+                            (wv[e], wv[e + 1]), (xv[e], xv[e + 1]), (a0, a1)
+                        )
+                    acc[r, 0], acc[r, 1] = a0, a1
+        for r in cutlass.range_constexpr(ROWS_PER_WARP):
+            acc[r, 0] = acc[r, 0] + acc[r, 1]
+        v = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
+        return v, warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP), (w, *chans[1:])
+
+    def owns_row(self, warp, lane):
+        return lane % (32 // ROWS_PER_WARP) == 0
+
+    def owns_pair(self, warp, lane):
+        """Owns an even row 2j, whose partner 2j + 1 ``pair_value`` delivers."""
+        return lane % (2 * (32 // ROWS_PER_WARP)) == 0
+
+    @cute.jit
+    def pair_value(self, v):
+        """Row 2j + 1's value on the owner of row 2j (every lane must call it)."""
+        return cute.arch.shuffle_sync_down(v, offset=32 // ROWS_PER_WARP)
+
+
 class QwenDecodeMegakernel(WarpSpecialized):
     def __init__(
         self,
@@ -468,6 +529,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # released by Warps the layer emits the fence.proxy.async on release.
         self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w, "KV": kv})
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
+        self.engine = CudaCoreGemv()
         self.work = WorkStream(
             mapping=InstructionTable(),
             schedule=StaticPersistent() if schedule == "static" else AtomicPersistent(stages=1),
@@ -651,31 +713,49 @@ class QwenDecodeMegakernel(WarpSpecialized):
     @role(warps=range(COMPUTE_WARPS))
     @cute.jit
     def compute(self, p: MegakernelParams, *, w: Consumer, work: WorkCursor, me: Local):
+        chans, work = self.compute_loop(p, (w,), work, me)
+        return chans[0], work
+
+    @cute.jit
+    def next_input(self, op, layer, a, b, xkey, xbuf):
+        """``(new, xkey, xbuf)``: whether GEMV row ``(op, layer, a, b)`` writes a new input to
+        ``xs[xbuf]`` (alternating) or reuses the previous one. Consecutive rows with the same key
+        share it; row 0 of GATEUP (of ROUTER for MoE) and of layer 0's QKV always runs the
+        prologue: it publishes the residual."""
+        ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
+        key = (op * (self.layers + 1) + layer) * 8 + ks
+        mid = ROUTER if self.moe else GATEUP  # the op whose row 0 publishes h_mid
+        publishes = (a == 0) & ((op == mid) | ((op == QKV) & (layer == 0)))
+        new = (key != xkey) | publishes
+        if new:
+            xkey = key
+            xbuf = 1 - xbuf
+        return new, xkey, xbuf
+
+    @cute.jit
+    def compute_loop(self, p: MegakernelParams, chans, work: WorkCursor, me: Local):
+        """The compute role over its rows; ``chans[0]`` is the weight ring, the rest belong to
+        the engine. Returns the channel ends and the cursor."""
         tid, warp, lane = me.tid, me.warp, me.lane
         ctas = cute.arch.grid_dim()[0]
         pos = p.step[1]
         token = p.step[0]
         epoch = p.state[0] + 1
-        # Consecutive rows with the same key share the GEMV input in xs[xbuf]. Row 0 of GATEUP
-        # (of ROUTER for MoE) and of layer 0's QKV always runs the prologue: it publishes the
-        # residual.
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
             op, layer, a, b, row = work.item
             if op == ATTN:
-                w = self.attention(p, w, layer, a, b, pos, epoch, tid, warp, lane, row)
+                w = self.attention(p, chans[0], layer, a, b, pos, epoch, tid, warp, lane, row)
+                chans = (w, *chans[1:])
             else:
-                ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
-                key = (op * (self.layers + 1) + layer) * 8 + ks
-                mid = ROUTER if self.moe else GATEUP  # the op whose row 0 publishes h_mid
-                publishes = (a == 0) & ((op == mid) | ((op == QKV) & (layer == 0)))
-                if (key != xkey) | publishes:
-                    xkey = key
-                    xbuf = 1 - xbuf
+                new, xkey, xbuf = self.next_input(op, layer, a, b, xkey, xbuf)
+                if new:
+                    ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
                     self.prologue(p, op, layer, a, ks, token, epoch, xbuf, tid, warp, lane, row)
                     self.csync.sync()
-                w = self.gemv(p, w, op, layer, a, b, epoch, xbuf, warp, lane, row)
+                chans = self.engine.input_ready(chans)
+                chans = self.gemv(p, chans, op, layer, a, b, epoch, xbuf, warp, lane, row)
                 if (op == DOWN) & (b == DOWN_SPLITS - 1) & (tid < ROWS):
                     self.reduce_down(p, layer, a * ROWS + tid, epoch, row)
             work.advance()
@@ -687,7 +767,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             if finished == ctas - 1:
                 p.state[1] = Int32(0)
                 p.state[0] = epoch
-        return w, work
+        return chans, work
 
     # ------------------------------------------------------------ compute helpers
 
@@ -910,8 +990,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 xs[hh * HEAD_DIM + d + 1] = BFloat16(num1 / den)
 
     @cute.jit
-    def gemv(self, p: MegakernelParams, w, op, layer, a, b, epoch, xbuf, warp, lane, row_index):
-        """GEMV of 32-row tiles: warp w owns rows 4w..4w+3 of a stage, lane l columns 8l..8l+7."""
+    def gemv(
+        self, p: MegakernelParams, chans, op, layer, a, b, epoch, xbuf, warp, lane, row_index
+    ):
+        """The row's 32-row weight tiles through ``self.engine``, each result published by
+        ``epilogue`` (the LM head runs ``b`` tiles per row); returns the channel ends."""
         k_tiles = self.hidden_k_tiles
         if op == OPROJ:
             k_tiles = self.oproj_k_tiles
@@ -919,62 +1002,39 @@ class QwenDecodeMegakernel(WarpSpecialized):
             k_tiles = self.down_k_tiles
         row_tiles = cutlass.select_(op == LMHEAD, b, 1)
         for t in cutlass.range(row_tiles, unroll=1):
-            # Even and odd columns accumulate separately, one packed FFMA2 per pair.
-            acc = cute.make_rmem_tensor((ROWS_PER_WARP, 2), Float32)
-            acc.fill(0.0)
             with self.trace_region("stream", payload=row_index):
-                # Fully unrolled: the rolled loop kept acc in a 32-byte stack frame.
-                for kt in cutlass.range(k_tiles, unroll_full=True):
-                    with w.consume() as h:
-                        sW = h.data["W"]
-                        wf = []
-                        for r in cutlass.range_constexpr(ROWS_PER_WARP):
-                            frag = cute.make_rmem_tensor((8,), BFloat16)
-                            row_w = sW[warp * ROWS_PER_WARP + r, None]
-                            cute.autovec_copy(cute.local_tile(row_w, (8,), (lane,)), frag)
-                            wf.append(frag)
-                        xh = cute.make_rmem_tensor((8,), BFloat16)
-                        cute.autovec_copy(
-                            cute.local_tile(p.xs[xbuf, None], (8,), (kt * 32 + lane,)), xh
-                        )
-                        xv = bf16x8_to_f32(xh)
-                        for r in cutlass.range_constexpr(ROWS_PER_WARP):
-                            wv = bf16x8_to_f32(wf[r])
-                            a0, a1 = acc[r, 0], acc[r, 1]
-                            for e in cutlass.range_constexpr(0, 8, 2):
-                                a0, a1 = cute.arch.fma_packed_f32x2(
-                                    (wv[e], wv[e + 1]), (xv[e], xv[e + 1]), (a0, a1)
-                                )
-                            acc[r, 0], acc[r, 1] = a0, a1
-                for r in cutlass.range_constexpr(ROWS_PER_WARP):
-                    acc[r, 0] = acc[r, 0] + acc[r, 1]
-            v = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
-            row = warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP)  # within the tile
-            if op == GATEUP:
-                # Tile rows alternate gate, up: lanes 0-7 hold gate j, lanes 8-15 up j.
-                up = cute.arch.shuffle_sync_down(v, offset=8)
-                if lane % 16 == 0:
-                    g = bf16_round(v)
-                    silu = bf16_round(g / (1.0 + cute.math.exp2(-g * LOG2E)))
-                    out = bf16_round(silu * bf16_round(up))
-                    if cutlass.const_expr(self.moe):
-                        # Fold slot s's routing weight in here, so down sums plain partials.
-                        slot = a // (2 * self.expert_inter // ROWS)
-                        out = bf16_round(out * p.route[xbuf, slot])
-                    publish(p.act, self.act_index(layer, a * (ROWS // 2) + row // 2), out, epoch)
-            elif lane % (32 // ROWS_PER_WARP) == 0:
-                if op == QKV:
-                    publish(p.qkv, self.qkv_index(layer, a * ROWS + row), bf16_round(v), epoch)
-                elif op == OPROJ:
-                    publish(p.o_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
-                elif op == DOWN:
-                    publish(p.d_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
-                elif op == ROUTER:
-                    index = layer * self.experts + a * ROWS + row
-                    publish(p.router_logits, index, bf16_round(v), epoch)
-                else:
-                    p.logits[(a + t) * ROWS + row] = bf16_round(v)
-        return w
+                v, row, chans = self.engine.tile(p, chans, xbuf, k_tiles, warp, lane)
+            self.epilogue(p, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane)
+        return chans
+
+    @cute.jit
+    def epilogue(self, p: MegakernelParams, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane):
+        """Publish one tile's results: ``v`` is the dot product of tile row ``row``, valid on the
+        lanes the engine says own it."""
+        if op == GATEUP:
+            # Tile rows alternate gate, up: the owner of gate row 2j gets up row 2j + 1's value.
+            up = self.engine.pair_value(v)
+            if self.engine.owns_pair(warp, lane):
+                g = bf16_round(v)
+                silu = bf16_round(g / (1.0 + cute.math.exp2(-g * LOG2E)))
+                out = bf16_round(silu * bf16_round(up))
+                if cutlass.const_expr(self.moe):
+                    # Fold slot s's routing weight in here, so down sums plain partials.
+                    slot = a // (2 * self.expert_inter // ROWS)
+                    out = bf16_round(out * p.route[xbuf, slot])
+                publish(p.act, self.act_index(layer, a * (ROWS // 2) + row // 2), out, epoch)
+        elif self.engine.owns_row(warp, lane):
+            if op == QKV:
+                publish(p.qkv, self.qkv_index(layer, a * ROWS + row), bf16_round(v), epoch)
+            elif op == OPROJ:
+                publish(p.o_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
+            elif op == DOWN:
+                publish(p.d_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
+            elif op == ROUTER:
+                index = layer * self.experts + a * ROWS + row
+                publish(p.router_logits, index, bf16_round(v), epoch)
+            else:
+                p.logits[(a + t) * ROWS + row] = bf16_round(v)
 
     @cute.jit
     def attention(
