@@ -1603,7 +1603,9 @@ def _launch_grouped_backward(
             if v_is_k
             else torch.zeros(sparse_shape, dtype=torch.float32, device=sparse_kv.device)
         )
-        BWD_DSPARSE_KV_DENSE[(key_tile_grid, kv_heads, batch)](
+        BWD_DSPARSE_KV_DENSE[
+            lambda meta: (key_tile_grid * (dense_block_n // meta["BLOCK_N"]), kv_heads, batch)
+        ](
             query,
             sparse_kv,
             sparse_values,
@@ -1638,7 +1640,7 @@ def _launch_grouped_backward(
             USE_INT64_OFFSETS=use_int64_offsets or requires_int64_offsets(grad_dense_kv),
             TILE_QUERIES=tile_queries,
             BLOCK_M=DENSE_TILE_ROWS,
-            BLOCK_N=dense_block_n,
+            KEY_TILE_SIZE=dense_block_n,
             BLOCK_D=block_d,
             autotune=autotune,
         )

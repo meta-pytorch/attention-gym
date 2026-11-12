@@ -262,14 +262,16 @@ def _gather_attn_bwd_dsparse_kv_dense(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    KEY_TILE_SIZE: tl.constexpr,
 ):
     """FP32 dK and dV of one document-aligned key tile from the dense query tiles over it.
 
     BLOCK_M rows cover one dense tile's (query, head) pairs.
 
-    Key tiles start at multiples of BLOCK_N within their document, so each row's selection
-    bits for the tile are whole bitmap words. ``cu_key_tiles`` numbers every document's
-    tiles consecutively; programs past the last tile exit. ``bounds`` (see
+    ``cu_key_tiles`` numbers document-aligned KEY_TILE_SIZE-key tiles; each is split into
+    KEY_TILE_SIZE // BLOCK_N independent programs. This lets tuning change accumulator
+    size and grid fill without rebuilding document offsets. Selection bits remain whole
+    bitmap words. Programs past the last tile exit. ``bounds`` (see
     ``plan_dense_tiles``) limits the walk to the document's dense tiles and skips key tiles
     past every dense span, leaving their zeroed outputs for the gather schedules to add to.
     Dense spans lie within each query's bitmap, the first four top-k widths of its document,
@@ -287,19 +289,24 @@ def _gather_attn_bwd_dsparse_kv_dense(
     )
     GRAD_STRIDES = offset_strides(GRAD_STRIDES, USE_INT64_OFFSETS)
 
-    key_tile = tl.program_id(0)
+    tl.static_assert(KEY_TILE_SIZE % BLOCK_N == 0)
+    subtiles: tl.constexpr = KEY_TILE_SIZE // BLOCK_N
+    key_tile = tl.program_id(0) // subtiles
+    subtile = tl.program_id(0) % subtiles
     kv_head = tl.program_id(1)
     batch = tl.program_id(2)
     if HAS_CU_SEQLENS:
         document = _document_ids(cu_key_tiles_ptr, key_tile, num_documents, False)
         if document >= num_documents:
             return
-        local_start = (key_tile - tl.load(cu_key_tiles_ptr + document)) * BLOCK_N
+        local_start = (
+            key_tile - tl.load(cu_key_tiles_ptr + document)
+        ) * KEY_TILE_SIZE + subtile * BLOCK_N
         candidate_start = tl.load(cu_seqlens_k_ptr + document)
         candidate_end = tl.load(cu_seqlens_k_ptr + document + 1)
     else:
         document = batch
-        local_start = key_tile * BLOCK_N
+        local_start = key_tile * KEY_TILE_SIZE + subtile * BLOCK_N
         candidate_start = 0
         candidate_end = SPARSE_SEQ_LEN
     first_tile = tl.load(bounds_ptr + document * 3)
@@ -378,10 +385,28 @@ def _gather_attn_bwd_dsparse_kv_dense(
         tl.store(grad_v_ptr + store_offsets, grad_value, mask=store_mask)
 
 
+_dense_kv_static_key = tuning_key(
+    "query_ptr", "H", "KV_HEADS", "V_IS_K", "D", "TILE_QUERIES", "HAS_CU_SEQLENS"
+)
+
+
+def _dense_kv_tuning_key(args):
+    # The 32/64-key winner changes with the query walk: four 2K documents favor 64,
+    # while one 8K document favors 32. Bucket average document length, keeping small
+    # shapes together and avoiding a tuning sweep at each new token/document count.
+    documents = max(1, args["num_documents"]) if args["HAS_CU_SEQLENS"] else 1
+    queries = triton.cdiv(args["S"], documents)
+    return (*_dense_kv_static_key(args), triton.next_power_of_2(max(128, queries)))
+
+
 BWD_DSPARSE_KV_DENSE = TritonTuner(
     _gather_attn_bwd_dsparse_kv_dense,
-    [triton.Config({}, num_warps=num_warps, num_stages=1) for num_warps in (8, 4)],
-    key=tuning_key("query_ptr", "H", "KV_HEADS", "V_IS_K", "D", "TILE_QUERIES", "HAS_CU_SEQLENS"),
+    [
+        triton.Config({"BLOCK_N": block_n}, num_warps=num_warps, num_stages=1)
+        for block_n in (64, 32)
+        for num_warps in (8, 4)
+    ],
+    key=_dense_kv_tuning_key,
 )
 
 
