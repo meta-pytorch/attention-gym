@@ -7,7 +7,7 @@ repository's BSD header):
 
 | Tag | Files | Terms |
 | --- | --- | --- |
-| `Apache-2.0` | the kernels, `work_tables.py` and `blockwise_inverse.py` | [LICENSE.txt](LICENSE.txt) and [NOTICE](NOTICE) |
+| `Apache-2.0` | the kernels, `work_tables.py`, `blockwise_inverse.py` and `kda_common.py` | [LICENSE.txt](LICENSE.txt) and [NOTICE](NOTICE) |
 | `MIT` | `ptx.py`, `umma.py` (derived from the upstream tile helpers) | [LICENSE-MIT.txt](LICENSE-MIT.txt) |
 | `BSD-3-Clause` | `contract.py`, `ragged.py` (Attention Gym code) | the repository [LICENSE](../../../../LICENSE) |
 
