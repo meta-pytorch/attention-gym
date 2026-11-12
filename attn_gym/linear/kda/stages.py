@@ -214,7 +214,7 @@ class ChunkKDACudnnPrepared:
         Rows follow NOTE [Summary ranges are subsequences]. The maps carry cuDNN's 16-token-chunk
         rounding, which differs from the fused maps and from an unsharded cuDNN pass.
         """
-        # Lazy import keeps the optional CuTeDSL 4.7 backend out of the fused import path.
+        # Lazy import keeps the optional cuDNN backend out of the fused import path.
         from attn_gym.linear._delta_rule.cudnn.state_summary import build_cudnn_state_summaries
 
         saved = self.saved

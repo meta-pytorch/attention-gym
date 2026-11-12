@@ -5,10 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 GDN path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.cudnn.gdn_backward import chunk_gdn_bwd_cudnn_packed
@@ -17,7 +14,7 @@ from attn_gym.testing import make_gdn_test_inputs
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 GDN path requires SM100 or SM103",
+    reason="the cuDNN GDN path requires SM100 or SM103",
 )
 
 
@@ -53,8 +50,15 @@ def pad_state_sequences(tensor: torch.Tensor, padding: int = 16) -> torch.Tensor
     ).copy_(tensor)
 
 
-def test_gdn_cudnn_outer_strides_match_compact_forward_and_backward() -> None:
-    """Dynamic outer strides must preserve all forward and backward values."""
+def pad_state_rows(tensor: torch.Tensor, padding: int = 4) -> torch.Tensor:
+    """Copy `[N,H,V,K]` state into rows padded by `padding` elements (16 bytes for fp32)."""
+    return pad_last_mode(tensor, padding)
+
+
+@pytest.mark.parametrize("pad_state", [pad_state_sequences, pad_state_rows])
+def test_gdn_cudnn_outer_strides_match_compact_forward_and_backward(pad_state) -> None:
+    """Dynamic outer strides must preserve all forward and backward values. State rows padded
+    to a 16-byte (not 32-byte) multiple are legal: the host checks 16-byte alignment."""
     inputs = make_gdn_test_inputs(
         (65, 63), key_heads=2, value_heads=2, dtype=torch.bfloat16, seed=211
     )
@@ -83,11 +87,11 @@ def test_gdn_cudnn_outer_strides_match_compact_forward_and_backward() -> None:
         pad_last_mode(value),
         pad_scalar_rows(gate),
         pad_scalar_rows(beta),
-        pad_state_sequences(state),
+        pad_state(state),
         cu_seqlens,
     )
     strided_d_output = pad_last_mode(d_output)
-    strided_d_final_state = pad_state_sequences(d_final_state)
+    strided_d_final_state = pad_state(d_final_state)
     actual_forward = run_forward(
         *strided[:5],
         strided[6],
@@ -153,12 +157,12 @@ def test_gdn_cudnn_forward_rejects_misaligned_and_noncontiguous_inner_modes() ->
 
 def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> None:
     """Public forward and backward must actually exercise their forced-wide launch ABIs."""
-    from attn_gym.linear._delta_rule.cudnn_fe.kernel import (
-        gdn_bprop_f16,
-        gdn_chain_backward_f16,
-        gdn_chain_forward_f16,
-        gdn_warmup_backward_f16,
-        gdn_warmup_forward_f16,
+    # The bprop runs as frost.gdn_bprop, which has no int64 launch variant to force.
+    from attn_gym.linear._delta_rule.frost.bundles import (
+        gdn_chain_backward,
+        gdn_chain_forward,
+        gdn_warmup_backward,
+        gdn_warmup_forward,
     )
 
     q, k, value, gate, beta, state, cu_seqlens = make_gdn_test_inputs(
@@ -175,11 +179,10 @@ def test_gdn_cudnn_forced_int64_forward_backward_matches_int32(monkeypatch) -> N
     )
     forced_calls = []
     for module in (
-        gdn_warmup_forward_f16,
-        gdn_chain_forward_f16,
-        gdn_bprop_f16,
-        gdn_warmup_backward_f16,
-        gdn_chain_backward_f16,
+        gdn_warmup_forward,
+        gdn_chain_forward,
+        gdn_warmup_backward,
+        gdn_chain_backward,
     ):
 
         def force_wide(*tensors, name=module.__name__):

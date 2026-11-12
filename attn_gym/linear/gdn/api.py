@@ -73,7 +73,7 @@ def chunk_gdn(
             capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
             ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. The repo-local path is the
-            default; ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend.
+            default; ``{"backend": "cudnn"}`` selects the optional cuDNN backend.
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
             for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
@@ -171,7 +171,7 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "cudnn"}`` selects the optional CuTeDSL 4.7 cuDNN backend, which
+            ``{"backend": "cudnn"}`` selects the optional cuDNN backend, which
             requires 16-byte-aligned pool bases and slot origins. Split schedules are not
             supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
             of the repo-local factor and output kernels. When ``False``, and always under

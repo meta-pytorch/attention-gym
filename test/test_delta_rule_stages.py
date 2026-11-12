@@ -210,10 +210,10 @@ GDN = Op(
 )
 CUDNN = {"backend": "cudnn"}
 requires_cudnn = pytest.mark.skipif(
-    importlib.util.find_spec("cutlass.experimental") is None
+    importlib.util.find_spec("cutlass.cute") is None
     or not torch.cuda.is_available()
     or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="cuDNN requires CuTeDSL>=4.7 on SM100/SM103",
+    reason="cuDNN requires CuTeDSL on SM100/SM103",
 )
 KDA_CUDNN = KDA._replace(
     chunk=partial(chunk_kda, kernel_options=CUDNN),

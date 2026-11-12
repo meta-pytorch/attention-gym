@@ -5,10 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 KDA path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear import chunk_kda, paged_chunk_kda
 from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_fwd_paged_op
@@ -17,7 +14,7 @@ from attn_gym.testing.kda import make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 KDA path requires SM100 or SM103",
+    reason="the cuDNN KDA path requires SM100 or SM103",
 )
 
 _CUDNN = {"backend": "cudnn"}
@@ -297,7 +294,7 @@ def test_cudnn_paged_empty_routes_past_compaction_capacity() -> None:
 def test_cudnn_paged_runs_the_native_driver(monkeypatch) -> None:
     """Paged calls launch the v1.30 driver in place and reject final-state and split requests."""
     from attn_gym.linear._delta_rule.cudnn import forward
-    from attn_gym.linear._delta_rule.cudnn_fe import kda
+    from attn_gym.linear._delta_rule.frost.drivers import kda
 
     calls = []
 

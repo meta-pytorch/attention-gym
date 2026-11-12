@@ -1,4 +1,4 @@
-"""Private backward validation for the CuTeDSL 4.7 scalar-GDN kernels."""
+"""Private backward validation for the cuDNN scalar-GDN kernels."""
 
 from __future__ import annotations
 
@@ -8,10 +8,7 @@ from typing import Literal
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the CuTeDSL 4.7 GDN path requires nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear import chunk_gdn
 from attn_gym.linear._delta_rule.cudnn.gdn_backward import chunk_gdn_bwd_cudnn_packed
@@ -22,7 +19,7 @@ from attn_gym.testing.kda import assert_matches_low_precision_reference
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL 4.7 GDN path requires SM100 or SM103",
+    reason="the cuDNN GDN path requires SM100 or SM103",
 )
 
 BackwardStateMode = Literal["none", "initial", "cotangent"]
@@ -316,13 +313,13 @@ def test_gdn_cudnn_backward_mixed_small_beta_matches_reference() -> None:
 
 def test_gdn_cudnn_chain_backward_mixed_small_beta_matches_reference(monkeypatch) -> None:
     """The piece-chain backward runs its own bprop launch; dBeta must stay exact there too."""
-    from attn_gym.linear._delta_rule.cudnn_fe import gdn as fe_gdn
+    from attn_gym.linear._delta_rule.frost.drivers import gdn as gdn_driver
 
-    monkeypatch.setattr(fe_gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
     inputs = make_gdn_test_inputs(
         (2048,), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=163
     )
-    assert fe_gdn.BackwardPlan.build(2048, 1, 2, inputs[0].device).pieces > 1
+    assert gdn_driver.BackwardPlan.build(2048, 1, 2, inputs[0].device).pieces > 1
     beta = inputs[4]
     beta[:, ::4] = 0.0
     beta[:, 1::4] = 1e-12

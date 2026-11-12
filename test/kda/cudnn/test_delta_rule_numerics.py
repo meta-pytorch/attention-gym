@@ -5,10 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-pytest.importorskip(
-    "cutlass.experimental",
-    reason="the cuDNN numerical tests require nvidia-cutlass-dsl>=4.7",
-)
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear import chunk_gdn, chunk_kda, recurrent_gdn
 from attn_gym.linear.kda.impl.cudnn_ops import chunk_cudnn_packed_local_bwd_op

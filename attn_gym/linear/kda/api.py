@@ -233,7 +233,7 @@ def paged_chunk_kda(
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
         kernel_options: Backend-specific options. ``{"backend": "cudnn"}`` selects
-            the optional CuTeDSL 4.7 cuDNN backend. ``split_backward`` and
+            the optional cuDNN backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
             applies to the fused backend as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the repo-local fused kernels;

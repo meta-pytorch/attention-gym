@@ -32,13 +32,6 @@ linear = [
     "packaging",
 ]
 
-cudnn = [
-    "nvidia-cutlass-dsl[cu13]>=4.7.0; sys_platform == 'linux'",
-    "cuda-python>=13.0; sys_platform == 'linux'",
-    "apache-tvm-ffi>=0.1.11",
-    "packaging",
-]
-
 tests = [
     # xdist 3.8 loses loadgroup isolation with pytest 9.2.
     "pytest<9.2",
@@ -73,14 +66,6 @@ docs = [
 ]
 
 # ---------- TOOL CONFIGURATIONS ------------
-[tool.uv]
-conflicts = [
-    [
-        { extra = "cudnn" },
-        { extra = "tests" },
-    ],
-]
-
 [tool.hatch.version]
 source = "vcs"
 
@@ -154,8 +139,6 @@ ignore = ['E231', 'E731']
 "__init__.py" = ["F401", "F403"]
 "attn_gym/linear/kda/utils.py" = ["BLE001"]
 "test/test_kda_kernels.py" = ["E402"]
-# CuTeDSL traces if-expressions and nested ifs as device selects/branches; min/max builtins and
-# `and` do not trace the same way on dynamic values, so keep the vendored control flow.
-"attn_gym/linear/_delta_rule/cudnn_fe/{common,kernel,tile_dsl}/*.py" = ["FURB136", "PLR1730", "SIM102"]
-# The same holds for warpdrive's traced code (profiler included) and the kernels its tests build.
+# CuTeDSL traces nested ifs as device branches, so keep them in warpdrive's traced code (profiler
+# included) and the kernels its tests build.
 "{attn_gym/warpdrive,test/warpdrive,test/warpdrive_fuzz,test/profiler}/**/*.py" = ["SIM102"]

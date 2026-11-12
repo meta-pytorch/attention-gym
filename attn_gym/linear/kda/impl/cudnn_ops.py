@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Private KDA operators around the shared CuTeDSL 4.7 cuDNN launchers."""
+"""Private KDA operators around the shared cuDNN launchers."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def _backend(q: torch.Tensor):
     try:
         backend = importlib.import_module("attn_gym.linear._delta_rule.cudnn.forward")
     except ImportError as error:
-        raise ImportError("the cuDNN KDA backend requires CUDA and attn-gym[cudnn]") from error
+        raise ImportError("the cuDNN KDA backend requires CUDA and attn-gym[linear]") from error
     backend.validate_available(q)
     return backend
 

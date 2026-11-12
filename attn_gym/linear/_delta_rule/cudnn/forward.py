@@ -11,7 +11,7 @@ from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
 
-from ..cudnn_fe.kda import kda_forward
+from ..frost.drivers.kda import kda_forward
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 
@@ -22,7 +22,7 @@ def validate_available(q: torch.Tensor) -> None:
         raise ValueError("the cuDNN KDA backend requires CUDA tensors")
     properties = get_device_properties(q.device)
     if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
-        raise ValueError("the CuTeDSL 4.7 KDA backend requires SM100 or SM103")
+        raise ValueError("the cuDNN KDA backend requires SM100 or SM103")
 
 
 def run_forward_on_current_device(

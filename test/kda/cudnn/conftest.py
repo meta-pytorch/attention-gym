@@ -13,7 +13,7 @@ def kda_plan_comparison(request, monkeypatch):
     Prep and piece-chain plans change rounding order and are selected from shape.
     Their independent forward/gradient correctness is covered by the FP64 reference tests.
     """
-    from attn_gym.linear._delta_rule.cudnn_fe import kda
+    from attn_gym.linear._delta_rule.frost.drivers import kda
 
     pinned = request.param == "uncut"
     if pinned:

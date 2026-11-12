@@ -8,14 +8,14 @@ from itertools import pairwise
 import pytest
 import torch
 
-pytest.importorskip("cutlass.experimental", reason="native cuDNN summaries require CuTeDSL 4.7")
+pytest.importorskip("cutlass.cute", reason="the cuDNN backend requires CuTeDSL")
 
 from attn_gym.linear._delta_rule.cudnn.state_summary import (
     build_cudnn_state_grad_summaries,
     build_cudnn_state_summaries,
 )
-from attn_gym.linear._delta_rule.cudnn_fe import kda as cudnn_fe_kda
-from attn_gym.linear._delta_rule.cudnn_fe import summary as native_summary
+from attn_gym.linear._delta_rule.frost.drivers import kda as kda_driver
+from attn_gym.linear._delta_rule.frost.drivers import summary as native_summary
 from attn_gym.linear.context_parallel import merge_state
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 from attn_gym.testing.kda import (
@@ -85,7 +85,7 @@ def _native_no_state_final(
     ``split=True`` pins the uncut BT16 prefill plan (the split-K table never cuts these short
     sequences); the automatic plan may pick the d_v split, whose rounding differs.
     """
-    _, final = cudnn_fe_kda.kda_forward(
+    _, final = kda_driver.kda_forward(
         *(t[0] for t in inputs), cu_seqlens, scale=SCALE, output_final_state=True, split=True
     )
     assert final is not None
@@ -96,7 +96,7 @@ def _forbid_driver_plans(monkeypatch: pytest.MonkeyPatch) -> None:
     """Summaries launch the summary kernels directly, never a forward/backward driver plan."""
     for name in ("kda_forward", "kda_backward"):
         monkeypatch.setattr(
-            cudnn_fe_kda,
+            kda_driver,
             name,
             lambda *args, **kwargs: pytest.fail("native summaries must not select a driver plan"),
         )

@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch launcher for the scalar-GDN cuDNN backward (vendored cudnn-frontend v1.30 kernels)."""
+"""Torch launcher for the scalar-GDN cuDNN backward (frost kernels)."""
 
 from __future__ import annotations
 
 import torch
 
 from attn_gym._backends.cute.utils import initialized_cuda_device
-from attn_gym.linear._delta_rule.cudnn_fe.gdn import gdn_backward
+from attn_gym.linear._delta_rule.frost.drivers.gdn import gdn_backward
 from attn_gym.linear._delta_rule.validation import resolve_scale
 
 

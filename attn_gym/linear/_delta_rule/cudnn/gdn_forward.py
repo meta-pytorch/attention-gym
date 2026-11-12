@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Torch launcher for the scalar-GDN cuDNN forward (vendored cudnn-frontend v1.30 kernels)."""
+"""Torch launcher for the scalar-GDN cuDNN forward (frost kernels)."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import torch
 
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym._backends.cute.utils import get_device_properties
-from attn_gym.linear._delta_rule.cudnn_fe.gdn import gdn_forward
+from attn_gym.linear._delta_rule.frost.drivers.gdn import gdn_forward
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import resolve_scale
 
@@ -21,7 +21,7 @@ def validate_available(q: torch.Tensor) -> None:
         raise ValueError("the cuDNN GDN backend requires CUDA tensors")
     properties = get_device_properties(q.device)
     if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
-        raise ValueError("the CuTeDSL 4.7 GDN backend requires SM100 or SM103")
+        raise ValueError("the cuDNN GDN backend requires SM100 or SM103")
 
 
 def run_forward_on_current_device(
@@ -40,7 +40,7 @@ def run_forward_on_current_device(
     """Validate and launch one packed scalar-GDN forward.
 
     A ``PagedState`` is advanced in place and produces no separate final state. ``split``
-    enables the approximate forgetting-horizon work table (see ``cudnn_fe/common/split_k.py``)
+    enables the approximate forgetting-horizon work table (see ``frost/work_tables.py``)
     and is only offered for calls without recurrent state.
     """
     if split and (state is not None or output_final_state):
