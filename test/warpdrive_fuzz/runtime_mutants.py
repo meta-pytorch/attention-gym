@@ -183,8 +183,8 @@ def signal_false_signals():
 
 def decode_unguarded():
     """Every mapping is decoded at any index, as if it declared ``decodes_any_index``."""
-    scheduling._decode = lambda stream, index, problem, state: scheduling._keep_words(
-        stream.mapping, index, problem.space, state
+    scheduling.IndexSchedule._decode = lambda self, index, problem, state: scheduling._keep_words(
+        problem.stream.mapping, index, problem.space, state
     )[1:]
 
 
