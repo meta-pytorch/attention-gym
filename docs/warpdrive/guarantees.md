@@ -193,6 +193,8 @@ What the layer supplies, checks and leaves to you:
 
 12. **Reports and tests.** `describe()` checks declarations before compilation; body reports
     appear after tracing or [cache restoration](cache.md#cached-builds-were-never-traced).
+    Every trace starts from no reports, so an instance whose retrace fails shows none from an
+    earlier trace.
     Kernels built inside compile functions restore no reports on a hit. Tests cover only the
     inputs and toolchain exercised.
     Protocol logs record trace sites; profiling plans and timings prove neither safety nor

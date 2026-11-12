@@ -429,7 +429,8 @@ _HOST_SETTINGS = (
 )
 _COLLECTED_SETTINGS = ("cluster", "trace_protocol")
 # Trace results for describe(), pipeline plans and trace-time warnings.
-# __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes.
+# __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes;
+# _reset_trace gives each its empty value.
 _TRACE_RESULTS = (
     "_ws_tma",
     "_ws_smem",
@@ -686,18 +687,34 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
         self._ws_named_bars = named_bars
-        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item, traced
-        self._ws_trace_tags = []  # globaltimer range names, traced
-        self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}, traced
-        self._ws_ownership = {}  # owned-epoch channel -> epoch-ownership verdict, traced
         self._ws_streams = streams
+        self._reset_trace()
+
+    def _reset_trace(self):
+        """Clear trace state so a failed retrace cannot expose an earlier trace's reports.
+
+        This is the only reset, called at collection and the start of ``begin_roles``.
+        ``_ws_traced`` stays false until ``_finish_trace`` or ``__cute_restore_trace__`` marks
+        the reports ready.
+        """
+        self._ws_traced = False
+        # Results, saved and restored by cached builds (_TRACE_RESULTS).
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
         self._ws_alias = None  # alias.AliasReport, after a trace
-        self._ws_liveness = None  # liveness.Liveness, after a trace
         self._ws_fences = None  # fences.FenceReport, after a trace
         self._ws_opt_outs = []
+        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
+        self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}
+        self._ws_ownership = {}  # owned-epoch channel -> epoch-ownership verdict
+        self._ws_liveness = None  # liveness.Liveness, after a trace
+        self._ws_trace_tags = []  # globaltimer range names
+        # The protocol log is not saved: a cached build has none (trace_key).
         self._ws_log = ProtocolLog() if self.trace_protocol else None
+        # What a trace records for _finish_trace's checks.
+        self._ws_role_events = []  # RoleEvents of every dispatched role
+        self._ws_epoch_seqs = {}  # (owned-epoch channel, role) -> RoleTrace.epoch_sequence
+        self._ws_raw_barrier_access = ""
 
     @staticmethod
     def _bind_stream(name: str, st: WorkStream, roles: list, chans: dict, cluster):
@@ -1258,6 +1275,13 @@ class WarpSpecialized(metaclass=_KernelType):
         Plain Python at trace time; only barrier initialization is a device-side branch.
         """
         self._collect()
+        self._reset_trace()
+        # Trace state outside this kernel: process-wide recorders and flags on its declarations.
+        # Collection may run inside another kernel's trace, so _reset_trace leaves these alone.
+        take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
+        for nb in self._ws_named_bars.values():  # count only this trace's native ID reads
+            nb._native_outside_roles = False
+        clear_multicast_masks()
         if set(problems) != set(self._ws_streams):
             raise ProtocolError(
                 f"begin_roles needs a problem for each WorkStream {sorted(self._ws_streams)}, "
@@ -1266,15 +1290,6 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_problems = problems
         for problem in problems.values():
             problem.start()  # per-CTA start values, computed once ahead of role dispatch
-        self._ws_tma = {}
-        self._ws_role_events = []  # RoleEvents of every dispatched role
-        self._ws_raw_barrier_access = ""
-        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
-        self._ws_epoch_seqs = {}  # (owned-epoch channel, role) -> RoleTrace.epoch_sequence
-        take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
-        for nb in self._ws_named_bars.values():  # count only this trace's native ID reads
-            nb._native_outside_roles = False
-        clear_multicast_masks()
         smem = SmemAllocator()
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
@@ -1344,7 +1359,6 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"begin_roles(layouts=...) needs a layout for each smem_plan buffer "
                 f"{sorted(buffers)}, got {sorted(layouts)}"
             )
-        self._ws_smem = {}
         for buf in buffers.values():
             self._ws_smem[buf.name] = allocate(smem, buf, layouts[buf.name], self._ws_smem)
         for name, ch in self._ws_chans.items():
@@ -1450,7 +1464,6 @@ class WarpSpecialized(metaclass=_KernelType):
     def _start_trace(self, buffer):
         """Kernel-wide trace state that makes each role's ranges: ``tracing.GlobaltimerTrace``
         (device code computes this CTA's unit), ``IketTrace``, or None when tracing is off."""
-        self._ws_trace_tags = []
         if self.trace_backend is None:
             return None
         if self.trace_backend == "iket":
@@ -1497,16 +1510,14 @@ class WarpSpecialized(metaclass=_KernelType):
     def _finish_trace(self):
         """Collect opt-outs and check reports, then report findings."""
         self._ws_opt_outs = take_opt_outs()
-        self._check_named_barriers()
-        self._check_ownership()
+        self._ws_named_users = self._check_named_barriers()
+        self._ws_ownership = self._check_ownership()
         if self.liveness_check not in liveness.MODES:
             raise ValueError(
                 f"liveness_check must be one of {liveness.MODES}, got {self.liveness_check!r}"
             )
-        self._ws_liveness = None
         if self.liveness_check != "off":
             self._ws_liveness = liveness.check(self, self._ws_role_events)
-        self._ws_alias = self._ws_fences = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
         if self.alias_check != "off":
@@ -1537,10 +1548,11 @@ class WarpSpecialized(metaclass=_KernelType):
         (``docs/warpdrive/channels.md``).
         """
         persistent = any(st.schedule.persistent for st in self._ws_streams.values())
-        self._ws_ownership = {}
+        verdicts = {}
         for name, ch in self._ws_chans.items():
             if ch.owned_epochs:
-                self._ws_ownership[name] = self._epoch_ownership(name, ch, persistent)
+                verdicts[name] = self._epoch_ownership(name, ch, persistent)
+        return verdicts
 
     def _epoch_ownership(self, name: str, ch, persistent: bool) -> str:
         """``_check_ownership``'s verdict for one channel."""
@@ -1677,7 +1689,7 @@ class WarpSpecialized(metaclass=_KernelType):
         """Check named-barrier IDs and ``NamedBarrier`` participation after a trace.
 
         Rejects hand-picked ``alias.named_barrier`` IDs that are out of range or owned by the
-        layer, a named channel, or a ``NamedBarrier``. Records each ``NamedBarrier``'s users
+        layer, a named channel, or a ``NamedBarrier``. Returns each ``NamedBarrier``'s users
         (``{"sync"/"arrive"/"native": role names, "unverified": notes}``) and rejects one whose
         users cannot supply its count in some CTA. Native code that read ``.id`` may supply the
         rest, so short observed participation in a CTA where such code runs is only
@@ -1768,7 +1780,7 @@ class WarpSpecialized(metaclass=_KernelType):
                         f"roles calling it{where} have {total} of {nb.threads} threads; native "
                         f"code reading .id ({', '.join(used['native'])}) must supply the rest"
                     )
-        self._ws_named_users = users
+        return users
 
     def _report_trace(self):
         """Report findings under each check's mode, after tracing or cache restoration."""
