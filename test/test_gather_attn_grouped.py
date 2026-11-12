@@ -5,6 +5,7 @@ import contextlib
 import pytest
 import torch
 
+from attn_gym._backends import tune as tune_module
 from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
 from attn_gym.testing import cumulative_sequence_offsets
 from attn_gym.testing.gather_attn import (
@@ -925,9 +926,6 @@ def test_tile_query_map_reuses_dynamic_kernels(triton_compiles):
 
 def test_dense_key_tiles_reuse_tuning_buckets(monkeypatch, tmp_path):
     """New token/document counts reuse a winner until average length crosses its bucket."""
-    import importlib
-
-    tune_module = importlib.import_module("attn_gym._backends.cute.tune")
     monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path))
     monkeypatch.setattr(tune_module, "_WINNERS", {})
     monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
