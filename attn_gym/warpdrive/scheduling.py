@@ -526,6 +526,22 @@ class IndexSchedule:
     def close_claims(self, fetch, problem):
         pass
 
+    # ---- private: how the layer launches a stream of this kind ---------------- #
+    # The defaults launch a 1-D grid of work units over the mapping's items. OneShot and
+    # TilePersistent, which read items from blockIdx, override them; a subclass inherits its
+    # kind's answers. ``problem`` is the stream's ``BoundWork``.
+
+    def _index_count(self, count64, space):
+        """Host, at bind: how many indices the stream has, from the mapping's item count. The
+        kernel receives it narrowed to Int32 (``BoundWork.total``), and ``BoundWork.grid``'s
+        Int32 check bounds it."""
+        return count64
+
+    def _grid(self, problem, units):
+        """Host: the launch grid for ``units`` work units, before ``BoundWork.grid``'s Int32
+        check."""
+        return units * problem.cs, 1, 1
+
 
 @dataclass(frozen=True)
 class OneShot(IndexSchedule):
@@ -586,6 +602,11 @@ class OneShot(IndexSchedule):
 
     def next_index(self, index, problem):
         return problem.total
+
+    def _grid(self, problem, units):
+        if _tile_grid(problem.stream):
+            return tile_grid_dims(problem.space, problem.cs, self.grid)
+        return super()._grid(problem, units)
 
 
 @dataclass(frozen=True)
@@ -659,6 +680,17 @@ class TilePersistent(IndexSchedule):
         if self.units is not None:
             return index + self.units
         return index + cute.arch.grid_dim()[AXES.index(self.axis)]
+
+    def _index_count(self, count64, space):
+        # The stream's index is the axis coordinate; an empty space has none.
+        extent = space[AXES.index(self.axis)]
+        if isinstance(count64, int):
+            return extent if count64 > 0 else 0
+        return cutlass.select_(count64 > 0, Int64(extent), Int64(0))
+
+    def _grid(self, problem, units):
+        _check_single_cta(problem.stream, problem.cs)
+        return _tile_persistent_dims(problem.space, self.axis, units)
 
 
 @cute.jit
@@ -1060,20 +1092,15 @@ class _HostProblem:
 
 class BoundWork:
     """A stream bound to its runtime work space (``WorkStream.bind``), passed to the kernel as a
-    DSL value: the mapping's space, the Int32 item count ``total`` and, for ``AtomicPersistent``,
-    the workspace. ``count64`` (the mapping's Int64 count) and ``max_ctas`` stay on the host."""
+    DSL value: the mapping's space, the Int32 index count ``total`` and, for
+    ``AtomicPersistent``, the workspace. ``count64`` (the index count as an Int64: the mapping's
+    items, or ``TilePersistent``'s axis coordinates) and ``max_ctas`` stay on the host."""
 
     def __init__(self, stream: WorkStream, space, workspace, max_ctas, total=None, limit=None):
         self.stream, self.space, self.workspace, self.max_ctas = stream, space, workspace, max_ctas
         if total is None:  # host: count once; the kernel's copies carry the narrowed count
-            self.count64 = stream.mapping.count64(space)
+            self.count64 = stream.schedule._index_count(stream.mapping.count64(space), space)
             total = _narrow(self.count64)
-            if _tile_persistent(stream):  # the stream's index is the axis coordinate
-                extent = space[AXES.index(stream.schedule.axis)]
-                if isinstance(self.count64, int):
-                    total = extent if self.count64 > 0 else 0
-                else:
-                    total = Int32(cutlass.select_(self.count64 > 0, Int32(extent), Int32(0)))
         self.total = total
         self.limit = limit  # a Limit, read per decoding site (``_limited``)
         self.cs = stream.cluster_size  # CTAs per work unit
@@ -1198,18 +1225,11 @@ class BoundWork:
         grid as is, which CUDA rejects."""
         schedule = self.stream.schedule
         units = _launch_units(schedule, self.total, self.max_ctas, self.cs)
-        if _tile_grid(self.stream):
-            x, y, z = tile_grid_dims(self.space, self.cs, schedule.grid)
-        elif _tile_persistent(self.stream):
-            _check_single_cta(self.stream, self.cs)
-            x, y, z = _tile_persistent_dims(self.space, schedule.axis, units)
-        else:
-            x, y, z = units * self.cs, 1, 1
+        x, y, z = schedule._grid(self, units)
         # Every grid extent and index must fit Int32. Past that the grid is zero-wide, so CUDA
         # rejects the launch instead of the kernel covering a wrapped space. This is host code
         # in the jit entry point: kernels pay nothing for the check.
-        # TilePersistent indexes its axis coordinate, so the axis extent bounds its indices.
-        count = self.total if _tile_persistent(self.stream) else self.count64
+        count = self.count64
         if isinstance(count, int) and isinstance(units, int):  # static extents: plain host ints
             return (x if schedule.index_limit(count, units, self.cs) <= INT32_MAX else 0), y, z
         limit = schedule.index_limit(Int64(count), Int64(units), self.cs)
