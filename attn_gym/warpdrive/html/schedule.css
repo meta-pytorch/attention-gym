@@ -1,15 +1,42 @@
 /* schedule_html: CTA x slot grid, timeline and work-space map. */
-.controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0 0 8px; }
-.controls .figlabel { margin: 0; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 0 0 10px; }
+.toolbar .group { display: inline-flex; align-items: center; gap: 6px; }
+.toolbar .label { font: 11px var(--mono); color: var(--muted); }
+.toolbar .spacer { flex: 1; }
 .seg { display: inline-flex; }
 .seg button { border-radius: 0; margin-left: -1px; }
 .seg button:first-child { border-radius: 3px 0 0 3px; margin-left: 0; }
 .seg button:last-child { border-radius: 0 3px 3px 0; }
-.readout { font: 11.5px var(--mono); color: var(--ink); }
+.readout { font: 12px var(--mono); color: var(--ink); white-space: pre; }
+.hint { font-size: 12px; color: var(--muted); margin: 0 0 8px; }
+[hidden] { display: none !important; }
+.legend { margin-bottom: 6px; }
 .legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px;
   vertical-align: -1px; margin-right: 5px; }
 .view { margin-bottom: 14px; }
 .view canvas { display: block; }
+.view canvas[data-view="timeline"] { cursor: crosshair; touch-action: pan-y; user-select: none; }
+.view canvas[data-view="grid"] { cursor: pointer; }
 .view .figure { overflow: hidden; }
 .pair { display: flex; gap: 14px; align-items: flex-start; flex-wrap: wrap; }
 .pair > .view { flex: 1 1 420px; min-width: 0; }
+.about { font-size: 12.5px; color: var(--muted); margin-top: 6px; max-width: 760px; }
+.about summary { cursor: pointer; color: var(--ink); }
+.about ul { margin: 6px 0 0; padding-left: 18px; line-height: 1.55; }
+.path { border: 1px solid var(--rule); border-radius: 3px; padding: 8px 10px; margin: 0 0 10px;
+  font-size: 12.5px; }
+.path p { margin: 0 0 8px; max-width: 900px; }
+.path .bar { display: flex; height: 14px; border-radius: 2px; overflow: hidden; margin: 0 0 4px;
+  max-width: 900px; }
+.path .wait { background: repeating-linear-gradient(45deg, var(--rule) 0 3px, transparent 3px 6px); }
+.path i.sw.wait { border: 1px solid var(--rule); }
+.path .table { max-height: 260px; overflow: auto; max-width: 900px; border-top: 1px solid var(--rule); }
+.path table { border-collapse: collapse; width: 100%; font: 11.5px var(--mono); }
+.path th { position: sticky; top: 0; background: var(--paper); text-align: left; font-weight: 500;
+  color: var(--muted); padding: 4px 8px; }
+.path td { padding: 3px 8px; border-top: 1px solid var(--rule); white-space: nowrap; }
+.path td:nth-child(n+3) { text-align: right; }
+.path th:nth-child(n+3) { text-align: right; }
+.path tbody tr { cursor: pointer; }
+.path tbody tr:hover, .path tbody tr.on { background: var(--panel); }
+.path .more { color: var(--muted); }
