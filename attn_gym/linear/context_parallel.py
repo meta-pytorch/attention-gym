@@ -167,6 +167,7 @@ from typing import NamedTuple, Protocol
 import torch
 import torch.distributed as dist
 from torch.distributed._functional_collectives import all_gather_single
+from torch.export import register_dataclass
 
 from attn_gym._backends.profiler import profiler_range
 
@@ -369,6 +370,12 @@ class ContextParallelRouting:
             )
         if self.cu_seqlens.device != span.device:
             raise ValueError(f"routing lives on {self.cu_seqlens.device}, inputs on {span.device}")
+
+
+# Routing holds per-batch device tensors that callers carry inside CUDA graph inputs. Register
+# it with pytree so graph wrappers that flatten their inputs copy a new layout into the captured
+# buffers; unregistered, it is one opaque leaf that must compare equal across replays.
+register_dataclass(ContextParallelRouting)
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.utils._pytree as pytree
 
 from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
@@ -152,6 +153,34 @@ def test_routing_builds_directly_from_fragments():
             torch.testing.assert_close(actual_value, expected_value)
         else:
             assert actual_value == expected_value
+
+
+def test_routing_flattens_to_fixed_leaves_across_layouts():
+    """Graph wrappers copy tensor leaves and require all other leaves to stay equal."""
+    # Same span length per rank, 5 fragments then 3, under one cap.
+    tables = [FRAGMENTS, [[(0, 6)], [(6, 12)], [(12, 16)]]]
+    (captured, spec), (fresh, fresh_spec) = (
+        pytree.tree_flatten(
+            ContextParallelRouting.from_fragments(
+                (0, 5, 12, 16),
+                table,
+                cp_rank=1,
+                device="cpu",
+                slots=3,
+                max_subsequences=4,
+                conv_history=2,
+            )
+        )
+        for table in tables
+    )
+    assert fresh_spec == spec
+    assert sum(isinstance(leaf, torch.Tensor) for leaf in captured) == 11  # every routing tensor
+    for captured_leaf, fresh_leaf in zip(captured, fresh):
+        if isinstance(captured_leaf, torch.Tensor):
+            assert captured_leaf.shape == fresh_leaf.shape
+            assert captured_leaf.dtype == fresh_leaf.dtype
+        else:
+            assert captured_leaf == fresh_leaf
 
 
 def test_plan_cuts_fragments_at_sequences_and_orders_neighbors():
