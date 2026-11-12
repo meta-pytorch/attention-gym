@@ -2064,8 +2064,13 @@ def _compile_chunk_kda_bwd_intra(
     dq2 = column_token_head(io_type, KEY_DIM)
     dk2 = column_token_head(io_type, KEY_DIM)
     dg2 = column_token_head(cutlass.Float32, KEY_DIM)
-    cu_seqlens = normal(cutlass.Int32, (sequences,)) if ragged else None
-    chunk_offsets = normal(cutlass.Int32, (sequences,)) if ragged else None
+    # Routing metadata is read one int32 at a time; sliced buffers need only element alignment.
+    cu_seqlens = (
+        make_fake_compact_tensor(cutlass.Int32, (sequences,), assumed_align=4) if ragged else None
+    )
+    chunk_offsets = (
+        make_fake_compact_tensor(cutlass.Int32, (sequences,), assumed_align=4) if ragged else None
+    )
     return compile_tvm_ffi(
         op,
         q,

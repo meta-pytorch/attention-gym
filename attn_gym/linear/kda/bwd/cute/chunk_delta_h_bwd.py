@@ -1918,8 +1918,8 @@ def _compile_delta_h_bwd(
     )
     dhof = make_fake_tensor(io_type, (sa, snt, H, K, V))
     dv2f = make_fake_tensor(io_type, (sa, sb, H, V))
-    cuf = make_fake_tensor(cutlass.Int32, (sn,))
-    cof = make_fake_tensor(cutlass.Int32, (sn,))
+    cuf = make_fake_compact_tensor(cutlass.Int32, (sn,), assumed_align=4)
+    cof = make_fake_compact_tensor(cutlass.Int32, (sn,), assumed_align=4)
 
     return compile_tvm_ffi(
         kern,
@@ -1990,7 +1990,8 @@ def _compile_delta_h_bwd_packed(
         dynamic_state_layout,
     )
     chunk_state = make_fake_tensor(io_type, (chunks, heads, key_dim, value_dim))
-    metadata = make_fake_tensor(cutlass.Int32, (metadata_entries,))
+    # Sequence bounds and chunk offsets use scalar int32 loads, not TMA or vector copies.
+    metadata = make_fake_compact_tensor(cutlass.Int32, (metadata_entries,), assumed_align=4)
     return compile_tvm_ffi(
         kernel,
         token_tensor(io_type, key_dim),
