@@ -1350,6 +1350,32 @@ def test_tile_persistent_units_fix_the_grid_and_stride():
             TilePersistent("m", units=units)
 
 
+def test_tile_persistent_assignment_follows_the_launch():
+    """``assignment`` uses the launch's units: one row per CTA of the launch grid, every tile
+    once, also for a subclass that changes whether ``max_ctas`` is read. It reads no launch
+    resources."""
+
+    class Uncapped(TilePersistent):
+        uses_max_ctas = False  # one unit per axis coordinate
+
+    class WithWorkspace(TilePersistent):
+        uses_workspace = True
+
+    space = (5, 4, 3)
+    for schedule, max_ctas in [
+        (TilePersistent("n"), 2),
+        (TilePersistent("l", units=2), None),
+        (Uncapped("m"), None),
+    ]:
+        stream = WorkStream(schedule=schedule)
+        rows = stream.assignment(space, max_ctas)
+        assert len(rows) == math.prod(stream.bind(space, max_ctas=max_ctas).grid())
+        items = sorted(item for row in rows for _, item in row)
+        assert items == sorted(itertools.product(*map(range, space)))
+    reference = WorkStream(schedule=TilePersistent("m")).assignment(space, 2)
+    assert WorkStream(schedule=WithWorkspace("m")).assignment(space, 2) == reference
+
+
 def test_tile_persistent_rejections():
     with pytest.raises(ValueError, match="axis must be one of"):
         TilePersistent("k")

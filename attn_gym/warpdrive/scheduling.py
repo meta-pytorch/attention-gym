@@ -87,7 +87,6 @@ from __future__ import annotations
 import functools
 import inspect
 import itertools
-import math
 import re
 from dataclasses import dataclass, field, fields, is_dataclass
 
@@ -977,7 +976,9 @@ class WorkStream:
             if decode is not None:
                 raise ValueError(f"{schedule.describe()} reads items from blockIdx; drop decode")
             _check_single_cta(self, self.cluster_size)
-            return _tile_persistent_assignment(mapping.bind(space), schedule, max_ctas)
+            return _tile_persistent_assignment(
+                BoundWork(self, mapping.bind(space), None, max_ctas)
+            )
         if schedule.broadcast:
             raise ValueError(
                 f"{schedule.describe()} claims indices at run time; only a local schedule has a "
@@ -1022,14 +1023,13 @@ class WorkStream:
         return rows
 
 
-def _tile_persistent_assignment(space, schedule, max_ctas) -> list[list[tuple]]:
-    """``WorkStream.assignment`` of a ``TilePersistent`` schedule over a bound static space."""
+def _tile_persistent_assignment(bound) -> list[list[tuple]]:
+    """``WorkStream.assignment`` of a ``TilePersistent`` stream bound to a static space, with the
+    launch's ``total`` and units."""
+    schedule, total = bound.stream.schedule, bound.total
     k = AXES.index(schedule.axis)
-    total = space[k] if math.prod(space) > 0 else 0
-    if schedule.units is None and max_ctas is None:
-        raise ValueError(f"{schedule.describe()} needs max_ctas")
-    units = schedule.launch_units(total, max_ctas)
-    dims = _tile_persistent_dims(space, schedule.axis, units)
+    units = _launch_units(schedule, total, bound.max_ctas, bound.cs)
+    dims = _tile_persistent_dims(bound.space, schedule.axis, units)
     rows = []
     for z, y, x in itertools.product(*(range(d) for d in reversed(dims))):  # x fastest
         block = (x, y, z)
