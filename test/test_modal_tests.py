@@ -214,20 +214,84 @@ def test_failed_cache_upload_preserves_previous_archive(
     assert (restored / "kernel.o").read_bytes() == b"previous compile"
 
 
-@pytest.mark.parametrize("first_code", [0, 1, -9])
-def test_main_publishes_each_suite_before_allocating_the_next(
-    runner: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, first_code: int
+def test_compile_cache_ages_entries_from_their_last_read(runner: ModuleType, tmp_path: Path):
+    """An old compile that a run reads survives two saves; one nobody reads is dropped."""
+    cache = tmp_path / "cache"
+    read, unread = cache / "triton" / "read.cubin", cache / "triton" / "unread.cubin"
+    week_ago = time.time() - 7 * 24 * 60 * 60
+    for path in (read, unread):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(path.name.encode())
+        os.utime(path, (week_ago, week_ago))
+    # A read advances only atime; set it explicitly so noatime mounts still test this.
+    read_at = time.time()
+    os.utime(read, (read_at, week_ago))
+    archive = tmp_path / "volume" / "main.tar"
+    runner.save_compile_cache(cache, archive, max_age_seconds=24 * 60 * 60)
+
+    # The next run restores atime and mtime to the archived last use and never reads the entry.
+    restored = tmp_path / "restored"
+    runner.restore_compile_cache(archive, restored)
+    assert [path.name for path in restored.rglob("*") if path.is_file()] == ["read.cubin"]
+    assert (restored / "triton" / "read.cubin").stat().st_mtime == pytest.approx(read_at, abs=1)
+    runner.save_compile_cache(restored, archive, max_age_seconds=24 * 60 * 60)
+    again = tmp_path / "again"
+    runner.restore_compile_cache(archive, again)
+    assert (again / "triton" / "read.cubin").read_bytes() == b"read.cubin"
+
+
+@pytest.mark.parametrize(("main_code", "cudnn_code"), [(0, 0), (1, 0), (0, -9)])
+def test_main_runs_suites_together_and_fails_if_either_fails(
+    runner: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    main_code: int,
+    cudnn_code: int,
 ):
-    """Publish completed evidence even if the next remote call times out; stop after failure."""
+    """Request both GPUs before waiting on either, then publish both summaries."""
     summary_file = tmp_path / "summary.md"
     monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
-    first = Mock(return_value=(first_code, "ordinary summary\n"))
-    second = Mock(side_effect=TimeoutError("remote deadline"))
-    monkeypatch.setattr(runner, "run_pytest", SimpleNamespace(remote=first))
-    monkeypatch.setattr(runner, "run_cudnn_pytest", SimpleNamespace(remote=second))
+    events = []
 
-    with pytest.raises(SystemExit if first_code else TimeoutError):
+    def suite(name: str, code: int) -> SimpleNamespace:
+        def get():
+            events.append(f"get {name}")
+            return code, name
+
+        def spawn():
+            events.append(f"spawn {name}")
+            return SimpleNamespace(get=get)
+
+        return SimpleNamespace(spawn=spawn)
+
+    monkeypatch.setattr(runner, "run_pytest", suite("main", main_code))
+    monkeypatch.setattr(runner, "run_cudnn_pytest", suite("cudnn", cudnn_code))
+
+    with pytest.raises(SystemExit) if main_code or cudnn_code else contextlib.nullcontext():
         runner.main()
 
-    assert summary_file.read_text() == "ordinary summary\n"
-    assert second.call_count == (0 if first_code else 1)
+    assert events == ["spawn main", "spawn cudnn", "get main", "get cudnn"]
+    assert summary_file.read_text() == "maincudnn"
+
+
+@pytest.mark.parametrize("timed_out_suite", ["run_pytest", "run_cudnn_pytest"])
+def test_main_publishes_finished_suite_when_the_other_times_out(
+    runner: ModuleType, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timed_out_suite: str
+):
+    """Wait for and publish the other suite even if either remote call times out."""
+    summary_file = tmp_path / "summary.md"
+    monkeypatch.setenv("GITHUB_STEP_SUMMARY", str(summary_file))
+
+    def timed_out():
+        raise TimeoutError("remote deadline")
+
+    for name in ("run_pytest", "run_cudnn_pytest"):
+        get = timed_out if name == timed_out_suite else lambda: (0, "finished summary\n")
+        monkeypatch.setattr(
+            runner, name, SimpleNamespace(spawn=lambda get=get: SimpleNamespace(get=get))
+        )
+
+    with pytest.raises(TimeoutError):
+        runner.main()
+
+    assert summary_file.read_text() == "finished summary\n"
