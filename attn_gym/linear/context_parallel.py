@@ -372,11 +372,9 @@ class ContextParallelRouting:
             raise ValueError(f"routing lives on {self.cu_seqlens.device}, inputs on {span.device}")
 
 
-# The only pytree-registered type in attn_gym: unlike the config and plan dataclasses,
-# routing holds per-batch device tensors that callers carry inside CUDA graph inputs.
-# Graph wrappers that flatten their inputs then copy a new layout into the captured buffers;
-# unregistered, the routing is one opaque leaf that must compare equal across replays, so a
-# new layout fails.
+# Routing holds per-batch device tensors that callers carry inside CUDA graph inputs. Register
+# it with pytree so graph wrappers that flatten their inputs copy a new layout into the captured
+# buffers; unregistered, it is one opaque leaf that must compare equal across replays.
 register_dataclass(ContextParallelRouting)
 
 
