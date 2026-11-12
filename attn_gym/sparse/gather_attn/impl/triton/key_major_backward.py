@@ -267,21 +267,25 @@ def _query_tile_counts(
     The total is a device scalar. With no gather queries, even the temporary sort rows and
     histogram matrix remain untouched; later kernels only publish zero tile offsets.
     """
+    # Widen before forming the runtime [batch, tile, query] strides.
+    S = S.to(tl.int64)
     if tl.load(total_ptr) > 0:
         row = tl.program_id(0).to(tl.int64)
+        batch, query = row // S, row % S
         count = tl.load(counts_ptr + row)
         histogram = tl.full((HIST_BINS,), 0, tl.int32)
         if count > 0:
             slots = tl.arange(0, BLOCK_K)
-            keys = tl.load(rows_ptr + row * TOPK + slots, mask=slots < count, other=2**31 - 1).to(
+            row_offsets = ptr_offset((row, slots), (TOPK, 1))
+            keys = tl.load(rows_ptr + row_offsets, mask=slots < count, other=2**31 - 1).to(
                 tl.int32
             )
             keys = tl.sort(keys, descending=False)
-            tl.store(sorted_rows_ptr + row * TOPK + slots, keys, mask=slots < TOPK)
+            tl.store(sorted_rows_ptr + row_offsets, keys, mask=slots < TOPK)
             starts, _ = _query_pair_starts(keys, slots, TILE)
             histogram = tl.histogram(keys // TILE, HIST_BINS, mask=starts)
         tiles = tl.arange(0, HIST_BINS)
-        offset = ((row // S) * NUM_TILES + tiles.to(tl.int64)) * S + row % S
+        offset = ptr_offset((batch, tiles, query), (NUM_TILES * S, S, 1))
         tl.store(query_offsets_ptr + offset, histogram, mask=tiles < NUM_TILES)
 
 
@@ -338,6 +342,8 @@ def _query_tile_pairs(
     BLOCK_K: tl.constexpr,
 ):
     """Scatter complete pair masks to disjoint, query-ordered positions; no atomics."""
+    # Widen before forming the runtime [batch, tile, query] strides.
+    S = S.to(tl.int64)
     if tl.load(total_ptr) > 0:
         row = tl.program_id(0).to(tl.int64)
         count = tl.load(counts_ptr + row)
@@ -345,7 +351,7 @@ def _query_tile_pairs(
             batch, query = row // S, row % S
             slots = tl.arange(0, BLOCK_K)
             keys = tl.load(
-                sorted_rows_ptr + row * TOPK + slots,
+                sorted_rows_ptr + ptr_offset((row, slots), (TOPK, 1)),
                 mask=slots < count,
                 other=2**31 - 1,
             )
@@ -358,14 +364,18 @@ def _query_tile_pairs(
             _, bits = tl.associative_scan((starts, bits), 0, _or_within_pairs)
             tiles = keys // TILE
             tile_start = tl.load(
-                tile_offsets_ptr + batch * (NUM_TILES + 1) + tiles, mask=ends, other=0
-            )
-            query_start = tl.load(
-                query_offsets_ptr + (batch * NUM_TILES + tiles.to(tl.int64)) * S + query,
+                tile_offsets_ptr + ptr_offset((batch, tiles), (NUM_TILES + 1, 1)),
                 mask=ends,
                 other=0,
             )
-            destination = batch * ENTRIES + tile_start + query_start + pair - first_pair
+            query_start = tl.load(
+                query_offsets_ptr + ptr_offset((batch, tiles, query), (NUM_TILES * S, S, 1)),
+                mask=ends,
+                other=0,
+            )
+            destination = ptr_offset(
+                (batch, tile_start.to(tl.int64) + query_start + pair - first_pair), (ENTRIES, 1)
+            )
             tl.store(pair_queries_ptr + destination, query.to(tl.int32), mask=ends)
             tl.store(pair_masks_ptr + destination, bits.to(tl.int32), mask=ends)
 
