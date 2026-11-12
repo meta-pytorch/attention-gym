@@ -10,7 +10,9 @@ self.work = WorkStream()
 ```
 
 A **work unit** is one CTA, or one whole cluster with `CtaPair()` or `Cluster(...)`.
-Declare at most one stream per kernel. The schedule assigns indices; the mapping turns
+Declare at most one stream per kernel, and give each kernel its own: a stream belongs to the
+kernel it was last assigned to, and another kernel that still holds it raises. The schedule
+assigns indices; the mapping turns
 each index into the item that roles read:
 
 ```text

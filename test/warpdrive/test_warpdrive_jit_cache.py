@@ -106,6 +106,18 @@ def test_key_names_each_compile_time_choice():
         key_of(retiled, compile_pgemm)
 
 
+def test_a_stream_belongs_to_one_kernel():
+    """Assigning a stream hands it over; the kernel it was taken from can no longer use it."""
+    first, second = PersistentGemm(), PersistentGemm()
+    second.work = first.work
+    assert first.work.owner is second
+    second.describe()
+    with pytest.raises(
+        ProtocolError, match="work: this WorkStream now belongs to a PersistentGemm"
+    ):
+        first.describe()
+
+
 def test_pickled_kernel_keeps_its_key():
     """Pickle the constructor call and host settings for a fresh compiler process."""
     op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair(), tile_n=224)
