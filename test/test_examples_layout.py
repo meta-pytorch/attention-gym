@@ -8,10 +8,13 @@ from pathlib import Path
 import pytest
 import torch
 
+import attn_gym
 from examples.flex_attention import paged_attention, paged_attention_model, paged_attention_utils
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXAMPLES_ROOT = REPO_ROOT / "examples"
+# The directory holding the attn_gym package: the checkout, or site-packages for a wheel.
+PACKAGE_PARENT = Path(attn_gym.__file__).resolve().parents[1]
 
 
 def test_examples_have_one_concept_directory() -> None:
@@ -85,7 +88,7 @@ def test_documented_example_paths_exist(document: Path) -> None:
     for example in re.findall(r"(?<![\w/.-])examples/[\w./-]+\.(?:py|ipynb)\b", text):
         assert (REPO_ROOT / example).is_file(), f"{document}: missing {example}"
     for example in re.findall(r"attn_gym/warpdrive/examples/[\w./-]+\.py\b", text):
-        assert (REPO_ROOT / example).is_file(), f"{document}: missing {example}"
+        assert (PACKAGE_PARENT / example).is_file(), f"{document}: missing {example}"
     for example, section in re.findall(r'--8<-- "(examples/[^":]+):([^"\n]+)"', text):
         source = (REPO_ROOT / example).read_text()
         assert f"[start:{section}]" in source, f"{document}: missing {example}:{section}"
