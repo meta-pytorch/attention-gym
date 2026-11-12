@@ -557,6 +557,18 @@ at B = 16. GB200, all sequences at one context, tokens per second
 Beyond B = 32 the input buffer leaves 0.6B five ring stages, and at ctx 1024 the batch's KV
 reads (about 270 MB per layer at B = 64) bound attention.
 
+**Batched MoE.** Qwen3-30B-A3B batches too (B <= 32, its inputs' shared-memory bound). The router
+row computes every token's logits, takes each token's top 8 and publishes per-expert token lists
+(count, token and rank, routing weight) plus the normalized MLP input. Each expert has four
+gate/up and four down rows (a quarter of its tiles each) whose MMA columns are its tokens:
+gate/up gathers their inputs and writes each token's activation slot times its routing weight,
+down writes per-(token, rank) outputs, and REDUCE rows sum a token's eight into the next
+residual. Rows of experts no token chose skip after one poll. A sequence's results do not
+depend on which tokens share its experts (bit-identical in batches of 8 and 3). GB200, tokens
+per second at ctx 256 / 1024: B=1 410 / 407 (the batch-one kernel), B=2 442 / 446, B=4 834 /
+817, B=8 1401 / 1326, B=16 1925 / 1771, B=32 2279 / 2052. At small batches most of the 1024
+expert rows per layer only skip; a device-built list of active experts would remove them.
+
 The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
 which varies about 5x across prompts on the deep models.
