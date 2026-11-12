@@ -104,6 +104,35 @@ def work_item_spans(ranges: list[Range], role: str) -> list[list]:
     ]
 
 
+def role_tracks(ranges: list[Range], kernel, origin_ns: int) -> list[list]:
+    """``[cta, track, name, payload, start, end]`` per range, in us from ``origin_ns``: each
+    CTA's ranges by recording role, as ``schedule_html``'s ``tracks`` draws them. A role's
+    outermost ranges (its work items) are on track ``"<role> w<warps>"``; ranges nested
+    ``n`` deep inside them, such as ``trace_region``s, on ``"<role> +n"``; a range with its
+    enclosing range's span nests inside it, the role's own range outermost. Ranges recorded by no
+    role's first warp (compact records) are skipped."""
+    roles = {r.first_warp: r for r in kernel._ws_roles}
+    by_warp: dict[tuple[int, int], list[Range]] = defaultdict(list)
+    for item in ranges:
+        if item.warp in roles:
+            by_warp[item.cta[0], item.warp].append(item)
+    rows = []
+    for (cta, warp), items in sorted(by_warp.items()):
+        role = roles[warp]
+        first, last = role.warps[0], role.warps[-1]
+        outer = f"{role.name} w{first}" + (f"-{last}" if last != first else "")
+        items.sort(key=lambda r: (r.start_ns, -r.end_ns, r.name != role.name))
+        open_ends: list[int] = []  # ends of the ranges enclosing the current one
+        for item in items:
+            while open_ends and open_ends[-1] <= item.start_ns:
+                open_ends.pop()
+            track = f"{role.name} +{len(open_ends)}" if open_ends else outer
+            open_ends.append(item.end_ns)
+            start, end = (item.start_ns - origin_ns) / 1e3, (item.end_ns - origin_ns) / 1e3
+            rows.append([cta, track, item.name, item.payload, start, end])
+    return rows
+
+
 WAIT_OPERATIONS = frozenset({"acquire", "wait", "peek", "tail", "turn", "sync"})
 
 

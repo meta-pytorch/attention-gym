@@ -1,11 +1,12 @@
 """Render a static schedule as a self-contained HTML page.
 
 The caller converts ``WorkStream.assignment`` results to ``Item`` objects.
-``rows[cta]`` lists their positions in execution order. The page draws a CTA-by-slot grid,
-a timeline if all items have predicted spans, and a work-space map if all have 2-D
+``rows[cta]`` lists their positions in execution order. The page draws a timeline if all items
+have predicted spans, otherwise a CTA-by-slot grid, and a work-space map if all items have 2-D
 coordinates. Drag the timeline to zoom and click a CTA to focus it across views. Predicted
 and measured spans can be compared on one axis; hover shows dependencies and timing deltas.
-Colours follow item kind or list position.
+A focused CTA expands into its measured ``Track``s (one per role, for example). Colours
+follow item kind or list position.
 """
 
 from __future__ import annotations
@@ -50,6 +51,18 @@ class Item:
     coord: tuple[int, int] | None = None
 
 
+@dataclass(frozen=True)
+class Track:
+    """One measured lane drawn under its CTA's timeline row when the CTA is focused.
+
+    ``spans`` are ``(name, start, end, item)`` in the page's ``unit``; ``item`` is the position
+    in ``items`` the span belongs to (it takes that item's colour and hover), or None.
+    """
+
+    name: str
+    spans: Sequence[tuple[str, float, float, int | None]]
+
+
 def schedule_html(
     title: str,
     subtitle: str,
@@ -59,6 +72,7 @@ def schedule_html(
     unit: str = "us",
     critical: Sequence[int] = (),
     measured: Mapping[int, tuple[int, float, float]] | None = None,
+    tracks: Mapping[int, Sequence[Track]] | None = None,
     color_by: str = "kind",
     kinds: Sequence[str] = (),
     notes: Sequence[str] = (),
@@ -69,8 +83,10 @@ def schedule_html(
     predicted critical path in order. ``measured`` maps item positions to
     ``(cta, start, end)`` from a capture of the same static table, in the same units and
     relative to a comparable origin as the prediction. The viewer can show either timing
-    source or both; spans within each CTA and timing source must not overlap. Both require
-    all items to have predicted spans. ``notes`` appear below the figures for provenance.
+    source or both; spans within each CTA and timing source must not overlap. ``critical``,
+    ``measured`` and ``tracks`` require all items to have predicted spans. ``tracks[cta]`` are that CTA's measured lanes, drawn on
+    the timeline under its row while it is focused. ``notes`` appear below the figures for
+    provenance.
     ``kinds`` sets legend/colour order; unlisted kinds follow in order of appearance.
     """
     if color_by not in COLOR_BY:
@@ -78,15 +94,26 @@ def schedule_html(
     placed = sorted(i for row in rows for i in row)
     if placed != list(range(len(items))):
         raise ValueError("rows must place every item exactly once")
-    named = [*critical, *(measured or ()), *(d for item in items for d in item.deps)]
+    tracks = {cta: lanes for cta, lanes in (tracks or {}).items() if lanes}
+    spans = [span for lanes in tracks.values() for lane in lanes for span in lane.spans]
+    named = [
+        *critical,
+        *(measured or ()),
+        *(d for item in items for d in item.deps),
+        *(item for *_, item in spans if item is not None),
+    ]
     if any(not 0 <= i < len(items) for i in named):
-        raise ValueError("deps, critical and measured name items by position in items")
+        raise ValueError("deps, critical, measured and tracks name items by position in items")
     if any(not 0 <= cta < len(rows) for cta, _, _ in (measured or {}).values()):
         raise ValueError("a measured span's CTA is not one of rows")
+    if any(not 0 <= cta < len(rows) for cta in tracks):
+        raise ValueError("a track's CTA is not one of rows")
     kinds = list(dict.fromkeys([*kinds, *(item.kind for item in items)]))
     timed = bool(items) and all(item.start is not None and item.end is not None for item in items)
-    if (critical or measured) and not timed:
-        raise ValueError("critical and measured are drawn on the timeline: give items spans")
+    if (critical or measured or tracks) and not timed:
+        raise ValueError(
+            "critical, measured and tracks are drawn on the timeline: give items spans"
+        )
     data = {
         "kinds": kinds,
         "colors": [PALETTE[i % len(PALETTE)] for i in range(len(kinds))],
@@ -103,6 +130,20 @@ def schedule_html(
         "unit": unit,
         "critical": list(critical),
         "measured": {str(k): list(v) for k, v in measured.items()} if measured else None,
+        "tracks": {
+            str(cta): [
+                [
+                    lane.name,
+                    [
+                        [n, s, e, -1 if i is None else i]
+                        for n, s, e, i in sorted(lane.spans, key=lambda span: span[1])
+                    ],
+                ]
+                for lane in lanes
+            ]
+            for cta, lanes in tracks.items()
+        }
+        or None,
         "colorBy": color_by,
     }
     about = []
@@ -117,15 +158,10 @@ def schedule_html(
             "schedule. This is the real timing."
         )
     about.append("Each row is one CTA (thread block); each box is one work item.")
+    if tracks:
+        about.append("Tracks: a focused CTA's measured ranges, drawn below its work items.")
     notes_html = "".join(f"<li>{html.escape(line)}</li>" for line in [*about, *notes])
     colors = {"kind": "Kind", "slot": "Order"}
-    hint = "Hover for details · click a row to show only that CTA (shift-click adds)"
-    if timed:
-        hint = (
-            "Drag across the timeline to zoom · double-click to zoom out · "
-            + hint[0].lower()
-            + hint[1:]
-        )
     body = f"""<div class="toolbar">
 <span class="group" id="timing-controls" hidden><span class="label">Show</span>
 <span class="seg" id="timing" role="group" aria-label="Timing">
@@ -148,7 +184,6 @@ Critical path</button>
 </div>
 <div class="legend" id="legend"></div>
 <div class="path" id="path" hidden></div>
-<p class="hint">{hint}</p>
 <div id="views"></div>
 <details class="about"><summary>What am I looking at?</summary><ul>{notes_html}</ul></details>
 <div id="tip" role="status" hidden></div>"""
