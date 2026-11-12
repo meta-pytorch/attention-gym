@@ -3551,7 +3551,10 @@ def test_short_conv_decode_compile_ignores_the_time_tile():
     state = torch.randn(3, 3, 64, device="cuda", dtype=x.dtype)
     outputs = [
         causal_conv1d_decode(
-            x, weight, state.clone(), forward_config=ShortConvConfig(64, 2, times_per_block)
+            x,
+            weight,
+            state.clone(),
+            kernel_options={"forward_config": ShortConvConfig(64, 2, times_per_block)},
         )
         for times_per_block in (1, 16, 17)
     ]
