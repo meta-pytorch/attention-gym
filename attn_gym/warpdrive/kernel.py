@@ -18,7 +18,7 @@ import cutlass
 from cutlass import Int32, Uint32, cute, pipeline
 from cutlass._mlir.dialects import llvm
 
-from attn_gym.warpdrive import alias, fences, liveness, tracing
+from attn_gym.warpdrive import alias, fences, liveness, named, ownership, tracing
 from attn_gym.warpdrive.alias import RoleEvents
 from attn_gym.warpdrive.cache._key import canonical_key, module_source_digest
 from attn_gym.warpdrive.channels import (
@@ -53,7 +53,13 @@ from attn_gym.warpdrive.cluster import (
 )
 from attn_gym.warpdrive.compat import SmemAllocator, TmemAllocator
 from attn_gym.warpdrive.describe import KernelChecks, describe_kernel, kernel_checks
-from attn_gym.warpdrive.named import NamedBarrier
+from attn_gym.warpdrive.named import (
+    FIRST_FREE_BARRIER_ID,
+    MAX_NAMED_BARRIER_ID,
+    TMEM_PTR_BARRIER_ID,
+    TMEM_TEARDOWN_BARRIER_ID,
+    NamedBarrier,
+)
 from attn_gym.warpdrive.protocol import (
     ProtocolError,
     ProtocolLog,
@@ -84,13 +90,6 @@ WARPGROUP = 4
 REGS_PER_SM = 65536
 MIN_REGS = 24  # setmaxnreg floor: the budget of a warpgroup no role owns
 MAX_WARPS = 32  # CUDA's 1024-thread block limit
-# Named barrier ids owned by the layer; user code must not reuse them.
-TMEM_PTR_BARRIER_ID = 1
-TMEM_TEARDOWN_BARRIER_ID = 2
-# Named-barrier channels take IDs from the top down and declared NamedBarriers from the bottom
-# up, so adding a NamedBarrier leaves every channel's IDs where they were.
-FIRST_FREE_BARRIER_ID = 3
-MAX_NAMED_BARRIER_ID = 15
 
 
 # --------------------------------------------------------------------------- #
@@ -429,7 +428,8 @@ _HOST_SETTINGS = (
 )
 _COLLECTED_SETTINGS = ("cluster", "trace_protocol")
 # Trace results for describe(), pipeline plans and trace-time warnings.
-# __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes.
+# __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes;
+# _reset_trace gives each its empty value.
 _TRACE_RESULTS = (
     "_ws_tma",
     "_ws_smem",
@@ -686,18 +686,34 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_chans, self._ws_turns, self._ws_roles = chans, turns, roles
         self._ws_raw_bars = raw_bars
         self._ws_named_bars = named_bars
-        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item, traced
-        self._ws_trace_tags = []  # globaltimer range names, traced
-        self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}, traced
-        self._ws_ownership = {}  # owned-epoch channel -> epoch-ownership verdict, traced
         self._ws_streams = streams
+        self._reset_trace()
+
+    def _reset_trace(self):
+        """Clear trace state so a failed retrace cannot expose an earlier trace's reports.
+
+        This is the only reset, called at collection and the start of ``begin_roles``.
+        ``_ws_traced`` stays false until ``_finish_trace`` or ``__cute_restore_trace__`` marks
+        the reports ready.
+        """
+        self._ws_traced = False
+        # Results, saved and restored by cached builds (_TRACE_RESULTS).
         self._ws_tma = {}  # channel name -> tma.TmaReport, filled while tracing
         self._ws_smem = {}  # SmemPlan buffer name -> storage.ResolvedBuffer, after begin_roles
         self._ws_alias = None  # alias.AliasReport, after a trace
-        self._ws_liveness = None  # liveness.Liveness, after a trace
         self._ws_fences = None  # fences.FenceReport, after a trace
         self._ws_opt_outs = []
+        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
+        self._ws_named_users = {}  # NamedBarrier name -> {"sync"/"arrive": role names}
+        self._ws_ownership = {}  # owned-epoch channel -> epoch-ownership verdict
+        self._ws_liveness = None  # liveness.Liveness, after a trace
+        self._ws_trace_tags = []  # globaltimer range names
+        # The protocol log is not saved: a cached build has none (trace_key).
         self._ws_log = ProtocolLog() if self.trace_protocol else None
+        # What a trace records for _finish_trace's checks.
+        self._ws_role_events = []  # RoleEvents of every dispatched role
+        self._ws_epoch_seqs = {}  # (owned-epoch channel, role) -> RoleTrace.epoch_sequence
+        self._ws_raw_barrier_access = ""
 
     @staticmethod
     def _bind_stream(name: str, st: WorkStream, roles: list, chans: dict, cluster):
@@ -1258,6 +1274,13 @@ class WarpSpecialized(metaclass=_KernelType):
         Plain Python at trace time; only barrier initialization is a device-side branch.
         """
         self._collect()
+        self._reset_trace()
+        # Trace state outside this kernel: process-wide recorders and flags on its declarations.
+        # Collection may run inside another kernel's trace, so _reset_trace leaves these alone.
+        take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
+        for nb in self._ws_named_bars.values():  # count only this trace's native ID reads
+            nb._native_outside_roles = False
+        clear_multicast_masks()
         if set(problems) != set(self._ws_streams):
             raise ProtocolError(
                 f"begin_roles needs a problem for each WorkStream {sorted(self._ws_streams)}, "
@@ -1266,15 +1289,6 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_problems = problems
         for problem in problems.values():
             problem.start()  # per-CTA start values, computed once ahead of role dispatch
-        self._ws_tma = {}
-        self._ws_role_events = []  # RoleEvents of every dispatched role
-        self._ws_raw_barrier_access = ""
-        self._ws_uses = {}  # (role, channel) -> acquires/waits per work item (0: inner loop)
-        self._ws_epoch_seqs = {}  # (owned-epoch channel, role) -> RoleTrace.epoch_sequence
-        take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
-        for nb in self._ws_named_bars.values():  # count only this trace's native ID reads
-            nb._native_outside_roles = False
-        clear_multicast_masks()
         smem = SmemAllocator()
         plan, total = self._barrier_plan()
         bars = smem.allocate_array(cutlass.Int64, max(total, 1))
@@ -1344,7 +1358,6 @@ class WarpSpecialized(metaclass=_KernelType):
                 f"begin_roles(layouts=...) needs a layout for each smem_plan buffer "
                 f"{sorted(buffers)}, got {sorted(layouts)}"
             )
-        self._ws_smem = {}
         for buf in buffers.values():
             self._ws_smem[buf.name] = allocate(smem, buf, layouts[buf.name], self._ws_smem)
         for name, ch in self._ws_chans.items():
@@ -1450,7 +1463,6 @@ class WarpSpecialized(metaclass=_KernelType):
     def _start_trace(self, buffer):
         """Kernel-wide trace state that makes each role's ranges: ``tracing.GlobaltimerTrace``
         (device code computes this CTA's unit), ``IketTrace``, or None when tracing is off."""
-        self._ws_trace_tags = []
         if self.trace_backend is None:
             return None
         if self.trace_backend == "iket":
@@ -1497,16 +1509,14 @@ class WarpSpecialized(metaclass=_KernelType):
     def _finish_trace(self):
         """Collect opt-outs and check reports, then report findings."""
         self._ws_opt_outs = take_opt_outs()
-        self._check_named_barriers()
-        self._check_ownership()
+        self._ws_named_users = named.check(self, self._ws_role_events)
+        self._ws_ownership = ownership.check(self, self._ws_epoch_seqs)
         if self.liveness_check not in liveness.MODES:
             raise ValueError(
                 f"liveness_check must be one of {liveness.MODES}, got {self.liveness_check!r}"
             )
-        self._ws_liveness = None
         if self.liveness_check != "off":
             self._ws_liveness = liveness.check(self, self._ws_role_events)
-        self._ws_alias = self._ws_fences = None
         if self.alias_check not in alias.MODES:
             raise ValueError(f"alias_check must be one of {alias.MODES}, got {self.alias_check!r}")
         if self.alias_check != "off":
@@ -1521,254 +1531,6 @@ class WarpSpecialized(metaclass=_KernelType):
                     )
         self._ws_traced = True
         self._report_trace()
-
-    def _check_ownership(self):
-        """Verify epoch ownership on channels whose epochs have owners (a round-robin side, or
-        exclusive consumers) and whose acquires, waits and skips are static per work item.
-
-        Every epoch must be filled once and waited by exactly one consumer; the others skip it.
-        Round-robin instance ``j`` of ``k`` takes epochs ``j, j + k, ...``: an owner that skips
-        the other instances' epochs after each of its own. A static violation raises; dynamic
-        sequences stay unverified.
-
-        Also names the first wait whose parity test is exact only behind a rendezvous. A wait
-        of epoch ``e`` is exact once epoch ``e - n`` was filled, which the waiter saw itself
-        only if its previous wait was of epoch ``e - n`` or later
-        (``docs/warpdrive/channels.md``).
-        """
-        persistent = any(st.schedule.persistent for st in self._ws_streams.values())
-        self._ws_ownership = {}
-        for name, ch in self._ws_chans.items():
-            if ch.owned_epochs:
-                self._ws_ownership[name] = self._epoch_ownership(name, ch, persistent)
-
-    def _epoch_ownership(self, name: str, ch, persistent: bool) -> str:
-        """``_check_ownership``'s verdict for one channel."""
-        bound = {"producer": ch.producers, "consumer": ch.consumers}
-        joined = [side for side in SIDES if ch.sharing(side) is Sharing.JOIN]
-        if not joined:
-            return "unverified (both sides take turns)"
-        if len(bound[joined[0]]) != 1:
-            return f"unverified (several joining {joined[0]}s)"
-        names = {side: [ri.name for ri, _ in bound[side]] for side in SIDES}
-        traced = {
-            who: self._ws_epoch_seqs[(name, who)] for who in names["producer"] + names["consumer"]
-        }
-        dynamic = [seq for seq in traced.values() if isinstance(seq, str)]
-        if dynamic:
-            return f"unverified ({dynamic[0]})"
-        if len({per_item for per_item, _ in traced.values()} - {None}) > 1:
-            return "unverified (some roles use it once per work item, others once per launch)"
-        per_item = any(scope for scope, _ in traced.values())
-        unit = "work item" if per_item else "launch"
-        seqs = {who: seq for who, (_, seq) in traced.items()}
-        continues = persistent and per_item  # each end carries on into the next work item
-
-        def walk(side):
-            """(who, first epoch, epochs per acquire/wait) of each instance on ``side``."""
-            k = ch.turns(side)
-            return [(who, j if k > 1 else 0, k) for j, who in enumerate(names[side])]
-
-        # The producers' epochs: a round-robin instance's m-th acquire takes start + m * k.
-        filled, retired, acquired = [], set(), {}
-        for who, start, step in walk("producer"):
-            acquires = [op for op, _ in seqs[who] if op == "acquire"]
-            filled += [(start + m * step, who) for m in range(len(acquires))]
-            # A retired acquire publishes nothing: its epoch has no owner, only skips.
-            retired |= {start + order * step for op, order in seqs[who] if op == "retire"}
-            acquired[who] = (start, step, len(acquires))
-        total = len(filled)
-        fillers = [[] for _ in range(total)]
-        for e, who in filled:
-            if e < total:
-                fillers[e].append(who)
-        producer = " and ".join(names["producer"])
-
-        def verb(word):  # agrees with ``producer``
-            return word if len(names["producer"]) > 1 else f"{word}s"
-
-        gap = next(((e, f) for e, f in enumerate(fillers) if len(f) != 1), None)
-        if gap is not None:  # round-robin producers whose trip counts do not add up
-            e, f = gap
-            who = "no producer" if not f else " and ".join(f)
-            raise ProtocolError(
-                f"channel {name}: epoch {e} of {total} per {unit} is acquired by {who}; "
-                "round-robin producers take epochs j, j + k, ... in turn, so their acquires "
-                "must add up to every epoch once"
-            )
-        if continues:
-            for who, (start, step, count) in acquired.items():
-                if step > 1 and count * step != total:
-                    raise ProtocolError(
-                        f"channel {name}: {who} acquires {count} of the {total} epochs per "
-                        f"{unit}; a round-robin producer continues into the next item, so each "
-                        f"of the {step} instances must take {total} / {step}"
-                    )
-        owners: list[list[str]] = [[] for _ in range(total)]
-        waited = {who: [] for who in names["consumer"]}
-        blind = None  # (consumer, epoch) of the first wait that needs a rendezvous
-        for who, start, step in walk("consumer"):
-            e, seen = start, -1  # the next epoch; the last one this consumer waited for
-            for op, count in seqs[who]:
-                if op == "wait":
-                    if e >= total or e in retired:
-                        raise ProtocolError(
-                            f"channel {name}: {who} waits on epoch {e}, but {producer} "
-                            + (
-                                f"{verb('retire')} it unpublished"
-                                if e in retired
-                                else f"{verb('fill')} only {total} per {unit}"
-                            )
-                        )
-                    owners[e].append(who)
-                    waited[who].append(e)
-                    if e - ch.n > seen and blind is None and not ch.named:
-                        blind = (who, e)
-                    seen = e
-                    e += step
-                else:  # a skip
-                    e += count
-            # The next item's first wait follows this item's last one.
-            mine = waited[who]
-            if continues and mine and mine[0] + total - mine[-1] > ch.n and not ch.named:
-                blind = blind or (who, mine[0] + total)
-            # A persistent role continues into the next item: it must cover every epoch.
-            if (step == 1 and e > total) or (continues and e - start != total):
-                raise ProtocolError(
-                    f"channel {name}: {who} advances {e - start} epochs per {unit} ("
-                    + ("waits and skips" if step == 1 else f"{step} per wait")
-                    + f"), but {producer} {verb('acquire')} {total}"
-                )
-        bad = next(
-            ((e, o) for e, o in enumerate(owners) if len(o) != 1 and e not in retired), None
-        )
-        if bad is not None:
-            e, o = bad
-            who = "no consumer" if not o else " and ".join(o)
-            rule = (
-                "each epoch of an exclusive ring has exactly one owner, which the other "
-                "consumers skip()"
-                if ch.exclusive
-                else "round-robin consumers take epochs j, j + k, ... in turn, so their waits "
-                "must add up to every epoch once"
-                if ch.turns("consumer") > 1
-                else "the consumer must wait for every epoch the round-robin producers fill"
-            )
-            raise ProtocolError(
-                f"channel {name}: epoch {e} of {total} per {unit} is waited by {who}; {rule}"
-            )
-        owned = "producer" if ch.turns("producer") > 1 else "consumer"
-        counts = (
-            {who: count for who, (_, _, count) in acquired.items()}
-            if owned == "producer"
-            else {who: len(mine) for who, mine in waited.items()}
-        )
-        share = ", ".join(f"{who} {count}" for who, count in counts.items())
-        verdict = f"verified: {total - len(retired)} epochs per {unit} ({share})"
-        if blind is not None:
-            who, e = blind
-            verdict += (
-                f"; {who}'s wait of epoch {e} is exact only after epoch {e - ch.n} was "
-                "filled, which it did not observe: order it with a rendezvous"
-            )
-        return verdict
-
-    def _check_named_barriers(self):
-        """Check named-barrier IDs and ``NamedBarrier`` participation after a trace.
-
-        Rejects hand-picked ``alias.named_barrier`` IDs that are out of range or owned by the
-        layer, a named channel, or a ``NamedBarrier``. Records each ``NamedBarrier``'s users
-        (``{"sync"/"arrive"/"native": role names, "unverified": notes}``) and rejects one whose
-        users cannot supply its count in some CTA. Native code that read ``.id`` may supply the
-        rest, so short observed participation in a CTA where such code runs is only
-        unverified; a count above the threads that run in that CTA still raises.
-        """
-        taken = {
-            i: f"channel {name}"
-            for name, ids in self._ws_named.items()
-            for i in (*ids[0], *ids[1])
-        }
-        taken.update({TMEM_PTR_BARRIER_ID: "the layer", TMEM_TEARDOWN_BARRIER_ID: "the layer"})
-        taken.update(
-            {
-                nb._allocated_id(): f"NamedBarrier {name} (call {name}.sync() or {name}.arrive())"
-                for name, nb in self._ws_named_bars.items()
-            }
-        )
-        users = {
-            name: {"sync": [], "arrive": [], "native": [], "unverified": []}
-            for name in self._ws_named_bars
-        }
-        channel_bars = {
-            nb.name: nb
-            for ch in self._ws_chans.values()
-            for nb in (*ch.full_barriers, *ch.empty_barriers)
-        }
-        ops = {"barrier": "sync", "barrier_arrive": "arrive", "barrier_native": "native"}
-        for role_events in self._ws_role_events:
-            for ev in role_events.events:
-                if ev.kind not in ops:
-                    continue
-                if "barrier" in ev.data:  # a NamedBarrier operation or ID read
-                    name = ev.data["barrier"].name
-                    if channel_bars.get(name) is ev.data["barrier"]:
-                        continue  # a named channel's slot: participation is the channel's
-                    if self._ws_named_bars.get(name) is not ev.data["barrier"]:
-                        raise ProtocolError(
-                            f"{role_events.name}: NamedBarrier {name} at {ev.site} belongs to "
-                            "another kernel; declare one on this kernel"
-                        )
-                    op = ops[ev.kind]
-                    if role_events.name not in users[name][op]:
-                        users[name][op].append(role_events.name)
-                    continue
-                barrier_id = ev.data["id"]
-                if barrier_id is None:  # a dynamic ID: not checkable
-                    continue
-                if not 0 <= barrier_id <= MAX_NAMED_BARRIER_ID:
-                    raise ProtocolError(
-                        f"{role_events.name}: named_barrier({barrier_id}) at {ev.site}: barrier "
-                        f"IDs are 0-{MAX_NAMED_BARRIER_ID}"
-                    )
-                if barrier_id in taken:
-                    raise ProtocolError(
-                        f"{role_events.name}: named_barrier({barrier_id}) at {ev.site} uses a "
-                        f"barrier ID owned by {taken[barrier_id]}; pick an unused ID"
-                    )
-        roles = {r.name: r for r in self._ws_roles}
-        for name, nb in self._ws_named_bars.items():
-            used = users[name]
-            outside = nb._native_outside_roles  # kernel code every role's threads may run
-            if outside:
-                used["native"].append("kernel code")
-            used_by = [roles[r] for r in dict.fromkeys(used["sync"] + used["arrive"])]
-            native = [roles[r] for r in used["native"] if r in roles]
-            for rank in range(self.cluster.size):
-                in_rank = [r for r in self._ws_roles if rank in self.cluster.ctas(r.cta)]
-                here = [r for r in used_by if r in in_rank]
-                total = sum(r.num_threads for r in here)
-                where = f" in CTA rank {rank}" if self.cluster.size > 1 else ""
-                if not (outside or any(r in in_rank for r in native)):
-                    if 0 < total < nb.threads:
-                        raise ProtocolError(
-                            f"NamedBarrier {name} counts {nb.threads} threads, but the roles "
-                            f"using it{where} ({', '.join(r.name for r in here)}) have only "
-                            f"{total}; it can never complete"
-                        )
-                    continue
-                # Native callers can be any thread that runs here (a role, or kernel code).
-                runs = self.num_threads if outside else sum(r.num_threads for r in in_rank)
-                if runs < nb.threads:
-                    raise ProtocolError(
-                        f"NamedBarrier {name} counts {nb.threads} threads, but only {runs} run "
-                        f"the roles{where}; it can never complete"
-                    )
-                if total < nb.threads:
-                    used["unverified"].append(
-                        f"roles calling it{where} have {total} of {nb.threads} threads; native "
-                        f"code reading .id ({', '.join(used['native'])}) must supply the rest"
-                    )
-        self._ws_named_users = users
 
     def _report_trace(self):
         """Report findings under each check's mode, after tracing or cache restoration."""
