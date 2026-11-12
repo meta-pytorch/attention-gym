@@ -160,7 +160,10 @@ SCHED_STAGES = 8
 DECAY_STAGES = 2
 INTER_STAGES = 2
 O_STAGES = 2
+# CG1 releases chunk c-1's O accumulator only after staging Y(c), while the MMA warp claims
+# chunk c's slot before KS/QS/U(c): with one slot that would cycle, so keep two or more.
 QS_STAGES = 2
+assert QS_STAGES >= 2, "CG1's late o_acc release needs two O accumulator slots"
 
 # TMEM state handoffs (``tstate`` barriers, upstream counts), each completing once per epoch:
 #   SIN_L  left key half of the fp16 state operand: CG0 instance (chunks after an item's first),
@@ -307,8 +310,15 @@ class KdaPrefill(WarpSpecialized):
             commit_fence=smem_commit,
             buffer={"Qdecay": buf["Qdecay"], "Krestore": buf["Krestore"]},
         )
-        self.tinv = Ring(INTER_STAGES, Warps, Umma, commit_fence=smem_commit, buffer=buf["Tinv"])
-        self.a = Ring(INTER_STAGES, Warps, Umma, commit_fence=smem_commit, buffer=buf["A"])
+        # The MMA warp spins on the single-warp T_inv / A handoffs, as upstream does: a suspended
+        # T_inv wait delayed U on the per-chunk recurrence (0.9% at d128). Spinning o_acc too
+        # (CG1's four warps) cost more issue slots than it saved.
+        self.tinv = Ring(
+            INTER_STAGES, Warps, Umma, commit_fence=smem_commit, buffer=buf["Tinv"], wait="spin"
+        )
+        self.a = Ring(
+            INTER_STAGES, Warps, Umma, commit_fence=smem_commit, buffer=buf["A"], wait="spin"
+        )
         self.o_smem = Ring(O_STAGES, Warps, Warps, commit_fence=smem_commit, buffer=buf["O"])
         self.o_acc = Ring(QS_STAGES, Umma, Warps)
         # The TMEM state recurrence (upstream protocol): signal-only barriers whose stage reuse
@@ -1239,8 +1249,6 @@ class KdaPrefill(WarpSpecialized):
                 [scaled[i] for i in range(d_k // 4)],
             )
         self.stage_o(params, oh, o_lo, o_hi, ov_lo, ov_hi, active)
-        oh.commit()
-        oa.release()
         # ---- Y = beta (V - K_decay S), U -------------------------------------------------------
         v_lo, v_hi = self.load_v(params, stage, geo, chunk_start, seqlen)
         s_beta = params.s_beta + stage * (B_T * 4)
@@ -1261,6 +1269,11 @@ class KdaPrefill(WarpSpecialized):
             if cutlass.const_expr(self.d_v == 128):
                 y_hi[r] = beta_residual(v_hi[r], b0, b1, ks_hi[2 * r], ks_hi[2 * r + 1], io, True)
         self.stage_y(tstate, geo, y_lo, y_hi)
+        # Publish the staged O only now: its smem_async commit fence (MEMBAR.ALL.CTA) stalls the
+        # warp, which between SIN_R and Y lay on the per-chunk recurrence; here it overlaps the
+        # U wait (0.9% at d128, 3% at d64). Needs QS_STAGES >= 2 (see its declaration).
+        oh.commit()
+        oa.release()
         n_u = self.stage_u(tstate, n_u, geo)
         raw_beta_release(raw, beta, stage)
         eh.release(signal=False)  # signal-only channel (see __init__)
@@ -1390,6 +1403,10 @@ class KdaPrefill(WarpSpecialized):
         kd_offs = [opaque_i32(swz128(kd_row, kd_row * 64 + i * 16 + kd_col)) for i in range(4)]
         row_lo = lane // 4
         row_hi = row_lo + 8
+        # Kept in registers: otherwise ptxas rematerializes the lane id (S2R) in the chunk loop
+        # in front of the beta loads, and the T_inv chain, on the d128 critical path, waits.
+        beta_lo_off = opaque_i32(4 * row_lo)
+        beta_hi_off = opaque_i32(4 * row_hi)
         while work.valid:
             unit, _, _ = work.item
             total = params.work_count[0]
@@ -1412,8 +1429,8 @@ class KdaPrefill(WarpSpecialized):
                     bh = beta.wait()
                     bh.access(read=True, by="threads")
                     s_beta = params.s_beta + bh.index * (B_T * 4)
-                    beta_lo = lds_f32(s_beta + 4 * row_lo)
-                    beta_hi = lds_f32(s_beta + 4 * row_hi)
+                    beta_lo = lds_f32(s_beta + beta_lo_off)
+                    beta_hi = lds_f32(s_beta + beta_hi_off)
                     l_regs = cute.make_rmem_tensor((8,), Float32)
                     for i in cutlass.range_constexpr(8):
                         r = row_hi if cutlass.const_expr(i % 4 >= 2) else row_lo
