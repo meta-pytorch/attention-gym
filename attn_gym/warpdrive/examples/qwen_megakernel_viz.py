@@ -22,7 +22,7 @@ launch (``qwen_megakernel_trace``)::
 Draw it::
 
     python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html \\
-        [--ctas 152] [--splits 16] [--timeline capture.json]
+        [--model Qwen/Qwen3-32B] [--ctas 152] [--splits 16] [--timeline capture.json]
 """
 
 import argparse
@@ -30,9 +30,10 @@ import json
 from pathlib import Path
 
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples.qwen_megakernel_trace import item_ranges
+from attn_gym.warpdrive.examples.qwen_megakernel_ref import QwenConfig
 from attn_gym.warpdrive.profiler import Range
 from attn_gym.warpdrive.schedule_html import Item, schedule_html
+from attn_gym.warpdrive.trace_session import work_item_spans
 
 
 def critical_path(pred: list[mk.RowSpan]) -> list[int]:
@@ -62,10 +63,18 @@ def _label(words, deps, table_row: int) -> str:
     return f"{what}\nwaits for: {waits}\ntable row {table_row}"
 
 
-def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -> str:
-    op = mk.QwenDecodeMegakernel(splits=splits)
+def megakernel_view(
+    ctas: int,
+    splits: int | None = None,
+    measured: dict | None = None,
+    model: QwenConfig = mk.QWEN3_0_6B,
+    name: str = "Qwen3-0.6B",
+) -> str:
+    op = mk.QwenDecodeMegakernel(splits=splits, model=model)
+    splits = op.splits
     rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
-    pred = mk.list_schedule(rows, ctas)
+    cost = mk.row_cost(op)
+    pred = mk.list_schedule(rows, ctas, cost)
     by_cta: list[list[int]] = [[] for _ in range(ctas)]
     for i, p in enumerate(pred):
         by_cta[p.cta].append(i)
@@ -82,7 +91,7 @@ def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -
         Item(
             _label(words, deps, t),
             mk.OP_NAMES[words[0]],
-            shade=words[1] / (mk.LAYERS - 1) if words[0] != mk.LMHEAD else 0.0,
+            shade=words[1] / (op.layers - 1) if words[0] != mk.LMHEAD else 0.0,
             start=pred[i].start,
             end=pred[i].end,
             deps=pred[i].gates,
@@ -102,64 +111,65 @@ def megakernel_view(ctas: int, splits: int = 16, measured: dict | None = None) -
                 )
         spans = {table_row[t]: (cta, s, e) for t, cta, s, e in measured["spans"]}
     path = critical_path(pred)
-    makespan = max(p.end for p in pred)
     return schedule_html(
-        f"Qwen3-0.6B decode megakernel: {len(rows)} rows on {ctas} CTAs",
-        f"{op.work.describe()} · splits {splits} · predicted makespan {makespan:.1f} us",
+        f"{name} decode step",
+        f"{len(rows):,} work items · {ctas} CTAs · {splits} KV splits",
         items,
         by_cta,
         critical=path,
         measured=spans,
         kinds=mk.OP_NAMES,
         notes=[
-            "Predicted spans are list_schedule's model: ROW_COST "
-            + ", ".join(f"{mk.OP_NAMES[k]} {c} us" for k, c in mk.ROW_COST.items())
-            + f", plus {mk.DEPENDENCY_LATENCY} us per producer group. Illustrative, not "
-            "measured.",
             (
-                "Arrows on hover: the last row of each producer group the row waits for (the one "
-                "that gates it in the model). Critical path: rows that each set the next's start."
+                "Colours are operations; lighter shades are later layers. Arrows on hover point "
+                "to the items it waits for."
             ),
-            (
-                "Shade: layer (darker = earlier). CTA rows are WorkStream.assignment over the "
-                "[slot][cta] table, as StaticPersistent runs them."
-            ),
-            *(
-                [f"Measured overlay: {len(spans)} spans from the --timeline capture."]
-                if spans
-                else []
-            ),
+            "Predicted cost per item (us): "
+            + ", ".join(f"{mk.OP_NAMES[k]} {c:.1f}" for k, c in cost.items())
+            + f", plus {mk.DEPENDENCY_LATENCY:g} us per dependency.",
         ],
     )
 
 
 def overlay(ranges: list[Range], runner: mk.QwenMegakernel) -> dict:
     """The ``--timeline`` JSON of one traced launch: each table row's compute work item on its
-    CTA, in us from the earliest start."""
-    items = sorted(item_ranges(ranges).items())
-    if not items:
-        raise ValueError(
-            "no compute work-item ranges: trace a launch of a trace='globaltimer' runner"
-        )
-    t0 = min(e.start_ns for _, e in items)
-    spans = [[row, e.cta[0], (e.start_ns - t0) / 1e3, (e.end_ns - t0) / 1e3] for row, e in items]
+    CTA, in us from the earliest start, with the table's CTA and split counts."""
+    spans = work_item_spans(ranges, "compute")
     return {"unit": "us", "ctas": runner.max_ctas, "splits": runner.op.splits, "spans": spans}
+
+
+def load_config(path_or_repo: str) -> QwenConfig:
+    """The shape in a checkpoint's ``config.json``: a directory, or a Hub repo (fetches only
+    that file)."""
+    path = Path(path_or_repo) / "config.json"
+    if not path.is_file():
+        from huggingface_hub import hf_hub_download
+
+        path = Path(hf_hub_download(path_or_repo, "config.json"))
+    return QwenConfig.from_hf(json.loads(path.read_text()))
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out", type=Path)
     parser.add_argument("--ctas", type=int, default=152, help="resident CTAs (GB300: 152 SMs)")
-    parser.add_argument("--splits", type=int, default=16)
+    parser.add_argument("--splits", type=int, help="KV splits (default: the kernel's)")
+    parser.add_argument(
+        "--model", default="Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory (its config)"
+    )
     parser.add_argument("--timeline", type=Path, help="measured spans (see the docstring)")
     args = parser.parse_args()
+    model = load_config(args.model)
+    if args.splits is None:
+        args.splits = mk.QwenDecodeMegakernel(model=model).splits
     measured = json.loads(args.timeline.read_text()) if args.timeline else None
     for key in ("ctas", "splits"):  # the capture must be of the drawn table
         if measured and measured.get(key, getattr(args, key)) != getattr(args, key):
             parser.error(
                 f"the capture ran with {key} = {measured[key]}; pass --{key} {measured[key]}"
             )
-    args.out.write_text(megakernel_view(args.ctas, args.splits, measured))
+    name = Path(args.model).name
+    args.out.write_text(megakernel_view(args.ctas, args.splits, measured, model, name))
     print(args.out)
 
 

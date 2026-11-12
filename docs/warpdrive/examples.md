@@ -15,7 +15,7 @@ PyTorch or FA4 feature.
 | Study attention backward and overlapping lifetimes | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
-| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-06b-decode-megakernel) |
+| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -460,7 +460,7 @@ With split rings, V-stage reuse waits on the previous PV before the loader reach
 The shared ring lets V reuse K stages that QK already released. Compare with `--shared-kv`;
 the shape determines whether that reuse helps.
 
-## Qwen3-0.6B decode megakernel
+## Qwen3 decode megakernel
 
 ```python
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
@@ -491,10 +491,32 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 
 | Input | Contract |
 |---|---|
-| Model | Qwen3-0.6B shapes, bf16 weights, batch 1, one token per launch |
-| Caches | Contiguous bf16 `(28, 8, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
+| Model | Dense Qwen3: 0.6B, 1.7B, 8B, 14B and 32B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
+| Caches | Contiguous bf16 `(layers, kv_heads, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
 | GPU | SM100 family; one CTA per SM, cooperative launch |
-| Not supported | Batch > 1, prefill, paging, other model shapes |
+| Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models |
+
+The table above shows 0.6B's counts. Larger models change only the counts: an attention row
+serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj split covers a
+quarter of the q heads, the residual polls run 8 elements per thread at a time, the ring keeps
+as many 16 KB stages as fit (11 for 32B), and the default KV split count targets about 128
+attention rows per layer (16 for 0.6B and 1.7B, 8 above).
+
+Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `bench_qwen_megakernel`;
+"roofline" is the logical bytes per step at the measured 6.2 TB/s read bandwidth, so above
+100% means L2 hits):
+
+| model | ctx | `torch.compile` + graph | megakernel | speedup | roofline / megakernel |
+|---|---:|---:|---:|---:|---:|
+| 0.6B | 1024 / 8192 | 1327 / 1451 | 465 / 645 | 2.85x / 2.25x | 45% / 53% |
+| 1.7B | 1024 / 8192 | 1693 / 1819 | 887 / 1061 | 1.91x / 1.71x | 64% / 66% |
+| 8B | 1024 / 8192 | 3858 / 4011 | 2949 / 3368 | 1.31x / 1.19x | 90% / 84% |
+| 14B | 1024 / 8192 | 5918 / 6106 | 4760 / 5634 | 1.24x / 1.08x | 101% / 88% |
+| 32B | 1024 / 8192 | 12849 / 13101 | 10650 / 12035 | 1.21x / 1.09x | 99% / 91% |
+
+The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
+dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
+which varies about 5x across prompts on the deep models.
 
 <details markdown="1">
 <summary>How the megakernel runs the model</summary>

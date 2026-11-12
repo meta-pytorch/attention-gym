@@ -1,11 +1,12 @@
-"""Batch-one Qwen3-0.6B decode oracle with HF's bf16 rounding boundaries.
+"""Batch-one Qwen3 decode oracle with HF's bf16 rounding boundaries.
 
 Torch only; no CuTeDSL. Caches are (layer, kv_head, position, head_dim), keys stored after
 head RMSNorm and rotate-half RoPE. Positions are Python ints (torch.compile specializes on
 them); tokens are scalar tensors.
 """
 
-from dataclasses import dataclass, fields, replace
+import json
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
@@ -14,6 +15,8 @@ import torch.nn.functional as F
 
 @dataclass(frozen=True)
 class QwenConfig:
+    """A dense Qwen3 shape; the defaults are Qwen3-0.6B's."""
+
     hidden_size: int = 1024
     num_layers: int = 28
     num_q_heads: int = 16
@@ -23,6 +26,37 @@ class QwenConfig:
     vocab_size: int = 151936
     rms_eps: float = 1e-6
     rope_theta: float = 1e6
+
+    @classmethod
+    def from_hf(cls, config: dict) -> "QwenConfig":
+        """The shape of an HF ``config.json``."""
+        return cls(
+            hidden_size=config["hidden_size"],
+            num_layers=config["num_hidden_layers"],
+            num_q_heads=config["num_attention_heads"],
+            num_kv_heads=config["num_key_value_heads"],
+            head_dim=config["head_dim"],
+            intermediate_size=config["intermediate_size"],
+            vocab_size=config["vocab_size"],
+            rms_eps=config["rms_norm_eps"],
+            rope_theta=config["rope_theta"],
+        )
+
+
+# QwenWeights' per-layer fields and their checkpoint names, model.layers.<i>.<name>.weight.
+LAYER_TENSORS = {
+    "input_ln": "input_layernorm",
+    "q_proj": "self_attn.q_proj",
+    "k_proj": "self_attn.k_proj",
+    "v_proj": "self_attn.v_proj",
+    "q_norm": "self_attn.q_norm",
+    "k_norm": "self_attn.k_norm",
+    "o_proj": "self_attn.o_proj",
+    "post_ln": "post_attention_layernorm",
+    "gate": "mlp.gate_proj",
+    "up": "mlp.up_proj",
+    "down": "mlp.down_proj",
+}
 
 
 @dataclass(frozen=True)
@@ -42,63 +76,59 @@ class QwenWeights:
     up: torch.Tensor
     down: torch.Tensor
     final_norm: torch.Tensor
+    untied_lm_head: torch.Tensor | None = None  # None: the LM head is the embedding
     config: QwenConfig = QwenConfig()
 
     @property
     def lm_head(self) -> torch.Tensor:
-        return self.embed
+        return self.embed if self.untied_lm_head is None else self.untied_lm_head
 
-    def to(self, dtype: torch.dtype) -> "QwenWeights":
-        return replace(
-            self,
-            **{
-                field.name: getattr(self, field.name).to(dtype)
-                for field in fields(self)
-                if field.name != "config"
-            },
-        )
+    def tensors(self) -> dict[str, torch.Tensor]:
+        """The checkpoint tensors by field name."""
+        return {
+            field.name: getattr(self, field.name)
+            for field in fields(self)
+            if isinstance(getattr(self, field.name), torch.Tensor)
+        }
 
 
 def load_qwen3_weights(
     path_or_repo: str = "Qwen/Qwen3-0.6B", device: str | torch.device = "cuda"
 ) -> QwenWeights:
-    """Load the single-file Qwen3-0.6B safetensors checkpoint (a path or a Hub repo)."""
+    """Load a Qwen3 safetensors checkpoint, single-file or sharded, with its ``config.json``:
+    a Hub repo, a checkpoint directory, or a file inside one."""
     # Optional dependencies: importing the oracle needs only torch.
-    from huggingface_hub import hf_hub_download
+    from huggingface_hub import snapshot_download
     from safetensors.torch import load_file
 
     checkpoint = Path(path_or_repo)
-    if checkpoint.is_dir():
-        checkpoint = checkpoint / "model.safetensors"
-    elif not checkpoint.is_file():
-        checkpoint = Path(hf_hub_download(path_or_repo, "model.safetensors"))
-    tensors = load_file(str(checkpoint), device=str(device))
-    config = QwenConfig()
-    layer_names = {
-        "input_ln": "input_layernorm",
-        "q_proj": "self_attn.q_proj",
-        "k_proj": "self_attn.k_proj",
-        "v_proj": "self_attn.v_proj",
-        "q_norm": "self_attn.q_norm",
-        "k_norm": "self_attn.k_norm",
-        "o_proj": "self_attn.o_proj",
-        "post_ln": "post_attention_layernorm",
-        "gate": "mlp.gate_proj",
-        "up": "mlp.up_proj",
-        "down": "mlp.down_proj",
-    }
+    if checkpoint.is_file():
+        checkpoint = checkpoint.parent
+    elif not checkpoint.is_dir():
+        checkpoint = Path(
+            snapshot_download(path_or_repo, allow_patterns=["*.json", "*.safetensors"])
+        )
+    tensors = {}
+    for shard in sorted(checkpoint.glob("*.safetensors")):
+        tensors.update(load_file(str(shard), device=str(device)))
+    hf_config = json.loads((checkpoint / "config.json").read_text())
+    config = QwenConfig.from_hf(hf_config)
+    # Pop each layer's tensor as it is stacked: loading peaks near one model, not two.
     stacked = {
         name: torch.stack(
             [
-                tensors[f"model.layers.{layer}.{suffix}.weight"]
+                tensors.pop(f"model.layers.{layer}.{suffix}.weight")
                 for layer in range(config.num_layers)
             ]
         ).to(torch.bfloat16)
-        for name, suffix in layer_names.items()
+        for name, suffix in LAYER_TENSORS.items()
     }
+    tied = hf_config.get("tie_word_embeddings", False)
     return QwenWeights(
         embed=tensors["model.embed_tokens.weight"].to(torch.bfloat16),
         final_norm=tensors["model.norm.weight"].to(torch.bfloat16),
+        untied_lm_head=None if tied else tensors["lm_head.weight"].to(torch.bfloat16),
+        config=config,
         **stacked,
     )
 
@@ -121,6 +151,14 @@ def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     return x * cos + rotated * sin
 
 
+def rope_angles(config: QwenConfig, positions: torch.Tensor) -> torch.Tensor:
+    """fp32 rotate-half RoPE angles, (len(positions), head_dim), for fp32 ``positions``."""
+    exponents = torch.arange(0, config.head_dim, 2, device=positions.device).float()
+    inv_freq = 1.0 / (config.rope_theta ** (exponents / config.head_dim))
+    freqs = positions[:, None] * inv_freq[None, :]
+    return torch.cat((freqs, freqs), dim=-1)
+
+
 def forward_tokens(
     weights: QwenWeights,
     tokens: torch.Tensor,
@@ -133,32 +171,30 @@ def forward_tokens(
 ) -> torch.Tensor:
     """Prefill or decode; returns the last token's fp32 logits.
 
-    ``dtype`` is the activation dtype; pass ``weights.to(dtype)``. Caches of that dtype give a
-    fully upcast oracle; bf16 caches with upcast weights score one step on exactly the
-    megakernel's quantized cache inputs.
+    ``dtype`` is the activation dtype; weights are upcast to it a layer at a time (exactly,
+    from bf16). Caches of that dtype give a fully upcast oracle; bf16 caches score one step on
+    exactly the megakernel's quantized cache inputs.
     """
     config = weights.config
     count = tokens.numel()
     x = F.embedding(tokens.reshape(-1), weights.embed).to(dtype)
     positions = torch.arange(pos, pos + count, device=x.device, dtype=torch.float32)
-    inv_freq = 1.0 / (
-        config.rope_theta
-        ** (torch.arange(0, config.head_dim, 2, device=x.device).float() / config.head_dim)
-    )
-    freqs = positions[:, None] * inv_freq[None, :]
-    angles = torch.cat((freqs, freqs), dim=-1)
+    angles = rope_angles(config, positions)
     cos, sin = angles.cos().to(dtype)[:, None, :], angles.sin().to(dtype)[:, None, :]
+    group = config.num_q_heads // config.num_kv_heads  # q heads per kv head
     for layer in range(config.num_layers):
-        norm = rms_norm(x, weights.input_ln[layer], config.rms_eps)
-        q = F.linear(norm, weights.q_proj[layer]).view(count, config.num_q_heads, config.head_dim)
-        k = F.linear(norm, weights.k_proj[layer]).view(count, config.num_kv_heads, config.head_dim)
-        v = F.linear(norm, weights.v_proj[layer]).view(count, config.num_kv_heads, config.head_dim)
-        q = rope(rms_norm(q, weights.q_norm[layer], config.rms_eps), cos, sin).transpose(0, 1)
-        k = rope(rms_norm(k, weights.k_norm[layer], config.rms_eps), cos, sin).transpose(0, 1)
+        # Upcast one layer at a time: an fp32 oracle of a 32B model fits beside its bf16 weights.
+        w = {name: getattr(weights, name)[layer].to(dtype) for name in LAYER_TENSORS}
+        norm = rms_norm(x, w["input_ln"], config.rms_eps)
+        q = F.linear(norm, w["q_proj"]).view(count, config.num_q_heads, config.head_dim)
+        k = F.linear(norm, w["k_proj"]).view(count, config.num_kv_heads, config.head_dim)
+        v = F.linear(norm, w["v_proj"]).view(count, config.num_kv_heads, config.head_dim)
+        q = rope(rms_norm(q, w["q_norm"], config.rms_eps), cos, sin).transpose(0, 1)
+        k = rope(rms_norm(k, w["k_norm"], config.rms_eps), cos, sin).transpose(0, 1)
         k_cache[layer, :, pos : pos + count].copy_(k)
         v_cache[layer, :, pos : pos + count].copy_(v.transpose(0, 1))
-        keys = k_cache[layer, :, : pos + count].to(dtype).repeat_interleave(2, dim=0)
-        values = v_cache[layer, :, : pos + count].to(dtype).repeat_interleave(2, dim=0)
+        keys = k_cache[layer, :, : pos + count].to(dtype).repeat_interleave(group, dim=0)
+        values = v_cache[layer, :, : pos + count].to(dtype).repeat_interleave(group, dim=0)
         outputs = []
         for start in range(0, count, query_chunk):
             end = min(start + query_chunk, count)
@@ -171,12 +207,12 @@ def forward_tokens(
             probs = F.softmax(scores, dim=-1, dtype=softmax_dtype).to(dtype)
             outputs.append(probs @ values)
         attention = torch.cat(outputs, dim=1).transpose(0, 1).reshape(count, -1)
-        x = x + F.linear(attention, weights.o_proj[layer])
-        norm = rms_norm(x, weights.post_ln[layer], config.rms_eps)
-        mlp = F.silu(F.linear(norm, weights.gate[layer])) * F.linear(norm, weights.up[layer])
-        x = x + F.linear(mlp, weights.down[layer])
-    x = rms_norm(x[-1:], weights.final_norm, config.rms_eps)
-    return F.linear(x, weights.lm_head).reshape(-1).float()
+        x = x + F.linear(attention, w["o_proj"])
+        norm = rms_norm(x, w["post_ln"], config.rms_eps)
+        mlp = F.silu(F.linear(norm, w["gate"])) * F.linear(norm, w["up"])
+        x = x + F.linear(mlp, w["down"])
+    x = rms_norm(x[-1:], weights.final_norm.to(dtype), config.rms_eps)
+    return F.linear(x, weights.lm_head.to(dtype)).reshape(-1).float()
 
 
 @torch.no_grad()
