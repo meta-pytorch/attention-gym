@@ -53,12 +53,11 @@ Roles and channels (8 warps)::
     compute      --ckpt: 1 x fp16 state-->      store (7): TMA store to checkpoints
 
 Each chunk's GEMMs and compute steps form one serial chain (KV -> restage -> KS -> Y -> U ->
-dU -> KV), and the kernel's speed is that chain's latency. Upstream signals each step one way
-(the reverse ordering follows from the next step); here every TMEM handoff is a one-stage ring
-whose free slot was released by a step that already completed, so each side probes the slot
-(``try_acquire``) while it waits for something else, and the compute group releases ``ks``,
-``u`` and ``v`` at the end of the chunk, off the chain. The decay factors are computed after
-``y`` is published so they fill the U GEMM's latency, as upstream's schedule does.
+dU -> KV), and the kernel's speed is that chain's latency. The six TMEM handoffs use one-way
+``sig`` barriers: each region is reused only after a later handoff in that same chain (see
+``SIGNALS`` for the ordering arguments). A second full/empty handshake adds latency without
+adding ordering. The decay factors are computed after ``y`` is published so they fill the U
+GEMM's latency, as upstream's schedule does.
 
 Upstream's table invariant holds: an item with ``write_start > 0`` has ``compute_start <
 write_start`` (the split tables' warmups are at least one chunk); otherwise its first checkpoint
@@ -75,6 +74,7 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync
 
 from attn_gym.warpdrive import (
+    Barriers,
     Consumer,
     Local,
     OneShot,
@@ -97,6 +97,8 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
+from attn_gym.warpdrive.protocol import current_trace
+from attn_gym.warpdrive.tracing import wait_range
 
 from .contract import tma_divisibility
 from .ptx import (
@@ -134,6 +136,45 @@ V_STAGES = 2
 TINV_STAGES = 3
 GATE_STAGES = 3
 SCHED_STAGES = 2
+
+# Producer -> consumer, with the later handoff that licenses reuse:
+#   state_in: compute -> MMA. Restaged after the previous KV completes, hence after KS read it.
+#   y: compute -> MMA. Rewritten after the previous KV, which follows U reading Y.
+#   du: compute -> MMA. Rewritten after the previous KV reading dU completes.
+#   ks: MMA -> compute. Rewritten after the next state_in, published after compute read KS
+#       and completed Y -> U -> dU -> KV -> state for the previous chunk.
+#   u: MMA -> compute. Rewritten after the next y, whose publication follows that same chain.
+#   state: MMA -> compute. Rescaled/restaged after KV completion; the next KV waits for du,
+#       published after the rescale's TMEM-store fence.
+# KS/U loads precede the same warp's Y/dU TMEM stores; the tcgen05.ld -> st pipeline and the
+# wait::st before publication order those reads before the accumulators are reused (a register
+# dependency alone would not order memory). No separate tcgen05.wait::ld belongs on this chain;
+# a path that publishes without those stores and their wait cannot reuse this argument.
+# Each item's final state wait drains KV before the next item can seed or reuse any columns.
+# Parities belong to the physical CTA and carry across items, including conditional KS steps.
+SIGNALS = (("state_in", 128), ("y", 128), ("du", 128), ("ks", 1), ("u", 1), ("state", 1))
+SIG = {name: i for i, (name, _) in enumerate(SIGNALS)}
+
+
+@cute.jit
+def _wait(bars, phases, name: cutlass.Constexpr[str]):
+    """Wait on one recurrence signal and flip only its parity, with a measured wait range."""
+    i = SIG[name]
+    with wait_range(current_trace(), f"{name}.wait"):
+        cute.arch.mbarrier_wait(bars + i, Int32((phases >> i) & 1))
+    return phases ^ Int32(1 << i)
+
+
+@cute.jit
+def _arrive(bars, name: cutlass.Constexpr[str]):
+    cute.arch.mbarrier_arrive(bars + SIG[name])
+
+
+@cute.jit
+def _commit(bars, name: cutlass.Constexpr[str]):
+    with cute.arch.elect_one():
+        cute.nvgpu.tcgen05.commit(bars + SIG[name])
+
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
 _IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
@@ -211,23 +252,9 @@ class GdnRecompute(WarpSpecialized):
         self.v = Ring(V_STAGES, Tma(self.v_stage_bytes), Threads, buffer=v_buf)
         self.sched = Ring(SCHED_STAGES, Warps, Warps, payload=(Int32, (1,)))
         self.gate = Ring(GATE_STAGES, Threads, Threads, payload=(Float32, (B_T, 2)))
-        # TMEM handoffs between the compute group and the MMA warp. ``state_in``, ``y`` and
-        # ``du`` are the A operands of the KS, U and KV GEMMs; ``ks`` and ``u`` their
-        # accumulators (upstream shares one TMEM region; separate ones keep the releases off
-        # the chain).
-        self.state_in = Ring(1, Threads, Umma, commit_fence="tmem_store")
-        self.y = Ring(1, Threads, Umma, commit_fence="tmem_store")
-        self.du = Ring(1, Threads, Umma, commit_fence="tmem_store")
-        # No tcgen05.wait::ld before the ks/u releases: the loaded registers feed the Y (dU)
-        # stores before this group publishes the operand the next KS (U) GEMM also waits for,
-        # so the loads are complete before the accumulator can be overwritten; a fence here
-        # would stall the math behind the second load.
-        self.ks = Ring(1, Umma, Threads, release_fence=())
-        self.u = Ring(1, Umma, Threads, release_fence=())
-        # The compute group releases ``state`` once it sees the chunk's KV GEMM complete; its
-        # rewrite of the state columns in the next chunk (rescale, seed) reaches the next KV
-        # GEMM through ``du``, which the MMA warp waits for before issuing it.
-        self.state = Ring(1, Umma, Threads)
+        # One-way TMEM signals: reuse is ordered by the later signal in the same serial
+        # recurrence, not by a second full/empty handshake (see SIGNALS).
+        self.sig = Barriers(len(SIGNALS), counts=[count for _, count in SIGNALS])
         self.ckpt = Ring(1, Warps, Threads, commit_fence="smem_async", buffer=ckpt_buf)
         self.tmem_plan = (
             TmemPlan()
@@ -455,32 +482,24 @@ class GdnRecompute(WarpSpecialized):
         *,
         k: Consumer,
         tinv: Consumer,
-        state_in: Consumer,
-        y: Consumer,
-        du: Consumer,
-        ks: Producer,
-        u: Producer,
-        state: Producer,
+        sig: Barriers,
         sched: Consumer,
         work: WorkCursor,
         tmem: Tmem,
     ):
+        ph = Int32(0)
         while work.valid:
             unit, _, _ = work.item
             total = params.count[0]
             row = unit
             while row < total:
-                k, tinv, state_in, y, du, ks, u, state = self.mma_item(
-                    params, Item(params, row), k, tinv, state_in, y, du, ks, u, state, tmem
-                )
+                k, tinv, ph = self.mma_item(params, Item(params, row), k, tinv, sig, ph, tmem)
                 row, sched = self._next_row(sched)
             work.advance()
-        return k, tinv, state_in, y, du, ks, u, state, sched, work
+        return k, tinv, sched, work
 
     @cute.jit
-    def mma_item(
-        self, params: RecomputeParams, it: Item, k, tinv, state_in, y, du, ks, u, state, tmem
-    ):
+    def mma_item(self, params: RecomputeParams, it: Item, k, tinv, sig, ph, tmem):
         io, d_k, d_v = self.io_dtype, self.d_k, self.d_v
         ks_desc = MmaDesc(
             M=d_v,
@@ -524,13 +543,9 @@ class GdnRecompute(WarpSpecialized):
             k_addr = params.sK.iterator.toint() + kh.index * self.k_stage_bytes
             desc_k = desc_opaque(smem_desc(k_addr, 16, 1024, SWIZZLE_128B))
             desc_kt = desc_opaque(smem_desc(k_addr, BOX_BYTES, 1024, SWIZZLE_128B))
-            # Each accumulator's free slot is probed before the wait for the operand the
-            # compute group publishes, so the chain (operand ready -> MMA issue) sees no wait.
             # ---- KS = state(fp16) @ K^T ----------------------------------------------
             if have_state:
-                ks_free = ks.try_acquire()
-                sih = state_in.wait()
-                kah = ks.acquire(token=ks_free)
+                ph = _wait(sig, ph, "state_in")
                 tmem.access("state_in", read=True, by="umma")
                 tmem.access("ks", write=True, by="umma")
                 for box in cutlass.range_constexpr(d_k // BOX):
@@ -543,27 +558,21 @@ class GdnRecompute(WarpSpecialized):
                             kk,
                             cutlass.Boolean(box > 0 or kk > 0),
                         )
-                kah.commit()
-                sih.release()
+                _commit(sig, "ks")
             # ---- U = Y @ Tinv^T -----------------------------------------------------
             th = tinv.wait()
             th.access(read=True, by="umma")
-            u_free = u.try_acquire()
-            yh = y.wait()
-            uh = u.acquire(token=u_free)
+            ph = _wait(sig, ph, "y")
             tmem.access("y", read=True, by="umma")
             tmem.access("u", write=True, by="umma")
             t_addr = params.sTinv.iterator.toint() + th.index * BOX_BYTES
             desc_t = desc_opaque(smem_desc(t_addr, 16, 1024, SWIZZLE_128B))
             for kk in cutlass.range_constexpr(B_T // 16):
                 mma_ts_step(u_desc, y_col, desc_t, u_col, kk, cutlass.Boolean(kk > 0))
-            uh.commit()
+            _commit(sig, "u")
             th.release()
-            yh.release()
             # ---- state += dU @ K (accumulate onto the rescaled state) ----------------
-            state_free = state.try_acquire()
-            duh = du.wait()
-            sh = state.acquire(token=state_free)
+            ph = _wait(sig, ph, "du")
             tmem.access("du", read=True, by="umma")
             tmem.access("state", read=True, write=True, by="umma")
             for kk in cutlass.range_constexpr(B_T // 16):
@@ -575,10 +584,9 @@ class GdnRecompute(WarpSpecialized):
                     kk,
                     cutlass.Boolean(True) if cutlass.const_expr(kk > 0) else have_state,
                 )
-            sh.commit()
-            duh.release()
+            _commit(sig, "state")
             kh.release()
-        return k, tinv, state_in, y, du, ks, u, state
+        return k, tinv, ph
 
     # ---- compute (warps 0-3): state restage, checkpoints, Y and the decayed U ------------
 
@@ -590,41 +598,33 @@ class GdnRecompute(WarpSpecialized):
         *,
         v: Consumer,
         gate: Consumer,
-        ks: Consumer,
-        u: Consumer,
-        state: Consumer,
-        state_in: Producer,
-        y: Producer,
-        du: Producer,
+        sig: Barriers,
         ckpt: Producer,
         sched: Consumer,
         work: WorkCursor,
         tmem: Tmem,
         me: Local,
     ):
+        ph = Int32(0)
         while work.valid:
             unit, _, _ = work.item
             total = params.count[0]
             row = unit
             while row < total:
-                v, gate, ks, u, state, state_in, y, du, ckpt = self.compute_item(
+                v, gate, ckpt, ph = self.compute_item(
                     params,
                     Item(params, row),
                     v,
                     gate,
-                    ks,
-                    u,
-                    state,
-                    state_in,
-                    y,
-                    du,
                     ckpt,
+                    sig,
+                    ph,
                     tmem,
                     me,
                 )
                 row, sched = self._next_row(sched)
             work.advance()
-        return v, gate, ks, u, state, state_in, y, du, ckpt, sched, work
+        return v, gate, ckpt, sched, work
 
     @cute.jit
     def _state_row(self, tid):
@@ -641,13 +641,9 @@ class GdnRecompute(WarpSpecialized):
         it: Item,
         v,
         gate,
-        ks,
-        u,
-        state,
-        state_in,
-        y,
-        du,
         ckpt,
+        sig,
+        ph,
         tmem,
         me,
     ):
@@ -680,23 +676,16 @@ class GdnRecompute(WarpSpecialized):
                 if chunk == 0 and it.write_start == 0:
                     ckpt = self.zero_checkpoint(params, ckpt, tid)
             valid_state = local > 0 or seed
-            # Probe the operand slots while the previous chunk's KV GEMM runs: their waits
-            # stay off the chain (KV -> restage -> KS -> Y -> U -> dU -> KV).
-            y_free = y.try_acquire()
-            du_free = du.try_acquire()
             gh = gate.wait()
             cs = gh.data
             cumprod_total = cs[B_T - 1, 1]
             if local > 0:
                 # KV of the previous chunk complete: the state columns are this group's
-                # until the next du commit (see the ``state`` channel).
-                sh = state.wait()
-                sh.release()
+                # until the next du publication (see the ``state`` signal).
+                ph = _wait(sig, ph, "state")
             # ---- state: restage as the KS operand, checkpoint, rescale --------------
             if valid_state:
-                state_in, ckpt = self.restage(
-                    params, it, chunk, cumprod_total, state_in, ckpt, tmem, me
-                )
+                ckpt = self.restage(params, it, chunk, cumprod_total, ckpt, sig, tmem, me)
             cumprod_vals = [
                 cs[(lane % 4) * 2 + ((kv // 4) * 8 + kv % 2), 1] for kv in range(n_vals)
             ]
@@ -714,7 +703,7 @@ class GdnRecompute(WarpSpecialized):
                         trans=True,
                     )
             if valid_state:
-                kh = ks.wait()
+                ph = _wait(sig, ph, "ks")
                 tmem.access("ks", read=True)
                 acc = []
                 for half in cutlass.range_constexpr(dv_halves):
@@ -734,7 +723,6 @@ class GdnRecompute(WarpSpecialized):
                             )
                         )
                 words = new
-                kh.release()
             # Tokens past the sequence end take upstream's zero-filled Y (see module doc).
             n_valid = it.batch_end - it.batch_start - chunk * B_T
             if n_valid < B_T:
@@ -746,7 +734,6 @@ class GdnRecompute(WarpSpecialized):
                         lo = w & Int32(0xFFFF) if tok < n_valid else Int32(0)
                         masked.append(w if tok + 1 < n_valid else lo)
                 words = masked
-            yh = y.acquire(token=y_free)
             tmem.access("y", write=True)
             for half in cutlass.range_constexpr(dv_halves):
                 tmem_st(
@@ -754,7 +741,8 @@ class GdnRecompute(WarpSpecialized):
                     ((lane_base + half * 16) << 16) + y_col,
                     words[half * 16 : half * 16 + 16],
                 )
-            yh.commit()
+            cute.arch.fence_view_async_tmem_store()
+            _arrive(sig, "y")
             # ---- decayed U -> the KV GEMM operand ------------------------------------
             # The decay factors fill the U GEMM's latency (upstream's schedule).
             last = cs[B_T - 1, 0]
@@ -769,12 +757,11 @@ class GdnRecompute(WarpSpecialized):
                 decay.append(cute.math.exp2(d0, fastmath=True))
                 decay.append(cute.math.exp2(d1, fastmath=True))
             gh.release()
-            uh = u.wait()
+            ph = _wait(sig, ph, "u")
             tmem.access("u", read=True)
             acc = []
             for half in cutlass.range_constexpr(dv_halves):
                 acc += tmem_ld("16x256b", 8, ((lane_base + half * 16) << 16) + u_col)
-            duh = du.acquire(token=du_free)
             tmem.access("du", write=True)
             for half in cutlass.range_constexpr(dv_halves):
                 pack = []
@@ -787,31 +774,29 @@ class GdnRecompute(WarpSpecialized):
                     )
                     pack.append(fp32_to_fp16(s0, s1, dtype=io))
                 tmem_st("16x128b", ((lane_base + half * 16) << 16) + du_col, pack)
-            duh.commit()
-            # ---- off the chain: release what this chunk read ----------------------------
-            uh.release()
+            cute.arch.fence_view_async_tmem_store()
+            _arrive(sig, "du")
+            # The V release retains its proxy fence before the TMA ring refills this stage.
             vh.release()
         if n_local > 0:
-            sh = state.wait()  # the item's last KV: the state columns are free again
-            sh.release()
-        return v, gate, ks, u, state, state_in, y, du, ckpt
+            ph = _wait(sig, ph, "state")  # the item's last KV: the columns are free again
+        return v, gate, ckpt, ph
 
     @cute.jit
-    def restage(self, params: RecomputeParams, it: Item, chunk, scale, state_in, ckpt, tmem, me):
+    def restage(self, params: RecomputeParams, it: Item, chunk, scale, ckpt, sig, tmem, me):
         """fp16 state into ``state_in``, the chunk's checkpoint, then ``state *= scale``."""
         io = self.io_dtype
         lane0 = (32 * (me.tmem_row // 32)) << 16
         state_col = tmem.ptr("state").toint()
         state_in_col = tmem.ptr("state_in").toint()
         n_ld = self.d_k // 32
-        in_free = state_in.try_acquire()
         vecs = [tmem_ld("32x32b", 32, lane0 + state_col + i * 32) for i in range(n_ld)]
-        h = state_in.acquire(token=in_free)
         tmem.access("state_in", write=True)
         for i in cutlass.range_constexpr(n_ld):
             pack = [fp32_to_fp16(vecs[i][2 * j], vecs[i][2 * j + 1], dtype=io) for j in range(16)]
             tmem_st("32x32b", lane0 + state_in_col + i * 16, pack)
-        h.commit()
+        cute.arch.fence_view_async_tmem_store()
+        _arrive(sig, "state_in")
         if chunk >= it.write_start:
             row, row_valid = self._state_row(me.tid)
             with ckpt.produce() as h:
@@ -837,7 +822,7 @@ class GdnRecompute(WarpSpecialized):
                 scaled += [s0, s1]
             tmem_st("32x32b", lane0 + state_col + i * 32, scaled)
         cute.arch.fence_view_async_tmem_store()
-        return state_in, ckpt
+        return ckpt
 
     @cute.jit
     def zero_checkpoint(self, params: RecomputeParams, ckpt, tid):
@@ -1151,12 +1136,14 @@ def gdn_recompute(
     scheduler: torch.Tensor | None = None,
     op: GdnRecompute | None = None,
     trace: torch.Tensor | None = None,
+    max_ctas: int | None = None,
 ) -> None:
     """Fill ``checkpoints`` for packed ``k [T, HK, DK]``, ``v [T, HV, DV]``, fp32 natural-log
     ``gate [T, H]``, ``frost.gdn_tinv`` tiles and an int32 work table ``items`` (see the module
     docstring). ``scheduler`` (int32, zeroed) is allocated when omitted. ``op`` (a
     ``GdnRecompute`` with ``enable_trace("globaltimer")``) and its ``trace`` buffer capture a role
-    timeline."""
+    timeline. ``max_ctas`` caps the grid (default: one CTA per SM); with fewer CTAs than rows,
+    each CTA claims several items in turn."""
     if k.dtype not in _IO_DTYPES or v.dtype != k.dtype or checkpoints.dtype != k.dtype:
         raise TypeError("k, v and checkpoints must share a 16-bit dtype")
     if state_in is not None and state_in.dtype not in _STATE_DTYPES:
@@ -1168,6 +1155,8 @@ def gdn_recompute(
     state_name = None if state_in is None else _STATE_DTYPES[state_in.dtype].__name__
     fn = compile_gdn_recompute(op, state_name)
     workspace, sms = op.work.launch_args(k.device)
+    if max_ctas is not None:
+        sms = max_ctas
     fn(
         k,
         v,
