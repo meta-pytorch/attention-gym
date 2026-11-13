@@ -536,6 +536,27 @@ padding. At batch one it is not faster (GB200, ctx 1024, us): 0.6B 465 vs 637, 8
 CTAs (30B-A3B's router is one item). It is the base for batched decoding, where the CUDA-core
 GEMV's work grows with every token.
 
+**Batched decoding.** ``QwenMegakernel(..., engine="tcgen05", batch=B)`` decodes B sequences (dense
+models, B <= 64) per launch through ``decode(tokens, positions, k_cache, v_cache)``, each sequence
+with its own position and cache. The weights stream once for all B: the MMA's N columns are the
+tokens, and every activation carries a token axis. Attention rows are per (sequence, kv head,
+split), with the split count divided by B. Each warp builds whole tokens' GEMV inputs, and
+o_proj's last split publishes the post-attention residual so gate/up rows read one word per
+element. A sequence's logits do not depend on the rest of the batch (bit-identical in batches
+of 8 and 3). The inputs stay in shared memory (B x hidden x 2 bytes), which bounds Qwen3-8B
+at B = 16. GB200, all sequences at one context, tokens per second
+(``bench_qwen_megakernel_batch``):
+
+| model, ctx | CUDA cores, B=1 | B=1 | B=4 | B=16 | B=32 | B=64 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.6B, 256 | 1993 | 1422 | 5312 | 12251 | 15010 | 13568 |
+| 0.6B, 1024 | 2049 | 1600 | 4860 | 10146 | 11963 | 10991 |
+| 8B, 256 | 323 | 332 | 1095 | 2721 | | |
+| 8B, 1024 | 339 | 330 | 1041 | 2438 | | |
+
+Beyond B = 32 the input buffer leaves 0.6B five ring stages, and at ctx 1024 the batch's KV
+reads (about 270 MB per layer at B = 64) bound attention.
+
 The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
 which varies about 5x across prompts on the deep models.
