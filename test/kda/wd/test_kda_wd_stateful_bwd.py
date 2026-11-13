@@ -318,6 +318,67 @@ def test_stateful_backward_matches_fp64_reference_including_d_initial_state(
     assert high[5].abs().max() > 1e-3
 
 
+def _public_gradients(inputs, entry_state, offsets, loss: str, *, compile_fn=None):
+    """The five input gradients of a public call that returns its final state."""
+    leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+
+    def step(*operands):
+        return chunk_kda(
+            *operands,
+            entry_state,
+            cu_seqlens=offsets,
+            output_final_state=True,
+            kernel_options={"backend": "warpdrive"},
+        )
+
+    output, final_state = (compile_fn(step) if compile_fn else step)(*leaves)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
+    d_final = torch.randn(final_state.shape, device="cuda", generator=generator)
+    outs = {"output": (output,), "final": (final_state,), "both": (output, final_state)}[loss]
+    cots = {"output": (d_output,), "final": (d_final,), "both": (d_output, d_final)}[loss]
+    return _grads(outs, leaves, cots), cots
+
+
+def _grads(outs, leaves, cotangents):
+    """Gradients of every leaf; one the outputs do not depend on (q of the final state) is zero."""
+    grads = torch.autograd.grad(outs, leaves, cotangents, allow_unused=True)
+    return tuple(
+        torch.zeros_like(leaf) if grad is None else grad
+        for grad, leaf in zip(grads, leaves, strict=True)
+    )
+
+
+@pytest.mark.parametrize("loss", ["output", "final", "both"])
+def test_final_state_without_entry_state_trains_like_a_zero_entry_state(loss: str) -> None:
+    """With no entry state, the exit cotangent still reaches every input: the gradients equal a
+    zero-entry-state call's and sit within the FP64/FP32 reference budget, eager and compiled."""
+    lengths = [100, 156]
+    q, k, value, gate, beta, *_ = _make_inputs(lengths, heads=1, gate_scale=MILD_GATE, seed=7)
+    inputs, offsets = (q, k, value, gate, beta), cumulative_sequence_offsets(lengths)
+    zeros = torch.zeros(len(lengths), 1, D, D, device="cuda")
+
+    actual, cotangents = _public_gradients(inputs, None, offsets, loss)
+    with_zeros, _ = _public_gradients(inputs, zeros, offsets, loss)
+    compiled, _ = _public_gradients(
+        inputs, None, offsets, loss, compile_fn=lambda fn: torch.compile(fn, fullgraph=True)
+    )
+    _assert_gradients_equal(actual, compiled)
+    for name, got, want in zip(GRADIENT_NAMES, actual, with_zeros, strict=False):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6, msg=name)
+
+    references = []
+    for precision in (torch.float64, torch.float32):
+        leaves = tuple(tensor.detach().to(precision).requires_grad_() for tensor in inputs)
+        output, final_state = kda_reference(
+            *leaves, cu_seqlens=offsets, scale=SCALE, output_final_state=True
+        )
+        outs = {"output": (output,), "final": (final_state,), "both": (output, final_state)}[loss]
+        references.append(_grads(outs, leaves, tuple(c.to(precision) for c in cotangents)))
+    for name, got, high, low in zip(GRADIENT_NAMES, actual, *references, strict=False):
+        assert_matches_low_precision_reference(got, high, low, name)
+
+
 def test_public_stateful_backward_carries_a_tiny_cotangent_in_fp32(backward_pieces: int) -> None:
     """A ``2^-25`` exit cotangent reaches ``d_initial_state`` at FP32 precision in every plan.
 
