@@ -161,12 +161,12 @@ def _chain_shape(family: str, direction: str) -> tuple[int, int]:
     num_sm = torch.cuda.get_device_properties().multi_processor_count
     if direction == "forward":
         heads = num_sm // 3
-        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD * (num_sm // heads)
+        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD[128] * (num_sm // heads)
         assert driver.ForwardPlan.build(tokens, 1, heads, 128, "cuda").chain
     else:
         heads = num_sm // 2
-        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD * (num_sm // heads)
-        assert driver.BackwardPlan.build(tokens, 1, heads, "cuda").chain
+        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD[128] * (num_sm // heads)
+        assert driver.BackwardPlan.build(tokens, 1, heads, 128, "cuda").chain
     return tokens, heads
 
 

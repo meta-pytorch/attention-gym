@@ -54,7 +54,8 @@ def recording(driver, name):
 
 
 for driver in (gdn, kda):
-    driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD = 0
+    for floors in (driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD, driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD):
+        floors.update(dict.fromkeys(floors, 0))
     for name in (
         "build_warmup_forward",
         "build_chain_forward",

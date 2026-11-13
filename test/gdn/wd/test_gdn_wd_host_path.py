@@ -64,14 +64,14 @@ def test_warm_gdn_call_validates_once_and_skips_full_cache_key(monkeypatch):
 def test_gdn_chain_changing_shapes_matches_default(monkeypatch):
     """The chain launches are keyed without the batch shape; a later shape must still get its
     own plan, piece geometry and validation instead of a replay of the previous one."""
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 0)
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    monkeypatch.setitem(gdn_driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD, 128, 0)
+    monkeypatch.setitem(gdn_driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD, 128, 0)
     device = torch.device("cuda")
     # 8, then 4 pieces per sequence, then the first shape again.
     for lengths in ((2048,), (900, 1148), (2048,)):
         tokens = sum(lengths)
         assert gdn_driver.ForwardPlan.build(tokens, len(lengths), 2, 128, device).chain
-        assert gdn_driver.BackwardPlan.build(tokens, len(lengths), 2, device).chain
+        assert gdn_driver.BackwardPlan.build(tokens, len(lengths), 2, 128, device).chain
         actual = _gdn_step(lengths)
         expected = _gdn_step(lengths, kernel_options=None)
         for got, want in zip(actual, expected, strict=True):

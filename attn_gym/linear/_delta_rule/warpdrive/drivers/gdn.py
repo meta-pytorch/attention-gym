@@ -28,13 +28,20 @@ from .plan import ForwardPlan as _ForwardPlan
 from .plan import aligned, chain_buffers, int32, split_scratch, tma_slots
 
 B_T = gdn_prefill.B_T
-# Shorter chain pieces cost more in summaries than they save. cudnn-frontend v1.30 chains any
-# sequence whose heads fill at most a third of the SMs; on GB200 at 48 heads, D=128 the forward
-# d_v split beats the chain up to ~5.5k tokens per piece (1x16384: 370 vs 393 us) and the chain
-# wins at ~13.6k (1x40960: 848 vs 901 us). The backward has no d_v split, and its chain already
-# wins at ~2.7k tokens per piece (1x8192: 705 vs 928 us) but loses at 1k (1x2048: 279 vs 258).
-MIN_CHAIN_TOKENS_PER_PIECE_FWD = 8192
-MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
+# Minimum tokens per chain piece by head dimension: shorter pieces cost more in summaries than
+# they save. cudnn-frontend v1.30 chains any sequence whose heads fill at most a third of the SMs;
+# on GB200 at 48 heads, D=128 the forward d_v split beats the chain up to ~5.5k tokens per piece
+# (1x16384: 370 vs 393 us) and the chain wins at ~13.6k (1x40960: 848 vs 901 us). The backward has
+# no d_v split, and its chain already wins at ~2.7k tokens per piece (1x8192: 705 vs 928 us) but
+# loses at 1k (1x2048: 279 vs 258). D=64 has no d_v split and a quarter of the summary state. On
+# GB300 with 1-4 sequences of 4-32 heads, its forward chain loses at 256 tokens per piece on four
+# pieces (1x1024 H16: 38 vs 35 us) and wins from 512 (1x2048 H32: 51 vs 56 us), and its backward
+# chain wins from the 256-token pieces the planner allows (1x1024 H16: 70 vs 96 us, 1x4096 H16:
+# 122 vs 321 us). With only two or three pieces (48-64 heads) the D=64 chain needs longer
+# sequences than these floors admit: forward 1x2048 H48 75 vs 54 us, backward 1x1024 H64 111 vs
+# 100 us; a floor high enough to exclude them would forgo the wins above.
+MIN_CHAIN_TOKENS_PER_PIECE_FWD = {64: 512, 128: 8192}
+MIN_CHAIN_TOKENS_PER_PIECE_BWD = {64: 256, 128: 2048}
 # Natural-log gate with no in-kernel gate or beta activation.
 _GATE_FLAGS = {"log_gate": True}
 
@@ -56,7 +63,7 @@ class ForwardPlan(_ForwardPlan):
             dim_v,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_FWD,
+            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_FWD[dim_v],
         )
 
 
@@ -222,14 +229,14 @@ def _tinv_buffers(tokens: int, num_pieces: int, heads_out: int, dtype, device) -
 
 class BackwardPlan(_BackwardPlan):
     @classmethod
-    def build(cls, tokens: int, num_seqs: int, heads_out: int, device) -> BackwardPlan:
+    def build(cls, tokens: int, num_seqs: int, heads_out: int, dim_v: int, device) -> BackwardPlan:
         return cls.for_shape(
             tokens,
             num_seqs,
             heads_out,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_BWD,
+            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_BWD[dim_v],
         )
 
 
@@ -262,7 +269,7 @@ def gdn_backward(
     heads_out = gate.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
+    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs

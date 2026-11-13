@@ -318,11 +318,11 @@ def test_gdn_wd_chain_backward_mixed_small_beta_matches_reference(monkeypatch) -
     """The piece-chain backward runs its own bprop launch; dBeta must stay exact there too."""
     from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as gdn_driver
 
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    monkeypatch.setitem(gdn_driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD, 128, 0)
     inputs = make_gdn_test_inputs(
         (2048,), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=163
     )
-    assert gdn_driver.BackwardPlan.build(2048, 1, 2, inputs[0].device).pieces > 1
+    assert gdn_driver.BackwardPlan.build(2048, 1, 2, 128, inputs[0].device).pieces > 1
     beta = inputs[4]
     beta[:, ::4] = 0.0
     beta[:, 1::4] = 1e-12

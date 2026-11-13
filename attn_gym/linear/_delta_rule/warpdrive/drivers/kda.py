@@ -26,10 +26,11 @@ from .plan import BackwardPlan as _BackwardPlan
 from .plan import ForwardPlan as _ForwardPlan
 from .plan import aligned, chain_buffers, int32, split_scratch, tma_slots
 
-# Start with the GDN driver's conservative chain floors; KDA has its own BT16 pieces.
-# These guard against summary overhead, rather than claiming KDA-specific tuning.
-MIN_CHAIN_TOKENS_PER_PIECE_FWD = 8192
-MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
+# Start with the GDN driver's conservative D=128 chain floors, by head dimension as in GDN; KDA
+# has its own BT16 pieces. These guard against summary overhead, rather than claiming
+# KDA-specific tuning.
+MIN_CHAIN_TOKENS_PER_PIECE_FWD = {128: 8192}
+MIN_CHAIN_TOKENS_PER_PIECE_BWD = {128: 2048}
 PREP_TILE_FRACTION = 0.475
 _GATE_FLAGS = {"log_gate": True}
 
@@ -51,7 +52,7 @@ class ForwardPlan(_ForwardPlan):
             dim_v,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_FWD,
+            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_FWD[dim_v],
         )
 
 
@@ -225,14 +226,14 @@ def _prep_buffers(
 
 class BackwardPlan(_BackwardPlan):
     @classmethod
-    def build(cls, tokens: int, num_seqs: int, heads_out: int, device) -> BackwardPlan:
+    def build(cls, tokens: int, num_seqs: int, heads_out: int, dim_v: int, device) -> BackwardPlan:
         return cls.for_shape(
             tokens,
             num_seqs,
             heads_out,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_BWD,
+            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_BWD[dim_v],
         )
 
 
@@ -268,7 +269,7 @@ def kda_backward(
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
+    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs

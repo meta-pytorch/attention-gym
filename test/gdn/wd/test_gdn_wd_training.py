@@ -896,7 +896,7 @@ def test_gdn_wd_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
     tokens, heads = q.shape[1], value.shape[2]
     if not gdn_driver.ForwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain:
         pytest.skip("this device has too many (sequence, head) tiles per SM to chain")
-    assert gdn_driver.BackwardPlan.build(tokens, 1, heads, q.device).chain
+    assert gdn_driver.BackwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain
     inputs = (q, k, value, gate, beta, state)
     cotangents = (torch.randn_like(value), torch.randn_like(state))
 
@@ -911,8 +911,8 @@ def test_gdn_wd_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
         return (*output, *torch.autograd.grad(output, leaves, cotangents))
 
     chain = run()
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 1 << 40)
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 1 << 40)
+    monkeypatch.setitem(gdn_driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD, 128, 1 << 40)
+    monkeypatch.setitem(gdn_driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD, 128, 1 << 40)
     uncut = run()
     for actual, expected in zip(chain, uncut, strict=True):
         assert actual.isfinite().all()
