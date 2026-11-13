@@ -106,6 +106,7 @@ def chain_backward_head_host(
     seed: cute.Tensor | None,
     state_x_series: cute.Tensor,
     tma_slots: cute.Tensor,
+    dgate: cute.Tensor,
     stream: cuda.CUstream,
 ) -> None:
     piece_chain.launch_chain_tables(
@@ -126,6 +127,7 @@ def chain_backward_head_host(
         rows=tinv_rows,
         row_count=tinv_row_count,
         rows_b_t=B_T,
+        tail_rows=dgate,
     )
     tinv_op, tinv_sms = tinv_cfg
     tinv_op.launch(
@@ -717,6 +719,7 @@ def build_chain_backward(
             _as_dtype(signature_spec(seed, assumed_align=4), seed_name),
             signature_spec(state_x, assumed_align=16, mode3_divisibility=DK),
             signature_spec(tma_slots, assumed_align=128, compact=True),
+            signature_spec(dgate, assumed_align=16),
         )
         return _compile_chain_backward_head(
             chain_constexprs, cfg_args, head_specs, use_int64_offsets
@@ -842,6 +845,7 @@ def run_chain_backward(
         seed,
         state_x,
         tma_slots,
+        dgate,
     )
     tail(
         int(pieces),

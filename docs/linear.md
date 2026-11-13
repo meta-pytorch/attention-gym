@@ -270,10 +270,11 @@ explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries thr
 forward, backward, and recurrent states; logical sequences may have tails or be empty. For
 fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
 forward values outside `[0, cu_seqlens[-1])` are unspecified. `paged_chunk_kda` uses the same
-Ampere-or-newer forward route while updating selected FP32 state-cache slots in place. The
-internal reverse scan returns zero cotangents for inactive gate rows. This does not sanitize arbitrary
-parameterized gate producers: callers still need the masking rules below because
-``0 * NaN`` can poison their reductions.
+Ampere-or-newer forward route while updating selected FP32 state-cache slots in place. Both chunk
+backends return zero cotangents for inactive gate rows (the fused internal reverse scan writes
+them; warpdrive zeroes them in its backward prologue). This does not sanitize arbitrary
+parameterized gate producers: callers still need the masking rules below because ``0 * NaN`` can
+poison their reductions.
 
 !!! warning "FP16 intermediate range"
 

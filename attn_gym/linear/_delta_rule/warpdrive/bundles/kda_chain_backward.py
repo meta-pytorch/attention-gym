@@ -110,6 +110,7 @@ def chain_backward_host(
         work_items_summary,
         scheduler_all,
         stream,
+        tail_rows=dgate,
     )
     summary_op.launch(
         k,
