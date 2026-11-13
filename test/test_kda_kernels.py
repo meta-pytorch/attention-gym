@@ -62,7 +62,7 @@ try:
     from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
         chunk_kda_bwd_wy_dqkg as chunk_kda_bwd_wy_dqkg_fused_cute,
     )
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import (
+    from attn_gym.linear.kda.fwd.factors import (
         chunk_kda_fwd_intra as chunk_kda_fwd_intra_cute,
     )
 
@@ -73,7 +73,10 @@ except Exception as e:
         "cutlass",
         "cuda",
     }
-    if IS_SM100 and not optional_dep_missing:
+    legacy_kernel_missing = isinstance(e, ImportError) and (
+        getattr(e, "name", "") or ""
+    ).startswith("attn_gym.linear.kda.bwd.cute")
+    if IS_SM100 and not (optional_dep_missing or legacy_kernel_missing):
         raise
     HAS_CUTE = False
     CUTE_IMPORT_ERR = f"{type(e).__name__}: {e}"

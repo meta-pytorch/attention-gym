@@ -5,6 +5,11 @@ from pathlib import Path
 import pytest
 import torch
 
+pytest.importorskip(
+    "attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused",
+    reason="legacy CuTe kernel is not installed",
+)
+
 from attn_gym.warpdrive.cache import CompileTarget, precompile_many
 from attn_gym.warpdrive.cache import target as cute_target
 

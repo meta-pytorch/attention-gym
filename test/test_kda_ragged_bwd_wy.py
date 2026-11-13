@@ -7,6 +7,11 @@ from typing import NamedTuple
 import pytest
 import torch
 
+pytest.importorskip(
+    "attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused",
+    reason="legacy CuTe kernel is not installed",
+)
+
 pytest.importorskip("cutlass")
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
