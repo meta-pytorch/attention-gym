@@ -28,6 +28,7 @@ from attn_gym.linear._delta_rule.paged_state import (
 )
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_backend,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -44,7 +45,6 @@ from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import (
-    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
 )
@@ -100,17 +100,16 @@ def chunk_kda(
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
-            are internal. Calls that run warpdrive (the default for BF16 kernels on
-            SM100-family GPUs) require about ``[-5.25, 0]``
-            (``WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE``): gradient error grows quickly past
-            a uniform gate of about ``-5.25``, and results stop being finite once an aligned
-            16-token per-channel sum reaches ``-126 * ln(2)`` (a uniform gate of ``-5.45``).
-            The common ``-5`` bound stays comparable to the fused backend. Calls that run the
-            repo-local fused backend require approximately ``[-5.914, 0]``
-            (``MAX_GATE_LOWER_BOUND_MAGNITUDE``). warpdrive FP16 does not support usual
-            model-range gates, so the default runs FP16 on the fused backend. The KDA gate
-            contract in ``docs/linear.md`` gives the measurements. These limits are not checked
-            at runtime and do not apply to reference or recurrent execution.
+            are internal. Calls that run warpdrive (the default on SM100-family GPUs) require
+            about ``[-5.25, 0]`` (``WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE``): gradient
+            error grows quickly past a uniform gate of about ``-5.25``, and with
+            ``fastmath=True`` results stop being finite once an aligned 16-token per-channel sum
+            reaches ``-126 * ln(2)`` (a uniform gate of ``-5.45``; ``-128 * ln(2)`` with
+            ``fastmath=False``). The common ``-5`` bound stays comparable to the fused backend.
+            Calls that run the repo-local fused backend require approximately ``[-5.914, 0]``
+            (``MAX_GATE_LOWER_BOUND_MAGNITUDE``). The KDA gate contract in ``docs/linear.md``
+            gives the measurements. These limits are not checked at runtime and do not apply to
+            reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
@@ -168,7 +167,7 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if resolve_kda_backend(options.backend, q, k, v) == "warpdrive":
+        if resolve_chunk_backend(options.backend, q) == "warpdrive":
             return _warpdrive_chunk_forward(
                 q,
                 k,
@@ -345,7 +344,7 @@ def paged_chunk_kda(
     fused_only = replay_state is not None or not state_pool_is_aligned(
         state_cache, WARPDRIVE_POOL_ALIGNMENT_BYTES
     )
-    backend = resolve_kda_backend(options.backend, q, k, v, fused_only=fused_only)
+    backend = resolve_chunk_backend(options.backend, q, fused_only=fused_only)
     if backend == "warpdrive":
         return _warpdrive_paged_chunk_forward(
             q,

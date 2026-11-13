@@ -42,6 +42,7 @@ from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import CHUNK_SIZE, prepare_span, zero_state
+from attn_gym.linear._delta_rule.validation import resolve_chunk_backend
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import (
     ChunkKDABwdPrepared,
     _finish_chunk_kda_bwd,
@@ -62,7 +63,6 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 from attn_gym.linear.kda.validation import (
-    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
 )
@@ -283,7 +283,7 @@ def chunk_kda_prepare(
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
     Pass the same value to ``chunk_kda_prepare_backward``. ``"backend"`` selects the kernels
     of the local pass and both summaries as in ``chunk_kda``, so the default runs warpdrive on
-    SM100-family GPUs except for FP16. Split schedules are not available with entry states. ``"autotune"``
+    SM100-family GPUs. Split schedules are not available with entry states. ``"autotune"``
     follows ``chunk_kda``.
     """
     backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
@@ -299,7 +299,7 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
-    backend = resolve_kda_backend(backend, q, k, v)
+    backend = resolve_chunk_backend(backend, q)
     if backend == "warpdrive":
         validate_warpdrive_available(q)
         if cu_seqlens is None:
