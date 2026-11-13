@@ -5,10 +5,6 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.autotune import should_autotune
-from attn_gym.linear._delta_rule.paged_state import (
-    WARPDRIVE_POOL_ALIGNMENT_BYTES,
-    state_pool_is_aligned,
-)
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_backend,
@@ -183,8 +179,7 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. ``"backend"`` selects the kernels as in ``chunk_gdn``.
-            The default runs pools whose base or slot stride is not 16-byte aligned on the fused
-            backend. Split schedules are not supported. ``"autotune"``
+            Split schedules are not supported. ``"autotune"``
             (default ``True``) benchmarks candidate configurations of the repo-local factor and
             output kernels. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
@@ -210,8 +205,7 @@ def paged_chunk_gdn(
     )
     scale = resolve_scale(scale, q.shape[-1])
     gate, beta, _ = cast_to_kernel_dtypes(gate, beta, None)
-    aligned = state_pool_is_aligned(state_cache, WARPDRIVE_POOL_ALIGNMENT_BYTES)
-    if resolve_chunk_backend(options["backend"], q, fused_only=not aligned) == "warpdrive":
+    if resolve_chunk_backend(options["backend"], q) == "warpdrive":
         return warpdrive_paged_chunk_forward(
             q,
             k,

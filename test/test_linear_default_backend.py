@@ -151,8 +151,6 @@ SERVED = {
     "paged_chunk_kda aligned pool": lambda: _run_paged_kda(),
     "paged_chunk_kda fp16": lambda: _run_paged_kda(dtype=torch.float16),
     "paged_chunk_gdn aligned pool": lambda: _run_paged_gdn(),
-}
-ROUTED_TO_FUSED = {
     "paged_chunk_kda replay_state": lambda: _run_paged_kda(replay=True),
     "paged_chunk_kda misaligned pool": lambda: _run_paged_kda(prefix=1),
     "paged_chunk_gdn misaligned pool": lambda: _run_paged_gdn(prefix=1),
@@ -166,14 +164,6 @@ def test_default_runs_warpdrive_on_sm100_family(monkeypatch, dispatched, capabil
     monkeypatch.setattr(validation, "_CUTEDSL_INSTALLED", True)
     SERVED[case]()
     assert dispatched == ["warpdrive"]
-
-
-@pytest.mark.parametrize("capability", BLACKWELL)
-@pytest.mark.parametrize("case", ROUTED_TO_FUSED)
-def test_default_routes_unserved_calls_to_fused(monkeypatch, dispatched, capability, case):
-    _simulate_capability(monkeypatch, capability)
-    ROUTED_TO_FUSED[case]()
-    assert dispatched == ["fused"]
 
 
 @pytest.mark.parametrize("capability", OTHER_GPUS)
@@ -205,7 +195,7 @@ def test_default_runs_fused_on_rubin_without_a_cutedsl_that_targets_it(
 
 @pytest.mark.parametrize("capability", (*BLACKWELL, (9, 0)))
 def test_explicit_backends_are_never_rerouted(monkeypatch, dispatched, capability):
-    """Explicit choices hold on every device and for calls that ``"auto"`` would route."""
+    """Explicit choices hold on every device and route."""
     _simulate_capability(monkeypatch, capability)
     fused, warpdrive = {"backend": "fused"}, {"backend": "warpdrive"}
     _run_kda(kernel_options=fused)
@@ -243,17 +233,11 @@ def _two_sequences():
 
 @needs_warpdrive
 @pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("kda bf16", "warpdrive"),
-        ("kda fp16", "warpdrive"),
-        ("kda fastmath=False", "warpdrive"),
-        ("gdn bf16", "warpdrive"),
-        ("gdn fp16", "warpdrive"),
-    ],
+    "name", ["kda bf16", "kda fp16", "kda fastmath=False", "gdn bf16", "gdn fp16"]
 )
-def test_default_reproduces_the_selected_backend(name, expected):
-    """The default call's outputs and gradients are bitwise those of the backend it selects."""
+def test_default_reproduces_the_selected_backend(name):
+    """The default call's outputs and gradients are bitwise those of warpdrive, which it
+    selects."""
     family, variant = name.split(" ")
     dtype = torch.float16 if variant == "fp16" else torch.bfloat16
     kwargs = {"fastmath": False} if variant == "fastmath=False" else {}
@@ -270,17 +254,14 @@ def test_default_reproduces_the_selected_backend(name, expected):
             kernel_options=options,
             **kwargs,
         )
-        for options in ({"autotune": False}, {"backend": expected, "autotune": False})
+        for options in ({"autotune": False}, {"backend": "warpdrive", "autotune": False})
     )
     _assert_bitwise(default, selected)
 
 
 @needs_warpdrive
-@pytest.mark.parametrize(
-    ("name", "warpdrive"),
-    [("kda bf16", True), ("kda fp16", True), ("kda fastmath=False", True), ("gdn bf16", True)],
-)
-def test_default_stages_select_like_the_public_op(name, warpdrive):
+@pytest.mark.parametrize("name", ["kda bf16", "kda fp16", "kda fastmath=False", "gdn bf16"])
+def test_default_stages_select_like_the_public_op(name):
     """The staged entry points behind context parallelism resolve the default as the ops do."""
     from attn_gym.linear.gdn.stages import ChunkGDNWarpdrivePrepared, chunk_gdn_prepare
     from attn_gym.linear.kda.stages import ChunkKDAWarpdrivePrepared, chunk_kda_prepare
@@ -293,25 +274,53 @@ def test_default_stages_select_like_the_public_op(name, warpdrive):
             cu_seqlens=_two_sequences(),
             fastmath=variant != "fastmath=False",
         )
-        assert isinstance(prepared, ChunkKDAWarpdrivePrepared) is warpdrive
+        assert isinstance(prepared, ChunkKDAWarpdrivePrepared)
     else:
         prepared = chunk_gdn_prepare(*_gdn_inputs(dtype), cu_seqlens=_two_sequences())
-        assert isinstance(prepared, ChunkGDNWarpdrivePrepared) is warpdrive
+        assert isinstance(prepared, ChunkGDNWarpdrivePrepared)
+
+
+def _relative_rms(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    error = (actual.double() - expected.double()).square().mean().sqrt()
+    return (error / expected.double().square().mean().sqrt()).item()
 
 
 @needs_warpdrive
-def test_default_paged_routes_reproduce_the_selected_backend():
-    """Aligned pools advance on warpdrive and misaligned pools on fused, bit for bit."""
-    inputs = _gdn_inputs()
-    for prefix, expected in ((0, "warpdrive"), (1, "fused")):
-        pools = []
-        for options in ({"autotune": False}, {"backend": expected, "autotune": False}):
-            torch.manual_seed(1)
-            _storage, pool, indices = _pool(prefix)
-            with torch.no_grad():
-                output = paged_chunk_gdn(*inputs, pool, indices, kernel_options=options)
-            pools.append((output, pool.clone()))
-        _assert_bitwise(*pools)
+@pytest.mark.parametrize("family", ["kda", "gdn"])
+@pytest.mark.parametrize("route", ["aligned", "misaligned", "replay"])
+def test_default_paged_routes_run_warpdrive(family, route):
+    """Every paged route, misaligned pools and KDA replay included, reproduces explicit warpdrive
+    bit for bit and the fused backend within low-precision rounding."""
+    if family == "gdn" and route == "replay":
+        pytest.skip("replay_state is KDA-only")
+    inputs = _kda_inputs() if family == "kda" else _gdn_inputs()
+    op = paged_chunk_kda if family == "kda" else paged_chunk_gdn
+    results = {}
+    for backend in ("auto", "warpdrive", "fused"):
+        torch.manual_seed(1)
+        _storage, pool, indices = _pool(prefix=int(route == "misaligned"))
+        pool.mul_(0.01)
+        extra = {}
+        if route == "replay":
+            layout = ReplayState.slot_layout(2, 128)
+            extra["replay_state"] = ReplayState(
+                *(torch.zeros((3, *shape), dtype=dt, device="cuda") for shape, dt in layout)
+            )
+        with torch.no_grad():
+            output = op(
+                *inputs,
+                pool,
+                indices,
+                kernel_options={"backend": backend, "autotune": False},
+                **extra,
+            )
+        results[backend] = (output, pool.clone(), *extra.get("replay_state", ()))
+    _assert_bitwise(results["auto"], results["warpdrive"])
+    output, pool, *replay = results["warpdrive"]
+    fused_output, fused_pool, *fused_replay = results["fused"]
+    assert _relative_rms(output, fused_output) < 1e-2
+    assert _relative_rms(pool, fused_pool) < 1e-2
+    _assert_bitwise(replay, fused_replay)  # the token caches hold inputs, not results
 
 
 @needs_warpdrive
