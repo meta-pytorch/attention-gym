@@ -15,7 +15,15 @@ from cutlass.cute.arch import inline_ptx
 
 from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
-from .ptx import elect_sync, f16x2_to_f32, fmul2, fp32_to_fp16, ldmatrix, mma_step_tf32
+from .ptx import (
+    elect_sync,
+    f16x2_to_f32,
+    fmul2,
+    fp32_to_fp16,
+    ldmatrix,
+    mma_step_tf32,
+    tf32_round,
+)
 from .ragged import RaggedTma, ragged_load
 
 B_T = 16
@@ -468,12 +476,9 @@ def tf32_offset(row, dim, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr[b
 def sts_tf32x8(
     base, row, dim, values, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr = False
 ):
-    """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32 and store
-    them into the tile at ``base``."""
-    words = [
-        inline_ptx("cvt.rna.tf32.f32 $0, $1;", write_only_types=[Int32], read_only_args=[v])
-        for v in values
-    ]
+    """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32
+    (``tf32_round``) and store them into the tile at ``base``."""
+    words = [tf32_round(v) for v in values]
     for half in cutlass.range_constexpr(2):
         inline_ptx(
             "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
