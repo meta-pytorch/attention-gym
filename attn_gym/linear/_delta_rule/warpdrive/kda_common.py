@@ -309,27 +309,40 @@ def ldg_l2_f32(addr, dtype: cutlass.Constexpr):
 # ---- TF32 decay operands (fp16 io) -------------------------------------------------------
 # fp16 cannot hold the in-chunk decay factors 2^g and 2^-g, whose ratio spans the whole
 # 16-token gate sum (about 2^121 at the gate bound), so the fp16 kernels stage the decay operands
-# of the in-chunk products (A, KK) as fp32 ``[16, d_k]`` tiles rounded to tf32 and multiply them
-# with m16n8k8 tf32 mma.sync. Rows are 16-byte chunks of four fp32 columns. Logical chunk
-# ``c = (c4, c3 c2 c1, c0)`` sits at physical chunk ``(c4, c0, c3 c2 c1 ^ row & 7)``: the eight
-# rows each ``ldmatrix`` matrix reads, and the eight chunks ``2 l + c0`` that eight lanes of a
-# row store, land in distinct 16-byte bank groups.
+# of the in-chunk products as fp32 ``[16, d_k]`` tiles rounded to tf32 and multiply them with
+# m16n8k8 tf32 mma.sync (and, in the backward, tcgen05 ``.kind::tf32``). Rows are 16-byte
+# chunks of four fp32 columns in one of two layouts:
+# - mma.sync only (``umma=False``): rows of ``4 d_k`` bytes; logical chunk
+#   ``c = (c4, c3 c2 c1, c0)`` sits at physical chunk ``(c4, c0, c3 c2 c1 ^ row & 7)``, so the
+#   eight rows each ``ldmatrix`` matrix reads and the eight chunks ``2 l + c0`` that eight lanes
+#   of a row store land in distinct 16-byte bank groups.
+# - also a tcgen05 MN-major operand (``umma=True``): the canonical SWIZZLE_128B_BASE32B layout,
+#   2048-byte boxes of 32 columns, each 4 atoms of 4 rows x 128 bytes, the 32-byte unit XORed
+#   with ``row & 3`` (2-way conflicts on those reads and stores).
 
 
 @cute.jit
 def tf32_chunk(row, chunk):
-    """Physical 16-byte chunk of logical ``chunk`` in ``row`` of a tf32 decay tile."""
+    """Physical 16-byte chunk of logical ``chunk`` in ``row`` of an mma.sync tf32 tile."""
     return (chunk & 16) | ((chunk & 1) << 3) | (((chunk >> 1) & 7) ^ (row & 7))
 
 
 @cute.jit
-def tf32_offset(row, dim, d_k: cutlass.Constexpr[int]):
+def tf32_offset(row, dim, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr[bool] = False):
     """Byte offset of fp32 ``(row, dim)`` (``dim`` a multiple of 4) in a tf32 decay tile."""
+    if cutlass.const_expr(umma):
+        unit = ((dim >> 3) & 3) ^ (row & 3)
+        return (
+            (dim >> 5) * 2048 + (row >> 2) * 512 + (row & 3) * 128 + (unit << 5)
+            + (((dim >> 2) & 1) << 4)
+        )  # fmt: skip
     return row * (d_k * 4) + (tf32_chunk(row, dim >> 2) << 4)
 
 
 @cute.jit
-def sts_tf32x8(base, row, dim, values, d_k: cutlass.Constexpr[int]):
+def sts_tf32x8(
+    base, row, dim, values, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr = False
+):
     """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32 and store
     them into the tile at ``base``."""
     words = [
@@ -340,31 +353,40 @@ def sts_tf32x8(base, row, dim, values, d_k: cutlass.Constexpr[int]):
         inline_ptx(
             "st.shared.v4.b32 [$0], {$1, $2, $3, $4};",
             read_only_args=[
-                Int32(base + tf32_offset(row, dim + 4 * half, d_k)),
+                Int32(base + tf32_offset(row, dim + 4 * half, d_k, umma)),
                 *words[4 * half : 4 * half + 4],
             ],
         )
 
 
-def tf32_fragment_offsets(lane, d_k: int, *, b_operand: bool):
-    """This lane's ``ldmatrix.x4`` row offsets of k-steps ``0..7`` (add ``256 * (ks // 8)`` for
-    k-step ``ks``). The four matrices are the A fragment of rows ``[0, 16)`` (rows 0-7 / 8-15 at
-    columns +0, then at +4) or the B fragment of tokens ``[0, 16)`` (columns +0 / +4 of tokens
-    0-7, then of 8-15)."""
+def _tf32_period(umma: bool) -> tuple[int, int]:
+    """K steps after which a tile's row offsets repeat, and the bytes the next period adds."""
+    return (4, 2048) if umma else (8, 256)
+
+
+def tf32_fragment_offsets(lane, d_k: int, *, b_operand: bool, umma: bool = False):
+    """This lane's ``ldmatrix.x4`` row offsets of the first period of k-steps (see
+    ``mma_tf32_16x16``). The four matrices are the A fragment of rows ``[0, 16)`` (rows 0-7 /
+    8-15 at columns +0, then at +4) or the B fragment of tokens ``[0, 16)`` (columns +0 / +4 of
+    tokens 0-7, then of 8-15)."""
     m, r = lane // 8, lane % 8
     if b_operand:
         row, col = r + 8 * (m // 2), m % 2
     else:
         row, col = r + 8 * (m % 2), m // 2
-    return [opaque_i32(row * (d_k * 4) + (tf32_chunk(r, 2 * ks + col) << 4)) for ks in range(8)]
+    period, _ = _tf32_period(umma)
+    return [opaque_i32(tf32_offset(row, 8 * ks + 4 * col, d_k, umma)) for ks in range(period)]
 
 
 @cute.jit
-def mma_tf32_16x16(acc, s_a, s_b, a_offs, b_offs, d_k: cutlass.Constexpr[int]):
+def mma_tf32_16x16(
+    acc, s_a, s_b, a_offs, b_offs, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr = False
+):
     """``acc[16, 16] += A B^T`` over ``d_k`` columns of two tf32 decay tiles (A rows at ``s_a``,
     B rows at ``s_b``), in the m16n8k16 accumulator layout."""
+    period, box = _tf32_period(umma)
     for ks in cutlass.range_constexpr(d_k // 8):
-        box = (ks // 8) * 256
-        af = ldmatrix(s_a + a_offs[ks % 8] + box, 4)
-        bf = ldmatrix(s_b + b_offs[ks % 8] + box, 4)
+        step = (ks // period) * box
+        af = ldmatrix(s_a + a_offs[ks % period] + step, 4)
+        bf = ldmatrix(s_b + b_offs[ks % period] + step, 4)
         mma_step_tf32(acc, af, bf, M=16, N=16)
