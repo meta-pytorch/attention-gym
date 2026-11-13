@@ -88,6 +88,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync
 
 from .blockwise_inverse import invert_unit_lower_16x16_fragments
 from .contract import tma_divisibility
@@ -165,11 +166,13 @@ TSTATE_COUNTS = (4, 4, 1, 1, 4, 8, 1, 1, 1, 1)
 def _raw_beta_wait(raw, beta, n):
     """CG1's waits on chunk ``n``'s ``raw`` and ``beta`` stages, driven by one shared counter
     (the upstream raw_index): both are ``RAW_STAGES``-stage rings CG1 consumes once per chunk, in
-    order. Returns the stage."""
+    order; then ``tcgen05.fence::after_thread_sync`` as after a managed wait in a TMEM role.
+    Returns the stage."""
     stage = n % RAW_STAGES
     phase = (n // RAW_STAGES) & 1
     cute.arch.mbarrier_wait(raw.full_barrier(stage), phase)
     cute.arch.mbarrier_wait(beta.full_barrier(stage), phase)
+    tcgen05_after_thread_sync()
     return stage
 
 

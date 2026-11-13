@@ -13,6 +13,8 @@ import torch
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.arch import inline_ptx
 
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
+
 from .ptx import elect_sync, f16x2_to_f32, fmul2, fp32_to_fp16
 from .ragged import RaggedTma, ragged_load
 
@@ -54,19 +56,24 @@ def load_rows(
 def spin_wait(bar, phase):
     """Hint-less ``mbarrier.try_wait.parity`` loop (the upstream kernels' ``spin=True`` wait):
     ptxas keeps it a ``SYNCS.PHASECHK`` retry branch, without the ``NANOSLEEP`` of the
-    suspend-hint form that ``cute.arch.mbarrier_wait`` (and so a channel wait) emits."""
+    suspend-hint form that ``cute.arch.mbarrier_wait`` (and so a channel wait) emits. Then
+    ``tcgen05.fence::after_thread_sync``, which orders the caller's later tcgen05 operations
+    after the wait (PTX ISA 9.7.18.6.3), as a managed wait in a TMEM role does."""
     inline_ptx(
         "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
         "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 P1, [$0], $1;\n\t"
         "@P1 bra.uni DONE;\n\tbra.uni LAB_WAIT;\n\tDONE:\n\t}",
         read_only_args=[Int32(bar.toint()), Int32(phase)],
     )
+    tcgen05_after_thread_sync()
 
 
 @cute.jit
 def warp_arrive(bar):
-    """One arrival per warp after all its lanes (the ``Warps`` signal): the warp sync orders
-    every lane's prior accesses and completion waits before the elected lane's arrive."""
+    """One arrival per warp after all its lanes (the ``Warps`` signal): every lane fences its
+    tcgen05 operations (``tcgen05.fence::before_thread_sync``), then the warp sync orders every
+    lane's prior accesses and completion waits before the elected lane's arrive."""
+    tcgen05_before_thread_sync()
     cute.arch.sync_warp()
     if elect_sync():
         cute.arch.mbarrier_arrive(bar)
@@ -246,12 +253,14 @@ def resolve_paged_state(batch, state_indices, has_initial_state):
 @cute.jit
 def raw_beta_wait(raw, beta, n, stages: cutlass.Constexpr[int]):
     """Waits on chunk ``n``'s stages of two ``stages``-deep rings that a compute group consumes
-    once per chunk, in order, driven by one shared counter through the end accessors. Returns
-    the stage."""
+    once per chunk, in order, driven by one shared counter through the end accessors, then
+    ``tcgen05.fence::after_thread_sync`` as after a managed wait in a TMEM role. Returns the
+    stage."""
     stage = n & (stages - 1)
     phase = (n // stages) & 1
     cute.arch.mbarrier_wait(raw.full_barrier(stage), phase)
     cute.arch.mbarrier_wait(beta.full_barrier(stage), phase)
+    tcgen05_after_thread_sync()
     return stage
 
 
