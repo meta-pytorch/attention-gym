@@ -720,12 +720,13 @@ dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 ```
 
 Each `bounds` row names one local `cu_seqlens` segment (or a whole-chunk run inside one), and
-one call returns every row's map; the context-parallel routing supplies the rows. The Triton
-summaries split long ranges into work items when their static budget permits, then compose the
-partial maps on the device. The budget depends on the span length, head count, selected tile
-size, and SM count; budget 1 scans whole ranges in one kernel
-without a planner or compose launch. Work planning reads only device values, preserving CUDA Graph
-replay across different `bounds` values of the same shape.
+one call returns every row's map; the context-parallel routing supplies the rows. Both backends
+split long ranges into pieces when the span's shape leaves SMs idle, scan the pieces in parallel
+and compose their maps on the device (the Triton summaries through work items within a static
+budget, warpdrive's as described under [warpdrive local execution](#warpdrive-local-execution)).
+The split depends on the span length, sequence and head counts, selected tile size and SM count;
+unsplit, whole ranges scan in one kernel without a planner or compose launch. Planning reads only
+device values, preserving CUDA Graph replay across different `bounds` values of the same shape.
 `attn_gym.linear.context_parallel` holds the pure-PyTorch algebra on summaries (`merge_state`,
 `compose_summaries`, `neutral_summary`).
 
@@ -868,17 +869,28 @@ checkpoints, then the backward consumes them together with the exit cotangent, r
 token gradients and the entry-state cotangent. `state_grad_summaries` produces each
 subsequence's `[C; R]` map: `C` is the entry-state cotangent of the range's outputs under a zero
 exit cotangent (`kda_bprop_summary`, `gdn_bprop_summary`), and `R` is the forward transition
-transposed. No fused factors are computed anywhere on the warpdrive path. Each summary kernel runs
-one work item per selected (subsequence, head), so it fills few SMs; GDN overlaps the forward and
-reverse passes behind `state_grad_summaries` on a side stream.
+transposed. No fused factors are computed anywhere on the warpdrive path. The summary kernels scan
+a range's 16-token (KDA) or 64-token (GDN) chunks serially, one CTA per (range, head), so a few
+long subsequences on few heads would leave most SMs idle. When the span's shape does that
+(NOTE [Summary split cost] in `warpdrive/drivers/plan.py`), a device planner cuts each selected
+subsequence into pieces of one span length, the kernels summarize every (piece, head) in
+parallel, and the piece state chain composes each subsequence's pieces in order (in reverse for
+`[C; R]`) in 3xTF32. On a GB300 this takes the KDA forward summary of a single 8192-token
+subsequence at four heads from about 550 µs to about 85 µs (CUDA-graph time). GDN overlaps the
+forward and reverse passes behind `state_grad_summaries` on a side stream.
 
 *Numerics.* KDA's warpdrive kernels chunk at 16 tokens: a document cut on 16-token boundaries
 whose fragments exchange warpdrive's own state and cotangent reproduces the unsharded warpdrive
 gradients bit for bit, but the composed entry states do not, so KDA under CP is its own numerical
-baseline, neither the fused CP baseline nor unsharded warpdrive. GDN's warpdrive kernels chunk at
-64 tokens like the fused ones; sharded GDN matches the FP32 reference as closely as unsharded
-warpdrive and fused CP do (`test/test_delta_rule_stages.py`). The staged handles and this recipe
-are eager-only; `torch.compile` is not supported through them.
+baseline, neither the fused CP baseline nor unsharded warpdrive. A split summary's bits depend on
+the span's token, sequence and head counts and the SM count (they fix the piece length), not on
+the bounds or on other sequences' contents; against FP64 it is as accurate as the unsplit scan,
+whose 16-bit state operands already round the maps by about 4e-3 (bias) to 2e-2 (transition)
+relative L2 over thousands of tokens, so split and unsplit maps differ at that level
+(`test/test_wd_summary_split.py`). GDN's warpdrive kernels chunk at 64 tokens like the fused
+ones; sharded GDN matches the FP32 reference as closely as unsharded warpdrive and fused CP do
+(`test/test_delta_rule_stages.py`). The staged handles and this recipe are eager-only;
+`torch.compile` is not supported through them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 

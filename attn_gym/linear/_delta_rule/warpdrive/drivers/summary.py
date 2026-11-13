@@ -7,13 +7,21 @@ Forward maps pack ``[B; A]`` for ``exit = entry @ A + B``; reverse maps pack ``[
 state H) and A (the stored-domain transition ``M_buf``); one ``kda_bprop_summary`` launch writes
 C (the entry cotangent under a zero exit cotangent). GDN does the same in its own 64-token chunks
 with ``gdn_summary`` and ``gdn_bprop_summary``, after one ``gdn_tinv`` pass for the chunk
-inverses both read. Every work item is the whole, uncut sequence, so the arithmetic is
-independent of sequence ownership and packed token count.
+inverses both read.
 
-Bounds select whole packed sequences on device: a Triton selector writes one uncut work item
-per (sequence, head) and neutralizes unrequested sequences to zero width, and a gather maps each
-requested bound to its sequence-indexed result. Bounds values may change between CUDA Graph
-replays; nothing here synchronizes with the host.
+Each call either runs every sequence uncut or splits them (``plan.summary_span``, NOTE [Summary
+split cost]). Uncut, one work item per (sequence, head) walks the whole sequence, so the
+arithmetic is independent of sequence ownership and packed token count. Split, a planner cuts
+every selected sequence into pieces of ``span`` chunks (the last one shorter), the summary
+kernels write one map per (piece, head), and ``piece_chain.state_chain`` composes each
+sequence's piece maps in order (``[B; A] = [0; I]`` chained through every piece, reversed for
+``[C; R]``) in 3xTF32. ``span`` follows the call's shapes and SM count, so a sequence's bits
+depend on its own tokens and those, not on the other sequences or the bounds.
+
+Bounds select whole packed sequences on device: the selector (uncut) or the planner (split)
+writes work items only for requested sequences, and a gather maps each requested bound to its
+sequence-indexed result. Bounds values may change between CUDA Graph replays; nothing here
+synchronizes with the host.
 """
 
 from __future__ import annotations
@@ -29,9 +37,17 @@ from attn_gym._backends.cute.utils import initialized_cuda_device
 from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.utils import cdiv, fork_join_streams
 
-from .. import gdn_bprop_summary, gdn_summary, gdn_tinv, kda_bprop_summary, kda_common, kda_summary
+from .. import (
+    gdn_bprop_summary,
+    gdn_summary,
+    gdn_tinv,
+    kda_bprop_summary,
+    kda_common,
+    kda_summary,
+    piece_chain,
+)
 from ..work_tables import WORK_ITEM_FIELDS
-from .plan import int32
+from .plan import SummaryCost, int32, summary_span
 
 # Staged tensors: natural-log FP32 gate (per channel for KDA, per head for GDN), FP32
 # post-sigmoid beta, normalized keys.
@@ -79,6 +95,76 @@ def _select_summary_work(
     tl.store(work + (seq * HEADS + head) * FIELDS + fields, row, fields < FIELDS)
     if (seq == 0) & (head == 0):
         tl.store(count, tl.num_programs(0) * HEADS)
+
+
+@triton.jit(debug=True, do_not_specialize=["sequences", "rows", "tokens", "span", "capacity"])
+def _plan_summary_pieces(
+    cu,
+    bounds,
+    cu_pieces,
+    main_rows,
+    work,
+    count,
+    sequences,
+    rows,
+    tokens,
+    span,
+    capacity,
+    HEADS: tl.constexpr,
+    ROW_BLOCK: tl.constexpr,
+    PIECE_BLOCK: tl.constexpr,
+    FIELDS: tl.constexpr,
+    CHUNK: tl.constexpr,
+):
+    """Cut every selected sequence into pieces of ``span`` chunks, the last one shorter.
+
+    One program walks the sequences in order. ``cu_pieces[: capacity + 1]`` gets the flat piece
+    starts padded with the stream end, so the pieces tile the stream like a ``cu_seqlens`` (an
+    unselected or empty sequence is one piece); sequence ``s`` owns piece rows ``main_rows[s] ..
+    main_rows[s + 1]`` (pieces times ``HEADS``, the ``piece_chain`` table). Work items, one per
+    (selected piece, head) and named by piece, go to the first ``count[0]`` rows of ``work``.
+    ``ROW_BLOCK`` and ``PIECE_BLOCK`` are powers of two covering ``rows`` and any sequence's
+    pieces. The offsets are checked as in :func:`_select_summary_work`.
+    """
+    bound = tl.arange(0, ROW_BLOCK)
+    lo = tl.load(bounds + 2 * bound, bound < rows, other=-1)
+    hi = tl.load(bounds + 2 * bound + 1, bound < rows, other=-1)
+    pieces = tl.arange(0, PIECE_BLOCK)
+    fields = tl.arange(0, 16)
+    piece = 0
+    item = 0
+    for seq in range(sequences):
+        start, stop = tl.load(cu + seq), tl.load(cu + seq + 1)
+        valid = (start <= stop) & ((seq != 0) | (start == 0))
+        valid &= (seq != sequences - 1) | (stop <= tokens)
+        tl.device_assert(valid, "invalid packed cu_seqlens")
+        matched = tl.sum(((lo == start) & (hi == stop) & (lo < hi)).to(tl.int32), 0) > 0
+        selected = (rows == 0) | matched
+        chunks = tl.cdiv(stop - start, CHUNK)
+        count_here = tl.where(selected, tl.maximum(tl.cdiv(chunks, span), 1), 1)
+        piece_start = tl.minimum(start + pieces.to(tl.int64) * span * CHUNK, stop)
+        piece_stop = tl.minimum(piece_start + span * CHUNK, stop)
+        own = pieces < count_here
+        tl.store(cu_pieces + piece + pieces, piece_start.to(tl.int32), own)
+        tl.store(main_rows + seq, piece * HEADS)
+        piece_chunks = tl.cdiv(piece_stop - piece_start, CHUNK)
+        index = (piece + pieces)[:, None]
+        row = tl.where((fields == 0) | (fields >= 8), index, 0)
+        row = tl.where((fields == 3) | (fields == 5), piece_chunks[:, None], row)
+        row = tl.where(fields == 6, piece_start[:, None], row)
+        row = tl.where(fields == 7, piece_stop[:, None], row).to(tl.int32)
+        mask = (own & selected)[:, None] & (fields < FIELDS)
+        for head in range(HEADS):
+            head_row = tl.where(fields == 1, head, row)
+            offsets = (item + pieces[:, None] * HEADS + head) * FIELDS + fields
+            tl.store(work + offsets, head_row, mask)
+        item += tl.where(selected, count_here * HEADS, 0)
+        piece += count_here
+    tl.store(main_rows + sequences, piece * HEADS)
+    end = tl.load(cu + sequences)
+    for tail in range(piece, capacity + 1, PIECE_BLOCK):
+        tl.store(cu_pieces + tail + pieces, end, tail + pieces <= capacity)
+    tl.store(count, item)
 
 
 @triton.jit(do_not_specialize=["sequences"])
@@ -146,11 +232,19 @@ def _summary_rows(
 
 @dataclass(frozen=True)
 class _Launch:
-    """Device-owned scheduling buffers for one selected uncut summary launch."""
+    """Device-owned scheduling buffers for one selected summary launch: uncut, or split into
+    pieces whose maps the chain composes through ``main_rows``."""
 
     work_items: torch.Tensor
     work_count: torch.Tensor
     counters: torch.Tensor
+    map_rows: int  # rows of the kernels' maps: pieces when split, else sequences
+    cu_pieces: torch.Tensor | None = None  # split: the pieces as packed offsets
+    main_rows: torch.Tensor | None = None  # split: each sequence's piece rows
+
+    @property
+    def split(self) -> bool:
+        return self.cu_pieces is not None
 
     @classmethod
     def prepare(
@@ -160,27 +254,59 @@ class _Launch:
         heads: int,
         bounds: torch.Tensor | None,
         chunk: int,
+        cost: SummaryCost | None,
     ) -> _Launch:
         device = cu_seqlens.device
         sequences = cu_seqlens.shape[0] - 1
-        work_items = torch.empty(
-            sequences * heads, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
-        )
-        work_count = int32(1, device)
         rows = 0 if bounds is None else bounds.shape[0]
-        _select_summary_work[(sequences, heads)](
+        row_block = max(1, triton.next_power_of_2(rows))
+        span = summary_span(tokens, sequences, heads, device, b_t=chunk, cost=cost) if cost else 0
+        work_count = int32(1, device)
+        if not span:
+            work_items = torch.empty(
+                sequences * heads, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
+            )
+            _select_summary_work[(sequences, heads)](
+                cu_seqlens,
+                work_count if bounds is None else bounds,
+                work_items,
+                work_count,
+                rows,
+                tokens,
+                heads,
+                row_block,
+                WORK_ITEM_FIELDS,
+                chunk,
+            )
+            return cls(work_items, work_count, int32(2, device), sequences)
+        # Sequence s has at most ceil(chunks_s / span) pieces, and the chunks add up to at most
+        # ceil(tokens / chunk) + sequences (each sequence may end in a partial chunk).
+        per_sequence = cdiv(cdiv(tokens, chunk), span)
+        capacity = cdiv(cdiv(tokens, chunk) + sequences, span) + sequences
+        cu_pieces = int32(capacity + 1, device)
+        main_rows = int32(sequences + 1, device)
+        work_items = torch.empty(
+            capacity * heads, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
+        )
+        _plan_summary_pieces[(1,)](
             cu_seqlens,
             work_count if bounds is None else bounds,
+            cu_pieces,
+            main_rows,
             work_items,
             work_count,
+            sequences,
             rows,
             tokens,
+            span,
+            capacity,
             heads,
-            max(1, triton.next_power_of_2(rows)),
+            row_block,
+            triton.next_power_of_2(per_sequence),
             WORK_ITEM_FIELDS,
             chunk,
         )
-        return cls(work_items, work_count, int32(2, device))
+        return cls(work_items, work_count, int32(2, device), capacity, cu_pieces, main_rows)
 
     def reset(self) -> None:
         """The work-stealing counters must be zero before every launch, including replays."""
@@ -309,6 +435,45 @@ def _launches(tokens: int, bounds: torch.Tensor | None) -> bool:
     return tokens != 0 and (bounds is None or bounds.shape[0] != 0)
 
 
+# Split costs per variant and direction (NOTE [Summary split cost]). A reverse step pays both
+# summary kernels, which share one composing chain; GDN runs the two concurrently.
+KDA_FORWARD_COST = SummaryCost(compose=2.0, overhead=3.0, fill=2.0)
+KDA_REVERSE_COST = SummaryCost(compose=0.8, overhead=2.0, fill=0.0)
+GDN_FORWARD_COST = SummaryCost(compose=1.8, overhead=2.0, fill=3.0)
+GDN_REVERSE_COST = SummaryCost(compose=1.0, overhead=2.0, fill=0.75, kernels=2)
+# The composing chain is latency bound, so its finest tensor-core blocks run fastest.
+CHAIN_ROWS = 16
+
+
+def _compose(
+    bias: torch.Tensor,
+    transition: torch.Tensor,
+    launch: _Launch,
+    sequences: int,
+    *,
+    reverse: bool,
+) -> torch.Tensor:
+    """Each sequence's piece maps (bias ``[pieces, H, V, K]``, transition ``[pieces, H, K, K]``)
+    composed into its ``[S, H, V + K, K]`` map: ``[B; A]`` through the pieces in order, or with
+    ``reverse`` ``[C; R]`` through their transposes last piece first (``R = A.T``)."""
+    pieces, heads, dim_v, dim_k = bias.shape
+    maps = torch.empty(
+        sequences, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=bias.device
+    )
+    piece_chain.state_chain(
+        bias,
+        transition,
+        torch.empty(  # unused
+            pieces, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=bias.device
+        ),
+        launch.main_rows,
+        transpose=reverse,
+        rows=CHAIN_ROWS,
+        final=maps,
+    )
+    return maps
+
+
 def build_state_summaries(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -332,18 +497,26 @@ def build_state_summaries(
     with initialized_cuda_device(k):
         sequences, heads = cu_seqlens.shape[0] - 1, k.shape[2]
         dim_v, dim_k = v.shape[-1], k.shape[-1]
-        maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
-        if _launches(k.shape[1], bounds):
-            launch = _Launch.prepare(cu_seqlens, k.shape[1], heads, bounds, kda_common.B_T)
+        if not _launches(k.shape[1], bounds):
+            maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
+            return _summary_rows(maps, cu_seqlens, bounds)
+        launch = _Launch.prepare(
+            cu_seqlens, k.shape[1], heads, bounds, kda_common.B_T, KDA_FORWARD_COST
+        )
+        inputs = (k[0], v[0], gate[0], beta[0])
+        if launch.split:
+            bias = torch.empty(
+                launch.map_rows, heads, dim_v, dim_k, dtype=torch.float32, device=k.device
+            )
+            transition = torch.empty(
+                launch.map_rows, heads, dim_k, dim_k, dtype=torch.float32, device=k.device
+            )
+            _forward_summary(*inputs, bias, transition, launch, fastmath=fastmath)
+            maps = _compose(bias, transition, launch, sequences, reverse=False)
+        else:
+            maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
             _forward_summary(
-                k[0],
-                v[0],
-                gate[0],
-                beta[0],
-                maps[:, :, :dim_v],
-                maps[:, :, dim_v:],
-                launch,
-                fastmath=fastmath,
+                *inputs, maps[:, :, :dim_v], maps[:, :, dim_v:], launch, fastmath=fastmath
             )
         return _summary_rows(maps, cu_seqlens, bounds)
 
@@ -367,8 +540,8 @@ def build_state_grad_summaries(
     C is the native entry cotangent under a zero exit cotangent. R is ``A.T`` from the forward
     summary (the exact adjoint of right-multiplication by A) or, with
     ``transpose_forward_transition=False``, a second reverse launch seeded with the identity exit
-    cotangent and zero ``d_output`` (requires ``V == K``). Inputs, bounds and ``fastmath``
-    follow :func:`build_state_summaries`.
+    cotangent and zero ``d_output`` (requires ``V == K``; never split). Inputs, bounds and
+    ``fastmath`` follow :func:`build_state_summaries`.
     """
     _validate(
         {"q": q, "k": k, "v": v, "gate": gate, "beta": beta, "d_output": d_output},
@@ -378,29 +551,33 @@ def build_state_grad_summaries(
     with initialized_cuda_device(q):
         sequences, heads = cu_seqlens.shape[0] - 1, q.shape[2]
         dim_v, dim_k = d_output.shape[-1], k.shape[-1]
-        maps = _identity_maps(sequences, heads, dim_v, dim_k, q.device)
         if not _launches(q.shape[1], bounds):
+            maps = _identity_maps(sequences, heads, dim_v, dim_k, q.device)
             return _summary_rows(maps, cu_seqlens, bounds)
+        if not transpose_forward_transition and dim_v != dim_k:
+            raise ValueError("the identity reverse probe requires V == K")
+        cost = KDA_REVERSE_COST if transpose_forward_transition else None
+        launch = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds, kda_common.B_T, cost)
+        rows = launch.map_rows
+        if launch.split:
+            maps = torch.empty(  # the pieces' C
+                rows, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
+            )
+        else:
+            maps = _identity_maps(sequences, heads, dim_v, dim_k, q.device)
         if transpose_forward_transition:
-            forward = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds, kda_common.B_T)
-            state = torch.empty(
-                sequences, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
+            state = torch.empty(  # unused
+                rows, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
             )
             transition = torch.empty(
-                sequences, heads, dim_k, dim_k, dtype=torch.float32, device=q.device
+                rows, heads, dim_k, dim_k, dtype=torch.float32, device=q.device
             )
             _forward_summary(
-                k[0], v[0], gate[0], beta[0], state, transition, forward, fastmath=fastmath
+                k[0], v[0], gate[0], beta[0], state, transition, launch, fastmath=fastmath
             )
-            maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
-        elif dim_v != dim_k:
-            raise ValueError("the identity reverse probe requires V == K")
-        launch = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds, kda_common.B_T)
+        operands = (q[0], k[0], gate[0], beta[0])
         _reverse_summary(
-            q[0],
-            k[0],
-            gate[0],
-            beta[0],
+            *operands,
             d_output[0],
             cu_seqlens,
             scale,
@@ -409,17 +586,18 @@ def build_state_grad_summaries(
             launch,
             fastmath=fastmath,
         )
-        if not transpose_forward_transition:
+        if launch.split:
+            maps = _compose(maps, transition, launch, sequences, reverse=True)
+        elif transpose_forward_transition:
+            maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
+        else:
             identity = (
                 torch.eye(dim_k, dtype=torch.float32, device=q.device)
-                .expand(sequences, heads, -1, -1)
+                .expand(rows, heads, -1, -1)
                 .contiguous()
             )
             _reverse_summary(
-                q[0],
-                k[0],
-                gate[0],
-                beta[0],
+                *operands,
                 torch.zeros_like(d_output[0]),
                 cu_seqlens,
                 scale,
@@ -439,13 +617,28 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 def _gdn_tinv(
     k: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor, cu_seqlens: torch.Tensor
 ) -> torch.Tensor:
-    """``gdn_tinv``'s chunk-inverse tiles for every sequence: both GDN summaries read them."""
+    """``gdn_tinv``'s chunk-inverse tiles for every sequence (or piece) of ``cu_seqlens``: both
+    GDN summaries read them."""
     tokens, heads = gate.shape
     rows = gdn_tinv.tinv_rows(tokens, cu_seqlens.shape[0] - 1)
     tinv = torch.empty(rows, heads, gdn_tinv.B_T, gdn_tinv.B_T, dtype=k.dtype, device=k.device)
     row_table = int32(rows * 4, k.device).view(rows, 4)
     gdn_tinv.gdn_tinv(k, gate, beta, cu_seqlens, tinv, row_table, int32(1, k.device))
     return tinv
+
+
+def _gdn_launch(
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    bounds: torch.Tensor | None,
+    cost: SummaryCost,
+) -> tuple[_Launch, torch.Tensor]:
+    """The selected work and the chunk inverses of its sequences or pieces."""
+    launch = _Launch.prepare(cu_seqlens, k.shape[0], gate.shape[1], bounds, gdn_summary.B_T, cost)
+    tinv = _gdn_tinv(k, gate, beta, launch.cu_pieces if launch.split else cu_seqlens)
+    return launch, tinv
 
 
 def build_gdn_state_summaries(
@@ -471,22 +664,26 @@ def build_gdn_state_summaries(
             maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
             return _summary_rows(maps, cu_seqlens, bounds)
         k, v, gate, beta = k[0], v[0], gate[0], beta[0]
-        tinv = _gdn_tinv(k, gate, beta, cu_seqlens)
-        launch = _Launch.prepare(cu_seqlens, k.shape[0], heads, bounds, gdn_summary.B_T)
-        # Every sequence has a work item, so the kernel writes every map, empty ones as [0; I].
-        maps = torch.empty(
-            sequences, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=k.device
-        )
-        gdn_summary.gdn_summary(
-            k,
-            v,
-            gate,
-            tinv,
-            maps[:, :, :dim_v],
-            maps[:, :, dim_v:],
-            launch.work_items,
-            launch.work_count,
-        )
+        launch, tinv = _gdn_launch(k, gate, beta, cu_seqlens, bounds, GDN_FORWARD_COST)
+        items = (launch.work_items, launch.work_count)
+        if launch.split:
+            bias = torch.empty(
+                launch.map_rows, heads, dim_v, dim_k, dtype=torch.float32, device=k.device
+            )
+            transition = torch.empty(
+                launch.map_rows, heads, dim_k, dim_k, dtype=torch.float32, device=k.device
+            )
+            gdn_summary.gdn_summary(k, v, gate, tinv, bias, transition, *items)
+            maps = _compose(bias, transition, launch, sequences, reverse=False)
+        else:
+            # Every sequence has a work item, so the kernel writes every map, empty ones as
+            # [0; I].
+            maps = torch.empty(
+                sequences, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=k.device
+            )
+            gdn_summary.gdn_summary(
+                k, v, gate, tinv, maps[:, :, :dim_v], maps[:, :, dim_v:], *items
+            )
         return _summary_rows(maps, cu_seqlens, bounds)
 
 
@@ -520,19 +717,19 @@ def build_gdn_state_grad_summaries(
             maps = _identity_maps(sequences, heads, dim_v, dim_k, q.device)
             return _summary_rows(maps, cu_seqlens, bounds)
         q, k, v, gate, beta, d_output = (t[0] for t in (q, k, v, gate, beta, d_output))
-        tinv = _gdn_tinv(k, gate, beta, cu_seqlens)
-        launch = _Launch.prepare(cu_seqlens, q.shape[0], heads, bounds, gdn_summary.B_T)
-        maps = torch.empty(
-            sequences, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=q.device
-        )
+        launch, tinv = _gdn_launch(k, gate, beta, cu_seqlens, bounds, GDN_REVERSE_COST)
+        rows = launch.map_rows
+        # Split, the pieces' C; uncut, the maps themselves.
+        map_rows = dim_v if launch.split else dim_v + dim_k
+        maps = torch.empty(rows, heads, map_rows, dim_k, dtype=torch.float32, device=q.device)
         items = (launch.work_items, launch.work_count)
 
         def transition() -> torch.Tensor:
             exit_state = torch.empty(  # unused
-                sequences, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
+                rows, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
             )
             transition = torch.empty(
-                sequences, heads, dim_k, dim_k, dtype=torch.float32, device=q.device
+                rows, heads, dim_k, dim_k, dtype=torch.float32, device=q.device
             )
             gdn_summary.gdn_summary(k, v, gate, tinv, exit_state, transition, *items)
             return transition
@@ -542,11 +739,15 @@ def build_gdn_state_grad_summaries(
                 q, k, gate, d_output, tinv, maps[:, :, :dim_v], *items, scale=scale
             )
 
-        # Both passes run one CTA per selected (sequence, head), a fraction of the SMs: overlap.
+        # Uncut, both passes run one CTA per selected (sequence, head), a fraction of the SMs:
+        # overlap.
         _, transition = fork_join_streams(
             torch.cuda.current_stream(q.device), _side_stream(q.device), transition, bias
         )
-        maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
+        if launch.split:
+            maps = _compose(maps, transition, launch, sequences, reverse=True)
+        else:
+            maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
         return _summary_rows(maps, cu_seqlens, bounds)
 
 
