@@ -307,7 +307,7 @@ class ContextParallelRouting:
             with ``world * slots`` (the identity).
         successors: Same for each fragment's successors, in reverse token order.
         predecessor_links: ``int32 [slots, 3]`` checkpoint links: chain length, next local
-            row (or -1), and number of checkpoints on a root (zero on continuation rows).
+            row (or -1), and is_root (one on roots, zero on continuation rows).
             Linked rows are increasing prefixes of one document's predecessor chain.
         successor_links: Same for reverse folds, grouped by each fragment's last document.
             Copy links together with their source tables when replacing a captured layout.
@@ -618,7 +618,6 @@ def _checkpoint_links(
             assert chains[following][: len(chains[previous])] == chains[previous]
             links[previous][1] = following
             links[following][2] = 0
-        links[rows[0]][2] = len(rows)
     return links
 
 

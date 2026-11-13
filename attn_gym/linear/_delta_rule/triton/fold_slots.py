@@ -29,6 +29,8 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.triton.utils import ptr_offset
+
 
 @triton.jit
 def fold_slots_kernel(
@@ -111,19 +113,24 @@ def fold_slots_linked_kernel(
     head = tl.program_id(1).to(tl.int64)
     rows = tl.program_id(2) * BM + tl.arange(0, BM)
     cols = tl.arange(0, K)
-    checkpoints = tl.load(links + row * 3 + 2)
+    is_root = tl.load(links + ptr_offset((row, 2), (3, 1)))
+    if is_root == 0:
+        return
     acc = tl.zeros([BM, K], dtype=tl.float32)
     start = 0
-    for checkpoint in range(checkpoints):
-        end = tl.load(links + row * 3)
+    while row != -1:
+        end = tl.load(links + ptr_offset((row, 0), (3, 1)))
         for step in tl.range(start, end, num_stages=2):
-            slot = tl.load(sources + row * chain_stride + step).to(tl.int64)
-            base = maps + (slot * H + head) * (V + K) * K
-            transition = tl.load(base + (V + cols[:, None]) * K + cols[None, :])
-            bias = tl.load(base + rows[:, None] * K + cols[None, :])
+            slot = tl.load(sources + ptr_offset((row, step), (chain_stride, 1))).to(tl.int64)
+            base = maps + ptr_offset((slot, head), (H * (V + K) * K, (V + K) * K))
+            transition = tl.load(base + ptr_offset((V + cols[:, None], cols[None, :]), (K, 1)))
+            bias = tl.load(base + ptr_offset((rows[:, None], cols[None, :]), (K, 1)))
             acc = tl.dot(acc, transition, input_precision="ieee") + bias
-        tl.store(states + (row * H + head) * V * K + rows[:, None] * K + cols[None, :], acc)
-        row = tl.load(links + row * 3 + 1).to(tl.int64)
+        output_offset = ptr_offset(
+            (row, head, rows[:, None], cols[None, :]), (H * V * K, V * K, K, 1)
+        )
+        tl.store(states + output_offset, acc)
+        row = tl.load(links + ptr_offset((row, 1), (3, 1))).to(tl.int64)
         start = end
 
 
@@ -132,8 +139,9 @@ def fold_slots_linked(
 ) -> torch.Tensor:
     """Fold nested source chains once, storing the state at each linked row.
 
-    Each int32 link row is (length, next row, checkpoint count). Roots own disjoint
-    chains of linked rows; continuation rows have count zero. Empty rows are singleton roots.
+    Each int32 link row is (length, next row, is_root). Roots own disjoint, acyclic
+    chains ending at next row -1; continuation rows have is_root zero. Empty rows are singleton
+    roots with is_root one.
     The caller builds links on the host and updates them together with sources.
     Singleton roots also represent independent folds without changing arithmetic.
     """

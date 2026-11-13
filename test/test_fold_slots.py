@@ -80,7 +80,7 @@ def test_linked_fold_matches_independent_bits_and_replays(key, value, reverse):
     initial = routing((0, 128), fragments)
     sources = getattr(initial, direction)
     links = getattr(initial, link_name)
-    assert (links[:, 2] > 1).any()
+    assert (links[:, 1] != -1).any()
     actual = fold_slots_linked(maps, sources, links)
     assert torch.equal(actual, fold_slots_fused(maps, sources))
     torch.cuda.synchronize()

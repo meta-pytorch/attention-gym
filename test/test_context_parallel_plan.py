@@ -194,20 +194,23 @@ def test_checkpoint_links_partition_the_original_chains(cu_seqlens, fragments):
             (routing.predecessors, routing.predecessor_links),
             (routing.successors, routing.successor_links),
         ):
-            seen = []
-            for root, (_, _, checkpoints) in enumerate(links.tolist()):
+            seen = set()
+            for root, (_, _, is_root) in enumerate(links.tolist()):
+                assert is_root in (0, 1)
+                if not is_root:
+                    continue
                 row, prefix = root, []
-                for _ in range(checkpoints):
+                while row != -1:
                     assert 0 <= row < routing.slots
-                    length, following, _ = links[row].tolist()
+                    assert row not in seen
+                    length, following, root_flag = links[row].tolist()
+                    assert root_flag == (row == root)
                     chain = sources[row, :length].tolist()
                     assert chain[: len(prefix)] == prefix
                     assert length == int((sources[row] != routing.world * routing.slots).sum())
-                    seen.append(row)
+                    seen.add(row)
                     prefix, row = chain, following
-                if checkpoints:
-                    assert row == -1
-            assert sorted(seen) == list(range(routing.slots))
+            assert seen == set(range(routing.slots))
 
 
 def test_plan_cuts_fragments_at_sequences_and_orders_neighbors():
