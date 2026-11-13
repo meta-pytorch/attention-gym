@@ -41,17 +41,21 @@ def _expected_from_warpdrive(inputs, initial_state, cu_seqlens):
     return output, final_state
 
 
-def test_warpdrive_paged_matches_gather_scatter() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16])
+def test_warpdrive_paged_matches_gather_scatter(
+    pool_dtype: torch.dtype, io_dtype: torch.dtype
+) -> None:
     """Resumed, fresh, empty, and null routes match non-paged warpdrive bitwise."""
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
-        (65, 0, 0, 0, 127, 64), key_heads=1, value_heads=4, seed=11
+        (65, 0, 0, 0, 127, 64), key_heads=1, value_heads=4, seed=11, dtype=io_dtype
     )
     state_indices = torch.tensor([4, 2, 5, 0, 0, 1], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False, True, True, True, False], device="cuda")
     # Null-route padding is allowed to contain arbitrary values, including NaNs.
     for tensor in (q, k, value, gate, beta):
         tensor[:, 65:192] = torch.nan
-    storage, pool = strided_state_pool(6, 4, 128, 128, prefix=0, suffix=32)
+    storage, pool = strided_state_pool(6, 4, 128, 128, prefix=0, suffix=32, dtype=pool_dtype)
     expected_storage = storage.clone()
     expected_pool = expected_storage[:, : pool[0].numel()].view_as(pool)
 
@@ -86,21 +90,24 @@ def test_warpdrive_paged_matches_gather_scatter() -> None:
     torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
 
 
-def test_warpdrive_paged_dense_batch_without_mask_seeds_every_slot() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_dense_batch_without_mask_seeds_every_slot(
+    pool_dtype: torch.dtype,
+) -> None:
     """Dense inputs lower to packed and ``has_initial_state=None`` resumes every route."""
     q, k, value, gate, beta, _state, _none = make_gdn_test_inputs(
         96, batch=3, key_heads=2, value_heads=2, seed=23
     )
     state_indices = torch.tensor([3, 1, 2], device="cuda", dtype=torch.int32)
-    pool = torch.randn(4, 2, 128, 128, device="cuda")
+    pool = torch.randn(4, 2, 128, 128, device="cuda", dtype=pool_dtype)
     expected_pool = pool.clone()
 
     packed = tuple(t.reshape(1, -1, *t.shape[2:]) for t in (q, k, value, gate, beta))
     cu_seqlens = torch.arange(4, device="cuda", dtype=torch.int32) * 96
     expected_output, final_state = _expected_from_warpdrive(
-        packed, pool[state_indices.long()].clone(), cu_seqlens
+        packed, pool[state_indices.long()].float().clone(), cu_seqlens
     )
-    expected_pool[state_indices.long()] = final_state
+    expected_pool[state_indices.long()] = final_state.to(pool_dtype)
 
     with torch.no_grad():
         output = paged_chunk_gdn(
@@ -111,12 +118,13 @@ def test_warpdrive_paged_dense_batch_without_mask_seeds_every_slot() -> None:
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
 
 
-def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64,), key_heads=1, value_heads=1, seed=1
     )
     state_indices = torch.ones(1, device="cuda", dtype=torch.int32)
-    pool = torch.zeros(2, 1, 128, 128, device="cuda")
+    pool = torch.zeros(2, 1, 128, 128, device="cuda", dtype=pool_dtype)
     with pytest.raises(RuntimeError, match="inference-only"):
         paged_chunk_gdn(
             q.requires_grad_(),
@@ -129,7 +137,9 @@ def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride() -> None:
             cu_seqlens=cu_seqlens,
             kernel_options=_WARPDRIVE,
         )
-    _storage, misaligned = strided_state_pool(2, 1, 128, 128, prefix=0, suffix=17)
+    _storage, misaligned = strided_state_pool(
+        2, 1, 128, 128, prefix=0, suffix=17, dtype=pool_dtype
+    )
     with torch.no_grad(), pytest.raises(TypeError, match="16-byte aligned"):
         paged_chunk_gdn(
             q.detach(),
@@ -142,25 +152,26 @@ def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride() -> None:
             cu_seqlens=cu_seqlens,
             kernel_options=_WARPDRIVE,
         )
-    with torch.no_grad(), pytest.raises(TypeError, match="state pool must use float32"):
+    with torch.no_grad(), pytest.raises(TypeError, match="pool must use float32 or bfloat16"):
         paged_chunk_gdn(
             q.detach(),
             k,
             value,
             gate,
             beta,
-            pool.bfloat16(),
+            pool.half(),
             state_indices,
             cu_seqlens=cu_seqlens,
             kernel_options=_WARPDRIVE,
         )
 
 
-def test_warpdrive_paged_raw_operator_registration() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_raw_operator_registration(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64, 32), key_heads=1, value_heads=2, seed=2
     )
-    pool = torch.zeros(3, 2, 128, 128, device="cuda")
+    pool = torch.zeros(3, 2, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         chunk_gdn_warpdrive_packed_fwd_paged_op,
@@ -179,13 +190,14 @@ def test_warpdrive_paged_raw_operator_registration() -> None:
     )
 
 
-def test_warpdrive_paged_fullgraph_compile_and_cuda_graph_replay() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_fullgraph_compile_and_cuda_graph_replay(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (65, 63), key_heads=1, value_heads=2, seed=7
     )
     state_indices = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
-    seed_pool = torch.randn(3, 2, 128, 128, device="cuda") * 0.01
+    seed_pool = torch.randn(3, 2, 128, 128, device="cuda", dtype=pool_dtype) * 0.01
 
     @torch.compile(fullgraph=True)
     def compiled(q, k, value, gate, beta, pool, state_indices, has_initial_state, cu_seqlens):
@@ -254,12 +266,13 @@ def _paged(inputs, pool, state_indices, cu_seqlens, has_initial_state=None):
         )
 
 
-def test_warpdrive_paged_runs_the_v130_work_table() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_runs_the_v130_work_table(pool_dtype: torch.dtype) -> None:
     """The paged route compiles through the warmup forward bundle."""
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64, 32), key_heads=1, value_heads=2, seed=2
     )
-    pool = torch.zeros(3, 2, 128, 128, device="cuda")
+    pool = torch.zeros(3, 2, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     before = gdn_warmup_forward._compile_warmup_forward.cache_info()
     _paged((q, k, value, gate, beta), pool, state_indices, cu_seqlens)
@@ -267,7 +280,8 @@ def test_warpdrive_paged_runs_the_v130_work_table() -> None:
     assert after.hits + after.misses == before.hits + before.misses + 1
 
 
-def test_warpdrive_paged_negative_and_zero_routes_are_null() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_negative_and_zero_routes_are_null(pool_dtype: torch.dtype) -> None:
     """Non-positive routes zero their output (even over NaN padding) and never touch the pool."""
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64, 96, 32), key_heads=1, value_heads=2, seed=5
@@ -275,11 +289,11 @@ def test_warpdrive_paged_negative_and_zero_routes_are_null() -> None:
     for tensor in (q, k, value, gate, beta):
         tensor[:, :160] = torch.nan
     state_indices = torch.tensor([-1, 0, 2], device="cuda", dtype=torch.int32)
-    pool = torch.randn(3, 2, 128, 128, device="cuda")
+    pool = torch.randn(3, 2, 128, 128, device="cuda", dtype=pool_dtype)
     expected_pool = pool.clone()
     expected_output, final_state = _expected_from_warpdrive(
         tuple(t[:, 160:] for t in (q, k, value, gate, beta)),
-        pool[2:3].clone(),
+        pool[2:3].float().clone(),
         torch.tensor([0, 32], device="cuda", dtype=torch.int32),
     )
     expected_pool[2] = final_state[0]
@@ -293,7 +307,10 @@ def test_warpdrive_paged_negative_and_zero_routes_are_null() -> None:
 
 
 @pytest.mark.parametrize("with_mask", [True, False])
-def test_warpdrive_paged_empty_sequences_clear_fresh_and_preserve_resumed(with_mask: bool) -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_empty_sequences_clear_fresh_and_preserve_resumed(
+    pool_dtype: torch.dtype, with_mask: bool
+) -> None:
     """Empty fresh routes clear their slot; empty resumed and null routes leave the pool alone."""
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (0, 0, 0, 64), key_heads=1, value_heads=2, seed=9
@@ -302,10 +319,10 @@ def test_warpdrive_paged_empty_sequences_clear_fresh_and_preserve_resumed(with_m
     has_initial_state = (
         torch.tensor([False, True, True, True], device="cuda") if with_mask else None
     )
-    pool = torch.randn(4, 2, 128, 128, device="cuda")
+    pool = torch.randn(4, 2, 128, 128, device="cuda", dtype=pool_dtype)
     expected_pool = pool.clone()
     expected_output, final_state = _expected_from_warpdrive(
-        (q, k, value, gate, beta), pool[[0, 0, 0, 3]].clone(), cu_seqlens
+        (q, k, value, gate, beta), pool[[0, 0, 0, 3]].float().clone(), cu_seqlens
     )
     expected_pool[3] = final_state[3]
     if with_mask:
@@ -317,7 +334,10 @@ def test_warpdrive_paged_empty_sequences_clear_fresh_and_preserve_resumed(with_m
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
 
 
-def test_warpdrive_paged_beyond_compaction_capacity_still_clears_fresh_empties() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_beyond_compaction_capacity_still_clears_fresh_empties(
+    pool_dtype: torch.dtype,
+) -> None:
     """More sequences than the compactor's capacity fall back to the full table, which still
     applies the route predicates to every (empty) sequence."""
     num_seqs = ORDER_CAPACITY + 3
@@ -334,7 +354,7 @@ def test_warpdrive_paged_beyond_compaction_capacity_still_clears_fresh_empties()
     state_indices[-1] = 4  # nonempty resumed
     has_initial_state = torch.ones(num_seqs, device="cuda", dtype=torch.bool)
     has_initial_state[:2] = False
-    pool = torch.randn(5, 1, 128, 128, device="cuda")
+    pool = torch.randn(5, 1, 128, 128, device="cuda", dtype=pool_dtype)
     expected_pool = pool.clone()
     seeds = torch.zeros(num_seqs, 1, 128, 128, device="cuda")
     seeds[-1] = pool[4]
@@ -351,11 +371,12 @@ def test_warpdrive_paged_beyond_compaction_capacity_still_clears_fresh_empties()
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
 
 
-def test_warpdrive_paged_driver_rejects_split_and_final_state() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_driver_rejects_split_and_final_state(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64,), key_heads=1, value_heads=1, seed=1
     )
-    pool = torch.zeros(2, 1, 128, 128, device="cuda")
+    pool = torch.zeros(2, 1, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.ones(1, device="cuda", dtype=torch.int32)
     args = (q[0], k[0], value[0], gate[0].float(), beta[0].float(), cu_seqlens)
     with pytest.raises(ValueError, match="paged state"):
@@ -379,18 +400,21 @@ def test_warpdrive_paged_driver_rejects_split_and_final_state() -> None:
         )
 
 
-def test_warpdrive_paged_writes_every_token_up_to_the_last_interval() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_writes_every_token_up_to_the_last_interval(
+    pool_dtype: torch.dtype,
+) -> None:
     """Every token in ``[0, cu_seqlens[-1])`` is written: sequence tokens with their output and
     null-route tokens with zeros. Rows past ``cu_seqlens[-1]`` are unspecified (not written)."""
     q, k, value, gate, beta, _state, _cu = make_gdn_test_inputs(
         (128,), key_heads=1, value_heads=2, seed=3
     )
     cu_seqlens = torch.tensor([0, 32, 96], device="cuda", dtype=torch.int32)
-    pool = torch.zeros(2, 2, 128, 128, device="cuda")
+    pool = torch.zeros(2, 2, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     expected, _final = _expected_from_warpdrive(
         tuple(t[:, 32:96] for t in (q, k, value, gate, beta)),
-        pool[1:2].clone(),
+        pool[1:2].float().clone(),
         torch.tensor([0, 64], device="cuda", dtype=torch.int32),
     )
     _paged((q, k, value, gate, beta), pool.clone(), state_indices, cu_seqlens)
