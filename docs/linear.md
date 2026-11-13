@@ -91,9 +91,9 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
     its no-state local backward, through a diagonal MMA in the Q/K/V dtype rather than in FP32.
 
 The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
-and equal `K = V` of 64 or 128, but has no cuDNN runtime dependency. Its scalar natural-log gate
-is not lower-bounded:
-kernels contract raw QK/KK before applying masked nonpositive causal decay differences. The public
+and equal `K = V` of 64 or 128, but has no cuDNN runtime dependency. Kernels contract raw QK/KK
+before applying masked nonpositive causal decay differences; the scalar natural-log gate has the
+numerical-range contract below. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
 Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
 wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM100/SM103 and
@@ -101,8 +101,36 @@ portable Triton kernels on other supported architectures. The `K = V = 64` backw
 Triton on every architecture.
 
 The cuDNN chunk backend requires the optional `linear` dependencies and SM100/SM103,
-FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It also consumes the scalar natural-log
-gate without a lower bound and uses exact execution by default.
+FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It uses the same scalar natural-log gate
+contract and exact execution by default.
+
+#### Scalar gate numerical range
+
+Chunk GDN gates must be finite and nonpositive. Both chunk backends accumulate the gates in FP32
+(log2 units) within each 64-token chunk, then subtract prefix sums to obtain causal decay
+exponents. The numerical contract requires finite prefix sums and enough FP32 precision to retain
+these decay differences. Mixing extremely negative isolated gates with ordinary-sized gates can
+lose subsequent small increments; it is not an unrestricted "no lower bound" contract.
+
+For example, the following maximum output errors relative to an independent FP64 token recurrence
+were measured on GB300 (SM103), PyTorch `2.16.0.dev20261112+cu134`, and CuTeDSL 4.8.1, with BF16
+Q/K/V, FP32 gates, two heads, `K = V = 128`, packed lengths `[200, 65, 0, 127]`, and seed 21.
+One gate every 37 tokens has the listed value; other gates
+are in `[-1, 0]`. Error is `max(abs(output - reference)) / max(abs(reference))`:
+
+| Isolated gate | Repo-local fused error | cuDNN error |
+| --- | --- | --- |
+| `-1e4` | 0.6% | 0.6% |
+| `-1e5` | 1.5% | 1.6% |
+| `-1e6` | 7.2% | 13.5% |
+| `-1e7` | 159% | 373% |
+
+Avoid isolated gates of magnitude `1e5` or larger among ordinary-sized gates. Spikes down to `-1e4`
+and uniform gates down to `-1e30` were accurate in this workload; uniform huge gates do not lose
+small increments in the same way. Uniform gates near `-1e38` can overflow the FP32 chunk prefix
+and produce NaNs. These are empirical examples, not a universal safe lower bound: the distribution
+within each chunk matters. Neither backend clamps gates or validates their values. The supported
+isolated and uniform cases are covered by `test/linear/test_gdn_gate_range.py`.
 
 The fused recurrent implementation requires CUDA with Triton, Q/K/V in FP16, BF16, or FP32, and
 `K <= 256`. Packed offsets must begin at zero, be nondecreasing, and end within the physical token
