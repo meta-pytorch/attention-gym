@@ -1,4 +1,5 @@
-"""FP16 warpdrive KDA across the model gate range, against FP64 and the fused FP16 backend.
+"""FP16 warpdrive KDA forward and backward across the model gate range, against FP64 and the
+fused FP16 backend.
 
 FP16 cannot hold the in-chunk decay factors 2^g and 2^-g (their ratio reaches 2^121 at the
 gate bound), so the FP16 kernels form the in-chunk products from TF32 decay operands.
@@ -110,3 +111,38 @@ def test_fp16_forward_matches_fp64_across_the_gate_range(plan, gate, stateful) -
         assert_matches_low_precision_reference(
             final_state, expected_final, fused_final, "final state", source_dtype=torch.half
         )
+
+
+@pytest.mark.parametrize("states", ["no-state", "exit", "entry+exit"])
+@pytest.mark.parametrize("gate", GATES, ids=str)
+def test_fp16_backward_matches_fp64_across_the_gate_range(plan, gate, states) -> None:
+    """The local backward, the exit-cotangent backward, and the native stateful backward with
+    its d_initial_state, all through ``chunk_kda``."""
+    q, k, v, g, beta, state = _inputs(gate, stateful=states == "entry+exit")
+    cu_seqlens = cumulative_sequence_offsets(LENGTHS)
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    d_output = torch.randn(v.shape, device="cuda", generator=generator).half()
+    final_shape = (len(LENGTHS), HEADS, D, D)
+    d_final_state = torch.randn(final_shape, device="cuda", generator=generator) / 8
+    output_final_state = states != "no-state"
+
+    def grads(op, *inputs, **options):
+        leaves = [t.detach().clone().requires_grad_() for t in inputs]
+        if state is not None:
+            options["initial_state"] = leaves[5]
+        output, final_state = op(
+            *leaves[:5], cu_seqlens=cu_seqlens, output_final_state=output_final_state, **options
+        )
+        if not output_final_state:
+            return torch.autograd.grad(output, leaves, d_output.to(output.dtype))
+        cotangents = (d_output.to(output.dtype), d_final_state.to(final_state.dtype))
+        return torch.autograd.grad((output, final_state), leaves, cotangents)
+
+    inputs = (q, k, v, g, beta) + (() if state is None else (state,))
+    expected = grads(kda_reference, *(t.double() for t in inputs))
+    actual = grads(chunk_kda, *inputs, kernel_options={"backend": "warpdrive"})
+    fused = grads(chunk_kda, *inputs, kernel_options=FUSED)
+    names = ("dq", "dk", "dv", "dgate", "dbeta", "d_initial_state")[: len(inputs)]
+    for name, got, low, high in zip(names, actual, fused, expected, strict=True):
+        assert_relative_rms_within(got, high, name, max_eps=2.0, source_dtype=torch.half)
+        assert_matches_low_precision_reference(got, high, low, name, source_dtype=torch.half)

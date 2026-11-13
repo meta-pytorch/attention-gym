@@ -96,6 +96,7 @@ KERNELS = [
     ("kda_bprop", "KdaBprop", ("bf16", "fp32", 128, 64, True, False, True, 152), ("fp32",)),
     ("kda_bprop", "KdaBprop", ("fp16", "fp32", 128, 128, False, False, False, 4), ("fp32",)),
     ("kda_bprop", "KdaBprop", ("fp16", "fp32", 64, 128, True, False, True, 152), ("fp32",)),
+    ("kda_bprop", "KdaBprop", ("fp16", "fp32", 128, 128, True, True, True, 152), ("fp32",)),
     (
         "kda_bprop",
         "KdaBprop",
@@ -110,6 +111,7 @@ KERNELS = [
     ("kda_bprop_summary", "KdaBpropSummary", ("fp16", 64, 128, False), ()),
     ("kda_bprop_summary", "KdaBpropSummary", ("fp16", 64, 128, True), ()),
     ("kda_bprop_summary", "KdaBpropSummary", ("fp16", 64, 64, True), ()),
+    ("kda_bprop_summary", "KdaBpropSummary", ("fp16", 128, 128, True), ()),
     ("kda_bprop_summary", "KdaBpropSummary", ("bf16", 128, 128, True, False), ()),
     (
         "kda_prefill",
@@ -186,6 +188,12 @@ KERNELS = [
     (
         "kda_prefill",
         "KdaPrefill",
+        ("fp16", "fp32", 128, 64, 2, True, True, 0, 152),
+        ("fp32", "fp32"),
+    ),
+    (
+        "kda_prefill",
+        "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 0, 152, False),
         ("fp32", "fp32"),
     ),
@@ -210,6 +218,7 @@ KERNELS = [
     ("kda_recompute", "KdaRecompute", ("bf16", "fp32", 128, 128, True, 152), ("fp32", "fp32")),
     ("kda_recompute", "KdaRecompute", ("fp16", "fp32", 128, 128, False, 4), ("fp32", None)),
     ("kda_recompute", "KdaRecompute", ("fp16", "fp32", 64, 128, False, 152), ("fp32", None)),
+    ("kda_recompute", "KdaRecompute", ("fp16", "fp32", 128, 128, True, 152), ("fp32", "fp32")),
     (
         "kda_recompute",
         "KdaRecompute",

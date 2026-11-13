@@ -817,16 +817,7 @@ CP_CASES = [
 @requires_kda_target
 @op_param
 @pytest.mark.parametrize(("cu_seqlens", "layout", "dtype"), CP_CASES)
-def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout, dtype, request):
-    if op is KDA_WARPDRIVE and dtype is torch.float16:
-        # The unsharded warpdrive op itself returns non-finite FP16 outputs for model-range gates:
-        # exp(-cumulative gate) over a 16-token chunk exceeds the FP16 range once gates fall below
-        # -ln 2. Sharding neither causes nor hides that, so pin it here until the kernel is fixed.
-        request.applymarker(
-            pytest.mark.xfail(
-                strict=True, raises=AssertionError, reason="warpdrive FP16 gate overflow"
-            )
-        )
+def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout, dtype):
     inputs = op.make_inputs(cu_seqlens[-1], seed=4, dtype=dtype)
     check_simulated_context_parallel(op, cu_seqlens, layout, inputs, dtype)
 
