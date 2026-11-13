@@ -6,6 +6,11 @@ import pytest
 import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
+
+pytest.importorskip(
+    "attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd", reason="legacy CuTe kernel is not installed"
+)
+
 from attn_gym.testing.kda import bwd_daqk_reference
 
 pytestmark = pytest.mark.skipif(

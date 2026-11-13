@@ -784,8 +784,8 @@ def test_module_source_digest_follows_the_module_closure(synthetic_package):
 
 
 def test_kernel_constants_are_part_of_the_kernel_key():
-    """Inlined constants outside ``cute/`` paths must still affect the key."""
+    """Inlined constants outside the compile module must still affect the key."""
     package = cute_key._PACKAGE_ROOT
-    closure = cute_key.module_closure(package / "linear/kda/fwd/cute/gate_fwd.py")
-    assert package / "linear/kda/constants.py" in closure
+    closure = cute_key.module_closure(package / "linear/_delta_rule/warpdrive/kda_prefill.py")
+    assert package / "linear/_delta_rule/warpdrive/kda_common.py" in closure
     assert package / "linear/short_conv/cute.py" not in closure

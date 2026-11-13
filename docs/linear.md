@@ -164,8 +164,15 @@ native context-parallel summaries, and the per-channel `D=128` gate kernels.
 them. The variable is read on every launch inside the registered operators, so changing it needs
 no recompilation. It exists to validate and measure the portable route on Blackwell before the
 legacy kernels are removed; it does not affect `kernel_options={"backend": "warpdrive"}` kernels.
-Without the optional CuTeDSL dependency every architecture takes the Triton route, except that
-the staged and context-parallel entry points still import the CuTe summary module.
+Without the optional CuTeDSL dependency every architecture takes the Triton route, including the
+staged and context-parallel entry points. Host composition lives in `kda/impl/chunk.py` and
+`_delta_rule/summaries.py`, independently of the legacy kernel files.
+
+The reverse-summary wrapper retains its route-dependent `fastmath=None` default: fast
+exponentials on Triton (including SM100-family GPUs with `ATTN_GYM_LEGACY_CUTE=0`), non-fast on
+legacy CuTe. Pass an explicit `fastmath` value to match a local backward using a different setting;
+staged KDA handles already pass their resolved value. Removing the legacy route therefore keeps
+the current forced-Triton default rather than preserving the former SM100 CuTe default.
 
 #### Scalar gate numerical range
 
