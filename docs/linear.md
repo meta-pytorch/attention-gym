@@ -524,7 +524,11 @@ replays the current partial chunk with `chunk_kda` from the last FP32 boundary s
 makes decode output bitwise-identical to training whenever the training and replay calls run the
 same kernels with the same plan (the example pins `autotune` off). warpdrive, the SM100-family
 default, picks its plan from the packed shape and the SM count, so there the replay and training
-shapes must select the same plan ([Determinism](determinism.md#warpdrive-chunk-kernels)).
+shapes must select the same plan ([Determinism](determinism.md#warpdrive-chunk-kernels)). On the
+Triton fused kernels, a 16-token subchunk whose cumulative gate falls by more than `64 * ln(2)`
+(about 44) in some key channel shifts that key block's factors by a decision that reads all of its
+rows, so a partial-chunk replay that ends inside such a subchunk can differ from training at
+rounding level.
 
 For replay-backed `paged_chunk_kda`, a serving engine can plan its pool before allocating
 device memory. `ReplayState.slot_layout(num_heads, head_dim)` returns the per-slot shape and
