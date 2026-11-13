@@ -145,6 +145,19 @@ tuned kernel in forward and backward under `kernel_options={"autotune": False}` 
   match; `test/test_gather_attn_autotune.py` compares forward outputs and LSE because deterministic
   mode changes its backward schedules.
 
+## Host Work in Capture-Safe Paths
+
+Launch paths run on every step and under CUDA Graph capture:
+
+- Read sizes from host-side shape metadata (tensor shapes and arguments). Never allocate a
+  temporary or launch a kernel just to recover a size.
+- Build only the metadata the selected backend consumes. The backend is host-known, so choose
+  it first and skip another backend's schedules (the warpdrive path builds no fused
+  chunk-offset schedule).
+- Counts derived from device tensor contents (`cu_seqlens` values, work counts) stay on the
+  device: size buffers from shape-derived capacities and pass the counts to kernels. Never read
+  them back, allocate from them on the host, or synchronize.
+
 ## Adding CuTeDSL Kernels
 
 Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache` from

@@ -574,7 +574,8 @@ Every delta-rule token step is affine in the V-major recurrent state, so any tok
 collapses to one FP32 map `H_out = H_in @ A + B`, packed as `[HV, V + K, K] = [bias; transition]`
 (one map per value head; GQA key heads are expanded by the factor kernels).
 Context parallelism is therefore a prefix scan over these summaries, and the same machinery serves
-KDA and GDN (whose scalar per-head gate broadcasts onto the per-channel summary kernels). The
+KDA and GDN (on the fused backend, GDN's scalar per-head gate broadcasts onto the per-channel
+summary kernels; warpdrive has native GDN summary kernels). The
 public surface has three tiers so that new partitionings or communication topologies never add
 options to an op.
 
@@ -751,41 +752,49 @@ heads, packing a document with 40 others instead of at most one moved about 62% 
 elements by one bf16 ulp (relative L2 4.5e-3, within the 1% that the plan tests allow). In those
 public calls without states, its gradients stayed bitwise equal, including through the backward
 piece chain; that observation does not cover the stateful staged gradients of a full context
-parallel step. GDN's staged entry points have no warpdrive backend, so its recipe is
-unaffected. The public warpdrive `chunk_gdn`
+parallel step. The public warpdrive `chunk_gdn`
 forward stayed bitwise across the d_v split and the forward piece chain. Its backward piece chain
 did not: taken for a few long documents, it changed dk, dv, dgate and dbeta at rounding level
-(relative L2 at most 2.3e-4), while dq stayed bitwise.
+(relative L2 at most 2.3e-4), while dq stayed bitwise. GDN's warpdrive recipe runs these kernels,
+so the same holds for it; `test/test_context_parallel_distributed.py` checks the document-aligned
+bits for short documents, which take neither chain.
 
 ### warpdrive local execution
 
-`kernel_options={"backend": "warpdrive"}` runs each rank's local passes with warpdrive's kernels.
-The recipe is the same as for the fused backend: summarize every local range as an affine map of
-its entry state, exchange and compose the maps, then run the local pass from the composed state.
+`kernel_options={"backend": "warpdrive"}` runs each rank's local passes with warpdrive's kernels,
+for KDA (`chunk_kda_prepare`, `context_parallel_kda`) and GDN (`chunk_gdn_prepare`,
+`context_parallel_gdn`). The recipe is the same as for the fused backend: summarize every local
+range as an affine map of its entry state, exchange and compose the maps, then run the local pass
+from the composed state.
 
 *Forward.* `prepare` stores only the inputs; warpdrive keeps its WY factors on chip and never
 writes them out. `state_summaries` produces each range's `[B; A]` map (`S_exit = S_entry @ A + B`)
-by running warpdrive's state-only pass over the range twice: from a zero entry state, whose final
-state is `B`, and from an identity entry state with the value term disabled, whose final state is
-`A`. Which ranges are probed and how their rows are ordered is decided on the device, so the call
+with a native summary kernel (`kda_summary`, or `gdn_summary` after one `gdn_tinv` pass for the
+chunk inverses) that carries two chains over the range: one from a zero entry state, whose final
+state is `B`, and one from the identity with the value term disabled, whose final state is `A`.
+Which ranges are summarized and how their rows are ordered is decided on the device, so the call
 is CUDA Graph replayable and an empty range yields the identity map. Every range must be a
 subsequence (one rank's piece of a document, one segment of the local `cu_seqlens`), which is
 all the CP recipes ever request; a nonempty range that is not one is filled with NaN. `run` is
 warpdrive's forward from the composed entry state.
 
-*Backward.* `run` is warpdrive's own stateful backward (`kda_chunk_cudnn_packed_bwd_with_state`):
-the state pass from the saved entry state writes checkpoints, then the BT16 backward consumes
-them together with the exit cotangent, returning the token gradients and the entry-state
-cotangent. `state_grad_summaries` produces each subsequence's `[C; R]` map with the same
-kernels: `C` is the entry-state cotangent of warpdrive's backward run with a zero exit cotangent,
-and `R` is the forward transition transposed. No fused factors are computed anywhere on the
-warpdrive path.
+*Backward.* In a CP step `run` is warpdrive's own stateful backward
+(`kda_chunk_cudnn_packed_bwd_with_state`, `gdn_chunk_cudnn_packed_bwd_with_state`): the state pass from the saved entry state writes
+checkpoints, then the backward consumes them together with the exit cotangent, returning the
+token gradients and the entry-state cotangent. `state_grad_summaries` produces each
+subsequence's `[C; R]` map: `C` is the entry-state cotangent of the range's outputs under a zero
+exit cotangent (`kda_bprop_summary`, `gdn_bprop_summary`), and `R` is the forward transition
+transposed. No fused factors are computed anywhere on the warpdrive path. Each summary kernel runs
+one work item per selected (subsequence, head), so it fills few SMs; GDN overlaps the forward and
+reverse passes behind `state_grad_summaries` on a side stream.
 
-*Numerics.* A document cut on 16-token boundaries whose fragments exchange warpdrive's own state
-and cotangent reproduces the unsharded warpdrive gradients bit for bit. The composed entry states
-do not: the maps carry warpdrive's 16-token-chunk rounding, so warpdrive under CP is its own
-numerical baseline, neither the fused CP baseline nor unsharded warpdrive. The staged handles and
-this recipe are eager-only; `torch.compile` is not supported through them.
+*Numerics.* KDA's warpdrive kernels chunk at 16 tokens: a document cut on 16-token boundaries
+whose fragments exchange warpdrive's own state and cotangent reproduces the unsharded warpdrive
+gradients bit for bit, but the composed entry states do not, so KDA under CP is its own numerical
+baseline, neither the fused CP baseline nor unsharded warpdrive. GDN's warpdrive kernels chunk at
+64 tokens like the fused ones; sharded GDN matches the FP32 reference as closely as unsharded
+warpdrive and fused CP do (`test/test_delta_rule_stages.py`). The staged handles and this recipe
+are eager-only; `torch.compile` is not supported through them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 

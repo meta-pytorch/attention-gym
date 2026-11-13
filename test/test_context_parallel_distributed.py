@@ -28,6 +28,7 @@ from torch.distributed._functional_collectives import all_gather_single
 pytest.importorskip("cutlass")
 
 import attn_gym.linear.context_parallel as cp_impl
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear.context_parallel import ContextParallelPlan, context_parallel_conv_history
 from attn_gym.linear.gdn import chunk_gdn, context_parallel_gdn
 from attn_gym.linear.kda import chunk_kda, context_parallel_kda
@@ -49,7 +50,23 @@ pytestmark = [
 CU_SEQLENS = (0, 40, 232, 384)
 HEADS, HEAD_DIM = 2, 128
 # The unsharded op and its context-parallel binding.
-OPS = {"kda": (chunk_kda, context_parallel_kda), "gdn": (chunk_gdn, context_parallel_gdn)}
+WARPDRIVE = {"backend": "warpdrive"}
+OPS = {
+    "kda": (chunk_kda, context_parallel_kda),
+    "gdn": (chunk_gdn, context_parallel_gdn),
+    "gdn-warpdrive": (
+        partial(chunk_gdn, kernel_options=WARPDRIVE),
+        partial(context_parallel_gdn, kernel_options=WARPDRIVE),
+    ),
+}
+requires_warpdrive = pytest.mark.skipif(
+    not cuda_runs_sm100_kernels(),
+    reason="warpdrive requires an SM100-family GPU",
+)
+op_param = pytest.mark.parametrize(
+    "op_name",
+    [pytest.param(name, marks=requires_warpdrive if "warpdrive" in name else ()) for name in OPS],
+)
 
 # Fragment tables over two cp ranks. Zig-zag is the training layout; "uneven" is one 384-token
 # sequence where cp rank 0 owns three fragments and cp rank 1 two, so its chain alternates ranks
@@ -353,7 +370,7 @@ def _spawn(target, args: tuple) -> None:
                 process.kill()
 
 
-@pytest.mark.parametrize("op_name", list(OPS))
+@op_param
 def test_context_parallel_matches_unsharded_op_on_two_ranks(op_name):
     """One spawn per op covers every loss structure and table; a failure names each failing case."""
     _spawn(_rank_main, (op_name,))
@@ -505,13 +522,14 @@ def _replay_main(
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="NCCL graph replay needs two GPUs")
-@pytest.mark.parametrize("op_name", list(OPS))
+@op_param
 @pytest.mark.parametrize("fragmented", [False, True], ids=["small", "fragmented"])
 def test_one_captured_graph_replays_across_document_layouts(op_name, fragmented):
     _spawn(_replay_main, (op_name, fragmented))
 
 
-@pytest.mark.parametrize("op_name", list(OPS))
+# The recipe saves the links for every backend; the kernel_options below would drop a bound one.
+@pytest.mark.parametrize("op_name", ["kda", "gdn"])
 def test_backward_detects_fold_link_mutation(op_name):
     with _process_group(0, 1, _free_port()) as device:
         plan = ContextParallelPlan.from_fragments((0, 192), [[(0, 64), (64, 128), (128, 192)]], 0)
