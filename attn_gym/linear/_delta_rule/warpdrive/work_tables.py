@@ -77,7 +77,7 @@ from attn_gym.warpdrive.cache import (
 )
 from attn_gym.warpdrive.compat import SmemAllocator
 
-from .ptx import ld_global_v
+from .ptx import ld_global_v, st_global_v
 
 WORK_ITEM_FIELDS = 10
 WORK_ITEM_FINAL_DST = 8
@@ -111,6 +111,10 @@ RCP_LN2 = 1.4426950408889634  # natural-log gates -> the scan's log2 domain
 ORDER_THREADS = 1024
 ORDER_ELEMENTS = 4
 ORDER_CAPACITY = ORDER_THREADS * ORDER_ELEMENTS  # past this the rows copy through unsorted
+# A backward's prologue adds one CTA per this many gate cotangent stores, up to the cap, to
+# zero the inactive capacity rows.
+TAIL_STORES_PER_CTA = 1 << 14
+TAIL_MAX_CTAS = 128
 
 INT32_MAX = 2147483647
 INT32_MIN = -2147483648
@@ -331,6 +335,70 @@ def check_packed_offsets(cu_seqlens, tokens: Int32, tidx, n_threads: cutlass.Con
         if invalid:
             assert_fail("invalid packed cu_seqlens", "check_packed_offsets")
     cute.arch.barrier()
+
+
+@cute.jit
+def row_shape(mRows: cute.Tensor):
+    """``(H, U)``: the heads of one gate cotangent row and the stores per head. GDN ``(T, H)``
+    rows store one element; KDA ``(T, H, D)`` rows store 16-byte vectors of channels, which the
+    KDA bprop's TMA store already requires to be 16-byte aligned with a unit channel stride."""
+    units = Int32(1)
+    if cutlass.const_expr(cute.rank(mRows) == 3):
+        units = Int32(mRows.shape[2]) // (128 // mRows.element_type.width)
+    return Int32(mRows.shape[1]), units
+
+
+@cute.jit
+def tail_ctas(tokens: Int32, mRows: cute.Tensor) -> Int32:
+    """Host side: the CTA count of :func:`zero_inactive_rows`, from the capacity and the row
+    layout; the active endpoint is known only on the device."""
+    heads, units = row_shape(mRows)
+    rows_per_cta = cutlass.max(Int32(TAIL_STORES_PER_CTA) // (heads * units), Int32(1))
+    return cutlass.min(cute.ceil_div(tokens, rows_per_cta), Int32(TAIL_MAX_CTAS))
+
+
+@cute.jit
+def zero_inactive_rows(mRows: cute.Tensor, cu_seqlens, tokens: Int32, worker, workers, tidx):
+    """Zero the gate cotangent's inactive capacity rows ``[cu_seqlens[-1], tokens)``: gate
+    producers reduce it over every physical token. Runs after :func:`check_packed_offsets` on
+    CTA ``worker`` of ``workers`` (:func:`tail_ctas`), each of ``ORDER_THREADS`` threads. A row is ``H * U`` stores (:func:`row_shape`); a CTA zeroes
+    ``ORDER_THREADS // (H * U)`` rows per pass, or one row in ``ORDER_THREADS``-store strides
+    when rows are wider. Each thread splits its first store and its stride into (head, unit)
+    once, so the loop needs no division."""
+    start = cu_at(cu_seqlens, Int32(cu_seqlens.shape[0]) - Int32(1))
+    heads, units = row_shape(mRows)
+    width = heads * units
+    rows_per_pass = cutlass.max(Int32(ORDER_THREADS) // width, Int32(1))
+    sub_row = tidx // width
+    if sub_row < rows_per_pass:
+        column = tidx - sub_row * width
+        head0 = column // units
+        unit0 = column - head0 * units
+        step_head = Int32(ORDER_THREADS) // units
+        step_unit = Int32(ORDER_THREADS) - step_head * units
+        row = start + worker * rows_per_pass + sub_row
+        while row < tokens:
+            head = head0
+            unit = unit0
+            while head < heads:
+                if cutlass.const_expr(cute.rank(mRows) == 3):
+                    offset = Int64(row) * Int64(mRows.stride[0]) + Int64(head) * Int64(
+                        mRows.stride[1]
+                    )
+                    address = (
+                        mRows.iterator.toint()
+                        + offset * Int64(mRows.element_type.width // 8)
+                        + Int64(unit) * Int64(16)
+                    )
+                    st_global_v(address, [Int32(0)] * 4, Int32)
+                else:
+                    mRows[row, head] = mRows.element_type(0)
+                head = head + step_head
+                unit = unit + step_unit
+                if unit >= units:
+                    unit = unit - units
+                    head = head + Int32(1)
+            row = row + workers * rows_per_pass
 
 
 @cute.jit
@@ -1653,16 +1721,19 @@ def work_table_kernel(
     has_initial_state: cute.Tensor | None,
     rows: cute.Tensor | None,
     row_count: cute.Tensor | None,
+    tail_rows: cute.Tensor | None,
 ):
     """Every block checks the offsets against ``tokens``; block 0 then orders the table
     (:func:`order_body`), block 1 (bound ``rows``) builds the chunk row table of
-    ``rows_b_t``-token chunks on its first warp."""
+    ``rows_b_t``-token chunks on its first warp. With ``tail_rows`` bound, the blocks after
+    them zero the gate cotangent's inactive rows (:func:`zero_inactive_rows`)."""
     cute.arch.griddepcontrol_wait()
     cute.arch.griddepcontrol_launch_dependents()
     tidx = Int32(cute.arch.thread_idx()[0])
     check_packed_offsets(cu_seqlens, tokens, tidx, ORDER_THREADS)
     n_batch = Int32(cu_seqlens.shape[0]) - Int32(1)
-    if Int32(cute.arch.block_idx()[0]) == Int32(0):
+    block = Int32(cute.arch.block_idx()[0])
+    if block == Int32(0):
         sKey, sIdx, sSpread = order_storage()
         order_body(
             source,
@@ -1683,9 +1754,20 @@ def work_table_kernel(
             mHasInitialState=has_initial_state,
         )
     else:
-        if cutlass.const_expr(rows is not None):
-            if tidx < Int32(32):
-                emit_chunk_rows(rows_b_t, cu_seqlens, rows, row_count, tidx)
+        if cutlass.const_expr(tail_rows is None):
+            if cutlass.const_expr(rows is not None):
+                if tidx < Int32(32):
+                    emit_chunk_rows(rows_b_t, cu_seqlens, rows, row_count, tidx)
+        else:
+            table_ctas = Int32(1 if cutlass.const_expr(rows is None) else 2)
+            tail_block = block - table_ctas
+            if tail_block >= Int32(0):
+                workers = Int32(cute.arch.grid_dim()[0]) - table_ctas
+                zero_inactive_rows(tail_rows, cu_seqlens, tokens, tail_block, workers, tidx)
+            else:
+                if cutlass.const_expr(rows is not None):
+                    if tidx < Int32(32):
+                        emit_chunk_rows(rows_b_t, cu_seqlens, rows, row_count, tidx)
 
 
 @cute.jit
@@ -1706,12 +1788,14 @@ def launch_work_table(
     rows: cute.Tensor | None = None,
     row_count: cute.Tensor | None = None,
     rows_b_t: cutlass.Constexpr[int] = 0,
+    tail_rows: cute.Tensor | None = None,
 ) -> None:
     """The main kernels' table prologue: check ``cu_seqlens`` against the ``tokens`` packed
     tokens (:func:`check_packed_offsets`), order ``staging`` (the split rows; ``None`` for the
     uncut table from ``cu_seqlens``) into ``work_items`` / ``work_count`` for ``n_heads_out``
-    tile heads, zero ``scheduler``, and optionally build a chunk row table. Callable from a
-    launch bundle's ``@cute.jit`` host; the next launch waits on it through PDL."""
+    tile heads, zero ``scheduler``, and optionally build a chunk row table. A backward binds its
+    gate cotangent as ``tail_rows`` to have the inactive rows zeroed. Callable from a launch
+    bundle's ``@cute.jit`` host; the next launch waits on it through PDL."""
     work_table_kernel(
         "uncut" if cutlass.const_expr(staging is None) else "staged",
         b_t,
@@ -1728,12 +1812,23 @@ def launch_work_table(
         has_initial_state,
         rows,
         row_count,
+        tail_rows,
     ).launch(
-        grid=(1 if cutlass.const_expr(rows is None) else 2, 1, 1),
+        grid=(prologue_ctas(tokens, rows, tail_rows), 1, 1),
         block=(ORDER_THREADS, 1, 1),
         stream=stream,
         use_pdl=True,
     )
+
+
+@cute.jit
+def prologue_ctas(tokens: Int32, rows: cute.Tensor | None, tail_rows: cute.Tensor | None):
+    """Host side: the CTAs of a table prologue, for the table, the chunk row table and the
+    tail zeroing."""
+    ctas = 1 if cutlass.const_expr(rows is None) else 2
+    if cutlass.const_expr(tail_rows is not None):
+        ctas = Int32(ctas) + tail_ctas(tokens, tail_rows)
+    return ctas
 
 
 # ---- standalone entry points -----------------------------------------------------------------

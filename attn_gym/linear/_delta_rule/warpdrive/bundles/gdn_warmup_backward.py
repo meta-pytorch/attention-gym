@@ -87,6 +87,7 @@ def warmup_backward_host(
     scheduler_all: cute.Tensor,
     scheduler_recompute: cute.Tensor,
     tma_slots: cute.Tensor,
+    dgate: cute.Tensor,
     stream: cuda.CUstream,
 ) -> None:
     """``split`` is the split table's :class:`~work_tables.SplitStatic` (None: the uncut
@@ -135,6 +136,7 @@ def warmup_backward_host(
         work_items,
         scheduler_all,
         stream,
+        tail_rows=dgate,
     )
     recompute_op, recompute_sms = recompute_cfg
     recompute_op.launch(
@@ -205,6 +207,7 @@ def _validate_launch(
     chunk_scratch,
     scheduler_all,
     scheduler_recompute,
+    dgate,
     split,
     n_tiles,
     ideal_chunks,
@@ -227,6 +230,7 @@ def _validate_launch(
         checkpoints,
         num_pieces=validate_seqlens(cu_seqlens),
         b_t=b_t,
+        dgate=dgate,
     )
     validate_cuda_tensors(
         q,
@@ -319,6 +323,7 @@ def build_warmup_backward(
     scheduler_all,
     scheduler_recompute,
     tma_slots,
+    dgate,
     split,
     n_tiles,
     ideal_chunks,
@@ -352,6 +357,7 @@ def build_warmup_backward(
         chunk_scratch=chunk_scratch,
         scheduler_all=scheduler_all,
         scheduler_recompute=scheduler_recompute,
+        dgate=dgate,
         split=split,
         n_tiles=n_tiles,
         ideal_chunks=ideal_chunks,
@@ -375,7 +381,7 @@ def build_warmup_backward(
         state_in is not None,
     )
     use_int64_offsets = requires_int64_abi(
-        k, v, gate, beta, cu_seqlens, tinv, checkpoints, state_in
+        k, v, gate, beta, cu_seqlens, tinv, checkpoints, state_in, dgate
     )
     split_static = None if facts is None else facts.static
     # Every tensor a signature spec reads, so the warm path keys the launch without the specs.
@@ -399,6 +405,7 @@ def build_warmup_backward(
                 scheduler_all,
                 scheduler_recompute,
                 tinv_rows,
+                dgate,
             ),
             compact=(work_items, item_scratch, tma_slots),
         ),
@@ -423,6 +430,7 @@ def build_warmup_backward(
             signature_spec(scheduler_all, assumed_align=4),
             signature_spec(scheduler_recompute, assumed_align=4),
             signature_spec(tma_slots, assumed_align=128, compact=True),
+            signature_spec(dgate, assumed_align=16),
         )
         return _compile_warmup_backward(split_static, cfg_args, specs, use_int64_offsets)
 
@@ -450,6 +458,7 @@ def run_warmup_backward(
     scheduler_all,
     scheduler_recompute,
     tma_slots,
+    dgate,
     q=None,
     do=None,
     dq=None,
@@ -457,8 +466,9 @@ def run_warmup_backward(
     dv=None,
 ) -> None:
     """Replay the head of the warmup or uncut backward: one crossing into the DSL. The plan
-    validated the contract at build, so nothing here raises. The bprop's own buffers (``q``,
-    ``do`` and the gradients) are accepted so the caller replays with the build's buffers."""
+    validated the contract at build, so nothing here raises. The bprop's other buffers (``q``,
+    ``do`` and the other gradients) are accepted so the caller replays with the build's
+    buffers; the head zeroes ``dgate``'s inactive rows."""
     split = facts is not None
     compiled(
         *(facts.scalars() if split else (0, 0, 0, 0, 0.0, 0, 0, 0)),
@@ -479,4 +489,5 @@ def run_warmup_backward(
         scheduler_all,
         scheduler_recompute,
         tma_slots,
+        dgate,
     )

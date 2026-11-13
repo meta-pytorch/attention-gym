@@ -344,6 +344,7 @@ def gdn_backward(
         buffers = dict(
             common,
             state_in=initial_state,
+            dgate=dgate,
             work_items=work_items,
             work_count=work_count,
             item_scratch=item_scratch,

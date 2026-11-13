@@ -41,7 +41,8 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     ``initial_state`` and ``d_final_state`` are optional FP32 ``[N, H, V, K]`` entry states
     and exit cotangents per packed sequence. ``None`` skips state loads, with token gradients
     bitwise equal to an explicit zero tensor. Returns ``(dq, dk, dv, dgate, dbeta,
-    d_initial_state)``; the last is ``None`` unless ``initial_state`` was given.
+    d_initial_state)``; the last is ``None`` unless ``initial_state`` was given. ``dgate`` is zero
+    past ``cu_seqlens[-1]``; the other token gradients are unspecified there.
     The approximate forgetting-horizon ``split`` schedule requires a no-state call.
     """
     scale = resolve_scale(scale, q.shape[-1])
