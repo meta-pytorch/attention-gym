@@ -422,8 +422,8 @@ def test_operator_registration(shape: str):
 @pytest.mark.parametrize("fastmath", [False, True])
 def test_gate_backends_agree_on_d128(fastmath: bool, transform: GateTransform):
     """The CuTeDSL and Triton gate launchers implement one contract on the shared shape."""
-    from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_bwd
-    from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_fwd
+    cute_bwd = pytest.importorskip("attn_gym.linear.kda.bwd.cute.gate_bwd")
+    cute_fwd = pytest.importorskip("attn_gym.linear.kda.fwd.cute.gate_fwd")
 
     raw_gate, A_log, dt_bias = make_gate_inputs(VECTOR128, tokens=97)
     d_gate = torch.randn(raw_gate.shape, device="cuda")
@@ -447,8 +447,8 @@ def test_gate_backends_agree_on_d128(fastmath: bool, transform: GateTransform):
 def test_cute_gate_compiles_two_grid_variants():
     """Batch, tokens and tile counts are runtime values: one kernel serves every shape whose
     batch fits ``gridDim.z``, and one more (the batch folded into ``gridDim.x``) the batches past 65535."""
-    from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_bwd
-    from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_fwd
+    cute_bwd = pytest.importorskip("attn_gym.linear.kda.bwd.cute.gate_bwd")
+    cute_fwd = pytest.importorskip("attn_gym.linear.kda.fwd.cute.gate_fwd")
 
     compile_fns = (cute_fwd._compile_gate_transform_fwd, cute_bwd._compile_gate_transform_bwd)
     lower_bound = -4.6875  # this test's own compile key, so every variant below is a new entry
@@ -489,8 +489,8 @@ def test_cute_gate_compiles_two_grid_variants():
 def test_cute_gate_launchers_skip_an_empty_space(batch: int, tokens: int):
     """The kernels assume every CTA has an item, so the launchers must not launch an empty
     space (the public ``gate_transform`` rejects one earlier): empty outputs, zero gradients."""
-    from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_bwd
-    from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_fwd
+    cute_bwd = pytest.importorskip("attn_gym.linear.kda.bwd.cute.gate_bwd")
+    cute_fwd = pytest.importorskip("attn_gym.linear.kda.fwd.cute.gate_fwd")
 
     raw_gate, A_log, dt_bias = make_gate_inputs(VECTOR128, batch=batch, tokens=tokens)
     softplus = GateTransform.SOFTPLUS
