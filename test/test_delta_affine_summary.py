@@ -18,6 +18,7 @@ import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
 from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
+from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV, uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, plan_work_items
 from attn_gym.testing.kda import assert_relative_rms_within
 
@@ -52,8 +53,7 @@ def summary_backend(request, monkeypatch):
     if request.param == "portable":
         if not runs_sm100_kernels(torch.cuda.get_device_capability()):
             pytest.skip("the routed backend is already the portable Triton path")
-        for module in (native_fwd, native_rev):
-            monkeypatch.setattr(module, "runs_sm100_kernels", lambda _capability: False)
+        monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
 
 
 def compose_summaries(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
@@ -231,8 +231,8 @@ def test_affine_summaries_support_int64_tensor_strides():
 def test_portable_affine_summaries_support_forced_int64_offsets(budget, monkeypatch):
     """Keep the portable single-item and split wide-address specializations executable."""
     plan_budget = Mock(return_value=budget)
+    monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
     for module in (native_fwd, native_rev):
-        monkeypatch.setattr(module, "runs_sm100_kernels", lambda _capability: False)
         monkeypatch.setattr(module, "plan_work_budget", plan_budget)
     qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(20, tokens=640)
 
@@ -474,8 +474,10 @@ def test_state_columns_leave_room_for_long_time_splits(
 @pytest.mark.parametrize("tokens", [8128, 8193])
 def test_native_summary_tile_choice_and_layout_replay(dtype, tokens, monkeypatch):
     """The public selector preserves tail arithmetic and replay across empty/short ranges."""
-    if not runs_sm100_kernels(torch.cuda.get_device_capability()):
-        pytest.skip("native state tile selection requires an SM100-family GPU")
+    if not uses_legacy_cute(torch.device("cuda")):
+        pytest.skip(
+            "native state tile selection requires an SM100-family GPU and the legacy CuTe route"
+        )
     heads = torch.cuda.get_device_properties().multi_processor_count // 8
     _, kg, w, u, _, _, gate = make_summary_inputs(89, dtype, tokens, heads)
     bounds = whole_stream(kg)

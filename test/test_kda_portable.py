@@ -1,4 +1,8 @@
-"""Native SM90 KDA forward, backward, and compiler integration tests."""
+"""Portable Triton KDA forward, backward, and compiler integration tests.
+
+Every test forces the portable route, so it also runs on SM100-family GPUs, where the fused pipeline
+otherwise defaults to the legacy CuTe stages.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ import torch
 pytest.importorskip("cutlass")
 
 from attn_gym.linear import Impl, chunk_kda, paged_chunk_kda
+from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
 )
@@ -30,10 +35,19 @@ from attn_gym.testing.kda import (
     strided_state_pool,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
-    reason="the native Hopper KDA route requires CUDA capability 9.x",
-)
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="the portable KDA route requires CUDA capability 8.0 or newer",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
+
+
+@pytest.fixture(autouse=True)
+def portable_route(monkeypatch) -> None:
+    monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
 
 
 @pytest.fixture(autouse=True)
@@ -115,27 +129,27 @@ def _assert_training_matches_reference(
             actual,
             high,
             reference,
-            f"Hopper chunk KDA {name}",
+            f"Portable chunk KDA {name}",
             source_dtype=dtype,
         )
         assert_rms_matches_low_precision_reference(
-            actual, high, reference, f"Hopper chunk KDA {name}", source_dtype=dtype
+            actual, high, reference, f"Portable chunk KDA {name}", source_dtype=dtype
         )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("lengths", [None, [65, 0, 63]], ids=["dense", "packed"])
-def test_hopper_training_matches_low_precision_reference(
+def test_portable_training_matches_low_precision_reference(
     dtype: torch.dtype,
     lengths: list[int] | None,
 ):
-    """Cover ordinary dense and packed Hopper training."""
+    """Cover ordinary dense and packed portable training."""
     inputs, cu_seqlens = _training_inputs(dtype, lengths)
     _assert_training_matches_reference(inputs, cu_seqlens, dtype)
 
 
-def test_hopper_fastmath_backward_matches_reference(monkeypatch):
-    """Exercise and verify fastmath plumbing in the native SM90 WY backward."""
+def test_portable_fastmath_backward_matches_reference(monkeypatch):
+    """Exercise and verify fastmath plumbing in the portable WY backward."""
     import attn_gym.linear.kda.bwd.cute.chunk_kda_bwd as backward_module
 
     original = backward_module.chunk_kda_bwd_wy_triton
@@ -154,7 +168,7 @@ def test_hopper_fastmath_backward_matches_reference(monkeypatch):
 @pytest.mark.parametrize("seed", [2, 4])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("lengths", [None, [65, 63]], ids=["dense", "packed"])
-def test_hopper_bc16_rebase_matches_reference_at_lower_bound_five(
+def test_portable_bc16_rebase_matches_reference_at_lower_bound_five(
     dtype: torch.dtype,
     lengths: list[int] | None,
     seed: int,
@@ -169,7 +183,7 @@ def test_hopper_bc16_rebase_matches_reference_at_lower_bound_five(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_delta_h_masks_upper_aqk(dtype: torch.dtype):
+def test_portable_delta_h_masks_upper_aqk(dtype: torch.dtype):
     """Ignore poisoned upper-triangular Aqk entries in the reverse recurrence."""
     torch.cuda.manual_seed(97)
     shape = (1, 64, 1, 128)
@@ -209,7 +223,7 @@ def test_hopper_delta_h_masks_upper_aqk(dtype: torch.dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_final_state_only_gradient(dtype: torch.dtype):
+def test_portable_final_state_only_gradient(dtype: torch.dtype):
     """Exercise a final-state cotangent when the output cotangent is absent."""
     actual_inputs, cu_seqlens = _training_inputs(dtype, [65, 0, 63])
     reference_inputs = clone_kda_inputs(actual_inputs)
@@ -243,14 +257,14 @@ def test_hopper_final_state_only_gradient(dtype: torch.dtype):
             actual,
             high,
             reference,
-            f"Hopper final-state-only gradient {name}",
+            f"Portable final-state-only gradient {name}",
             source_dtype=dtype,
         )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_hopper_fullgraph_forward_backward(dtype: torch.dtype):
-    """Keep the public Hopper route inside one strict compiled training graph."""
+def test_portable_fullgraph_forward_backward(dtype: torch.dtype):
+    """Keep the public portable route inside one strict compiled training graph."""
     eager_inputs, cu_seqlens = _training_inputs(dtype, [65, 63])
     compiled_inputs = clone_kda_inputs(eager_inputs)
 
@@ -280,8 +294,8 @@ def test_hopper_fullgraph_forward_backward(dtype: torch.dtype):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_hopper_raw_operator_registration():
-    """Validate the unchanged opaque schemas against the real SM90 launchers."""
+def test_portable_raw_operator_registration():
+    """Validate the unchanged opaque schemas against the real portable launchers."""
     inputs, _cu_seqlens = _training_inputs(torch.bfloat16, None)
     q, k, v, gate, beta, initial_state = inputs
     cumulative_gate = chunk_cumsum_ref(gate * LOG2_E, 64)
@@ -330,8 +344,8 @@ def test_hopper_raw_operator_registration():
     )
 
 
-def test_hopper_outer_strided_cotangents():
-    """Normalize supported output/state cotangent layouts at the SM90 boundary."""
+def test_portable_outer_strided_cotangents():
+    """Normalize supported output/state cotangent layouts at the portable boundary."""
     actual_inputs, cu_seqlens = _training_inputs(torch.bfloat16, [65, 63])
     expected_inputs = clone_kda_inputs(actual_inputs)
     actual_output, actual_state = chunk_kda(
@@ -371,8 +385,8 @@ def test_hopper_outer_strided_cotangents():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_hopper_cuda_graph_replays_packed_boundaries_and_backward():
-    """Replay changed packed boundaries through the complete SM90 training route."""
+def test_portable_cuda_graph_replays_packed_boundaries_and_backward():
+    """Replay changed packed boundaries through the complete portable training route."""
     inputs, _ = _training_inputs(torch.bfloat16, [64, 64])
     cu_seqlens = cumulative_sequence_offsets([64, 64])
     warm_output, warm_state = chunk_kda(
@@ -422,7 +436,7 @@ def test_hopper_cuda_graph_replays_packed_boundaries_and_backward():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-def test_hopper_int64_specializations_match_default(monkeypatch):
+def test_portable_int64_specializations_match_default(monkeypatch):
     """Force every new wide-address path and preserve public outputs and gradients."""
     packed_offsets = cumulative_sequence_offsets([65, 63])
 
@@ -473,7 +487,7 @@ def test_hopper_int64_specializations_match_default(monkeypatch):
             torch.testing.assert_close(wide, normal, rtol=0, atol=0)
 
 
-def test_paged_chunk_kda_uses_pre_blackwell_route():
+def test_paged_chunk_kda_uses_portable_route():
     """Advance paged state through the same portable factors as ordinary prefill."""
     inputs = tuple(
         tensor.detach() for tensor in make_kda_test_inputs(64, batch=1, heads=1, normalize_qk=True)
