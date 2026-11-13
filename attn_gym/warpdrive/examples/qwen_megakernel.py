@@ -58,6 +58,7 @@ from dataclasses import dataclass
 from typing import NamedTuple
 
 import cutlass
+import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, Int64, Uint32, cute
@@ -65,7 +66,7 @@ from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, vector
 from cutlass._mlir.extras import types as T
 from cutlass._mlir_helpers.arith import bitcast
-from cutlass.cute.nvgpu import cpasync
+from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from attn_gym.warpdrive import (
     AtomicPersistent,
@@ -80,6 +81,9 @@ from attn_gym.warpdrive import (
     StageView,
     StaticPersistent,
     Tma,
+    Tmem,
+    TmemPlan,
+    Umma,
     Warps,
     WarpSpecialized,
     WorkCursor,
@@ -404,7 +408,7 @@ class CudaCoreGemv:
         return chans
 
     @cute.jit
-    def tile(self, p: MegakernelParams, chans, xbuf, k_tiles, warp, lane):
+    def tile(self, p: MegakernelParams, chans, env, xbuf, k_tiles, warp, lane):
         """``(value, row, chans)``: one tile's dot products against ``xs[xbuf]``, this lane's
         tile row and the advanced channel ends (``chans[0]`` is the weight ring)."""
         w = chans[0]
@@ -451,6 +455,9 @@ class CudaCoreGemv:
 
 
 class QwenDecodeMegakernel(WarpSpecialized):
+    rows, tile_k = ROWS, TILE_K  # a weight stage and work-item tile: rows x columns (16 KB)
+    x_tail = 0  # bf16 elements after each GEMV input that an engine may read
+
     def __init__(
         self,
         stages: int | None = None,
@@ -486,9 +493,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.group_size = self.q_heads // self.kv_heads  # q heads per kv head
         self.heads_per_split = self.q_heads // O_SPLITS  # q heads in one o_proj split
         # Weight stages per 32-row tile: QKV, GATEUP and LMHEAD read all hidden columns.
-        self.hidden_k_tiles = self.hidden // TILE_K
-        self.oproj_k_tiles = self.heads_per_split * HEAD_DIM // TILE_K
-        self.down_k_tiles = self.inter // TILE_K // DOWN_SPLITS
+        self.hidden_k_tiles = self.hidden // self.tile_k
+        self.oproj_k_tiles = self.heads_per_split * HEAD_DIM // self.tile_k
+        self.down_k_tiles = self.inter // self.tile_k // DOWN_SPLITS
         # RMSNorm and the residual sums hold the hidden vector this many elements per thread.
         self.per_thread = self.hidden // COMPUTE_THREADS
         # The longest GEMV input: the hidden vector, a down split or an o_proj split.
@@ -527,13 +534,17 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.smem_plan.buffer("ROUTE", Float32, align=16)
         # Compute reads stages with generic loads before TMA refills them. For a Tma-filled ring
         # released by Warps the layer emits the fence.proxy.async on release.
-        self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w, "KV": kv})
+        self.w = Ring(stages, Tma(STAGE_BYTES), self.weight_consumers(), buffer={"W": w, "KV": kv})
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
         self.engine = CudaCoreGemv()
         self.work = WorkStream(
             mapping=InstructionTable(),
             schedule=StaticPersistent() if schedule == "static" else AtomicPersistent(stages=1),
         )
+
+    def weight_consumers(self):
+        """The weight ring's consumer mechanism (the engine may add an MMA warp)."""
+        return Warps
 
     def fixed_smem_bytes(self) -> int:
         """Shared memory besides the weight ring, with headroom for barriers and alignment."""
@@ -544,7 +555,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             + self.heads_per_split * self.splits * 2  # MLS
             + self.route_floats  # ROUTE
         )
-        return 2 * 2 * self.x_width + 4 * floats + SMEM_HEADROOM
+        x_bytes = 2 * 2 * (self.x_width + self.x_tail)
+        return x_bytes + 4 * floats + SMEM_HEADROOM
 
     @property
     def route_floats(self) -> int:
@@ -596,36 +608,36 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     w = self.load_tiles(w, tma_k, g_k, row0 + blk, 0, 1, "KV")
                     w = self.load_tiles(w, tma_v, g_v, row0 + blk, 0, 1, "KV")
             elif op == QKV:
-                tile = layer * (self.qkv_rows // ROWS) + a
+                tile = layer * (self.qkv_rows // self.rows) + a
                 w = self.load_tiles(w, tma_qkv, g_qkv, tile, 0, self.hidden_k_tiles, "W")
             elif op == OPROJ:
-                tile = layer * (self.hidden // ROWS) + a
+                tile = layer * (self.hidden // self.rows) + a
                 k_tiles = self.oproj_k_tiles
                 w = self.load_tiles(w, tma_o, g_o, tile, b * k_tiles, k_tiles, "W")
             elif op == GATEUP:
-                tile = layer * (2 * self.inter // ROWS) + a
+                tile = layer * (2 * self.inter // self.rows) + a
                 if cutlass.const_expr(self.moe):
                     # Tile a of slot s is tile a % per_slot of expert e_s's gate/up rows.
-                    per_slot = 2 * self.expert_inter // ROWS
+                    per_slot = 2 * self.expert_inter // self.rows
                     expert = self.expert_of(chosen, a // per_slot)
                     tile = (layer * self.experts + expert) * per_slot + a % per_slot
                 w = self.load_tiles(w, tma_gu, g_gu, tile, 0, self.hidden_k_tiles, "W")
             elif op == DOWN:
-                tile = layer * (self.hidden // ROWS) + a
+                tile = layer * (self.hidden // self.rows) + a
                 k_tiles = self.down_k_tiles
                 if cutlass.const_expr(self.moe):
                     # Column tile kt of the routed activation is tile kt % per_slot of slot
                     # kt // per_slot's expert down projection.
-                    per_slot = self.expert_inter // TILE_K
+                    per_slot = self.expert_inter // self.tile_k
                     for k in cutlass.range_constexpr(k_tiles):
                         kt = b * k_tiles + k
                         expert = self.expert_of(chosen, kt // per_slot)
-                        row = (layer * self.experts + expert) * (self.hidden // ROWS) + a
+                        row = (layer * self.experts + expert) * (self.hidden // self.rows) + a
                         w = self.load_tiles(w, tma_d, g_d, row, kt % per_slot, 1, "W")
                 else:
                     w = self.load_tiles(w, tma_d, g_d, tile, b * k_tiles, k_tiles, "W")
             elif op == ROUTER:
-                tile = layer * (self.experts // ROWS) + a
+                tile = layer * (self.experts // self.rows) + a
                 w = self.load_tiles(w, tma_router, g_router, tile, 0, self.hidden_k_tiles, "W")
             else:
                 for rt in cutlass.range(a, a + b, unroll=1):
@@ -733,9 +745,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return new, xkey, xbuf
 
     @cute.jit
-    def compute_loop(self, p: MegakernelParams, chans, work: WorkCursor, me: Local):
+    def compute_loop(self, p: MegakernelParams, chans, work: WorkCursor, me: Local, env=()):
         """The compute role over its rows; ``chans[0]`` is the weight ring, the rest belong to
-        the engine. Returns the channel ends and the cursor."""
+        the engine, and ``env`` holds the engine's loop-invariant values (TMEM tensors). Returns
+        the channel ends and the cursor."""
         tid, warp, lane = me.tid, me.warp, me.lane
         ctas = cute.arch.grid_dim()[0]
         pos = p.step[1]
@@ -755,9 +768,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     self.prologue(p, op, layer, a, ks, token, epoch, xbuf, tid, warp, lane, row)
                     self.csync.sync()
                 chans = self.engine.input_ready(chans)
-                chans = self.gemv(p, chans, op, layer, a, b, epoch, xbuf, warp, lane, row)
-                if (op == DOWN) & (b == DOWN_SPLITS - 1) & (tid < ROWS):
-                    self.reduce_down(p, layer, a * ROWS + tid, epoch, row)
+                chans = self.gemv(p, chans, env, op, layer, a, b, epoch, xbuf, warp, lane, row)
+                if (op == DOWN) & (b == DOWN_SPLITS - 1) & (tid < self.rows):
+                    self.reduce_down(p, layer, a * self.rows + tid, epoch, row)
             work.advance()
         # Every CTA has read the epoch by the time it finishes; the last one advances it.
         if tid == 0:
@@ -991,21 +1004,26 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
     @cute.jit
     def gemv(
-        self, p: MegakernelParams, chans, op, layer, a, b, epoch, xbuf, warp, lane, row_index
+        self, p: MegakernelParams, chans, env, op, layer, a, b, epoch, xbuf, warp, lane, row_index
     ):
         """The row's 32-row weight tiles through ``self.engine``, each result published by
         ``epilogue`` (the LM head runs ``b`` tiles per row); returns the channel ends."""
+        k_tiles, row_tiles = self.gemv_tiles(op, b)
+        for t in cutlass.range(row_tiles, unroll=1):
+            with self.trace_region("stream", payload=row_index):
+                v, row, chans = self.engine.tile(p, chans, env, xbuf, k_tiles, warp, lane)
+            self.epilogue(p, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane)
+        return chans
+
+    @cute.jit
+    def gemv_tiles(self, op, b):
+        """``(k_tiles, row_tiles)``: weight stages per tile and tiles of a GEMV row."""
         k_tiles = self.hidden_k_tiles
         if op == OPROJ:
             k_tiles = self.oproj_k_tiles
         if op == DOWN:
             k_tiles = self.down_k_tiles
-        row_tiles = cutlass.select_(op == LMHEAD, b, 1)
-        for t in cutlass.range(row_tiles, unroll=1):
-            with self.trace_region("stream", payload=row_index):
-                v, row, chans = self.engine.tile(p, chans, xbuf, k_tiles, warp, lane)
-            self.epilogue(p, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane)
-        return chans
+        return k_tiles, cutlass.select_(op == LMHEAD, b, 1)
 
     @cute.jit
     def epilogue(self, p: MegakernelParams, op, layer, a, b, t, v, row, epoch, xbuf, warp, lane):
@@ -1020,21 +1038,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 out = bf16_round(silu * bf16_round(up))
                 if cutlass.const_expr(self.moe):
                     # Fold slot s's routing weight in here, so down sums plain partials.
-                    slot = a // (2 * self.expert_inter // ROWS)
+                    slot = a // (2 * self.expert_inter // self.rows)
                     out = bf16_round(out * p.route[xbuf, slot])
-                publish(p.act, self.act_index(layer, a * (ROWS // 2) + row // 2), out, epoch)
+                publish(p.act, self.act_index(layer, a * (self.rows // 2) + row // 2), out, epoch)
         elif self.engine.owns_row(warp, lane):
             if op == QKV:
-                publish(p.qkv, self.qkv_index(layer, a * ROWS + row), bf16_round(v), epoch)
+                publish(p.qkv, self.qkv_index(layer, a * self.rows + row), bf16_round(v), epoch)
             elif op == OPROJ:
-                publish(p.o_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
+                publish(p.o_part, self.part_index(layer, b, a * self.rows + row), v, epoch)
             elif op == DOWN:
-                publish(p.d_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
+                publish(p.d_part, self.part_index(layer, b, a * self.rows + row), v, epoch)
             elif op == ROUTER:
-                index = layer * self.experts + a * ROWS + row
+                index = layer * self.experts + a * self.rows + row
                 publish(p.router_logits, index, bf16_round(v), epoch)
             else:
-                p.logits[(a + t) * ROWS + row] = bf16_round(v)
+                p.logits[(a + t) * self.rows + row] = bf16_round(v)
 
     @cute.jit
     def attention(
@@ -1286,13 +1304,14 @@ class QwenDecodeMegakernel(WarpSpecialized):
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(self, tma, gtensors, scratch, tensors, bound):
+    def kernel(self, tma, gtensors, scratch, tensors, bound, engine_args):
+        x_stride = self.x_width + self.x_tail
         layouts = {
-            "W": cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K)),
+            "W": self.weight_stage_layout(),
             "KV": cute.make_layout(
                 (BLOCK, HEAD_DIM, self.stages), stride=(HEAD_DIM, 1, BLOCK * HEAD_DIM)
             ),
-            "X": cute.make_layout((2, self.x_width), stride=(self.x_width, 1)),
+            "X": cute.make_layout((2, x_stride), stride=(x_stride, 1)),
             "RED": cute.make_layout((COMPUTE_WARPS,)),
             "ATT": cute.make_layout(
                 (COMPUTE_WARPS + 1, self.att_stride), stride=(self.att_stride, 1)
@@ -1307,8 +1326,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # not dominate the other roles' uses.
         tensors = dict(zip(TENSOR_ARGS, (cute.make_tensor(t.iterator, t.layout) for t in tensors)))
         trace_buffer = tensors.pop("trace_buffer")
-        parts = tma_partitions(tma, gtensors, self.buffer("W"), self.buffer("KV"))
-        params = MegakernelParams(
+        parts = self.tma_partitions(tma, gtensors, engine_args)
+        fields = dict(
             tma=tuple(tma),
             gmem=tuple(part[1] for part in parts),
             sW=StageView(parts[0][0], axis=1),
@@ -1322,7 +1341,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
             **tagged_views(scratch, self.scratch_layout),
             **tensors,
         )
-        self.run_roles(params, trace_buffer=trace_buffer)
+        self.run_roles(self.make_params(fields, engine_args), trace_buffer=trace_buffer)
+
+    def weight_stage_layout(self):
+        return cute.make_layout((ROWS, TILE_K, self.stages), stride=(TILE_K, 1, ROWS * TILE_K))
+
+    def tma_partitions(self, tma, gtensors, engine_args):
+        return tma_partitions(tma, gtensors, self.buffer("W"), self.buffer("KV"))
+
+    def make_params(self, fields, engine_args):
+        return MegakernelParams(**fields)
+
+    def make_tma_atoms(self, weights, caches):
+        """TMA atoms, their global tile tensors and the engine's extra kernel arguments."""
+        tma, gtensors = make_tma_atoms(weights, caches)
+        return tma, gtensors, ()
 
     @cute.jit
     def __call__(
@@ -1352,7 +1385,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        tma, gtensors = make_tma_atoms((wqkv, wo, wgu, wd, lm_head, router), (k_cache, v_cache))
+        weights = (wqkv, wo, wgu, wd, lm_head, router)
+        tma, gtensors, engine_args = self.make_tma_atoms(weights, (k_cache, v_cache))
         bound = self.work.bind(table, workspace, max_ctas)
         # TENSOR_ARGS order.
         tensors = (
@@ -1371,31 +1405,268 @@ class QwenDecodeMegakernel(WarpSpecialized):
             v_cache,
         )
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(tma, gtensors, scratch, tensors, bound).launch(
+        self.kernel(tma, gtensors, scratch, tensors, bound, engine_args).launch(
             **self.launch_config(bound), stream=stream, cooperative=True
         )
+
+
+# ------------------------------------------------------------ tcgen05 engine
+
+TC_N = 16  # MMA N: tokens (batch 1 uses column 0; the others read shifted copies of x)
+TC_ROWS, TC_TILE_K = 128, 64  # a stage: one 128 x 64 SW128 K-major MMA operand (16 KB)
+
+
+@dataclass(frozen=True)
+class TcParams(MegakernelParams):
+    tiled_mma: cute.TiledMma
+    a_layout: cute.ComposedLayout  # a weight stage as an MMA operand: 128 x 64 SW128 K-major
+    acc_layout: cute.Layout  # TMEM accumulators: (MMA, MMA_M, MMA_N, stage)
+    acc_fake: cute.Tensor  # one accumulator stage, for building the TMEM load
+
+
+class TcGen05Gemv:
+    """The GEMV engine on tcgen05 tensor cores, swap-AB: D (128 x 16) = W x X^T with a 128-row
+    weight tile as A and the GEMV input as B, accumulated in TMEM by the one-warp mma role.
+
+    A: a weight stage is one 128 x 64 SW128 K-major operand, so a stage is four K=16 MMAs.
+    B: SWIZZLE_NONE K-major with a 16-byte leading-dimension offset, so its core matrices overlap
+    and row n is the input shifted by 8n elements; row 0 is the input itself. The input stays the
+    contiguous ``xs[xbuf]`` the CUDA-core engine reads, plus a tail; columns 1..15 of D are
+    discarded.
+    D: TMEM lane i holds row i. Compute warps 0-3 load the tile: the one on TMEM subpartition
+    s (hardware warp index % 4) loads rows 32s .. 32s + 31, lane l holding row 32s + l.
+
+    Channels ``(w, xin, acc)``: ``xin`` hands each GEMV row's input to the mma warp, ``acc`` each
+    tile's accumulator back. The compute warps release the weight stages without reading them."""
+
+    def input_ready(self, chans):
+        w, xin, acc = chans
+        with xin.produce():
+            pass
+        return (w, xin, acc)
+
+    @cute.jit
+    def tile(self, p: MegakernelParams, chans, env, xbuf, k_tiles, warp, lane):
+        w, xin, acc = chans
+        (t_acc,) = env
+        for _ in cutlass.range(k_tiles, unroll=1):
+            with w.consume():
+                pass
+        v = Float32(0.0)
+        # A warp reaches TMEM lanes 32 * (its hardware warp % 4) ..: role-local warps 0-3 are
+        # four consecutive warps, so they cover the four subpartitions wherever the role sits.
+        row = 32 * (cute.arch.warp_idx() % 4) + lane
+        with acc.consume() as h:
+            if warp < 4:
+                t2r = tcgen05.make_tmem_copy(
+                    cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(TC_N)), Float32),
+                    p.acc_fake,
+                ).get_slice(row)
+                src = t2r.partition_S(t_acc[None, None, None, h.index])
+                vals = cute.make_rmem_tensor(t2r.partition_D(p.acc_fake).shape, Float32)
+                cute.copy(t2r, src, vals)
+                v = vals[0]
+        return v, row, (w, xin, acc)
+
+    def owns_row(self, warp, lane):
+        return warp < 4
+
+    def owns_pair(self, warp, lane):
+        return (warp < 4) & (lane % 2 == 0)
+
+    @cute.jit
+    def pair_value(self, v):
+        return cute.arch.shuffle_sync_down(v, offset=1)
+
+
+class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
+    """The decode megakernel with the tcgen05 GEMV engine (``TcGen05Gemv``): work items are
+    128-row tiles streamed in 128 x 64 stages, an mma warp (warp 9) issues the MMAs, and the
+    compute warps prepare inputs and run the epilogues. Attention and the epilogues are the
+    CUDA-core kernel's."""
+
+    rows, tile_k = TC_ROWS, TC_TILE_K
+    x_tail = 8 * (TC_N - 1) + 8  # B row n reads 8n elements past the input
+
+    def __init__(self, *args, model: QwenConfig = QWEN3_0_6B, **kwargs):
+        check_tc_model(model)
+        super().__init__(*args, model=model, **kwargs)
+        self.engine = TcGen05Gemv()
+        self.xin = Ring(2, Warps, Umma, commit_fence="smem_async")
+        self.acc = Ring(2, Umma, Warps, release_fence="tmem_load")
+        self.tmem_plan = TmemPlan().region("acc", TC_N, 2)
+
+    def weight_consumers(self):
+        return {"mma": Umma, "compute": Warps}
+
+    def get_name(self) -> str:
+        return super().get_name() + "_tc"
+
+    def weight_stage_layout(self):
+        return cute.make_layout(
+            (self.rows, self.tile_k, self.stages), stride=(self.tile_k, 1, STAGE_BYTES // 2)
+        )
+
+    def tma_partitions(self, tma, gtensors, engine_args):
+        _, a_layout = engine_args
+        ptr = cute.recast_ptr(self.buffer("W").iterator, a_layout.inner, dtype=BFloat16)
+        stages = cute.make_tensor(ptr, self.weight_stage_layout())
+        w_tile = (self.rows, self.tile_k)
+        return tma_partitions(tma, gtensors, stages, self.buffer("KV"), w_tile)
+
+    def make_tma_atoms(self, weights, caches):
+        op = tcgen05.MmaF16BF16Op(
+            BFloat16,
+            Float32,
+            (self.rows, TC_N, 16),
+            tcgen05.CtaGroup.ONE,
+            tcgen05.OperandSource.SMEM,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
+        )
+        tiled_mma = cute.make_tiled_mma(op)
+        tile = (self.rows, TC_N, self.tile_k)
+        a_layout = sm100_utils.make_smem_layout_a(tiled_mma, tile, BFloat16, 1)
+        a_layout = cute.select(a_layout, mode=[0, 1, 2])
+        w_smem = cute.make_composed_layout(
+            a_layout.inner, 0, cute.make_layout((self.rows, self.tile_k), stride=(self.tile_k, 1))
+        )
+        tma, gtensors = make_tma_atoms(weights, caches, w_smem)
+        return tma, gtensors, (tiled_mma, a_layout)
+
+    def make_params(self, fields, engine_args):
+        tiled_mma, a_layout = engine_args
+        acc_shape = tiled_mma.partition_shape_C((self.rows, TC_N))
+        return TcParams(
+            **fields,
+            tiled_mma=tiled_mma,
+            a_layout=a_layout,
+            acc_layout=tiled_mma.make_fragment_C(cute.append(acc_shape, 2)).layout,
+            acc_fake=tiled_mma.make_fragment_C(acc_shape),
+        )
+
+    @role(warps=range(COMPUTE_WARPS))
+    @cute.jit
+    def compute(
+        self,
+        p: MegakernelParams,
+        *,
+        w: Consumer,
+        xin: Producer,
+        acc: Consumer,
+        work: WorkCursor,
+        me: Local,
+        tmem: Tmem,
+    ):
+        t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
+        chans, work = self.compute_loop(p, (w, xin, acc), work, me, env=(t_acc,))
+        return (*chans, work)
+
+    @role(warps=COMPUTE_WARPS + 1)
+    @cute.jit
+    def mma(
+        self,
+        p: MegakernelParams,
+        *,
+        w: Consumer,
+        xin: Consumer,
+        acc: Producer,
+        work: WorkCursor,
+        tmem: Tmem,
+    ):
+        """Per GEMV row: wait for its input, then per tile accumulate its weight stages into a
+        TMEM stage; attention rows' KV stages are released untouched."""
+        tiled_mma = p.tiled_mma
+        t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
+        w_base = self.buffer("W").iterator
+        x_base = p.xs.iterator
+        x_stride = self.x_width + self.x_tail
+        # B row n, column k at element 8n + k of the input (core matrices 16 bytes apart).
+        b_layout = cute.make_layout((((8, 2), 16), 1, 1), stride=(((8, 64), 1), 0, 0))
+        pos = p.step[1]
+        xkey = Int32(-1)
+        xbuf = Int32(0)
+        while work.valid:
+            op, layer, a, b, _row = work.item
+            if op == ATTN:
+                blk0, blk1 = self.split_blocks(pos, b)
+                for _ in cutlass.range(2 * (blk1 - blk0), unroll=1):
+                    with w.consume():
+                        pass
+            else:
+                _new, xkey, xbuf = self.next_input(op, layer, a, b, xkey, xbuf)
+                k_tiles, row_tiles = self.gemv_tiles(op, b)
+                with xin.consume():
+                    for _t in cutlass.range(row_tiles, unroll=1):
+                        with acc.produce() as d:
+                            dst = t_acc[None, None, None, d.index]
+                            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+                            for kt in cutlass.range(k_tiles, unroll=1):
+                                with w.consume() as h:
+                                    ptr = cute.recast_ptr(
+                                        w_base + h.index * (STAGE_BYTES // 2),
+                                        p.a_layout.inner,
+                                        dtype=BFloat16,
+                                    )
+                                    frag_a = tiled_mma.make_fragment_A(
+                                        cute.make_tensor(ptr, p.a_layout.outer)
+                                    )
+                                    col = xbuf * x_stride + kt * self.tile_k
+                                    for kb in cutlass.range_constexpr(self.tile_k // 16):
+                                        sb = cute.make_tensor(x_base + col + kb * 16, b_layout)
+                                        frag_b = tiled_mma.make_fragment_B(sb)
+                                        cute.gemm(
+                                            tiled_mma,
+                                            dst,
+                                            frag_a[None, None, kb],
+                                            frag_b[None, None, 0],
+                                            dst,
+                                        )
+                                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+            work.advance()
+        return w, xin, acc, work
+
+
+def check_tc_model(model: QwenConfig):
+    """Raise unless 128-row tiles and 64-column stages cover ``model`` (every Qwen3 shape the
+    CUDA-core kernel covers does)."""
+    sizes = {
+        "q/k/v rows": qkv_rows(model),
+        "hidden size": model.hidden_size,
+        "gate/up rows": 2 * mlp_width(model),
+        "vocabulary size": model.vocab_size,
+    }
+    if model.is_moe:
+        sizes["experts"] = model.num_experts
+        sizes["expert gate/up rows"] = 2 * model.moe_intermediate_size
+    for what, size in sizes.items():
+        if size % TC_ROWS:
+            raise ValueError(f"tcgen05 engine: {what} {size} must be a multiple of {TC_ROWS}")
 
 
 # Plain Python, not cute.jit: loops in a jit body are staged, so building lists of atoms and
 # views there leaks values out of the loop region.
 
 
-def make_tma_atoms(weights, caches):
-    """TMA atoms and tile tensors: 32 x 256 weight boxes, 64 x 128 KV-cache boxes."""
+def make_tma_atoms(weights, caches, w_smem=None):
+    """TMA atoms and tile tensors: weight boxes of ``w_smem`` (default 32 x 256 row-major),
+    64 x 128 KV-cache boxes."""
     op = cpasync.CopyBulkTensorTileG2SOp()
-    w_smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
+    if w_smem is None:
+        w_smem = cute.make_layout((ROWS, TILE_K), stride=(TILE_K, 1))
     kv_smem = cute.make_layout((BLOCK, HEAD_DIM), stride=(HEAD_DIM, 1))
-    pairs = [cpasync.make_tiled_tma_atom(op, src, w_smem, (ROWS, TILE_K)) for src in weights]
+    w_tile = cute.product_each(w_smem.shape)
+    pairs = [cpasync.make_tiled_tma_atom(op, src, w_smem, w_tile) for src in weights]
     pairs += [cpasync.make_tiled_tma_atom(op, src, kv_smem, (BLOCK, HEAD_DIM)) for src in caches]
     return tuple(a for a, _ in pairs), tuple(g for _, g in pairs)
 
 
-def tma_partitions(tma, gtensors, sW, sKV):
+def tma_partitions(tma, gtensors, sW, sKV, w_tile=(ROWS, TILE_K)):
     """``(smem, gmem)`` TMA partitions per atom: ``(TMA, stage)`` and ``(TMA, rows, cols)``."""
     parts = []
     for atom, g in zip(tma, gtensors):
         is_kv = len(parts) >= WEIGHT_ATOMS
-        tile = (BLOCK, HEAD_DIM) if is_kv else (ROWS, TILE_K)
+        tile = (BLOCK, HEAD_DIM) if is_kv else w_tile
         smem = sKV if is_kv else sW
         tiles = cute.local_tile(g, tile, (None, None))
         parts.append(
@@ -1466,7 +1737,7 @@ def packed_mlp_shapes(op: QwenDecodeMegakernel) -> tuple[tuple, tuple, tuple]:
     if op.moe:
         experts, inter = layers * op.experts, op.expert_inter
         return (experts * 2 * inter, hidden), (experts * hidden, inter), (experts, hidden)
-    return (layers * 2 * op.inter, hidden), (layers * hidden, op.inter), (ROWS, hidden)
+    return (layers * 2 * op.inter, hidden), (layers * hidden, op.inter), (op.rows, hidden)
 
 
 def check_model(model: QwenConfig):
@@ -1542,24 +1813,24 @@ def instruction_rows(op: QwenDecodeMegakernel, ops: tuple[int, ...] = ALL_OPS) -
             rows.append(([kind, layer, a, b], *row_groups(op, kind, layer, a, b)))
 
     for layer in range(op.layers):
-        for t in range(op.qkv_rows // ROWS):
+        for t in range(op.qkv_rows // op.rows):
             add(QKV, layer, t, 0)
         for group in range(op.attn_groups):
             for split in range(op.splits):
                 add(ATTN, layer, group, split)
         for ks in range(O_SPLITS):
-            for t in range(op.hidden // ROWS):
+            for t in range(op.hidden // op.rows):
                 add(OPROJ, layer, t, ks)
         if op.moe:
-            for t in range(op.experts // ROWS):
+            for t in range(op.experts // op.rows):
                 add(ROUTER, layer, t, 0)
-        for t in range(2 * op.inter // ROWS):
+        for t in range(2 * op.inter // op.rows):
             add(GATEUP, layer, t, 0)
         for ks in range(DOWN_SPLITS):
-            for t in range(op.hidden // ROWS):
+            for t in range(op.hidden // op.rows):
                 add(DOWN, layer, t, ks)
     # The LM head's layer word is ``layers``: it reads h_in[layers].
-    lm_rows = op.vocab // ROWS
+    lm_rows = op.vocab // op.rows
     for t in range(0, lm_rows, LM_TILES):
         add(LMHEAD, op.layers, t, min(LM_TILES, lm_rows - t))
     return rows
@@ -1584,7 +1855,7 @@ def row_groups(
     """The producer groups instruction ``(kind, layer, a, b)`` waits for, and the group its
     completion counts toward. A group is done when all of its rows are."""
     if kind == QKV:
-        head = a * ROWS // HEAD_DIM
+        head = a * op.rows // HEAD_DIM
         if head < op.q_heads:
             kvh = head // op.group_size
         else:
@@ -1600,7 +1871,7 @@ def row_groups(
         return [("oproj", layer)], ("router", layer)
     if kind == GATEUP:
         # MoE expert rows read h_mid (router row 0 publishes it) and the router's logits.
-        per_split = 2 * op.inter // ROWS // DOWN_SPLITS
+        per_split = 2 * op.inter // op.rows // DOWN_SPLITS
         producer = ("router", layer) if op.moe else ("oproj", layer)
         return [producer], ("gateup", layer, a // per_split)
     if kind == DOWN:
@@ -1676,18 +1947,23 @@ class QwenMegakernel:
         ops: tuple[int, ...] = ALL_OPS,
         trace: str | None = None,
         waits: bool = False,
+        engine: str = "cuda_core",
         **config,
     ):
         """``ops``: keep only these instruction kinds (tests). ``trace``: compile with ranges for
         the work items and ``trace_region``s, recorded by ``"globaltimer"``
         (``qwen_megakernel_trace.trace_session`` decodes a launch) or ``"iket"`` (``run-iket``);
-        ``waits`` adds the layer's wait ranges. ``config``: ``QwenDecodeMegakernel`` constructor
-        arguments; the model shape comes from ``weights.config``."""
+        ``waits`` adds the layer's wait ranges. ``engine``: the GEMV engine, ``"cuda_core"`` or
+        ``"tcgen05"`` (``QwenDecodeMegakernelTc``). ``config``: ``QwenDecodeMegakernel``
+        constructor arguments; the model shape comes from ``weights.config``."""
+        kernels = {"cuda_core": QwenDecodeMegakernel, "tcgen05": QwenDecodeMegakernelTc}
+        if engine not in kernels:
+            raise ValueError(f"engine must be one of {sorted(kernels)}, got {engine!r}")
         if max_len % BLOCK:
             raise ValueError(f"max_len must be a multiple of {BLOCK}, got {max_len}")
         device = weights.embed.device
         self.max_len = max_len
-        self.op = op = QwenDecodeMegakernel(model=weights.config, **config)
+        self.op = op = kernels[engine](model=weights.config, **config)
         self.workspace, self.max_ctas = op.work.launch_args(device)
         self.table = build_table(op, self.max_ctas, ops).to(device)
         rows_per_cta = -(-self.table.shape[0] // self.max_ctas)

@@ -1,5 +1,7 @@
 """Qwen3 decode megakernel: each instruction alone, then whole decode steps."""
 
+import gc
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -25,6 +27,15 @@ from attn_gym.warpdrive.profiler import Range
 from attn_gym.warpdrive.trace_session import work_item_ranges
 
 MAX_LEN = 256
+
+
+@pytest.fixture(autouse=True)
+def release_cuda_memory():
+    """Return each test's runners (packed weight copies, up to 64 GB for Qwen3-32B) to the
+    device before the next test, which may load another checkpoint on this worker."""
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 def cached_weights(repo: str):
@@ -79,11 +90,12 @@ def rope_at(pos: int):
     return table[0][None], table[1][None]
 
 
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
 @pytest.mark.parametrize("op", ["qkv", "attn", "gateup", "down", "lmhead"])
-def test_single_instruction(weights, op):
+def test_single_instruction(weights, op, engine):
     """One instruction type over all layers, from random inputs in its scratch buffers."""
     torch.manual_seed(0)
-    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(getattr(mk, op.upper()),))
+    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(getattr(mk, op.upper()),), engine=engine)
     config = weights.config
     q_heads, kv_heads = config.num_q_heads, config.num_kv_heads
     view = runner.values
@@ -150,10 +162,11 @@ def test_single_instruction(weights, op):
         torch.testing.assert_close(runner.logits, expected, atol=2e-2, rtol=1e-2)
 
 
-def test_oproj_instruction(weights):
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_oproj_instruction(weights, engine):
     """o_proj combines KV-split partials: split s carries weight 2^m_s and sum l_s."""
     torch.manual_seed(1)
-    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.OPROJ,))
+    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.OPROJ,), engine=engine)
     o = torch.randn(runner.values("attn_o").shape, device="cuda")  # (L, group, split, head, d)
     m = torch.randn(runner.values("attn_ml").shape[:-1], device="cuda") * 3  # (L, grp, head, sp)
     den = torch.rand(m.shape, device="cuda") + 0.5
@@ -179,7 +192,8 @@ def test_oproj_instruction(weights):
         (1500, 1536, "static", 19),
     ],
 )
-def test_decode_steps(weights, ctx, max_len, schedule, splits):
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
     """Test teacher-forced decode steps under both schedules against an fp32 oracle.
 
     Context 127 crosses a KV-block boundary at position 128. Context 1500 gives each split
@@ -187,7 +201,7 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits):
     bf16 reference's error budget. Pick the oracle's token when its lead exceeds 0.5, write
     only cache row pos, mask NaN-poisoned unused rows, and repeat launches bit for bit.
     """
-    runner = mk.QwenMegakernel(weights, max_len, schedule=schedule, splits=splits)
+    runner = mk.QwenMegakernel(weights, max_len, schedule=schedule, splits=splits, engine=engine)
     caches, token, pos = make_decode_state(weights, ctx, max_len, seed=ctx)
     for cache in caches:
         cache[:, :, pos:] = float("nan")
@@ -225,7 +239,8 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits):
     assert runner.state.tolist() == [6, 0]  # one epoch per launch
 
 
-def test_odd_gqa_group_random_weights():
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_odd_gqa_group_random_weights(engine):
     """A GQA group of 3 (like Qwen3-14B's 5) serves one q head per attention row; its o_proj
     splits hold 6 heads, so the combine runs a full and a partial pass. No checkpoint needed."""
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
@@ -235,7 +250,7 @@ def test_odd_gqa_group_random_weights():
         intermediate_size=2048, vocab_size=4096,
     )  # fmt: skip
     weights = random_weights(config)
-    runner = mk.QwenMegakernel(weights, MAX_LEN)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
     assert (runner.op.per_row, runner.op.heads_per_split) == (1, 6)
     caches, token, pos = make_decode_state(weights, 150, MAX_LEN, seed=3)
     ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))
@@ -248,13 +263,18 @@ def test_odd_gqa_group_random_weights():
         torch.testing.assert_close(mine[:, :, pos], oracle[:, :, pos], atol=0.05, rtol=0.02)
 
 
-def test_moved_roles_match_defaults(weights_0_6b):
-    """The roles index their own threads: moving compute off warp 0 changes no bit."""
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_moved_roles_match_defaults(weights_0_6b, engine):
+    """The roles index their own threads: moving compute off warp 0 changes no bit. With the
+    tcgen05 engine the TMEM loads then run on other hardware warps, whose subpartitions (warp
+    index % 4) are rotated."""
     moved = {"load": RoleConfig(0), "compute": RoleConfig(range(1, 1 + mk.COMPUTE_WARPS))}
     caches, token, pos = make_decode_state(weights_0_6b, 100, MAX_LEN, seed=0)
     ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
-    logits = mk.QwenMegakernel(weights_0_6b, MAX_LEN, roles=moved)(weights_0_6b, token, pos, *ours)
-    expected = mk.QwenMegakernel(weights_0_6b, MAX_LEN)(weights_0_6b, token, pos, *theirs)
+    runner = mk.QwenMegakernel(weights_0_6b, MAX_LEN, roles=moved, engine=engine)
+    logits = runner(weights_0_6b, token, pos, *ours)
+    reference = mk.QwenMegakernel(weights_0_6b, MAX_LEN, engine=engine)
+    expected = reference(weights_0_6b, token, pos, *theirs)
     assert torch.equal(logits, expected)
     for mine, other in zip(ours, theirs):  # rows past pos are uninitialized
         assert torch.equal(mine[:, :, : pos + 1], other[:, :, : pos + 1])
@@ -325,3 +345,15 @@ def test_trace_analysis_on_synthetic_rows():
 def test_compute_size_is_fixed(warps):
     with pytest.raises(ProtocolError, match="one instance of 8 warps"):
         mk.QwenDecodeMegakernel(roles={"compute": RoleConfig(warps)})
+
+
+def test_tcgen05_engine_rejects_shapes_its_tiles_do_not_cover():
+    """128-row tiles: a vocabulary the CUDA-core kernel covers (a multiple of 32) but not of 128
+    is rejected by the tcgen05 kernel's constructor."""
+    config = QwenConfig(
+        hidden_size=1024, num_layers=1, num_q_heads=16, num_kv_heads=8, intermediate_size=3072,
+        vocab_size=4128,
+    )  # fmt: skip
+    mk.QwenDecodeMegakernel(model=config)
+    with pytest.raises(ValueError, match="vocabulary size 4128 must be a multiple of 128"):
+        mk.QwenDecodeMegakernelTc(model=config)

@@ -101,3 +101,15 @@ def test_error_budget_rejects_wrong_token_and_nonfinite_logits() -> None:
     assert compare_logits(bf16, bf16, high)["passed"]
     assert not compare_logits(high.flip(0), bf16, high)["passed"]
     assert not compare_logits(torch.full_like(high, float("nan")), bf16, high)["passed"]
+
+
+def test_compare_logits_accepts_either_token_of_a_near_tie():
+    """Eager and the test pick different tokens 0.01 apart in the oracle (well within eager's
+    error): the gate passes. A token the oracle scores far below eager's fails."""
+    high = torch.tensor([8.0, 7.99, 2.0, 1.0], dtype=torch.float64)
+    eager = torch.tensor([7.97, 8.0, 2.05, 0.95])
+    test = torch.tensor([8.01, 7.98, 2.0, 1.04])
+    metrics = compare_logits(test, eager, high)
+    assert not metrics["argmax_match"] and metrics["argmax_ok"] and metrics["passed"], metrics
+    wrong = torch.tensor([7.9, 7.95, 8.05, 1.0])
+    assert not compare_logits(wrong, eager, high)["argmax_ok"]
