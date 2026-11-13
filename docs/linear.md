@@ -141,8 +141,9 @@ numerical-range contract below. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
 Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
 wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM100-family GPUs
-and portable Triton kernels on other supported architectures. The `K = V = 64` backward uses
-portable Triton on every architecture.
+and portable Triton kernels on other supported architectures (see
+[Legacy CuTe routing](#legacy-cute-routing)). The `K = V = 64` backward uses portable Triton on
+every architecture.
 
 The warpdrive chunk backend, the default on SM100-family GPUs, requires the optional `linear`
 dependencies, an SM100-family GPU, FP16/BF16 Q/K/V, and `K = V` of 64 or 128.
@@ -150,6 +151,21 @@ Like the fused backend it runs gate, beta, and entry states in FP32 (returning t
 the caller's dtypes), packs dense batches into one sequence per row, and copies operands whose
 layout its kernels cannot address. It uses the same scalar natural-log gate contract and exact
 execution by default.
+
+#### Legacy CuTe routing
+
+The repo-local fused pipelines (`chunk_gdn`, `chunk_kda`, their paged, staged and
+context-parallel forms, and `gate_transform`/`bound_gate`) implement every stage in portable
+Triton, which runs on every supported CUDA architecture. On SM100-family GPUs some stages still
+default to legacy CuTeDSL kernels: the KDA forward factor engines, the KDA backward delta-H,
+WY/dQKG and intra-chunk kernels (the first two also serve the `K = V = 128` GDN backward), the
+native context-parallel summaries, and the per-channel `D=128` gate kernels.
+`ATTN_GYM_LEGACY_CUTE=0` routes those stages to Triton there as well; `1`, the default, keeps
+them. The variable is read on every launch inside the registered operators, so changing it needs
+no recompilation. It exists to validate and measure the portable route on Blackwell before the
+legacy kernels are removed; it does not affect `kernel_options={"backend": "warpdrive"}` kernels.
+Without the optional CuTeDSL dependency every architecture takes the Triton route, except that
+the staged and context-parallel entry points still import the CuTe summary module.
 
 #### Scalar gate numerical range
 
@@ -227,11 +243,14 @@ required: a default could silently select the wrong recurrence convention. `boun
 KDA-specific spelling of `kind="bounded"` for per-channel gates with `lower_bound=-5.0`.
 Both producers default to `fastmath=True`; see [Fast math and precision](#fast-math-and-precision).
 
-`impl="fused"` has a portable and a fast route. Per-channel `D=128` gates on CUDA capability
-9.0+ use the CuTeDSL kernels for both kinds (near the bf16->fp32 cast roofline with
-`fastmath=True`); every other `"softplus"` configuration uses a portable Triton kernel, and
-per-head `"bounded"` gates are reference-only. Both backwards reduce the `A_log` and `dt_bias`
-gradients in FP32 from per-block partials, so they are deterministic. The
+`impl="fused"` uses portable Triton kernels for both kinds and both gate shapes on every CUDA
+architecture. On SM100-family GPUs, per-channel `D=128` gates still default to legacy CuTeDSL
+kernels when they are installed (`ATTN_GYM_LEGACY_CUTE=0` selects Triton there too; see
+[Legacy CuTe routing](#legacy-cute-routing)). On GB300 the Triton kernels take 1.1-1.2x the
+CuTeDSL forward time and 1.1-1.25x its backward time (BF16, 16-134M elements). Both backwards
+reduce the `A_log` and `dt_bias` gradients in FP32 from per-block partials, so they are
+deterministic. The Triton bounded backward evaluates `sigmoid'(x)` as `e / (1 + e)^2` with
+`e = exp(-|x|)`, so saturated logits keep gradients that `s * (1 - s)` would cancel to zero. The
 decode kernels (`recurrent_kda_decode`, `recurrent_gdn_decode`) evaluate the same transforms
 in-kernel from the raw projections and do not call this operation. Unbounded softplus gates
 exceed the finite range some fused chunk-KDA schedules assume; keep per-channel softplus
@@ -294,9 +313,8 @@ convolution, the forget and output gates use two-stage factorized projections,
 and the per-head output uses learned RMS normalization before sigmoid gating.
 `--backend=reference` uses the PyTorch reference throughout. The optimized `chunk_kda`
 core used by `--backend=fused` supports Ampere or newer and owns the BT64 scan behind the same
-public boundary. The complete fused KDA variant currently requires Hopper because its separate
-`bound_gate` producer uses TMA. Implementations may inline the scan, but cumulative gates and
-chunk boundaries are not caller-visible representations.
+public boundary, as does its separate `bound_gate` producer. Implementations may inline the
+scan, but cumulative gates and chunk boundaries are not caller-visible representations.
 
 The example explicitly runs projections in BF16 while retaining FP32 parameters and gate
 math; no ambient autocast context is required. Distributed mixed-precision policies must
@@ -309,7 +327,8 @@ The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its 
 accepts FP16, BF16, or FP32 inputs. On SM100-family GPUs the default runs warpdrive, which chunks
 internally at 16 tokens ([Chunk backend selection](#chunk-backend-selection)); the rest of this
 paragraph describes the repo-local fused backend, which SM100-family GPUs run as the specialized
-CuTe path and SM120 and earlier supported architectures as the portable Triton stages. Homogeneous FP16
+CuTe path and SM120 and earlier supported architectures as the portable Triton stages for the
+forward and the backward (see [Legacy CuTe routing](#legacy-cute-routing)). Homogeneous FP16
 and BF16 Q/K/V stay in their input dtype, while FP32 or mixed-dtype inputs retain the existing BF16
 normalization. The core chunks internally at 64 tokens. Complete `B=1` inputs whose length is a
 multiple of the chunk size run on the direct dense route; other dense `[B, T, H, D]` inputs are
@@ -425,7 +444,7 @@ requires recompilation or recapture. Pass `--compile` to compile the complete ex
 one full graph. This keeps the custom KDA core behind its registered operator boundary
 while allowing
 Inductor to fuse the surrounding PyTorch normalization and remaining pointwise work.
-The bounded gate itself uses private CuTeDSL forward and backward operators. It can be
+The bounded gate itself uses private forward and backward operators. It can be
 combined with `--profile`; compilation warmups run before the
 trace starts. Profiling requires transformer-nuggets and writes a native Perfetto `.pftrace`
 through the shared `attn_gym.testing.profile_trace` helper. Like FLA's default training path, its backward recomputes the W/U,
