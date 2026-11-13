@@ -259,7 +259,8 @@ class KdaPrepPrefill(WarpSpecialized):
         )
         self.sched = Ring(SCHED_STAGES, Warps, Warps, payload=(Int32, (1,)))
         self.o_smem = Ring(O_STAGES, Warps, Warps, commit_fence="smem_async", buffer=buf["O"])
-        self.o_acc = Ring(QS_STAGES, Umma, Warps)
+        # The O drain issues no TMEM store: its release waits for the loads (tcgen05.wait::ld).
+        self.o_acc = Ring(QS_STAGES, Umma, Warps, release_fence="tmem_load")
         self.tstate = Barriers(len(TSTATE_COUNTS), counts=list(TSTATE_COUNTS))
         self.tmem_plan = (
             TmemPlan()
@@ -836,6 +837,9 @@ class KdaPrepPrefill(WarpSpecialized):
                                     for t in range(4)
                                 ]
                                 stg_v4(addr + (kb + g * 8) * obytes, words)
+                # The CTA's last item has no later TMEM store to order these loads before
+                # teardown frees TMEM.
+                cute.arch.fence_view_async_tmem_load()
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:

@@ -142,8 +142,12 @@ def tmem_ld(
     shape: cutlass.Constexpr[str], num: cutlass.Constexpr[int], taddr, dtype=cutlass.Float32
 ):
     """``tcgen05.ld.sync.aligned.{shape}.x{num}.b32`` at TMEM address ``taddr`` (lane << 16 |
-    column); returns the thread's registers as ``dtype`` values. Complete with
-    ``cute.arch.fence_view_async_tmem_load()`` before relying on them.
+    column); returns the thread's registers as ``dtype`` values. Using them needs no wait (the
+    register dependency is respected), but it orders no memory: before a signal lets another
+    thread overwrite these columns, complete the load with
+    ``cute.arch.fence_view_async_tmem_load()``, or follow it with a ``tmem_st`` from the same warp
+    completed by ``cute.arch.fence_view_async_tmem_store()`` (a pipelined ld -> st pair; PTX ISA
+    9.7.18.6.2 and 9.7.18.6.4.5).
 
     For ``16x256b``, value ``k`` of each x1 block is row ``lane // 4 + 8 * ((k // 2) % 2)``,
     column ``2 * (lane % 4) + k % 2 + 8 * block`` (the mma.sync accumulator fragment)."""

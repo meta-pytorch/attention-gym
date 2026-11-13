@@ -407,11 +407,23 @@ class KdaBprop(WarpSpecialized):
             buffer={k: buf[k] for k in ("Kdecay", "Kinv", "Qdecay", "Scale")},
             wait=CHANNEL_WAIT,
         )
+        # cg2 only reads these TMEM stages: its releases wait for the loads (tcgen05.wait::ld)
+        # before cg0 may store the next chunk over them.
         self.qk_raw = Ring(
-            QK_RAW_STAGES, Threads, Threads, commit_fence="tmem_store", wait=CHANNEL_WAIT
+            QK_RAW_STAGES,
+            Threads,
+            Threads,
+            commit_fence="tmem_store",
+            release_fence="tmem_load",
+            wait=CHANNEL_WAIT,
         )
         self.state_in = Ring(
-            2, Threads, {"mma": Umma, "cg2": Threads}, commit_fence="tmem_store", wait=CHANNEL_WAIT
+            2,
+            Threads,
+            {"mma": Umma, "cg2": Threads},
+            commit_fence="tmem_store",
+            release_fence="tmem_load",
+            wait=CHANNEL_WAIT,
         )
         # The 16 x 16 tiles share upstream's interleaved ``Inter`` stage (A, T, dA, dM, -dM).
         smem = "smem_async"
@@ -773,19 +785,22 @@ class KdaBprop(WarpSpecialized):
                 p1 = prefix + pair_sum
                 e0 = cute.math.exp2(p0, fastmath=True)
                 e1 = cute.math.exp2(p1, fastmath=True)
-                if channel_active:
-                    sts_f32(
-                        s_ex
-                        + 4
-                        * (f32_seg * (B_T * 32) + row0 * 32 + swz128(row0 ^ f32_seg, f32_dim, 4)),
-                        e0,
-                    )
-                    sts_f32(
-                        s_ex
-                        + 4
-                        * (f32_seg * (B_T * 32) + row1 * 32 + swz128(row1 ^ f32_seg, f32_dim, 4)),
-                        e1,
-                    )
+                # exp2(g) goes in place over this raw gate pair, into slots that other lanes of
+                # this warp read (below 32 channel rows, duplicate lanes store equal values to
+                # equal slots): the warp sync orders every lane's reads of the pair first. Later
+                # pairs touch other rows. Loading all 16 rows before one sync, as cuDNN Frontend
+                # v1.32.1 does with a cg0 barrier (v1.30.0 had none), measured 2-5% slower.
+                cute.arch.sync_warp()
+                sts_f32(
+                    s_ex
+                    + 4 * (f32_seg * (B_T * 32) + row0 * 32 + swz128(row0 ^ f32_seg, f32_dim, 4)),
+                    e0,
+                )
+                sts_f32(
+                    s_ex
+                    + 4 * (f32_seg * (B_T * 32) + row1 * 32 + swz128(row1 ^ f32_seg, f32_dim, 4)),
+                    e1,
+                )
                 prefix = p1
                 exp_g_last = e1
         else:
@@ -1396,6 +1411,8 @@ class KdaBprop(WarpSpecialized):
                                 addr + (i * 32 + g * 4) * 4,
                                 [as_i32(vec[g * 4 + t]) for t in range(4)],
                             )
+                # Before DSTATE0 lets the MMA rewrite dS, or teardown frees TMEM.
+                cute.arch.fence_view_async_tmem_load()
         else:
             if row_valid and dst >= 0:
                 for kd in cutlass.range(self.d_k, unroll=1):  # cold: empty items

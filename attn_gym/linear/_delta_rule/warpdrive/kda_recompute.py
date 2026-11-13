@@ -645,6 +645,10 @@ class KdaRecompute(WarpSpecialized):
                     s_gate + 2 * (gate_offsets[row % 8] + row * 64), self.gate_dtype
                 )
             g[row] = raw_g * Float32(LOG2_E)
+        if cutlass.const_expr(self.gate == "fp32"):
+            # The exp2(g) stores below go in place over this raw gate stage, into slots that
+            # only this warp read: the warp sync orders every lane's reads before them.
+            cute.arch.sync_warp()
         ragged = chunk_start + B_T > seqlen
         if ragged:  # padded rows carry no decay
             for row in cutlass.range_constexpr(B_T):
