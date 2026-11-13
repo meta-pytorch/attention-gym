@@ -240,6 +240,22 @@ SCENARIOS = {
         "head_dim": 512,
         "latent_values": True,
     },
+    "wide_fp16": {
+        "seqlens": [600, 200],
+        "query_lens": [2, 2],
+        "heads": 8,
+        "kv_heads": 1,
+        "head_dim": 512,
+        "topk": 128,
+        "dtype": torch.float16,
+    },
+    "large_head_group": {
+        "seqlens": [600, 200],
+        "query_lens": [2, 2],
+        "heads": 48,
+        "kv_heads": 1,
+        "topk": 128,
+    },
 }
 
 
@@ -317,6 +333,152 @@ def test_compiled_calls_reuse_kernels(triton_compiles, topk):
     assert triton_compiles["_paged_sparse_decode_kernel"] == (2 if topk == 512 else 3)
     # The merge kernel specializes only on the power-of-two bucket of the split count.
     assert triton_compiles["_merge_splits_kernel"] <= 4
+
+
+@requires_cuda
+@pytest.mark.parametrize("rows", [1, 4])
+@pytest.mark.parametrize("topk_length", [False, True])
+@pytest.mark.parametrize("separate_window", [False, True])
+def test_capacity_changes_reuse_kernels(triton_compiles, topk_length, separate_window, rows):
+    """Bounds cross 1, divisible-by-16 and other values without changing the tile bucket."""
+    compiled = torch.compile(paged_sparse_decode, fullgraph=True, dynamic=True)
+    # topk 1/16/17 all fit one 64-key tile (plus a window tile); the remaining
+    # capacities stay in the two-sparse-tile bucket.
+    for topk, context in ((1, 1), (16, 960), (17, 1024), (65, 1088), (66, 2048), (68, 2112)):
+        inputs = make_paged_sparse_decode_inputs(
+            [context] * rows,
+            [1] * rows,
+            heads=2,
+            kv_heads=1,
+            head_dim=32,
+            topk=topk,
+            topk_length=topk_length,
+            index_block_size=1,
+            window_size=8,
+            compress_ratio=4 if separate_window else 1,
+        )
+        # Include a width-one table, which the factory normally pads with a spare page.
+        if context == 1:
+            for name in ("kv", "window_kv"):
+                source = inputs[name]
+                if source is not None:
+                    inputs[name] = PagedKV(
+                        source.key_cache,
+                        source.value_cache,
+                        source.block_table[:, :1].contiguous(),
+                    )
+        expected = paged_sparse_decode(**inputs, impl="reference")
+        actual = compiled(**inputs)
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        assert_relative_rms_within(actual, expected.double(), "dynamic capacity", max_eps=2.0)
+    assert triton_compiles["_paged_sparse_decode_kernel"] == 1
+    assert triton_compiles["_merge_splits_kernel"] <= (3 if rows == 1 else 2)
+
+
+def test_int64_offset_inventory():
+    pytest.importorskip("triton")
+    from attn_gym.sparse.paged_decode.impl import triton
+
+    names = (
+        "Q",
+        "K",
+        "V",
+        "BlockTable",
+        "Indices",
+        "Out",
+        "PartialOut",
+        "PartialStats",
+        "WK",
+        "WV",
+        "WBlockTable",
+    )
+    small = torch.empty(16, device="meta")
+    wide = torch.empty_strided((3, 16), (2**30, 1), device="meta")
+    singleton = torch.empty_strided((1, 16), (2**32, 1), device="meta")
+    args = {
+        **dict.fromkeys(names, small),
+        "SHARED_WINDOW": False,
+        "WINDOW": 8,
+        "topk": 16,
+        "INDEX_BLOCK": 4,
+        "table_width": 1,
+        "PAGE_SIZE": 64,
+        "wtable_width": 1,
+        "WINDOW_PAGE_SIZE": 64,
+    }
+    assert not triton._requires_int64_decode_offsets(args)
+    for name in names:
+        assert triton._requires_int64_decode_offsets({**args, name: wide}), name
+        # An unreachable singleton stride does not require wide relative offsets.
+        assert not triton._requires_int64_decode_offsets({**args, name: singleton}), name
+    assert not triton._requires_int64_decode_offsets({**args, "WK": wide, "WINDOW": 0})
+    for name in ("topk", "table_width", "wtable_width"):
+        assert triton._requires_int64_decode_offsets({**args, name: 2**30}), name
+    assert triton._requires_int64_decode_offsets(
+        {**args, "table_width": 2**31 - 1, "PAGE_SIZE": 1, "INDEX_BLOCK": 3}
+    )
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", ["qsa_tp1", "small_batch_qsa_mtp", "dsv4_compressed_plus_window"])
+def test_forced_int64_matches_default(name, monkeypatch):
+    from attn_gym.sparse.paged_decode.impl import triton
+
+    inputs = make_paged_sparse_decode_inputs(**SCENARIOS[name])
+    expected, expected_aux = paged_sparse_decode(**inputs, return_aux=AuxRequest(lse=True))
+    calls = []
+
+    def force(*tensors):
+        calls.append(True)
+        return True
+
+    monkeypatch.setattr(triton, "requires_int64_offsets", force)
+    actual, aux = paged_sparse_decode(**inputs, return_aux=AuxRequest(lse=True))
+    assert calls
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(aux.lse, expected_aux.lse, atol=0, rtol=0)
+
+
+@requires_cuda
+def test_cache_offsets_beyond_int32():
+    """Both the correct address and its int32 wrap are allocated, so regressions fail safely."""
+    if torch.cuda.mem_get_info()[0] < 10 * 2**30:
+        pytest.skip("wide-stride regression needs 8 GiB of free device storage")
+    origin, stride = 2**31, 2**30
+    storage = torch.empty(origin + 2 * stride + 16, device="cuda", dtype=torch.bfloat16)
+    storage[:16].fill_(42)
+    cache = storage.as_strided((1, 3, 1, 16), (3 * stride, stride, 16, 1), origin)
+    cache.copy_(torch.ones_like(cache))
+    inputs = make_paged_sparse_decode_inputs(
+        [3], [1], heads=1, kv_heads=1, head_dim=16, topk=1, index_block_size=1
+    )
+    inputs["kv"] = PagedKV(cache, cache, torch.zeros((1, 1), device="cuda", dtype=torch.int32))
+    inputs["indices"].fill_(2)
+    expected = paged_sparse_decode(**inputs, impl="reference")
+    actual = paged_sparse_decode(**inputs)
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("separate_window", [False, True])
+def test_oversized_block_ids_are_ignored(separate_window):
+    inputs = make_paged_sparse_decode_inputs(
+        [32],
+        [1],
+        heads=1,
+        kv_heads=1,
+        head_dim=16,
+        topk=1,
+        compress_ratio=4 if separate_window else 1,
+    )
+    inputs["indices"].fill_(2**30)
+    inputs["topk_length"].fill_(1)
+    actual, aux = paged_sparse_decode(**inputs, return_aux=AuxRequest(lse=True))
+    expected, expected_aux = paged_sparse_decode(
+        **inputs, impl="reference", return_aux=AuxRequest(lse=True)
+    )
+    torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    torch.testing.assert_close(aux.lse, expected_aux.lse, atol=0, rtol=0)
 
 
 @requires_cuda

@@ -17,6 +17,40 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
+from attn_gym._backends.triton.utils import requires_int64_offsets
+
+
+def _requires_int64_decode_offsets(args) -> bool:
+    """Inventory strided inputs and scratch; disabled window inputs do not affect codegen.
+
+    Contiguous metadata uses direct indices, and LSE already uses int64 row arithmetic.
+    Include an index block's overhang when bounding logical entry arithmetic.
+    """
+    if (
+        args["topk"] * args["INDEX_BLOCK"] > 2**31 - 1
+        or args["table_width"] * args["PAGE_SIZE"] + args["INDEX_BLOCK"] - 1 > 2**31 - 1
+        or (
+            (args["SHARED_WINDOW"] or args["WINDOW"] > 0)
+            and args["wtable_width"] * args["WINDOW_PAGE_SIZE"] > 2**31 - 1
+        )
+    ):
+        return True
+    return requires_int64_offsets(
+        args["Q"],
+        args["K"],
+        args["V"],
+        args["BlockTable"],
+        args["Indices"],
+        args["Out"],
+        args["PartialOut"],
+        args["PartialStats"],
+        *(
+            (args["WK"], args["WV"], args["WBlockTable"])
+            if not args["SHARED_WINDOW"] and args["WINDOW"] > 0
+            else ()
+        ),
+    )
+
 
 @triton.jit
 def _attend_tile(
@@ -37,12 +71,17 @@ def _attend_tile(
     HEAD_DIM: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     K_ROWS: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     dims = tl.arange(0, HEAD_DIM)
     dims_v = tl.arange(0, HEAD_DIM_V)
-    # Masked rows issue no memory traffic; page/offset are clamped to zero there.
-    page = tl.where(valid, page, 0).to(tl.int64)
-    offset = tl.where(valid, offset, 0)
+    # Callers mask page-table loads with other=0; the same mask guards these cache loads.
+    # Widen before either multiply, including the within-page token offset.
+    # Keep the page multiply wide even on the narrow path: narrowing it costs 0.8-0.9 us
+    # on B200's small grids. Other offset products only widen for large layouts.
+    page = page.to(tl.int64)
+    if USE_INT64_OFFSETS:
+        offset = offset.to(tl.int64)
     if K_ROWS:
         # Keys in the values' [keys, dims] layout: the page and offset vectors then need no
         # second layout, which saved 0.8-2 us per call on the many-warp small-batch tiles.
@@ -75,7 +114,19 @@ def _attend_tile(
     return acc, m_new, l_i
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_splits"])
+@triton.heuristics({"USE_INT64_OFFSETS": _requires_int64_decode_offsets})
+@triton.jit(
+    do_not_specialize=[
+        "num_rows",
+        "num_splits",
+        "topk",
+        "stride_table",
+        "table_width",
+        "stride_indices",
+        "stride_wtable",
+        "wtable_width",
+    ]
+)
 def _paged_sparse_decode_kernel(
     Q,
     K,
@@ -117,7 +168,7 @@ def _paged_sparse_decode_kernel(
     stride_out_row,
     stride_out_head,
     qk_scale,
-    TOPK: tl.constexpr,
+    topk,
     INDEX_BLOCK: tl.constexpr,
     PAGE_SIZE: tl.constexpr,
     WINDOW_PAGE_SIZE: tl.constexpr,
@@ -136,6 +187,7 @@ def _paged_sparse_decode_kernel(
     K_ROWS: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
     USE_PDL: tl.constexpr,
+    USE_INT64_OFFSETS: tl.constexpr,
 ):
     # The grid walks (sequence, query) pairs, so every metadata load issues at once instead of
     # after a search of cu_seqlens_q; pairs past a sequence's query count do nothing.
@@ -153,6 +205,9 @@ def _paged_sparse_decode_kernel(
     has_row = row < query_end
     active = has_row & (position >= 0)
     row = tl.where(has_row, row, 0)
+    if USE_INT64_OFFSETS:
+        table_width = table_width.to(tl.int64)
+        wtable_width = wtable_width.to(tl.int64)
 
     window_start = tl.maximum(position + 1 - WINDOW, 0)
     if SHARED_WINDOW:
@@ -161,9 +216,11 @@ def _paged_sparse_decode_kernel(
     window_end = tl.minimum(position + 1, wtable_width * WINDOW_PAGE_SIZE)
     num_window = tl.where(active, tl.maximum(window_end - window_start, 0), 0)
     if HAS_TOPK_LENGTH:
-        num_blocks = tl.minimum(tl.maximum(tl.load(TopkLength + row), 0), TOPK)
+        num_blocks = tl.minimum(tl.maximum(tl.load(TopkLength + row), 0), topk)
     else:
-        num_blocks = TOPK
+        num_blocks = topk
+    if USE_INT64_OFFSETS:
+        num_blocks = num_blocks.to(tl.int64)
     num_sparse = tl.where(active, num_blocks * INDEX_BLOCK, 0)
     if SHARED_WINDOW:
         sparse_limit = window_start
@@ -171,6 +228,9 @@ def _paged_sparse_decode_kernel(
         sparse_limit = table_width * PAGE_SIZE
 
     heads = tl.arange(0, BLOCK_M)
+    if USE_INT64_OFFSETS:
+        heads = heads.to(tl.int64)
+        kv_head = kv_head.to(tl.int64)
     # Pairs past their sequence's queries load and store nothing.
     head_mask = (heads < GROUP) & has_row
     first_head = kv_head * GROUP
@@ -194,6 +254,12 @@ def _paged_sparse_decode_kernel(
 
     sparse_tiles = tl.cdiv(num_sparse, BLOCK_N)
     window_tiles = tl.cdiv(num_window, BLOCK_N)
+    if tl.constexpr(topk.dtype == tl.int32 and INDEX_BLOCK <= BLOCK_N // 2):
+        # Tile counts, unlike cache addresses, fit int32 here: sparse_tiles <= ceil(topk/2)
+        # and window_tiles <= ceil(INT32_MAX/BLOCK_N). Keep the loop and split modulo narrow;
+        # int64 versions cost 6-7% on B200 with a large cache. Widen tile-to-entry products below.
+        sparse_tiles = sparse_tiles.to(tl.int32)
+        window_tiles = window_tiles.to(tl.int32)
     if SHARED_WINDOW:
         # One loop over sparse then window tiles: a second loop costs latency even when empty.
         # Tiny grids give each split one tile. Removing the loop also lets the compiler
@@ -203,15 +269,22 @@ def _paged_sparse_decode_kernel(
         tile_step = 1 if SINGLE_TILE else num_splits
         for tile_index in range(tile_begin, tile_end, tile_step):
             tile = split if SINGLE_TILE else tile_index
-            column = tile * BLOCK_N + columns
+            tile_offset = tile.to(tl.int64) if USE_INT64_OFFSETS else tile
+            column = tile_offset * BLOCK_N + columns
             is_sparse = tile < sparse_tiles
             block = tl.load(
                 Indices + row.to(tl.int64) * stride_indices + column // INDEX_BLOCK,
                 mask=is_sparse & (column < num_sparse),
                 other=-1,
             )
+            # Reject oversized ids before multiplying: an int32 wrap could turn an invalid
+            # block into a valid entry (or a negative address into the page table).
+            block = tl.where(block < tl.cdiv(sparse_limit, INDEX_BLOCK), block, -1)
+            if USE_INT64_OFFSETS:
+                block = block.to(tl.int64)
             sparse_entry = block * INDEX_BLOCK + column % INDEX_BLOCK
-            window_column = column - sparse_tiles * BLOCK_N
+            sparse_tile_offset = sparse_tiles.to(tl.int64) if USE_INT64_OFFSETS else sparse_tiles
+            window_column = column - sparse_tile_offset * BLOCK_N
             entry = tl.where(is_sparse, sparse_entry, window_start + window_column)
             valid = tl.where(
                 is_sparse,
@@ -237,15 +310,20 @@ def _paged_sparse_decode_kernel(
                 HEAD_DIM,
                 HEAD_DIM_V,
                 K_ROWS,
+                USE_INT64_OFFSETS,
             )
     else:
         for tile in range(split, sparse_tiles, num_splits):
-            column = tile * BLOCK_N + columns
+            tile_offset = tile.to(tl.int64) if USE_INT64_OFFSETS else tile
+            column = tile_offset * BLOCK_N + columns
             block = tl.load(
                 Indices + row.to(tl.int64) * stride_indices + column // INDEX_BLOCK,
                 mask=column < num_sparse,
                 other=-1,
             )
+            block = tl.where(block < tl.cdiv(sparse_limit, INDEX_BLOCK), block, -1)
+            if USE_INT64_OFFSETS:
+                block = block.to(tl.int64)
             entry = block * INDEX_BLOCK + column % INDEX_BLOCK
             valid = (block >= 0) & (entry < sparse_limit)
             page = tl.load(table_row + entry // PAGE_SIZE, mask=valid, other=0)
@@ -267,6 +345,7 @@ def _paged_sparse_decode_kernel(
                 HEAD_DIM,
                 HEAD_DIM_V,
                 K_ROWS,
+                USE_INT64_OFFSETS,
             )
         if WINDOW > 0:
             w_table_row = WBlockTable + sequence.to(tl.int64) * stride_wtable
@@ -297,6 +376,7 @@ def _paged_sparse_decode_kernel(
                     HEAD_DIM,
                     HEAD_DIM_V,
                     K_ROWS,
+                    USE_INT64_OFFSETS,
                 )
 
     dims_v = tl.arange(0, HEAD_DIM_V)
@@ -322,7 +402,7 @@ def _paged_sparse_decode_kernel(
             lse = tl.where(l_i > 0, (m_i + tl.math.log2(l_i)) * 0.6931471805599453, float("-inf"))
             tl.store(Lse + row.to(tl.int64) * NUM_HEADS + first_head + heads, lse, mask=head_mask)
     else:
-        partial_row = (split * num_rows + row).to(tl.int64) * NUM_HEADS + first_head + heads
+        partial_row = (split.to(tl.int64) * num_rows + row) * NUM_HEADS + first_head + heads
         # Keep unnormalized sums and maxima: the merge can normalize once, avoiding a
         # division and log2 per split followed by an exp2 to reconstruct the weights.
         tl.store(
@@ -395,32 +475,37 @@ def _merge_splits_kernel(
 
 
 def _tile_config(
-    head_dim: int, head_dim_v: int, num_programs: int, sparse_entries: int
+    head_dim: int, head_dim_v: int, num_programs: int, sparse_entries: int, block_m: int
 ) -> tuple[int, int, int, bool]:
     """Return (block_n, num_warps, num_stages, k_rows) for ``num_programs`` (row, KV head) pairs.
 
     Measured on B200 with QSA decode shapes. Up to 3 programs, latency rules: target 128
     sparse tiles, with widths bucketed to 16/32/64 keys. Wider tiles keep larger budgets on
     the one-tile path (2048-block batch-1 decode: 9.2 vs 16.6 us with 16-key looped tiles).
-    From 4 programs on, 64-key tiles on 2 warps win; wider rows halve the tile to keep a
-    prefetched stage of K and V in shared memory.
+    From 4 programs on, 64-key tiles on 2 warps win for QSA. Wider rows halve the tile and
+    use 8 warps; large head groups also need 8 warps to avoid spilling the Q/value accumulators.
     """
     if num_programs <= 3:
         if head_dim + head_dim_v <= 512 and sparse_entries > 2048:
             block_n = 32 if sparse_entries <= 4096 else 64
             return block_n, 8 if num_programs <= 2 else 4, 2, True
         return 16, 4, 2, True
-    return (64 if head_dim + head_dim_v <= 512 else 32), 2, 2, False
+    if head_dim + head_dim_v > 512:
+        return 32, 8, 2, False
+    if block_m * (head_dim + head_dim_v) > 16384:
+        return 64, 8, 2, False
+    return 64, 2, 2, False
 
 
 @functools.cache
 def _cta_slots(device_index: int, smem_per_cta: int) -> int:
-    """CTAs resident at once: shared memory bounds them, 2-warp register use caps them at 4."""
+    """CTAs resident at once: shared memory bounds them; cap the model at 4 per SM."""
     properties = torch.cuda.get_device_properties(device_index)
     per_sm = properties.shared_memory_per_multiprocessor // (smem_per_cta + 1024)
     return properties.multi_processor_count * max(1, min(per_sm, 4))
 
 
+@functools.lru_cache(maxsize=256)
 def _choose_splits(num_programs: int, num_tiles: int, slots: int) -> int:
     """Pick the split count minimizing a wave-fill cost model.
 
@@ -428,6 +513,9 @@ def _choose_splits(num_programs: int, num_tiles: int, slots: int) -> int:
     and every split beyond the first adds merge work proportional to its waves. The constants
     were fitted on B200 across 1-1024 (row, KV head) programs; the model's choice stayed within
     5% of the best of 32 split counts measured at each size.
+
+    Memoize this host arithmetic to avoid repeating the sweep on every eager call. The bounded
+    cache holds only integer decisions; compiled kernels still reuse runtime rows and splits.
     """
     best_cost, best_splits = float("inf"), 1
     for splits in range(1, min(num_tiles, 64) + 1):
@@ -502,7 +590,7 @@ def paged_sparse_decode(
     num_programs = num_rows * kv_heads
     topk = indices.shape[1]
     block_n, num_warps, num_stages, k_rows = _tile_config(
-        head_dim, head_dim_v, num_programs, topk * index_block_size
+        head_dim, head_dim_v, num_programs, topk * index_block_size, block_m
     )
     smem_per_cta = query.element_size() * (block_m * head_dim + block_n * (head_dim + head_dim_v))
     max_window = window_size + (index_block_size - 1 if shared_window else 0)
@@ -568,7 +656,7 @@ def paged_sparse_decode(
         out.stride(0),
         out.stride(1),
         scale * math.log2(math.e),
-        TOPK=topk,
+        topk=topk,
         INDEX_BLOCK=index_block_size,
         PAGE_SIZE=key_cache.shape[1],
         WINDOW_PAGE_SIZE=window_key_cache.shape[1],

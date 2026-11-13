@@ -311,11 +311,13 @@ window are skipped, so each key is attended once and the incomplete block holdin
   correctness oracle and supports every shape.
 - `impl="fused"` (default) runs a Triton split-K kernel and an LSE merge on CUDA, under
   `torch.compile(fullgraph=True, dynamic=True)` and CUDA graph capture. Batch, sequence count,
-  and split count are runtime values. For up to 3 (row, KV head) pairs, tile widths are
+  split count, sparse capacity, and page-table extents are runtime values. For up to 3
+  (row, KV head) pairs, tile widths are
   bucketed to 16/32/64 keys as the sparse budget grows, targeting 128 tiles. Larger grids use
   64-key tiles split by a wave-occupancy model of the GPU's SMs (32 keys for wider head
   dimensions). For fixed head dimensions and sparse budget, changing batches compile at most
-  three kernel configurations: small grids use four or eight warps, larger grids use two.
+  three tile configurations: small grids use four or eight warps. Larger grids use two warps
+  for QSA, and eight for wide heads or large head groups to avoid register spills.
   Small grids over a shared cache use one tile per split for budgets of at most 256 tiles,
   including the incomplete final block. Larger budgets keep a loop. Splits store unnormalized
   accumulators and softmax statistics so normalization happens once in the merge. It needs
@@ -323,6 +325,11 @@ window are skipped, so each key is attended once and the incomplete block holdin
   `group x head_dim` per KV head (for example 16 x 256 or 32 x 512). Quantized caches (FP8/FP4
   DeepSeek formats) are not supported yet; DeepSeek V3.2's 576-wide latent needs the reference
   path.
+
+The fused backend accepts caches with a contiguous feature dimension and arbitrary outer strides,
+including layouts whose relative offsets require int64 addressing. Sparse capacities within the
+same tile bucket reuse the producer kernel; the merge specializes on a power-of-two split bucket.
+Out-of-range positive block ids are ignored before block-to-token multiplication.
 
 On B200 with Qwen3.8-Flash-Next QSA shapes (24/2 heads per rank at TP1, 6/1 at TP4, BF16,
 head dim 256, four-token index blocks, page 64, context 32,771), cold-cache batch-1 timings are:
