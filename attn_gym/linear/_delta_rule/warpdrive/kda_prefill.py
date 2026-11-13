@@ -102,7 +102,6 @@ from .kda_common import (
     FINAL_DST,
     TORCH_NAMES,
     WORK_ITEM_FIELDS,
-    as_i32,
     beta_residual,
     box128,
     lds_16_f32,
@@ -119,7 +118,8 @@ from .kda_common import (
     raw_beta_wait,
     resolve_paged_state,
     spin_wait,
-    stg_v4,
+    state_align_suffix,
+    store_state_32,
     sts_f32,
     sts_tf32x8,
     swz32,
@@ -238,8 +238,10 @@ class KdaPrefill(WarpSpecialized):
 
     ``d_v`` is the tile width (64 under the d_v split, ``tiles_per_head = 2``). The static state
     flags and ``paged_state`` (0 none, 1 routes, 2 routes + fresh-slot mask) select code; the
-    state dtype follows the traced tensors.
-    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
+    state dtype follows the traced tensors. ``state_align`` is the byte alignment of every state
+    row: below 16 only for a paged pool with unaligned rows (NOTE [Unaligned state rows] in
+    kda_common). ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and
+    reciprocal."""
 
     def __init__(
         self,
@@ -253,6 +255,7 @@ class KdaPrefill(WarpSpecialized):
         paged_state: int,
         num_ctas: int,
         fastmath: bool = True,
+        state_align: int = 16,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA prefill serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
@@ -264,6 +267,7 @@ class KdaPrefill(WarpSpecialized):
         self.tiles_per_head, self.num_ctas = tiles_per_head, num_ctas
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         self.paged_state, self.fastmath = paged_state, fastmath
+        self.state_align = state_align
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         gate_bytes = self.gate_dtype.width // 8
@@ -391,7 +395,8 @@ class KdaPrefill(WarpSpecialized):
         flags = f"{int(self.use_initial_state)}{int(self.store_final_state)}{self.paged_state}"
         return (
             f"wd_kda_prefill_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
-            f"_t{self.tiles_per_head}_f{flags}" + ("" if self.fastmath else "_nofm")
+            f"_t{self.tiles_per_head}_f{flags}{state_align_suffix(self.state_align)}"
+            + ("" if self.fastmath else "_nofm")
         )
 
     # ---- work decode -------------------------------------------------------------------
@@ -1134,7 +1139,7 @@ class KdaPrefill(WarpSpecialized):
             blocks = range(half * (self.d_k // 32), (half + 1) * (self.d_k // 32))
             vecs = []
             for i in cutlass.range_constexpr(blocks.start, blocks.stop):
-                vals = load_state_16(addr + i * 16 * sbytes, st.element_type)
+                vals = load_state_16(addr + i * 16 * sbytes, st.element_type, self.state_align)
                 if cutlass.const_expr(self.paged_state > 0):
                     vals = [Float32(cutlass.select_(load_initial, v, Float32(0.0))) for v in vals]
                 vecs.append(vals)
@@ -1414,23 +1419,7 @@ class KdaPrefill(WarpSpecialized):
                 for kb in cutlass.range_constexpr(0, self.d_k, 32):
                     vals = tmem_ld("32x32b", 32, lane_base + cols["state"] + kb)
                     if row_valid:
-                        if cutlass.const_expr(out.element_type is Float32):
-                            for g in cutlass.range_constexpr(8):
-                                stg_v4(
-                                    addr + (kb + g * 4) * obytes,
-                                    [as_i32(vals[g * 4 + t]) for t in range(4)],
-                                )
-                        else:
-                            for g in cutlass.range_constexpr(4):
-                                words = [
-                                    fp32_to_fp16(
-                                        vals[g * 8 + 2 * t],
-                                        vals[g * 8 + 2 * t + 1],
-                                        dtype=out.element_type,
-                                    )
-                                    for t in range(4)
-                                ]
-                                stg_v4(addr + (kb + g * 8) * obytes, words)
+                        store_state_32(addr, kb * obytes, vals, out.element_type, self.state_align)
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:

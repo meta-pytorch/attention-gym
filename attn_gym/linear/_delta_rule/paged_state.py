@@ -12,23 +12,28 @@ import torch
 WARPDRIVE_POOL_ALIGNMENT_BYTES = 16
 
 
-def state_pool_is_aligned(cache: torch.Tensor, alignment_bytes: int) -> bool:
-    """Return whether a pool's base and slot origins are ``alignment_bytes``-aligned.
+def state_row_alignment(cache: torch.Tensor) -> int:
+    """Return the largest power-of-two byte alignment, at most 16, of every row of a state tensor.
 
-    Fake tensors have no address, so under ``torch.compile`` the view offset stands in for the
-    base: allocations themselves are aligned.
+    That is the alignment shared by the base and every outer stride, so it covers each slot,
+    head and value row; the innermost mode is contiguous. Fake tensors have no address, so under
+    ``torch.compile`` the view offset stands in for the base: allocations themselves are aligned.
     """
     element_bytes = cache.element_size()
-    if alignment_bytes % element_bytes:
-        raise ValueError("alignment must be a multiple of the state element size")
-    base = (
+    offsets = (
         cache.storage_offset() * element_bytes
         if torch.compiler.is_compiling()
         else cache.data_ptr()
     )
-    return (
-        base % alignment_bytes == 0 and cache.stride(0) % (alignment_bytes // element_bytes) == 0
-    )
+    offsets |= 16
+    for stride in cache.stride()[:-1]:
+        offsets |= stride * element_bytes
+    return offsets & -offsets
+
+
+def state_pool_is_aligned(cache: torch.Tensor, alignment_bytes: int) -> bool:
+    """Return whether every state row of a pool is ``alignment_bytes``-aligned (at most 16)."""
+    return state_row_alignment(cache) >= alignment_bytes
 
 
 def validate_has_initial_state(
@@ -118,14 +123,6 @@ class PagedState:
                 raise ValueError("the paged state pool must not alias read-only inputs")
         return cls(cache, indices, has_initial_state)
 
-    def require_alignment(self, alignment_bytes: int) -> PagedState:
-        """Refine the common contract with a backend's pointer-alignment requirement."""
-        if not state_pool_is_aligned(self.cache, alignment_bytes):
-            raise TypeError(
-                f"the paged state pool base and slot origins must be {alignment_bytes}-byte aligned"
-            )
-        return self
-
     @property
     def byte_mask(self) -> torch.Tensor | None:
         """Expose the bool mask through byte-oriented foreign-function ABIs."""
@@ -136,5 +133,6 @@ __all__ = [
     "WARPDRIVE_POOL_ALIGNMENT_BYTES",
     "PagedState",
     "state_pool_is_aligned",
+    "state_row_alignment",
     "validate_has_initial_state",
 ]
