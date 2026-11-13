@@ -144,6 +144,7 @@ SERVED = {
         initial_state=torch.zeros(1, 2, 128, 128, device="cuda"), output_final_state=True
     ),
     "chunk_kda schedule=persistent": lambda: _run_kda(kernel_options={"schedule": "persistent"}),
+    "chunk_kda fastmath=False": lambda: _run_kda(fastmath=False),
     "chunk_gdn d128": lambda: _run_gdn(),
     "chunk_gdn d64": lambda: _run_gdn(dim=64),
     "paged_chunk_kda aligned pool": lambda: _run_paged_kda(),
@@ -151,7 +152,6 @@ SERVED = {
 }
 ROUTED_TO_FUSED = {
     "chunk_kda fp16": lambda: _run_kda(dtype=torch.float16),
-    "chunk_kda fastmath=False": lambda: _run_kda(fastmath=False),
     "paged_chunk_kda fp16": lambda: _run_paged_kda(dtype=torch.float16),
     "paged_chunk_kda replay_state": lambda: _run_paged_kda(replay=True),
     "paged_chunk_kda misaligned pool": lambda: _run_paged_kda(prefix=1),
@@ -247,7 +247,7 @@ def _two_sequences():
     [
         ("kda bf16", "warpdrive"),
         ("kda fp16", "fused"),
-        ("kda fastmath=False", "fused"),
+        ("kda fastmath=False", "warpdrive"),
         ("gdn bf16", "warpdrive"),
         ("gdn fp16", "warpdrive"),
     ],
@@ -278,7 +278,7 @@ def test_default_reproduces_the_selected_backend(name, expected):
 @needs_warpdrive
 @pytest.mark.parametrize(
     ("name", "warpdrive"),
-    [("kda bf16", True), ("kda fp16", False), ("kda fastmath=False", False), ("gdn bf16", True)],
+    [("kda bf16", True), ("kda fp16", False), ("kda fastmath=False", True), ("gdn bf16", True)],
 )
 def test_default_stages_select_like_the_public_op(name, warpdrive):
     """The staged entry points behind context parallelism resolve the default as the ops do."""

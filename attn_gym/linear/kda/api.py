@@ -128,10 +128,11 @@ def chunk_kda(
             didn’t improve accuracy in our tests. If you’re seeing unexpected outputs or
             gradients, especially with strong negative gates, try ``False`` and compare
             against the reference. It can preserve small contributions that fast math
-            drops when intermediate values fall into the subnormal range.
-            The reference backend uses normal PyTorch math for either value; explicit
-            warpdrive requires ``True``, and the default backend runs ``False`` on the fused
-            backend. Configure gate production separately with ``bound_gate`` or
+            drops when intermediate values fall into the subnormal range. On warpdrive both
+            values give the same bits inside its gate range; ``False`` only keeps results
+            finite slightly past it, where accuracy is already poor ("Fast math and
+            precision" in ``docs/linear.md``). The reference backend uses normal PyTorch math
+            for either value. Configure gate production separately with ``bound_gate`` or
             ``gate_transform``.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
             differentiable eager PyTorch in FP32. There is no automatic fallback between
@@ -167,7 +168,7 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if resolve_kda_backend(options.backend, q, k, v, fastmath=fastmath) == "warpdrive":
+        if resolve_kda_backend(options.backend, q, k, v) == "warpdrive":
             return _warpdrive_chunk_forward(
                 q,
                 k,
@@ -344,7 +345,7 @@ def paged_chunk_kda(
     fused_only = replay_state is not None or not state_pool_is_aligned(
         state_cache, WARPDRIVE_POOL_ALIGNMENT_BYTES
     )
-    backend = resolve_kda_backend(options.backend, q, k, v, fastmath=True, fused_only=fused_only)
+    backend = resolve_kda_backend(options.backend, q, k, v, fused_only=fused_only)
     if backend == "warpdrive":
         return _warpdrive_paged_chunk_forward(
             q,

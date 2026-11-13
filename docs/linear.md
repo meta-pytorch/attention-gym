@@ -30,11 +30,10 @@ On SM100-family GPUs, `"auto"` runs these calls on the fused backend:
 | Call | Reason |
 | --- | --- |
 | KDA whose kernels run in FP16 (Q, K, and V all FP16) | warpdrive FP16 does not hold model-range gates yet ([KDA gate contract](#kimi-delta-attention)) |
-| KDA with `fastmath=False` (`chunk_kda`, `chunk_kda_prepare`, `context_parallel_kda`) | warpdrive has only fast gate exponentials |
 | `paged_chunk_kda` with `replay_state` | replay-backed decode and prefill exist only on the fused backend |
 | `paged_chunk_gdn`/`paged_chunk_kda` with a pool base or slot stride that is not 16-byte aligned | warpdrive's paged kernels require that alignment |
 
-The choice depends only on the device, dtypes, `fastmath`, `replay_state`, and pool alignment,
+The choice depends only on the device, dtypes, `replay_state`, and pool alignment,
 never on sizes, so a compiled graph or captured CUDA Graph keeps one backend. A staged backward
 handle follows its forward tape. `split_forward` and `split_backward` still require an explicit
 `"warpdrive"`. Explicit `"fused"` and `"warpdrive"` are never rerouted.
@@ -479,7 +478,8 @@ backend requires approximately `[-5.914, 0]` (`MAX_GATE_LOWER_BOUND_MAGNITUDE`).
 the default on SM100-family GPUs for BF16, FP32, and mixed Q/K/V, requires about `[-5.25, 0]`
 (`WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`), for the reasons below. Every aligned 16-token
 per-channel sum must exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
-results are not finite. That bound keeps the forward finite; gradients need more margin. The
+results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). That bound keeps the
+forward finite; gradients need more margin. The
 backward stages `Q_decay = scale * q * exp(in-chunk cumulative decay)` as a BF16 MMA operand,
 which flushes to zero once `scale * |q| * exp(16-token sum)` falls below about `2^-126`, and dv,
 dgate and dbeta then lose precision. Measured as relative RMS error against FP64 (one BF16
@@ -592,7 +592,7 @@ count and always stride over the active work only, so it needs no option for ove
 |---|---|---|
 | Repo-local fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
-| warpdrive KDA | Native backend math | Runs on the repo-local fused backend under the default `"auto"`; `ValueError` with explicit `"warpdrive"` |
+| warpdrive KDA | Flush-to-zero approximate exponentials and reciprocals | Non-flushing approximate exponentials and reciprocals that preserve FP32 subnormal results |
 
 One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100-family GPUs always uses
 the flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
@@ -602,6 +602,14 @@ that a factor flushes only when the decay it belongs to is below `2^-126`, so `f
 gradients stay accurate up to the gate bound; such a decay is still lost with `fastmath=True` even
 when a large K entry would make its term normal. Its in-subchunk factors reach `2^68.3` there, so
 at the gate bound the backward needs Q entries and `beta`-scaled K entries below `2^59.7`.
+
+warpdrive gives bitwise-identical results in both modes while every in-chunk decay stays at or
+above `2^-126`, as the [KDA gate contract](#kimi-delta-attention) implies. Below that, `False`
+keeps a decayed state or summary entry as an FP32 subnormal instead of zero and keeps results
+finite while every aligned 16-token per-channel sum exceeds about `-128 * ln(2)` (a uniform gate
+of at least `-5.54`) instead of `-126 * ln(2)`. Accuracy in that band stays poor (BF16, uniform `-5.5`:
+1.3% relative RMS error on the output and 45% on dgate, against 0.4% and 0.3% for the fused
+backend with `False`), so the gradient guideline of about `-5.25` applies in both modes.
 
 Use the same value for staged forward and backward preparation. Choose it before warmup and
 CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.

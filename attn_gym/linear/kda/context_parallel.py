@@ -41,7 +41,7 @@ def context_parallel_kda(
     ``scale``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``.
     Forward, backward, and their summaries share the same math policy.
     ``"backend"`` selects the kernels of the local pass and summaries as in
-    ``chunk_kda_prepare``; explicit warpdrive requires ``fastmath=True``.
+    ``chunk_kda_prepare``.
     """
     stages = _kda_stages(scale, fastmath, kernel_options)
     return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)

@@ -179,8 +179,7 @@ class DeltaRuleAttention(nn.Module):
     and the bounded ``gate_transform``; ``variant="gdn"`` learns one softplus log decay per head
     through ``a_proj``. ``lower_bound`` applies to the KDA gate only; ``fastmath`` applies to
     both fused gates and to the KDA core. Its default ``True`` permits approximate math;
-    reference execution keeps ordinary PyTorch math, and the default chunk backend runs ``False``
-    on the repo-local kernels (explicit warpdrive KDA rejects it). ``kernel_options`` are passed
+    reference execution keeps ordinary PyTorch math. ``kernel_options`` are passed
     through to the chunk core, whose default runs warpdrive on SM100-family GPUs for either variant;
     ``{"backend": "fused"}`` keeps the repo-local kernels. Unless the KDA core is pinned to the
     repo-local kernels, ``lower_bound`` must respect warpdrive's narrower gate range.
@@ -926,8 +925,7 @@ def main(
         bool,
         typer.Option(
             help="Permit approximate gating math (default); --no-fastmath requests non-fast "
-            "math, which auto runs on repo-local KDA kernels and explicit warpdrive KDA "
-            "rejects. Reference math is unchanged."
+            "math. Reference math is unchanged."
         ),
     ] = True,
     steps: Annotated[int, typer.Option(min=1, help="Number of optimizer steps.")] = 2,
