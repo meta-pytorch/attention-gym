@@ -34,7 +34,7 @@ from attn_gym.warpdrive import (
     role,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import QwenConfig
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 
 # Every size but the head dimension comes from the model (QwenDecodeMegakernel, check_model).
 QWEN3_0_6B = QwenConfig()

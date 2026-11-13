@@ -21,7 +21,7 @@ from attn_gym.warpdrive import (
     WorkCursor,
     role,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_core import (
+from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ATTN,
     COMPUTE_WARPS,
     DOWN,
@@ -43,7 +43,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel_core import (
     qkv_rows,
     tma_partitions,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import QwenConfig
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 
 TC_MIN_N = 16  # MMA N >= 16 at M = 128; batch one uses column 0 (the others: shifted x)
 TC_ROWS, TC_TILE_K = 128, 64  # a stage: one 128 x 64 SW128 K-major MMA operand (16 KB)

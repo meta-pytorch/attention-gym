@@ -10,8 +10,8 @@ import torch.nn.functional as F
 pytest.importorskip("cutlass.cute")
 
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples import qwen_megakernel_ref as ref_module
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel import ref as ref_module
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
     compare_logits,
     decode_step_ref,
@@ -179,7 +179,7 @@ def test_moe_routing_in_the_kernel(normalized, engine):
 
 def test_moe_phase_spans_count_expert_rows_from_the_router():
     """A MoE table's GATEUP phase runs from the router's last row, not o_proj's."""
-    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
     from attn_gym.warpdrive.profiler import Range
 
     rows = [[mk.OPROJ, 0, 0, 0], [mk.ROUTER, 0, 0, 0], [mk.GATEUP, 0, 0, 0]]

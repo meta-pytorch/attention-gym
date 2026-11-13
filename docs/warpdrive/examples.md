@@ -15,7 +15,7 @@ PyTorch or FA4 feature.
 | Study attention backward and overlapping lifetimes | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
-| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
+| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -464,7 +464,7 @@ the shape determines whether that reuse helps.
 
 ```python
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     load_qwen3_weights,
     make_decode_state,
 )
@@ -502,7 +502,7 @@ quarter of the q heads, the residual polls run 8 elements per thread at a time, 
 as many 16 KB stages as fit (11 for 32B), and the default KV split count targets about 128
 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
 
-Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `bench_qwen_megakernel`;
+Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `qwen_megakernel.bench`;
 "roofline" is the logical bytes per step at the measured 6.2 TB/s read bandwidth, so above
 100% means L2 hits):
 
@@ -545,7 +545,7 @@ o_proj's last split publishes the post-attention residual so gate/up rows read o
 element. A sequence's logits do not depend on the rest of the batch (bit-identical in batches
 of 8 and 3). The inputs stay in shared memory (B x hidden x 2 bytes), which bounds Qwen3-8B
 at B = 16. GB200, all sequences at one context, tokens per second
-(``bench_qwen_megakernel_batch``):
+(``qwen_megakernel.bench_batch``):
 
 | model, ctx | CUDA cores, B=1 | B=1 | B=4 | B=16 | B=32 | B=64 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -601,10 +601,9 @@ which varies about 5x across prompts on the deep models.
 <details markdown="1">
 <summary>How the megakernel runs the model</summary>
 
-- **Code.** `qwen_megakernel_core.py` holds the base kernel and the CUDA-core engine,
-  `qwen_megakernel_tc.py` the tcgen05 engine and streamed inputs, `qwen_megakernel_schedule.py`
-  the host's instruction table and CTA assignment, and `qwen_megakernel.py` the
-  `QwenMegakernel` runner. One prologue builds every GEMV input: a group of
+- **Code.** The `qwen_megakernel` package: `core.py` holds the base kernel and the CUDA-core engine,
+  `tc.py` the tcgen05 engine and streamed inputs, `schedule.py` the host's instruction
+  table and CTA assignment, and `runner.py` the `QwenMegakernel` runner. One prologue builds every GEMV input: a group of
   `8 // min(batch, 8)` warps per token, so batch one uses all eight warps per token and a batch
   of eight or more one warp each.
 - **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
@@ -644,7 +643,7 @@ gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 600s \
   .venv/bin/python -m pytest test/warpdrive/test_warpdrive_qwen_megakernel.py \
   test/warpdrive/test_warpdrive_qwen_megakernel_ref.py
 gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 2400s \
-  .venv/bin/python -m attn_gym.warpdrive.examples.bench_qwen_megakernel \
+  .venv/bin/python -m attn_gym.warpdrive.examples.qwen_megakernel.bench \
   --output agent_space/qwen_megakernel.json
 ```
 
@@ -656,10 +655,10 @@ ctx 1024/4096/8192 (`--contexts`).
 (payload: the table row) and the compute role's `trace_region`s, also with the row as payload:
 `poll` (waiting for the row's inputs; it ends when they are ready), `stream` (a GEMV tile's
 weight stages), `attn.blocks` (an attention row's KV blocks) and `reduce.poll` (the last down
-split fetching the other partials). `qwen_megakernel_trace` decodes one launch:
+split fetching the other partials). `qwen_megakernel.trace` decodes one launch:
 
 ```python
-from attn_gym.warpdrive.examples import qwen_megakernel_trace as mkt
+from attn_gym.warpdrive.examples.qwen_megakernel import trace as mkt
 
 runner = QwenMegakernel(weights, max_len=1088, trace="globaltimer")
 runner(weights, token, pos, *caches)  # compile and warm up
@@ -672,7 +671,7 @@ mkt.input_waits(session.ranges, runner.table)  # median row start -> inputs read
 The trace has one process per SM and one track per role; work items are named after their
 instruction (`QKV`, `load QKV`, ...) with `layer`, `a` and `b` in their args, and an arrow runs
 from each input group's last-finishing producer row to the row waiting for it, across SMs
-(`write_step_trace`). `bench_qwen_megakernel --trace-dir DIR` writes one trace per context and
+(`write_step_trace`). `qwen_megakernel.bench --trace-dir DIR` writes one trace per context and
 reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
 [Tracing](tracing.md#iket)), and `waits=True` adds the layer's wait ranges with either backend.
 Disabled, both emit no instructions.

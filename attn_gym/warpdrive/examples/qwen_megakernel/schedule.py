@@ -9,7 +9,7 @@ from typing import NamedTuple
 import torch
 
 from attn_gym.warpdrive import StaticPersistent
-from attn_gym.warpdrive.examples.qwen_megakernel_core import (
+from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
     ATTN,
     BLOCK,
@@ -30,7 +30,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel_core import (
     WORDS,
     QwenDecodeMegakernel,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_tc import QwenDecodeMegakernelTc
+from attn_gym.warpdrive.examples.qwen_megakernel.tc import QwenDecodeMegakernelTc
 
 
 # Static-assignment latency model, in us. Ordinary rows cost ``base`` plus ``per_token`` for
