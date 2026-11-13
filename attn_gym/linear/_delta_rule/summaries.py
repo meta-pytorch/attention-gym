@@ -1,14 +1,13 @@
-"""Host contracts, work planning and backend routing for delta-rule affine summaries.
+"""Host contracts and work planning for the fused delta-rule affine summaries.
 
-The staged KDA/GDN and context-parallel entry points share these wrappers. Only the
-legacy launch branches import CuTeDSL; the portable route requires Torch and Triton.
+The staged KDA/GDN and context-parallel entry points share these wrappers, which launch Triton
+kernels on every CUDA architecture of capability 8.0 or newer.
 """
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.cute import get_device_properties
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
 
@@ -16,23 +15,15 @@ BT = 64
 KEY_DIM = 128
 VAL_DIM = 128
 SUMMARY_DIM = VAL_DIM + KEY_DIM
-DATA_ALIGN_BYTES = 16
-_IO_TYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
-
-
-def _aligned(tensor: torch.Tensor) -> torch.Tensor:
-    """Materialize the uncommon contiguous view that misses the TMA alignment."""
-    return tensor if tensor.data_ptr() % DATA_ALIGN_BYTES == 0 else tensor.clone()
+_IO_DTYPES = (torch.bfloat16, torch.float16)
 
 
 # Splitting adds the planner and the fold (two small launches), so a work item must carry
 # enough chunks for the shortened chain to pay for them. This floor puts the smallest split at
 # the measured crossover, so every split is a win.
 MIN_CHUNKS_PER_ITEM = 16
-# Widening an otherwise one-wave scan pays for the extra planner/fold at long spans.
-MIN_CHUNKS_FOR_WIDE_SPLIT = 128
-# Both Triton fallbacks put ranges or work items on grid.z (limit 65535); leave room for
-# the work budget, which is at most the SM count. Native OneShot work has a 1-D fallback.
+# Both kernels put ranges or work items on grid.z (limit 65535); leave room for the work
+# budget, which is at most the SM count.
 MAX_RANGES = 65535 - 1024
 
 
@@ -47,16 +38,13 @@ def plan_work_budget(max_chunks: int, work_tiles: int, sm_count: int) -> int:
     return max(1, min(max_chunks // MIN_CHUNKS_PER_ITEM, sm_count // work_tiles))
 
 
-def select_state_columns(max_chunks: int, heads: int, ranges: int, sm_count: int) -> int:
-    """Choose the native state tile from span capacity and available time parallelism."""
-    narrow_tiles = heads * (SUMMARY_DIM // 32)
-    if ranges * narrow_tiles > sm_count:
-        return 64
-    # BN32 is faster per chunk, but BN64 can split a long otherwise-unsplit recurrence
-    # while keeping its active pieces in one wave. Already-split scans keep the narrower tile.
-    if max_chunks >= MIN_CHUNKS_FOR_WIDE_SPLIT and sm_count // narrow_tiles == 1:
-        return 64
-    return 32
+def _configure_allocator(device: torch.device, capability: tuple[int, int]) -> None:
+    """Install the Triton scratch allocator that SM100/SM120 kernels may need (triton#10002)."""
+    if capability[0] in (10, 12):
+        from attn_gym._backends.triton.utils import configure_triton_allocator
+
+        with torch.cuda.device(device):
+            configure_triton_allocator()
 
 
 @torch.compiler.disable
@@ -92,10 +80,8 @@ def build_state_summaries(
     The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
     across different ``bounds`` values of the same shape. The tokens right after a partial last
     chunk are read but dropped by selection, so they may hold anything. Supported scope: B=1,
-    fixed K=V=128 and BT=64, contiguous CUDA inputs. The legacy SM100-family GPUs route uses the
-    native UMMA kernel; otherwise, capability 8.0+ targets use Triton. Both backends split
-    long ranges into work items when the static budget permits, then compose their partial
-    maps on the device.
+    fixed K=V=128 and BT=64, contiguous CUDA inputs of capability 8.0+. Long ranges split into
+    work items when the static budget permits, and the partial maps compose on the device.
     """
     assert kg.ndim == 4, f"kg must be 4D [1, T, H, K], got shape {tuple(kg.shape)}"
     batch, tokens, heads, key_dim = kg.shape
@@ -111,7 +97,7 @@ def build_state_summaries(
         f"cumulative_gate must match kg shape {tuple(kg.shape)}, "
         f"got {tuple(cumulative_gate.shape)}"
     )
-    assert kg.dtype in _IO_TYPE_NAMES, f"kg dtype must be bf16 or fp16, got {kg.dtype}"
+    assert kg.dtype in _IO_DTYPES, f"kg dtype must be bf16 or fp16, got {kg.dtype}"
     assert w.dtype == kg.dtype and u.dtype == kg.dtype, (
         f"kg/w/u dtypes must match, got {kg.dtype}/{w.dtype}/{u.dtype}"
     )
@@ -141,56 +127,33 @@ def build_state_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_fwd requires CUDA capability 8.0+, got {capability}")
-    portable = not uses_legacy_cute(kg.device)
-    sm_count = properties.multi_processor_count
-    if portable:
-        if capability[0] in (10, 12):
-            from attn_gym._backends.triton.utils import configure_triton_allocator
+    _configure_allocator(kg.device, capability)
+    from attn_gym.linear._delta_rule.triton.affine_summary_fwd import (
+        _select_block_columns,
+        launch_affine_summary_fwd,
+    )
 
-            with torch.cuda.device(kg.device):
-                configure_triton_allocator()
-        from attn_gym.linear._delta_rule.triton.affine_summary_fwd import (
-            _select_block_columns,
-            launch_affine_summary_fwd,
-        )
-
-        state_bn = _select_block_columns(heads, capability)
-    else:
-        kg, w, u, cumulative_gate = (_aligned(tensor) for tensor in (kg, w, u, cumulative_gate))
-        state_bn = select_state_columns(cdiv(tokens, BT), heads, ranges, sm_count)
+    state_bn = _select_block_columns(heads, capability)
     # The bounds live on the device, so the budget comes from the span's chunk count (a static
     # upper bound) and the device cuts the ranges' actual chunks into that many items.
-    budget = plan_work_budget(cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), sm_count)
+    budget = plan_work_budget(
+        cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), properties.multi_processor_count
+    )
     work, range_ids = work_table(bounds, budget)
     partials = torch.empty(
         (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=kg.device
     )
-    if portable:
-        launch_affine_summary_fwd(
-            kg,
-            w,
-            u,
-            cumulative_gate,
-            work,
-            partials,
-            capability,
-            whole_ranges=range_ids is None,
-            fastmath=fastmath,
-        )
-    else:
-        from attn_gym.linear._delta_rule.cute.affine_summary_fwd import launch_affine_summary_fwd
-
-        launch_affine_summary_fwd(
-            kg,
-            w,
-            u,
-            cumulative_gate,
-            work,
-            partials,
-            state_bn,
-            whole_ranges=range_ids is None,
-            fastmath=fastmath,
-        )
+    launch_affine_summary_fwd(
+        kg,
+        w,
+        u,
+        cumulative_gate,
+        work,
+        partials,
+        capability,
+        whole_ranges=range_ids is None,
+        fastmath=fastmath,
+    )
     return compose_work_items(partials, range_ids, ranges, reverse=False)
 
 
@@ -205,7 +168,7 @@ def build_state_grad_summaries(
     scale: float,
     bounds: torch.Tensor,
     *,
-    fastmath: bool | None = None,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Compute one packed reverse affine summary per token range of a stream.
 
@@ -220,8 +183,6 @@ def build_state_grad_summaries(
         bounds: ``int32 [R, 2]`` device tensor of half-open token ranges ``[start, stop)``; the
             same contract as ``build_state_summaries``.
         fastmath: Select fast or non-fast per-chunk decay, matching the local backward.
-            ``None`` selects fast exponentials on the Triton route (including SM100-family GPUs
-            with ``ATTN_GYM_LEGACY_CUTE=0``), non-fast on the legacy CuTe route.
 
     Returns:
         FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as local bias then reverse
@@ -230,9 +191,8 @@ def build_state_grad_summaries(
     The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
     across different ``bounds`` values of the same shape. The tokens right after a partial last
     chunk are read but dropped by selection, so they may hold anything. Supported scope: B=1,
-    fixed K=V=128 and BT=64, contiguous CUDA inputs. The legacy SM100-family GPUs route uses the
-    native UMMA kernel; otherwise, capability 8.0+ targets use Triton. Both backends split
-    long ranges into work items when the static budget permits, then compose on the device.
+    fixed K=V=128 and BT=64, contiguous CUDA inputs of capability 8.0+. Long ranges split into
+    work items when the static budget permits, and the partial maps compose on the device.
     """
     assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
     batch, tokens, heads, key_dim = qg.shape
@@ -251,7 +211,7 @@ def build_state_grad_summaries(
         f"cumulative_gate must match qg shape {tuple(qg.shape)}, "
         f"got {tuple(cumulative_gate.shape)}"
     )
-    assert qg.dtype in _IO_TYPE_NAMES, f"qg dtype must be bf16 or fp16, got {qg.dtype}"
+    assert qg.dtype in _IO_DTYPES, f"qg dtype must be bf16 or fp16, got {qg.dtype}"
     for name, tensor in (("kg", kg), ("w", w), ("dout", dout), ("Aqk", Aqk)):
         assert tensor.dtype == qg.dtype, (
             f"{name} dtype must match qg dtype {qg.dtype}, got {tensor.dtype}"
@@ -290,30 +250,13 @@ def build_state_grad_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
-    portable = not uses_legacy_cute(qg.device)
-    if fastmath is None:
-        fastmath = portable
-    if portable:
-        if capability[0] in (10, 12):
-            from attn_gym._backends.triton.utils import configure_triton_allocator
+    _configure_allocator(qg.device, capability)
+    from attn_gym.linear._delta_rule.triton.affine_summary_rev import (
+        _select_block_columns,
+        launch_affine_summary_rev,
+    )
 
-            with torch.cuda.device(qg.device):
-                configure_triton_allocator()
-        from attn_gym.linear._delta_rule.triton.affine_summary_rev import (
-            _select_block_columns,
-            launch_affine_summary_rev,
-        )
-
-        state_bn = _select_block_columns(heads, capability)
-    else:
-        from attn_gym.linear._delta_rule.cute.affine_summary_rev import (
-            BlackwellDeltaAffineSummaryRev,
-        )
-
-        qg, kg, w, dout, Aqk, cumulative_gate = (
-            _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
-        )
-        state_bn = BlackwellDeltaAffineSummaryRev.BN
+    state_bn = _select_block_columns(heads, capability)
     # As in the forward: a static budget from the span's chunk count, ranges cut on the device.
     budget = plan_work_budget(
         cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), properties.multi_processor_count
@@ -322,36 +265,19 @@ def build_state_grad_summaries(
     partials = torch.empty(
         (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
     )
-    if portable:
-        launch_affine_summary_rev(
-            qg,
-            kg,
-            w,
-            dout,
-            Aqk,
-            cumulative_gate,
-            scale,
-            work,
-            partials,
-            capability,
-            whole_ranges=range_ids is None,
-            fastmath=fastmath,
-        )
-    else:
-        from attn_gym.linear._delta_rule.cute.affine_summary_rev import launch_affine_summary_rev
-
-        launch_affine_summary_rev(
-            qg,
-            kg,
-            w,
-            dout,
-            Aqk,
-            cumulative_gate,
-            scale,
-            work,
-            partials,
-            whole_ranges=range_ids is None,
-            fastmath=fastmath,
-        )
+    launch_affine_summary_rev(
+        qg,
+        kg,
+        w,
+        dout,
+        Aqk,
+        cumulative_gate,
+        scale,
+        work,
+        partials,
+        capability,
+        whole_ranges=range_ids is None,
+        fastmath=fastmath,
+    )
     # The cotangent flows through the later item first.
     return compose_work_items(partials, range_ids, ranges, reverse=True)

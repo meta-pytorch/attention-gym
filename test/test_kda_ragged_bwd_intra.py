@@ -1,12 +1,8 @@
-"""Tests for the CuTe and Triton KDA intra-chunk backward stages."""
+"""Tests for the Triton KDA intra-chunk backward stage."""
 
 from __future__ import annotations
 
 import math
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import torch
@@ -28,40 +24,6 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
     reason="the KDA backward stages require CUDA capability 8.0 or newer",
 )
-
-
-def cute_backward(*args, **kwargs):
-    native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
-    return native.chunk_kda_bwd_intra(*args, **kwargs)
-
-
-IMPLEMENTATIONS = {"cute": cute_backward, "triton": chunk_kda_bwd_intra_triton}
-
-
-@pytest.fixture(params=sorted(IMPLEMENTATIONS))
-def implementation(request) -> str:
-    return request.param
-
-
-@pytest.mark.parametrize("architecture", ["sm_80", "sm_120"])
-def test_bwd_intra_compiles_for_portable_targets(architecture: str):
-    """Compile the portable specialization without SM100-only instructions."""
-    pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
-    source = """
-import cutlass
-from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as module
-
-module._compile_chunk_kda_bwd_intra(
-    heads=1,
-    ragged=False,
-    io_type=cutlass.BFloat16,
-    use_int64_offsets=False,
-)
-"""
-    environment = os.environ.copy()
-    environment["CUTE_DSL_ARCH"] = architecture
-    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
-    subprocess.run([sys.executable, "-c", source], env=environment, check=True, timeout=180)
 
 
 def _metadata(lengths: list[int]):
@@ -89,22 +51,14 @@ def _inputs(
     return q, k, g, beta, dAqk, dAkk, dq, dk, db, dg
 
 
-def _run(inputs: tuple[torch.Tensor, ...], lengths: list[int], implementation: str = "cute"):
-    """Run a ragged launch; the CuTe launch exposes the full fixed-capacity grid."""
-    if implementation == "cute":
-        native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
-    metadata = _metadata(lengths)
-    if implementation == "triton":
-        return chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
-    return native.chunk_kda_bwd_intra(
-        *inputs, metadata, config=native.ChunkKdaBwdIntraConfig(metadata.capacity), autotune=False
-    )
+def _run(inputs: tuple[torch.Tensor, ...], lengths: list[int]):
+    """Run one ragged launch over ``lengths``."""
+    return chunk_kda_bwd_intra_triton(*inputs, _metadata(lengths), autotune=False)
 
 
 def _sequence_local_reference(
     inputs: tuple[torch.Tensor, ...],
     lengths: list[int],
-    implementation: str,
 ) -> tuple[torch.Tensor, ...]:
     """Concatenate independent per-sequence launches as the routing oracle."""
     output_parts: list[list[torch.Tensor]] = [[], [], [], []]
@@ -114,7 +68,7 @@ def _sequence_local_reference(
             continue
         end = begin + length
         local_inputs = tuple(tensor[:, begin:end].clone() for tensor in inputs)
-        outputs = _run(local_inputs, [length], implementation)
+        outputs = _run(local_inputs, [length])
         for parts, output in zip(output_parts, outputs, strict=True):
             parts.append(output)
         begin = end
@@ -122,9 +76,7 @@ def _sequence_local_reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_ragged_bwd_intra_matches_independent_numerical_reference(
-    dtype: torch.dtype, implementation: str
-):
+def test_ragged_bwd_intra_matches_independent_numerical_reference(dtype: torch.dtype):
     lengths = [65, 0, 63]
     inputs = list(_inputs(sum(lengths), dtype))
     cu_seqlens = cumulative_sequence_offsets(lengths)
@@ -141,7 +93,7 @@ def test_ragged_bwd_intra_matches_independent_numerical_reference(
         token_start += length
     inputs = tuple(inputs)
 
-    actual = _run(inputs, lengths, implementation)
+    actual = _run(inputs, lengths)
     golden_contribution = bwd_intra_reference(
         *(tensor.double() for tensor in inputs[:6]),
         cu_seqlens=cu_seqlens,
@@ -181,7 +133,7 @@ def test_ragged_bwd_intra_matches_independent_numerical_reference(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_bwd_intra_diagonal_is_gate_independent(dtype: torch.dtype, implementation: str) -> None:
+def test_bwd_intra_diagonal_is_gate_independent(dtype: torch.dtype) -> None:
     """Diagonal pairwise terms affect Q/K/beta gradients, but never the gate."""
     inputs = list(_inputs(64, dtype))
     dAqk = torch.zeros_like(inputs[4])
@@ -192,7 +144,7 @@ def test_bwd_intra_diagonal_is_gate_independent(dtype: torch.dtype, implementati
     inputs[4:6] = (dAqk, dAkk)
     inputs[6:] = tuple(torch.zeros_like(tensor) for tensor in inputs[6:])
 
-    dq, dk, dg, db = _run(tuple(inputs), [64], implementation)
+    dq, dk, dg, db = _run(tuple(inputs), [64])
     reference = bwd_intra_reference(*inputs[:6])
     high_precision = bwd_intra_reference(*(tensor.double() for tensor in inputs[:6]))
 
@@ -231,7 +183,6 @@ def test_bwd_intra_keeps_subchunk_decays_at_gate_bound(
     qk_scale: float,
     lengths: list[int] | None,
     fastmath: bool,
-    implementation: str,
 ) -> None:
     """Every gate falls at the documented bound, so a 16-row subchunk spans 128 log2 units.
 
@@ -249,7 +200,7 @@ def test_bwd_intra_keeps_subchunk_decays_at_gate_bound(
     inputs[6:] = tuple(torch.zeros_like(tensor) for tensor in inputs[6:])
     metadata = None if lengths is None else _metadata(lengths)
 
-    dq, dk, dg, db = IMPLEMENTATIONS[implementation](
+    dq, dk, dg, db = chunk_kda_bwd_intra_triton(
         *inputs, metadata, fastmath=fastmath, autotune=False
     )
     # The FP32 reference overflows exp2 at this gate, so bound the error by the FP64 scale.
@@ -275,7 +226,7 @@ def test_bwd_intra_keeps_subchunk_decays_at_gate_bound(
     ids=["unit", "large-k", "small-dA"],
 )
 def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
-    k_value: float, dAqk_value: float, fastmath: bool, implementation: str
+    k_value: float, dAqk_value: float, fastmath: bool
 ) -> None:
     """One query/key pair 7 tokens apart across a subchunk boundary, at the gate bound.
 
@@ -294,7 +245,7 @@ def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
     dAqk[0, 16, 0, 9] = dAqk_value
     dAkk = torch.zeros_like(dAqk)
     running = [torch.zeros(shape, device="cuda") for _ in range(3)]
-    dq, dk, dg, db = IMPLEMENTATIONS[implementation](
+    dq, dk, dg, db = chunk_kda_bwd_intra_triton(
         q, k, g, beta, dAqk, dAkk, *running[:2], torch.zeros_like(beta), running[2], None,
         fastmath=fastmath, autotune=False
     )  # fmt: skip
@@ -304,16 +255,14 @@ def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
         assert (error <= 2**-7 * golden.abs()).all(), f"{name}: max error {error.max():.3e}"
 
 
-def test_ragged_bwd_intra_rejects_mismatched_chunk_size(implementation: str):
+def test_ragged_bwd_intra_rejects_mismatched_chunk_size():
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([64]), 64, 32)
     with pytest.raises(ValueError, match="metadata chunk size"):
-        IMPLEMENTATIONS[implementation](*_inputs(64), metadata, autotune=False)
+        chunk_kda_bwd_intra_triton(*_inputs(64), metadata, autotune=False)
 
 
 @pytest.mark.parametrize("lengths", [[65, 63], [0, 1, 64, 0, 65]])
-def test_ragged_bwd_intra_matches_sequence_local_launches(lengths, implementation: str):
-    if implementation == "cute":
-        native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
+def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
     inputs = _inputs(sum(lengths))
     metadata = _metadata(lengths)
     active_chunks = metadata.chunk_offsets[-1].item()
@@ -321,40 +270,20 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths, implementatio
     if 0 in lengths:
         assert active_chunks < metadata.capacity
 
-    if implementation == "triton":
-        actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
-    else:
-        config = native.ChunkKdaBwdIntraConfig(metadata.capacity) if 0 in lengths else None
-        actual = native.chunk_kda_bwd_intra(*inputs, metadata, config=config, autotune=False)
-    expected = _sequence_local_reference(inputs, lengths, implementation)
+    actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    expected = _sequence_local_reference(inputs, lengths)
 
     for packed, sequence_local in zip(actual, expected, strict=True):
         torch.testing.assert_close(packed, sequence_local, rtol=0, atol=0)
 
 
-def test_ragged_bwd_intra_clamps_grid_wider_than_capacity():
-    """An explicit grid past the chunk capacity runs exactly like the capacity-wide grid."""
-    native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
-    lengths = [65, 63]
-    inputs = _inputs(sum(lengths))
-    metadata = _metadata(lengths)
-    wide = native.chunk_kda_bwd_intra(
-        *inputs,
-        metadata,
-        config=native.ChunkKdaBwdIntraConfig(4 * metadata.capacity),
-        autotune=False,
-    )
-    for actual, expected in zip(wide, _run(inputs, lengths), strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("metadata", [None, "ragged"], ids=["dense", "ragged"])
-def test_bwd_intra_accepts_zero_tokens(metadata, implementation: str):
+def test_bwd_intra_accepts_zero_tokens(metadata):
     inputs = _inputs(0)
     outputs = (
-        IMPLEMENTATIONS[implementation](*inputs, None, autotune=False)
+        chunk_kda_bwd_intra_triton(*inputs, None, autotune=False)
         if metadata is None
-        else _run(inputs, [0, 0], implementation)
+        else _run(inputs, [0, 0])
     )
     dq, dk, dg, db = outputs
 
@@ -364,43 +293,12 @@ def test_bwd_intra_accepts_zero_tokens(metadata, implementation: str):
     torch.testing.assert_close(db, inputs[8], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("ragged", [False, True])
-def test_bwd_intra_reuses_compile_across_grid_caps_and_capacities(ragged):
-    native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
-    native._compile_chunk_kda_bwd_intra.cache_clear()
-    launches = 0
-    for chunks in (1, 16, 17, 33):
-        tokens = chunks * 64
-        lengths = [0, 1, tokens - 1, 0] if ragged else None
-        metadata = _metadata(lengths) if ragged else None
-        inputs = _inputs(tokens)
-        expected = native.chunk_kda_bwd_intra(
-            *inputs, metadata, config=native.ChunkKdaBwdIntraConfig(1), autotune=False
-        )
-        launches += 1
-        for cap in (1, 16, 17, 64):
-            actual = native.chunk_kda_bwd_intra(
-                *inputs, metadata, config=native.ChunkKdaBwdIntraConfig(cap), autotune=False
-            )
-            launches += 1
-            for output, reference in zip(actual, expected, strict=True):
-                torch.testing.assert_close(output, reference, rtol=0, atol=0)
-            info = native._compile_chunk_kda_bwd_intra.cache_info()
-            assert info.currsize == 1
-            assert info.hits + info.misses == launches
-
-
-def test_ragged_bwd_intra_replays_aligned_to_partial(implementation: str):
-    if implementation == "cute":
-        native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
+def test_ragged_bwd_intra_replays_aligned_to_partial():
     inputs = _inputs(128)
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
 
     def launch(metadata):
-        if implementation == "triton":
-            return chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
-        config = native.ChunkKdaBwdIntraConfig(metadata.capacity)
-        return native.chunk_kda_bwd_intra(*inputs, metadata, config=config, autotune=False)
+        return chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
 
     launch(prepare_ragged_chunk_metadata(cu_seqlens, 128, 64))
     torch.cuda.synchronize()
@@ -414,7 +312,7 @@ def test_ragged_bwd_intra_replays_aligned_to_partial(implementation: str):
     graph.replay()
     torch.cuda.synchronize()
 
-    expected = _run(inputs, [65, 63], implementation)
+    expected = _run(inputs, [65, 63])
     assert metadata.chunk_offsets.tolist() == [0, 2, 3]
     for captured, eager in zip(actual, expected, strict=True):
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
@@ -434,30 +332,25 @@ def test_triton_bwd_intra_reuses_compile_across_lengths(triton_compiles, ragged:
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("lengths", [None, [65, 0, 21, 170]], ids=["dense", "ragged"])
-def test_triton_bwd_intra_matches_cute(dtype: torch.dtype, lengths: list[int] | None) -> None:
-    """Both stages compute the same TF32 algebra; outputs agree to about one output ulp.
-
-    Q and K arrive as unbound views of a packed QKV projection, the training layout.
-    """
-    native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
+def test_bwd_intra_packed_qkv_views_match_compact(
+    dtype: torch.dtype, lengths: list[int] | None
+) -> None:
+    """Q and K as unbound views of a packed QKV projection (the training layout) match their
+    compact copies exactly; only the addressing differs."""
     tokens = 256 if lengths is None else sum(lengths)
     heads = 3
     inputs = list(_inputs(tokens, dtype, heads))
-    qkv = torch.cat((inputs[0], inputs[1], inputs[0]), dim=-1)
-    inputs[0], inputs[1] = qkv[..., :128], qkv[..., 128:256]
     cu_seqlens = None if lengths is None else cumulative_sequence_offsets(lengths)
     inputs[2] = chunk_cumsum_ref(inputs[2] * 4, 64, cu_seqlens=cu_seqlens)
     metadata = None if lengths is None else _metadata(lengths)
+    qkv = torch.cat((inputs[0], inputs[1], inputs[0]), dim=-1)
+    views = (qkv[..., :128], qkv[..., 128:256], *inputs[2:])
+    assert not views[0].is_contiguous()
 
-    expected = native.chunk_kda_bwd_intra(*inputs, metadata, autotune=False)
-    actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
-    active = tokens if lengths is None else sum(lengths)
+    expected = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    actual = chunk_kda_bwd_intra_triton(*views, metadata, autotune=False)
     for name, output, reference in zip(("dq", "dk", "dg", "db"), actual, expected, strict=True):
-        assert output.dtype == reference.dtype, name
-        output, reference = output[:, :active].double(), reference[:, :active].double()
-        bound = torch.finfo(dtype if name in ("dq", "dk") else torch.float32).eps * 8
-        error = (output - reference).abs().max().item()
-        assert error <= bound * reference.abs().max().item(), f"{name}: max error {error:.3e}"
+        torch.testing.assert_close(output, reference, rtol=0, atol=0, msg=name)
 
 
 def test_triton_bwd_intra_forced_int64_offsets_match_default(monkeypatch) -> None:

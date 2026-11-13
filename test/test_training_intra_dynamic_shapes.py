@@ -11,6 +11,7 @@ pytest.importorskip("triton")
 
 from attn_gym.linear import chunk_kda
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_intra import chunk_kda_bwd_intra_triton
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
     chunk_kda_fwd_kernel_intra_sub_chunk_forloop,
@@ -153,47 +154,44 @@ def check_backward(inputs, outputs, lengths):
             )
 
 
+def reuse_cases(packed: bool) -> list[tuple[int, list[int] | None]]:
+    """T and N vary independently, including equal capacity and multiple grid waves."""
+    if not packed:
+        return [(128, None), (192, None), (320, None)]
+    return [
+        (128, [0, 63, 0, 65]),
+        (129, [0, 63, 0, 65]),
+        (193, [0, 63, 0, 130]),
+        (193, [0, 31, 32, 0, 65, 65]),
+        (2, [0, 1, 1]),
+        (2, [0, 1, 0, 1]),
+    ]
+
+
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize("fixed", [False, True], ids=["default-grid", "fixed-grid"])
-@pytest.mark.parametrize("stage", ["diagonal", "backward"])
-def test_intra_backend_cache_reuse(stage, fixed, packed):
-    """T and N vary independently, including equal capacity and multiple grid waves."""
+def test_intra_diagonal_cache_reuse(fixed, packed):
+    """Runtime T, N, capacity, and grid reuse one compiled diagonal stage."""
     jit = chunk_kda_fwd_kernel_intra_sub_chunk_forloop.fn
     cache = jit.device_caches[torch.cuda.current_device()][0]
     cache.clear()
-    if stage == "backward":
-        native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
-        native._compile_chunk_kda_bwd_intra.cache_clear()
-    cases = (
-        [
-            (128, [0, 63, 0, 65]),
-            (129, [0, 63, 0, 65]),
-            (193, [0, 63, 0, 130]),
-            (193, [0, 31, 32, 0, 65, 65]),
-            (2, [0, 1, 1]),
-            (2, [0, 1, 0, 1]),
-        ]
-        if packed
-        else [(128, None), (192, None), (320, None)]
-    )
-    for tokens, lengths in cases:
+    for tokens, lengths in reuse_cases(packed):
         inputs = intra_inputs(tokens, torch.bfloat16)
-        metadata = metadata_for(tokens, lengths)
-        if stage == "diagonal":
-            outputs = diagonal(inputs, metadata, fixed=fixed)
-            check_diagonal(inputs, outputs, lengths or [tokens])
-            assert len(cache) == 1, "diagonal compiled again for runtime T/N/capacity/grid"
-        else:
-            outputs = native.chunk_kda_bwd_intra(
-                *inputs,
-                metadata,
-                config=native.ChunkKdaBwdIntraConfig(1) if fixed else None,
-                autotune=False,
-            )
-            check_backward(inputs, outputs, lengths or [tokens])
-            info = native._compile_chunk_kda_bwd_intra.cache_info()
-            # Disk-cache loads count as hits, including another xdist worker's compile.
-            assert info.currsize == 1, "backward compiled again for runtime T/N/capacity/grid"
+        outputs = diagonal(inputs, metadata_for(tokens, lengths), fixed=fixed)
+        check_diagonal(inputs, outputs, lengths or [tokens])
+        assert len(cache) == 1, "diagonal compiled again for runtime T/N/capacity/grid"
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_intra_backward_cache_reuse(packed, triton_compiles):
+    """Runtime T, N, and capacity reuse one compiled intra backward."""
+    for tokens, lengths in reuse_cases(packed):
+        inputs = intra_inputs(tokens, torch.bfloat16)
+        outputs = chunk_kda_bwd_intra_triton(
+            *inputs, metadata_for(tokens, lengths), autotune=False
+        )
+        check_backward(inputs, outputs, lengths or [tokens])
+    assert triton_compiles["chunk_kda_bwd_intra_kernel"] == 1, triton_compiles
 
 
 def test_diagonal_runtime_grid_int64_offsets(monkeypatch):
@@ -214,14 +212,13 @@ def test_diagonal_runtime_grid_int64_offsets(monkeypatch):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("poison", [0.0, float("nan")], ids=["finite", "nan"])
 def test_intra_graph_replay_changed_metadata(dtype, poison):
-    native = pytest.importorskip("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra")
     inputs = intra_inputs(193, dtype, strided=True)
     cu = cumulative_sequence_offsets([0, 63, 0, 130])
 
     def operation():
         metadata = prepare_ragged_chunk_metadata(cu, 193, 64)
-        return diagonal(inputs, metadata, fixed=True), native.chunk_kda_bwd_intra(
-            *inputs, metadata, config=native.ChunkKdaBwdIntraConfig(1), autotune=False
+        return diagonal(inputs, metadata, fixed=True), chunk_kda_bwd_intra_triton(
+            *inputs, metadata, autotune=False
         )
 
     for _ in range(3):
@@ -246,8 +243,6 @@ def test_intra_graph_replay_changed_metadata(dtype, poison):
 def test_public_kda_dynamic_training(compiled):
     """The documented op, not only private launchers, supports dynamic backward."""
     operation = torch.compile(chunk_kda, fullgraph=True, dynamic=True) if compiled else chunk_kda
-    # FP16 selects the diagonal stage on both Hopper and Blackwell. BF16 Blackwell
-    # uses a different forward engine when the legacy route is enabled.
     for tokens, lengths in ((128, [0, 63, 65]), (193, [65, 0, 64, 64])):
         inputs = make_kda_test_inputs(
             tokens, dtype=torch.float16, normalize_qk=True, requires_grad=True

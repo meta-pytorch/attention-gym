@@ -15,11 +15,16 @@ triton = pytest.importorskip("triton")
 
 # These imports intentionally follow the optional-dependency check above.
 from attn_gym._backends import tune as tune_module
-from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.triton.utils import can_use_tma
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
+    chunk_kda_bwd_delta_h_triton,
+)
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_intra import chunk_kda_bwd_intra_triton
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton import chunk_kda_bwd_wy_triton
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
+from attn_gym.linear.kda.fwd.factors import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton import l2norm_fwd as l2norm_fwd_module
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import (
@@ -47,46 +52,6 @@ from attn_gym.testing.kda import (
 )
 from attn_gym.testing.kda import (
     bwd_wy_dqkg_reference as _bwd_wy_dqkg_ref,
-)
-
-IS_SM100 = cuda_runs_sm100_kernels()
-
-try:
-    from attn_gym.linear.kda.bwd.cute import chunk_delta_h_bwd as delta_h_bwd
-    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
-        blackwell_delta_h_bwd_dhu_dv_fused,
-    )
-    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
-        chunk_kda_bwd_intra as chunk_kda_bwd_intra_cute,
-    )
-    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
-        chunk_kda_bwd_wy_dqkg as chunk_kda_bwd_wy_dqkg_fused_cute,
-    )
-    from attn_gym.linear.kda.fwd.factors import (
-        chunk_kda_fwd_intra as chunk_kda_fwd_intra_cute,
-    )
-
-    HAS_CUTE = True
-    CUTE_IMPORT_ERR = ""
-except Exception as e:
-    optional_dep_missing = isinstance(e, ModuleNotFoundError) and (e.name or "").split(".")[0] in {
-        "cutlass",
-        "cuda",
-    }
-    legacy_kernel_missing = isinstance(e, ImportError) and (
-        getattr(e, "name", "") or ""
-    ).startswith("attn_gym.linear.kda.bwd.cute")
-    if IS_SM100 and not (optional_dep_missing or legacy_kernel_missing):
-        raise
-    HAS_CUTE = False
-    CUTE_IMPORT_ERR = f"{type(e).__name__}: {e}"
-
-requires_cute = pytest.mark.skipif(
-    not (IS_SM100 and HAS_CUTE),
-    reason=(
-        "CuTe DSL kernels require SM100 (Blackwell) and an importable cutlass"
-        + (f"; import failed with {CUTE_IMPORT_ERR}" if IS_SM100 and not HAS_CUTE else "")
-    ),
 )
 
 DEV = "cuda"
@@ -1048,8 +1013,8 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
         dh0       = dh   (final, when h0 is provided)
 
     ``dh`` is seeded with ``dht`` when given, else zero. ``gk_last_c`` is the gate at the
-    chunk's last row. match the kernel's stated ops exactly (no gate on ``k @ dh``,
-    per-channel decay ``2^{gk_last}`` only — matching the forward cuteDSL config).
+    chunk's last row. Matches the kernel's stated ops exactly (no gate on ``k @ dh``,
+    per-channel decay ``2^{gk_last}`` only, as in the forward).
     """
     B, T, H, K = q.shape
     V = do.shape[-1]
@@ -1079,15 +1044,14 @@ def _delta_h_bwd_dhu_ref(q, k, w, do, dv, gk, h0, dht, scale, chunk_size=64):
     return dh_out, dh0, dv2
 
 
-@requires_cute
 @pytest.mark.parametrize(
-    "bv,num_chunks,use_h0,use_dht",
-    [(16, 4, False, False), (32, 5, True, False), (16, 4, True, True)],
-    ids=["bv16", "bv32-state", "final-state-gradient"],
+    "num_chunks,use_h0,use_dht",
+    [(4, False, False), (5, True, False), (4, True, True)],
+    ids=["stateless", "initial-state", "final-state-gradient"],
 )
-def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
+def test_delta_h_bwd_dhu(num_chunks, use_h0, use_dht):
     # Non-varlen path: B=1, K=V=128, chunk_size=64. Covers the dht (final-state grad)
-    # and h0 (initial-state grad -> dh0) input paths, and both BV=16/BV=32 SS-mode tiles.
+    # and h0 (initial-state grad -> dh0) input paths.
     torch.manual_seed(21)
     B, H, K, V = 1, 2, 128, 128
     T = num_chunks * 64
@@ -1106,8 +1070,17 @@ def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
     dht = torch.randn(B, H, V, K, device="cuda", dtype=torch.float32) if use_dht else None
 
     qb, kb, wb, dob, aqkb = (t.to(torch.bfloat16) for t in (q, k, w, do, aqk))
-    dh, dh0, dv2 = blackwell_delta_h_bwd_dhu_dv_fused(
-        qb, kb, wb, dob, aqkb, gk=gk, h0=h0, dht=dht, scale=scale, chunk_size=64, bv=bv
+    dh, dh0, dv2 = chunk_kda_bwd_delta_h_triton(
+        qb,
+        kb,
+        wb,
+        dob,
+        aqkb,
+        gk=gk,
+        initial_state=h0,
+        d_final_state=dht,
+        scale=scale,
+        metadata=None,
     )
     dvb = torch.empty(B, T, H, V, device="cuda", dtype=torch.bfloat16)
     for start in range(0, T, 64):
@@ -1132,44 +1105,16 @@ def test_delta_h_bwd_dhu_cute(bv, num_chunks, use_h0, use_dht):
     )
     rDH, rDH0, rDV2 = _delta_h_bwd_dhu_ref(qb, kb, wb, dob, dvb, gk, h0, dht, scale)
 
-    tag = f"NT={num_chunks} h0={use_h0} dht={use_dht} bv={bv}"
+    tag = f"NT={num_chunks} h0={use_h0} dht={use_dht}"
     assert_golden(dh, gDH, rDH, torch.bfloat16, f"delta_h_bwd dh {tag}")
     assert_golden(dv2, gDV2, rDV2, torch.bfloat16, f"delta_h_bwd dv2 {tag}")
     if use_h0:
         assert_golden(dh0, gDH0, rDH0, torch.bfloat16, f"delta_h_bwd dh0 {tag}")
 
 
-@requires_cute
-@pytest.mark.parametrize("sm_count,expected_bv", [(1024, 16), (8, 32)])
-def test_delta_h_bwd_dhu_dispatch_selects_bv(monkeypatch, sm_count, expected_bv):
-    """The BV-dispatch wrapper picks BV=32 when V-tiles exceed the SM count, else BV=16.
-
-    The leaf kernel is mocked so this isolates the selection heuristic (an integer compare)
-    without a kernel launch; numerics for both BV tiles are covered by the leaf test above.
-    """
-    B, H, K, V = 1, 2, 128, 128
-    q = torch.empty(B, 64, H, K, device="cuda")
-    zeros = torch.empty(B, 64, H, V, device="cuda")
-
-    captured = {}
-
-    def fake_fused(*args, bv, **kwargs):
-        captured["bv"] = bv
-        return zeros, None, zeros
-
-    class _Props:
-        multi_processor_count = sm_count
-
-    monkeypatch.setattr(delta_h_bwd, "get_device_properties", lambda device: _Props())
-    monkeypatch.setattr(delta_h_bwd, "blackwell_delta_h_bwd_dhu_dv_fused", fake_fused)
-
-    delta_h_bwd.blackwell_delta_h_bwd_dhu_dv_fused_dispatch(q, q, q, zeros, zeros)
-    assert captured["bv"] == expected_bv
-
-
 def _inter_solve_ref(q, k, gk, beta, scale, chunk_size=64):
-    """Reference for the composed CuTe forward-intra inter-solve (K3b off-diagonal Aqk +
-    K4b 64x64 block inverse), per 64-token chunk with ``gk`` the cumulative gate::
+    """Reference for the forward intra factors (Aqk and the 64x64 block inverse Akk), per
+    64-token chunk with ``gk`` the cumulative gate::
 
         Aqk[l, m] = scale * <q_l 2^{gk_l}, k_m 2^{-gk_m}>          (l >= m, incl. diag)
         raw[l, m] = beta_l * <k_l 2^{gk_l}, k_m 2^{-gk_m}>         (l >  m, strict)
@@ -1206,8 +1151,7 @@ def _chunk_tril_mask(T: int, BT: int, device) -> torch.Tensor:
     return torch.arange(BT, device=device)[None, :] <= row_local
 
 
-@requires_cute
-def test_chunk_kda_fwd_intra_cute():
+def test_chunk_kda_fwd_intra_factors_and_wu():
     num_chunks, H = 4, 4
     torch.manual_seed(22)
     B, K, V = 1, 128, 128
@@ -1222,7 +1166,7 @@ def test_chunk_kda_fwd_intra_cute():
     gk = g_inc.view(B, num_chunks, 64, H, K).cumsum(2).view(B, T, H, K)
     beta = torch.sigmoid(torch.randn(B, T, H, device="cuda", dtype=torch.float32))
 
-    w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra_cute(
+    w, u, _kg, Aqk, Akk = chunk_kda_fwd_intra(
         q, k, v, gk, beta, scale, None, chunk_size=64, autotune=True
     )
 
@@ -1236,10 +1180,10 @@ def test_chunk_kda_fwd_intra_cute():
     tag = f"NT={num_chunks} H={H}"
     mask = _chunk_tril_mask(T, 64, "cuda")[None, :, None, :]
     Aqk_tril = torch.where(mask, Aqk, torch.zeros_like(Aqk))
-    assert_golden(Aqk_tril, gAqk, rAqk, torch.bfloat16, f"fwd_intra_cute Aqk {tag}")
-    assert_golden(Akk, gAkk, rAkk, torch.bfloat16, f"fwd_intra_cute Akk {tag}")
-    assert_golden(w, gW, rW, torch.bfloat16, f"fwd_intra_cute w {tag}")
-    assert_golden(u, gU, rU, torch.bfloat16, f"fwd_intra_cute u {tag}")
+    assert_golden(Aqk_tril, gAqk, rAqk, torch.bfloat16, f"fwd_factors Aqk {tag}")
+    assert_golden(Akk, gAkk, rAkk, torch.bfloat16, f"fwd_factors Akk {tag}")
+    assert_golden(w, gW, rW, torch.bfloat16, f"fwd_factors w {tag}")
+    assert_golden(u, gU, rU, torch.bfloat16, f"fwd_factors u {tag}")
 
 
 def _dense_reference_routes(num_chunks):
@@ -1285,8 +1229,7 @@ def _perchunk_unit_lower(cu, chunk_indices, T, H):
     return A.to(torch.bfloat16)
 
 
-@requires_cute
-def test_chunk_kda_bwd_intra_cute():
+def test_chunk_kda_bwd_intra():
     num_chunks, H = 4, 4
     torch.manual_seed(3)
     B, K = 1, 128
@@ -1304,7 +1247,7 @@ def test_chunk_kda_bwd_intra_cute():
     zq = torch.zeros(B, T, H, K, device="cuda", dtype=torch.float32)
     zb = torch.zeros(B, T, H, device="cuda", dtype=torch.float32)
 
-    dq, dk, dg, db = chunk_kda_bwd_intra_cute(
+    dq, dk, dg, db = chunk_kda_bwd_intra_triton(
         q,
         k,
         g,
@@ -1334,14 +1277,13 @@ def test_chunk_kda_bwd_intra_cute():
     )
 
     tag = f"NT={num_chunks} H={H}"
-    assert_golden(dq, gdq, rdq, torch.bfloat16, f"bwd_intra_cute dq {tag}")
-    assert_golden(dk, gdk, rdk, torch.bfloat16, f"bwd_intra_cute dk {tag}")
-    assert_golden(db, gdb, rdb, torch.bfloat16, f"bwd_intra_cute db {tag}")
-    assert_golden(dg, gdg, rdg, torch.bfloat16, f"bwd_intra_cute dg {tag}")
+    assert_golden(dq, gdq, rdq, torch.bfloat16, f"bwd_intra dq {tag}")
+    assert_golden(dk, gdk, rdk, torch.bfloat16, f"bwd_intra dk {tag}")
+    assert_golden(db, gdb, rdb, torch.bfloat16, f"bwd_intra db {tag}")
+    assert_golden(dg, gdg, rdg, torch.bfloat16, f"bwd_intra dg {tag}")
 
 
-@requires_cute
-def test_chunk_kda_bwd_wy_dqkg_fused_cute():
+def test_chunk_kda_bwd_wy_dqkg():
     num_chunks, H = 4, 4
     torch.manual_seed(4)
     B, K, V = 1, 128, 128
@@ -1365,8 +1307,8 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
     # A: per-chunk unit-lower-triangular (a plausible (I - Akk)^-1).
     A = _perchunk_unit_lower(cu, chunk_indices, T, HV)
 
-    dq, dk, dv2, dg, db, dA = chunk_kda_bwd_wy_dqkg_fused_cute(
-        q, k, v, v_new, g, beta, A, h, do, dh, dv, None, scale=scale, chunk_size=64, autotune=False
+    dq, dk, dv2, dg, db, dA = chunk_kda_bwd_wy_triton(
+        q, k, v, v_new, g, beta, A, h, do, dh, dv, None, scale=scale
     )
 
     ref_args = (v_new, g, beta, A, h, do, dh, dv)
@@ -1384,9 +1326,9 @@ def test_chunk_kda_bwd_wy_dqkg_fused_cute():
     )
 
     tag = f"NT={num_chunks} H={H}"
-    assert_golden(dq, gdq, rdq, torch.bfloat16, f"bwd_wy_cute dq {tag}")
-    assert_golden(dk, gdk, rdk, torch.bfloat16, f"bwd_wy_cute dk {tag}")
-    assert_golden(dv2, gdv2, rdv2, torch.bfloat16, f"bwd_wy_cute dv2 {tag}")
-    assert_golden(db, gdb, rdb, torch.bfloat16, f"bwd_wy_cute db {tag}")
-    assert_golden(dg, gdg, rdg, torch.bfloat16, f"bwd_wy_cute dg {tag}")
-    assert_golden(dA, gdA, rdA, torch.bfloat16, f"bwd_wy_cute dA {tag}")
+    assert_golden(dq, gdq, rdq, torch.bfloat16, f"bwd_wy dq {tag}")
+    assert_golden(dk, gdk, rdk, torch.bfloat16, f"bwd_wy dk {tag}")
+    assert_golden(dv2, gdv2, rdv2, torch.bfloat16, f"bwd_wy dv2 {tag}")
+    assert_golden(db, gdb, rdb, torch.bfloat16, f"bwd_wy db {tag}")
+    assert_golden(dg, gdg, rdg, torch.bfloat16, f"bwd_wy dg {tag}")
+    assert_golden(dA, gdA, rdA, torch.bfloat16, f"bwd_wy dA {tag}")

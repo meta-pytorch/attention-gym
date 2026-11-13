@@ -17,7 +17,7 @@ Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to
 document crosses ranks, so the delta-rule op exchanges no state, and with ``--core-backend fused``
 its result is bitwise independent of the CP degree (``test/test_context_parallel_distributed.py``,
 table ``documents``). ``--core-backend`` selects each rank's local KDA or GDN kernels: ``auto``
-(the default: warpdrive on SM100-family GPUs), ``fused`` (repo-local), or ``warpdrive``.
+(the default: warpdrive on SM100-family GPUs), ``fused`` (Triton), or ``warpdrive``.
 ``--cuda-graph`` checks a changed-input replay; ``--profile`` writes a merged native Perfetto
 trace. ``--no-validate`` skips the unsharded reference at scales where it does not fit. Batch
 construction, loss/backward, and capture are shown in ``delta_rule_training.py`` and imported here.
@@ -351,7 +351,7 @@ def main(
             "compute_dtype": getattr(torch, compute_dtype.value),
             "device": device,
         }
-        # The reference keeps the repo-local core; only each rank's local pass may use warpdrive.
+        # The reference keeps the Triton core; only each rank's local pass may use warpdrive.
         make_model = partial(
             ContextParallelDeltaRuleAttention,
             **model_options,

@@ -1,4 +1,4 @@
-"""End-to-end behavior and gradient tests for public ragged CuTe KDA."""
+"""End-to-end behavior and gradient tests for public ragged fused KDA."""
 
 from __future__ import annotations
 
@@ -6,8 +6,6 @@ import inspect
 
 import pytest
 import torch
-
-pytest.importorskip("cutlass")
 
 from attn_gym.linear import chunk_kda
 from attn_gym.linear.kda.constants import LOG2_E
@@ -641,20 +639,13 @@ def test_public_auto_persistent_matches_static_composition(monkeypatch):
 
     kinds = []
     resolve_flat = chunk_scheduler.GridScheduler.resolve_flat
-    resolve_chunk = chunk_scheduler.GridScheduler.resolve_chunk
 
     def record_flat(self, *args, **kwargs):
         resolved = resolve_flat(self, *args, **kwargs)
         kinds.append(resolved.kind)
         return resolved
 
-    def record_chunk(self, *args, **kwargs):
-        resolved = resolve_chunk(self, *args, **kwargs)
-        kinds.append(resolved.kind)
-        return resolved
-
     monkeypatch.setattr(chunk_scheduler.GridScheduler, "resolve_flat", record_flat)
-    monkeypatch.setattr(chunk_scheduler.GridScheduler, "resolve_chunk", record_chunk)
     monkeypatch.setattr(chunk_scheduler, "PERSISTENT_AUTO_WAVES", 1 << 30)
     static = _run_gradients(
         clone_kda_inputs(inputs),

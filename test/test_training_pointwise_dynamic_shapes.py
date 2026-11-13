@@ -12,7 +12,6 @@ pytest.importorskip("triton")
 
 from attn_gym._backends import tune as tune_module
 from attn_gym.linear import gate_transform
-from attn_gym.linear._delta_rule.gate import _gate_uses_cute
 from attn_gym.linear._delta_rule.triton import gate_transform as softplus_backend
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm, l2norm_fwd_kernel
@@ -66,7 +65,6 @@ def run_operation(
     separates backend reuse from the row-bucket autotuning policy."""
     if kind == "l2norm":
         return l2norm(inputs[0], cu_seqlens=metadata, kernel_options={"autotune": autotune})
-    assert not _gate_uses_cute(inputs[0])
     return gate_transform(*inputs, kind="softplus")
 
 

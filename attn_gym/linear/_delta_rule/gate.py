@@ -16,20 +16,18 @@ to per-head ``[B, T, H]`` or per-channel ``[B, T, H, D]`` gates.
 from __future__ import annotations
 
 import importlib
-from functools import cache
 from numbers import Real
 from sys import float_info
 
 import torch
 import torch.nn.functional as F
 
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear.types import GateTransform, Impl, resolve_gate_transform, resolve_impl
 
 _SUPPORTED_FUSED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# One operator pair covers both kinds and both fused backends; ``kind`` is an argument, so the
-# backend is chosen once per call inside the CUDA implementation on real tensors.
+# One operator pair covers both kinds; ``kind`` is an argument resolved inside the CUDA
+# implementation.
 torch.library.define(
     "attn_gym::_gate_transform_fwd",
     "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, str kind, float lower_bound, bool fastmath)"
@@ -51,55 +49,18 @@ def _triton_backend():
         ) from error
 
 
-@cache
-def _cute_gate_backend_available() -> bool:
-    """Whether the CuTeDSL gate kernels import; probed once, only on an eligible call."""
-    try:
-        importlib.import_module("attn_gym.linear.kda.fwd.cute.gate_fwd")
-        importlib.import_module("attn_gym.linear.kda.bwd.cute.gate_bwd")
-    except ImportError:
-        return False
-    return True
-
-
-# NOTE [Gate Backend Selection]
-# The Triton gate kernels are portable (any CUDA device, both kinds, both gate shapes, any
-# strides) and serve every architecture. The legacy CuTeDSL gate kernels remain the SM100-family GPUs
-# route for per-channel D=128 gates while they exist (see _delta_rule/routing.py); they keep
-# their original contract: per-channel gates with D=128 and the optional CuTeDSL dependency.
-# Selection runs inside the registered operator on real tensors, so it is invisible to
-# torch.compile tracing; tests pin the policy through ``_gate_uses_cute``.
-def _gate_uses_cute(raw_gate: torch.Tensor) -> bool:
-    """Route per-channel D=128 gates to the legacy CuTeDSL kernels where they are selected."""
-    return (
-        raw_gate.ndim == 4
-        and raw_gate.shape[3] == 128
-        and uses_legacy_cute(raw_gate.device)
-        and _cute_gate_backend_available()
-    )
-
-
+# The Triton gate kernels serve every CUDA architecture, both kinds, both gate shapes and any
+# strides. They are imported inside the registered operator, so ``impl="reference"`` callers and
+# CPU-only installs never need Triton.
 def _gate_transform_fwd_cuda(raw_gate, A_log, dt_bias, kind, lower_bound, fastmath):
-    transform = GateTransform(kind)
-    backend = (
-        importlib.import_module("attn_gym.linear.kda.fwd.cute.gate_fwd")
-        if _gate_uses_cute(raw_gate)
-        else _triton_backend()
-    )
-    return backend._gate_transform_fwd_cuda(
-        raw_gate, A_log, dt_bias, lower_bound, fastmath, transform
+    return _triton_backend()._gate_transform_fwd_cuda(
+        raw_gate, A_log, dt_bias, lower_bound, fastmath, GateTransform(kind)
     )
 
 
 def _gate_transform_bwd_cuda(raw_gate, A_log, dt_bias, d_gate, kind, lower_bound, fastmath):
-    transform = GateTransform(kind)
-    backend = (
-        importlib.import_module("attn_gym.linear.kda.bwd.cute.gate_bwd")
-        if _gate_uses_cute(raw_gate)
-        else _triton_backend()
-    )
-    return backend._gate_transform_bwd_cuda(
-        raw_gate, A_log, dt_bias, d_gate, lower_bound, fastmath, transform
+    return _triton_backend()._gate_transform_bwd_cuda(
+        raw_gate, A_log, dt_bias, d_gate, lower_bound, fastmath, GateTransform(kind)
     )
 
 
@@ -249,10 +210,9 @@ def gate_transform(
         fastmath: Allow approximate amplitude, sigmoid, and softplus math (default ``True``).
             ``False`` selects non-fast primitives for forward and backward. The reference
             implementation uses normal PyTorch math for either value.
-        impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses portable Triton kernels
-            for both kinds and gate shapes; SM100-family GPUs still route per-channel ``D=128``
-            gates to legacy CuTeDSL kernels when they are installed. Fused paths require
-            FP16, BF16, or FP32 ``raw_gate``.
+        impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses Triton kernels for both
+            kinds and gate shapes on every CUDA architecture and requires FP16, BF16, or FP32
+            ``raw_gate``.
 
     Raises:
         ValueError: On shape, ``lower_bound``, or unsupported fused configurations.
