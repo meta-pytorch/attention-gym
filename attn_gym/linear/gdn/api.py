@@ -183,8 +183,8 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. ``"backend"`` selects the kernels as in ``chunk_gdn``.
-            warpdrive requires 16-byte-aligned pool bases and slot origins, so the default runs
-            other pools on the fused backend. Split schedules are not supported. ``"autotune"``
+            The default runs pools whose base or slot stride is not 16-byte aligned on the fused
+            backend. Split schedules are not supported. ``"autotune"``
             (default ``True``) benchmarks candidate configurations of the repo-local factor and
             output kernels. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
