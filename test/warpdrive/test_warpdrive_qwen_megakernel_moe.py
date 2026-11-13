@@ -47,7 +47,7 @@ SMALL_MOE = QwenConfig(
 )  # fmt: skip
 
 
-def check_moe_step(monkeypatch, runner, weights, caches, token, pos):
+def check_moe_step(monkeypatch, runner, weights, caches, token, pos, error_factor=2.0):
     """One megakernel step against the reference forced onto the kernel's experts: logits within
     the bf16 error budget. Unforced, a layer may route differently only at a near-tie: the
     reference's margin between ranks k and k + 1 is within the two router logits' difference."""
@@ -57,7 +57,7 @@ def check_moe_step(monkeypatch, runner, weights, caches, token, pos):
     high = decode_step_ref(
         weights, token, pos, *[c.clone() for c in caches], dtype=torch.float32, experts=experts
     )
-    metrics = compare_logits(logits, ref, high)
+    metrics = compare_logits(logits, ref, high, error_factor=error_factor)
     assert metrics["passed"], metrics
     ours = runner.values("router_logits")
     recorded = []
@@ -125,7 +125,10 @@ def test_moe_checkpoint_decode_steps(monkeypatch, engine):
         max_len = (ctx // mk.BLOCK + 1) * mk.BLOCK
         runner = mk.QwenMegakernel(weights, max_len, engine=engine)
         state = make_decode_state(weights, ctx, max_len, seed=ctx)
-        check_moe_step(monkeypatch, runner, weights, *state)
+        # The deep-model gate (as in check_moe_batch): the budget scales the eager bf16 reference's
+        # error, which varies by GPU. The tcgen05 logits are bit-identical on B200 and Rubin, yet
+        # ctx 127 measures 1.5x the eager RMS error on B200 and 2.1x on Rubin.
+        check_moe_step(monkeypatch, runner, weights, *state, error_factor=3.0)
         del runner
 
 
