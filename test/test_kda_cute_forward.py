@@ -46,10 +46,14 @@ from attn_gym.linear.kda.ops import (
 from attn_gym.testing import strided_state_pool
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
-pytestmark = pytest.mark.skipif(
-    not cuda_runs_sm100_kernels(),
-    reason="the CuTeDSL KDA forward pipeline requires an SM100-family GPU",
-)
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(
+        not cuda_runs_sm100_kernels(),
+        reason="the CuTeDSL KDA forward pipeline requires an SM100-family GPU",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 _DEFAULT_SCALE = 128**-0.5
 

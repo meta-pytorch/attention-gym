@@ -5,8 +5,13 @@ from __future__ import annotations
 import torch
 
 from attn_gym._backends.autotune import should_autotune
+from attn_gym.linear._delta_rule.paged_state import (
+    WARPDRIVE_POOL_ALIGNMENT_BYTES,
+    state_pool_is_aligned,
+)
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_backend,
     resolve_chunk_kernel_options,
     resolve_decode_out,
     resolve_scale,
@@ -74,19 +79,21 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        impl: ``"fused"`` (default) uses the repo-local scalar chunk pipeline on CUDA
-            capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
-            ``"reference"`` uses eager PyTorch.
-        kernel_options: Backend-specific options for fused execution. The repo-local path is the
-            default; ``{"backend": "warpdrive"}`` selects the optional warpdrive backend.
-            ``split_forward`` and ``split_backward`` opt into its approximate
-            forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
-            for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
-            (default ``True``) benchmarks candidate configurations of the repo-local fused
-            kernels; winners are cached and reused. When ``False``, and always under
-            ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
-            fixed configurations, so bits repeat across processes and winner-cache states on
-            one GPU model and software stack. The warpdrive backend always uses its fixed schedule.
+        impl: ``"fused"`` (default) uses the optimized chunk kernels that
+            ``kernel_options["backend"]`` selects, on CUDA capability 8.0+ with FP16/BF16 QKV
+            and equal ``K = V`` of 64 or 128; ``"reference"`` uses eager PyTorch.
+        kernel_options: Backend-specific options for fused execution. ``"backend"`` defaults to
+            ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed, the
+            repo-local fused backend elsewhere; ``"fused"`` and ``"warpdrive"`` force one.
+            With ``{"backend": "warpdrive"}``, ``split_forward`` and ``split_backward`` opt into
+            its approximate forgetting-horizon split schedules (see
+            :class:`attn_gym.linear.types.SplitOptions`) for calls without ``initial_state`` or
+            ``output_final_state``. ``"autotune"`` (default ``True``) benchmarks candidate
+            configurations of the repo-local fused kernels; winners are cached and reused. When
+            ``False``, and always under ``torch.use_deterministic_algorithms(True)``, the forward
+            and backward launch fixed configurations, so bits repeat across processes and
+            winner-cache states on one GPU model and software stack. The warpdrive backend always
+            uses its fixed schedule.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -97,7 +104,7 @@ def chunk_gdn(
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
         gate, beta, initial_state = cast_to_kernel_dtypes(gate, beta, initial_state)
-        if options["backend"] == "warpdrive":
+        if resolve_chunk_backend(options["backend"], q) == "warpdrive":
             return warpdrive_chunk_forward(
                 q,
                 k,
@@ -175,11 +182,11 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend, which
-            requires 16-byte-aligned pool bases and slot origins. Split schedules are not
-            supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
-            of the repo-local factor and output kernels. When ``False``, and always under
+        kernel_options: Backend options. ``"backend"`` selects the kernels as in ``chunk_gdn``.
+            warpdrive requires 16-byte-aligned pool bases and slot origins, so the default runs
+            other pools on the fused backend. Split schedules are not supported. ``"autotune"``
+            (default ``True``) benchmarks candidate configurations of the repo-local factor and
+            output kernels. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
             The recurrence that advances ``state_cache`` and the warpdrive backend always use
             fixed configurations.
@@ -203,7 +210,8 @@ def paged_chunk_gdn(
     )
     scale = resolve_scale(scale, q.shape[-1])
     gate, beta, _ = cast_to_kernel_dtypes(gate, beta, None)
-    if options["backend"] == "warpdrive":
+    aligned = state_pool_is_aligned(state_cache, WARPDRIVE_POOL_ALIGNMENT_BYTES)
+    if resolve_chunk_backend(options["backend"], q, fused_only=not aligned) == "warpdrive":
         return warpdrive_paged_chunk_forward(
             q,
             k,

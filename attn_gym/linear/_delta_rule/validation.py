@@ -3,19 +3,23 @@
 from __future__ import annotations
 
 import functools
+import importlib.util
 import sys
 import warnings
 from collections.abc import Iterable, Mapping
 from numbers import Real
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
 from attn_gym.types import KernelOptionSpec, validate_kernel_options
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# Probed without importing, so selecting a backend never loads the optional CuTeDSL kernels.
+_CUTEDSL_INSTALLED = importlib.util.find_spec("cutlass") is not None
 
 
 def validate_delta_rule_inputs(
@@ -124,6 +128,35 @@ def resolve_chunk_kernel_options(
         if options[name] and options["backend"] != "warpdrive":
             raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")
     return options
+
+
+# NOTE [Default chunk backend]
+# ``backend="auto"`` (the default) runs warpdrive for CUDA inputs on SM100-family GPUs
+# (``runs_sm100_kernels``: SM100, SM103, and SM107 with CuTeDSL 4.8+) when CuTeDSL (the
+# ``[linear]`` extra) is installed, and the fused backend everywhere else. On those GPUs the calls
+# warpdrive does not serve yet run the fused backend, as listed in docs/linear.md
+# ("Chunk backend selection"): KDA with FP16 kernels or ``fastmath=False``, replay-backed paged
+# KDA, and paged pools without warpdrive's 16-byte alignment. Each caller reports those as
+# ``fused_only``. The choice depends only on the device, dtypes, options, and layout, never on
+# sizes, so it is fixed for a compiled or captured call. Explicit ``"fused"`` and ``"warpdrive"``
+# are never rerouted.
+def resolve_chunk_backend(
+    backend: str, q: torch.Tensor, *, fused_only: bool = False
+) -> Literal["fused", "warpdrive"]:
+    """Resolve a requested chunk backend to the one that runs this call.
+
+    See NOTE [Default chunk backend]: ``"auto"`` selects warpdrive on SM100-family GPUs unless
+    ``fused_only`` reports a call warpdrive does not serve yet.
+    """
+    if backend != "auto":
+        return backend
+    warpdrive = (
+        not fused_only
+        and _CUTEDSL_INSTALLED
+        and q.is_cuda
+        and runs_sm100_kernels(torch.cuda.get_device_capability(q.device))
+    )
+    return "warpdrive" if warpdrive else "fused"
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -245,6 +278,7 @@ def validate_paged_state(
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
     "require_inference_only",
+    "resolve_chunk_backend",
     "resolve_chunk_kernel_options",
     "resolve_decode_out",
     "resolve_scale",

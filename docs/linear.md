@@ -12,6 +12,57 @@ This page is the API and implementation reference. Start with the operation you 
 - **Understand changing sequence lengths under capture:** the
   [Ragged CUDA Graphs guide](guides/ragged-cuda-graphs.md).
 
+## Chunk backend selection
+
+With `impl="fused"`, the chunk operations (`chunk_gdn`, `paged_chunk_gdn`, `chunk_kda`,
+`paged_chunk_kda`, the staged `chunk_gdn_prepare`/`chunk_kda_prepare` handles, and
+`context_parallel_gdn`/`context_parallel_kda`) run one of two kernel families, chosen by
+`kernel_options["backend"]`:
+
+- `"auto"` (default): warpdrive on SM100-family GPUs for every call it serves, when CuTeDSL (the
+  `[linear]` extra) is installed; the repo-local fused kernels everywhere else.
+- `"fused"`: the repo-local kernels (CuTe on SM100-family GPUs, Triton elsewhere).
+- `"warpdrive"`: the warpdrive kernels, on any SM100-family GPU (SM100, SM103, and SM107 with
+  CuTeDSL 4.8+); raises where they cannot run.
+
+On SM100-family GPUs, `"auto"` runs these calls on the fused backend:
+
+| Call | Reason |
+| --- | --- |
+| KDA whose kernels run in FP16 (Q, K, and V all FP16) | warpdrive FP16 does not hold model-range gates yet ([KDA gate contract](#kimi-delta-attention)) |
+| KDA with `fastmath=False` (`chunk_kda`, `chunk_kda_prepare`, `context_parallel_kda`) | warpdrive has only fast gate exponentials |
+| `paged_chunk_kda` with `replay_state` | replay-backed decode and prefill exist only on the fused backend |
+| `paged_chunk_gdn`/`paged_chunk_kda` with a pool base or slot stride that is not 16-byte aligned | warpdrive's paged kernels require that alignment |
+
+The choice depends only on the device, dtypes, `fastmath`, `replay_state`, and pool alignment,
+never on sizes, so a compiled graph or captured CUDA Graph keeps one backend. A staged backward
+handle follows its forward tape. `split_forward` and `split_backward` still require an explicit
+`"warpdrive"`. Explicit `"fused"` and `"warpdrive"` are never rerouted.
+
+What changes when the default runs warpdrive (it was the fused backend before), as measured on
+GB300 (SM103); there are no SM107 (Rubin) performance numbers yet:
+
+- **Bits.** warpdrive KDA chunks at 16 tokens instead of 64, and warpdrive GDN, though it also
+  chunks at 64, uses different kernels. Outputs and gradients therefore differ from the fused
+  backend at low-precision rounding level (relative RMS at most 0.6% over all outputs and
+  gradients in the GB300 comparison of the two backends). Against an FP32 reference the errors
+  match the fused backend's, except BF16 KDA `dgate`, whose error is about 1.7x larger (0.8%
+  instead of 0.5% relative RMS for two 64-token sequences, two heads, gates down to `-5`). Pass
+  `{"backend": "fused"}` to keep the previous bits.
+- **KDA gate range.** BF16 KDA (and FP32 or mixed Q/K/V, which run in BF16) narrows from about
+  `[-5.914, 0]` to about `[-5.25, 0]` per token (`WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`); the
+  default `bound_gate` bound of `-5` is inside both
+  ([KDA gate contract](#kimi-delta-attention)).
+- **Determinism.** warpdrive neither autotunes nor needs a tuning warm-up, and repeats its bits
+  run to run, but its plan follows the packed shape and the SM count, so a sequence's bits can
+  depend on the rest of the batch ([Determinism](determinism.md#warpdrive-chunk-kernels)).
+  Document-aligned context parallelism is CP-degree invariant only on the fused backend
+  ([Document-aligned fragments](#document-aligned-fragments-cp-invariant-bits)).
+- **Speed.** On GB300, warpdrive was faster than the fused backend on every measured GDN and KDA
+  training and prefill shape (geomean 2.1-3.9x) except one-sequence 2048-token, 8-head KDA
+  forward+backward, which is at parity in CUDA Graph replay (0.99-1.05x) and 5-7% slower in
+  summed kernel time.
+
 ## Gated Delta Rule
 
 `chunk_gdn` and `recurrent_gdn` use the token-major layout
@@ -30,10 +81,11 @@ Public and persistent state uses axis order `[N, H, V, K]`; paged pools replace 
 slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
 `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. Like
-`chunk_kda`, `chunk_gdn` defaults to the repo-local fused chunk pipeline (`impl="fused"`);
-`impl="reference"` selects eager PyTorch. Pass `kernel_options={"backend": "warpdrive"}` to select
-the optional warpdrive CuTeDSL backend; it accepts the same approximate `split_forward` and
-`split_backward` forgetting-horizon options as warpdrive KDA (see
+`chunk_kda`, `chunk_gdn` defaults to the optimized chunk kernels (`impl="fused"`): warpdrive on
+SM100-family GPUs and the repo-local fused pipeline elsewhere
+([Chunk backend selection](#chunk-backend-selection)); `impl="reference"` selects eager PyTorch.
+With `kernel_options={"backend": "warpdrive"}` the warpdrive CuTeDSL backend accepts the same
+approximate `split_forward` and `split_backward` forgetting-horizon options as warpdrive KDA (see
 [Kimi Delta Attention](#kimi-delta-attention)), with the same no-state restriction. They help only
 when few sequences leave the GPU idle and every head forgets quickly; heads that never forget stay
 uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan. Pass
@@ -61,8 +113,8 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
   support. On CUDA capability 8.0+, `paged_chunk_gdn` advances selected
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
   gather/scatter copies.
-- An opt-in warpdrive fused chunk implementation with the same public training/state contract and
-  direct paged-cache prefill on SM100-family GPUs (SM100, SM103, and SM107 with CuTeDSL 4.8+).
+- A warpdrive chunk implementation, the default on SM100-family GPUs, with the same public
+  training/state contract and direct paged-cache prefill.
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
 - Autograd for the reference and fused chunk implementations, including initial-state gradients.
@@ -98,11 +150,12 @@ wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM
 and portable Triton kernels on other supported architectures. The `K = V = 64` backward uses
 portable Triton on every architecture.
 
-The warpdrive chunk backend requires the optional `linear` dependencies and an SM100-family GPU,
-FP16/BF16 Q/K/V, and `K = V` of 64 or 128. Like the fused backend it runs gate, beta, and entry
-states in FP32 (returning their gradients in the caller's dtypes), packs dense batches into one
-sequence per row, and copies operands whose layout its kernels cannot address. It uses the same
-scalar natural-log gate contract and exact execution by default.
+The warpdrive chunk backend, the default on SM100-family GPUs, requires the optional `linear`
+dependencies, an SM100-family GPU, FP16/BF16 Q/K/V, and `K = V` of 64 or 128.
+Like the fused backend it runs gate, beta, and entry states in FP32 (returning their gradients in
+the caller's dtypes), packs dense batches into one sequence per row, and copies operands whose
+layout its kernels cannot address. It uses the same scalar natural-log gate contract and exact
+execution by default.
 
 #### Scalar gate numerical range
 
@@ -258,18 +311,19 @@ casting activations inside `forward`. A module-wide BF16 FSDP policy violates th
 contract. A correctness-first integration can keep the KDA unit under an FP32 policy while
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
-The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public
-boundary accepts FP16, BF16, or FP32 inputs. SM100-family GPUs select the specialized CuTe path;
-SM120 and earlier supported architectures use the portable Triton stages. Homogeneous FP16 and
-BF16 Q/K/V stay in their input dtype, while
-FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
-64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
-direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
-equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)` accepts
-explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
+The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public boundary
+accepts FP16, BF16, or FP32 inputs. On SM100-family GPUs the default runs warpdrive, which chunks
+internally at 16 tokens ([Chunk backend selection](#chunk-backend-selection)); the rest of this
+paragraph describes the repo-local fused backend, which SM100-family GPUs run as the specialized
+CuTe path and SM120 and earlier supported architectures as the portable Triton stages. Homogeneous FP16
+and BF16 Q/K/V stay in their input dtype, while FP32 or mixed-dtype inputs retain the existing BF16
+normalization. The core chunks internally at 64 tokens. Complete `B=1` inputs whose length is a
+multiple of the chunk size run on the direct dense route; other dense `[B, T, H, D]` inputs are
+lowered internally to equal-length packed sequences, while `chunk_kda(..., cu_seqlens=offsets)`
+accepts explicitly packed `[1, T, H, D]` inputs. All forms carry sequence boundaries through the
 forward, backward, and recurrent states; logical sequences may have tails or be empty. For
-fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive
-forward values outside `[0, cu_seqlens[-1])` are unspecified. `paged_chunk_kda` uses the same
+fixed-capacity execution, the terminal offset may be smaller than physical `T`; primitive forward
+values outside `[0, cu_seqlens[-1])` are unspecified. `paged_chunk_kda` uses the same
 Ampere-or-newer forward route while updating selected FP32 state-cache slots in place. Both chunk
 backends return zero cotangents for inactive gate rows (the fused internal reverse scan writes
 them; warpdrive zeroes them in its backward prologue). This does not sanitize arbitrary
@@ -421,8 +475,10 @@ conversion and its sequence-local BT64 cumulative sum; `recurrent_kda` performs 
 conversion because recurrence consumes one token decay at a time. This keeps chunking out
 of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The repo-local fused
-backend requires approximately `[-5.914, 0]`. warpdrive BF16 instead requires every aligned
-16-token per-channel sum to exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
+backend requires approximately `[-5.914, 0]` (`MAX_GATE_LOWER_BOUND_MAGNITUDE`). warpdrive BF16,
+the default on SM100-family GPUs for BF16, FP32, and mixed Q/K/V, requires about `[-5.25, 0]`
+(`WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`), for the reasons below. Every aligned 16-token
+per-channel sum must exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
 results are not finite. That bound keeps the forward finite; gradients need more margin. The
 backward stages `Q_decay = scale * q * exp(in-chunk cumulative decay)` as a BF16 MMA operand,
 which flushes to zero once `scale * |q| * exp(16-token sum)` falls below about `2^-126`, and dv,
@@ -438,15 +494,17 @@ from a separate, milder factor. A sum concentrated on the first token of its 16-
 the backward no headroom: with the whole decay on one token of a 48-token sequence, dq and dgate
 were non-finite for 0 of 20 seeds at `-86.5`, 1 of 20 at `-86.9` and 10 of 20 at `-87.3`.
 Upstream cuDNN Frontend behaves identically. warpdrive stages these MMA operands in the Q/K dtype
-rather than TF32, so warpdrive FP16 does not support usual model-range gates. These limits are not
-checked at runtime. The training example uses the Kimi-style FP32 transform
+rather than TF32, so warpdrive FP16 does not support usual model-range gates, and the default
+backend runs FP16 KDA on the fused kernels. These limits are not checked at runtime. The training
+example uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
 Both cores select their implementation with `impl`: `"fused"` runs the optimized kernels
 and enforces their constraints (the chunked core requires `head_dim=128` and Ampere or newer,
 preserves homogeneous FP16/BF16 Q/K/V, normalizes FP32 or mixed inputs to BF16, and chunks at
-64 tokens; the fused recurrent scan is inference-only), while `"reference"`
+64 tokens on the repo-local kernels and 16 on warpdrive; the fused recurrent scan is
+inference-only), while `"reference"`
 runs the eager FP32 oracle behind the identical packed contract on any hardware and head
 dimension, and stays differentiable. There is no automatic fallback between implementations, and
 the chunk-versus-recurrent switch is caller policy (on B200 the scan wins below roughly 32 tokens
@@ -463,7 +521,10 @@ Token-at-a-time decode groups floating-point additions differently than 64-row `
 training, so decode drifts from training numerics.
 [`examples/linear/kda_zero_drift_decode.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_zero_drift_decode.py)
 replays the current partial chunk with `chunk_kda` from the last FP32 boundary state, which
-makes decode output bitwise-identical to training.
+makes decode output bitwise-identical to training whenever the training and replay calls run the
+same kernels with the same plan (the example pins `autotune` off). warpdrive, the SM100-family
+default, picks its plan from the packed shape and the SM count, so there the replay and training
+shapes must select the same plan ([Determinism](determinism.md#warpdrive-chunk-kernels)).
 
 For replay-backed `paged_chunk_kda`, a serving engine can plan its pool before allocating
 device memory. `ReplayState.slot_layout(num_heads, head_dim)` returns the per-slot shape and
@@ -483,11 +544,11 @@ replay_state.count.zero_()
 The current fused KDA kernel requires key and value dimensions of 128. A pool may pad the
 stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[num_slots]`.
 
-`chunk_kda(..., kernel_options={"backend": "warpdrive"})` selects an opt-in SM100-family
-training backend for applications that already hold per-token natural-log gate increments. It
-applies the fused backend's dtype policy: Q/K/V that share FP16 or BF16 run as given, FP32 or mixed
-Q/K/V run in BF16, gate, beta, and the entry state run in FP32, the output keeps `q.dtype`, and
-every gradient comes back in its operand's dtype. It uses
+`chunk_kda` runs the warpdrive training backend by default on SM100-family GPUs
+([Chunk backend selection](#chunk-backend-selection)); `kernel_options={"backend": "warpdrive"}`
+forces it. It applies the fused backend's dtype policy: Q/K/V that share FP16 or
+BF16 run as given, FP32 or mixed Q/K/V run in BF16, gate, beta, and the entry state run in FP32,
+the output keeps `q.dtype`, and every gradient comes back in its operand's dtype. It uses
 warpdrive CuTeDSL kernels (CuTeDSL 4.6.2 or newer, the `[linear]` extra) and has no cuDNN Frontend
 runtime dependency. Like the other
 implementations, it returns `(output, final_state)`; request the latter with
@@ -510,9 +571,9 @@ affects only the forward recurrence: unless `split_backward` is also enabled, ba
 exact unsplit recurrence's gradient rather than the derivative of the split forward. The
 implementation chooses the split count from the input geometry; no public split-size knob is
 exposed. Split schedules currently require a no-state call, so context parallelism never uses them.
-`paged_chunk_kda(..., kernel_options={"backend": "warpdrive"})` uses the same unsplit forward while
-updating selected cache slots directly; paged execution never uses forgetting-horizon splitting.
-Install the `linear` extra to use this backend.
+On warpdrive, `paged_chunk_kda` uses the same unsplit forward while updating selected cache slots
+directly; paged execution never uses forgetting-horizon splitting. Install the `linear` extra to
+use this backend.
 
 `kernel_options={"schedule": "persistent"}` is for CUDA graphs whose replays can carry far fewer
 tokens than the capacity they were captured for. The default static grid launches one CTA per
@@ -531,7 +592,7 @@ count and always stride over the active work only, so it needs no option for ove
 |---|---|---|
 | Repo-local fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
-| `kernel_options={"backend": "warpdrive"}` | Native backend math | `ValueError`: unsupported |
+| warpdrive KDA | Native backend math | Runs on the repo-local fused backend under the default `"auto"`; `ValueError` with explicit `"warpdrive"` |
 
 One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100-family GPUs always uses
 the flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
@@ -744,8 +805,9 @@ to ranks, longest first onto the least-loaded rank, so ranks stay within one doc
 each other. What it cannot do is split a document that does not fit on one rank; that is what
 the summaries above are for.
 
-This holds for the fused backend, not for warpdrive. warpdrive picks its plan from the packed
-shape and the SM count, so a document's bits can change with how many others share its rank:
+This holds for the fused backend, not for warpdrive, so pass `kernel_options={"backend": "fused"}`
+for it on SM100-family GPUs, where warpdrive is the default. warpdrive picks its plan from the
+packed shape and the SM count, so a document's bits can change with how many others share its rank:
 any plan change can move KDA forward bits. For example, KDA's forward takes the d_v-split prep
 path while `num_seqs * heads` stays below about half the SM count, and a long document can leave
 the forward piece chain for it when packed with a single other one. On a 152-SM GB300 with two
@@ -762,8 +824,9 @@ bits for short documents, which take neither chain.
 
 ### warpdrive local execution
 
-`kernel_options={"backend": "warpdrive"}` runs each rank's local passes with warpdrive's kernels,
-for KDA (`chunk_kda_prepare`, `context_parallel_kda`) and GDN (`chunk_gdn_prepare`,
+On SM100-family GPUs the default backend (or an explicit
+`kernel_options={"backend": "warpdrive"}`) runs each rank's local passes with warpdrive's
+kernels, for KDA (`chunk_kda_prepare`, `context_parallel_kda`) and GDN (`chunk_gdn_prepare`,
 `context_parallel_gdn`). The recipe is the same as for the fused backend: summarize every local
 range as an affine map of its entry state, exchange and compose the maps, then run the local pass
 from the composed state.

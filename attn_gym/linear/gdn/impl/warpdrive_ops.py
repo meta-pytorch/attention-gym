@@ -19,7 +19,7 @@ from attn_gym.linear._delta_rule.operand_layout import (
     normalize_cu_seqlens,
     normalize_scalar_rows,
 )
-from attn_gym.linear._delta_rule.paged_state import PagedState
+from attn_gym.linear._delta_rule.paged_state import WARPDRIVE_POOL_ALIGNMENT_BYTES, PagedState
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
@@ -230,7 +230,7 @@ def _packed_fwd_paged_cuda(
         key_dim=q.shape[3],
         device=q.device,
         read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
-    ).require_alignment(16)
+    ).require_alignment(WARPDRIVE_POOL_ALIGNMENT_BYTES)
     output, _ = backend.run_forward(
         q,
         k,

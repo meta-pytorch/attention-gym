@@ -163,19 +163,22 @@ def gdn_inputs(tokens: int, *, key_heads: int, value_heads: int, seed: int, dtyp
     )[:5]
 
 
+# The default backend runs warpdrive on SM100-family GPUs, so the fused variants name their
+# backend.
+FUSED = {"backend": "fused"}
 KDA = Op(
-    chunk_kda,
+    partial(chunk_kda, kernel_options=FUSED),
     partial(chunk_kda, impl="reference"),
-    chunk_kda_prepare,
+    partial(chunk_kda_prepare, kernel_options=FUSED),
     chunk_kda_prepare_backward,
     kda_inputs,
     key_heads=2,
     value_heads=2,
 )
 GDN = Op(
-    partial(chunk_gdn, impl="fused"),
+    partial(chunk_gdn, impl="fused", kernel_options=FUSED),
     partial(chunk_gdn, impl="reference"),
-    chunk_gdn_prepare,
+    partial(chunk_gdn_prepare, kernel_options=FUSED),
     chunk_gdn_prepare_backward,
     gdn_inputs,
     key_heads=2,
@@ -488,7 +491,7 @@ def test_backward_from_a_tape_without_factors_matches_saved_factors(packing, dty
     )
 
     prepared = chunk_kda_prepare(
-        *inputs, cu_seqlens=cu_seqlens, scale=0.25, kernel_options={"autotune": False}
+        *inputs, cu_seqlens=cu_seqlens, scale=0.25, kernel_options={**FUSED, "autotune": False}
     )
     # A warpdrive forward saves no factors; its backward must match one that did, bit for bit.
     tapes = (prepared.saved, prepared.saved._replace(aqk=None, akk=None))
