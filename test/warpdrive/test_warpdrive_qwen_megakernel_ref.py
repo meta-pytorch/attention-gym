@@ -16,6 +16,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
     decode_step_ref,
     load_qwen3_weights,
     make_decode_state,
+    prompt_tokens,
     validate_against_hf,
 )
 
@@ -59,6 +60,39 @@ def test_decode_matches_hf_and_writes_only_current_cache_position(checkpoint: Pa
     for cache, before in zip(caches, prefix):
         torch.testing.assert_close(cache[:, :, :pos], before, rtol=0, atol=0)
         assert torch.isnan(cache[:, :, pos + 1]).all()
+
+
+def test_moe_decode_matches_hf(tmp_path: Path) -> None:
+    """A small random Qwen3-MoE, saved by HF and read back by load_qwen3_weights (per-expert
+    tensors, router, untied head, transformers 5 config names): prefill and decode logits agree
+    with Qwen3MoeForCausalLM to bf16 noise."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    torch.manual_seed(0)
+    config = transformers.Qwen3MoeConfig(
+        hidden_size=512, num_hidden_layers=3, num_attention_heads=8, num_key_value_heads=2,
+        head_dim=128, intermediate_size=1024, moe_intermediate_size=256, num_experts=16,
+        num_experts_per_tok=4, norm_topk_prob=True, vocab_size=2048, tie_word_embeddings=False,
+    )  # fmt: skip
+    model = transformers.Qwen3MoeForCausalLM(config).to(torch.bfloat16).cuda().eval()
+    model.save_pretrained(tmp_path)
+    weights = load_qwen3_weights(str(tmp_path))
+    assert weights.config.num_experts == 16 and weights.router.shape == (3, 16, 512)
+    assert weights.gate.shape == (3, 16, 256, 512) and weights.down.shape == (3, 16, 512, 256)
+    ctx = 40
+    with torch.no_grad():
+        output = model(prompt_tokens(weights, ctx, 0)[None], use_cache=True, logits_to_keep=1)
+        caches, token, pos = make_decode_state(weights, ctx, ctx + 4, seed=0)
+        assert token == output.logits[0, -1].argmax()
+        for step in range(3):
+            ours = decode_step_ref(weights, token, pos + step, *caches)
+            output = model(token.reshape(1, 1), past_key_values=output.past_key_values)
+            theirs = output.logits[0, -1].float()
+            torch.testing.assert_close(ours, theirs, atol=0.05, rtol=0.02)
+            assert ours.argmax() == theirs.argmax()
+            token = theirs.argmax()
 
 
 def test_error_budget_rejects_wrong_token_and_nonfinite_logits() -> None:

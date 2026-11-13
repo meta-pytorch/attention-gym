@@ -114,19 +114,28 @@ COMPUTE_WARPS = 8
 ROWS_PER_WARP = ROWS // COMPUTE_WARPS
 COMPUTE_THREADS = 32 * COMPUTE_WARPS
 
-QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD = range(6)
-ALL_OPS = (QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD)
+QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER = range(7)
+ALL_OPS = (QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER)
 EVICT_FIRST = 0x12F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST)
 WORDS = 5  # op, layer, a, b, table row
-OP_NAMES = ("QKV", "ATTN", "OPROJ", "GATEUP", "DOWN", "LMHEAD")
+OP_NAMES = ("QKV", "ATTN", "OPROJ", "GATEUP", "DOWN", "LMHEAD", "ROUTER")
 # Globaltimer records per role and CTA: at least TRACE_EVENTS (0.6B: a CTA runs ~140 rows),
 # else TRACE_EVENTS_PER_ROW per row of the CTA's share (a row records its work item and regions).
 TRACE_EVENTS, TRACE_EVENTS_PER_ROW = 2048, 8
+WEIGHT_ATOMS = 6  # wqkv, wo, wgu, wd, LM head, router; the KV caches' atoms follow
 
 
 def qkv_rows(model: QwenConfig) -> int:
     """Rows of the fused [Wq; Wk; Wv]."""
     return (model.num_q_heads + 2 * model.num_kv_heads) * HEAD_DIM
+
+
+def mlp_width(model: QwenConfig) -> int:
+    """Columns of the MLP's activation: the intermediate size, or for a MoE model the routed
+    experts' activations side by side (slot s holds expert e_s's, scaled by its weight)."""
+    if model.is_moe:
+        return model.experts_per_token * model.moe_intermediate_size
+    return model.intermediate_size
 
 
 def attention_groups(model: QwenConfig) -> tuple[int, int]:
@@ -151,8 +160,9 @@ class ScratchLayout:
             "attn_ml": (layers, groups, per_row, splits, 2),  # (m, l) per head, split; log2 m
             "o_part": (layers, O_SPLITS, hidden),
             "h_mid": (layers, hidden),  # residual after attention
-            "act": (layers, model.intermediate_size),
+            "act": (layers, mlp_width(model)),
             "d_part": (layers, DOWN_SPLITS, hidden),
+            "router_logits": (layers, model.num_experts or ROWS),  # MoE only
         }
         self.offsets, offset = {}, 0
         for name, shape in self.shapes.items():
@@ -183,7 +193,7 @@ class InstructionTable(WorkMap):
 
 @dataclass(frozen=True)
 class MegakernelParams:
-    tma: tuple  # TMA atoms: wqkv, wo, wgu, wd, lm head, k cache, v cache
+    tma: tuple  # TMA atoms: wqkv, wo, wgu, wd, lm head, router, k cache, v cache
     gmem: tuple  # their tile partitions: (TMA, row tiles, k tiles)
     sW: StageView  # weight stage partition
     sKV: StageView  # KV stage partition
@@ -192,6 +202,7 @@ class MegakernelParams:
     att: cute.Tensor  # (9, att_stride) fp32 per-warp attention states
     qkvs: cute.Tensor  # ((per_row + 2) * HEAD_DIM,) fp32 an attention row's q heads, k and v
     mls: cute.Tensor  # (heads_per_split, splits, 2) fp32 an o_proj row's (m, l) per KV split
+    route: cute.Tensor  # (2, top_k) fp32 routing weights by rank, double-buffered by item
     # Tagged int64 activations, flat row-major (ScratchLayout.shapes; see the *_index helpers).
     h_in: cute.Tensor
     qkv: cute.Tensor
@@ -201,6 +212,7 @@ class MegakernelParams:
     h_mid: cute.Tensor
     act: cute.Tensor
     d_part: cute.Tensor
+    router_logits: cute.Tensor
     logits: cute.Tensor  # (vocab,) fp32
     state: cute.Tensor  # int32 [epoch of the previous launch, CTAs finished]
     step: cute.Tensor  # int32 [token, pos]
@@ -402,7 +414,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
         check_model(model)
         self.model = model
         self.layers, self.hidden = model.num_layers, model.hidden_size
-        self.inter, self.vocab = model.intermediate_size, model.vocab_size
+        self.inter, self.vocab = mlp_width(model), model.vocab_size
+        # MoE: the gate/up and down GEMVs gather slot s's rows from the routed expert e_s.
+        self.moe = model.is_moe
+        self.experts, self.top_k = model.num_experts, model.experts_per_token
+        self.expert_inter = model.moe_intermediate_size
         self.q_heads, self.kv_heads = model.num_q_heads, model.num_kv_heads
         self.qkv_rows = qkv_rows(model)
         self.attn_groups, self.per_row = attention_groups(model)
@@ -447,6 +463,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.smem_plan.buffer("ATT", Float32, align=16)
         self.smem_plan.buffer("QKVS", Float32, align=16)
         self.smem_plan.buffer("MLS", Float32, align=16)
+        self.smem_plan.buffer("ROUTE", Float32, align=16)
         # Compute reads stages with generic loads before TMA refills them. For a Tma-filled ring
         # released by Warps the layer emits the fence.proxy.async on release.
         self.w = Ring(stages, Tma(STAGE_BYTES), Warps, buffer={"W": w, "KV": kv})
@@ -463,8 +480,19 @@ class QwenDecodeMegakernel(WarpSpecialized):
             + (COMPUTE_WARPS + 1) * self.att_stride  # ATT
             + (self.per_row + 2) * HEAD_DIM  # QKVS
             + self.heads_per_split * self.splits * 2  # MLS
+            + self.route_floats  # ROUTE
         )
         return 2 * 2 * self.x_width + 4 * floats + SMEM_HEADROOM
+
+    @property
+    def route_floats(self) -> int:
+        """ROUTE: the top-k routing weights by rank, double-buffered like the GEMV input.
+        Dense models keep a stub."""
+        return 2 * self.route_width
+
+    @property
+    def route_width(self) -> int:
+        return self.top_k if self.moe else 2
 
     @property
     def att_stride(self) -> int:
@@ -473,7 +501,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
     def get_name(self) -> str:
         return (
-            f"warpdrive_qwen_decode_h{self.hidden}_s{self.stages}_kv{self.splits}_"
+            f"warpdrive_qwen_decode_h{self.hidden}{f'_moe{self.experts}' if self.moe else ''}"
+            f"_s{self.stages}_kv{self.splits}_"
             f"{self.work.get_key()}{self.trace_key()}"
         )
 
@@ -483,12 +512,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
     @cute.jit
     def load(self, p: MegakernelParams, *, w: Producer, work: WorkCursor):
         w = w.views(W=p.sW, KV=p.sKV)
-        tma_qkv, tma_o, tma_gu, tma_d, tma_lm, tma_k, tma_v = p.tma
-        g_qkv, g_o, g_gu, g_d, g_lm, g_k, g_v = p.gmem
+        tma_qkv, tma_o, tma_gu, tma_d, tma_lm, tma_router, tma_k, tma_v = p.tma
+        g_qkv, g_o, g_gu, g_d, g_lm, g_router, g_k, g_v = p.gmem
         pos = p.step[1]
         max_len = p.k_cache.shape[0] // (self.layers * self.kv_heads)
+        # MoE: the expert rows to load follow the layer's routing, recomputed once per layer.
+        epoch = p.state[0] + 1
+        lane = cute.arch.lane_idx()
+        chosen = cute.make_rmem_tensor((max(self.top_k, 1),), Int32)
+        routed_layer = Int32(-1)
         while work.valid:
             op, layer, a, b, _row = work.item
+            if cutlass.const_expr(self.moe):
+                if ((op == GATEUP) | (op == DOWN)) & (layer != routed_layer):
+                    self.route(p, layer, lane, epoch, chosen)
+                    routed_layer = layer
             if op == ATTN:
                 blk0, blk1 = self.split_blocks(pos, b)
                 row0 = (layer * self.kv_heads + self.kv_head(a)) * (max_len // BLOCK)
@@ -504,11 +542,29 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 w = self.load_tiles(w, tma_o, g_o, tile, b * k_tiles, k_tiles, "W")
             elif op == GATEUP:
                 tile = layer * (2 * self.inter // ROWS) + a
+                if cutlass.const_expr(self.moe):
+                    # Tile a of slot s is tile a % per_slot of expert e_s's gate/up rows.
+                    per_slot = 2 * self.expert_inter // ROWS
+                    expert = self.expert_of(chosen, a // per_slot)
+                    tile = (layer * self.experts + expert) * per_slot + a % per_slot
                 w = self.load_tiles(w, tma_gu, g_gu, tile, 0, self.hidden_k_tiles, "W")
             elif op == DOWN:
                 tile = layer * (self.hidden // ROWS) + a
                 k_tiles = self.down_k_tiles
-                w = self.load_tiles(w, tma_d, g_d, tile, b * k_tiles, k_tiles, "W")
+                if cutlass.const_expr(self.moe):
+                    # Column tile kt of the routed activation is tile kt % per_slot of slot
+                    # kt // per_slot's expert down projection.
+                    per_slot = self.expert_inter // TILE_K
+                    for k in cutlass.range_constexpr(k_tiles):
+                        kt = b * k_tiles + k
+                        expert = self.expert_of(chosen, kt // per_slot)
+                        row = (layer * self.experts + expert) * (self.hidden // ROWS) + a
+                        w = self.load_tiles(w, tma_d, g_d, row, kt % per_slot, 1, "W")
+                else:
+                    w = self.load_tiles(w, tma_d, g_d, tile, b * k_tiles, k_tiles, "W")
+            elif op == ROUTER:
+                tile = layer * (self.experts // ROWS) + a
+                w = self.load_tiles(w, tma_router, g_router, tile, 0, self.hidden_k_tiles, "W")
             else:
                 for rt in cutlass.range(a, a + b, unroll=1):
                     w = self.load_tiles(w, tma_lm, g_lm, rt, 0, self.hidden_k_tiles, "W")
@@ -532,6 +588,66 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 )
         return w
 
+    @cute.jit
+    def route(self, p: MegakernelParams, layer, lane, epoch, chosen, weights=None):
+        """One warp's top-k routing of ``layer``, uniform across the warp: ``chosen`` (top_k Int32)
+        gets the experts by rank, largest router logit first, ties to the lower expert index
+        (the reference's stable sort). With ``weights`` (top_k floats), lane 0 also writes their
+        routing weights: softmax over all experts in fp32, renormalized over the top k when the
+        model's ``norm_topk_prob`` is set, and rounded to bf16, as HF does.
+
+        Router logits are bf16-rounded, so a logit and its index pack into one int32 key that
+        orders like (logit, -index): k rounds of a 5-shuffle warp max pick the top k."""
+        n = self.experts // 32  # lane l holds experts n*l .. n*l + n - 1
+        logits = cute.make_rmem_tensor((n,), Float32)
+        fetch([(p.router_logits, layer * self.experts + n * lane, n)], logits, epoch)
+        keys = cute.make_rmem_tensor((n,), Int32)
+        for i in cutlass.range_constexpr(n):
+            bits = (Int32(bitcast(logits[i].ir_value(), T.i32())) >> 16) & 0xFFFF
+            # bf16 bits -> an unsigned order (flip negatives, set the sign of positives), then
+            # recentred so a signed compare keeps it.
+            order = cutlass.select_((bits & 0x8000) != 0, (~bits) & 0xFFFF, bits | 0x8000)
+            keys[i] = ((order - 0x8000) << 16) | (0xFFFF - (n * lane + i))
+        chosen_logits = cute.make_rmem_tensor((self.top_k,), Float32)
+        for r in cutlass.range_constexpr(self.top_k):
+            best = keys[0]
+            for i in cutlass.range_constexpr(1, n):
+                best = cutlass.max(best, keys[i])
+            for step in cutlass.range_constexpr(5):
+                best = cutlass.max(best, cute.arch.shuffle_sync_bfly(best, offset=16 >> step))
+            chosen[r] = 0xFFFF - (best & 0xFFFF)
+            order = (best >> 16) + 0x8000
+            bits = cutlass.select_((order & 0x8000) != 0, order & 0x7FFF, (~order) & 0xFFFF)
+            chosen_logits[r] = Float32(bitcast((bits << 16).ir_value(), T.f32()))
+            for i in cutlass.range_constexpr(n):
+                keys[i] = cutlass.select_(keys[i] == best, Int32(-(2**31)), keys[i])
+        if cutlass.const_expr(weights is not None):
+            top = chosen_logits[0]
+            total = Float32(0.0)
+            for i in cutlass.range_constexpr(n):
+                total = total + cute.math.exp2((logits[i] - top) * LOG2E)
+            total = group_sum(total, 32)
+            chosen_sum = Float32(0.0)
+            probs = cute.make_rmem_tensor((self.top_k,), Float32)
+            for r in cutlass.range_constexpr(self.top_k):
+                probs[r] = cute.math.exp2((chosen_logits[r] - top) * LOG2E) / total
+                chosen_sum = chosen_sum + probs[r]
+            if lane == 0:
+                for r in cutlass.range_constexpr(self.top_k):
+                    if cutlass.const_expr(self.model.norm_topk_prob):
+                        weights[r] = bf16_round(probs[r] / chosen_sum)
+                    else:
+                        weights[r] = bf16_round(probs[r])
+
+    @cute.jit
+    def expert_of(self, chosen, slot):
+        """The expert at rank ``slot`` of ``route``'s ``chosen`` (a select chain: no
+        dynamically indexed registers)."""
+        expert = chosen[0]
+        for r in cutlass.range_constexpr(1, self.top_k):
+            expert = cutlass.select_(slot == r, chosen[r], expert)
+        return expert
+
     @role(warps=range(COMPUTE_WARPS))
     @cute.jit
     def compute(self, p: MegakernelParams, *, w: Consumer, work: WorkCursor, me: Local):
@@ -541,7 +657,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         token = p.step[0]
         epoch = p.state[0] + 1
         # Consecutive rows with the same key share the GEMV input in xs[xbuf]. Row 0 of GATEUP
-        # and of layer 0's QKV always runs the prologue: it publishes the residual.
+        # (of ROUTER for MoE) and of layer 0's QKV always runs the prologue: it publishes the
+        # residual.
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
@@ -551,7 +668,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             else:
                 ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
                 key = (op * (self.layers + 1) + layer) * 8 + ks
-                publishes = (a == 0) & ((op == GATEUP) | ((op == QKV) & (layer == 0)))
+                mid = ROUTER if self.moe else GATEUP  # the op whose row 0 publishes h_mid
+                publishes = (a == 0) & ((op == mid) | ((op == QKV) & (layer == 0)))
                 if (key != xkey) | publishes:
                     xkey = key
                     xbuf = 1 - xbuf
@@ -599,7 +717,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         norm_weight = cute.make_rmem_tensor((n,), Float32)
         if op == QKV:
             load_into(norm_weight, p.ln_in[layer, None], n * tid, n)
-        elif op == GATEUP:
+        elif (op == GATEUP) | (op == ROUTER):
             load_into(norm_weight, p.ln_post[layer, None], n * tid, n)
         elif op == LMHEAD:
             load_into(norm_weight, p.final_norm, n * tid, n)
@@ -613,12 +731,21 @@ class QwenDecodeMegakernel(WarpSpecialized):
             else:
                 self.published_residual(x, p.h_in, layer, epoch, tid, row)
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
-        elif op == GATEUP:
-            self.residual(x, p.h_in, p.o_part, layer, epoch, tid, row)
-            if a == 0:
-                for e in cutlass.range_constexpr(n):
-                    publish(p.h_mid, self.hidden_index(layer, n * tid + e), x[e], epoch)
+        elif (op == GATEUP) | (op == ROUTER):
+            # The MLP input: RMSNorm of the residual after attention. For MoE the router runs
+            # first and its row 0 publishes h_mid; the expert rows read it back and route.
+            if cutlass.const_expr(self.moe) and op == GATEUP:
+                self.published_residual(x, p.h_mid, layer, epoch, tid, row)
+            else:
+                self.residual(x, p.h_in, p.o_part, layer, epoch, tid, row)
+                if a == 0:
+                    for e in cutlass.range_constexpr(n):
+                        publish(p.h_mid, self.hidden_index(layer, n * tid + e), x[e], epoch)
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
+            if cutlass.const_expr(self.moe):
+                if (op == GATEUP) & (warp == 0):
+                    chosen = cute.make_rmem_tensor((self.top_k,), Int32)
+                    self.route(p, layer, lane, epoch, chosen, p.route[xbuf, None])
         elif op == LMHEAD:
             self.published_residual(x, p.h_in, layer, epoch, tid, row)  # layer == layers
             self.rms_norm(p, x, norm_weight, xs, tid, warp, lane)
@@ -830,6 +957,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     g = bf16_round(v)
                     silu = bf16_round(g / (1.0 + cute.math.exp2(-g * LOG2E)))
                     out = bf16_round(silu * bf16_round(up))
+                    if cutlass.const_expr(self.moe):
+                        # Fold slot s's routing weight in here, so down sums plain partials.
+                        slot = a // (2 * self.expert_inter // ROWS)
+                        out = bf16_round(out * p.route[xbuf, slot])
                     publish(p.act, self.act_index(layer, a * (ROWS // 2) + row // 2), out, epoch)
             elif lane % (32 // ROWS_PER_WARP) == 0:
                 if op == QKV:
@@ -838,6 +969,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     publish(p.o_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
                 elif op == DOWN:
                     publish(p.d_part, self.part_index(layer, b, a * ROWS + row), v, epoch)
+                elif op == ROUTER:
+                    index = layer * self.experts + a * ROWS + row
+                    publish(p.router_logits, index, bf16_round(v), epoch)
                 else:
                     p.logits[(a + t) * ROWS + row] = bf16_round(v)
         return w
@@ -1105,6 +1239,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             ),
             "QKVS": cute.make_layout(((self.per_row + 2) * HEAD_DIM,)),
             "MLS": cute.make_layout((self.heads_per_split * 2 * self.splits,)),
+            "ROUTE": cute.make_layout((2, self.route_width), stride=(self.route_width, 1)),
         }
         self.begin_roles(work=bound, layouts=layouts)
         # Materialize the argument tensors here, in converged code: iterators and layouts are
@@ -1117,12 +1252,13 @@ class QwenDecodeMegakernel(WarpSpecialized):
             tma=tuple(tma),
             gmem=tuple(part[1] for part in parts),
             sW=StageView(parts[0][0], axis=1),
-            sKV=StageView(parts[5][0], axis=1),
+            sKV=StageView(parts[WEIGHT_ATOMS][0], axis=1),
             xs=self.buffer("X"),
             red=self.buffer("RED"),
             att=self.buffer("ATT"),
             qkvs=self.buffer("QKVS"),
             mls=self.buffer("MLS"),
+            route=self.buffer("ROUTE"),
             **tagged_views(scratch, self.scratch_layout),
             **tensors,
         )
@@ -1137,6 +1273,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         wd: cute.Tensor,
         embed: cute.Tensor,
         lm_head: cute.Tensor,
+        router: cute.Tensor,
         k_cache: cute.Tensor,
         v_cache: cute.Tensor,
         scratch: cute.Tensor,
@@ -1155,7 +1292,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        tma, gtensors = make_tma_atoms((wqkv, wo, wgu, wd, lm_head), (k_cache, v_cache))
+        tma, gtensors = make_tma_atoms((wqkv, wo, wgu, wd, lm_head, router), (k_cache, v_cache))
         bound = self.work.bind(table, workspace, max_ctas)
         # TENSOR_ARGS order.
         tensors = (
@@ -1197,7 +1334,7 @@ def tma_partitions(tma, gtensors, sW, sKV):
     """``(smem, gmem)`` TMA partitions per atom: ``(TMA, stage)`` and ``(TMA, rows, cols)``."""
     parts = []
     for atom, g in zip(tma, gtensors):
-        is_kv = len(parts) >= 5
+        is_kv = len(parts) >= WEIGHT_ATOMS
         tile = (BLOCK, HEAD_DIM) if is_kv else (ROWS, TILE_K)
         smem = sKV if is_kv else sW
         tiles = cute.local_tile(g, tile, (None, None))
@@ -1228,15 +1365,17 @@ def compile_megakernel(op: QwenDecodeMegakernel):
     """One compile serves every context length and cache capacity: ``max_len`` is dynamic."""
     bf16 = BFloat16
     cache_rows = cute.sym_int(divisibility=BLOCK)
-    layers, hidden, inter, vocab = op.layers, op.hidden, op.inter, op.vocab
+    layers, hidden, vocab = op.layers, op.hidden, op.vocab
+    gate_up, down, router = packed_mlp_shapes(op)
     return compile_tvm_ffi(
         op,
         make_fake_compact_tensor(bf16, (layers * op.qkv_rows, hidden)),
         make_fake_compact_tensor(bf16, (layers * hidden, op.q_heads * HEAD_DIM)),
-        make_fake_compact_tensor(bf16, (layers * 2 * inter, hidden)),
-        make_fake_compact_tensor(bf16, (layers * hidden, inter)),
+        make_fake_compact_tensor(bf16, gate_up),
+        make_fake_compact_tensor(bf16, down),
         make_fake_compact_tensor(bf16, (vocab, hidden)),  # embedding
         make_fake_compact_tensor(bf16, (vocab, hidden)),  # LM head (the embedding when tied)
+        make_fake_compact_tensor(bf16, router),
         make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
         make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
         make_fake_compact_tensor(Int64, (op.scratch_layout.size,)),
@@ -1260,10 +1399,22 @@ def compile_megakernel(op: QwenDecodeMegakernel):
 # ---------------------------------------------------------------------- host side
 
 
+def packed_mlp_shapes(op: QwenDecodeMegakernel) -> tuple[tuple, tuple, tuple]:
+    """2-D shapes of the packed gate/up (rows interleaved), down and router weights. MoE stacks
+    them per (layer, expert); a dense model's router is a one-tile stub."""
+    layers, hidden = op.layers, op.hidden
+    if op.moe:
+        experts, inter = layers * op.experts, op.expert_inter
+        return (experts * 2 * inter, hidden), (experts * hidden, inter), (experts, hidden)
+    return (layers * 2 * op.inter, hidden), (layers * hidden, op.inter), (ROWS, hidden)
+
+
 def check_model(model: QwenConfig):
     """Raise unless the kernel's tilings cover ``model``: 128-dim heads, o_proj splits of
     whole 256-column tiles, a hidden size the norms split into 4-element multiples per thread,
-    whole 256-column down splits and 32-row LM-head tiles. Qwen3-4B fails the hidden size."""
+    whole 256-column down splits and 32-row LM-head tiles. Qwen3-4B fails the hidden size. MoE:
+    32, 64, 128 or 256 experts (a routing warp's lanes each hold a power-of-two share) and
+    expert widths of whole 256-column tiles."""
     if model.head_dim != HEAD_DIM:
         raise ValueError(f"head dim must be {HEAD_DIM}, got {model.head_dim}")
     if model.num_q_heads % model.num_kv_heads:
@@ -1272,10 +1423,15 @@ def check_model(model: QwenConfig):
         raise ValueError(f"q heads must be a multiple of {2 * O_SPLITS}")
     if model.hidden_size % (4 * COMPUTE_THREADS):
         raise ValueError(f"hidden size must be a multiple of {4 * COMPUTE_THREADS}")
-    if model.intermediate_size % (DOWN_SPLITS * COMPUTE_THREADS):
+    if mlp_width(model) % (DOWN_SPLITS * COMPUTE_THREADS):
         raise ValueError(
-            f"intermediate size must be a multiple of {DOWN_SPLITS * COMPUTE_THREADS}"
+            f"MLP width {mlp_width(model)} must be a multiple of {DOWN_SPLITS * COMPUTE_THREADS}"
         )
+    if model.is_moe:
+        if model.num_experts not in (32, 64, 128, 256):
+            raise ValueError(f"need 32, 64, 128 or 256 experts, got {model.num_experts}")
+        if model.moe_intermediate_size % TILE_K:
+            raise ValueError(f"expert width must be a multiple of {TILE_K}")
     if model.vocab_size % ROWS:
         raise ValueError(f"vocabulary size must be a multiple of {ROWS}")
 
@@ -1286,7 +1442,7 @@ def check_model(model: QwenConfig):
 # capture (GB200, ctx 1024) measured median rows at 0.32-0.36 us per stage for every weight-
 # streaming kind (0.18 us, the compute-warp time with resident data, predicted 7.0 ms for a
 # 10.6 ms step; 0.33 predicts 10.3 ms, and 2.87 / 4.93 ms for 8B / 14B against 2.95 / 4.76).
-ROW_COST = {QKV: 1.9, ATTN: 3.9, OPROJ: 1.7, GATEUP: 1.9, DOWN: 1.2, LMHEAD: 9.6}
+ROW_COST = {QKV: 1.9, ATTN: 3.9, OPROJ: 1.7, GATEUP: 1.9, DOWN: 1.2, LMHEAD: 9.6, ROUTER: 1.9}
 STAGE_COST = 0.33
 DEPENDENCY_LATENCY = 1.0
 
@@ -1301,6 +1457,7 @@ def weight_stages(op: QwenDecodeMegakernel) -> dict[int, int]:
         GATEUP: k,
         DOWN: op.down_k_tiles,
         LMHEAD: LM_TILES * k,
+        ROUTER: k,
     }
 
 
@@ -1333,6 +1490,9 @@ def instruction_rows(op: QwenDecodeMegakernel, ops: tuple[int, ...] = ALL_OPS) -
         for ks in range(O_SPLITS):
             for t in range(op.hidden // ROWS):
                 add(OPROJ, layer, t, ks)
+        if op.moe:
+            for t in range(op.experts // ROWS):
+                add(ROUTER, layer, t, 0)
         for t in range(2 * op.inter // ROWS):
             add(GATEUP, layer, t, 0)
         for ks in range(DOWN_SPLITS):
@@ -1376,9 +1536,13 @@ def row_groups(
         first = b * op.heads_per_split // op.per_row
         last = ((b + 1) * op.heads_per_split - 1) // op.per_row
         return [("attn", layer, g) for g in range(first, last + 1)], ("oproj", layer)
+    if kind == ROUTER:
+        return [("oproj", layer)], ("router", layer)
     if kind == GATEUP:
+        # MoE expert rows read h_mid (router row 0 publishes it) and the router's logits.
         per_split = 2 * op.inter // ROWS // DOWN_SPLITS
-        return [("oproj", layer)], ("gateup", layer, a // per_split)
+        producer = ("router", layer) if op.moe else ("oproj", layer)
+        return [producer], ("gateup", layer, a // per_split)
     if kind == DOWN:
         return [("gateup", layer, b)], ("down", layer)
     return [("down", layer - 1)], ("lmhead",)
@@ -1473,9 +1637,15 @@ class QwenMegakernel:
             -1, op.hidden
         )
         self.wo = weights.o_proj.reshape(-1, op.q_heads * HEAD_DIM).contiguous()
-        # Gate and up rows interleaved, so a 32-row tile holds 16 (gate, up) pairs.
-        self.wgu = torch.stack((weights.gate, weights.up), dim=2).reshape(-1, op.hidden)
-        self.wd = weights.down.reshape(-1, op.inter).contiguous()
+        # Gate and up rows interleaved, so a 32-row tile holds 16 (gate, up) pairs; MoE weights
+        # carry an expert axis after the layer axis.
+        self.wgu = torch.stack((weights.gate, weights.up), dim=-2).reshape(-1, op.hidden)
+        self.wd = weights.down.reshape(-1, weights.down.shape[-1]).contiguous()
+        if op.moe:
+            self.router = weights.router.reshape(-1, op.hidden).contiguous()
+        else:  # a stub tile for the unused router atom
+            shape = packed_mlp_shapes(op)[2]
+            self.router = torch.zeros(shape, device=device, dtype=torch.bfloat16)
         self.weights = weights
         self.rope = rope_table(max_len, device, weights.config.rope_theta)
         self.scratch = torch.zeros(op.scratch_layout.size, device=device, dtype=torch.int64)
@@ -1496,6 +1666,13 @@ class QwenMegakernel:
     def values(self, name: str) -> torch.Tensor:
         """A tagged buffer's fp32 values, ignoring the tags."""
         return self.tagged(name).view(torch.int32)[..., 0::2].view(torch.float32)
+
+    def routed_experts(self) -> torch.Tensor:
+        """MoE: the (layers, 1, experts_per_token) experts the last launch routed to, by rank:
+        the top-k of its router logits, ties to the lower index as in the kernel."""
+        logits = self.values("router_logits")
+        order = logits.sort(dim=-1, descending=True, stable=True).indices
+        return order[:, None, : self.op.top_k]
 
     def set_values(self, name: str, values: torch.Tensor):
         """Publish ``values`` to a tagged buffer for the next launch; tests feed single
@@ -1522,6 +1699,7 @@ class QwenMegakernel:
             self.wd,
             w.embed,
             w.lm_head,
+            self.router,
             k_cache.view(-1, HEAD_DIM),
             v_cache.view(-1, HEAD_DIM),
             self.scratch,

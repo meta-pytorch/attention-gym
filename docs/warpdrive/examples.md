@@ -491,10 +491,10 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 
 | Input | Contract |
 |---|---|
-| Model | Dense Qwen3: 0.6B, 1.7B, 8B, 14B and 32B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
+| Model | Qwen3 0.6B, 1.7B, 8B, 14B and 32B, and Qwen3-MoE 30B-A3B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
 | Caches | Contiguous bf16 `(layers, kv_heads, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
 | GPU | SM100 family; one CTA per SM, cooperative launch |
-| Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models |
+| Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models across GPUs (235B-A22B) |
 
 The table above shows 0.6B's counts. Larger models change only the counts: an attention row
 serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj split covers a
@@ -513,6 +513,17 @@ Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `bench_qwen_megake
 | 8B | 1024 / 8192 | 3858 / 4011 | 2949 / 3368 | 1.31x / 1.19x | 90% / 84% |
 | 14B | 1024 / 8192 | 5918 / 6106 | 4760 / 5634 | 1.24x / 1.08x | 101% / 88% |
 | 32B | 1024 / 8192 | 12849 / 13101 | 10650 / 12035 | 1.21x / 1.09x | 99% / 91% |
+| 30B-A3B (MoE) | 1024 / 8192 | 4650 / 4818 | 2202 / 2768 | 2.11x / 1.74x | 50% / 44% |
+
+A MoE model adds a router phase after o_proj (128 logits from 4 tiles) and routes the MLP:
+the gate/up and down GEMVs keep the dense layout over `experts_per_token x moe_intermediate_size`
+activation columns, with slot s's weight rows taken from its routed expert. Each consumer computes
+the top-k itself from the logits (k rounds of a warp max over packed (logit, index) keys; ties go
+to the lower expert), the load warp for expert addresses and one compute warp for the routing
+weights, which gate/up folds into its output. The torch.compile baseline gathers the top-k
+experts' weights for batched matmuls. Its floor counts only the routed experts' bytes, and it
+stays latency-bound like the small dense models: one more dependent phase per layer, routing on
+the critical path, and expert weights that cannot stream before the router finishes.
 
 The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
