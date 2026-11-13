@@ -31,6 +31,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel import (
     OP_NAMES,
     OPROJ,
     QKV,
+    REDUCE,
     ROUTER,
     QwenDecodeMegakernel,
     row_groups,
@@ -42,9 +43,12 @@ from attn_gym.warpdrive.trace_session import work_item_ranges, write_trace
 # The instruction kind each phase waits for; QKV and the LM head wait for the previous layer's
 # down.
 PRODUCER = {
-    QKV: DOWN, ATTN: QKV, OPROJ: ATTN, ROUTER: OPROJ, GATEUP: OPROJ, DOWN: GATEUP, LMHEAD: DOWN
+    QKV: DOWN, ATTN: QKV, OPROJ: ATTN, ROUTER: OPROJ, GATEUP: OPROJ, DOWN: GATEUP, LMHEAD: DOWN,
+    REDUCE: DOWN,
 }  # fmt: skip
 MOE_PRODUCER = {**PRODUCER, GATEUP: ROUTER}  # a MoE table's expert rows wait for the router
+# Batched MoE: REDUCE rows publish the residual QKV and the LM head read.
+MOE_BATCH_PRODUCER = {**MOE_PRODUCER, QKV: REDUCE, LMHEAD: REDUCE}
 
 
 @contextmanager
@@ -118,7 +122,11 @@ def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     phase's last row done. QKV counts from layer 1, whose producer is the previous layer's
     down; a MoE table's GATEUP counts from its ROUTER."""
     rows = table.tolist()
-    producers = MOE_PRODUCER if any(row[0] == ROUTER for row in rows) else PRODUCER
+    producers = PRODUCER
+    if any(row[0] == ROUTER for row in rows):
+        producers = MOE_PRODUCER
+    if any(row[0] == REDUCE for row in rows):
+        producers = MOE_BATCH_PRODUCER
     last: dict[tuple[int, int], int] = {}
     for row, item in work_item_ranges(ranges, "compute").items():
         key = tuple(rows[row][:2])  # (op, layer); the LM head's layer is the layer count
@@ -134,13 +142,16 @@ def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
 
 def input_waits(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     """Median us, by instruction kind, from a row's start to its inputs ready (the end of its
-    first ``poll``). Rows that reuse the previous row's GEMV input poll nothing and are not
-    counted."""
+    first ``poll``; a REDUCE row's ``reduce.poll``). Rows that reuse the previous row's GEMV input
+    poll nothing and are not counted."""
     rows = table.tolist()
     starts = {row: item.start_ns for row, item in work_item_ranges(ranges, "compute").items()}
     ready: dict[int, float] = {}
     for item in ranges:
-        if item.name == "poll" and item.payload is not None:
+        if item.payload is None:
+            continue
+        reduce_row = 0 <= item.payload < len(rows) and rows[item.payload][0] == REDUCE
+        if item.name == "poll" or (item.name == "reduce.poll" and reduce_row):
             ready[item.payload] = min(ready.get(item.payload, math.inf), item.end_ns)
     waits: dict[str, list[int]] = {}
     for row, end in ready.items():

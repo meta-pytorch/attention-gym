@@ -1,5 +1,7 @@
-"""Qwen3 decode megakernel, batched: several sequences per launch on the tcgen05 engine."""
+"""Qwen3 decode megakernel, batched: several sequences per launch on the tcgen05 engine, dense
+and MoE (per-expert token lists)."""
 
+import dataclasses
 import gc
 import math
 
@@ -23,6 +25,11 @@ MAX_LEN = 512
 SMALL = QwenConfig(
     hidden_size=1024, num_layers=2, num_q_heads=16, num_kv_heads=8, intermediate_size=3072,
     vocab_size=4096,
+)  # fmt: skip
+# Qwen3-30B-A3B's heads, expert count and top-k at a small size.
+SMALL_MOE = QwenConfig(
+    hidden_size=1024, num_layers=2, num_q_heads=32, num_kv_heads=4, intermediate_size=1024,
+    vocab_size=4096, num_experts=128, experts_per_token=8, moe_intermediate_size=256,
 )  # fmt: skip
 
 
@@ -169,12 +176,141 @@ def test_batch_checkpoint():
     check_batch(load_qwen3_weights(path), 16)
 
 
-def test_batch_needs_the_tcgen05_engine_and_a_dense_model():
+def check_moe_batch(weights, batch, error_factor=2.0, **config):
+    """Each sequence against its own reference step forced onto the experts the kernel routed it
+    to (near-tied router logits may pick either expert; see the MoE tests): logits within the
+    budget. Returns the per-sequence metrics."""
+    k, v, tokens, positions = batch_state(weights, batch)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine="tcgen05", batch=batch, **config)
+    logits = runner.decode(tokens, positions, k.clone(), v.clone())
+    experts = runner.routed_experts()  # (layers, batch, top_k)
+    assert experts.shape == (weights.config.num_layers, batch, weights.config.experts_per_token)
+    results = []
+    for b, pos in enumerate(positions):
+        forced = experts[:, b : b + 1]
+        caches = (k[b], v[b])
+        ref = decode_step_ref(
+            weights, tokens[b], pos, *[c.clone() for c in caches], experts=forced
+        )
+        high = decode_step_ref(
+            weights, tokens[b], pos, *[c.clone() for c in caches], dtype=torch.float32,
+            experts=forced,
+        )  # fmt: skip
+        results.append(compare_logits(logits[b], ref, high, error_factor=error_factor))
+    return results
+
+
+@pytest.mark.parametrize("batch", [5, 32])
+def test_moe_batch_random_weights(batch):
+    """5 tokens leave most experts without tokens (their rows skip); 32 reach most experts with
+    several tokens each."""
+    require_sm100()
+    for b, metrics in enumerate(check_moe_batch(random_weights(SMALL_MOE), batch)):
+        assert metrics["passed"], (b, metrics)
+
+
+def test_moe_batch_rows_do_not_depend_on_the_batch():
+    """A sequence's logits and K/V rows are bit-identical in batches of 8 and 3: the experts it
+    shares with other tokens compute its MMA column alone."""
+    require_sm100()
+    weights = random_weights(SMALL_MOE)
+    k, v, tokens, positions = batch_state(weights, 8)
+    outputs = []
+    for batch in (8, 3):
+        runner = mk.QwenMegakernel(weights, MAX_LEN, engine="tcgen05", batch=batch, splits=2)
+        caches = (k[:batch].clone(), v[:batch].clone())
+        outputs.append((runner.decode(tokens[:batch], positions[:batch], *caches), *caches))
+    (big, big_k, big_v), (small, small_k, small_v) = outputs
+    assert torch.equal(big[:3], small)
+    for b, pos in enumerate(positions[:3]):
+        assert torch.equal(big_k[b][:, :, : pos + 1], small_k[b][:, :, : pos + 1])
+        assert torch.equal(big_v[b][:, :, : pos + 1], small_v[b][:, :, : pos + 1])
+
+
+@pytest.mark.xdist_group("qwen-large-checkpoints")
+def test_moe_batch_checkpoint():
+    """Qwen3-30B-A3B, 8 sequences. Over 48 layers one step's bf16 error varies by sequence, so
+    the gate is test_decode_steps': max error within 3x eager's per sequence, RMS within 2x
+    summed over the batch. Skips unless the checkpoint is in the local HF cache."""
+    require_sm100()
+    hub = pytest.importorskip("huggingface_hub")
+    path = hub.try_to_load_from_cache("Qwen/Qwen3-30B-A3B", "config.json")
+    if not isinstance(path, str):
+        pytest.skip("Qwen3-30B-A3B is not in the local HF cache")
+    gc.collect()
+    torch.cuda.empty_cache()
+    results = check_moe_batch(load_qwen3_weights(path), 8, error_factor=3.0)
+    for b, metrics in enumerate(results):
+        assert metrics["argmax_ok"] and metrics["max_error_ratio"] <= 3.0, (b, metrics)
+    ours = sum(m["test_fp32_rms_err"] for m in results)
+    assert ours <= 2 * sum(m["bf16_fp32_rms_err"] for m in results), results
+
+
+def test_batch_needs_the_tcgen05_engine_and_one_router_tile():
     with pytest.raises(ValueError, match="batch must be in"):
         mk.QwenDecodeMegakernel(batch=2)
-    moe = QwenConfig(
-        hidden_size=1024, num_layers=2, num_q_heads=32, num_kv_heads=4, intermediate_size=1024,
-        vocab_size=4096, num_experts=128, experts_per_token=8, moe_intermediate_size=256,
-    )  # fmt: skip
-    with pytest.raises(ValueError, match="dense models only"):
+    moe = dataclasses.replace(SMALL_MOE, num_experts=256)  # two router tiles
+    with pytest.raises(ValueError, match="batched MoE needs 128 experts"):
         mk.QwenDecodeMegakernelTc(model=moe, batch=2)
+
+
+def test_moe_batch_input_rows_cover_an_expert():
+    """With one expert per token the expert width (2048) exceeds the hidden size and a down
+    split: the input rows must still hold a down row's gathered activation slot."""
+    config = dataclasses.replace(SMALL_MOE, experts_per_token=1, moe_intermediate_size=2048)
+    op = mk.QwenDecodeMegakernelTc(model=config, batch=2)
+    assert op.x_width >= config.moe_intermediate_size
+    last = op.x_index(op.batch - 1, config.moe_intermediate_size - 1)
+    assert last < op.x_stride
+
+
+def test_moe_batch_phase_spans_count_from_reduce():
+    """With REDUCE rows the next layer's QKV counts from them, not from down."""
+    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.profiler import Range
+
+    rows = [[mk.DOWN, 0, 0, 0], [mk.REDUCE, 0, 0, 0], [mk.QKV, 1, 0, 0]]
+    table = torch.tensor([words + [i] for i, words in enumerate(rows)])
+    events = [Range("compute", d - 10, d, (0,), payload=i) for i, d in enumerate([100, 150, 200])]
+    assert mk_trace.phase_spans(events, table)["QKV"] == 0.05
+
+
+def test_moe_batch_repeated_launches():
+    """One runner, three launches with new tokens (atomic schedule): the routing, and with it
+    which experts' rows are active or skip, changes every launch; each launch's expert lists,
+    counts and epochs must be its own."""
+    require_sm100()
+    weights = random_weights(SMALL_MOE)
+    k, v, tokens, positions = batch_state(weights, 4)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine="tcgen05", batch=4, schedule="atomic")
+    active = []
+    for step in range(3):
+        steps = [pos + step for pos in positions]
+        logits = runner.decode(tokens, steps, k, v)
+        experts = runner.routed_experts()
+        active.append(set(experts[0].reshape(-1).tolist()))
+        for b, pos in enumerate(steps):
+            forced = experts[:, b : b + 1]
+            ref = decode_step_ref(
+                weights, tokens[b], pos, k[b].clone(), v[b].clone(), experts=forced
+            )
+            high = decode_step_ref(
+                weights, tokens[b], pos, k[b].clone(), v[b].clone(), dtype=torch.float32,
+                experts=forced,
+            )  # fmt: skip
+            metrics = compare_logits(logits[b], ref, high)
+            assert metrics["passed"], (step, b, metrics)
+        tokens = (tokens * 7 + 13 + step) % weights.config.vocab_size  # new routing next launch
+    assert active[0] != active[1] != active[2]  # rows switched between active and empty
+
+
+def test_input_waits_count_reduce_rows():
+    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.profiler import Range
+
+    table = torch.tensor([[mk.REDUCE, 0, 0, 0, 0]])
+    events = [
+        Range("compute", 100, 300, (0,), payload=0),
+        Range("reduce.poll", 120, 160, (0,), payload=0),
+    ]
+    assert mk_trace.input_waits(events, table) == {"REDUCE": 0.06}

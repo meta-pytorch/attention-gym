@@ -60,6 +60,8 @@ def _label(words, deps, table_row: int, rows: int) -> str:
             what = f"ROUTER layer {layer} · experts {a * rows}-{a * rows + rows - 1}"
         case mk.GATEUP:
             what = f"GATEUP layer {layer} · tile {a}"
+        case mk.REDUCE:
+            what = f"REDUCE layer {layer} · columns {a * rows}-{a * rows + rows - 1}"
         case _:
             what = f"LMHEAD · row tiles {a}-{a + b - 1}"
     waits = ", ".join(" ".join(map(str, d)) for d in deps) or "nothing"

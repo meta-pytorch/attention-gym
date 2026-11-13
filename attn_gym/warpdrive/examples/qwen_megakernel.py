@@ -116,15 +116,16 @@ SMEM_HEADROOM = 1024
 FETCH_ELEMENTS = 8  # residual elements per thread fetched in one poll (bounds registers)
 REDUCE_TOKENS = 4  # batched residual reduce: tokens per poll
 POLL_CHUNKS = 4  # batched prologue: 8-column chunks per poll
+EXPERT_GROUPS = 4  # batched MoE: rows per expert, each a quarter of its gate/up or down tiles
 COMPUTE_WARPS = 8
 ROWS_PER_WARP = ROWS // COMPUTE_WARPS
 COMPUTE_THREADS = 32 * COMPUTE_WARPS
 
-QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER = range(7)
-ALL_OPS = (QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER)
+QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER, REDUCE = range(8)
+ALL_OPS = (QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER, REDUCE)
 EVICT_FIRST = 0x12F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST)
 WORDS = 5  # op, layer, a, b, table row
-OP_NAMES = ("QKV", "ATTN", "OPROJ", "GATEUP", "DOWN", "LMHEAD", "ROUTER")
+OP_NAMES = ("QKV", "ATTN", "OPROJ", "GATEUP", "DOWN", "LMHEAD", "ROUTER", "REDUCE")
 # Globaltimer records per role and CTA: at least TRACE_EVENTS (0.6B: a CTA runs ~140 rows),
 # else TRACE_EVENTS_PER_ROW per row of the CTA's share (a row records its work item and regions).
 TRACE_EVENTS, TRACE_EVENTS_PER_ROW = 2048, 8
@@ -172,6 +173,17 @@ class ScratchLayout:
             "d_part": (batch, layers, DOWN_SPLITS, hidden),
             "router_logits": (batch, layers, model.num_experts or ROWS),  # MoE only
         }
+        # Batched MoE: the normalized MLP input per token, each expert's token list (count;
+        # entries t * top_k + rank; routing weights) and the per-(token, rank) down outputs.
+        moe_batch = model.is_moe and batch > 1
+        experts, top_k = model.num_experts or 1, model.experts_per_token or 1
+        self.shapes.update({
+            "x_mid": (batch, layers, hidden) if moe_batch else (1,),
+            "e_count": (layers, experts) if moe_batch else (1,),
+            "e_entry": (layers, experts, batch) if moe_batch else (1,),
+            "e_weight": (layers, experts, batch) if moe_batch else (1,),
+            "e_part": (batch, layers, top_k, hidden) if moe_batch else (1,),
+        })  # fmt: skip
         self.offsets, offset = {}, 0
         for name, shape in self.shapes.items():
             self.offsets[name] = offset
@@ -221,6 +233,12 @@ class MegakernelParams:
     act: cute.Tensor
     d_part: cute.Tensor
     router_logits: cute.Tensor
+    x_mid: cute.Tensor  # batched MoE (ScratchLayout)
+    e_count: cute.Tensor
+    e_entry: cute.Tensor
+    e_weight: cute.Tensor
+    e_part: cute.Tensor
+    exp: cute.Tensor  # batched MoE SMEM: the routing of a layer, then an expert row's tokens
     logits: cute.Tensor  # (vocab,) fp32
     state: cute.Tensor  # int32 [epoch of the previous launch, CTAs finished]
     step: cute.Tensor  # int32 [token, pos]
@@ -494,9 +512,13 @@ class QwenDecodeMegakernel(WarpSpecialized):
             raise ValueError(
                 f"batch must be in [1, {self.max_batch}] for this engine, got {batch}"
             )
-        if batch > 1 and model.is_moe:
-            raise ValueError("batched decoding supports dense models only")
         self.batch = batch
+        # Batched MoE: rows per (layer, expert) over the tokens routed there (``route_batch``).
+        self.moe_batched = model.is_moe and batch > 1
+        if self.moe_batched and model.num_experts != self.rows:
+            raise ValueError(f"batched MoE needs {self.rows} experts (one router tile)")
+        if self.moe_batched and (2 * model.moe_intermediate_size // self.rows) % EXPERT_GROUPS:
+            raise ValueError(f"batched MoE needs {EXPERT_GROUPS} groups of gate/up tiles")
         # GEMV input rows stored in SMEM, S = batch: row t, column k at
         # (k // 8) * S * 8 + t * 8 + k % 8. An MMA's B rows past the batch read the next column
         # group (their D columns are discarded); see TcGen05Gemv.
@@ -521,6 +543,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.per_thread = self.hidden // COMPUTE_THREADS
         # The longest GEMV input: the hidden vector, a down split or an o_proj split.
         self.x_width = max(self.hidden, self.inter // DOWN_SPLITS, self.heads_per_split * HEAD_DIM)
+        if self.moe_batched:  # an expert down row's input is one expert's activation slot
+            self.x_width = max(self.x_width, self.expert_inter)
         if schedule not in ("static", "atomic"):
             raise ValueError(f"schedule must be 'static' or 'atomic', got {schedule!r}")
         # The GEMV (ROWS_PER_WARP rows per warp), RMSNorm (per_thread elements per thread) and
@@ -554,6 +578,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.smem_plan.buffer("QKVS", Float32, align=16)
         self.smem_plan.buffer("MLS", Float32, align=16)
         self.smem_plan.buffer("ROUTE", Float32, align=16)
+        if self.moe_batched:
+            self.smem_plan.buffer("EXP", Float32, align=16)
         # Compute reads stages with generic loads before TMA refills them. For a Tma-filled ring
         # released by Warps the layer emits the fence.proxy.async on release.
         self.w = Ring(stages, Tma(STAGE_BYTES), self.weight_consumers(), buffer={"W": w, "KV": kv})
@@ -577,8 +603,16 @@ class QwenDecodeMegakernel(WarpSpecialized):
             + self.heads_per_split * self.splits * 2  # MLS
             + self.route_floats  # ROUTE
         )
+        if self.moe_batched:
+            floats += self.exp_floats
         x_bytes = 2 * self.x_buffers * self.x_stride
         return x_bytes + 4 * floats + SMEM_HEADROOM
+
+    @property
+    def exp_floats(self) -> int:
+        """EXP: each token's experts and weights by rank, then an expert row's entries, weights
+        and token count."""
+        return 2 * self.batch * self.top_k + 2 * self.batch + 1
 
     @property
     def x_stride(self) -> int:
@@ -632,10 +666,17 @@ class QwenDecodeMegakernel(WarpSpecialized):
         routed_layer = Int32(-1)
         while work.valid:
             op, layer, a, b, _row = work.item
-            if cutlass.const_expr(self.moe):
+            if cutlass.const_expr(self.moe and not self.moe_batched):
                 if ((op == GATEUP) | (op == DOWN)) & (layer != routed_layer):
                     self.route(p, layer, lane, epoch, chosen)
                     routed_layer = layer
+            if cutlass.const_expr(self.moe_batched):
+                if (op == GATEUP) | (op == DOWN):
+                    if self.expert_count(p, layer, a, epoch) > 0:
+                        if op == GATEUP:
+                            w = self.load_expert(p, w, GATEUP, layer, a, b)
+                        else:
+                            w = self.load_expert(p, w, DOWN, layer, a, b)
             if op == ATTN:
                 t, split = self.attn_token(b)
                 blk0, blk1 = self.split_blocks(p.step[t, 1], split)
@@ -651,6 +692,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 tile = layer * (self.hidden // self.rows) + a
                 k_tiles = self.oproj_k_tiles
                 w = self.load_tiles(w, tma_o, g_o, tile, b * k_tiles, k_tiles, "W")
+            elif (op == REDUCE) | (((op == GATEUP) | (op == DOWN)) & self.moe_batched):
+                pass  # no weights, or loaded above
             elif op == GATEUP:
                 tile = layer * (2 * self.inter // self.rows) + a
                 if cutlass.const_expr(self.moe):
@@ -683,6 +726,31 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return w, work
 
     @cute.jit
+    def load_expert(self, p: MegakernelParams, w, kind: cutlass.Constexpr, layer, expert, group):
+        """Batched MoE: all of one expert's gate/up or down (``kind``) tiles."""
+        atoms, tiles = (p.tma[2], p.gmem[2]) if kind == GATEUP else (p.tma[3], p.gmem[3])
+        k_tiles, row_tiles = self.expert_tiles(kind)
+        first = ((layer * self.experts + expert) * EXPERT_GROUPS + group) * row_tiles
+        for rt in cutlass.range(first, first + row_tiles, unroll=1):
+            w = self.load_tiles(w, atoms, tiles, rt, 0, k_tiles, "W")
+        return w
+
+    def expert_tiles(self, op):
+        """Batched MoE: (k_tiles, row_tiles) of an expert row, group b of EXPERT_GROUPS: a share of
+        gate/up's 2 x expert width rows over the hidden columns, or of down's hidden rows over
+        the expert width."""
+        if op == GATEUP:
+            return self.hidden_k_tiles, 2 * self.expert_inter // self.rows // EXPERT_GROUPS
+        return self.expert_inter // self.tile_k, self.hidden // self.rows // EXPERT_GROUPS
+
+    @cute.jit
+    def expert_count(self, p: MegakernelParams, layer, expert, epoch):
+        """Batched MoE: how many tokens the router row sent to ``expert`` in ``layer``."""
+        count = cute.make_rmem_tensor((1,), Float32)
+        fetch([(p.e_count, layer * self.experts + expert, 1)], count, epoch)
+        return Int32(count[0])
+
+    @cute.jit
     def load_tiles(
         self, w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr
     ):
@@ -700,7 +768,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return w
 
     @cute.jit
-    def route(self, p: MegakernelParams, layer, lane, epoch, chosen, weights=None):
+    def route(self, p: MegakernelParams, layer, lane, epoch, chosen, weights=None, t=0):
         """One warp's top-k routing of ``layer``, uniform across the warp: ``chosen`` (top_k Int32)
         gets the experts by rank, largest router logit first, ties to the lower expert index
         (the reference's stable sort). With ``weights`` (top_k floats), lane 0 also writes their
@@ -711,7 +779,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         orders like (logit, -index): k rounds of a 5-shuffle warp max pick the top k."""
         n = self.experts // 32  # lane l holds experts n*l .. n*l + n - 1
         logits = cute.make_rmem_tensor((n,), Float32)
-        fetch([(p.router_logits, layer * self.experts + n * lane, n)], logits, epoch)
+        base = (t * self.layers + layer) * self.experts
+        fetch([(p.router_logits, base + n * lane, n)], logits, epoch)
         keys = cute.make_rmem_tensor((n,), Int32)
         for i in cutlass.range_constexpr(n):
             bits = (Int32(bitcast(logits[i].ir_value(), T.i32())) >> 16) & 0xFFFF
@@ -776,6 +845,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         mid = ROUTER if self.moe else GATEUP  # the op whose row 0 publishes h_mid
         publishes = (a == 0) & ((op == mid) | ((op == QKV) & (layer == 0)))
         new = (key != xkey) | publishes
+        if cutlass.const_expr(self.moe_batched):
+            new = new | (op == GATEUP) | (op == DOWN)  # each expert gathers its own tokens
         if new:
             xkey = key
             xbuf = 1 - xbuf
@@ -800,7 +871,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     p, chans[0], layer, a, split, t, pos, epoch, tid, warp, lane, row
                 )
                 chans = (w, *chans[1:])
-            else:
+            elif op == REDUCE:
+                self.reduce_slots(p, layer, a, epoch, tid, row)
+            elif self.row_active(p, op, layer, a, epoch):
                 new, xkey, xbuf = self.next_input(op, layer, a, b, xkey, xbuf)
                 if new:
                     ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
@@ -813,11 +886,16 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     self.csync.sync()
                 chans = self.engine.input_ready(chans)
                 chans = self.gemv(p, chans, env, op, layer, a, b, epoch, xbuf, warp, lane, row)
+                if cutlass.const_expr(self.moe_batched):
+                    if op == ROUTER:
+                        self.route_batch(p, layer, epoch, tid, warp, lane)
                 # The last split publishes the residual its consumers read: down's always, o_proj's
                 # (h_mid) when batched, so a batch's gate/up rows read one word per element.
                 last = b == DOWN_SPLITS - 1
                 reduces = op == DOWN
-                if cutlass.const_expr(self.batch > 1):
+                if cutlass.const_expr(self.moe_batched):
+                    reduces = op == OPROJ  # b is the expert's tile group; REDUCE rows sum down
+                elif cutlass.const_expr(self.batch > 1):
                     reduces = reduces | (op == OPROJ)
                 if cutlass.const_expr(self.batch == 1):
                     if reduces & last & (tid < self.rows):
@@ -846,6 +924,68 @@ class QwenDecodeMegakernel(WarpSpecialized):
         """The KV block count of positions ``[0, pos)`` and the most blocks one split reads."""
         blocks = (pos + BLOCK - 1) // BLOCK
         return blocks, (blocks + self.splits - 1) // self.splits
+
+    @cute.jit
+    def row_active(self, p: MegakernelParams, op, layer, a, epoch):
+        """False only for a batched MoE expert row with no tokens routed to its expert (every
+        role skips it alike)."""
+        active = True
+        if cutlass.const_expr(self.moe_batched):
+            if (op == GATEUP) | (op == DOWN):
+                active = self.expert_count(p, layer, a, epoch) > 0
+        return active
+
+    @cute.jit
+    def route_batch(self, p: MegakernelParams, layer, epoch, tid, warp, lane):
+        """Batched MoE, in the router row after it published every token's logits: each warp
+        routes whole tokens (``route``) into EXP, then thread e lists expert e's tokens in token
+        order (count, entries t * top_k + rank, routing weights) for the expert rows."""
+        k, batch = self.top_k, self.batch
+        for t in cutlass.range(warp, batch, COMPUTE_WARPS, unroll=1):
+            chosen = cute.make_rmem_tensor((k,), Int32)
+            weights = cute.make_rmem_tensor((k,), Float32)
+            self.route(p, layer, lane, epoch, chosen, weights, t)
+            if lane == 0:
+                for r in cutlass.range_constexpr(k):
+                    p.exp[t * k + r] = Float32(chosen[r])
+                    p.exp[batch * k + t * k + r] = weights[r]
+        self.csync.sync()
+        if tid < self.experts:
+            count = Int32(0)
+            base = (layer * self.experts + tid) * batch
+            for t in cutlass.range(batch, unroll=1):
+                for r in cutlass.range_constexpr(k):
+                    if Int32(p.exp[t * k + r]) == tid:
+                        publish(p.e_entry, base + count, Float32(t * k + r), epoch)
+                        publish(p.e_weight, base + count, p.exp[batch * k + t * k + r], epoch)
+                        count = count + 1
+            publish(p.e_count, layer * self.experts + tid, Float32(count), epoch)
+        self.csync.sync()  # EXP is reused by the next row
+
+    @cute.jit
+    def reduce_slots(self, p: MegakernelParams, layer, a, epoch, tid, row):
+        """Batched MoE: next layer's residual columns a * rows .. of every token,
+        bf16(h_mid + bf16(sum of its top_k experts' down outputs, in rank order)); thread tid
+        takes column tid % rows of tokens tid // rows, + 2, ..."""
+        col = a * self.rows + tid % self.rows
+        groups = COMPUTE_THREADS // self.rows
+        k = self.top_k
+        for t in cutlass.range(tid // self.rows, self.batch, groups, unroll=1):
+            vals = cute.make_rmem_tensor((k + 1,), Float32)
+            segments = [(p.h_mid, self.hidden_index(t, layer, col), 1)]
+            for r in cutlass.range_constexpr(k):
+                segments.append((p.e_part, self.slot_index(t, layer, r, col), 1))
+            with self.trace_region("reduce.poll", payload=row):
+                fetch(segments, vals, epoch)
+            total = vals[1]
+            for r in cutlass.range_constexpr(2, k + 1):
+                total = total + vals[r]
+            h = bf16_round(vals[0] + bf16_round(total))
+            publish(p.h_in, self.hidden_index(t, layer + 1, col), h, epoch)
+
+    def slot_index(self, t, layer, rank, i):
+        """e_part: token t's rank-th expert's down output."""
+        return ((t * self.layers + layer) * self.top_k + rank) * self.hidden + i
 
     @cute.jit
     def attn_token(self, b):
@@ -935,6 +1075,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if op == OPROJ:
             for t in cutlass.range(warp, self.batch, COMPUTE_WARPS, unroll=1):
                 self.combine_attention_by_warp(p, layer, ks, t, epoch, xs, lane, row)
+        elif ((op == GATEUP) | (op == DOWN)) & self.moe_batched:
+            self.gather_expert_inputs(p, op, layer, a, epoch, xs, tid, warp, lane, row)
         elif op == DOWN:
             span = self.inter // DOWN_SPLITS
             for t in cutlass.range(warp, self.batch, COMPUTE_WARPS, unroll=1):
@@ -944,7 +1086,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             norm_weight = p.final_norm
             if op == QKV:
                 norm_weight = p.ln_in[layer, None]
-            elif op == GATEUP:
+            elif (op == GATEUP) | (op == ROUTER):
                 norm_weight = p.ln_post[layer, None]
             chunks = self.hidden // 256
             for t in cutlass.range(warp, self.batch, COMPUTE_WARPS, unroll=1):
@@ -960,7 +1102,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 else:
                     # QKV past layer 0 and the LM head read h_in; gate/up reads h_mid, which
                     # o_proj's last split publishes (``reduce_residual``).
-                    buf = p.h_mid if op == GATEUP else p.h_in
+                    buf = p.h_mid if (op == GATEUP) | (op == ROUTER) else p.h_in
                     base = self.hidden_index(t, layer, 0)
                     self.poll_chunks(buf, base, chunks, xs, t, lane, epoch, row)
                 ss = Float32(0.0)
@@ -977,6 +1119,41 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     for e in cutlass.range_constexpr(8):
                         x[e] = bf16_round(wv[e] * bf16_round(x[e] * rinv))
                     store_vec(xs, self.x_index(t, k0), x, 8)
+                    if cutlass.const_expr(self.moe_batched):
+                        if op == ROUTER:  # the expert rows gather it (gather_expert_inputs)
+                            for e in cutlass.range_constexpr(8):
+                                index = (t * self.layers + layer) * self.hidden + k0 + e
+                                publish(p.x_mid, index, x[e], epoch)
+
+    @cute.jit
+    def gather_expert_inputs(
+        self, p: MegakernelParams, op, layer, e, epoch, xs, tid, warp, lane, row
+    ):
+        """Batched MoE expert row: its token list into EXP, then input row i = entry i's token's
+        normalized MLP input (gate/up) or that token's rank's activation slot (down). Rows past
+        the count are stale; their MMA columns are discarded."""
+        k, batch = self.top_k, self.batch
+        entries = 2 * batch * k
+        count = self.expert_count(p, layer, e, epoch)
+        base = (layer * self.experts + e) * batch
+        self.csync.sync()  # the previous expert row's epilogue has read its list
+        for i in cutlass.range(tid, count, COMPUTE_THREADS, unroll=1):
+            vals = cute.make_rmem_tensor((2,), Float32)
+            fetch([(p.e_entry, base + i, 1), (p.e_weight, base + i, 1)], vals, epoch)
+            p.exp[entries + i] = vals[0]
+            p.exp[entries + batch + i] = vals[1]
+        if tid == 0:
+            p.exp[entries + 2 * batch] = Float32(count)
+        self.csync.sync()
+        for i in cutlass.range(warp, count, COMPUTE_WARPS, unroll=1):
+            entry = Int32(p.exp[entries + i])
+            t = entry // k
+            if op == GATEUP:
+                src = (t * self.layers + layer) * self.hidden
+                self.poll_chunks(p.x_mid, src, self.hidden // 256, xs, i, lane, epoch, row)
+            else:
+                src = self.act_index(t, layer, (entry - t * k) * self.expert_inter)
+                self.poll_chunks(p.act, src, self.expert_inter // 256, xs, i, lane, epoch, row)
 
     @cute.jit
     def poll_chunks(self, buf, base, chunks: cutlass.Constexpr, xs, t, lane, epoch, row):
@@ -1226,7 +1403,13 @@ class QwenDecodeMegakernel(WarpSpecialized):
             k_tiles = self.oproj_k_tiles
         if op == DOWN:
             k_tiles = self.down_k_tiles
-        return k_tiles, cutlass.select_(op == LMHEAD, b, 1)
+        row_tiles = cutlass.select_(op == LMHEAD, b, 1)
+        if cutlass.const_expr(self.moe_batched):
+            for kind in (GATEUP, DOWN):
+                expert_k, expert_rows = self.expert_tiles(kind)
+                k_tiles = cutlass.select_(op == kind, expert_k, k_tiles)
+                row_tiles = cutlass.select_(op == kind, expert_rows, row_tiles)
+        return k_tiles, row_tiles
 
     @cute.jit
     def epilogue(
@@ -1234,8 +1417,18 @@ class QwenDecodeMegakernel(WarpSpecialized):
     ):
         """Publish one tile's results: ``vals[t]`` is token t's dot product of tile row ``row``,
         valid on the lanes the engine says own it."""
+        if cutlass.const_expr(self.moe_batched):
+            if (op == GATEUP) | (op == DOWN):
+                # Row b holds group b of the expert's tiles.
+                per_group = self.expert_tiles(GATEUP)[1]
+                per_group = cutlass.select_(op == DOWN, self.expert_tiles(DOWN)[1], per_group)
+                first = b * per_group
+                self.expert_epilogue(p, op, layer, first + tile, vals, row, epoch, warp, lane)
         for t in cutlass.range_constexpr(self.batch):
             v = vals[t]
+            if cutlass.const_expr(self.moe_batched):
+                if (op == GATEUP) | (op == DOWN):
+                    op = -1  # published by expert_epilogue
             if op == GATEUP:
                 # Tile rows alternate gate, up: the owner of gate row 2j gets up row 2j + 1's.
                 up = self.engine.pair_value(v)
@@ -1258,10 +1451,36 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 elif op == DOWN:
                     publish(p.d_part, self.part_index(t, layer, b, a * self.rows + row), v, epoch)
                 elif op == ROUTER:
-                    index = layer * self.experts + a * self.rows + row
+                    index = (t * self.layers + layer) * self.experts + a * self.rows + row
                     publish(p.router_logits, index, bf16_round(v), epoch)
-                else:
+                elif op == LMHEAD:
                     p.logits[t, (a + tile) * self.rows + row] = bf16_round(v)
+
+    @cute.jit
+    def expert_epilogue(self, p: MegakernelParams, op, layer, tile, vals, row, epoch, warp, lane):
+        """Batched MoE expert row: MMA column i is entry i of the expert's list (EXP): token
+        t, rank r. Gate/up publishes t's activation slot r times its routing weight, down t's
+        rank-r output."""
+        k, batch = self.top_k, self.batch
+        entries = 2 * batch * k
+        count = Int32(p.exp[entries + 2 * batch])
+        for i in cutlass.range_constexpr(batch):
+            v = vals[i]
+            entry = Int32(p.exp[entries + i])
+            t = entry // k
+            rank = entry - t * k
+            if op == GATEUP:
+                up = self.engine.pair_value(v)
+                if self.engine.owns_pair(warp, lane) & (i < count):
+                    g = bf16_round(v)
+                    silu = bf16_round(g / (1.0 + cute.math.exp2(-g * LOG2E)))
+                    out = bf16_round(silu * bf16_round(up))
+                    out = bf16_round(out * p.exp[entries + batch + i])
+                    col = rank * self.expert_inter + tile * (self.rows // 2) + row // 2
+                    publish(p.act, self.act_index(t, layer, col), out, epoch)
+            elif self.engine.owns_row(warp, lane) & (i < count):
+                index = self.slot_index(t, layer, rank, tile * self.rows + row)
+                publish(p.e_part, index, v, epoch)
 
     @cute.jit
     def attention(
@@ -1546,6 +1765,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             "MLS": cute.make_layout((self.heads_per_split * 2 * self.splits,)),
             "ROUTE": cute.make_layout((2, self.route_width), stride=(self.route_width, 1)),
         }
+        if cutlass.const_expr(self.moe_batched):
+            layouts["EXP"] = cute.make_layout((self.exp_floats,))
         self.begin_roles(work=bound, layouts=layouts)
         # Materialize the argument tensors here, in converged code: iterators and layouts are
         # created lazily at first use, and a first use inside one role's dispatch branch would
@@ -1564,6 +1785,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             qkvs=self.buffer("QKVS"),
             mls=self.buffer("MLS"),
             route=self.buffer("ROUTE"),
+            exp=self.buffer("EXP") if self.moe_batched else self.buffer("ROUTE"),
             **tagged_views(scratch, self.scratch_layout),
             **tensors,
         )
@@ -1830,6 +2052,7 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
         b_layout = cute.make_layout(
             (((8, self.tc_n // 8), (8, 2)), 1, 1), stride=(((8, 64), (1, 8 * s_rows)), 0, 0)
         )
+        epoch = p.state[0] + 1  # batched MoE: expert rows with no tokens are skipped
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
@@ -1840,7 +2063,9 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
                 for _ in cutlass.range(2 * (blk1 - blk0), unroll=1):
                     with w.consume():
                         pass
-            else:
+            elif op == REDUCE:
+                pass
+            elif self.row_active(p, op, layer, a, epoch):
                 _new, xkey, xbuf = self.next_input(op, layer, a, b, xkey, xbuf)
                 k_tiles, row_tiles = self.gemv_tiles(op, b)
                 with xin.consume():
@@ -2021,7 +2246,9 @@ def check_model(model: QwenConfig):
 # capture (GB200, ctx 1024) measured median rows at 0.32-0.36 us per stage for every weight-
 # streaming kind (0.18 us, the compute-warp time with resident data, predicted 7.0 ms for a
 # 10.6 ms step; 0.33 predicts 10.3 ms, and 2.87 / 4.93 ms for 8B / 14B against 2.95 / 4.76).
-ROW_COST = {QKV: 1.9, ATTN: 3.9, OPROJ: 1.7, GATEUP: 1.9, DOWN: 1.2, LMHEAD: 9.6, ROUTER: 1.9}
+ROW_COST = {
+    QKV: 1.9, ATTN: 3.9, OPROJ: 1.7, GATEUP: 1.9, DOWN: 1.2, LMHEAD: 9.6, ROUTER: 1.9, REDUCE: 1.2
+}  # fmt: skip
 STAGE_COST = 0.33
 DEPENDENCY_LATENCY = 1.0
 
@@ -2037,6 +2264,12 @@ def weight_stages(op: QwenDecodeMegakernel) -> dict[int, int]:
         DOWN: op.down_k_tiles,
         LMHEAD: LM_TILES * k,
         ROUTER: k,
+        REDUCE: 0,
+        **(
+            {kind: math.prod(op.expert_tiles(kind)) for kind in (GATEUP, DOWN)}
+            if op.moe_batched
+            else {}
+        ),
     }
 
 
@@ -2073,6 +2306,16 @@ def instruction_rows(op: QwenDecodeMegakernel, ops: tuple[int, ...] = ALL_OPS) -
         if op.moe:
             for t in range(op.experts // op.rows):
                 add(ROUTER, layer, t, 0)
+        if op.moe_batched:  # EXPERT_GROUPS gate/up and down rows per expert, then the reduce
+            for expert in range(op.experts):
+                for group in range(EXPERT_GROUPS):
+                    add(GATEUP, layer, expert, group)
+            for expert in range(op.experts):
+                for group in range(EXPERT_GROUPS):
+                    add(DOWN, layer, expert, group)
+            for t in range(op.hidden // op.rows):
+                add(REDUCE, layer, t, 0)
+            continue
         for t in range(2 * op.inter // op.rows):
             add(GATEUP, layer, t, 0)
         for ks in range(DOWN_SPLITS):
@@ -2103,13 +2346,14 @@ def row_groups(
 ) -> tuple[list[tuple], tuple]:
     """The producer groups instruction ``(kind, layer, a, b)`` waits for, and the group its
     completion counts toward. A group is done when all of its rows are."""
+    residual = "reduce" if op.moe_batched else "down"  # who publishes h_in[layer + 1]
     if kind == QKV:
         head = a * op.rows // HEAD_DIM
         if head < op.q_heads:
             kvh = head // op.group_size
         else:
             kvh = (head - op.q_heads) % op.kv_heads
-        return [("down", layer - 1)] if layer else [], ("qkv", layer, kvh)
+        return [(residual, layer - 1)] if layer else [], ("qkv", layer, kvh)
     if kind == ATTN:
         return [("qkv", layer, op.kv_head(a))], ("attn", layer, a)
     if kind == OPROJ:
@@ -2118,6 +2362,9 @@ def row_groups(
         return [("attn", layer, g) for g in range(first, last + 1)], ("oproj", layer)
     if kind == ROUTER:
         return [("oproj", layer)], ("router", layer)
+    if op.moe_batched and kind in (GATEUP, DOWN, REDUCE):
+        producer = {GATEUP: "router", DOWN: "gateup", REDUCE: "down"}[kind]
+        return [(producer, layer)], (OP_NAMES[kind].lower(), layer)
     if kind == GATEUP:
         # MoE expert rows read h_mid (router row 0 publishes it) and the router's logits.
         per_split = 2 * op.inter // op.rows // DOWN_SPLITS
@@ -2125,7 +2372,7 @@ def row_groups(
         return [producer], ("gateup", layer, a // per_split)
     if kind == DOWN:
         return [("gateup", layer, b)], ("down", layer)
-    return [("down", layer - 1)], ("lmhead",)
+    return [(residual, layer - 1)], ("lmhead",)
 
 
 class RowSpan(NamedTuple):
@@ -2261,11 +2508,11 @@ class QwenMegakernel:
         return self.tagged(name).view(torch.int32)[..., 0::2].view(torch.float32)
 
     def routed_experts(self) -> torch.Tensor:
-        """MoE: the (layers, 1, experts_per_token) experts the last launch routed to, by rank:
+        """MoE: the (layers, batch, experts_per_token) experts the last launch routed to, by rank:
         the top-k of its router logits, ties to the lower index as in the kernel."""
-        logits = self.values("router_logits")
-        order = logits.sort(dim=-1, descending=True, stable=True).indices
-        return order[:, None, : self.op.top_k]
+        logits = self.values("router_logits")  # (layers, experts), batched (batch, layers, ...)
+        order = logits.sort(dim=-1, descending=True, stable=True).indices[..., : self.op.top_k]
+        return order[:, None] if self.batch == 1 else order.transpose(0, 1)
 
     def set_values(self, name: str, values: torch.Tensor):
         """Publish ``values`` to a tagged buffer for the next launch; tests feed single
