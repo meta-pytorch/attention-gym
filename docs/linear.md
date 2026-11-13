@@ -879,6 +879,21 @@ parallel, and the piece state chain composes each subsequence's pieces in order 
 subsequence at four heads from about 550 µs to about 85 µs (CUDA-graph time). GDN overlaps the
 forward and reverse passes behind `state_grad_summaries` on a side stream.
 
+*Staged passes over the pieces.* When the summaries split, the local pass reuses their pieces
+(NOTE [Staged piece plans] in `warpdrive/drivers/staged.py`). `prepare` summarizes every piece
+of every sequence once and composes them, keeping each piece's entry map; then
+`state_summaries` only gathers the composed maps, and `run` turns the entry state into every
+piece's entry state with one 3xTF32 product and runs the prefill over all pieces at once.
+`prepare_backward` does the same with the reverse maps, the state chain from the entry state
+and the checkpoint recompute, so `run` applies the exit cotangent and runs the backward over the
+pieces. The maps are built once from the inputs at `prepare` (`prepare_backward`), so a split
+handle's inputs must not change before its last use, and to replay its summaries or `run` over
+new input values from a CUDA graph, capture `prepare` (`prepare_backward`) with them, as
+`context_parallel_kda`/`context_parallel_gdn` do. On a GB300, one 2048-token sequence at eight heads takes a KDA CP step's forward
+(prepare, summaries, run) from about 136 µs to about 101 µs and its backward from about 220 µs
+to about 174 µs, and GDN's from about 112 µs to about 81 µs and about 168 µs to about 128 µs
+(CUDA-graph time).
+
 *Numerics.* KDA's warpdrive kernels chunk at 16 tokens: a document cut on 16-token boundaries
 whose fragments exchange warpdrive's own state and cotangent reproduces the unsharded warpdrive
 gradients bit for bit, but the composed entry states do not, so KDA under CP is its own numerical
@@ -887,10 +902,14 @@ the span's token, sequence and head counts and the SM count (they fix the piece 
 the bounds or on other sequences' contents; against FP64 it is as accurate as the unsplit scan,
 whose 16-bit state operands already round the maps by about 4e-3 (bias) to 2e-2 (transition)
 relative L2 over thousands of tokens, so split and unsplit maps differ at that level
-(`test/test_wd_summary_split.py`). GDN's warpdrive kernels chunk at 64 tokens like the fused
-ones; sharded GDN matches the FP32 reference as closely as unsharded warpdrive and fused CP do
-(`test/test_delta_rule_stages.py`). The staged handles and this recipe are eager-only;
-`torch.compile` is not supported through them.
+(`test/test_wd_summary_split.py`). The same goes for the staged passes over the pieces: their
+outputs, final states and gradients follow the piece length and are not the bits of the public
+op on the same stream, but they are as close to FP64 as the public op's and depend neither on
+the bounds nor on whether `run` comes before the summaries (`test/test_wd_staged_pieces.py`).
+GDN's warpdrive kernels chunk at 64 tokens like the fused ones; sharded GDN matches the FP32
+reference as closely as unsharded warpdrive and fused CP do (`test/test_delta_rule_stages.py`).
+The staged handles and this recipe are eager-only; `torch.compile` is not supported through
+them.
 
 ::: attn_gym.linear.context_parallel.context_parallel_chunk
 

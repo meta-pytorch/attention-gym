@@ -2122,7 +2122,7 @@ def compile_gdn_prefill(op: GdnPrefill):
     """Compile ``op`` for dynamic tokens, heads, sequences, tinv rows and table rows."""
     io = op.io_dtype
     state = _CUTE_DTYPES[op.state_dtype_name]
-    tokens, q_heads, k_heads, v_heads, heads, seqs, rows = (cute.sym_int() for _ in range(7))
+    tokens, q_heads, k_heads, v_heads, heads, rows = (cute.sym_int() for _ in range(6))
     d_v = op.d_v * op.tiles_per_head
     compute = op.tinv_source == "compute"
 
@@ -2130,7 +2130,10 @@ def compile_gdn_prefill(op: GdnPrefill):
         return make_fake_strided_tensor(io, (tokens, h, d), stride_divisibility=8)
 
     def state_t():
-        return make_fake_strided_tensor(state, (seqs, heads, d_v, op.d_k), stride_divisibility=4)
+        # Separate row extents: a chain-mode prefill reads piece states and stores sequences.
+        return make_fake_strided_tensor(
+            state, (cute.sym_int(), heads, d_v, op.d_k), stride_divisibility=4
+        )
 
     i32 = cutlass.Int32
     return compile_tvm_ffi(

@@ -115,6 +115,7 @@ def _plan_summary_pieces(
     PIECE_BLOCK: tl.constexpr,
     FIELDS: tl.constexpr,
     CHUNK: tl.constexpr,
+    DESTINATIONS: tl.constexpr,
 ):
     """Cut every selected sequence into pieces of ``span`` chunks, the last one shorter.
 
@@ -123,8 +124,10 @@ def _plan_summary_pieces(
     unselected or empty sequence is one piece); sequence ``s`` owns piece rows ``main_rows[s] ..
     main_rows[s + 1]`` (pieces times ``HEADS``, the ``piece_chain`` table). Work items, one per
     (selected piece, head) and named by piece, go to the first ``count[0]`` rows of ``work``.
-    ``ROW_BLOCK`` and ``PIECE_BLOCK`` are powers of two covering ``rows`` and any sequence's
-    pieces. The offsets are checked as in :func:`_select_summary_work`.
+    With ``DESTINATIONS`` they follow the chain-mode convention of ``work_tables`` instead: the
+    sequence's last piece names it as ``final_dst`` and its first as ``dstate_dst``, the others
+    ``-1``. ``ROW_BLOCK`` and ``PIECE_BLOCK`` are powers of two covering ``rows`` and any
+    sequence's pieces. The offsets are checked as in :func:`_select_summary_work`.
     """
     bound = tl.arange(0, ROW_BLOCK)
     lo = tl.load(bounds + 2 * bound, bound < rows, other=-1)
@@ -150,6 +153,10 @@ def _plan_summary_pieces(
         piece_chunks = tl.cdiv(piece_stop - piece_start, CHUNK)
         index = (piece + pieces)[:, None]
         row = tl.where((fields == 0) | (fields >= 8), index, 0)
+        if DESTINATIONS:
+            row = tl.where((fields == 8) & (pieces[:, None] != count_here - 1), -1, row)
+            row = tl.where((fields == 9) & (pieces[:, None] != 0), -1, row)
+            row = tl.where((fields >= 8) & (row >= 0), seq, row)
         row = tl.where((fields == 3) | (fields == 5), piece_chunks[:, None], row)
         row = tl.where(fields == 6, piece_start[:, None], row)
         row = tl.where(fields == 7, piece_stop[:, None], row).to(tl.int32)
@@ -255,7 +262,11 @@ class _Launch:
         bounds: torch.Tensor | None,
         chunk: int,
         cost: SummaryCost | None,
+        *,
+        destinations: bool = False,
     ) -> _Launch:
+        """``destinations`` (split only) follows :func:`_plan_summary_pieces`: the staged plans
+        run their prefill or backward over the same work items."""
         device = cu_seqlens.device
         sequences = cu_seqlens.shape[0] - 1
         rows = 0 if bounds is None else bounds.shape[0]
@@ -279,10 +290,8 @@ class _Launch:
                 chunk,
             )
             return cls(work_items, work_count, int32(2, device), sequences)
-        # Sequence s has at most ceil(chunks_s / span) pieces, and the chunks add up to at most
-        # ceil(tokens / chunk) + sequences (each sequence may end in a partial chunk).
         per_sequence = cdiv(cdiv(tokens, chunk), span)
-        capacity = cdiv(cdiv(tokens, chunk) + sequences, span) + sequences
+        capacity = cls.capacity(tokens, sequences, chunk, span)
         cu_pieces = int32(capacity + 1, device)
         main_rows = int32(sequences + 1, device)
         work_items = torch.empty(
@@ -305,8 +314,16 @@ class _Launch:
             triton.next_power_of_2(per_sequence),
             WORK_ITEM_FIELDS,
             chunk,
+            destinations,
         )
         return cls(work_items, work_count, int32(2, device), capacity, cu_pieces, main_rows)
+
+    @staticmethod
+    def capacity(tokens: int, sequences: int, chunk: int, span: int) -> int:
+        """Pieces a split plan may fill: sequence ``s`` has at most ``ceil(chunks_s / span)``,
+        and the chunks add up to at most ``ceil(tokens / chunk) + sequences`` (each sequence may
+        end in a partial chunk)."""
+        return cdiv(cdiv(tokens, chunk) + sequences, span) + sequences
 
     def reset(self) -> None:
         """The work-stealing counters must be zero before every launch, including replays."""
@@ -414,14 +431,18 @@ def _validate_operands(tensors: dict[str, torch.Tensor], cu_seqlens: torch.Tenso
         raise TypeError("gate and beta must be float32")
     if not k.is_cuda or any(t.device != k.device for t in (*tensors.values(), cu_seqlens)):
         raise ValueError("all inputs must be CUDA tensors on k.device")
+    validate_bounds(bounds, k.device)
+
+
+def validate_bounds(bounds: torch.Tensor | None, device: torch.device) -> None:
     if bounds is not None and (
         bounds.ndim != 2
         or bounds.shape[1] != 2
         or bounds.dtype != torch.int32
-        or bounds.device != k.device
+        or bounds.device != device
         or not bounds.is_contiguous()
     ):
-        raise ValueError("bounds must be contiguous int32 [R, 2] on k.device")
+        raise ValueError("bounds must be contiguous int32 [R, 2] on the inputs' device")
 
 
 def _identity_maps(sequences: int, heads: int, v: int, k: int, device) -> torch.Tensor:
