@@ -21,8 +21,7 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from attn_gym.warpdrive import alias
-from attn_gym.warpdrive.alias import PTX
-from attn_gym.warpdrive.protocol import Event, ProtocolError
+from attn_gym.warpdrive.protocol import PTX, Event, ProtocolError
 
 FENCE_KINDS = ("tmem_store", "tmem_load", "smem_async")
 SIDE_FENCES = {"producer": "commit_fence", "consumer": "release_fence"}
@@ -196,7 +195,9 @@ def _modes(access: alias.Access) -> list[Access]:
     ]
 
 
-def _event_fences(ev: Event) -> tuple[str, ...]:
+def event_fences(ev: Event) -> tuple[str, ...]:
+    """The fence kinds event ``ev`` runs: a hand fence, or a fenced managed signal's
+    channel fences (managed signals record them on their close, not as fence events)."""
     if ev.kind == "fence":
         return (ev.data["kind"],)
     if ev.kind == "close" and ev.data["signal"] and ev.data["fenced"]:
@@ -214,7 +215,7 @@ def _other_handoff(s: alias.Access, t: alias.Access | None, chan, kind: str) -> 
         ):
             continue
         if any(
-            ev.data.get("handle") is h and kind in _event_fences(ev)
+            ev.data.get("handle") is h and kind in event_fences(ev)
             for ev in s.role.events[s.index + 1 :]
         ):
             return True
@@ -260,7 +261,7 @@ def _check_handoff(s: alias.Access, rec, other: str, matches, res: FenceResult):
         covered = ev.data.get("handle") is rec or (
             where[: len(ev.where)] == ev.where and ev.data.get("once") != "last"
         )
-        (fenced if covered else uncertain).update(_event_fences(ev))
+        (fenced if covered else uncertain).update(event_fences(ev))
         if ev.kind != "close" or ev.data["handle"] is not rec:
             continue
         break

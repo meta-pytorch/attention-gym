@@ -142,11 +142,15 @@ What the layer supplies, checks and leaves to you:
     cross-warp SMEM check. Clusters are unverified.
 
     Annotations must cover actual accesses; raw pointers and `h.data` do not annotate later
-    uses. The model assumes TMEM loads finish before the next signal (the teardown drain covers
-    role exit) and raw synchronization
-    carries the [thread-sync fences](#thread-sync) that managed synchronization emits. Declare
-    every TMEM user with `tmem: Tmem` for allocation and teardown. Layouts, partitions,
-    storage lifetimes and alias ordering remain yours.
+    uses. A signal hands a `tcgen05.ld` to a later writer only after `tmem_load`, or after a
+    later `tcgen05.st` by each loading warp and then `tmem_store` (a same-warp `ld -> st` is
+    pipelined); otherwise the pair is `unverified`, since a manual `tcgen05.wait::ld` is
+    invisible. When a shared channel handoff fails only on such an unverified completion, the
+    pair stays `unverified` even if the cross-channel graph finds no other path. The teardown
+    drain covers role exit. The model assumes raw synchronization carries the
+    [thread-sync fences](#thread-sync) that managed synchronization emits. Declare every TMEM
+    user with `tmem: Tmem` for allocation and teardown. Layouts, partitions, storage lifetimes
+    and alias ordering remain yours.
 
 9. <a id="work"></a>**Work and configuration.** A correctly launched, drained built-in stream
     assigns each kept index to exactly one work unit and gives that unit's roles the same

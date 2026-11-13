@@ -18,6 +18,9 @@ _CONTEXTLIB = os.path.abspath(contextlib.__file__)  # frames of @contextmanager 
 _CUTEDSL_DIR = os.path.dirname(os.path.abspath(cutlass.__file__)) + os.sep
 
 
+PTX = "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html"  # rule citations
+
+
 class ProtocolError(Exception):
     """A role protocol violation detected while declaring or tracing a kernel."""
 
