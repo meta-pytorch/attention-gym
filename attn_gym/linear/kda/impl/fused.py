@@ -359,17 +359,9 @@ def paged_chunk_forward(
             state_cache,
             replay_count,
         )
-        return (
-            output[
-                torch.arange(
-                    active_counts.shape[0],
-                    dtype=torch.int64,
-                    device=active_counts.device,
-                ),
-                active_counts,
-            ]
-            .unsqueeze(1)
-            .to(q.dtype)
+        token_indices = active_counts.to(torch.int64).reshape(-1, 1, 1, 1)
+        return output.gather(1, token_indices.expand(-1, 1, output.shape[2], output.shape[3])).to(
+            q.dtype
         )
 
     if cu_seqlens is None:
