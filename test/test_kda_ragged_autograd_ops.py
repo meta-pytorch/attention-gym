@@ -116,7 +116,7 @@ def test_ragged_custom_op_registrations():
 
 
 def test_ragged_backward_ignores_akk_capacity_slack():
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
+    from attn_gym.linear.kda.fwd.factors import chunk_kda_fwd_factors
 
     lengths = [65, 63]
     active_tokens, physical_tokens = sum(lengths), 256

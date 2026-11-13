@@ -50,6 +50,7 @@ def test_sm100_kda_route_is_exact(monkeypatch, capability, expected):
 @pytest.mark.parametrize("legacy", [None, "1", "0"])
 def test_legacy_cute_route_needs_sm100_and_no_opt_out(monkeypatch, capability, legacy):
     """Only SM100-family GPUs run legacy CuTe stages, and ``ATTN_GYM_LEGACY_CUTE=0`` opts out."""
+    pytest.importorskip("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine")
 
     class Properties:
         major, minor = capability

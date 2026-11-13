@@ -7,7 +7,7 @@ import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
+from attn_gym.linear.kda.fwd.factors import chunk_kda_fwd_intra
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),

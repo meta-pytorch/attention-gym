@@ -9,16 +9,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("cutlass")
-
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.gate import _gate_transform_bwd_op, _gate_transform_fwd_op
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton import gate_transform as triton_gate
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda import bound_gate, chunk_kda
-from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_gate_bwd
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
-from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_gate_fwd
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
@@ -226,10 +223,16 @@ def _record_gate_launches(monkeypatch) -> list[torch.Tensor]:
     Covers both backends: the routed one records its launches, the other none.
     """
     launched = []
-    for module, name in (
-        (cute_gate_fwd, "_compile_gate_transform_fwd"),
-        (cute_gate_bwd, "_compile_gate_transform_bwd"),
-    ):
+    native_launchers = []
+    if uses_legacy_cute(torch.device("cuda")):
+        from attn_gym.linear.kda.bwd.cute import gate_bwd
+        from attn_gym.linear.kda.fwd.cute import gate_fwd
+
+        native_launchers = [
+            (gate_fwd, "_compile_gate_transform_fwd"),
+            (gate_bwd, "_compile_gate_transform_bwd"),
+        ]
+    for module, name in native_launchers:
         compile_fn = getattr(module, name)
 
         def compile_and_record(*args, _compile_fn=compile_fn):

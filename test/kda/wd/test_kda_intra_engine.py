@@ -16,6 +16,12 @@ import pytest
 import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
+
+pytest.importorskip(
+    "attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine",
+    reason="legacy CuTe kernel is not installed",
+)
+
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 

@@ -11,6 +11,11 @@ import math
 
 import pytest
 import torch
+
+pytest.importorskip(
+    "attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra",
+    reason="legacy CuTe kernel is not installed",
+)
 import torch.nn.functional as F
 
 from attn_gym._backends import tune as tune_module

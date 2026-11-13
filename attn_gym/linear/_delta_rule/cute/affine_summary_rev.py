@@ -42,10 +42,8 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
-from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.arch import runs_sm100_kernels
-from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     _CUTE_IO_TYPES,
@@ -53,15 +51,12 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     BT,
     DATA_ALIGN_BYTES,
     KEY_DIM,
-    MAX_RANGES,
     SUMMARY_DIM,
     VAL_DIM,
     TmaOp,
-    _aligned,
     _feature_sequence_head_batch_view,
     _sequence_feature_head_batch_view,
     decode_work_row,
-    plan_work_budget,
     range_tail,
     smem_tile_writer,
     store_rounded,
@@ -71,9 +66,6 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     tmem_tile_reader,
     zero_tail_tokens,
 )
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
-from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
-from attn_gym.utils import cdiv
 from attn_gym.warpdrive import (
     Consumer,
     Local,
@@ -1036,8 +1028,7 @@ def _compile_affine_summary_rev(
     )
 
 
-@torch.compiler.disable
-def build_state_grad_summaries(
+def launch_affine_summary_rev(
     qg: torch.Tensor,
     kg: torch.Tensor,
     w: torch.Tensor,
@@ -1045,157 +1036,32 @@ def build_state_grad_summaries(
     Aqk: torch.Tensor,
     cumulative_gate: torch.Tensor,
     scale: float,
-    bounds: torch.Tensor,
+    work: torch.Tensor,
+    partials: torch.Tensor,
     *,
-    fastmath: bool | None = None,
-) -> torch.Tensor:
-    """Compute one packed reverse affine summary per token range of a stream.
-
-    Args:
-        qg: Gated queries, shape ``[1, T, H, 128]``, bf16 or fp16.
-        kg: Gated keys, with the same shape and dtype as ``qg``.
-        w: WY factor, with the same shape and dtype as ``qg``.
-        dout: Output gradient, shape ``[1, T, H, 128]``, same dtype as ``qg``.
-        Aqk: Intra-chunk query/key factor, shape ``[1, T, H, 64]``, same dtype as ``qg``.
-        cumulative_gate: Cumulative log2 gates, shape ``[1, T, H, 128]``, fp32.
-        scale: Query scaling factor used by the local backward recurrence.
-        bounds: ``int32 [R, 2]`` device tensor of half-open token ranges ``[start, stop)``; the
-            same contract as ``build_state_summaries``.
-        fastmath: Select fast or non-fast per-chunk decay, matching the local backward.
-            ``None`` selects fast Triton or non-fast SM100 exponentials.
-
-    Returns:
-        FP32 tensor of shape ``[R, H, 256, 128]``, V-first packed as local bias then reverse
-        transition for ``dH_in = dH_out @ transition + bias``, one per row of ``bounds``.
-
-    The ranges are read on the device, so the launch is CUDA Graph capturable and replayable
-    across different ``bounds`` values of the same shape. The tokens right after a partial last
-    chunk are read but dropped by selection, so they may hold anything. Supported scope: B=1,
-    fixed K=V=128 and BT=64, contiguous CUDA inputs. SM100 uses the native UMMA kernel; other
-    capability 8.0+ targets use Triton. Both backends split long ranges into work items when
-    the static budget permits, then compose on the device.
-    """
-    assert qg.ndim == 4, f"qg must be 4D [1, T, H, K], got shape {tuple(qg.shape)}"
-    batch, tokens, heads, key_dim = qg.shape
-    assert batch == 1, f"build_state_grad_summaries requires B=1, got B={batch}"
-    assert tokens > 0, "build_state_grad_summaries requires at least one token"
-    assert heads > 0, "build_state_grad_summaries requires at least one head"
-    assert key_dim == KEY_DIM, f"build_state_grad_summaries requires K={KEY_DIM}, got {key_dim}"
-    for name, tensor in (("kg", kg), ("w", w), ("dout", dout)):
-        assert tensor.shape == qg.shape, (
-            f"{name} must match qg shape {tuple(qg.shape)}, got {tuple(tensor.shape)}"
-        )
-    assert Aqk.shape == (1, tokens, heads, BT), (
-        f"Aqk must have shape {(1, tokens, heads, BT)}, got {tuple(Aqk.shape)}"
+    whole_ranges: bool,
+    fastmath: bool,
+) -> None:
+    """Launch the native reverse kernel on prepared work and aligned factors."""
+    use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, partials)
+    compiled = _compile_affine_summary_rev(
+        _IO_TYPE_NAMES[qg.dtype],
+        qg.shape[2],
+        use_int64_offsets,
+        whole_ranges=whole_ranges,
+        fastmath=fastmath,
     )
-    assert cumulative_gate.shape == qg.shape, (
-        f"cumulative_gate must match qg shape {tuple(qg.shape)}, "
-        f"got {tuple(cumulative_gate.shape)}"
+    workspace, max_ctas = _LAUNCH_WORK.launch_args(qg.device)
+    compiled(
+        qg.detach(),
+        kg.detach(),
+        w.detach(),
+        dout.detach(),
+        Aqk.detach(),
+        cumulative_gate.detach(),
+        work,
+        partials,
+        Float32(scale),
+        workspace,
+        max_ctas,
     )
-    assert qg.dtype in _IO_TYPE_NAMES, f"qg dtype must be bf16 or fp16, got {qg.dtype}"
-    for name, tensor in (("kg", kg), ("w", w), ("dout", dout), ("Aqk", Aqk)):
-        assert tensor.dtype == qg.dtype, (
-            f"{name} dtype must match qg dtype {qg.dtype}, got {tensor.dtype}"
-        )
-    assert cumulative_gate.dtype == torch.float32, (
-        f"cumulative_gate must be fp32, got {cumulative_gate.dtype}"
-    )
-    assert bounds.ndim == 2 and bounds.shape[1] == 2 and bounds.shape[0] > 0, (
-        f"bounds must have shape [R, 2] with R > 0, got {tuple(bounds.shape)}"
-    )
-    assert bounds.dtype == torch.int32, f"bounds must be int32, got {bounds.dtype}"
-
-    if isinstance(qg, FakeTensor):
-        raise TypeError(
-            "build_state_grad_summaries does not support torch.export; run the context-parallel "
-            "summary eagerly or under CUDA Graph capture"
-        )
-
-    assert qg.is_cuda, "build_state_grad_summaries requires CUDA tensors"
-    inputs = (
-        ("qg", qg),
-        ("kg", kg),
-        ("w", w),
-        ("dout", dout),
-        ("Aqk", Aqk),
-        ("cumulative_gate", cumulative_gate),
-        ("bounds", bounds),
-    )
-    for name, tensor in inputs:
-        assert tensor.device == qg.device, f"{name} must be on {qg.device}, got {tensor.device}"
-        assert tensor.is_contiguous(), f"{name} must be contiguous, got strides {tensor.stride()}"
-    ranges = bounds.shape[0]
-    if ranges > MAX_RANGES:
-        raise ValueError(f"at most {MAX_RANGES} ranges per launch, got {ranges}")
-    properties = get_device_properties(qg.device)
-    capability = (properties.major, properties.minor)
-    if capability < (8, 0):
-        raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
-    portable = not uses_legacy_cute(qg.device)
-    if fastmath is None:
-        fastmath = portable
-    if portable:
-        if capability[0] in (10, 12):
-            from attn_gym._backends.triton.utils import configure_triton_allocator
-
-            with torch.cuda.device(qg.device):
-                configure_triton_allocator()
-        from attn_gym.linear._delta_rule.triton.affine_summary_rev import (
-            _select_block_columns,
-            launch_affine_summary_rev,
-        )
-
-        state_bn = _select_block_columns(heads, capability)
-    else:
-        qg, kg, w, dout, Aqk, cumulative_gate = (
-            _aligned(tensor) for tensor in (qg, kg, w, dout, Aqk, cumulative_gate)
-        )
-        state_bn = BlackwellDeltaAffineSummaryRev.BN
-    # As in the forward: a static budget from the span's chunk count, ranges cut on the device.
-    budget = plan_work_budget(
-        cdiv(tokens, BT), heads * (SUMMARY_DIM // state_bn), properties.multi_processor_count
-    )
-    work, range_ids = work_table(bounds, budget)
-    partials = torch.empty(
-        (work.shape[0], heads, SUMMARY_DIM, KEY_DIM), dtype=torch.float32, device=qg.device
-    )
-    if portable:
-        launch_affine_summary_rev(
-            qg,
-            kg,
-            w,
-            dout,
-            Aqk,
-            cumulative_gate,
-            scale,
-            work,
-            partials,
-            capability,
-            whole_ranges=range_ids is None,
-            fastmath=fastmath,
-        )
-    else:
-        use_int64_offsets = requires_int64_abi(qg, kg, w, dout, Aqk, cumulative_gate, partials)
-        compiled = _compile_affine_summary_rev(
-            _IO_TYPE_NAMES[qg.dtype],
-            heads,
-            use_int64_offsets,
-            whole_ranges=range_ids is None,
-            fastmath=fastmath,
-        )
-        workspace, max_ctas = _LAUNCH_WORK.launch_args(qg.device)
-        compiled(
-            qg.detach(),
-            kg.detach(),
-            w.detach(),
-            dout.detach(),
-            Aqk.detach(),
-            cumulative_gate.detach(),
-            work,
-            partials,
-            Float32(scale),
-            workspace,
-            max_ctas,
-        )
-    # The cotangent flows through the later item first.
-    return compose_work_items(partials, range_ids, ranges, reverse=True)

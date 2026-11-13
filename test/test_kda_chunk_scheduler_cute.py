@@ -5,6 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip(
+    "attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute",
+    reason="legacy CuTe kernel is not installed",
+)
+
 cutlass = pytest.importorskip("cutlass")
 
 from cuda.bindings import driver as cuda

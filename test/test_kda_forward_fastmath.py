@@ -167,7 +167,7 @@ def test_backward_factor_recomputation_preserves_fastmath(packed):
 def test_state_summary_fastmath_preserves_subnormal_decay(reverse):
     """Exercise the compiler's FTZ policy on an isolated FP32 decay."""
     pytest.importorskip("cutlass")
-    summaries = importlib.import_module("attn_gym.linear._delta_rule.cute")
+    summaries = importlib.import_module("attn_gym.linear._delta_rule.summaries")
     zeros = torch.zeros(1, 64, 1, 128, dtype=torch.bfloat16, device="cuda")
     cumulative_gate = torch.zeros_like(zeros, dtype=torch.float32)
     steps = torch.arange(1, 65, device="cuda", dtype=torch.float32)

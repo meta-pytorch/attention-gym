@@ -147,7 +147,7 @@ torch.library.define(
 
 def _chunk_backend():
     try:
-        return importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd")
+        return importlib.import_module("attn_gym.linear.kda.impl.chunk")
     except ImportError as error:
         raise ImportError("chunk_kda(impl='fused') requires CUDA with Triton support") from error
 

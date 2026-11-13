@@ -12,8 +12,6 @@ from collections.abc import Iterator
 import pytest
 import torch
 
-pytest.importorskip("cutlass")
-
 from attn_gym.linear import Impl, chunk_kda, paged_chunk_kda
 from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
@@ -150,7 +148,7 @@ def test_portable_training_matches_low_precision_reference(
 
 def test_portable_fastmath_backward_matches_reference(monkeypatch):
     """Exercise and verify fastmath plumbing in the portable WY backward."""
-    import attn_gym.linear.kda.bwd.cute.chunk_kda_bwd as backward_module
+    import attn_gym.linear.kda.impl.chunk as backward_module
 
     original = backward_module.chunk_kda_bwd_wy_triton
     received_fastmath: list[bool] = []

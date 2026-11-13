@@ -17,6 +17,11 @@ from dataclasses import replace
 
 import pytest
 import torch
+
+pytest.importorskip(
+    "attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine",
+    reason="legacy CuTe kernel is not installed",
+)
 import torch.nn.functional as F
 
 pytest.importorskip("cutlass")

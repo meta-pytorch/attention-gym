@@ -9,6 +9,11 @@ import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 
+pytest.importorskip(
+    "attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve",
+    reason="legacy CuTe kernel is not installed",
+)
+
 
 @pytest.mark.parametrize(
     ("head_dim", "chunk_size", "subchunk_size", "message"),
