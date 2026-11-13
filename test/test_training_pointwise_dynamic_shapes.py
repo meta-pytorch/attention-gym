@@ -12,8 +12,8 @@ pytest.importorskip("triton")
 
 from attn_gym._backends import tune as tune_module
 from attn_gym.linear import gate_transform
-from attn_gym.linear._delta_rule.gate import _softplus_uses_cute
-from attn_gym.linear._delta_rule.triton import softplus_gate as softplus_backend
+from attn_gym.linear._delta_rule.gate import _gate_uses_cute
+from attn_gym.linear._delta_rule.triton import gate_transform as softplus_backend
 from attn_gym.linear.kda.bwd.triton.l2norm_bwd import l2norm_bwd_kernel
 from attn_gym.linear.kda.fwd.triton.l2norm_fwd import l2norm, l2norm_fwd_kernel
 from attn_gym.testing.kda import assert_matches_low_precision_reference, assert_relative_rms_within
@@ -66,7 +66,7 @@ def run_operation(
     separates backend reuse from the row-bucket autotuning policy."""
     if kind == "l2norm":
         return l2norm(inputs[0], cu_seqlens=metadata, kernel_options={"autotune": autotune})
-    assert not _softplus_uses_cute(inputs[0])
+    assert not _gate_uses_cute(inputs[0])
     return gate_transform(*inputs, kind="softplus")
 
 
@@ -144,7 +144,10 @@ def test_pointwise_reuses_backend_cache(kind, layout):
     kernels = (
         (l2norm_fwd_kernel, l2norm_bwd_kernel)
         if kind == "l2norm"
-        else (softplus_backend.softplus_gate_fwd_kernel, softplus_backend.softplus_gate_bwd_kernel)
+        else (
+            softplus_backend.gate_transform_fwd_kernel,
+            softplus_backend.gate_transform_bwd_kernel,
+        )
     )
     for kernel in kernels:
         kernel.device_caches.clear()
@@ -167,10 +170,8 @@ def test_pointwise_reuses_backend_cache(kind, layout):
         assert all(1 <= count <= 2 for pair in counts for count in pair), counts
     if kind == "softplus":
         expected_stride = {"compact": 1, "misaligned": 1, "strided": 2}.get(layout, 0)
-        assert softplus_backend._softplus_element_stride(inputs[0]) == expected_stride
-        assert (
-            softplus_backend._softplus_element_stride(inputs[0].unsqueeze(-1)) == expected_stride
-        )
+        assert softplus_backend._element_stride(inputs[0]) == expected_stride
+        assert softplus_backend._element_stride(inputs[0].unsqueeze(-1)) == expected_stride
 
 
 def count_tuning_sweeps(monkeypatch: pytest.MonkeyPatch) -> list[None]:
