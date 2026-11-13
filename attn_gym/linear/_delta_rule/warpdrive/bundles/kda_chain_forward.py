@@ -196,14 +196,15 @@ def _compile_chain_forward(
     chain_rows: int,
     num_sm: int,
     use_int64_offsets: bool,
+    fastmath: bool = True,
 ):
     """Compile the chain forward host for one static config over fake tensors that repeat the
     standalone builds' placeholders.  Absent tensors have a None dtype."""
     i64 = use_int64_offsets
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
-    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm)
+    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm, fastmath)
     prefill_op = kda_prefill.KdaPrefill(
-        io, gate_name, d_k, d_v, 1, True, final_state_dtype is not None, 0, num_sm
+        io, gate_name, d_k, d_v, 1, True, final_state_dtype is not None, 0, num_sm, fastmath
     )
     static = (
         final_state_dtype is not None,
@@ -228,6 +229,7 @@ def _compile_chain_forward(
         )
     )
     name = "kda_chain_forward_" + "_".join(str(int(flag)) for flag in static) + f"_{dtype_names}"
+    name += "" if fastmath else "_nofm"
 
     def f32_state():
         return _dynamic(cutlass.Float32, 4, 16, i64)
@@ -426,10 +428,11 @@ def build_chain_forward(
     scale,
     chain_rows,
     num_sm,
+    fastmath=True,
 ):
     """Compile (persisted per static config: dtypes, dims, final-state
-    presence, seed dtype, chain rows, SM count, the int64 ABI) the chain forward launch over the
-    buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments. The
+    presence, seed dtype, chain rows, SM count, the int64 ABI, fastmath) the chain forward launch
+    over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments. The
     launch runs on the current Torch stream. The warpdrive KDA prefill takes no ``final_indices``
     and writes no checkpoints."""
     if not log_gate:
@@ -515,6 +518,7 @@ def build_chain_forward(
         int(chain_rows),
         int(num_sm),
         requires_int64_abi(*tensors),
+        bool(fastmath),
     )
 
 

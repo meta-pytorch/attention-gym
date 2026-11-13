@@ -135,8 +135,8 @@ def resolve_chunk_kernel_options(
 # (``runs_sm100_kernels``: SM100, SM103, and SM107 with CuTeDSL 4.8+) when CuTeDSL (the
 # ``[linear]`` extra) is installed, and the fused backend everywhere else. On those GPUs the calls
 # warpdrive does not serve yet run the fused backend, as listed in docs/linear.md
-# ("Chunk backend selection"): KDA with FP16 kernels or ``fastmath=False``, replay-backed paged
-# KDA, and paged pools without warpdrive's 16-byte alignment. Each caller reports those as
+# ("Chunk backend selection"): KDA with FP16 kernels, replay-backed paged KDA, and paged pools
+# without warpdrive's 16-byte alignment. Each caller reports those as
 # ``fused_only``. The choice depends only on the device, dtypes, options, and layout, never on
 # sizes, so it is fixed for a compiled or captured call. Explicit ``"fused"`` and ``"warpdrive"``
 # are never rerouted.

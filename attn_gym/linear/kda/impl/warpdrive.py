@@ -18,7 +18,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     chunk_warpdrive_packed_local_bwd_op,
     validate_warpdrive_available,
 )
-from attn_gym.linear.kda.validation import cast_to_kernel_dtypes, validate_warpdrive_fastmath
+from attn_gym.linear.kda.validation import cast_to_kernel_dtypes
 
 
 def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
@@ -49,9 +49,10 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         split_backward: bool,
         split_forward: bool,
         output_final_state: bool,
+        fastmath: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         ctx.split_backward = split_backward
-        ctx.scale = scale
+        ctx.scale, ctx.fastmath = scale, fastmath
         if output_final_state:
             # A zero entry state has no cotangent: the backward then skips every state access.
             entry_state = initial_state
@@ -65,15 +66,15 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                     device=q.device,
                 )
             output, final_state = chunk_warpdrive_packed_fwd_with_state_op(
-                q, k, value, gate, beta, entry_state, cu_seqlens, scale
+                q, k, value, gate, beta, entry_state, cu_seqlens, scale, fastmath
             )
         elif initial_state is None:
             output = chunk_warpdrive_packed_fwd_op(
-                q, k, value, gate, beta, cu_seqlens, split_forward, scale
+                q, k, value, gate, beta, cu_seqlens, split_forward, scale, fastmath
             )
         else:
             output = chunk_warpdrive_packed_fwd_with_initial_state_op(
-                q, k, value, gate, beta, initial_state, cu_seqlens, scale
+                q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath
             )
         ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
         ctx.set_materialize_grads(False)
@@ -88,12 +89,30 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         d_output = normalize_output_grad(d_output, value)
         if initial_state is None and d_final_state is None:
             gradients = chunk_warpdrive_packed_local_bwd_op(
-                q, k, value, gate, beta, d_output, cu_seqlens, ctx.split_backward, ctx.scale
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                d_output,
+                cu_seqlens,
+                ctx.split_backward,
+                ctx.scale,
+                ctx.fastmath,
             )
             gradients = (*gradients, None)
         elif initial_state is None:
             gradients = chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
-                q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, ctx.scale
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                d_output,
+                cu_seqlens,
+                d_final_state,
+                ctx.scale,
+                ctx.fastmath,
             )
             gradients = (*gradients, None)
         else:
@@ -108,8 +127,9 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 initial_state,
                 d_final_state,
                 ctx.scale,
+                ctx.fastmath,
             )
-        return *gradients, None, None, None, None, None
+        return *gradients, *(None,) * 6
 
 
 def validate_warpdrive_constraints(q: torch.Tensor, value: torch.Tensor) -> None:
@@ -140,7 +160,6 @@ def chunk_forward(
     split_forward: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the optional warpdrive implementation behind the shared ``chunk_kda`` contract."""
-    validate_warpdrive_fastmath(fastmath)
     scale = resolve_scale(scale, q.shape[-1])
     if split_backward and (initial_state is not None or output_final_state):
         raise ValueError("split_backward currently requires a no-state call")
@@ -170,6 +189,7 @@ def chunk_forward(
         split_backward,
         split_forward,
         output_final_state,
+        fastmath,
     )
     output, final_state = result if output_final_state else (result, None)
     return output.reshape(output_shape).to(output_dtype), final_state
