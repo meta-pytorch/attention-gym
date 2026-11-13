@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
@@ -20,8 +21,8 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTe K4 kernel requires an SM100 or SM103 GPU",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTe K4 kernel requires an SM100-family GPU",
 )
 
 _BLOCK_PAIRS = ((1, 0), (2, 0), (2, 1), (3, 0), (3, 1), (3, 2))

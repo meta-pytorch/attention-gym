@@ -12,12 +12,13 @@ cutlass = pytest.importorskip("cutlass")
 from cutlass import Int32, cute
 from cutlass.cute.runtime import from_dlpack
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.warpdrive import ptx, umma
 from attn_gym.warpdrive.compat import SmemAllocator
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="tcgen05 requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="tcgen05 requires an SM100-family GPU",
 )
 
 M, N, K = 128, 64, 128

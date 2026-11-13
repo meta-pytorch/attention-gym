@@ -7,7 +7,7 @@
 # clips the O stores), and the checkpoint, linear-gate, 16-bit-beta and final-index paths are
 # gone.
 
-"""Chunked scalar-gate GDN prefill (forward) for SM100/SM103.
+"""Chunked scalar-gate GDN prefill (forward) for the SM100 family.
 
 Per chunk ``c`` (64 tokens) of a work item, with ``g`` the in-chunk cumulative log2 gate::
 

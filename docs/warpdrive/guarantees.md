@@ -6,8 +6,8 @@ warpdrive manages synchronization for declared roles and channels. You supply th
 memory accesses. **A kernel that compiles can still race or deadlock.** See
 [channels](channels.md#stages-and-phases) for the vocabulary used here.
 
-The supported target is Blackwell SM100/SM103 with CuTeDSL 4.6.2 through 4.8, using one CTA,
-a CTA pair or a cluster of at most eight CTAs. Example wrappers have their own input contracts.
+The supported targets are Blackwell SM100/SM103 with CuTeDSL 4.6.2 through 4.8 and Rubin SM107
+with CuTeDSL 4.8, using one CTA, a CTA pair or a cluster of at most eight CTAs. Example wrappers have their own input contracts.
 
 ## What a successful check means
 

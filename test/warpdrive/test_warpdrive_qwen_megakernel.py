@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.testing.perfetto_trace import read_slices
 from attn_gym.warpdrive import ProtocolError, RoleConfig
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
@@ -40,7 +41,7 @@ def release_cuda_memory():
 
 def cached_weights(repo: str):
     """Load the checkpoint from the local HF cache; skip if it is missing, never download."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    if not cuda_runs_sm100_kernels():
         pytest.skip("the megakernel requires an SM100-family GPU")
     hub = pytest.importorskip("huggingface_hub")
     pytest.importorskip("safetensors")
@@ -271,7 +272,7 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
 def test_odd_gqa_group_random_weights(engine):
     """A GQA group of 3 (like Qwen3-14B's 5) serves one q head per attention row; its o_proj
     splits hold 6 heads, so the combine runs a full and a partial pass. No checkpoint needed."""
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    if not cuda_runs_sm100_kernels():
         pytest.skip("the megakernel requires an SM100-family GPU")
     config = QwenConfig(
         hidden_size=1024, num_layers=2, num_q_heads=24, num_kv_heads=8,

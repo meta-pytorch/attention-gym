@@ -10,6 +10,7 @@ import torch
 
 pytest.importorskip("cutlass.cute")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
@@ -41,7 +42,7 @@ def release_cuda_memory():
 
 
 def require_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+    if not cuda_runs_sm100_kernels():
         pytest.skip("the megakernel requires an SM100-family GPU")
 
 

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# KDA forward factor composition. SM100/SM103 retains its CuTe factor engines;
+# KDA forward factor composition. The SM100 family retains its CuTe factor engines;
 # every other supported GPU uses the FP32/TF32 BC16 stage plus Triton K3/K4.
 
 from __future__ import annotations

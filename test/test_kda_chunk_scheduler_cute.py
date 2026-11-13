@@ -11,6 +11,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Int32, cute
 from cutlass.cute.runtime import make_fake_compact_tensor
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
@@ -179,8 +180,8 @@ def decode_ragged_chunk_work_cute(
 
 
 requires_cute = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA scheduler test requires an SM100 or SM103 GPU",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTeDSL KDA scheduler test requires an SM100-family GPU",
 )
 
 

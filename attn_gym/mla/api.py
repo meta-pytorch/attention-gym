@@ -238,7 +238,7 @@ def paged_mla_decode(
             is the model's ``1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`` (times any
             rope scaling correction), not ``1 / sqrt(latent_dim + rope_dim)``.
         impl: ``Impl.FUSED`` (default) runs FlashAttention's absorbed MLA kernel:
-            FlashAttention-4 on SM100/SM103, FlashAttention-3 on SM90. Both support
+            FlashAttention-4 on SM100-family GPUs, FlashAttention-3 on SM90. Both support
             ``torch.compile``. ``Impl.REFERENCE`` runs eager PyTorch on CPU or CUDA.
         kernel_options: Kernel options, see :class:`attn_gym.types.TuningOptions`.
             ``"autotune"`` defaults to ``False`` for this operation. If True, benchmark

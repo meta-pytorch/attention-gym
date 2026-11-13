@@ -62,7 +62,7 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
   gather/scatter copies.
 - An opt-in warpdrive fused chunk implementation with the same public training/state contract and
-  direct paged-cache prefill on SM100/SM103.
+  direct paged-cache prefill on SM100-family GPUs (SM100, SM103, and SM107 with CuTeDSL 4.8+).
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
 - Autograd for the reference and fused chunk implementations, including initial-state gradients.
@@ -96,11 +96,11 @@ before applying masked nonpositive causal decay differences; the scalar natural-
 numerical-range contract below. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
 Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
-wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM100/SM103 and
-portable Triton kernels on other supported architectures. The `K = V = 64` backward uses portable
-Triton on every architecture.
+wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM100-family GPUs
+and portable Triton kernels on other supported architectures. The `K = V = 64` backward uses
+portable Triton on every architecture.
 
-The warpdrive chunk backend requires the optional `linear` dependencies and SM100/SM103,
+The warpdrive chunk backend requires the optional `linear` dependencies and an SM100-family GPU,
 FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It uses the same scalar natural-log gate
 contract and exact execution by default.
 
@@ -259,7 +259,7 @@ contract. A correctness-first integration can keep the KDA unit under an FP32 po
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
 The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public
-boundary accepts FP16, BF16, or FP32 inputs. SM100/SM103 select the specialized CuTe path;
+boundary accepts FP16, BF16, or FP32 inputs. SM100-family GPUs select the specialized CuTe path;
 SM120 and earlier supported architectures use the portable Triton stages. Homogeneous FP16 and
 BF16 Q/K/V stay in their input dtype, while
 FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
@@ -482,7 +482,7 @@ replay_state.count.zero_()
 The current fused KDA kernel requires key and value dimensions of 128. A pool may pad the
 stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[num_slots]`.
 
-`chunk_kda(..., kernel_options={"backend": "warpdrive"})` selects an opt-in SM100/SM103
+`chunk_kda(..., kernel_options={"backend": "warpdrive"})` selects an opt-in SM100-family
 FP16/BF16 training backend for
 applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
 warpdrive CuTeDSL kernels (CuTeDSL 4.6.2 or newer, the `[linear]` extra) and has no cuDNN Frontend
@@ -531,8 +531,8 @@ newer).
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
 | `kernel_options={"backend": "warpdrive"}` | Native backend math | `ValueError`: unsupported |
 
-One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100/SM103 always uses the
-flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
+One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100-family GPUs always uses
+the flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
 in the normal range, so both values give the same Aqk/Akk factors (for model-scale Q/K entries;
 entries must stay below `2^63` in magnitude). The backward intra-chunk kernel splits its decays so
 that a factor flushes only when the decay it belongs to is below `2^-126`, so `fastmath=True`

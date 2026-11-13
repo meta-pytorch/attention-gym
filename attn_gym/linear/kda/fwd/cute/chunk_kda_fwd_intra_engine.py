@@ -51,13 +51,13 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute import TMA_ALIGNMENT_BYTES, normalize_compact_tensor
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_chunk_work as _tl_load_ragged_chunk_work,
 )
-from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import load_ragged_chunk_work
 from attn_gym.warpdrive import (
     Consumer,
@@ -909,8 +909,8 @@ def _compile_intra_engine_fwd(
     use_int64_offsets: bool,
 ):
     target = get_compile_target()
-    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
-        raise ValueError(f"KDA intra engine requires an SM100 or SM103 target; got {target}")
+    if target.device_type != "cuda" or not runs_sm100_kernels(target.effective_capability):
+        raise ValueError(f"KDA intra engine requires an SM100-family target; got {target}")
     op = KdaIntraFwdEngine(
         head_dim=head_dim,
         num_heads=H,

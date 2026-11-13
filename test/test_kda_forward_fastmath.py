@@ -5,8 +5,9 @@ import importlib
 import pytest
 import torch
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.linear import chunk_kda
-from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE, is_sm100_kda_capability
+from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.testing.kda import cumulative_sequence_offsets, kda_reference, make_kda_test_inputs
 
 requires_cuda = pytest.mark.skipif(
@@ -14,9 +15,8 @@ requires_cuda = pytest.mark.skipif(
     reason="the fused KDA core requires CUDA capability 8.0 or newer",
 )
 requires_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not is_sm100_kda_capability(torch.cuda.get_device_capability()),
-    reason="the BF16 KDA intra engine requires SM100/SM103",
+    not torch.cuda.is_available() or not runs_sm100_kernels(torch.cuda.get_device_capability()),
+    reason="the BF16 KDA intra engine requires an SM100-family GPU",
 )
 
 

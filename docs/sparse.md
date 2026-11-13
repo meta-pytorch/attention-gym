@@ -35,7 +35,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 - `impl="reference"` evaluates PyTorch scoring and Top-K on CPU or CUDA. FP16/BF16/FP32
   inputs accumulate in FP32; FP64 inputs retain FP64. It materializes the score intermediates
   and is intended for correctness checks and small inputs.
-- `impl="fused"` (the default) selects **CuTe on SM100/SM103**, or **Triton on other NVIDIA GPUs
+- `impl="fused"` (the default) selects **CuTe on SM100-family GPUs**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
   keep their selection state on chip. CuTe generates scores with
   [warpdrive](warpdrive/index.md) TMA/MMA/epilogue kernels, separately from radix Top-K, and
@@ -50,7 +50,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 
 | Restriction | CuTe | Triton |
 |---|---|---|
-| GPU | SM100 or SM103 | SM90 or newer |
+| GPU | SM100, SM103, or SM107 | SM90 or newer |
 | Input dtype | FP16 or BF16, shared by all inputs | FP16 or BF16, shared by all inputs |
 | Heads `H` | Positive and even | `1..256` |
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
@@ -64,8 +64,9 @@ pair's FP32 scores fit its 32 MiB workspace. This includes inactive packed capac
 CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
 materializing contiguous copies. Weights need only element alignment, not TMA alignment.
 
-CuTe additionally requires the optional `linear` dependencies. It supports SM100 and SM103
-(including GB300), not every Blackwell variant; other supported devices use Triton by default.
+CuTe additionally requires the optional `linear` dependencies. It supports the SM100 family
+(SM100, SM103 including GB300, and Rubin SM107 with CuTeDSL 4.8+), not every Blackwell variant;
+other supported devices use Triton by default.
 
 ### Compilation and training scope
 
@@ -192,7 +193,7 @@ the query's bare/paired form, even when the local window is zero.
 
 ### Backends and compilation
 
-Automatic fused selection prefers eligible CuTe/FA4 calls on SM100/SM103, otherwise it
+Automatic fused selection prefers eligible CuTe/FA4 calls on SM100-family GPUs, otherwise it
 selects Triton. This is **not a general paired-input fallback**: nonempty rotary components
 run only on the restricted Triton shared-KV schedule below. In particular, nonempty paired
 FP16 calls are not supported by either fused backend; use the reference implementation for
@@ -205,7 +206,7 @@ also use FP32. Local and sparse pools must have the same KV head count: one shar
 
 | Input form | CuTe (FA4 sparse MLA) | Triton |
 |---|---|---|
-| Bare tensors | SM100/SM103, BF16, one shared KV head, `1 <= H <= 128`, `D = 512`; no additional window-size bound in the adapter | Generic CUDA path for FP16/BF16/FP32, shared or per-head KV; no fixed `H`, `D`, or `W` eligibility bounds in the generic launcher. A specialized BF16 shared-KV schedule uses the same GPU, `H`, `D`, `W`, and latent-stride constraints as nonempty pairs below, without rotary requirements. |
+| Bare tensors | SM100-family GPU, BF16, one shared KV head, `1 <= H <= 128`, `D = 512`; no additional window-size bound in the adapter | Generic CUDA path for FP16/BF16/FP32, shared or per-head KV; no fixed `H`, `D`, or `W` eligibility bounds in the generic launcher. A specialized BF16 shared-KV schedule uses the same GPU, `H`, `D`, `W`, and latent-stride constraints as nonempty pairs below, without rotary requirements. |
 | Nonempty `(latent, rope)` pairs (`R > 0`) | Same CuTe constraints as bare, with `R = 64` | Compute capability major >= 8 (Ampere or newer, including Hopper and SM120), BF16, one shared KV head, `16 <= H <= 128`, `D` in `{16, 32, ..., 128, 512}`, `R` in `{16, 32, 64, 128}`, `0 <= W <= 2048`; shared-schedule stride requirements below must hold. No generic paired path. |
 | Zero-width pairs (`R = 0`) | Same eligibility as bare tensors | Same eligibility as bare tensors; rotary operands are omitted from the kernels and their gradients have empty feature dimensions. |
 

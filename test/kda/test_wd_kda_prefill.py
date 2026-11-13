@@ -8,11 +8,12 @@ from __future__ import annotations
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.testing.kda import assert_matches_low_precision_reference, kda_reference
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive KDA prefill requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive KDA prefill requires an SM100-family GPU",
 )
 
 

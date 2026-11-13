@@ -1,4 +1,4 @@
-"""CuTe DSL (SM100/SM103) backend for gather attention.
+"""CuTe DSL (SM100 family) backend for gather attention.
 
 Launches FlashAttention-4 sparse MLA kernels behind the backend-neutral opaque
 operators. The caller owns the tensor autograd tape; FA4 owns kernel compilation,
@@ -9,7 +9,7 @@ Constraints
 - latent width = 512 with independent RoPE width 0 or 64, 1 <= nheads <= 128, one KV
   head that is also the values (fewer than 128 heads are zero-padded to FA4's 64/128-head
   tiles in-kernel via TMA out-of-bounds)
-- dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
+- dtype = bfloat16, SM100 family (compute capability 10.0, 10.3, or 10.7)
 - Requires FA4 4.0.0b32+ for sparse MLA attention sinks and, with fewer than 128
   heads, sparse-MLA head padding; 4.0.0b33+ to recompute probabilities in backward
   for any head count
@@ -24,12 +24,11 @@ from functools import cache
 
 import torch
 
+from attn_gym._backends.arch import SM100_KERNELS_REQUIREMENT, runs_sm100_kernels
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
-
-SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
-
 
 # FA4's sparse MLA kernels fix the latent (value) width and the key-only RoPE width.
 VALUE_DIM = 512
@@ -43,8 +42,8 @@ def _constraint_violation(
     _b, h, _s, d = query.shape
     if query.device.type != "cuda":
         return ValueError("CuTe backend requires CUDA tensors.")
-    if torch.cuda.get_device_capability(query.device) not in SUPPORTED_CAPABILITIES:
-        return ValueError("CuTe backend requires SM100 or SM103.")
+    if not runs_sm100_kernels(torch.cuda.get_device_capability(query.device)):
+        return ValueError(f"CuTe backend requires {SM100_KERNELS_REQUIREMENT}.")
     if query.dtype != torch.bfloat16:
         return TypeError("CuTe backend requires bfloat16.")
     if not share_kv:
@@ -97,7 +96,7 @@ def _environment_supported(device: torch.device, with_sink: bool, padded_heads: 
 
     Do not pass tensors or hide model sizes/determinism here: the caller guards those.
     """
-    if torch.cuda.get_device_capability(device) not in SUPPORTED_CAPABILITIES:
+    if not runs_sm100_kernels(torch.cuda.get_device_capability(device)):
         return False
     return _fa4_available(with_sink, padded_heads=padded_heads)
 

@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import torch
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute import (
     get_device_properties,
     normalize_compact_tensor,
@@ -57,10 +58,11 @@ def validate_supported_device(q: torch.Tensor) -> None:
 
 
 def use_blackwell_backward(q: torch.Tensor, v: torch.Tensor) -> bool:
-    """Select the fixed-D128 CuTe backward only on its validated SM100/SM103 targets."""
+    """Select the fixed-D128 CuTe backward only on SM100-family targets."""
     properties = get_device_properties(q.device)
     return (
-        properties.major == 10 and properties.minor in (0, 3) and q.shape[-1] == v.shape[-1] == 128
+        runs_sm100_kernels((properties.major, properties.minor))
+        and q.shape[-1] == v.shape[-1] == 128
     )
 
 
