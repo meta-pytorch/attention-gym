@@ -44,9 +44,18 @@ def trace_session(
     return capture(kernel, num_ctas, trace_path, device)
 
 
+def _roles(kernel) -> list:
+    """The kernel's role instances. A build restored from the compile cache carries its trace
+    record but collects its roles only on demand; plain stand-ins (tests) carry them as is."""
+    collect = getattr(kernel, "_collect", None)
+    if collect is not None:
+        collect()
+    return kernel._ws_roles
+
+
 @contextmanager
 def capture(kernel, num_ctas: int, trace_path, device) -> Iterator[ProfileSession]:
-    roles = kernel._ws_roles
+    roles = _roles(kernel)
     capacity = kernel.trace_events_per_role
     with profile_session(
         max_events_per_unit=len(roles) * capacity,
@@ -73,7 +82,7 @@ def write_trace(path: str | Path, kernel, ranges: list[Range], **options) -> Pat
 
     ``options`` (``name``, ``args``, ``flows``) pass through to ``write_ranges``.
     """
-    lanes = {r.first_warp: r.name for r in kernel._ws_roles}
+    lanes = {r.first_warp: r.name for r in _roles(kernel)}
     return write_ranges(
         path,
         ranges,
@@ -111,7 +120,7 @@ def role_tracks(ranges: list[Range], kernel, origin_ns: int) -> list[list]:
     ``n`` deep inside them, such as ``trace_region``s, on ``"<role> +n"``; a range with its
     enclosing range's span nests inside it, the role's own range outermost. Ranges recorded by no
     role's first warp (compact records) are skipped."""
-    roles = {r.first_warp: r for r in kernel._ws_roles}
+    roles = {r.first_warp: r for r in _roles(kernel)}
     by_warp: dict[tuple[int, int], list[Range]] = defaultdict(list)
     for item in ranges:
         if item.warp in roles:

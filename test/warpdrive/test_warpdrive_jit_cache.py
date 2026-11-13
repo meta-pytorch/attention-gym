@@ -162,6 +162,51 @@ def test_collected_kernel_rejects_cluster_and_stream_reassignment():
     assert op.__cute_cache_key__()  # a rejected assignment leaves the key intact
 
 
+def test_runtime_key_tells_constructor_calls_classes_and_settings_apart():
+    """The in-process key holds the constructor call, the class and the late settings, so two
+    kernels share a build only when every compile-time choice matches; it collects no roles."""
+    from attn_gym.warpdrive.cache.jit import _fast_key
+
+    op = Gemm()
+    assert _fast_key(op) == _fast_key(Gemm())
+    assert op._ws_roles is None  # keying a launch collects nothing
+    strict = Gemm()
+    strict.alias_check = "strict"  # a "warn" build must not satisfy a "strict" one
+    assert len({_fast_key(k) for k in (op, Gemm(ab_stages=4), ReorderedGemm(), strict)}) == 4
+
+
+def test_cached_launch_of_a_fresh_kernel_restores_without_collecting(
+    requires_blackwell, monkeypatch
+):
+    """A fresh instance served from the in-process cache takes the build's trace record without
+    collecting its roles (the launch costs a dict lookup, not a role walk); describe() collects
+    on demand and matches the traced instance, and the restored settings are frozen."""
+    from attn_gym.warpdrive import kernel
+
+    # The suite's fence fixture reports through checks(), which collects; measure the launch.
+    monkeypatch.setattr(kernel.WarpSpecialized, "_report_trace", lambda op: None)
+    traced = Gemm()
+    compile_gemm(traced)
+    before = compile_gemm.cache_info()
+    fresh = Gemm()
+    compile_gemm(fresh)
+    assert compile_gemm.cache_info().hits == before.hits + 1
+    assert fresh._ws_roles is None and fresh._ws_traced
+    with pytest.raises(ProtocolError, match="cluster.*after collection"):
+        fresh.cluster = CtaPair()
+    assert fresh.describe() == traced.describe()
+
+
+def test_cache_clear_drops_in_process_builds(requires_blackwell):
+    """``cache_clear()`` empties the in-process lookup too: the next launch loads the build
+    again instead of reusing one the caller cleared."""
+    compile_gemm(Gemm())
+    compile_gemm.cache_clear()
+    assert compile_gemm.cache_info() == CacheInfo(hits=0, misses=0, currsize=0)
+    compile_gemm(Gemm())
+    assert compile_gemm.cache_info().currsize == 1
+
+
 def test_uncopyable_constructor_argument_keeps_the_kernel_usable_but_unkeyed():
     """Keying and pickling require a copyable constructor call.
 

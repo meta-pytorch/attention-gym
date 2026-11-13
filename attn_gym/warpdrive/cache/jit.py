@@ -324,6 +324,10 @@ def _fast_key(item: Any) -> tuple[Any, ...] | None:
         case tuple() if item_type is tuple:  # NamedTuples keep their type via the pickled key.
             parts = tuple(map(_fast_key, item))
             return None if None in parts else (tuple, *parts)
+        case _ if hasattr(item_type, "__cute_runtime_key__"):
+            # An object with a cheap in-process key (a warpdrive kernel) keys on it instead of
+            # its full compile key; the class tags it, as the module and name do on disk.
+            return (item_type, item.__cute_runtime_key__())
         case _:
             return None
 

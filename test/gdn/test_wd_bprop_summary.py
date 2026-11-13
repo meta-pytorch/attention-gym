@@ -50,7 +50,7 @@ def _work_table(cu, heads, order, capacity, chunk_ranges=None):
     return table, torch.tensor([len(order)], dtype=torch.int32, device="cuda")
 
 
-def _run(q, k, do, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None):
+def _run(q, k, do, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None, state_g=None):
     from attn_gym.linear._delta_rule.warpdrive import gdn_bprop_summary, gdn_tinv
 
     pieces, heads = cu.numel() - 1, gate.shape[1]
@@ -61,7 +61,8 @@ def _run(q, k, do, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None):
     gdn_tinv.gdn_tinv(k, gate, beta, cu, tinv, row_table, row_count)
     order = range(pieces * heads) if order is None else order
     table, count = _work_table(cu, heads, order, len(order) + extra_rows, chunk_ranges)
-    state_g = torch.full((pieces, heads, do.shape[2], k.shape[2]), float("nan"), device="cuda")
+    if state_g is None:
+        state_g = torch.full((pieces, heads, do.shape[2], k.shape[2]), float("nan"), device="cuda")
     scale = k.shape[2] ** -0.5
     gdn_bprop_summary.gdn_bprop_summary(q, k, gate, do, tinv, state_g, table, count, scale=scale)
     return state_g
@@ -118,6 +119,17 @@ def test_gdn_bprop_summary_matches_reference(lens, heads, key_heads, d_k, d_v, d
     _assert_close(_run(*args), _reference(*args), dtype)
 
 
+def test_gdn_bprop_summary_writes_into_a_view_of_a_packed_map():
+    """``G`` may be one half of a packed ``[C; R]`` map: the same bits as a separate output, and
+    the other half stays untouched."""
+    args = _inputs((70, 130), 2, 1, 128, 128, torch.bfloat16, seed=4)
+    expected = _run(*args)
+    packed = torch.full((2, 2, 256, 128), float("nan"), device="cuda")
+    _run(*args, state_g=packed[:, :, 128:])
+    assert torch.equal(packed[:, :, 128:], expected)
+    assert packed[:, :, :128].isnan().all()
+
+
 def test_gdn_bprop_summary_runs_listed_items_in_any_order():
     """Rows past ``work_count`` never run, an empty piece writes ``G = 0``, and a permuted table
     writes the same bits."""
@@ -165,6 +177,8 @@ def test_gdn_bprop_summary_reuses_one_compile_across_runtime_shapes():
     gdn_bprop_summary.compile_gdn_bprop_summary.cache_clear()
     for lens, heads, key_heads in shapes:
         _run(*_inputs(lens, heads, key_heads, 128, 128, torch.bfloat16), extra_rows=heads)
-    info = gdn_bprop_summary.compile_gdn_bprop_summary.cache_info()
+    info = (
+        gdn_bprop_summary.compile_gdn_bprop_summary.cache_info()
+    )  # one specialization, looked up per launch
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(shapes), info

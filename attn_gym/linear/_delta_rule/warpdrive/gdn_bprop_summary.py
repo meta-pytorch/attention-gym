@@ -58,6 +58,7 @@ handoffs. The QK of chunk ``c - 1`` is issued during chunk ``c`` (upstream's ord
 and K through ``peek()`` previews that chunk ``c - 1``'s waits own.
 """
 
+import functools
 from dataclasses import dataclass
 
 import cutlass
@@ -90,6 +91,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
 
+from .gdn_summary import check_summary_outputs
 from .ptx import (
     f16x2_to_f32,
     fmul2,
@@ -1037,6 +1039,13 @@ def compile_gdn_bprop_summary(op: GdnBpropSummary):
     )
 
 
+@functools.cache
+def _op(dtype_name: str, d_k: int, d_v: int) -> GdnBpropSummary:
+    """One op per static configuration. Launches look its build up with ``by_static_key``
+    (the hot-path lookup), which still honours ``cache_clear()`` and the compile target."""
+    return GdnBpropSummary(dtype_name, d_k, d_v)
+
+
 def gdn_bprop_summary(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1050,7 +1059,8 @@ def gdn_bprop_summary(
     scale: float,
 ) -> None:
     """Fill ``state_g`` for the work table (see the module docstring for the layouts); ``tinv``
-    holds ``gdn_tinv``'s tiles over the same pieces."""
+    holds ``gdn_tinv``'s tiles over the same pieces. ``state_g`` may be a view into a larger
+    buffer, such as the bias half of a packed ``[C; R]`` map."""
     if q.dtype not in IO_DTYPE_NAMES or {k.dtype, do.dtype, tinv.dtype} != {q.dtype}:
         raise TypeError(f"q, k, do and tinv must share a 16-bit dtype, got {q.dtype}/{k.dtype}")
     if state_g.dtype != torch.float32:
@@ -1060,10 +1070,10 @@ def gdn_bprop_summary(
     heads = gate.shape[1]
     if heads % q.shape[1] or heads % k.shape[1] or do.shape[1] != heads:
         raise ValueError("heads must match dO and be a multiple of the query and key head counts")
-    if not state_g.is_contiguous() or state_g.data_ptr() % 16:
-        raise ValueError("the bprop summaries must be contiguous and 16-byte aligned")
-    op = GdnBpropSummary(IO_DTYPE_NAMES[q.dtype], q.shape[-1], do.shape[-1])
-    fn = compile_gdn_bprop_summary(op)
+    check_summary_outputs("the bprop summaries", q.shape[-1], state_g)
+    config = (IO_DTYPE_NAMES[q.dtype], q.shape[-1], do.shape[-1])
+    op = _op(*config)
+    fn = compile_gdn_bprop_summary.by_static_key(config, lambda: compile_gdn_bprop_summary(op))
     workspace, sms = op.work.launch_args(q.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), q.device)
     fn(q, k, gate, do, tinv, state_g, work_items, work_count, slots, scale, workspace, sms)

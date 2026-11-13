@@ -554,7 +554,8 @@ class WarpSpecialized(metaclass=_KernelType):
     def __setattr__(self, name, value):
         state = vars(self)
         collected_setting = isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS
-        if collected_setting and self._ws_roles is not None:
+        # A restored trace record describes the settings it was built with, like collection.
+        if collected_setting and (self._ws_roles is not None or self._ws_traced):
             raise ProtocolError(
                 f"{type(self).__name__}.{name} cannot change after collection (describe, "
                 "compile-cache lookup, or tracing derived the channels from it); construct a "
@@ -733,7 +734,13 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_named_bars = named_bars
         self._ws_streams = streams
         self._ws_fetch_keys = fetch_keys
+        # A cached build may have restored its trace record before anything collected: keep it.
+        restored = {n: getattr(self, n) for n in _TRACE_RESULTS} if self._ws_traced else None
         self._reset_trace()
+        if restored is not None:
+            for name, value in restored.items():
+                setattr(self, name, value)
+            self._ws_traced = True
 
     def _reset_trace(self):
         """Clear trace state so a failed retrace cannot expose an earlier trace's reports.
@@ -1081,6 +1088,27 @@ class WarpSpecialized(metaclass=_KernelType):
         in ``__init__``. In-place changes to objects the constructor built (``op.ab.n = 4``) are
         not keyed; don't make them.
         """
+        streams = self._keyed_streams()
+        parts = [self, self.cluster]
+        parts += [part for s in streams for part in (s.schedule, s.mapping, s.ready)]
+        modules = sorted({c.__module__ for part in parts for c in type(part).__mro__})
+        return (
+            *self._call_key(streams),
+            self.role_config_key(),
+            tuple((m, module_source_digest(m)) for m in modules),
+        )
+
+    def __cute_runtime_key__(self) -> tuple:
+        """This kernel's in-process lookup key: ``__cute_cache_key__`` without the parts a class
+        fixes for the whole process. The collected role placement is a pure function of the
+        constructor call and the class, and the module sources cannot change under a running
+        process, so ``jit_cache`` finds a build it already holds without collecting the roles
+        (about 0.3-0.8 ms per launch for a fresh instance). The disk key keeps both."""
+        init, *settings = self._call_key(self._keyed_streams())
+        return (init, canonical_key(tuple(settings)))  # the constructor key is canonical already
+
+    def _keyed_streams(self) -> list:
+        """The work streams, after checking that only keyed settings changed since construction."""
         late = vars(self).get("_ws_late")
         if late:
             raise TypeError(
@@ -1092,17 +1120,15 @@ class WarpSpecialized(metaclass=_KernelType):
             )
         if isinstance(self._ws_init_key, TypeError):
             raise self._ws_init_key
-        streams = [v for v in vars(self).values() if isinstance(v, WorkStream)]
-        parts = [self, self.cluster]
-        parts += [part for s in streams for part in (s.schedule, s.mapping, s.ready)]
-        modules = sorted({c.__module__ for part in parts for c in type(part).__mro__})
+        return [v for v in vars(self).values() if isinstance(v, WorkStream)]
+
+    def _call_key(self, streams: list) -> tuple:
+        """The constructor call and every setting that may change after it."""
         return (
             self._ws_init_key,
             self.cluster,
             tuple((s.schedule, s.mapping, s.ready, s.scheduler_warp) for s in streams),
             (self.alias_check, self.liveness_check, self.trace_protocol, self._trace_settings()),
-            self.role_config_key(),
-            tuple((m, module_source_digest(m)) for m in modules),
         )
 
     def __cute_trace_record__(self) -> dict:
@@ -1121,8 +1147,9 @@ class WarpSpecialized(metaclass=_KernelType):
     def __cute_restore_trace__(self, record: dict) -> None:
         """Load a cached build's trace record, so ``describe()`` and the warnings match a cold
         compile. An instance that traced, or already took a record, keeps its own. Restored
-        SMEM entries have no tensors: ``buffer()`` works only while tracing."""
-        self._collect()
+        SMEM entries have no tensors: ``buffer()`` works only while tracing. The record holds
+        everything ``describe()`` and the reports read, so restoring collects no roles: the
+        cached-launch path stays cheap for a fresh instance (``describe()`` collects on demand)."""
         if record is None or self._ws_traced:
             return
         record = pickle.loads(pickle.dumps(record))  # this instance's own copies

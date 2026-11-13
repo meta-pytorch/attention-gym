@@ -45,6 +45,7 @@ robin). Each compute instance syncs its four warps on its own named barrier betw
 inverse steps.
 """
 
+import functools
 from dataclasses import dataclass
 
 import cutlass
@@ -772,6 +773,13 @@ def compile_gdn_tinv(op: GdnTinv, beta_dtype_name: str):
     )
 
 
+@functools.cache
+def _op(dtype_name: str, d_k: int) -> GdnTinv:
+    """One op per static configuration. Launches look its build up with ``by_static_key``
+    (the hot-path lookup), which still honours ``cache_clear()`` and the compile target."""
+    return GdnTinv(dtype_name, d_k)
+
+
 def gdn_tinv(
     k: torch.Tensor,
     gate: torch.Tensor,
@@ -790,8 +798,11 @@ def gdn_tinv(
     heads = gate.shape[1]
     if heads % k.shape[1] or tinv.shape[1:] != (heads, B_T, B_T):
         raise ValueError("tinv must be [rows, heads, 64, 64] with heads a multiple of k heads")
-    op = GdnTinv(IO_DTYPE_NAMES[k.dtype], k.shape[-1])
-    fn = compile_gdn_tinv(op, _BETA_DTYPES[beta.dtype])
+    config, beta_name = (IO_DTYPE_NAMES[k.dtype], k.shape[-1]), _BETA_DTYPES[beta.dtype]
+    op = _op(*config)
+    fn = compile_gdn_tinv.by_static_key(
+        (config, beta_name), lambda: compile_gdn_tinv(op, beta_name)
+    )
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)
     fn(k, gate, beta, cu_seqlens, tinv, rows, row_count, workspace, slots, sms)
