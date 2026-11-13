@@ -619,6 +619,15 @@ entry state or exit cotangent; the collective in between is the caller's.
 [`examples/linear/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/delta_rule_context_parallel.py)
 builds contiguous and zig-zag fragment lists in a dozen lines.
 
+Routed folds use one **root-fold policy**, without a workload-dependent switch. Nonempty chains
+for the same document on a rank share a root: its kernel program keeps the accumulator between
+linked checkpoints rather than restarting each prefix from zero. Backward does the same in reverse
+order. The `predecessor_links` and `successor_links` rows contain `(length, next_row, is_root)`;
+empty and padded rows are singleton roots that produce zero. This preserves the sequential IEEE
+FP32 arithmetic and requires no additional communication. It removes repeated prefix work but can
+trade away useful parallelism for short chains; the benchmark below measures that cost. The generic
+`fold_slots` helper retains independent-row semantics and is not a routed scheduling option.
+
 ### Communication: the all-gather recipe
 
 **Reference recipe** (`attn_gym.linear.context_parallel.context_parallel_chunk`, bound as
@@ -661,7 +670,7 @@ routing tensors, so a CUDA Graph captured around it replays for any document lay
 table within the routing caps: capture with `plan.routing(device, slots=S, max_subsequences=N)`
 (at most `S` fragments per rank, `N` segments per span, the same span length), then copy each new
 layout's routing tensors into the captured ones (`test/test_context_parallel_distributed.py`
-checks three layout/table pairs). Eager callers pass no caps.
+checks small and highly fragmented layout changes). Eager callers pass no caps.
 
 The host plan is not rerun by graph replay. Before each replay, build the new plan outside
 capture, arrange the new inputs in its span order, and copy its routing values into the existing
@@ -675,6 +684,30 @@ updates that cotangent buffer before each replay, setting nonterminal rows to ze
 `plan.terminal` indices are useful outside capture, or when terminal rows never change; capturing
 an index selection from them does **not** make it follow later layouts. Update routing only
 between complete forward/backward steps, not while backward still needs the previous layout.
+
+### Benchmarking root folds
+
+[`examples/linear/benchmark_context_parallel_folds.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/benchmark_context_parallel_folds.py)
+compares the public root-fold path against an independent-fold baseline on two NCCL ranks. The
+baseline is confined to the benchmark; it does not add a production selector. Reserve two NVIDIA
+GPUs, then run:
+
+```bash
+torchrun --standalone --nproc-per-node=2 examples/linear/benchmark_context_parallel_folds.py --variant kda --tokens 32768 --fragments 512 --output data/cp_root_kda.json
+```
+
+Use `--variant gdn` for GDN. `--tokens` and `--fragments` count the whole document across both
+ranks, with equal-length fragments assigned alternately; `--slots` is the per-rank capacity.
+For a small live layout under an oversized capacity, use `--tokens 512 --fragments 16 --slots 256`.
+The default is two heads with K=V=128 and BF16 Q/K/V.
+
+The harness checks exact output, exit-state, and all-five-gradient parity before measuring forward
+and backward separately with fixed-buffer CUDA Graph replay. Timings include summaries, folds,
+scatter, local kernels, and NCCL, but exclude setup, capture, projections, and short convolution.
+The JSON report includes raw per-rank samples, source hashes, versions, and clock/power snapshots.
+For each iteration, take the maximum time across ranks; for each round, take the median of those
+maxima. Report the median across interleaved rounds, in milliseconds. These are warm/reused-buffer subsystem measurements, not full-model or
+cold-DRAM timings.
 
 ### Document-aligned fragments: CP-invariant bits
 
