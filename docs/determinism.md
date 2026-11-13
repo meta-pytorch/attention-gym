@@ -167,6 +167,13 @@ given a fixed configuration. The guarantees, strongest first:
   (GB300). The fused decode ops (`recurrent_kda_decode`, `recurrent_gdn_decode`)
   do not support it. For batch-invariant decode, apply `gate_transform`, the beta
   sigmoid and `l2norm` yourself, then call the scan with one token per sequence.
+- **Warpdrive context-parallel summaries with `kernel_options={"backend": "warpdrive",
+  "batch_invariant": True}` on `chunk_kda_prepare` / `chunk_gdn_prepare` (and their backward
+  handles): bitwise across packs.** By default a long sequence's `state_summaries` and
+  `state_grad_summaries` split into pieces whose length follows the packed stream's shape, so
+  its bits change with the other sequences. The option scans every sequence uncut in both
+  directions. It does not cover the handles' `run`, whose plan still follows the stream's
+  shape; the fused stages reject it.
 - **CUDA-graph replay: bitwise** by construction, and the intended serving mode
   for decode.
 - **Across lowerings: never bitwise.** Dense versus packed, chunked versus

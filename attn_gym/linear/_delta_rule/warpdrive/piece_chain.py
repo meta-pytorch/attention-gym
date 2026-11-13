@@ -25,7 +25,9 @@ fills slots in proportion to its length. Their summaries ``H_j`` (state from a z
     X_j     = X_{j+1} @ M_j^T + G_j                 (transpose: the backward, H playing G)
 
 8-row blocks chain on FMA, 16-row blocks on tensor cores in 3xTF32 (fp32 accurate); a backward
-runs its two chains, which share ``M``, in one launch.
+runs its two chains, which share ``M``, in one launch. The split context-parallel summaries reuse
+the chain to compose each sequence's piece maps ``[H_j; M_j]`` into one ``[B; A]`` (a map chain
+with a ``final`` state, :func:`launch_state_chain`).
 
 Layouts, fp32: ``H``, ``X`` ``[num_seqs * pieces, HO, V, K]``, ``M`` ``[num_seqs * pieces, HO,
 K, K]`` (contiguous), ``seed`` ``[num_seqs, HO, V, K]`` (fp32 or bf16). Slots are flat in
@@ -152,14 +154,14 @@ def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTable
 
 def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm, chains=1):
     """State rows per chain CTA of a launch running ``chains`` chains: ``dim_v // 16`` (16
-    CTAs per (chain, sequence, head)) when that grid fits the SMs and every warp keeps a whole
-    row of the state and of upstream's M product (``dim_k * rows // dim_v`` rows, kept so the
-    geometry matches), else ``dim_v // 8`` (16 rows at ``dim_v = 128``: the tensor-core walk
-    of :func:`state_chain_kernel`)."""
+    CTAs per (chain, sequence, head)) when that grid fits the SMs and every FMA walk warp keeps
+    whole rows of the state (``rows`` a multiple of ``CHAIN_WARPS``) and of upstream's M
+    product (``dim_k * rows // dim_v`` rows, kept so the geometry matches), else ``dim_v // 8``
+    (16 rows at ``dim_v = 128``: the tensor-core walk of :func:`state_chain_kernel`)."""
     rows = dim_v // 16
     if (
         chains * num_seqs * heads_out * 16 <= num_sm
-        and rows >= CHAIN_WARPS
+        and rows % CHAIN_WARPS == 0
         and (dim_k * rows // dim_v >= CHAIN_WARPS)
     ):
         return rows
@@ -609,6 +611,28 @@ def element_addr(mT, i0, i1, i2, col):
 
 
 @cute.jit
+def seed_row(mSeed, seed_seq, h, row, col0, cols: cutlass.Constexpr[int], bias_rows):
+    """``cols`` seed values of state ``row`` from column ``col0``: ``mSeed``'s, else zero, and
+    in a map chain (``bias_rows`` set) the identity on the transition rows below the bias."""
+    if cutlass.const_expr(mSeed is not None):
+        return load_row_f32(mSeed, element_addr(mSeed, seed_seq, h, row, col0), cols)
+    if cutlass.const_expr(bias_rows is None):
+        return [Float32(0.0)] * cols
+    diagonal = row - Int32(bias_rows) - col0
+    return [Float32(1.0) if diagonal == Int32(c) else Float32(0.0) for c in range(cols)]
+
+
+@cute.jit
+def bias_row(mH, slot, h, row, col0, cols: cutlass.Constexpr[int], bias_rows):
+    """``cols`` values of ``H[slot, h, row]`` from column ``col0``; in a map chain the rows from
+    ``bias_rows`` on, ``H``'s extent, add zero (they read a valid row and discard it)."""
+    if cutlass.const_expr(bias_rows is None):
+        return load_row_f32(mH, element_addr(mH, slot, h, row, col0), cols)
+    vals = load_row_f32(mH, element_addr(mH, slot, h, row % Int32(bias_rows), col0), cols)
+    return [v if row < Int32(bias_rows) else Float32(0.0) for v in vals]
+
+
+@cute.jit
 def prefetch_m(sM, mM, buf_words, slot, heads_out, h, tidx, dim_k: cutlass.Constexpr[int]):
     """``cp.async`` of ``M[slot, h]`` (contiguous ``dim_k x dim_k`` fp32) into the SMEM buffer
     at ``buf_words``, 16-byte chunks XOR-swizzled by row, then commit the group."""
@@ -639,9 +663,12 @@ def chain_walk_fma(
     heads_out: Int32,
     mH: cute.Tensor,
     mM: cute.Tensor,
-    mX: cute.Tensor,
+    mX: cute.Tensor | None,
     mSeed: cute.Tensor | None,
     seed_seq: Int32,
+    mFinal: cute.Tensor | None,
+    final_seq: Int32,
+    bias_rows: cutlass.Constexpr[int | None],
     h: Int32,
     row0: Int32,
     seq_base: Int32,
@@ -652,7 +679,8 @@ def chain_walk_fma(
     sM: cute.Tensor,
 ):
     """State rows ``[row0, row0 + rows)`` of head ``h`` chained over the ``count`` slots from
-    ``seq_base`` (see :func:`state_chain_kernel`)."""
+    ``seq_base`` (see :func:`state_chain_kernel`), the state leaving the walk stored to
+    ``mFinal[final_seq]`` when bound and the slots' incoming states to ``mX`` when bound."""
     K = cutlass.const_expr(dim_k)
     cols = cutlass.const_expr(K // CHAIN_LANES)
     k_slice = cutlass.const_expr(K // CHAIN_K_WARPS)
@@ -665,37 +693,37 @@ def chain_walk_fma(
     k_warp = warp % Int32(CHAIN_K_WARPS)
     row_group = warp // Int32(CHAIN_K_WARPS)
     col0 = lane * Int32(cols)
-    acc = cute.make_rmem_tensor((group_rows * cols,), Float32)
-    m_tile = cute.make_rmem_tensor((CHAIN_K_TILE * cols,), Float32)
-    cur = cute.make_rmem_tensor((own_rows * cols,), Float32)
-    piece_h = cute.make_rmem_tensor((own_rows * cols,), Float32)
+    # Register tiles, row-major: the lane's ``cols`` columns of each row (k for ``m_tile``).
+    acc = cute.make_rmem_tensor(cute.make_layout((group_rows, cols), stride=(cols, 1)), Float32)
+    m_tile = cute.make_rmem_tensor(
+        cute.make_layout((CHAIN_K_TILE, cols), stride=(cols, 1)), Float32
+    )
+    cur = cute.make_rmem_tensor(cute.make_layout((own_rows, cols), stride=(cols, 1)), Float32)
+    piece_h = cute.make_rmem_tensor(cute.make_layout((own_rows, cols), stride=(cols, 1)), Float32)
 
     # ---- seeds -------------------------------------------------------------------------------
     for rr in cutlass.range_constexpr(own_rows):
-        seed_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
-        if cutlass.const_expr(mSeed is not None):
-            seed_vals = load_row_f32(
-                mSeed, element_addr(mSeed, seed_seq, h, row0 + seed_row, col0), cols
-            )
-        else:
-            seed_vals = [Float32(0.0)] * cols
+        state_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
+        seed_vals = seed_row(mSeed, seed_seq, h, row0 + state_row, col0, cols, bias_rows)
         for c in cutlass.range_constexpr(cols):
-            cur[rr * cols + c] = seed_vals[c]
+            cur[rr, c] = seed_vals[c]
 
-    if count == Int32(1):
-        for rr in cutlass.range_constexpr(own_rows):
-            seed_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
-            store_row_f32(
-                element_addr(mX, seq_base, h, row0 + seed_row, col0),
-                [cur[rr * cols + c] for c in range(cols)],
-                cols,
-            )
+    # A one-slot walk only copies its seed, unless the state leaving the slot is wanted.
+    if count == Int32(1 if cutlass.const_expr(mFinal is None) else 0):
+        if cutlass.const_expr(mX is not None):
+            for rr in cutlass.range_constexpr(own_rows):
+                state_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
+                store_row_f32(
+                    element_addr(mX, seq_base, h, row0 + state_row, col0),
+                    [cur[rr, c] for c in range(cols)],
+                    cols,
+                )
     else:
         for rr in cutlass.range_constexpr(own_rows):
-            seed_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
+            state_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
             store_row_shared(
-                sWalk.iterator + (seed_row * K + col0),
-                [cur[rr * cols + c] for c in range(cols)],
+                sWalk.iterator + (state_row * K + col0),
+                [cur[rr, c] for c in range(cols)],
                 cols,
             )
         first_step = Int32(0) if cutlass.const_expr(not transpose) else count - Int32(1)
@@ -708,14 +736,15 @@ def chain_walk_fma(
             slot = seq_base + step
             for rr in cutlass.range_constexpr(own_rows):
                 row = row0 + row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
-                store_row_f32(
-                    element_addr(mX, slot, h, row, col0),
-                    [cur[rr * cols + c] for c in range(cols)],
-                    cols,
-                )
-                h_vals = load_row_f32(mH, element_addr(mH, slot, h, row, col0), cols)
+                if cutlass.const_expr(mX is not None):
+                    store_row_f32(
+                        element_addr(mX, slot, h, row, col0),
+                        [cur[rr, c] for c in range(cols)],
+                        cols,
+                    )
+                h_vals = bias_row(mH, slot, h, row, col0, cols, bias_rows)
                 for c in cutlass.range_constexpr(cols):
-                    piece_h[rr * cols + c] = h_vals[c]
+                    piece_h[rr, c] = h_vals[c]
             if i + Int32(1) < count:
                 next_step = (
                     step + Int32(1) if cutlass.const_expr(not transpose) else step - Int32(1)
@@ -729,8 +758,7 @@ def chain_walk_fma(
             buf_words = (i % Int32(CHAIN_M_BUFFERS)) * Int32(m_words)
 
             # ---- one sweep over the k tiles ------------------------------------------------
-            for j in cutlass.range_constexpr(group_rows * cols):
-                acc[j] = Float32(0.0)
+            acc.fill(0.0)
             for tile in cutlass.range_constexpr(tiles):
                 k0 = k_warp * Int32(k_slice) + Int32(tile * CHAIN_K_TILE)
                 if cutlass.const_expr(transpose):
@@ -750,7 +778,7 @@ def chain_walk_fma(
                             )
                             m_vals += ld_shared_f32(sM.iterator + m_word, 4)
                         for kk in cutlass.range_constexpr(CHAIN_K_TILE):
-                            m_tile[kk * cols + c] = m_vals[kk]
+                            m_tile[kk, c] = m_vals[kk]
                 else:
                     for kk in cutlass.range_constexpr(CHAIN_K_TILE):
                         m_row = k0 + Int32(kk)
@@ -768,23 +796,21 @@ def chain_walk_fma(
                             )
                             m_vals += ld_shared_f32(sM.iterator + m_word, min(4, cols))
                         for c in cutlass.range_constexpr(cols):
-                            m_tile[kk * cols + c] = m_vals[c]
+                            m_tile[kk, c] = m_vals[c]
                 for r in cutlass.range_constexpr(group_rows):
                     op_row = row_group * Int32(group_rows) + Int32(r)
                     for kq in cutlass.range_constexpr(CHAIN_K_TILE // 4):
                         x4 = ld_shared_f32(sWalk.iterator + (op_row * K + k0 + Int32(4 * kq)), 4)
                         for e in cutlass.range_constexpr(4):
                             for c in cutlass.range_constexpr(cols):
-                                acc[r * cols + c] = cute.math.fma(
-                                    x4[e], m_tile[(4 * kq + e) * cols + c], acc[r * cols + c]
-                                )
+                                acc[r, c] = cute.math.fma(x4[e], m_tile[4 * kq + e, c], acc[r, c])
 
             # ---- slice partials ------------------------------------------------------------
             for r in cutlass.range_constexpr(group_rows):
                 op_row = row_group * Int32(group_rows) + Int32(r)
                 store_row_shared(
                     sPart.iterator + ((k_warp * Int32(rows) + op_row) * K + col0),
-                    [acc[r * cols + c] for c in range(cols)],
+                    [acc[r, c] for c in range(cols)],
                     cols,
                 )
             cute.arch.barrier()
@@ -792,7 +818,7 @@ def chain_walk_fma(
             # ---- owned rows: H_j plus the four slice partials in slice order ---------------
             for rr in cutlass.range_constexpr(own_rows):
                 op_row = row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
-                total = [piece_h[rr * cols + c] for c in range(cols)]
+                total = [piece_h[rr, c] for c in range(cols)]
                 for w2 in cutlass.range_constexpr(CHAIN_K_WARPS):
                     part = load_row_shared(
                         sPart.iterator + ((Int32(w2 * rows) + op_row) * K + col0), cols
@@ -800,10 +826,18 @@ def chain_walk_fma(
                     for c in cutlass.range_constexpr(cols):
                         total[c] = total[c] + part[c]
                 for c in cutlass.range_constexpr(cols):
-                    cur[rr * cols + c] = total[c]
+                    cur[rr, c] = total[c]
                 store_row_shared(sWalk.iterator + (op_row * K + col0), total, cols)
             cute.arch.barrier()
             i = i + Int32(1)
+        if cutlass.const_expr(mFinal is not None):
+            for rr in cutlass.range_constexpr(own_rows):
+                row = row0 + row_group * Int32(group_rows) + k_warp * Int32(own_rows) + Int32(rr)
+                store_row_f32(
+                    element_addr(mFinal, final_seq, h, row, col0),
+                    [cur[rr, c] for c in range(cols)],
+                    cols,
+                )
 
 
 @cute.jit
@@ -879,9 +913,12 @@ def chain_walk_mma(
     heads_out: Int32,
     mH: cute.Tensor,
     mM: cute.Tensor,
-    mX: cute.Tensor,
+    mX: cute.Tensor | None,
     mSeed: cute.Tensor | None,
     seed_seq: Int32,
+    mFinal: cute.Tensor | None,
+    final_seq: Int32,
+    bias_rows: cutlass.Constexpr[int | None],
     h: Int32,
     row0: Int32,
     seq_base: Int32,
@@ -902,7 +939,8 @@ def chain_walk_mma(
     takes k ``16 kc + 4 t + 2 s`` for the fragment's k slot ``t`` and the next k for slot ``t +
     4``. The state is kept in SMEM in that A fragment order (one 16-byte fragment per lane and
     k step) in two buffers swapped each step; ``M_j`` arrives by ``cp.async``
-    ``CHAIN_MMA_M_BUFFERS - 1`` steps ahead; one CTA barrier per step."""
+    ``CHAIN_MMA_M_BUFFERS - 1`` steps ahead; one CTA barrier per step. With ``mFinal`` bound
+    the state leaving the walk lands at ``mFinal[final_seq]``; without ``mX`` only it is stored."""
     K = cutlass.const_expr(dim_k)
     n_tiles = cutlass.const_expr(chain_n_tiles(K))
     m_tiles = cutlass.const_expr(rows // 16)
@@ -953,22 +991,19 @@ def chain_walk_mma(
 
     # ---- seeds -------------------------------------------------------------------------------
     for r in cutlass.range_constexpr(m_tiles * 2):
-        if cutlass.const_expr(mSeed is not None):
-            vals = load_row_f32(
-                mSeed, element_addr(mSeed, seed_seq, h, row0 + state_rows[r], col0), row_cols
-            )
-        else:
-            vals = [Float32(0.0)] * row_cols
+        vals = seed_row(mSeed, seed_seq, h, row0 + state_rows[r], col0, row_cols, bias_rows)
         for e in cutlass.range_constexpr(row_cols):
             cur[r * row_cols + e] = vals[e]
 
-    if count == Int32(1):
-        for r in cutlass.range_constexpr(m_tiles * 2):
-            store_row_f32(
-                element_addr(mX, seq_base, h, row0 + state_rows[r], col0),
-                [cur[r * row_cols + e] for e in range(row_cols)],
-                row_cols,
-            )
+    # A one-slot walk only copies its seed, unless the state leaving the slot is wanted.
+    if count == Int32(1 if cutlass.const_expr(mFinal is None) else 0):
+        if cutlass.const_expr(mX is not None):
+            for r in cutlass.range_constexpr(m_tiles * 2):
+                store_row_f32(
+                    element_addr(mX, seq_base, h, row0 + state_rows[r], col0),
+                    [cur[r * row_cols + e] for e in range(row_cols)],
+                    row_cols,
+                )
     else:
         # M of walk index j sits in buffer j % CHAIN_MMA_M_BUFFERS; a step without a prefetch
         # commits an empty group so the wait below always leaves the same groups in flight.
@@ -1000,12 +1035,13 @@ def chain_walk_mma(
             piece_h = []
             for r in cutlass.range_constexpr(m_tiles * 2):
                 row = row0 + state_rows[r]
-                store_row_f32(
-                    element_addr(mX, slot, h, row, col0),
-                    [cur[r * row_cols + e] for e in range(row_cols)],
-                    row_cols,
-                )
-                piece_h += load_row_f32(mH, element_addr(mH, slot, h, row, col0), row_cols)
+                if cutlass.const_expr(mX is not None):
+                    store_row_f32(
+                        element_addr(mX, slot, h, row, col0),
+                        [cur[r * row_cols + e] for e in range(row_cols)],
+                        row_cols,
+                    )
+                piece_h += bias_row(mH, slot, h, row, col0, row_cols, bias_rows)
             ahead = i + Int32(CHAIN_MMA_M_BUFFERS - 1)
             if ahead < count:
                 prefetch_m_tile(
@@ -1074,6 +1110,13 @@ def chain_walk_mma(
                 K,
             )
             i = i + Int32(1)
+        if cutlass.const_expr(mFinal is not None):
+            for r in cutlass.range_constexpr(m_tiles * 2):
+                store_row_f32(
+                    element_addr(mFinal, final_seq, h, row0 + state_rows[r], col0),
+                    [cur[r * row_cols + e] for e in range(row_cols)],
+                    row_cols,
+                )
 
 
 @cute.jit
@@ -1134,22 +1177,29 @@ def state_chain_kernel(
     heads_out: Int32,
     mH: cute.Tensor,
     mM: cute.Tensor,
-    mX: cute.Tensor,
+    mX: cute.Tensor | None,
     mSeed: cute.Tensor | None,
     mMainRows: cute.Tensor,
     mSeedIndices: cute.Tensor | None,
     mG: cute.Tensor | None,
     mDX: cute.Tensor | None,
     mDSeed: cute.Tensor | None,
+    mFinal: cute.Tensor | None,
+    bias_rows: cutlass.Constexpr[int | None],
+    first_row: cutlass.Constexpr[int],
 ):
-    """CTA ``(seq, h, c)`` chains state rows ``[c * rows, (c + 1) * rows)`` over the
-    sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``, writing each
-    slot's incoming state to ``X``. Blocks of a multiple of 16 rows run on tensor cores
-    (:func:`chain_walk_mma`, four warps); 8-row blocks, which give few-head grids twice the
-    CTAs, on FMA (:func:`chain_walk_fma`: eight warps, two row groups times four k slices,
-    lane ``l`` owning ``K / 32`` columns; each ``M_j`` is staged whole in SMEM by
-    double-buffered ``cp.async`` and read as 8-wide k tiles, the four slice partials added to
-    ``H_j`` in slice order by the row owner). A one-slot sequence copies its seed into ``X``.
+    """CTA ``(seq, h, c)`` chains state rows ``first_row + [c * rows, (c + 1) * rows)`` over the
+    sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``, writing each slot's
+    incoming state to ``X`` (when bound) and, with ``mFinal`` bound, the state leaving the walk
+    (past the last slot, the first when transposed) to ``mFinal[seq]``. With ``bias_rows`` set the
+    chain composes affine maps: ``H`` holds only the state's first ``bias_rows`` rows (a map's
+    bias), and the ``dim_k`` rows below them take no bias and, without a seed, start at the
+    identity (the map's transition). Blocks of a multiple of 16 rows run on tensor cores
+    (:func:`chain_walk_mma`, four warps); 8-row blocks, which give few-head grids twice the CTAs,
+    on FMA (:func:`chain_walk_fma`: eight warps, two row groups times four k slices, lane ``l``
+    owning ``K / 32`` columns; each ``M_j`` is staged whole in SMEM by double-buffered ``cp.async``
+    and read as 8-wide k tiles, the four slice partials added to ``H_j`` in slice order by the row
+    owner). A one-slot sequence copies its seed into ``X``.
 
     With ``mG`` bound the grid's ``c`` extent doubles: its lower half runs this chain forward
     and its upper half the transposed chain of ``(mG, mDX, mDSeed)`` over the same ``M``, the
@@ -1188,19 +1238,19 @@ def state_chain_kernel(
     walk_args = (seq_base, count, tidx, *walk)
     if cutlass.const_expr(mG is None):
         walk_fn(
-            K, rows, transpose, heads_out, mH, mM, mX, mSeed, seed_seq, h,
-            row_block * Int32(rows), *walk_args,
+            K, rows, transpose, heads_out, mH, mM, mX, mSeed, seed_seq, mFinal, seq, bias_rows,
+            h, Int32(first_row) + row_block * Int32(rows), *walk_args,
         )  # fmt: skip
     else:
         blocks = Int32(cute.arch.grid_dim()[2]) // Int32(2)
         if row_block < blocks:
             walk_fn(
-                K, rows, False, heads_out, mH, mM, mX, mSeed, seed_seq, h,
+                K, rows, False, heads_out, mH, mM, mX, mSeed, seed_seq, None, seq, None, h,
                 row_block * Int32(rows), *walk_args,
             )  # fmt: skip
         else:
             walk_fn(
-                K, rows, True, heads_out, mG, mM, mDX, mDSeed, seed_seq, h,
+                K, rows, True, heads_out, mG, mM, mDX, mDSeed, seed_seq, None, seq, None, h,
                 (row_block - blocks) * Int32(rows), *walk_args,
             )  # fmt: skip
     cute.arch.griddepcontrol_launch_dependents()
@@ -1216,24 +1266,40 @@ def launch_state_chain(
     num_seqs: Int32,
     mH: cute.Tensor,
     mM: cute.Tensor,
-    mX: cute.Tensor,
+    mX: cute.Tensor | None,
     mSeed: cute.Tensor | None,
     mMainRows: cute.Tensor,
     mSeedIndices: cute.Tensor | None,
     stream: cuda.CUstream,
     *,
     reverse: tuple | None = None,
+    final: cute.Tensor | None = None,
+    bias_rows: cutlass.Constexpr[int | None] = None,
+    first_row: cutlass.Constexpr[int] = 0,
 ) -> None:
     """Chain the pieces' summaries into every slot's incoming state ``X`` (``transpose``: the
     backward recurrence over ``M^T``, last slot first), seeded by ``mSeed`` (zero when None,
     row ``mSeedIndices[seq]`` when bound); ``rows`` from :func:`chain_rows_per_cta`. With
     ``reverse = (mG, mDX, mDSeed)`` the same launch also runs the transposed chain of ``mG``
-    over ``mM`` into ``mDX`` (``transpose`` must be False). Callable from a launch bundle's
-    ``@cute.jit`` host."""
+    over ``mM`` into ``mDX`` (``transpose`` must be False). ``final`` (``[num_seqs, HO, V,
+    K]``) receives each sequence's state leaving its walk: the composition of all its slots;
+    with ``final``, ``mX`` may be None to store only it.
+    ``bias_rows = dim_v - dim_k``, ``mH``'s row extent, makes it a map chain (see
+    :func:`state_chain_kernel`); from no seed, ``final`` is then each sequence's ``[bias;
+    transition]`` composed over its slots. A nonzero ``first_row`` chains only the state rows from
+    it on into ``final``: its other rows are left unwritten, and each chained row has the bits of a
+    full launch. Callable from a launch bundle's ``@cute.jit`` host."""
+    assert rows % 16 == 0 or rows % CHAIN_WARPS == 0, "every walk warp owns whole rows"
+    assert dim_v % rows == 0, "the row blocks tile the state"
+    assert mX is not None or final is not None, "the chain must store some state"
+    assert first_row % rows == 0 and (first_row == 0 or mX is None), "first_row: final rows only"
     if cutlass.const_expr(reverse is not None):
         assert not transpose, "the paired launch chains forward and transposed"
+        assert final is None and mX is not None, "the paired launch keeps no final state"
     mG, mDX, mDSeed = reverse if cutlass.const_expr(reverse is not None) else (None,) * 3
     chains = 1 if cutlass.const_expr(reverse is None) else 2
+    if cutlass.const_expr(bias_rows is not None):
+        assert bias_rows == dim_v - dim_k and reverse is None, "a map chain runs alone"
     state_chain_kernel(
         dim_k,
         rows,
@@ -1248,8 +1314,11 @@ def launch_state_chain(
         mG,
         mDX,
         mDSeed,
+        final,
+        bias_rows,
+        first_row,
     ).launch(
-        grid=(num_seqs, heads_out, chains * (dim_v // rows)),
+        grid=(num_seqs, heads_out, chains * ((dim_v - first_row) // rows)),
         block=(CHAIN_MMA_THREADS if cutlass.const_expr(rows % 16 == 0) else CHAIN_THREADS, 1, 1),
         stream=stream,
         use_pdl=True,
@@ -1376,14 +1445,32 @@ def compile_state_chain(
     use_int64_offsets: bool,
     paired: bool = False,
     reverse_seed_dtype_name: str | None = None,
+    final: bool = False,
+    bias_rows: int | None = None,
+    slot_states: bool = True,
+    first_row: int = 0,
 ):
-    """Compile :func:`launch_state_chain`, ``paired`` with its transposed chain; every extent
-    but ``V`` / ``K`` is symbolic (int64 with ``use_int64_offsets``)."""
+    """Compile :func:`launch_state_chain`, ``paired`` with its transposed chain, with a
+    ``final`` state, as a map chain over ``bias_rows`` bias rows, or without the
+    ``slot_states`` (``X``) when only ``final`` is wanted, from state row ``first_row``; every
+    extent but ``V`` / ``K`` is symbolic (int64 with ``use_int64_offsets``)."""
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     @cute.jit
     def entry(
-        heads_out, num_seqs, mH, mM, mX, mSeed, mMainRows, mSeedIndices, mG, mDX, mDSeed, stream
+        heads_out,
+        num_seqs,
+        mH,
+        mM,
+        mX,
+        mSeed,
+        mMainRows,
+        mSeedIndices,
+        mG,
+        mDX,
+        mDSeed,
+        mFinal,
+        stream,
     ):
         launch_state_chain(
             dim_v,
@@ -1400,6 +1487,9 @@ def compile_state_chain(
             mSeedIndices,
             stream,
             reverse=(mG, mDX, mDSeed) if paired else None,
+            final=mFinal,
+            bias_rows=bias_rows,
+            first_row=first_row,
         )
 
     def state(dtype, d):
@@ -1417,19 +1507,21 @@ def compile_state_chain(
         entry,
         Int32(0),
         Int32(0),
-        state(Float32, dim_v),
+        state(Float32, bias_rows or dim_v),
         make_fake_compact_tensor(Float32, (sym(), sym(), dim_k, dim_k), assumed_align=16),
-        state(Float32, dim_v),
+        state(Float32, dim_v) if slot_states else None,
         seed_state(seed_dtype_name),
         _int32_vector(sym),
         _int32_vector(sym) if routed else None,
         state(Float32, dim_v) if paired else None,
         state(Float32, dim_v) if paired else None,
         seed_state(reverse_seed_dtype_name),
+        state(Float32, dim_v) if final else None,
         opt_level=OPT_LEVEL,
         name=f"wd_state_chain_{dim_v}_{dim_k}_{rows}_{int(transpose)}_"
         f"{(seed_dtype_name or 'none').lower()}_{int(routed)}_i64{int(use_int64_offsets)}_"
-        f"p{int(paired)}{(reverse_seed_dtype_name or 'none').lower()}",
+        f"p{int(paired)}{(reverse_seed_dtype_name or 'none').lower()}_f{int(final)}"
+        f"_b{bias_rows or 0}_x{int(slot_states)}_r{first_row}",
     )
 
 
@@ -1439,7 +1531,7 @@ _STATE_DTYPES = {torch.float32: "Float32", torch.bfloat16: "BFloat16"}
 def state_chain(
     state_h: torch.Tensor,
     state_m: torch.Tensor,
-    state_x: torch.Tensor,
+    state_x: torch.Tensor | None,
     main_rows: torch.Tensor,
     *,
     seed: torch.Tensor | None = None,
@@ -1448,11 +1540,17 @@ def state_chain(
     rows: int | None = None,
     use_int64_offsets: bool = False,
     reverse: tuple | None = None,
+    final: torch.Tensor | None = None,
+    first_row: int = 0,
 ) -> None:
     """Run :func:`launch_state_chain` standalone: ``state_x[slot]`` receives every slot's
     incoming state from ``state_h`` / ``state_m`` and the per-sequence ``seed``; ``reverse =
-    (state_g, state_dx, dseed)`` pairs it with the transposed chain of ``state_g``."""
-    _, heads_out, dim_v, dim_k = state_h.shape
+    (state_g, state_dx, dseed)`` pairs it with the transposed chain of ``state_g``, and
+    ``final[seq]`` receives the state leaving each sequence's walk; ``state_x=None`` stores only
+    that, from state row ``first_row`` on. A ``state_h`` with ``dim_k`` fewer rows than the states
+    runs a map chain (:func:`launch_state_chain`)."""
+    _, heads_out, dim_v, dim_k = (final if state_x is None else state_x).shape
+    bias_rows = state_h.shape[2] if state_h.shape[2] != dim_v else None
     num_seqs = main_rows.numel() - 1
     if rows is None:
         rows = chain_rows_per_cta(
@@ -1474,6 +1572,10 @@ def state_chain(
         use_int64_offsets,
         reverse is not None,
         None if dseed is None else _STATE_DTYPES[dseed.dtype],
+        final is not None,
+        bias_rows,
+        state_x is not None,
+        first_row,
     )
     fn(
         heads_out,
@@ -1487,6 +1589,7 @@ def state_chain(
         state_g,
         state_dx,
         dseed,
+        final,
     )
 
 

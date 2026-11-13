@@ -85,12 +85,14 @@ torch.cuda.synchronize()
 """
 
 # A staged warpdrive KDA handle reused after its device offsets change: the forward summaries,
-# the backward handle's reverse summaries, or the direct identity-probe reverse launch.
+# the backward handle's reverse summaries, the summary builders directly (split routes), or the
+# direct identity-probe reverse launch.
 _SUMMARY_CODE = """
 import torch
 import torch.nn.functional as F
 from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
     build_warpdrive_state_grad_summaries,
+    build_warpdrive_state_summaries,
 )
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
 
@@ -118,6 +120,16 @@ def run():
         return prepared.state_summaries(bounds)
     if route == "reverse":
         return backward.state_grad_summaries(bounds)
+    # The summary builders themselves, the split planner's callers.
+    if route == "split_forward":
+        return build_warpdrive_state_summaries(
+            saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds,
+        )
+    if route == "split_reverse":
+        return build_warpdrive_state_grad_summaries(
+            saved.q, saved.k, saved.v, saved.gate, saved.beta, backward.d_output,
+            saved.cu_seqlens, prepared.scale, transpose_forward_transition=True, bounds=bounds,
+        )
     return build_warpdrive_state_grad_summaries(
         saved.q, saved.k, saved.v, saved.gate, saved.beta, backward.d_output, saved.cu_seqlens,
         prepared.scale, transpose_forward_transition=False, bounds=bounds,
@@ -224,16 +236,34 @@ def test_public_kda_warpdrive_rejects_invalid_packed_offset_values(mode, compile
     _assert_rejected(code)
 
 
+# Two 2048-token sequences at two heads split their summaries into pieces in both directions.
+_SPLIT = [0, 2048, 4096]
+
+
 @pytest.mark.parametrize(
-    ("route", "offsets"),
+    ("route", "valid", "offsets"),
     [
-        pytest.param("forward", [1, 16, 32], id="forward-nonzero-start"),
-        pytest.param("forward", [0, 33, 32], id="forward-decreasing"),
-        pytest.param("reverse", [0, 16, 33], id="reverse-past-end"),
-        pytest.param("reverse_probe", [1, 16, 32], id="reverse_probe-nonzero-start"),
-        pytest.param("reverse_probe", [0, 16, 2**31 - 1], id="reverse_probe-int32-max"),
+        pytest.param("forward", [0, 16, 32], [1, 16, 32], id="forward-nonzero-start"),
+        pytest.param("forward", [0, 16, 32], [0, 33, 32], id="forward-decreasing"),
+        pytest.param("reverse", [0, 16, 32], [0, 16, 33], id="reverse-past-end"),
+        pytest.param("reverse_probe", [0, 16, 32], [1, 16, 32], id="reverse_probe-nonzero-start"),
+        pytest.param(
+            "reverse_probe", [0, 16, 32], [0, 16, 2**31 - 1], id="reverse_probe-int32-max"
+        ),
+        # An interior offset past the end, rejected before the planner writes its pieces.
+        pytest.param("split_forward", _SPLIT, [0, 2**31 - 1, 4096], id="split-forward-interior"),
+        pytest.param("split_reverse", _SPLIT, [0, 4097, 4096], id="split-reverse-interior"),
     ],
 )
-def test_kda_warpdrive_summaries_reject_invalid_packed_offsets(route, offsets):
-    """A prepared handle's summaries recheck offsets changed on the device after preparation."""
-    _assert_rejected(_SUMMARY_CODE.format(route=route, valid=[0, 16, 32], offsets=offsets))
+def test_kda_warpdrive_summaries_reject_invalid_packed_offsets(route, valid, offsets):
+    """A prepared handle's summaries recheck offsets changed on the device after preparation,
+    uncut or split into pieces."""
+    _assert_rejected(_SUMMARY_CODE.format(route=route, valid=valid, offsets=offsets))
+
+
+def test_split_offset_cases_split() -> None:
+    """The split cases above reach the piece planner."""
+    from attn_gym.linear._delta_rule.warpdrive.drivers import summary
+    from attn_gym.linear._delta_rule.warpdrive.drivers.plan import summary_span
+
+    assert summary_span(_SPLIT[-1], 2, 2, "cuda", b_t=16, cost=summary.KDA_SUMMARY_COST)

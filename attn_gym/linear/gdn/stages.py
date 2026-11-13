@@ -53,7 +53,7 @@ from attn_gym.linear.gdn.impl.warpdrive_ops import (
 )
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
-from attn_gym.linear.types import SPLIT_OPTION_SPEC, SplitOptions
+from attn_gym.linear.types import GDN_STAGE_OPTION_SPEC, GDNStageKernelOptions
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
@@ -168,6 +168,7 @@ class ChunkGDNWarpdrivePrepared:
 
     saved: ChunkGDNWarpdriveSaved
     scale: float
+    batch_invariant: bool = False
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -181,7 +182,13 @@ class ChunkGDNWarpdrivePrepared:
 
         saved = self.saved
         return build_warpdrive_gdn_state_summaries(
-            saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
+            saved.k,
+            saved.v,
+            saved.gate,
+            saved.beta,
+            saved.cu_seqlens,
+            bounds=bounds,
+            batch_invariant=self.batch_invariant,
         )
 
     def run(
@@ -217,17 +224,19 @@ def chunk_gdn_prepare(
     *,
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
-    kernel_options: SplitOptions | None = None,
+    kernel_options: GDNStageKernelOptions | None = None,
 ) -> ChunkGDNPrepared | ChunkGDNWarpdrivePrepared:
     """Run the factor half of ``chunk_gdn`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
     one packed stream. ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both
     summaries with warpdrive's kernels; split schedules are not available with entry states.
-    ``"autotune"`` follows ``chunk_gdn``.
+    ``"autotune"`` follows ``chunk_gdn``; ``"batch_invariant"`` (warpdrive only) keeps each
+    sequence's summary bits independent of the rest of the stream
+    (:class:`attn_gym.linear.types.GDNStageKernelOptions`).
     """
     options = resolve_chunk_kernel_options(
-        kernel_options, SPLIT_OPTION_SPEC, op_name="chunk_gdn_prepare"
+        kernel_options, GDN_STAGE_OPTION_SPEC, op_name="chunk_gdn_prepare"
     )
     if options["split_backward"] or options["split_forward"]:
         raise ValueError("split schedules are not supported by chunk_gdn_prepare")
@@ -246,7 +255,9 @@ def chunk_gdn_prepare(
         gate = normalize_compact_tensor(gate.float())
         validate_warpdrive_constraints(q, k, v)
         return ChunkGDNWarpdrivePrepared(
-            ChunkGDNWarpdriveSaved(q, k, v, gate, beta, cu_seqlens), scale
+            ChunkGDNWarpdriveSaved(q, k, v, gate, beta, cu_seqlens),
+            scale,
+            options["batch_invariant"],
         )
     q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
         q, k, v, beta, cu_seqlens=cu_seqlens, scale=scale
@@ -358,6 +369,7 @@ class ChunkGDNWarpdriveBackward:
     d_output: torch.Tensor
     initial_state: torch.Tensor | None
     scale: float
+    batch_invariant: bool = False
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
@@ -379,6 +391,7 @@ class ChunkGDNWarpdriveBackward:
             saved.cu_seqlens,
             self.scale,
             bounds=bounds,
+            batch_invariant=self.batch_invariant,
         )
 
     def run(
@@ -424,18 +437,19 @@ def chunk_gdn_prepare_backward(
     initial_state: torch.Tensor | None,
     *,
     scale: float,
-    kernel_options: SplitOptions | None = None,
+    kernel_options: GDNStageKernelOptions | None = None,
 ) -> ChunkGDNBackward | ChunkGDNWarpdriveBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the forward
     handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
-    ``kernel_options`` accepts the forward's options; ``"autotune"`` follows ``chunk_gdn``. The
+    ``kernel_options`` accepts the forward's options; ``"autotune"`` follows ``chunk_gdn`` and
+    ``"batch_invariant"`` follows ``chunk_gdn_prepare``. The
     tape selects the backend: a warpdrive tape (:class:`ChunkGDNWarpdriveSaved`) returns
     :class:`ChunkGDNWarpdriveBackward`.
     """
     options = resolve_chunk_kernel_options(
-        kernel_options, SPLIT_OPTION_SPEC, op_name="chunk_gdn_prepare_backward"
+        kernel_options, GDN_STAGE_OPTION_SPEC, op_name="chunk_gdn_prepare_backward"
     )
     if options["split_backward"] or options["split_forward"]:
         raise ValueError("split schedules are not supported by chunk_gdn_prepare_backward")
@@ -447,7 +461,11 @@ def chunk_gdn_prepare_backward(
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     if isinstance(saved, ChunkGDNWarpdriveSaved):
         return ChunkGDNWarpdriveBackward(
-            saved, d_output, _normalize_warpdrive_state(initial_state), scale
+            saved,
+            d_output,
+            _normalize_warpdrive_state(initial_state),
+            scale,
+            options["batch_invariant"],
         )
     metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     if initial_state is not None:

@@ -7,7 +7,7 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, TypedDict
 
 import torch
 
@@ -114,6 +114,26 @@ class KernelOptions(SplitOptions, total=False):
     always stride over the active work only."""
 
 
+class _StageOptions(TypedDict, total=False):
+    batch_invariant: bool
+    """Keep each sequence's context-parallel summary bits (``state_summaries`` and
+    ``state_grad_summaries``) independent of the rest of the packed stream: the other sequences,
+    their count and lengths. Defaults to ``False``, where a long sequence's summaries split into
+    pieces by a plan of the stream's shape. ``True`` scans every sequence uncut in both
+    directions. Only the warpdrive backend's summaries split, so the fused backend rejects it;
+    the handles' local ``run`` keeps its own shape-dependent plan."""
+
+
+class StageKernelOptions(KernelOptions, _StageOptions, total=False):
+    """``chunk_kda_prepare`` and ``chunk_kda_prepare_backward`` options: ``chunk_kda``'s and
+    ``batch_invariant``."""
+
+
+class GDNStageKernelOptions(SplitOptions, _StageOptions, total=False):
+    """``chunk_gdn_prepare`` and ``chunk_gdn_prepare_backward`` options: ``chunk_gdn``'s and
+    ``batch_invariant``."""
+
+
 class RecurrentKernelOptions(TuningOptions, total=False):
     """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
 
@@ -138,6 +158,8 @@ KERNEL_OPTION_SPEC: KernelOptionSpec = {
     "schedule": (("auto", "static", "persistent"), "auto"),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
+STAGE_OPTION_SPEC: KernelOptionSpec = {**KERNEL_OPTION_SPEC, "batch_invariant": (bool, False)}
+GDN_STAGE_OPTION_SPEC: KernelOptionSpec = {**SPLIT_OPTION_SPEC, "batch_invariant": (bool, False)}
 
 
 class GateTransform(str, Enum):
@@ -164,12 +186,14 @@ def resolve_gate_transform(kind: GateTransform | str) -> GateTransform:
 
 __all__ = [
     "BackendOptions",
+    "GDNStageKernelOptions",
     "GateTransform",
     "Impl",
     "KernelOptions",
     "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
+    "StageKernelOptions",
     "StateCheckpoints",
     "TuningOptions",
     "resolve_gate_transform",
