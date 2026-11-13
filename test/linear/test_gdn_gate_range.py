@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, recurrent_gdn
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
@@ -23,8 +24,8 @@ pytestmark = pytest.mark.skipif(
 def test_supported_large_negative_gates_match_recurrent_reference(backend: str, pattern: str):
     if backend == "warpdrive":
         pytest.importorskip("cutlass.experimental")
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            pytest.skip("the cuDNN backend requires SM100/SM103")
+        if not cuda_runs_sm100_kernels():
+            pytest.skip("the cuDNN backend requires an SM100-family GPU")
 
     lengths = [200, 65, 0, 127]
     shape = (1, sum(lengths), 2, 128)

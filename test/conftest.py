@@ -14,7 +14,7 @@ import pytest
 pytest.register_assert_rewrite("attn_gym.testing")
 
 # Both caches are read at import or CUDA-init time, so set them before any test module loads;
-# subprocess tests inherit them. Explicit user settings win.
+# subprocess tests inherit them. Explicit user settings win, except the TF32 override below.
 # Cached CuTeDSL objects are finalized by the driver on load and memoized in its ComputeCache.
 # One suite run writes ~1 GiB there; the smaller default limit evicts warm entries, and each
 # xdist worker then re-finalizes them (up to ~30 s per GDN backward test).
@@ -22,8 +22,13 @@ os.environ.setdefault("CUDA_CACHE_MAXSIZE", str(4 << 30))
 # FA4 otherwise recompiles every specialization in every process; its disk cache is keyed by
 # the FA4 source fingerprint, so editing a flash-attention checkout still invalidates it.
 os.environ.setdefault("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
+# NGC PyTorch containers set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1. Disable it so the FP32
+# references used to check kernel results do not run in TF32.
+os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
 
 import torch
+
+from attn_gym._backends.arch import SM100_KERNELS_REQUIREMENT, cuda_runs_sm100_kernels
 
 
 def _configure_worker_parallelism(config: pytest.Config) -> None:
@@ -110,8 +115,8 @@ def requires_blackwell() -> None:
     """Skip unless an SM100-family GPU (the warpdrive target) is present."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("warpdrive tests require SM100-family GPUs")
+    if not cuda_runs_sm100_kernels():
+        pytest.skip(f"warpdrive tests require {SM100_KERNELS_REQUIREMENT}")
 
 
 @pytest.fixture

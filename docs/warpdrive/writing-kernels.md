@@ -13,8 +13,9 @@ compilation does not prove correctness.
 
 [gemm.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/gemm.py)
 is the smallest complete example. It computes BF16 `D = A @ B.T` with FP32 accumulation on
-Blackwell SM100/SM103, including storage, launch, caching and a PyTorch wrapper. Use CuTeDSL
-4.6.2 or newer and the repository's [environment setup](index.md#tests).
+an SM100-family GPU (SM100, SM103, SM107), including storage, launch, caching and a PyTorch
+wrapper. Use CuTeDSL 4.6.2 or newer (4.8 on SM107) and the repository's
+[environment setup](index.md#tests).
 
 From the checkout root, in that environment:
 

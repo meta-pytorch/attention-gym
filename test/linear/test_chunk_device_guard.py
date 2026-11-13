@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, chunk_kda
 
 pytestmark = pytest.mark.skipif(
@@ -24,8 +25,8 @@ def test_forward_and_backward_follow_tensor_device(
             pytest.skip("the fused chunk cores require CUDA capability 8.0 or newer")
         if backend == "warpdrive":
             pytest.importorskip("cutlass.experimental")
-            if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-                pytest.skip("the cuDNN backend requires SM100/SM103")
+            if not cuda_runs_sm100_kernels():
+                pytest.skip("the cuDNN backend requires an SM100-family GPU")
         generator = torch.Generator(device="cuda:1").manual_seed(0)
         tokens = 100 if packed else 128
         shape = (1, tokens, 2, 128)

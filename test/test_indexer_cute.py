@@ -1,4 +1,4 @@
-"""Tests for the CuTeDSL (SM100/SM103) indexer backend.
+"""Tests for the CuTeDSL (SM100 family) indexer backend.
 
 Validates that the cute backend produces the same Top-K index sets as the
 eager reference, that FP64 scores at kernel-selected positions are at or
@@ -11,6 +11,7 @@ import math
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.ops import _indexer_op
 from attn_gym.testing.indexer import (
@@ -23,8 +24,8 @@ from attn_gym.testing.indexer import (
 def _skip_no_supported_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
-    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("SM100 or SM103 required for CuTe backend")
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("SM100-family GPU required for CuTe backend")
 
 
 def _validate_indices(

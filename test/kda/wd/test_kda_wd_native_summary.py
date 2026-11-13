@@ -10,6 +10,7 @@ import torch
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.warpdrive.drivers import kda as kda_driver
 from attn_gym.linear._delta_rule.warpdrive.drivers import summary as native_summary
 from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
@@ -28,8 +29,8 @@ from attn_gym.testing.kda import (
 from attn_gym.utils import cdiv
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="native warpdrive summaries require SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="native warpdrive summaries require an SM100-family GPU",
 )
 
 DTYPES = [torch.bfloat16, torch.float16]

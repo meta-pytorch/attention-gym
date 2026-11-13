@@ -17,7 +17,7 @@ from attn_gym.testing.gather_attn import (
 triton = pytest.importorskip("triton")
 from attn_gym.sparse.gather_attn.impl.triton import backward, forward, shared_backward
 
-# The grouped schedule runs only on datacenter Blackwell (SM100/SM103).
+# The grouped schedule runs only on SM100-family GPUs.
 BLACKWELL_AVAILABLE = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 
 pytestmark = [

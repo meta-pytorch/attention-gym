@@ -49,10 +49,10 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32, Int64
 from torch._guards import active_fake_mode
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute import get_device_properties, tensor_supports_contiguous_dim
 from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive import (
     Consumer,
@@ -1884,8 +1884,8 @@ def _compile_delta_h_bwd(
 ):
     """Compile one dense BlackwellDeltaHBwd variant."""
     target = get_compile_target()
-    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
-        raise ValueError(f"KDA delta-H backward requires an SM100 or SM103 target; got {target}")
+    if target.device_type != "cuda" or not runs_sm100_kernels(target.effective_capability):
+        raise ValueError(f"KDA delta-H backward requires an SM100-family target; got {target}")
     K = V = 128
     chunk_size = 64
     kern = BlackwellDeltaHBwd(
@@ -1956,8 +1956,8 @@ def _compile_delta_h_bwd_packed(
 ):
     """Compile one packed fused specialization with a width-matched TVM ABI."""
     target = get_compile_target()
-    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
-        raise ValueError(f"KDA delta-H backward requires an SM100 or SM103 target; got {target}")
+    if target.device_type != "cuda" or not runs_sm100_kernels(target.effective_capability):
+        raise ValueError(f"KDA delta-H backward requires an SM100-family target; got {target}")
     key_dim = value_dim = 128
     chunk_size = 64
     kernel = BlackwellDeltaHBwd(

@@ -12,6 +12,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.span import CHUNK_SIZE
 from attn_gym.linear.context_parallel import (
     ContextParallelPlan,
@@ -212,8 +213,8 @@ WARPDRIVE = {"backend": "warpdrive"}
 requires_warpdrive = pytest.mark.skipif(
     importlib.util.find_spec("cutlass.cute") is None
     or not torch.cuda.is_available()
-    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="warpdrive requires CuTeDSL on SM100/SM103",
+    or not cuda_runs_sm100_kernels(),
+    reason="warpdrive requires CuTeDSL on an SM100-family GPU",
 )
 KDA_WARPDRIVE = KDA._replace(
     chunk=partial(chunk_kda, kernel_options=WARPDRIVE),

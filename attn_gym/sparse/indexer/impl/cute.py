@@ -1,4 +1,4 @@
-"""Bounded-workspace indexer for SM100/SM103 scoring followed by radix Top-K.
+"""Bounded-workspace indexer for SM100-family scoring followed by radix Top-K.
 
 A slab contains at most 1024 query rows and 32 MiB of FP32 scores, independent
 of batch size and sequence length. Consecutive launches reuse that per-call
@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import torch
 
+from attn_gym._backends.arch import SM100_KERNELS_REQUIREMENT, runs_sm100_kernels
 from attn_gym._backends.cute import TMA_ALIGNMENT_BYTES, get_device_properties, tensor_supports_tma
 from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int64_abi
 from attn_gym.utils import cdiv
@@ -179,7 +180,7 @@ def _compile_topk(
 
 
 def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
-    """Validate SM100/SM103 kernel limits and Q/K base alignment.
+    """Validate SM100-family kernel limits and Q/K base alignment.
 
     Ranks, shape agreement, devices, dtype agreement, and ``topk``/``compress_ratio``
     are checked by the public ``lightning_indexer`` API.
@@ -203,8 +204,8 @@ def _validate(q: torch.Tensor, k: torch.Tensor) -> None:
             "bases and non-singleton outer strides"
         )
     properties = get_device_properties(q.device)
-    if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
-        raise RuntimeError("this tcgen05 kernel requires an SM100 or SM103 GPU")
+    if not runs_sm100_kernels((properties.major, properties.minor)):
+        raise RuntimeError(f"this tcgen05 kernel requires {SM100_KERNELS_REQUIREMENT}")
 
 
 def launch(

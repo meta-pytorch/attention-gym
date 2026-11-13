@@ -223,7 +223,7 @@ out, lse = fa4_fwd(
 128 scores -> four 32-column hardware maxima -> existing software row-max updater
 ```
 
-- SM103 only; an SM100 target raises `ValueError`. Default is false, retaining the software path.
+- SM103-family targets only (SM103 and SM107); an SM100 target raises `ValueError`. Default is false, retaining the software path.
 - Rescale threshold, exponentials, BF16 P conversion and row sums are unchanged, including
   fast-exp2's flush-to-zero rescale behavior.
 - Tests compare O/LSE bitwise: ragged Q, nonuniform scales, repeated launches, persistent

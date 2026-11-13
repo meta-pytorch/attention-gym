@@ -17,12 +17,13 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, chunk_kda
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive GDN/KDA kernels require SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive GDN/KDA kernels require an SM100-family GPU",
 )
 
 # A sequence shorter than one chunk box at the tensor start (5), an empty sequence, sequences

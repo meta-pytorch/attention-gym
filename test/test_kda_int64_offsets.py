@@ -5,12 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.cute.utils import requires_int64_abi
 
-CUTE_CAPABLE = torch.cuda.is_available() and torch.cuda.get_device_capability() in (
-    (10, 0),
-    (10, 3),
-)
+CUTE_CAPABLE = cuda_runs_sm100_kernels()
 
 
 def test_requires_int64_abi_covers_oversized_singleton_strides():

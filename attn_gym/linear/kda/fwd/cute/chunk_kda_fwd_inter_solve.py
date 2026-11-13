@@ -17,6 +17,7 @@ from cutlass import cute
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from torch._subclasses.fake_tensor import FakeTensor
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear._delta_rule.chunk_schedule import (
@@ -27,7 +28,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
     validate_schedule_request,
 )
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import GridScheduler
-from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE, is_sm100_kda_capability
+from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_k3b_offdiag_cutedsl import (
     ChunkKDAFwdK3bOffdiagCuteDSL,
 )
@@ -51,8 +52,8 @@ _IO_TYPES = (torch.float16, torch.bfloat16)
 
 def _check_compile_target() -> None:
     target = get_compile_target()
-    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
-        raise ValueError(f"KDA inter-solve requires an SM100 or SM103 target; got {target}")
+    if target.device_type != "cuda" or not runs_sm100_kernels(target.effective_capability):
+        raise ValueError(f"KDA inter-solve requires an SM100-family target; got {target}")
 
 
 def _validate_specialization(head_dim: int, chunk_size: int, subchunk_size: int) -> int:

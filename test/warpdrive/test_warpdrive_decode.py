@@ -584,6 +584,9 @@ def test_decode_matches_fa4_partials_bitwise(
     Per-sequence lengths use split counts from FA4's prepare kernel, then FA4's combine.
     """
     interface = pytest.importorskip("flash_attn.cute.interface")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        # FA4's SwapAB selector accepts only device_arch 100/103.
+        pytest.skip("FA4's SwapAB decode kernel runs only on SM100 and SM103")
     monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "swapab")
     torch.manual_seed(0)
     h, hkv = 8, 1

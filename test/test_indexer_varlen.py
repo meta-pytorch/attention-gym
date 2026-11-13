@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.sparse.gather_attn import gather_attn
 from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.ops import _indexer_op
@@ -14,8 +15,8 @@ def _device(backend):
     if not torch.cuda.is_available() or torch.version.hip:
         pytest.skip("NVIDIA CUDA required")
     capability = torch.cuda.get_device_capability()
-    if backend == "cute" and capability not in ((10, 0), (10, 3)):
-        pytest.skip("CuTe indexer requires SM100/SM103")
+    if backend == "cute" and not runs_sm100_kernels(capability):
+        pytest.skip("CuTe indexer requires an SM100-family GPU")
     if backend == "triton" and capability[0] < 9:
         pytest.skip("Triton indexer requires Hopper or newer")
     return "cuda"

@@ -16,7 +16,7 @@ Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to
 ``--partition documents`` assigns whole documents to ranks (``document_aligned_fragments``): no
 document crosses ranks, so the delta-rule op exchanges no state and its result is bitwise
 independent of the CP degree (``test/test_context_parallel_distributed.py``, table ``documents``).
-``--core-backend warpdrive`` selects the KDA warpdrive backend (SM100/SM103). ``--cuda-graph``
+``--core-backend warpdrive`` selects the KDA warpdrive backend (SM100 family). ``--cuda-graph``
 checks a changed-input replay; ``--profile`` writes a merged native Perfetto trace.
 ``--no-validate`` skips the unsharded reference at scales where it does not fit. Batch
 construction, loss/backward, and capture are shown in ``delta_rule_training.py`` and imported here.

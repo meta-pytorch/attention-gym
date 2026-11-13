@@ -8,6 +8,7 @@ import collections
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn
 from attn_gym.linear._delta_rule.warpdrive import contract
 from attn_gym.linear._delta_rule.warpdrive.bundles import gdn_warmup_backward
@@ -16,8 +17,8 @@ from attn_gym.testing import make_gdn_test_inputs
 from attn_gym.warpdrive.cache import jit as cute_cache
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive backend requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive backend requires an SM100-family GPU",
 )
 
 _WARPDRIVE = {"backend": "warpdrive"}

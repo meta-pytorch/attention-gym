@@ -8,6 +8,7 @@ import pytest
 import torch
 from test_gather_attn_triton import assert_matches_low_precision_eager
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.sparse.gather_attn import (
     AuxRequest,
     GatherAttnAux,
@@ -246,16 +247,10 @@ def test_d512_torch_compile_fullgraph(heads, share_kv, kernel_options):
 @pytest.mark.usefixtures("fresh_compile_cache")
 def test_cute_eligible_auto_fullgraph_training():
     from attn_gym.sparse.gather_attn.api import _select_backend
-    from attn_gym.sparse.gather_attn.impl.cute import (
-        SUPPORTED_CAPABILITIES,
-        _fa4_available,
-    )
+    from attn_gym.sparse.gather_attn.impl.cute import _fa4_available
 
-    if (
-        not torch.cuda.is_available()
-        or torch.cuda.get_device_capability() not in SUPPORTED_CAPABILITIES
-    ):
-        pytest.skip("SM100 or SM103 required")
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("SM100-family GPU required")
     if not _fa4_available(with_sink=False):
         pytest.skip("FA4 required to exercise compiled CuTe dispatch")
     torch.manual_seed(0)

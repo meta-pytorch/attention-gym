@@ -7,13 +7,14 @@ import subprocess
 import sys
 
 import pytest
-import torch
+
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive GDN/KDA kernels require SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive GDN/KDA kernels require an SM100-family GPU",
 )
 
 # Each case is a fresh subprocess: a device assert poisons the CUDA context.

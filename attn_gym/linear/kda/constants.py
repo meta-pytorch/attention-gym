@@ -10,8 +10,6 @@ from attn_gym.linear._delta_rule.constants import (
     DEFAULT_CHUNK_SIZE,
     LN2,
     LOG2_E,
-    SM100_KDA_CAPABILITIES,
-    is_sm100_kda_capability,
 )
 
 # The causal intra-chunk reference spans 15 steps. Keep the rebase exponent below
@@ -31,6 +29,4 @@ __all__ = [
     "LN2",
     "LOG2_E",
     "MAX_GATE_LOWER_BOUND_MAGNITUDE",
-    "SM100_KDA_CAPABILITIES",
-    "is_sm100_kda_capability",
 ]

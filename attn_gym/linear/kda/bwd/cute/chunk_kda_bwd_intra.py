@@ -21,11 +21,12 @@ from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import make_fake_compact_tensor, make_fake_tensor
 from cutlass.cutlass_dsl import Constexpr, T, dsl_user_op
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute.utils import cute_dtype, requires_int64_abi
 from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym._backends.tune import run_tunable
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.constants import LN2, is_sm100_kda_capability
+from attn_gym.linear.kda.constants import LN2
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_work,
 )
@@ -2015,7 +2016,7 @@ def _compile_chunk_kda_bwd_intra(
     op = ChunkKdaBwdIntraHmmaGrid(
         ragged=ragged,
         use_int64_offsets=use_int64_offsets,
-        use_packed_f32x2=is_sm100_kda_capability(capability),
+        use_packed_f32x2=runs_sm100_kernels(capability),
         use_stmatrix=capability >= (9, 0),
         fastmath=fastmath,
     )
