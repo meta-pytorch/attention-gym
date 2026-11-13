@@ -18,6 +18,7 @@ from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
 from attn_gym.linear.kda.utils import is_sm100_kda_target
+from attn_gym.linear.types import StateCheckpoints
 
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
@@ -160,6 +161,7 @@ def _finish_chunk_kda_fwd(
     autotune: bool,
     schedule: ScheduleRequest,
     fastmath: bool = False,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply an initial state and compose token outputs from prepared local factors."""
     with profiler_range("kda/triton/inter_chunk_state"):
@@ -173,6 +175,7 @@ def _finish_chunk_kda_fwd(
             has_initial_state=has_initial_state,
             chunk_size=_CHUNK_SIZE,
             output_final_state=output_final_state,
+            state_checkpoints=state_checkpoints,
             metadata=metadata,
             fastmath=fastmath,
         )
@@ -209,6 +212,7 @@ def _chunk_kda_fwd(
     autotune: bool,
     schedule: ScheduleRequest,
     fastmath: bool = False,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Run the optimized KDA core using an already selected chunk schedule."""
     factors = _prepare_chunk_kda_fwd(
@@ -236,6 +240,7 @@ def _chunk_kda_fwd(
         autotune=autotune,
         schedule=schedule,
         fastmath=fastmath,
+        state_checkpoints=state_checkpoints,
     )
     return output, final_state, factors.aqk, factors.akk
 
@@ -442,6 +447,9 @@ def _chunk_kda_fwd_ragged_paged_cuda(
     chunk_offsets: torch.Tensor,
     autotune: bool,
     schedule: str,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> torch.Tensor:
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_paged_private_abi(
@@ -471,6 +479,11 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         autotune=autotune,
         schedule=ScheduleRequest(schedule),
         fastmath=True,
+        state_checkpoints=(
+            StateCheckpoints(checkpoint_states, cu_checkpoint_offsets, checkpoint_interval)
+            if checkpoint_states is not None
+            else None
+        ),
     )
     return output
 
