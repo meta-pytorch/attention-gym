@@ -241,3 +241,27 @@ def test_backward_dq_is_accurate_below_the_documented_headroom(dtype) -> None:
     case["v"][0, 14] = 1.0
     case["d_output"][0, 15] = 128.0
     _assert_matches_fp64(case, dtype, max_eps=2.0)
+
+
+def test_fp16_nan_query_reaches_the_output_and_key_gradient() -> None:
+    """A NaN query channel stays NaN through the TF32 decay products. Without an entry state,
+    a one-token query reaches the output only through its TF32 attention tile, where rounding
+    the canonical NaN 0x7fffffff by adding half a TF32 ulp turned it into -0."""
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=torch.float16)
+    q[..., 0] = math.nan
+    k = torch.zeros_like(q)
+    k[..., 0] = 1
+    leaves = [
+        tensor.requires_grad_()
+        for tensor in (
+            q,
+            k,
+            torch.ones_like(q),
+            torch.zeros(q.shape, device="cuda"),
+            torch.ones(1, 1, 1, device="cuda"),
+        )
+    ]
+    output, _ = chunk_kda(*leaves, kernel_options={"backend": "warpdrive", "autotune": False})
+    assert torch.isnan(output).all()
+    (dk,) = torch.autograd.grad(output, leaves[1], torch.ones_like(output))
+    assert torch.isnan(dk[..., 0]).all()

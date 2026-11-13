@@ -25,6 +25,7 @@ from .ptx import (
     mma_step,
     mma_step_tf32,
     st_shared_v4,
+    tf32_round,
 )
 from .ragged import RaggedTma, ragged_load
 
@@ -507,9 +508,9 @@ def tf32_offset(row, dim, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr[b
 def sts_tf32x8(
     base, row, dim, values, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr = False
 ):
-    """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32 and store
-    them into the tile at ``base``."""
-    words = [cute.arch.cvt_f32_tf32(v) for v in values]
+    """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32
+    (``tf32_round``) and store them into the tile at ``base``."""
+    words = [tf32_round(v) for v in values]
     for half in cutlass.range_constexpr(2):
         st_shared_v4(
             base + tf32_offset(row, dim + 4 * half, d_k, umma), words[4 * half : 4 * half + 4]
