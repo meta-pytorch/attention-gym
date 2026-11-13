@@ -1,5 +1,6 @@
 """Test kernel compile keys, shape reuse, source invalidation, and compiler-process pickling."""
 
+import dataclasses
 import importlib
 import pickle
 import sys
@@ -17,6 +18,8 @@ from attn_gym.warpdrive import (
     ClusterLaunchControl,
     CtaPair,
     ProtocolError,
+    RoleConfig,
+    SingleCta,
 )
 from attn_gym.warpdrive.cache import CacheInfo, CompileTarget, compile_many
 from attn_gym.warpdrive.cache import _key as cute_key
@@ -68,23 +71,22 @@ def test_key_names_each_compile_time_choice():
     """Equal configurations share a key; codegen and trace-check settings get distinct keys."""
     base = key_of(Gemm())
     assert key_of(Gemm()) == key_of(Gemm(ab_stages=3)) == base  # defaults are filled in
-    strict = Gemm()
-    strict.alias_check = "strict"
     changed = [
         Gemm(ab_stages=4),
         Gemm(acc_stages=2),
-        Gemm().enable_iket(),
-        Gemm().enable_iket(waits=False),
-        Gemm().enable_trace("globaltimer"),
-        Gemm().enable_trace("globaltimer", events_per_role=64),
-        strict,
+        Gemm(trace_backend="iket"),
+        Gemm(trace_backend="iket", trace_waits=False),
+        Gemm(trace_backend="globaltimer"),
+        Gemm(trace_backend="globaltimer", trace_events_per_role=64),
+        Gemm(alias_check="strict"),
         ReorderedGemm(),
     ]
     keys = {key_of(op) for op in changed}
     assert base not in keys and len(keys) == len(changed)
     # Trace options that cannot change the code do not split the key.
-    assert key_of(Gemm().enable_trace(None, waits=False, events_per_role=8)) == base
-    assert key_of(Gemm().enable_trace("iket", events_per_role=8)) == key_of(Gemm().enable_iket())
+    assert key_of(Gemm(trace_waits=False, trace_events_per_role=8)) == base
+    iket = key_of(Gemm(trace_backend="iket"))
+    assert key_of(Gemm(trace_backend="iket", trace_events_per_role=8)) == iket
     pgemms = [
         PersistentGemm(),
         PersistentGemm(schedule=ClusterLaunchControl()),
@@ -92,46 +94,44 @@ def test_key_names_each_compile_time_choice():
         PersistentGemm(tile_n=224),
     ]
     assert len({key_of(op, compile_pgemm) for op in pgemms}) == len(pgemms)
-    reassigned = PersistentGemm()
-    reassigned.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
-    assert key_of(reassigned, compile_pgemm) != key_of(pgemms[0], compile_pgemm)
     stages = [2]
     listed = ListGemm(stages)
     stages[0] = 4  # the kernel keeps 2 stages; its key must too
     assert key_of(listed) != key_of(ListGemm([4])) and listed.ab.n == 2
     assert key_of(TaggedGemm(tag="a")) != key_of(TaggedGemm(tag="b"))  # mixin init assigns
-    retiled = PersistentGemm()
-    retiled.tile_n = 224  # the constructor call no longer describes the kernel
-    with pytest.raises(TypeError, match=r"\['tile_n'\] assigned after construction"):
-        key_of(retiled, compile_pgemm)
 
 
 def test_a_stream_belongs_to_one_kernel():
-    """Assigning a stream hands it over; the kernel it was taken from can no longer use it."""
-    first, second = PersistentGemm(), PersistentGemm()
-    second.work = first.work
+    """A stream handed to another kernel's constructor moves to it; the kernel it was taken
+    from can no longer use it."""
+
+    class Borrowing(PersistentGemm):
+        def __init__(self, donor):
+            super().__init__()
+            self.work = donor.work
+
+    first = PersistentGemm()
+    second = Borrowing(first)
     assert first.work.owner is second
     second.describe()
-    with pytest.raises(
-        ProtocolError, match="work: this WorkStream now belongs to a PersistentGemm"
-    ):
+    with pytest.raises(ProtocolError, match="work: this WorkStream now belongs to a Borrowing"):
         first.describe()
 
 
 def test_pickled_kernel_keeps_its_key():
-    """Pickle the constructor call and host settings for a fresh compiler process."""
-    op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair(), tile_n=224)
-    op.enable_iket(waits=False).alias_check = "off"
+    """Pickle the constructor call, settings included, for a fresh compiler process."""
+    op = PersistentGemm(
+        schedule=ClusterLaunchControl(),
+        cluster=CtaPair(),
+        tile_n=224,
+        trace_backend="iket",
+        trace_waits=False,
+        alias_check="off",
+    )
     copy = pickle.loads(pickle.dumps(op))
     assert type(copy) is PersistentGemm and copy is not op
     assert (copy.trace_backend, copy.trace_waits, copy.alias_check) == ("iket", False, "off")
     assert key_of(copy, compile_pgemm) == key_of(op, compile_pgemm)
-    moved = PersistentGemm()
-    moved.cluster = CtaPair()
-    moved.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
-    copy = pickle.loads(pickle.dumps(moved))
-    assert copy.work.owner is copy and copy.cluster == CtaPair()
-    assert key_of(copy, compile_pgemm) == key_of(moved, compile_pgemm)
     stages = [2]
     listed = ListGemm(stages)
     stages[0] = 4  # the key froze the call as made; the rebuilt kernel must be that call too
@@ -139,27 +139,112 @@ def test_pickled_kernel_keeps_its_key():
     assert copy.ab.n == 2 and key_of(copy) == key_of(listed)
 
 
-def test_collected_kernel_rejects_cluster_and_stream_reassignment():
-    """Freeze cluster, work-stream, and trace_protocol settings at first collection.
+def test_kernel_is_fixed_once_constructed():
+    """Every attribute, setting and work-stream field is fixed once construction returns, so
+    the constructor call stays the compile key; with_settings builds a changed kernel."""
+    op = PersistentGemm(
+        schedule=AtomicPersistent(stages=3), cluster=CtaPair(), trace_protocol=True
+    )
+    for name, value in (
+        ("cluster", SingleCta()),
+        ("work", PersistentGemm().work),
+        ("trace_protocol", False),
+        ("alias_check", "off"),
+        ("tile_n", 224),
+    ):
+        with pytest.raises(ProtocolError, match=f"{name} cannot change after construction"):
+            setattr(op, name, value)
+    with pytest.raises(ProtocolError, match="WorkStream.schedule cannot change"):
+        op.work.schedule = ClusterLaunchControl()
+    changed = op.with_settings(trace_protocol=False, tile_n=256, alias_check="strict")
+    assert (changed.trace_protocol, changed.tile_n, changed.alias_check) == (False, 256, "strict")
+    assert changed.cluster == CtaPair() and changed.work.schedule == AtomicPersistent(stages=3)
+    assert (op.trace_protocol, op.tile_n, op.alias_check) == (True, 224, "warn")  # untouched
+    with pytest.raises(TypeError, match="no setting or parameter 'stages'"):
+        op.with_settings(stages=2)
 
-    Before describe(), keying, or tracing, they may change. Later changes raise because
-    derived channels would be stale.
-    """
-    op = PersistentGemm()
-    op.cluster = CtaPair()
-    op.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
-    op.trace_protocol = True
-    before = op.describe()
-    with pytest.raises(ProtocolError, match="cluster.*after collection"):
-        op.cluster = CtaPair()
-    with pytest.raises(ProtocolError, match="work.*after collection"):
-        op.work = PersistentGemm(schedule=AtomicPersistent(stages=3)).work
-    with pytest.raises(ProtocolError, match="trace_protocol.*after collection"):
-        op.trace_protocol = False
-    assert op.describe() == before and op.work.roles
-    with pytest.raises(AttributeError):
-        op.num_warps = 4  # derived from the roles, not a setting
-    assert op.__cute_cache_key__()  # a rejected assignment leaves the key intact
+
+def test_runtime_key_tells_constructor_calls_classes_and_settings_apart():
+    """The in-process key holds the constructor call, the class and the late settings, so two
+    kernels share a build only when every compile-time choice matches; it collects no roles."""
+    from attn_gym.warpdrive.cache.jit import fast_key
+
+    op = Gemm()
+    assert fast_key(op) == fast_key(Gemm())
+    assert op._ws_roles is None  # keying a launch collects nothing
+    strict = Gemm(alias_check="strict")  # a "warn" build must not satisfy a "strict" one
+    assert len({fast_key(k) for k in (op, Gemm(ab_stages=4), ReorderedGemm(), strict)}) == 4
+
+
+def test_cached_launch_of_a_fresh_kernel_restores_without_collecting(
+    requires_blackwell, monkeypatch
+):
+    """A fresh instance served from the in-process cache takes the build's trace record without
+    collecting its roles (the launch costs a dict lookup, not a role walk); describe() collects
+    on demand and matches the traced instance."""
+    from attn_gym.warpdrive import kernel
+
+    # The suite's fence fixture reports through checks(), which collects; measure the launch.
+    monkeypatch.setattr(kernel.WarpSpecialized, "_report_trace", lambda op: None)
+    traced = Gemm()
+    compile_gemm(traced)
+    before = compile_gemm.cache_info()
+    fresh = Gemm()
+    compile_gemm(fresh)
+    assert compile_gemm.cache_info().hits == before.hits + 1
+    assert fresh._ws_roles is None and fresh._ws_traced
+    assert fresh.describe() == traced.describe()
+
+
+def test_reused_kernel_is_served_from_its_memo(requires_blackwell, monkeypatch):
+    """The second call with one instance is a lookup on the instance, with no key built (the
+    kernel is immutable, so the memo stays valid); cache_clear() and a new compile target each
+    send the next call back through the full lookup."""
+    from attn_gym.warpdrive import WarpSpecialized
+    from attn_gym.warpdrive.cache import jit
+
+    keys = []
+    runtime_key = WarpSpecialized.__cute_runtime_key__
+    monkeypatch.setattr(
+        Gemm, "__cute_runtime_key__", lambda op: keys.append(op) or runtime_key(op)
+    )
+    op = Gemm()
+    fn = compile_gemm(op)
+    assert len(keys) == 1
+    hits = compile_gemm.cache_info().hits
+    assert compile_gemm(op) is fn and len(keys) == 1
+    assert compile_gemm.cache_info().hits == hits + 1  # counted like any other hit
+    compile_gemm.cache_clear()
+    compile_gemm(op)
+    assert len(keys) == 2
+    target = dataclasses.replace(jit.get_compile_target())  # another target object
+    monkeypatch.setattr(jit, "get_compile_target", lambda: target)
+    compile_gemm(op)
+    assert len(keys) == 3
+
+
+def test_get_or_build_reuses_one_kernel_per_constructor_call():
+    """Kernel.get_or_build() returns one instance per class and constructor call, settings
+    included; direct construction always builds a new kernel."""
+    shared = Gemm.get_or_build(ab_stages=4)
+    assert Gemm.get_or_build(ab_stages=4) is shared
+    assert Gemm.get_or_build(ab_stages=2) is not shared
+    assert Gemm.get_or_build(ab_stages=4, alias_check="strict") is not shared
+    assert ReorderedGemm.get_or_build(ab_stages=4) is not shared
+    assert Gemm(ab_stages=4) is not shared
+    load, mma = RoleConfig(4, regs=48), RoleConfig(5, regs=48)
+    roles = PersistentGemm.get_or_build(roles={"load": load, "mma": mma})
+    assert PersistentGemm.get_or_build(roles={"mma": mma, "load": load}) is roles
+
+
+def test_cache_clear_drops_in_process_builds(requires_blackwell):
+    """``cache_clear()`` empties the in-process lookup too: the next launch loads the build
+    again instead of reusing one the caller cleared."""
+    compile_gemm(Gemm())
+    compile_gemm.cache_clear()
+    assert compile_gemm.cache_info() == CacheInfo(hits=0, misses=0, currsize=0)
+    compile_gemm(Gemm())
+    assert compile_gemm.cache_info().currsize == 1
 
 
 def test_uncopyable_constructor_argument_keeps_the_kernel_usable_but_unkeyed():

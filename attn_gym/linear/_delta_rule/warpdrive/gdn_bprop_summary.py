@@ -90,6 +90,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
 
+from .gdn_summary import check_summary_outputs
 from .ptx import (
     f16x2_to_f32,
     fmul2,
@@ -1050,7 +1051,8 @@ def gdn_bprop_summary(
     scale: float,
 ) -> None:
     """Fill ``state_g`` for the work table (see the module docstring for the layouts); ``tinv``
-    holds ``gdn_tinv``'s tiles over the same pieces."""
+    holds ``gdn_tinv``'s tiles over the same pieces. ``state_g`` may be a view into a larger
+    buffer, such as the bias half of a packed ``[C; R]`` map."""
     if q.dtype not in IO_DTYPE_NAMES or {k.dtype, do.dtype, tinv.dtype} != {q.dtype}:
         raise TypeError(f"q, k, do and tinv must share a 16-bit dtype, got {q.dtype}/{k.dtype}")
     if state_g.dtype != torch.float32:
@@ -1060,9 +1062,8 @@ def gdn_bprop_summary(
     heads = gate.shape[1]
     if heads % q.shape[1] or heads % k.shape[1] or do.shape[1] != heads:
         raise ValueError("heads must match dO and be a multiple of the query and key head counts")
-    if not state_g.is_contiguous() or state_g.data_ptr() % 16:
-        raise ValueError("the bprop summaries must be contiguous and 16-byte aligned")
-    op = GdnBpropSummary(IO_DTYPE_NAMES[q.dtype], q.shape[-1], do.shape[-1])
+    check_summary_outputs("the bprop summaries", q.shape[-1], state_g)
+    op = GdnBpropSummary.get_or_build(IO_DTYPE_NAMES[q.dtype], q.shape[-1], do.shape[-1])
     fn = compile_gdn_bprop_summary(op)
     workspace, sms = op.work.launch_args(q.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), q.device)

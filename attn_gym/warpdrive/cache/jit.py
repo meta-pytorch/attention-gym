@@ -307,7 +307,7 @@ def _target_key(target: CompileTarget) -> bytes:
     return pickle.dumps(target, protocol=pickle.HIGHEST_PROTOCOL)
 
 
-def _fast_key(item: Any) -> tuple[Any, ...] | None:
+def fast_key(item: Any) -> tuple[Any, ...] | None:
     """Key a plain static value without pickling, or return None to use the pickled key.
 
     Each value is tagged with its type, so values equal across types (``True == 1``) stay
@@ -322,8 +322,12 @@ def _fast_key(item: Any) -> tuple[Any, ...] | None:
         case float() if not math.isnan(item):
             return (item_type, item.hex())
         case tuple() if item_type is tuple:  # NamedTuples keep their type via the pickled key.
-            parts = tuple(map(_fast_key, item))
+            parts = tuple(map(fast_key, item))
             return None if None in parts else (tuple, *parts)
+        case _ if hasattr(item_type, "__cute_runtime_key__"):
+            # An object with a cheap in-process key (a warpdrive kernel) keys on it instead of
+            # its full compile key; the class tags it, as the module and name do on disk.
+            return (item_type, item.__cute_runtime_key__())
         case _:
             return None
 
@@ -355,6 +359,11 @@ def jit_cache(
     An argument with ``__cute_trace_record__()`` (a picklable record of what tracing left on
     it) and ``__cute_restore_trace__(record)`` gets the record of the build restored on every
     call served from memory or disk.
+
+    A first argument with a ``__cute_memo__`` dict (a warpdrive kernel) remembers the build
+    it was served, keyed by the remaining arguments, so the next call with the same object is a
+    dictionary lookup. The object replaces that dict whenever anything its key reads changes;
+    ``cache_clear()`` and a new compile target retire every entry.
 
     Args:
         persistent: False keeps only the process-local cache.
@@ -388,6 +397,10 @@ def jit_cache(
     cache_pid = os.getpid()
     hits = 0
     misses = 0
+    # Tags this function's entries in argument memos, for one compile target; replaced to retire
+    # all of them at once (cache_clear, a fork, or another target).
+    memo_token = object()
+    memo_target = None
 
     def reset_after_fork() -> None:
         nonlocal cache_pid, hits, misses, state_lock
@@ -395,6 +408,7 @@ def jit_cache(
         if current_pid == cache_pid:
             return
         state_lock = threading.RLock()
+        retire_memos()
         memory_cache.clear()
         runtime_cache.clear()
         static_cache.clear()
@@ -492,8 +506,32 @@ def jit_cache(
                 misses += 1
             return compiled
         target = get_compile_target()
+        memo = getattr(args[0], "__cute_memo__", None) if args and cache_key is None else None
+        if memo is None or kwargs:
+            return lookup(args, kwargs, target)
+        rest = fast_key(args[1:]) if len(args) > 1 else ()
+        if rest is None:
+            return lookup(args, kwargs, target)
+        if target is not memo_target:
+            retire_memos(target)
+        memo_key = (memo_token, rest)
+        compiled = memo.get(memo_key)
+        if compiled is not None:
+            with state_lock:
+                hits += 1
+            return compiled
+        # Filled into the dict read before the lookup: a change during it retires the entry.
+        compiled = memo[memo_key] = lookup(args, kwargs, target)
+        return compiled
+
+    def retire_memos(target: CompileTarget | None = None) -> None:
+        nonlocal memo_token, memo_target
+        memo_token, memo_target = object(), target
+
+    def lookup(args: tuple[Any, ...], kwargs: dict[str, Any], target: CompileTarget) -> T:
+        nonlocal hits
         key_args, key_kwargs = key_arguments(args, kwargs)
-        runtime_key = _fast_key((key_args, tuple(key_kwargs.items())))
+        runtime_key = fast_key((key_args, tuple(key_kwargs.items())))
         if runtime_key is None:
             runtime_key = _make_runtime_key(key_args, key_kwargs, target)
         else:
@@ -616,6 +654,7 @@ def jit_cache(
         nonlocal hits, misses
         reset_after_fork()
         with state_lock:
+            retire_memos()
             memory_cache.clear()
             runtime_cache.clear()
             static_cache.clear()

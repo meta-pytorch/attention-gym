@@ -55,6 +55,7 @@ from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.arch import inline_ptx
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym._backends.cute.utils import layout_overlaps
 from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Consumer,
@@ -777,6 +778,19 @@ def compile_gdn_summary(op: GdnSummary):
     )
 
 
+def check_summary_outputs(what: str, d_k: int, *outputs: torch.Tensor) -> None:
+    """Raise unless every FP32 summary output fits the compile: unit-stride rows, a base and
+    outer strides divisible by ``d_k`` elements, and no two indices on one element (overlapping
+    rows would make items overwrite each other)."""
+    for output in outputs:
+        if output.stride(-1) != 1 or any(s % d_k for s in output.stride()[:-1]):
+            raise ValueError(f"{what} need unit-stride rows and d_k-divisible strides")
+        if output.data_ptr() % (4 * d_k):
+            raise ValueError(f"{what} must be aligned to d_k fp32 elements")
+        if layout_overlaps(output.shape, output.stride()):
+            raise ValueError(f"{what} must not overlap themselves")
+
+
 def gdn_summary(
     k: torch.Tensor,
     v: torch.Tensor,
@@ -788,7 +802,8 @@ def gdn_summary(
     work_count: torch.Tensor,
 ) -> None:
     """Fill ``state_h`` / ``state_m`` for the work table (see the module docstring for the
-    layouts); ``tinv`` holds ``gdn_tinv``'s tiles over the same pieces."""
+    layouts); ``tinv`` holds ``gdn_tinv``'s tiles over the same pieces. The states may be views
+    into a larger buffer, such as the two halves of a packed ``[H; M]`` map."""
     if k.dtype not in IO_DTYPE_NAMES or v.dtype != k.dtype or tinv.dtype != k.dtype:
         raise TypeError(f"k, v and tinv must share a 16-bit dtype, got {k.dtype}/{v.dtype}")
     if state_h.dtype != torch.float32 or state_m.dtype != torch.float32:
@@ -798,10 +813,8 @@ def gdn_summary(
     heads = gate.shape[1]
     if heads % k.shape[1] or heads % v.shape[1]:
         raise ValueError("heads must be a multiple of the key and value head counts")
-    for state in (state_h, state_m):
-        if not state.is_contiguous() or state.data_ptr() % 16:
-            raise ValueError("the summary states must be contiguous and 16-byte aligned")
-    op = GdnSummary(IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1])
+    check_summary_outputs("the summary states", k.shape[-1], state_h, state_m)
+    op = GdnSummary.get_or_build(IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1])
     fn = compile_gdn_summary(op)
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)

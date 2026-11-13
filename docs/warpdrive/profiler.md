@@ -17,7 +17,7 @@ import torch
 
 from attn_gym.warpdrive.examples.gemm import Gemm, compile_gemm
 
-op = Gemm().enable_trace("iket", waits=False)
+op = Gemm(trace_backend="iket", trace_waits=False)
 compiled = compile_gemm(op)
 
 a = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)

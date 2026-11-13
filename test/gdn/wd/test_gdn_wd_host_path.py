@@ -14,6 +14,7 @@ from attn_gym.linear._delta_rule.warpdrive import contract
 from attn_gym.linear._delta_rule.warpdrive.bundles import gdn_warmup_backward
 from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as gdn_driver
 from attn_gym.testing import make_gdn_test_inputs
+from attn_gym.warpdrive import WarpSpecialized
 from attn_gym.warpdrive.cache import jit as cute_cache
 
 pytestmark = pytest.mark.skipif(
@@ -50,7 +51,7 @@ def test_warm_gdn_call_validates_once_and_skips_full_cache_key(monkeypatch):
     calls = collections.Counter()
     _count(monkeypatch, calls, contract, "validate_gdn_bwd_operands")
     # jit_cache's full argument-key builds, the path a warm launch must skip.
-    _count(monkeypatch, calls, cute_cache, "_fast_key")
+    _count(monkeypatch, calls, WarpSpecialized, "__cute_runtime_key__")
     _count(monkeypatch, calls, cute_cache, "_make_runtime_key")
 
     _gdn_step(lengths)

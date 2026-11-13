@@ -76,10 +76,10 @@ skipped synchronization and math. Keep state explicit; raw CuTeDSL remains avail
 * Copies using barrier pointers the layer did not supply stay legal and mark TMA checks
   unverified.
 
-Call ``enable_trace(backend)`` before compiling to emit ``<role>`` ranges per work item (or
+Construct with ``trace_backend=...`` (or ``op.with_settings(trace_backend=...)``) to emit ``<role>`` ranges per work item (or
 role body), ``<channel>.acquire/.wait/.peek/.tail`` around blocking waits and
 ``<turnstile>.turn``. ``trace_region(name, payload=...)`` adds user ranges.
-``waits=False`` keeps only role and user ranges. Backends are ``"iket"`` (``enable_iket()``)
+``trace_waits=False`` keeps only role and user ranges. Backends are ``"iket"``
 and ``"globaltimer"`` (``trace_session.trace_session`` decodes it); disabled tracing emits
 nothing. ``plan_from_warpdrive(kernel, cta=0)`` exports matching ``PipelinePlan`` names for
 ``join``, ``analyze_pipeline`` and ``write_pipeline_perfetto`` in

@@ -212,7 +212,7 @@ def test_shared_body_compiles_one_body(requires_blackwell, tmp_path):
 @pytest.mark.parametrize("placement", ["ascending", "gapped"])
 def test_shared_body_globaltimer_ranges_per_instance(requires_blackwell, placement):
     """Each instance records its own role range and wait ranges from its first warp."""
-    op = SharedToy(True, placement).enable_trace("globaltimer")
+    op = SharedToy(True, placement).with_settings(trace_backend="globaltimer")
     fn = compile_toy(op)
     out_ring, out_named, out_local = _outputs()
     with trace_session(op, 1) as session:
@@ -242,7 +242,7 @@ def test_shared_body_iket_ranges_per_instance(monkeypatch, traced_compiles):
             return real.range_pop()
 
     monkeypatch.setattr(tracing, "iket", Recorder())
-    compile_toy.__wrapped__(SharedToy(True).enable_iket())
+    compile_toy.__wrapped__(SharedToy(True).with_settings(trace_backend="iket"))
     assert {f"cons[{j}]" for j in range(K)} <= set(pushed)
     assert "cons[*]" not in pushed
 

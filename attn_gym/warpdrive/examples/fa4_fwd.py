@@ -910,39 +910,20 @@ def fa4_fwd(
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
     out = torch.empty_like(q)
     lse = torch.empty(q.shape[0], q.shape[2], q.shape[1], device=q.device, dtype=torch.float32)
-    roles_key = None if roles is None else tuple(sorted(roles.items()))
-    key = (
+    op = FlashAttentionForward.get_or_build(
         kv_stages,
         turnstile,
-        schedule,
-        cluster,
-        split_p,
-        roles_key,
-        mapping,
-        use_ldred_rowmax,
-        tile_n,
-        head_dim,
-        rescale_threshold,
+        schedule=schedule,
+        cluster=cluster,
+        split_p=split_p,
+        roles=roles,
+        mapping=mapping,
+        use_ldred_rowmax=use_ldred_rowmax,
+        tile_n=tile_n,
+        head_dim=head_dim,
+        rescale_threshold=rescale_threshold,
     )
-    op = _OPS.get(key)
-    if op is None:
-        op = _OPS[key] = FlashAttentionForward(
-            kv_stages,
-            turnstile,
-            schedule=schedule,
-            cluster=cluster,
-            split_p=split_p,
-            roles=roles,
-            mapping=mapping,
-            use_ldred_rowmax=use_ldred_rowmax,
-            tile_n=tile_n,
-            head_dim=head_dim,
-            rescale_threshold=rescale_threshold,
-        )
-    fn = compile_fa4_fwd.by_static_key(key, lambda: compile_fa4_fwd(op))
+    fn = compile_fa4_fwd(op)
     workspace, sms = op.work.launch_args(q.device)
     fn(q, k, v, out, lse, scale * LOG2_E, workspace, max_ctas or sms)
     return out, lse
-
-
-_OPS: dict = {}

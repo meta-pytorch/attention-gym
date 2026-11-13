@@ -154,8 +154,7 @@ def test_diagnostic_emits_no_device_code():
     """The same kernel lowers to identical IR with the diagnostic on and off."""
     ir = []
     for mode in ("warn", "off"):
-        op = CrossWarpPOverS(barrier=True)
-        op.alias_check = mode
+        op = CrossWarpPOverS(barrier=True, alias_check=mode)
         fn = compile_toy.__wrapped__(op, "cross_warp_1")  # the compiled IR, not a cached artifact
         ir.append(str(fn.ir_module))
     assert ir[0] == ir[1]
@@ -1036,7 +1035,7 @@ def test_alias_verdicts(case):
     op = make()
     # no_proxy_fence also has a missing fence, which raises in strict mode.
     if expected != HAZARD and case != "no_proxy_fence":
-        op.alias_check = "strict"
+        op = op.with_settings(alias_check="strict")
     compile_quietly(op, case)
     text = alias_section(op)
     assert status(op, pair) == expected, text

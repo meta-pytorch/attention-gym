@@ -301,8 +301,7 @@ def test_external_channels_stay_cta_local():
         return ch
 
     external = {"ch": lambda: Ring(2, external="producer", override={"full_counts": 1})}
-    op = probe_kernel(external, {"cons": _cons, "lead": lead})
-    op.cluster = CtaPair()
+    op = probe_kernel(external, {"cons": _cons, "lead": lead}, cluster=CtaPair())
     _raises_protocol(
         "channel ch: its consumer roles run in different CTAs, but its producer side is "
         "external, driven by raw code in each CTA",

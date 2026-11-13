@@ -12,6 +12,7 @@ from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_kda
 from attn_gym.linear._delta_rule.warpdrive.bundles import kda_warmup_forward
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
+from attn_gym.warpdrive import WarpSpecialized
 from attn_gym.warpdrive.cache import jit as cute_cache
 
 pytestmark = pytest.mark.skipif(
@@ -46,7 +47,7 @@ def test_warm_kda_call_validates_once_and_skips_full_cache_key(monkeypatch):
     calls = collections.Counter()
     _count(monkeypatch, calls, kda_warmup_forward, "validate_kda_forward_operands")
     # jit_cache's full argument-key builds, the path a warm launch must skip.
-    _count(monkeypatch, calls, cute_cache, "_fast_key")
+    _count(monkeypatch, calls, WarpSpecialized, "__cute_runtime_key__")
     _count(monkeypatch, calls, cute_cache, "_make_runtime_key")
 
     _kda_step(lengths)

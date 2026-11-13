@@ -228,10 +228,14 @@ def test_rejects_unsupported_inputs(requires_blackwell):
         fa4_bwd(q, k, v, out, dout, lse, cluster=CtaPair(), dq_stages=2)
     with pytest.raises(ValueError, match="one CTA or a CTA pair"):
         fa4_bwd(q, k, v, out, dout, lse, cluster=Cluster(2, 2, pair=True))
+
+    class Persistent(FlashAttentionBackward):
+        def __init__(self):
+            super().__init__()
+            self.work = WorkStream(schedule=StaticPersistent())
+
     with pytest.raises(ValueError, match="one work item"):
-        op = FlashAttentionBackward()
-        op.work = WorkStream(schedule=StaticPersistent())
-        compile_fa4_bwd(op)
+        compile_fa4_bwd(Persistent())
     empty = torch.empty(1, 0, 2, D, device="cuda", dtype=torch.bfloat16)
     dq, dk, dv = fa4_bwd(empty, k, v, empty, empty, lse[..., :0])
     assert dq.shape == empty.shape and not dk.any() and not dv.any()

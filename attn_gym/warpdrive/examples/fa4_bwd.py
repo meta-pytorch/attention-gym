@@ -1486,21 +1486,12 @@ def compile_fa4_bwd(op: FlashAttentionBackward):
     )
 
 
-_OPS: dict = {}
-
-
-def _op(causal, roles, dq_stages, cluster) -> tuple:
+def _op(causal, roles, dq_stages, cluster):
     pair = is_pair(cluster)
     dq_stages = check_dq_stages(dq_stages, pair)  # normalized: one compile key per kernel
-    key = (causal, None if roles is None else tuple(sorted(roles.items())), dq_stages, pair)
-    op = _OPS.get(key)
-    if op is None:
-        if pair:
-            op = FlashAttentionBackward2Cta(causal, roles)
-        else:
-            op = FlashAttentionBackward(causal, roles, dq_stages)
-        _OPS[key] = op
-    return op, key
+    if pair:
+        return FlashAttentionBackward2Cta.get_or_build(causal, roles)
+    return FlashAttentionBackward.get_or_build(causal, roles, dq_stages)
 
 
 def check_dq_stages(dq_stages, pair: bool) -> int:
@@ -1544,8 +1535,8 @@ def fa4_bwd_main(
 
     This runs only the main kernel. Keyword options are the same as ``fa4_bwd``.
     """
-    op, key = _op(causal, roles, dq_stages, cluster)
-    fn = compile_fa4_bwd.by_static_key(key, lambda: compile_fa4_bwd(op))
+    op = _op(causal, roles, dq_stages, cluster)
+    fn = compile_fa4_bwd(op)
     workspace, sms = op.work.launch_args(q.device)
     fn(q, k, v, dout, lse_log2, dpsum, dq_accum, dk, dv, softmax_scale, workspace, sms)
 

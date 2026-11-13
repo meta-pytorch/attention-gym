@@ -933,6 +933,10 @@ class ClusterLaunchControl(IndexSchedule):
 # --------------------------------------------------------------------------- #
 
 
+# The fields a kernel's cache key reads (WarpSpecialized._call_key).
+_KEYED_STREAM_FIELDS = frozenset({"mapping", "schedule", "ready", "scheduler_warp"})
+
+
 @dataclass
 class WorkStream:
     """A kernel's work declaration:
@@ -989,6 +993,11 @@ class WorkStream:
         ):
             raise ValueError("broadcast schedule stages must be a positive int")
         self.schedule._check_stream(self)
+
+    def __setattr__(self, name, value):
+        if name in _KEYED_STREAM_FIELDS and self.owner is not None:
+            self.owner._check_constructing(f"WorkStream.{name}")
+        super().__setattr__(name, value)
 
     @property
     def cluster_size(self) -> int:

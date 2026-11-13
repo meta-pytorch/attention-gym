@@ -205,11 +205,15 @@ def test_custom_schedule_keys_and_launch_needs():
 
 @pytest.mark.parametrize("schedule", [OneShot(), StaticPersistent(), ClusterLaunchControl()])
 def test_scheduler_warp_only_specializes_broadcast_schedules(schedule):
-    kernels = []
-    for warp in (None, 30, 31):
-        op = Gemm()
-        op.work = WorkStream(schedule=schedule, scheduler_warp=warp)
-        kernels.append(op)
+    def streamed(warp):
+        class Streamed(Gemm):  # the warp is a class choice, not a constructor argument
+            def __init__(self):
+                super().__init__()
+                self.work = WorkStream(schedule=schedule, scheduler_warp=warp)
+
+        return Streamed()
+
+    kernels = [streamed(warp) for warp in (None, 30, 31)]
     keys = {canonical_key(op) for op in kernels}
     assert len(keys) == (3 if schedule.broadcast else 1)
     if not schedule.broadcast:
