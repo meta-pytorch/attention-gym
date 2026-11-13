@@ -9,7 +9,7 @@
 The transform kind is a compile-time specialization: ``lower_bound * sigmoid(a * z)`` (Kimi/KDA)
 or ``-a * softplus(z)`` (Mamba2/GDN) with ``z = raw + dt_bias`` and ``a = exp(A_log)``. Softplus
 uses the overflow-free form ``max(z, 0) + log1p(exp(-|z|))``; see NOTE [Fastmath Softplus] in
-``attn_gym/linear/_delta_rule/triton/softplus_gate.py`` for the fastmath accuracy contract.
+``attn_gym/linear/_delta_rule/triton/gate_transform.py`` for the fastmath accuracy contract.
 
 Each CTA owns eight heads of one physical token. The 128-thread/8-value thread-value map
 is::
@@ -58,7 +58,7 @@ _VALUES_PER_THREAD = 8
 _ALIGNMENT = 16
 _LN_2 = math.log(2.0)
 # Below this ``exp(-|z|)`` the fastmath ``log2(1 + e)`` has lost the tail; see NOTE [Fastmath
-# Softplus] in attn_gym/linear/_delta_rule/triton/softplus_gate.py.
+# Softplus] in attn_gym/linear/_delta_rule/triton/gate_transform.py.
 _SMALL_TAIL = 2.0**-8
 
 

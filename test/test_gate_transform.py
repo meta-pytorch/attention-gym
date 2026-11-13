@@ -1,4 +1,4 @@
-"""Shared gate transform semantics: kind x shape references and the fused softplus kernel."""
+"""Shared gate transform semantics: kind x shape references and the fused gate kernels."""
 
 from __future__ import annotations
 
@@ -13,8 +13,10 @@ from attn_gym.linear import GateTransform, chunk_gdn, gate_transform
 from attn_gym.linear._delta_rule.gate import (
     _gate_transform_bwd_op,
     _gate_transform_fwd_op,
-    _softplus_uses_cute,
+    _gate_uses_cute,
 )
+from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV, uses_legacy_cute
+from attn_gym.linear._delta_rule.triton import gate_transform as triton_backend
 from attn_gym.linear.kda import bound_gate
 from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import assert_relative_rms_within, clone_kda_inputs
@@ -23,14 +25,16 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="gate ops 
 
 SCALAR = "scalar"
 VECTOR = "vector"
-# Per-channel D=128 gates route to the CuTeDSL kernels on sm90+; other shapes use Triton.
+# Per-channel D=128 gates route to the legacy CuTeDSL kernels on SM100-family GPUs; every other
+# configuration uses Triton.
 VECTOR128 = "vector128"
 FUSED_SHAPES = [SCALAR, VECTOR, VECTOR128]
 HEAD_DIMS = {SCALAR: None, VECTOR: 40, VECTOR128: 128}
+KINDS = {"bounded": -3.25, "softplus": None}
+HAS_CUTLASS = importlib.util.find_spec("cutlass") is not None
+# The CuTeDSL gate kernels still compile on sm90+, so their parity tests run there.
 CUTE_CAPABLE = (
-    torch.cuda.is_available()
-    and torch.cuda.get_device_capability()[0] >= 9
-    and importlib.util.find_spec("cutlass") is not None
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9 and HAS_CUTLASS
 )
 requires_cute = pytest.mark.skipif(
     not CUTE_CAPABLE, reason="CuTeDSL gate kernels require CuTeDSL and CUDA capability >= 9.0"
@@ -38,8 +42,18 @@ requires_cute = pytest.mark.skipif(
 
 
 def uses_cute(shape: str) -> bool:
-    """Expected backend routing for a fused softplus gate of this shape."""
-    return shape == VECTOR128 and CUTE_CAPABLE
+    """Expected backend routing for a fused gate of this shape."""
+    return shape == VECTOR128 and HAS_CUTLASS and uses_legacy_cute(torch.device("cuda"))
+
+
+@pytest.fixture(params=["routed", "triton"])
+def route(request, monkeypatch) -> str:
+    """Run the routed backend, or force the legacy CuTeDSL route onto Triton."""
+    if request.param == "triton":
+        if not uses_cute(VECTOR128):
+            pytest.skip("the routed backend is already the Triton kernel")
+        monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
+    return request.param
 
 
 def make_gate_inputs(
@@ -98,7 +112,7 @@ def test_softplus_nonfast_uses_accurate_amplitude():
     raw = torch.full((1, 1, 1), 2.0**100, device="cuda")
     log_scale = torch.tensor([-90.0], device="cuda", requires_grad=True)
     bias = torch.zeros(1, device="cuda")
-    assert not _softplus_uses_cute(raw)
+    assert not _gate_uses_cute(raw)
     expected = expected_gate(raw, log_scale, bias, "softplus")
     accurate = gate_transform(raw, log_scale, bias, kind="softplus", fastmath=False)
     # Allow two FP32 subnormal quanta before multiplication by the large finite factor.
@@ -158,24 +172,24 @@ def test_fused_rejections():
         gate_transform(raw_gate.cpu(), A_log.cpu(), dt_bias.cpu(), kind="softplus")
     with pytest.raises(TypeError, match="fastmath"):
         gate_transform(raw_gate, A_log, dt_bias, kind="softplus", fastmath=1)
-    # Stage 1 fuses bounded gates only through the CuTeDSL per-channel D=128 kernel.
-    with pytest.raises(ValueError, match="use impl='reference'"):
-        gate_transform(raw_gate, A_log, dt_bias, kind="bounded", lower_bound=-5.0)
-    vector = make_gate_inputs(VECTOR, head_dim=40)
-    with pytest.raises(ValueError, match="use impl='reference'"):
-        gate_transform(*vector, kind="bounded", lower_bound=-5.0)
 
 
+@pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("shape", FUSED_SHAPES)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("fastmath", [False, True])
-def test_fused_softplus_matches_reference(shape: str, dtype: torch.dtype, fastmath: bool):
+def test_fused_gate_matches_reference(
+    shape: str, dtype: torch.dtype, fastmath: bool, kind: str, route: str
+):
     """Forward and all three gradients on partial row and channel blocks, both backends."""
+    lower_bound = KINDS[kind]
     expected_inputs = make_gate_inputs(shape, dtype=dtype, requires_grad=True)
-    assert _softplus_uses_cute(expected_inputs[0]) == uses_cute(shape)
+    assert _gate_uses_cute(expected_inputs[0]) == uses_cute(shape)
     actual_inputs = clone_kda_inputs(expected_inputs)
-    expected = gate_transform(*expected_inputs, kind="softplus", impl="reference")
-    actual = gate_transform(*actual_inputs, kind="softplus", fastmath=fastmath)
+    expected = gate_transform(
+        *expected_inputs, kind=kind, lower_bound=lower_bound, impl="reference"
+    )
+    actual = gate_transform(*actual_inputs, kind=kind, lower_bound=lower_bound, fastmath=fastmath)
     assert actual.dtype == torch.float32
     forward_tolerance = 1e-5 if fastmath else 2e-6
     torch.testing.assert_close(actual, expected, rtol=forward_tolerance, atol=forward_tolerance)
@@ -249,6 +263,74 @@ def test_fused_softplus_extreme_logits(
         torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=1e-6)
 
 
+@pytest.mark.parametrize("shape", [SCALAR, VECTOR])
+@pytest.mark.parametrize("fastmath", [False, True])
+def test_fused_bounded_keeps_saturated_gradients(shape: str, fastmath: bool):
+    """Saturated logits keep their tiny but representable gradients.
+
+    ``s * (1 - s)`` cancels to zero once ``sigmoid(x)`` rounds to one (``x >~ 17`` in FP32 and
+    ``x >~ 37`` in FP64), so the oracle is the closed form ``e / (1 + e)^2``, ``e = exp(-|x|)``.
+    """
+    raw_gate, A_log, dt_bias = make_gate_inputs(shape, dtype=torch.float32, requires_grad=True)
+    with torch.no_grad():
+        for offset, logit in enumerate((-60.0, -18.0, 0.5, 18.0, 60.0)):
+            raw_gate[:, offset::5] = logit
+        dt_bias.zero_()
+        A_log.zero_()
+    lower_bound = -5.0
+    actual = gate_transform(
+        raw_gate, A_log, dt_bias, kind="bounded", lower_bound=lower_bound, fastmath=fastmath
+    )
+    logits = raw_gate.detach().double()
+    torch.testing.assert_close(
+        actual.double(), lower_bound * torch.sigmoid(logits), rtol=1e-6, atol=1e-6
+    )
+    decay = torch.exp(-logits.abs())
+    exact_d_raw = lower_bound * decay / (1 + decay) ** 2
+    exact_d_A_log = (exact_d_raw * logits).sum((0, 1, 3)[: logits.ndim - 1])
+    d_raw, d_A_log = torch.autograd.grad(actual, (raw_gate, A_log), torch.ones_like(actual))
+    torch.testing.assert_close(d_raw.double(), exact_d_raw, rtol=1e-5, atol=0)
+    torch.testing.assert_close(d_A_log.double(), exact_d_A_log, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("fastmath", [False, True])
+@pytest.mark.parametrize(
+    ("kind", "lower_bound", "raw", "a_log", "bias"),
+    [
+        pytest.param("bounded", -5.0, 0.0, 88.0, 0.0, id="bounded-amplitude-near-max"),
+        pytest.param("bounded", -5.0, 1e4, 80.0, 0.0, id="bounded-overflowing-logit"),
+        pytest.param("softplus", None, -10020.0, 80.0, 1e4, id="softplus-overflowing-padding"),
+    ],
+)
+def test_fused_gate_gradients_stay_finite_at_extreme_amplitudes(
+    kind: str, lower_bound: float | None, raw: float, a_log: float, bias: float, fastmath: bool
+):
+    """All three gradients match the FP32 reference when only an intermediate would overflow.
+
+    Regressions: the bounded backward formed ``lower_bound * exp(A_log)`` before the sigmoid
+    slope, which overflows for ``exp(88)`` although the gradient is finite; and the padded rows
+    of a partial row block evaluate ``s = dt_bias``, where ``exp(A_log) * softplus(s)``
+    overflowed, so their zero cotangent gave ``inf * 0`` and poisoned ``d_A_log``. An
+    overflowing bounded logit has a zero slope that ``d_A_log`` must not multiply by the logit.
+    """
+    raw_gate = torch.full((1, 1, 1), raw, device="cuda", requires_grad=True)
+    A_log = torch.full((1,), a_log, device="cuda", requires_grad=True)
+    dt_bias = torch.full((1,), bias, device="cuda", requires_grad=True)
+    inputs = (raw_gate, A_log, dt_bias)
+    options = {"kind": kind, "lower_bound": lower_bound}
+    actual = gate_transform(*inputs, **options, fastmath=fastmath)
+    expected = gate_transform(*inputs, **options, impl="reference")
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=0)
+    cotangent = torch.ones_like(expected)
+    expected_gradients = torch.autograd.grad(expected, inputs, cotangent)
+    actual_gradients = torch.autograd.grad(actual, inputs, cotangent)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        assert torch.isfinite(expected_gradient).all()
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=1e-4, atol=0)
+
+
 @requires_cute
 @pytest.mark.parametrize(
     ("batch", "tokens", "heads"),
@@ -260,10 +342,11 @@ def test_fused_softplus_extreme_logits(
 )
 def test_cute_softplus_boundary_shapes(batch: int, tokens: int, heads: int):
     """The CuTeDSL softplus specialization on the forward head-group and TMA tile boundaries."""
+    if not uses_cute(VECTOR128):
+        pytest.skip("the legacy CuTeDSL gate route is not selected on this device")
     inputs = make_gate_inputs(
         VECTOR128, batch=batch, tokens=tokens, heads=heads, requires_grad=True
     )
-    assert _softplus_uses_cute(inputs[0])
     actual_inputs = clone_kda_inputs(inputs)
     expected = gate_transform(*inputs, kind="softplus", impl="reference")
     actual = gate_transform(*actual_inputs, kind="softplus")
@@ -280,9 +363,11 @@ def test_cute_softplus_boundary_shapes(batch: int, tokens: int, heads: int):
         )
 
 
+@pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("shape", FUSED_SHAPES)
-def test_fused_softplus_supports_strided_inputs(shape: str):
+def test_fused_gate_supports_strided_inputs(shape: str, kind: str, route: str):
     """Strided raw gates and cotangents are handled (in place by Triton, normalized by CuTeDSL)."""
+    lower_bound = KINDS[kind]
     raw_gate, A_log, dt_bias = make_gate_inputs(shape, heads=4, head_dim=48, requires_grad=True)
     # Slice heads and (for vector gates) channels out of a wider projection buffer; the
     # views stay differentiable so both paths see identical strided operands.
@@ -291,9 +376,9 @@ def test_fused_softplus_supports_strided_inputs(shape: str):
         views[0] = views[0][..., ::2]
         views[2] = views[2][:, ::2]
     assert not views[0].is_contiguous()
-    assert _softplus_uses_cute(views[0]) == uses_cute(shape)
-    expected = gate_transform(*views, kind="softplus", impl="reference")
-    actual = gate_transform(*views, kind="softplus")
+    assert _gate_uses_cute(views[0]) == uses_cute(shape)
+    expected = gate_transform(*views, kind=kind, lower_bound=lower_bound, impl="reference")
+    actual = gate_transform(*views, kind=kind, lower_bound=lower_bound)
     torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
     cotangent = torch.randn(*expected.shape, 2, device="cuda")[..., 0]
     assert not cotangent.is_contiguous()
@@ -314,9 +399,7 @@ def test_operator_registration(shape: str):
     utilities = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     raw_gate, A_log, dt_bias = make_gate_inputs(shape, tokens=33)
     d_gate = torch.randn(raw_gate.shape, device="cuda")
-    kinds = [("softplus", 0.0)]
-    if shape == VECTOR128 and CUTE_CAPABLE:
-        kinds.append(("bounded", -5.0))
+    kinds = [("softplus", 0.0), ("bounded", -5.0)]
     if dt_bias.ndim == 2:
         dt_bias = (
             dt_bias.t().contiguous().t()
@@ -335,27 +418,23 @@ def test_operator_registration(shape: str):
 
 
 @requires_cute
+@pytest.mark.parametrize("transform", list(GateTransform))
 @pytest.mark.parametrize("fastmath", [False, True])
-def test_softplus_backends_agree_on_d128(fastmath: bool):
-    """The CuTeDSL and Triton softplus launchers implement one contract on the shared shape."""
-    from attn_gym.linear._delta_rule.triton import softplus_gate as triton_backend
+def test_gate_backends_agree_on_d128(fastmath: bool, transform: GateTransform):
+    """The CuTeDSL and Triton gate launchers implement one contract on the shared shape."""
     from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_bwd
     from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_fwd
 
     raw_gate, A_log, dt_bias = make_gate_inputs(VECTOR128, tokens=97)
     d_gate = torch.randn(raw_gate.shape, device="cuda")
-    softplus = GateTransform.SOFTPLUS
-    cute_gate = cute_fwd._gate_transform_fwd_cuda(
-        raw_gate, A_log, dt_bias, 0.0, fastmath, softplus
-    )
-    triton_gate = triton_backend._softplus_gate_fwd_cuda(raw_gate, A_log, dt_bias, fastmath)
+    lower_bound = -5.0 if transform is GateTransform.BOUNDED else 0.0
+    args = (raw_gate, A_log, dt_bias, lower_bound, fastmath, transform)
+    cute_gate = cute_fwd._gate_transform_fwd_cuda(*args)
+    triton_gate = triton_backend._gate_transform_fwd_cuda(*args)
     torch.testing.assert_close(cute_gate, triton_gate, rtol=1e-5, atol=1e-5)
-    cute_grads = cute_bwd._gate_transform_bwd_cuda(
-        raw_gate, A_log, dt_bias, d_gate, 0.0, fastmath, softplus
-    )
-    triton_grads = triton_backend._softplus_gate_bwd_cuda(
-        raw_gate, A_log, dt_bias, d_gate, fastmath
-    )
+    args = (raw_gate, A_log, dt_bias, d_gate, lower_bound, fastmath, transform)
+    cute_grads = cute_bwd._gate_transform_bwd_cuda(*args)
+    triton_grads = triton_backend._gate_transform_bwd_cuda(*args)
     for name, cute_grad, triton_grad in zip(
         ("d_raw_gate", "d_A_log", "d_dt_bias"), cute_grads, triton_grads, strict=True
     ):
@@ -426,9 +505,11 @@ def test_cute_gate_launchers_skip_an_empty_space(batch: int, tokens: int):
     assert not dA_log.any() and not d_dt_bias.any()
 
 
+@pytest.mark.parametrize("kind", sorted(KINDS))
 @pytest.mark.parametrize("shape", [SCALAR, VECTOR128])
-def test_fused_softplus_fullgraph_dynamic_tokens(shape: str):
+def test_fused_gate_fullgraph_dynamic_tokens(shape: str, kind: str):
     """Reuse one fullgraph callable across batch and token sizes with backward, both backends."""
+    lower_bound = KINDS[kind]
     torch.compiler.reset()
     with torch._dynamo.config.patch(error_on_recompile=True):
         compiled = torch.compile(gate_transform, fullgraph=True, dynamic=True)
@@ -437,8 +518,10 @@ def test_fused_softplus_fullgraph_dynamic_tokens(shape: str):
                 shape, batch=batch, tokens=tokens, requires_grad=True, seed=tokens
             )
             actual_inputs = clone_kda_inputs(expected_inputs)
-            expected = gate_transform(*expected_inputs, kind="softplus", impl="reference")
-            actual = compiled(*actual_inputs, kind="softplus")
+            expected = gate_transform(
+                *expected_inputs, kind=kind, lower_bound=lower_bound, impl="reference"
+            )
+            actual = compiled(*actual_inputs, kind=kind, lower_bound=lower_bound)
             torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
             cotangent = torch.randn_like(expected)
             expected_gradients = torch.autograd.grad(expected, expected_inputs, cotangent)
@@ -454,7 +537,7 @@ def test_fused_softplus_fullgraph_dynamic_tokens(shape: str):
 def test_bound_gate_is_bounded_gate_transform():
     """``bound_gate`` keeps its per-channel contract and equals ``kind="bounded"``."""
     inputs = make_gate_inputs(VECTOR128)
-    for impl in ("reference", "fused") if CUTE_CAPABLE else ("reference",):
+    for impl in ("reference", "fused"):
         expected = gate_transform(*inputs, kind="bounded", lower_bound=-3.25, impl=impl)
         actual = bound_gate(*inputs, lower_bound=-3.25, impl=impl)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
@@ -489,3 +572,13 @@ def test_chunk_gdn_accepts_fused_softplus_gate():
         torch.testing.assert_close(
             actual_gradient.float(), expected_gradient.float(), rtol=2e-3, atol=2e-3
         )
+
+
+def test_triton_bounded_gate_reuses_kernels_across_bounds_and_lengths(triton_compiles):
+    """``lower_bound`` and the token count are runtime values of the Triton bounded kernels."""
+    for tokens, lower_bound in ((65, -5.0), (97, -3.25), (128, -1.0)):
+        inputs = make_gate_inputs(VECTOR, tokens=tokens, requires_grad=True)
+        gate = gate_transform(*inputs, kind="bounded", lower_bound=lower_bound)
+        torch.autograd.grad(gate.sum(), inputs)
+    assert triton_compiles["gate_transform_fwd_kernel"] == 1, triton_compiles
+    assert triton_compiles["gate_transform_bwd_kernel"] == 1, triton_compiles

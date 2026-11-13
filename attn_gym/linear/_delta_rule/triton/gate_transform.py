@@ -4,9 +4,11 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Portable fused softplus gate transform ``-exp(A_log) * softplus(raw_gate + dt_bias)``.
+"""Portable fused gate transforms ``lower_bound * sigmoid(exp(A_log) * z)`` and
+``-exp(A_log) * softplus(z)`` with ``z = raw_gate + dt_bias``.
 
-One pointwise kernel serves per-head gates ``[B, T, H]`` and per-channel gates ``[B, T, H, D]``:
+The transform kind is a compile-time specialization of one pointwise kernel pair. Each kernel
+serves per-head gates ``[B, T, H]`` and per-channel gates ``[B, T, H, D]``:
 the launcher views a per-head gate as ``D=1`` and the kernel tiles ``rows = B*T`` by
 ``channels = H*D``. Compact and uniformly interleaved (element stride two) operands use native
 row/channel indexing, so their batch stride cannot specialize the binary on ``T``. Other
@@ -28,6 +30,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from attn_gym._backends.triton.utils import LN_2, LOG2_E, ptr_offset
+from attn_gym.linear.types import GateTransform
 
 # Matches ``torch.nn.functional.softplus``: above this input the identity is exact in FP32.
 SOFTPLUS_THRESHOLD = tl.constexpr(20.0)
@@ -70,6 +73,22 @@ def _sigmoid(s, FASTMATH: tl.constexpr):
 
 
 @triton.jit
+def _sigmoid_terms(x, FASTMATH: tl.constexpr):
+    """Return ``(sigmoid(x), sigmoid'(x))`` from the one bounded exponential ``e = exp(-|x|)``.
+
+    ``sigmoid'(x) = e / (1 + e)^2`` keeps the saturated tails that ``s * (1 - s)`` cancels to zero
+    once ``sigmoid(x)`` rounds to one.
+    """
+    if FASTMATH:
+        e = tl.exp2(-tl.abs(x) * LOG2_E)
+        reciprocal = libdevice.fast_dividef(1.0, 1.0 + e)
+    else:
+        e = libdevice.exp(-tl.abs(x))
+        reciprocal = 1.0 / (1.0 + e)
+    return tl.where(x >= 0, reciprocal, e * reciprocal), e * reciprocal * reciprocal
+
+
+@triton.jit
 def _load_gate_operands(
     raw_gate,
     A_log,
@@ -107,11 +126,12 @@ def _load_gate_operands(
 
 
 @triton.jit(do_not_specialize=["ROWS", "T", "RAW_STRIDES"])
-def softplus_gate_fwd_kernel(
+def gate_transform_fwd_kernel(
     raw_gate,
     A_log,
     dt_bias,
     gate,
+    lower_bound,
     ROWS,
     T,
     RAW_STRIDES,
@@ -123,6 +143,7 @@ def softplus_gate_fwd_kernel(
     BLOCK_C: tl.constexpr,
     FASTMATH: tl.constexpr,
     RAW_ELEMENT_STRIDE: tl.constexpr,
+    BOUNDED: tl.constexpr,
 ):
     o_row = tl.program_id(0).to(tl.int64) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     o_c = (tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)).to(tl.int64)
@@ -145,7 +166,11 @@ def softplus_gate_fwd_kernel(
         RAW_ELEMENT_STRIDE,
         FASTMATH,
     )
-    value = -amplitude[None, :] * _softplus(s, FASTMATH)
+    if BOUNDED:
+        sigmoid, _ = _sigmoid_terms(amplitude[None, :] * s, FASTMATH)
+        value = lower_bound * sigmoid
+    else:
+        value = -amplitude[None, :] * _softplus(s, FASTMATH)
     tl.store(
         gate + o_row[:, None] * C + o_c[None, :],
         value,
@@ -154,7 +179,7 @@ def softplus_gate_fwd_kernel(
 
 
 @triton.jit(do_not_specialize=["ROWS", "T", "RAW_STRIDES", "D_GATE_STRIDES"])
-def softplus_gate_bwd_kernel(
+def gate_transform_bwd_kernel(
     raw_gate,
     A_log,
     dt_bias,
@@ -162,6 +187,7 @@ def softplus_gate_bwd_kernel(
     d_raw_gate,
     d_A_log_partial,
     d_dt_bias_partial,
+    lower_bound,
     ROWS,
     T,
     RAW_STRIDES,
@@ -175,6 +201,7 @@ def softplus_gate_bwd_kernel(
     FASTMATH: tl.constexpr,
     RAW_ELEMENT_STRIDE: tl.constexpr,
     D_GATE_ELEMENT_STRIDE: tl.constexpr,
+    BOUNDED: tl.constexpr,
 ):
     i_row_block = tl.program_id(0).to(tl.int64)
     o_row = i_row_block * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
@@ -214,20 +241,32 @@ def softplus_gate_bwd_kernel(
     grad = tl.load(d_gate + grad_offsets, mask=mask, other=0.0)
     grad = grad.to(tl.float32)
 
-    # gate = -amplitude * softplus(s): d/ds = -amplitude * sigmoid(s); d/dA_log = gate.
-    d_s = -amplitude[None, :] * _sigmoid(s, FASTMATH) * grad
-    d_amplitude_log = -amplitude[None, :] * _softplus(s, FASTMATH) * grad
+    if BOUNDED:
+        # gate = lower_bound * sigmoid(x), x = amplitude * s: d/ds = amplitude * d/dx and
+        # d/dA_log = amplitude * s * d/dx. The slope (<= 1/4) is applied before the amplitude,
+        # as in the reference's autograd, so lower_bound * amplitude cannot overflow a finite
+        # gradient.
+        _, slope = _sigmoid_terms(amplitude[None, :] * s, FASTMATH)
+        d_x = lower_bound * slope * grad
+        d_s = d_x * amplitude[None, :]
+        d_amplitude_log = d_x * s * amplitude[None, :]
+    else:
+        # gate = -amplitude * softplus(s): d/ds = -amplitude * sigmoid(s); d/dA_log = gate.
+        # The cotangent is applied before the amplitude, as in the reference's autograd.
+        d_s = -amplitude[None, :] * _sigmoid(s, FASTMATH) * grad
+        d_amplitude_log = -_softplus(s, FASTMATH) * grad * amplitude[None, :]
     tl.store(
         d_raw_gate + o_row[:, None] * C + o_c[None, :],
         d_s.to(d_raw_gate.dtype.element_ty),
         mask=mask,
     )
-    # Masked rows loaded grad == 0, so they contribute exactly zero to the block partials.
+    # Padded rows evaluate s = dt_bias with grad == 0; applying the cotangent before the
+    # amplitude keeps their contributions exactly zero whenever the amplitude is finite.
     tl.store(d_dt_bias_partial + i_row_block * C + o_c, tl.sum(d_s, 0), mask=m_c)
     tl.store(d_A_log_partial + i_row_block * C + o_c, tl.sum(d_amplitude_log, 0), mask=m_c)
 
 
-def _softplus_element_stride(tensor: torch.Tensor) -> int:
+def _element_stride(tensor: torch.Tensor) -> int:
     """Select bounded compact/interleaved layouts; zero keeps arbitrary runtime strides."""
     if tensor.is_contiguous():
         return 1
@@ -245,15 +284,17 @@ def _launch_config(channels: int, elements_per_program: int) -> tuple[int, int]:
     return max(1, elements_per_program // block_channels), block_channels
 
 
-def _softplus_gate_fwd_cuda(
+def _gate_transform_fwd_cuda(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
+    lower_bound: float,
     fastmath: bool,
+    transform: GateTransform,
 ) -> torch.Tensor:
     """Launch the forward over any input layout and return a compact FP32 gate."""
     shape = raw_gate.shape
-    raw_element_stride = _softplus_element_stride(raw_gate)
+    raw_element_stride = _element_stride(raw_gate)
     if raw_gate.ndim == 3:  # Per-head gate: view as per-channel with D=1.
         raw_gate, dt_bias = raw_gate.unsqueeze(-1), dt_bias.unsqueeze(-1)
     batch, tokens, heads, head_dim = raw_gate.shape
@@ -261,13 +302,14 @@ def _softplus_gate_fwd_cuda(
     gate = torch.empty(raw_gate.shape, device=raw_gate.device, dtype=torch.float32)
     elements_per_program, num_warps = FWD_PROGRAM
     block_rows, block_channels = _launch_config(channels, elements_per_program)
-    softplus_gate_fwd_kernel[
+    gate_transform_fwd_kernel[
         (triton.cdiv(rows, block_rows), triton.cdiv(channels, block_channels))
     ](
         raw_gate,
         A_log,
         dt_bias,
         gate,
+        lower_bound,
         rows,
         tokens,
         RAW_STRIDES=(0, 0, 0, 0) if raw_element_stride else raw_gate.stride(),
@@ -279,22 +321,25 @@ def _softplus_gate_fwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
+        BOUNDED=transform is GateTransform.BOUNDED,
         enable_reflect_ftz=fastmath,
         num_warps=num_warps,
     )
     return gate.view(shape)
 
 
-def _softplus_gate_bwd_cuda(
+def _gate_transform_bwd_cuda(
     raw_gate: torch.Tensor,
     A_log: torch.Tensor,
     dt_bias: torch.Tensor,
     d_gate: torch.Tensor,
+    lower_bound: float,
     fastmath: bool,
+    transform: GateTransform,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Launch the backward; returns ``(d_raw_gate, d_A_log, d_dt_bias)`` with reduced params."""
     shape = raw_gate.shape
-    raw_element_stride = _softplus_element_stride(raw_gate)
+    raw_element_stride = _element_stride(raw_gate)
     if raw_gate.ndim == 3:  # Per-head gate: view as per-channel with D=1.
         raw_gate, dt_bias, d_gate = (t.unsqueeze(-1) for t in (raw_gate, dt_bias, d_gate))
     batch, tokens, heads, head_dim = raw_gate.shape
@@ -303,14 +348,14 @@ def _softplus_gate_bwd_cuda(
     elements_per_program, num_warps = BWD_PROGRAM
     block_rows, block_channels = _launch_config(channels, elements_per_program)
     row_blocks = triton.cdiv(rows, block_rows)
-    d_gate_element_stride = _softplus_element_stride(d_gate)
+    d_gate_element_stride = _element_stride(d_gate)
     # Both parameter partials share one buffer so a single row reduction finishes them; the
     # separate `view(rb, H, D).sum((0, 2))` pattern was a slow strided reduce (2x the time).
     # d_dt_bias occupies row 0 so the returned view has the compact, zero-offset metadata the
     # fake implementation describes.
     partials = torch.empty(2, row_blocks, channels, device=raw_gate.device, dtype=torch.float32)
     d_dt_bias_partial, d_A_log_partial = partials[0], partials[1]
-    softplus_gate_bwd_kernel[(row_blocks, triton.cdiv(channels, block_channels))](
+    gate_transform_bwd_kernel[(row_blocks, triton.cdiv(channels, block_channels))](
         raw_gate,
         A_log,
         dt_bias,
@@ -318,6 +363,7 @@ def _softplus_gate_bwd_cuda(
         d_raw_gate,
         d_A_log_partial,
         d_dt_bias_partial,
+        lower_bound,
         rows,
         tokens,
         RAW_STRIDES=(0, 0, 0, 0) if raw_element_stride else raw_gate.stride(),
@@ -331,6 +377,7 @@ def _softplus_gate_bwd_cuda(
         BLOCK_ROWS=block_rows,
         BLOCK_C=block_channels,
         FASTMATH=fastmath,
+        BOUNDED=transform is GateTransform.BOUNDED,
         enable_reflect_ftz=fastmath,
         num_warps=num_warps,
     )
