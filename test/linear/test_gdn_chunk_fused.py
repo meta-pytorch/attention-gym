@@ -21,9 +21,6 @@ from attn_gym.linear import (
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear.gdn import ops as gdn_ops
-from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
-    chunk_gdn_bwd_intra_dense,
-)
 from attn_gym.linear.gdn.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -146,17 +143,6 @@ def run_final_state_gradients(
     )
 
 
-def force_portable_backward(monkeypatch) -> None:
-    """Force the Hopper Triton backward while retaining the current GPU forward."""
-    import attn_gym.linear.gdn.impl.chunk as chunk_impl
-
-    monkeypatch.setattr(
-        chunk_impl,
-        "get_device_properties",
-        lambda device: SimpleNamespace(major=9, minor=0),
-    )
-
-
 @pytest.mark.parametrize(
     (
         "batch",
@@ -167,24 +153,23 @@ def force_portable_backward(monkeypatch) -> None:
         "dtype",
         "gate_kind",
         "lengths",
-        "portable",
     ),
     [
-        (1, 64, 2, 2, 128, torch.bfloat16, "mild", None, False),
-        (1, 65, 1, 4, 128, torch.bfloat16, "spikes", None, False),
-        (2, 65, 1, 4, 128, torch.bfloat16, "mild", None, False),
-        (1, 128, 2, 6, 128, torch.bfloat16, "spikes", None, False),
-        (1, 64, 1, 16, 128, torch.bfloat16, "mild", None, False),
-        (1, 192, 2, 4, 128, torch.bfloat16, "spikes", [65, 0, 127], False),
-        (1, 64, 1, 1, 128, torch.bfloat16, "unbounded", None, True),
-        (1, 64, 1, 64, 128, torch.bfloat16, "mild", None, True),
-        (1, 192, 1, 4, 128, torch.bfloat16, "spikes", [65, 0, 127], True),
-        (1, 192, 2, 6, 128, torch.bfloat16, "spikes", [65, 0, 127], False),
-        (1, 64, 1, 2, 64, torch.bfloat16, "mild", None, True),
-        (1, 64, 1, 2, 64, torch.float16, "mild", None, True),
-        (1, 16, 1, 2, 64, torch.bfloat16, "mild", [7, 9], True),
-        (1, 16, 1, 2, 64, torch.float16, "mild", [7, 9], True),
-        (1, 192, 1, 4, 64, torch.bfloat16, "spikes", [65, 0, 127], True),
+        (1, 64, 2, 2, 128, torch.bfloat16, "mild", None),
+        (1, 65, 1, 4, 128, torch.bfloat16, "spikes", None),
+        (2, 65, 1, 4, 128, torch.bfloat16, "mild", None),
+        (1, 128, 2, 6, 128, torch.bfloat16, "spikes", None),
+        (1, 64, 1, 16, 128, torch.bfloat16, "mild", None),
+        (1, 192, 2, 4, 128, torch.bfloat16, "spikes", [65, 0, 127]),
+        (1, 64, 1, 1, 128, torch.bfloat16, "unbounded", None),
+        (1, 64, 1, 64, 128, torch.bfloat16, "mild", None),
+        (1, 192, 1, 4, 128, torch.bfloat16, "spikes", [65, 0, 127]),
+        (1, 192, 2, 6, 128, torch.bfloat16, "spikes", [65, 0, 127]),
+        (1, 64, 1, 2, 64, torch.bfloat16, "mild", None),
+        (1, 64, 1, 2, 64, torch.float16, "mild", None),
+        (1, 16, 1, 2, 64, torch.bfloat16, "mild", [7, 9]),
+        (1, 16, 1, 2, 64, torch.float16, "mild", [7, 9]),
+        (1, 192, 1, 4, 64, torch.bfloat16, "spikes", [65, 0, 127]),
     ],
 )
 def test_fused_chunk_matches_low_precision_reference(
@@ -196,12 +181,8 @@ def test_fused_chunk_matches_low_precision_reference(
     dtype: torch.dtype,
     gate_kind: str,
     lengths: list[int] | None,
-    portable: bool,
-    monkeypatch,
 ):
-    """Bound Blackwell and Hopper-route gradients by the eager low-precision error."""
-    if portable:
-        force_portable_backward(monkeypatch)
+    """Bound forward values and gradients by the eager low-precision error."""
     inputs = make_inputs(
         batch=batch,
         tokens=tokens,
@@ -246,10 +227,10 @@ def test_fused_chunk_matches_low_precision_reference(
     ):
         if high_precision.abs().max().item() < 1e-12:
             assert torch.isfinite(result).all()
-            # The portable gate VJP subtracts two independently reduced FP32 terms.
-            # Uniform -20 gates underflow the true result to zero, leaving a sub-nanounit
-            # cancellation residue that is still far below low-precision significance.
-            zero_atol = 1e-9 if portable and name == "dgate" else 1e-12
+            # The gate VJP subtracts two independently reduced FP32 terms. Uniform -20 gates
+            # underflow the true result to zero, leaving a sub-nanounit cancellation residue
+            # that is still far below low-precision significance.
+            zero_atol = 1e-9 if name == "dgate" else 1e-12
             assert (result.double() - high_precision).abs().max().item() <= zero_atol
         else:
             assert_matches_low_precision_reference(
@@ -264,11 +245,8 @@ def test_fused_chunk_matches_low_precision_reference(
                 )
 
 
-@pytest.mark.parametrize("portable", [False, True])
-def test_fp16_fused_chunk_matches_reference(portable: bool, monkeypatch):
-    """Validate FP16 forward and gradients on both backward implementations."""
-    if portable:
-        force_portable_backward(monkeypatch)
+def test_fp16_fused_chunk_matches_reference():
+    """Validate FP16 forward and gradients."""
     inputs = make_inputs(tokens=64, dtype=torch.float16, requires_grad=True)
     fused_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
     reference_inputs = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
@@ -743,11 +721,8 @@ def test_paged_chunk_cuda_graph_replay(state_dtype: torch.dtype, head_dim: int):
     torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("portable", [False, True])
-def test_packed_caller_masks_inactive_capacity_gradients(portable: bool, monkeypatch):
+def test_packed_caller_masks_inactive_capacity_gradients():
     """Block unspecified inactive gradients at the caller-to-ragged boundary."""
-    if portable:
-        force_portable_backward(monkeypatch)
     inputs = make_inputs(tokens=192, requires_grad=True)
     state = torch.randn(2, inputs[2].shape[2], 128, 128, device="cuda", requires_grad=True)
     leaves = (*inputs[:5], state)
@@ -776,28 +751,6 @@ def test_packed_caller_masks_inactive_capacity_gradients(portable: bool, monkeyp
             rtol=0,
             atol=0,
         )
-
-
-def test_scalar_intra_masks_poisoned_akk_diagonal_and_upper():
-    """Treat only strict-lower dAkk entries as meaningful before any arithmetic."""
-    q, k, _v, _gate, beta, _state = make_inputs(tokens=64, key_heads=1, value_heads=1)
-    cumulative_gate = (-20.0 * torch.arange(1, 65, device="cuda")).view(1, 64, 1)
-    d_aqk = torch.randn(1, 64, 1, 64, device="cuda")
-    d_akk = torch.randn_like(d_aqk)
-    row = torch.arange(64, device="cuda")
-    strict = row[:, None] > row[None, :]
-    clean_d_akk = torch.where(strict[None, :, None, :], d_akk, 0.0)
-    poisoned_d_akk = torch.where(strict[None, :, None, :], d_akk, torch.nan)
-    d_gate_raw = torch.zeros_like(cumulative_gate, dtype=torch.float32)
-    expected = chunk_gdn_bwd_intra_dense(
-        q, k, cumulative_gate, beta, d_aqk, clean_d_akk, d_gate_raw
-    )
-    actual = chunk_gdn_bwd_intra_dense(
-        q, k, cumulative_gate, beta, d_aqk, poisoned_d_akk, d_gate_raw
-    )
-    for result, reference in zip(actual, expected, strict=True):
-        assert torch.isfinite(result).all()
-        torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("tokens", [64, 65])
@@ -937,17 +890,14 @@ def test_fp16_no_initial_state_final_state_gradients(batch: int, tokens: int):
             )
 
 
-@pytest.mark.parametrize("portable", [False, True])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-def test_state_gate_term_contracts_in_fp32(dtype: torch.dtype, portable: bool, monkeypatch):
+def test_state_gate_term_contracts_in_fp32(dtype: torch.dtype):
     """The <state, state cotangent> gate term must not round to source-dtype precision.
 
     Zero Q/K/V leave the gate gradient with only the per-chunk state term. Positive operands
     avoid cancellation, so tape rounding averages out and any remaining error comes from
     contracting the tapes in low precision.
     """
-    if portable:
-        force_portable_backward(monkeypatch)
     tokens = 64
     generator = torch.Generator(device="cuda").manual_seed(2)
     shape = (1, tokens, 1, 128)
@@ -970,8 +920,8 @@ def test_state_gate_term_contracts_in_fp32(dtype: torch.dtype, portable: bool, m
     actual = d_gate("fused", dtype, torch.float32)
     expected = d_gate("reference", torch.float64, torch.float64)
     low_precision = d_gate("reference", torch.float32, torch.float32)
-    # Measured for this seed: below 0.01 eps with FP32 accumulation on both backends versus
-    # 0.21 (BF16) and 0.22 (FP16) eps when the portable kernel accumulated in the source dtype.
+    # Measured for this seed: below 0.01 eps with FP32 accumulation versus 0.21 (BF16) and
+    # 0.22 (FP16) eps when the kernel accumulated in the source dtype.
     assert_matches_low_precision_reference(
         actual, expected, low_precision, "dgate", source_dtype=dtype
     )
@@ -1109,23 +1059,15 @@ def test_packed_raw_operator_registration(head_dim: int, token_innermost: bool):
 
 @pytest.mark.parametrize("packed", [False, True])
 @pytest.mark.parametrize(
-    ("head_dim", "portable", "dtype"),
-    [(128, False, torch.bfloat16), (128, True, torch.bfloat16), (64, False, torch.float16)],
+    ("head_dim", "dtype"),
+    [(128, torch.bfloat16), (64, torch.float16)],
 )
-def test_public_fullgraph_forward_backward(
-    packed: bool,
-    head_dim: int,
-    portable: bool,
-    dtype: torch.dtype,
-    monkeypatch,
-):
-    """Compile both backward implementations with strict forward/backward capture.
+def test_public_fullgraph_forward_backward(packed: bool, head_dim: int, dtype: torch.dtype):
+    """Compile the forward and backward with strict capture.
 
     Capture runs through the same fakes for every dtype, so FP16 runs on one row only; the
     numerical tests cover the FP16 kernels.
     """
-    if portable:
-        force_portable_backward(monkeypatch)
     tokens = 128 if packed else 64
     inputs = make_inputs(
         tokens=tokens,
@@ -1192,14 +1134,9 @@ def test_public_dynamic_tokens_forward_backward(head_dim: int):
             torch.testing.assert_close(result, reference, rtol=2e-2, atol=2e-3)
 
 
-@pytest.mark.parametrize(
-    ("head_dim", "portable"),
-    [(128, False), (128, True), (64, False)],
-)
-def test_backward_cuda_graph_replay(head_dim: int, portable: bool, monkeypatch):
-    """Capture and replay both training backward implementations."""
-    if portable:
-        force_portable_backward(monkeypatch)
+@pytest.mark.parametrize("head_dim", [128, 64])
+def test_backward_cuda_graph_replay(head_dim: int):
+    """Capture and replay the training backward."""
     inputs = make_inputs(
         tokens=64,
         key_heads=1,
@@ -1240,9 +1177,8 @@ def test_backward_cuda_graph_replay(head_dim: int, portable: bool, monkeypatch):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
-def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, triton_compiles):
+def test_backward_reuses_kernels_across_packed_shapes(triton_compiles):
     """New token and sequence counts launch the Triton backward compiled for an earlier shape."""
-    force_portable_backward(monkeypatch)
     kernels = (
         "chunk_gdn_bwd_dqkwg_kernel",
         "chunk_gdn_bwd_wy_kernel",
@@ -1262,9 +1198,8 @@ def test_portable_backward_reuses_kernels_across_packed_shapes(monkeypatch, trit
     assert {name: triton_compiles[name] for name in kernels} == first_shape
 
 
-def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch, isolated_winners):
+def test_backward_reuses_tuning_across_packed_shapes(monkeypatch, isolated_winners):
     """New token counts and a sequence count in the same bucket reuse an earlier tuning."""
-    force_portable_backward(monkeypatch)
     tune = tune_module.tune
     tunes_per_shape: list[int] = []
 
@@ -1281,7 +1216,7 @@ def test_portable_backward_reuses_tuning_across_packed_shapes(monkeypatch, isola
         tunes_per_shape.append(0)
         run_with_gradients(tuple(inputs), "fused", cu_seqlens)
     torch.cuda.synchronize()
-    # The portable backward alone tunes four kernels.
+    # The backward alone tunes four kernels.
     assert tunes_per_shape[0] >= 4
     assert tunes_per_shape[1:] == [0, 0, 0]
 

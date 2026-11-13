@@ -92,7 +92,6 @@ def test_kernel_options_reject_invalid_schedule():
 )
 def test_public_chunk_kda_schedule_option_selects_kernels(monkeypatch):
     """``kernel_options['schedule']`` reaches both heavy kernels in forward and backward."""
-    pytest.importorskip("cutlass", reason="the fused chunk_kda core is CuTeDSL-backed")
     launches: list[str] = []
 
     class RecordingKernel:

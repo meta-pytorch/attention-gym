@@ -63,8 +63,7 @@ def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
     """Broadcast the per-head scalar gate to the per-channel layout the summary kernels read.
 
     Perf: this materializes an FP32 ``[1, T, H, K]`` temporary per summary call (512 MiB at 32k
-    tokens and 32 heads). A scalar-gate specialization of the summary kernels would remove it; the
-    fused SM100 backward pays the same expansion today.
+    tokens and 32 heads). A scalar-gate specialization of the summary kernels would remove it.
     """
     return cumulative_gate.unsqueeze(-1).expand(*cumulative_gate.shape, key_dim).contiguous()
 
@@ -286,7 +285,7 @@ class ChunkGDNBackward:
     @cached_property
     def aqk(self) -> torch.Tensor:
         """Intra-chunk Q/K factor for the reverse summary; the scalar backward does not otherwise
-        materialize it on pre-Blackwell targets, so it is computed once on first use."""
+        materialize it, so it is computed once on first use."""
         saved = self.saved
         if self.metadata is None:
             return chunk_gdn_recompute_aqk_dense(
@@ -345,7 +344,6 @@ class ChunkGDNBackward:
             self.metadata,
             self.prepared,
             self.scale,
-            aqk=self.__dict__.get("aqk"),  # Reuse it only when the reverse summary computed it.
             autotune=should_autotune(self.autotune),
         )
 

@@ -1,42 +1,24 @@
-"""Composition tests for the optimized CuTeDSL KDA forward pipeline."""
+"""Public chunk KDA coverage for the fused Triton chunk pipeline.
+
+Also covers paged replay, which runs on both chunk backends.
+"""
 
 from __future__ import annotations
 
-import collections
-import functools
 import gc
 import importlib
-import itertools
+import importlib.util
 import math
 
 import pytest
 import torch
-
-pytest.importorskip(
-    "attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra",
-    reason="legacy CuTe kernel is not installed",
-)
 import torch.nn.functional as F
 
-from attn_gym._backends import tune as tune_module
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from attn_gym.linear import ReplayState, chunk_kda, paged_chunk_kda
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
-
-pytest.importorskip("cutlass")
-
-from attn_gym.linear import ReplayState, chunk_kda, paged_chunk_kda
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
-from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as _intra_module
-from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_wy_dqkg_fused as _wy_module
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
-    ChunkKdaBwdIntraConfig,
-    chunk_kda_bwd_intra,
-)
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
-    ChunkKdaBwdWyDqkgConfig,
-    chunk_kda_bwd_wy_dqkg,
-)
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -50,22 +32,27 @@ from attn_gym.linear.kda.ops import (
     chunk_replay_state_gather_op,
 )
 from attn_gym.testing import strided_state_pool
-from attn_gym.testing.kda import cumulative_sequence_offsets
 
 # These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
 pytestmark = [
     pytest.mark.skipif(
-        not torch.cuda.is_available() or not uses_legacy_cute(torch.device("cuda")),
-        reason="the CuTeDSL KDA pipeline requires an SM100-family GPU and the legacy CuTe route",
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="fused chunk KDA requires CUDA capability 8.0 or newer",
     ),
     pytest.mark.usefixtures("fused_chunk_default"),
 ]
 
 _DEFAULT_SCALE = 128**-0.5
 
+_requires_warpdrive = pytest.mark.skipif(
+    not cuda_runs_sm100_kernels() or importlib.util.find_spec("cutlass") is None,
+    reason="the warpdrive backend requires CuTeDSL on an SM100-family GPU",
+)
 # Replay-backed paged KDA runs on either chunk backend and must reproduce that backend's own
 # unsplit chunk execution bit for bit.
-_replay_backends = pytest.mark.parametrize("backend", ["fused", "warpdrive"])
+_replay_backends = pytest.mark.parametrize(
+    "backend", ["fused", pytest.param("warpdrive", marks=_requires_warpdrive)]
+)
 
 
 def _inputs(
@@ -242,8 +229,10 @@ def test_optimized_chunk_kda_matches_reference():
         expected_gradients,
         strict=True,
     ):
-        error = (actual_gradient.float() - expected_gradient).abs().max()
-        tolerance = 5e-3 + 5e-3 * expected_gradient.abs().max()
+        # One rounding step of the gradient's own dtype on top of the FP32 comparison budget.
+        scale = expected_gradient.float().abs().max()
+        error = (actual_gradient.float() - expected_gradient.float()).abs().max()
+        tolerance = 5e-3 + (5e-3 + torch.finfo(actual_gradient.dtype).eps) * scale
         assert error <= tolerance
 
 
@@ -736,7 +725,7 @@ def test_chunk_kda_single_sequence_metadata_matches_dense_path():
     # The exception is the FP32 gradient at the internal chunk-scan boundary:
     # it is the only output assembled by software FP32 reduction chains (dq/dk/dv come
     # from MMA accumulators with hardware-fixed order), and the dense versus ragged
-    # constexpr specializations of the fused wy/dqkg kernel schedule those
+    # constexpr specializations of the wy/dqkg backward kernel schedule those
     # chains differently, so it accumulates a few rounding steps near zero and
     # gets an absolute bound instead of bit equality.
     gate_index = 3
@@ -771,13 +760,15 @@ def test_optimized_chunk_kda_autograd_without_initial_state():
         expected_gradients,
         strict=True,
     ):
-        error = (actual_gradient.float() - expected_gradient).abs().max()
-        tolerance = 5e-3 + 5e-3 * expected_gradient.abs().max()
+        # One rounding step of the gradient's own dtype on top of the FP32 comparison budget.
+        scale = expected_gradient.float().abs().max()
+        error = (actual_gradient.float() - expected_gradient.float()).abs().max()
+        tolerance = 5e-3 + (5e-3 + torch.finfo(actual_gradient.dtype).eps) * scale
         assert error <= tolerance
 
 
 def test_kda_tensor_descriptor_and_pointer_paths_match(monkeypatch):
-    """Keep the Blackwell TMA path bitwise equivalent to its pointer fallback."""
+    """Keep the Triton tensor-descriptor (TMA) path bitwise equivalent to its pointer fallback."""
     torch.manual_seed(41)
     descriptor_inputs = _inputs(heads=2)
     d_output = torch.randn_like(descriptor_inputs[0])
@@ -842,131 +833,6 @@ def test_kda_offset_width_specializations_match(monkeypatch):
     torch.testing.assert_close(output64, output32, rtol=0, atol=0)
     for gradient64, gradient32 in zip(gradients64, gradients32, strict=True):
         torch.testing.assert_close(gradient64, gradient32, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    ("module", "attribute", "kernel", "config_type"),
-    (
-        (_intra_module, "chunk_kda_bwd_intra", chunk_kda_bwd_intra, ChunkKdaBwdIntraConfig),
-        (_wy_module, "chunk_kda_bwd_wy_dqkg", chunk_kda_bwd_wy_dqkg, ChunkKdaBwdWyDqkgConfig),
-    ),
-    ids=["intra", "wy_dqkg"],
-)
-def test_backward_tuning_configs(monkeypatch, module, attribute, kernel, config_type):
-    """Keep each explicit and tuned schedule equivalent to its default."""
-    torch.manual_seed(5)
-    inputs = _inputs(tokens=320, heads=2)
-    d_output = torch.randn_like(inputs[0])
-    candidates = tuple(config_type(value) for value in (1, 2))
-    launches = (
-        kernel,
-        *(functools.partial(kernel, config=config) for config in candidates),
-        functools.partial(kernel, autotune=True),
-        functools.partial(kernel, autotune=True, configs=candidates),
-    )
-
-    gradients = []
-    for launch in launches:
-        # The composed backward imports the legacy stages from their modules at call time.
-        monkeypatch.setattr(module, attribute, launch)
-        cloned_inputs = _clone_inputs(inputs)
-        output, _ = chunk_kda(*cloned_inputs)
-        gradients.append(torch.autograd.grad(output, cloned_inputs, d_output))
-
-    for result in gradients[1:]:
-        for candidate, expected in zip(result, gradients[0], strict=True):
-            torch.testing.assert_close(candidate, expected, rtol=0, atol=0)
-
-
-def test_backward_tuning_reuses_winner_across_packed_document_counts(monkeypatch):
-    """Packs with a fixed token count but new document counts must not re-benchmark."""
-    benchmarked = collections.Counter()
-
-    def count_benchmark(fn) -> float:
-        benchmarked[type(fn.args[1])] += 1
-        return 1.0
-
-    monkeypatch.setattr(tune_module, "benchmark_gpu", count_benchmark)
-    monkeypatch.setattr(tune_module, "cache_enabled", lambda: False)
-    monkeypatch.setattr(tune_module, "_WINNERS", {})
-    monkeypatch.setattr(tune_module, "_WINNERS_FAST", {})
-    tokens = 16384
-    inputs = _inputs(tokens=tokens)
-    d_output = torch.randn_like(inputs[0])
-    tuned_configs = (ChunkKdaBwdIntraConfig, ChunkKdaBwdWyDqkgConfig)
-
-    counts = []
-    # Capacities 256-292 share the saturated intra bucket (256) and two wy/dQKG waves on 148-152
-    # SMs, so every pack reuses the first pack's winners.
-    for documents in (1, 2, 16, 37):
-        lengths = [100] * (documents - 1) + [tokens - 100 * (documents - 1)]
-        cu_seqlens = cumulative_sequence_offsets(lengths)
-        output, _ = chunk_kda(*inputs, cu_seqlens=cu_seqlens, kernel_options={"autotune": True})
-        torch.autograd.grad(output, inputs, d_output)
-        counts.append({config: benchmarked[config] for config in tuned_configs})
-
-    assert all(counts[0][config] > 0 for config in tuned_configs)
-    assert counts == [counts[0]] * len(counts)
-
-
-def test_delta_h_dispatch_counts_packed_sequences(monkeypatch):
-    """Choose BV from logical rather than physical packed batch size."""
-    dispatch = importlib.import_module("attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd")
-    captured = {}
-    result = tuple(torch.empty(0, device="cuda") for _ in range(3))
-
-    def fake_delta_h(*args, bv, **kwargs):
-        captured["bv"] = bv
-        captured["metadata"] = args[5]
-        return result
-
-    class DeviceProperties:
-        multi_processor_count = 100
-
-    monkeypatch.setattr(dispatch, "_blackwell_delta_h_bwd_dhu_dv_fused_packed", fake_delta_h)
-    monkeypatch.setattr(
-        dispatch,
-        "get_device_properties",
-        lambda _device: DeviceProperties(),
-    )
-    tensor = torch.empty(1, 7, 2, 128, device="cuda")
-    cu_seqlens = torch.arange(8, dtype=torch.int32, device="cuda")
-    metadata = prepare_ragged_chunk_metadata(cu_seqlens, tensor.shape[1], 64)
-    actual = dispatch.blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        tensor,
-        metadata=metadata,
-    )
-
-    assert actual is result
-    assert captured["bv"] == 32
-    assert captured["metadata"] is metadata
-
-
-def test_diag_neumann_inverse_reuses_kernel_across_sequence_counts(triton_compiles):
-    """Sequence counts in every integer class share one compiled diagonal-inverse kernel."""
-    engine = importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine")
-    torch.manual_seed(11)
-    heads = 2
-    for lengths in ((65, 70, 57), (192,), (12,) * 16):
-        tokens = sum(lengths)
-        cu_seqlens = torch.tensor([0, *itertools.accumulate(lengths)], device="cuda").int()
-        metadata = prepare_ragged_chunk_metadata(cu_seqlens, tokens, 64)
-        blocks = torch.randn(1, tokens, heads, 16, device="cuda").tril(-1) / 8
-        packed = engine._kda_diag_neumann_inverse(blocks.clone(), metadata, 64)
-        # Each sequence must see the same result as a single-sequence launch.
-        for begin, end in itertools.pairwise(cu_seqlens.tolist()):
-            local_metadata = prepare_ragged_chunk_metadata(
-                torch.tensor([0, end - begin], device="cuda", dtype=torch.int32), end - begin, 64
-            )
-            local = engine._kda_diag_neumann_inverse(
-                blocks[:, begin:end].clone(), local_metadata, 64
-            )
-            torch.testing.assert_close(packed[:, begin:end], local, rtol=0, atol=0)
-    assert triton_compiles["_diag_neumann_inverse_kernel"] == 1
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])

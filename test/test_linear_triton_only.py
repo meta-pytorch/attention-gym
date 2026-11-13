@@ -118,7 +118,6 @@ _SCRIPT = textwrap.dedent(
 
 def test_fused_training_runs_without_cutedsl():
     environment = os.environ.copy()
-    environment.pop("ATTN_GYM_LEGACY_CUTE", None)
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     result = subprocess.run(
         [sys.executable, "-c", _SCRIPT],

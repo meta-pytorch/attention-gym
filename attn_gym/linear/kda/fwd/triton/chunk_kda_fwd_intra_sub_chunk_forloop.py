@@ -8,9 +8,9 @@
 #
 # Computes the diagonal 16x16 Aqk/Akk sub-blocks of each 64-token chunk and
 # inverts each diagonal Akk block by forward substitution. The off-diagonal
-# blocks and the full 64x64 block-triangular inverse are handled by the
-# architecture-selected K3/K4 stages. ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop``
-# is consumed by the composed forward path in ``fwd.cute.chunk_kda_fwd_intra``.
+# blocks and the full 64x64 block-triangular inverse are handled by the Triton K3/K4
+# stages. ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop`` is consumed by the composed
+# forward factors in ``kda/fwd/factors.py``.
 
 import torch
 import triton
@@ -239,12 +239,12 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
 # exp2 keeps; that dropped the last rows' diagonal terms (the non-fast exp2 keeps them only as
 # subnormals). A key block (the BK channels of one loop step) whose span
 # min_{i,c} (g_ic - g_0c) over the subchunk is below -64 is therefore evaluated as
-# 2^{g_i - g_0 + 64} * 2^{g_0 - g_j - 64}, as the SM100 CuTe engine evaluates every block.
+# 2^{g_i - g_0 + 64} * 2^{g_0 - g_j - 64}.
 # Either way both factors stay within 2^±64, so they remain normal while
 # |lower_bound| <= 190 / (15 * log2(e)) = 8.78, and Q/K entries must stay below 2^64 in
 # magnitude. Leaving flatter blocks unshifted keeps tiny keys there: shifted, a 2^-100 key
 # underflows to 2^-164 before its product with a 2^58 query. A shifted block still loses
-# gated Q/K entries below 2^-62, like the engine. The span reads later rows, so an earlier
+# gated Q/K entries below 2^-62. The span reads later rows, so an earlier
 # output can depend on a later gate, but only through rounding of the shifted exponent once
 # the span crosses -64. The 8-interval midpoint needs no shift up to 10.9. Custom gate
 # producers must honor the fused bound.

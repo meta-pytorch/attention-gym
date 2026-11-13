@@ -11,7 +11,6 @@ import torch.nn.functional as F
 
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.gate import _gate_transform_bwd_op, _gate_transform_fwd_op
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton import gate_transform as triton_gate
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda import bound_gate, chunk_kda
@@ -218,33 +217,8 @@ def test_bound_gate_supports_general_layouts(layout: str):
 
 
 def _record_gate_launches(monkeypatch) -> list[torch.Tensor]:
-    """Record the ``raw_gate`` each gate kernel (forward, then backward) receives.
-
-    Covers both backends: the routed one records its launches, the other none.
-    """
+    """Record the ``raw_gate`` each gate kernel (forward, then backward) receives."""
     launched = []
-    native_launchers = []
-    if uses_legacy_cute(torch.device("cuda")):
-        from attn_gym.linear.kda.bwd.cute import gate_bwd
-        from attn_gym.linear.kda.fwd.cute import gate_fwd
-
-        native_launchers = [
-            (gate_fwd, "_compile_gate_transform_fwd"),
-            (gate_bwd, "_compile_gate_transform_bwd"),
-        ]
-    for module, name in native_launchers:
-        compile_fn = getattr(module, name)
-
-        def compile_and_record(*args, _compile_fn=compile_fn):
-            compiled = _compile_fn(*args)
-
-            def launch(raw_gate, *tensors):
-                launched.append(raw_gate)
-                return compiled(raw_gate, *tensors)
-
-            return launch
-
-        monkeypatch.setattr(module, name, compile_and_record)
 
     class RecordingKernel:
         def __init__(self, kernel):

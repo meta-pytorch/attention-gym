@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from typing import NamedTuple
 
 import torch
@@ -13,20 +12,10 @@ from attn_gym._backends.cute import (
     normalize_tma_rows,
 )
 from attn_gym._backends.triton.utils import requires_int64_offsets
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.span import zero_state
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear._delta_rule.triton.group_sum import group_sum
 from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
-from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
-    chunk_gdn_bwd_intra_dense,
-    chunk_gdn_bwd_intra_packed,
-)
-from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
-    chunk_gdn_recompute_aqk_dense,
-    chunk_gdn_recompute_aqk_packed,
-)
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_wy import chunk_gdn_bwd_wy
 from attn_gym.linear.gdn.fwd.triton.chunk_gdn_fwd_intra import (
     chunk_gdn_fwd_intra_dense,
@@ -41,7 +30,6 @@ from attn_gym.linear.gdn.fwd.triton.chunk_gdn_fwd_recurrence import (
     chunk_gdn_fwd_recurrence_dense,
     chunk_gdn_fwd_recurrence_packed,
 )
-from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
 
@@ -49,11 +37,6 @@ def validate_supported_device(q: torch.Tensor) -> None:
     """Reject devices older than the Ampere-capable fused implementation."""
     if get_device_properties(q.device).major < 8:
         raise ValueError("fused chunk_gdn requires CUDA capability 8.0 or newer")
-
-
-def use_blackwell_backward(q: torch.Tensor, v: torch.Tensor) -> bool:
-    """Select the fixed-D128 legacy CuTe backward only on SM100-family targets."""
-    return q.shape[-1] == v.shape[-1] == 128 and uses_legacy_cute(q.device)
 
 
 def require_fp32(**tensors: torch.Tensor | None) -> None:
@@ -369,20 +352,14 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     )
 
 
-@dataclass
-class ChunkGDNBwdPrepared:
-    """Recomputed local tensors shared across the context-parallel backward boundary.
+class ChunkGDNBwdPrepared(NamedTuple):
+    """Recomputed local tensors shared across the context-parallel backward boundary."""
 
-    Mutable so ``_finish_chunk_gdn_bwd`` can release each field at its last use; the callers'
-    frames keep the container alive, so a ``None`` field is the only way to free the storage
-    before the later stages allocate. Fields are ``None`` after the backward finishes.
-    """
-
-    w: torch.Tensor | None
-    qg: torch.Tensor | None
-    kg: torch.Tensor | None
-    h: torch.Tensor | None
-    v_new: torch.Tensor | None
+    w: torch.Tensor
+    qg: torch.Tensor
+    kg: torch.Tensor
+    h: torch.Tensor
+    v_new: torch.Tensor
 
 
 def _prepare_chunk_gdn_bwd(
@@ -482,152 +459,42 @@ def _finish_chunk_gdn_bwd(
     metadata: RaggedChunkMetadata | None,
     prepared: ChunkGDNBwdPrepared,
     scale: float,
-    aqk: torch.Tensor | None = None,
     *,
     autotune: bool,
 ) -> tuple[torch.Tensor, ...]:
     """Finish the local gradients from recomputed factors and the exit-state cotangent.
 
-    ``aqk`` is the per-value-head intra-chunk Q/K factor when the caller already holds it (the
-    staged reverse summary computes it first); the Blackwell path recomputes it otherwise.
-    ``autotune`` selects the portable path's kernel configurations by benchmark; the Blackwell
-    stages always launch fixed configurations.
-
-    The Blackwell path releases every recomputed tensor at its last use (``prepared`` fields
-    and the ``del`` statements) because the step's peak memory sits inside this function:
-    the wy/dqkg and intra stages each allocate several ``[T, H, K]`` FP32 buffers, and holding
-    the dead ``h``/``dh``/``w``/``qg``/``kg`` alongside them costs ~1 GiB per 16k tokens at
-    32 heads.
+    ``autotune`` selects the kernel configurations by benchmark.
     """
-    w, qg, kg, h, v_new = prepared.w, prepared.qg, prepared.kg, prepared.h, prepared.v_new
-    assert w is not None and qg is not None and kg is not None
-    assert h is not None and v_new is not None
-    if not use_blackwell_backward(q, v):
-        dh, d_initial_state, dv = chunk_gdn_bwd_delta_h(
-            q,
-            k,
-            w,
-            cumulative_gate,
-            d_output,
-            d_final_state,
-            initial_state,
-            metadata,
-            scale,
-            autotune=autotune,
-        )
-        dq, dk, dv, d_gate, db = chunk_gdn_bwd_wy(
-            q,
-            k,
-            v,
-            v_new,
-            w,
-            cumulative_gate,
-            beta,
-            inverse,
-            h,
-            d_output,
-            dh,
-            dv,
-            metadata,
-            scale,
-            autotune=autotune,
-        )
-        return dq, dk, dv, d_gate, db, d_initial_state
-
-    # The legacy CuTe stages import CuTeDSL, which the Triton route above must not need.
-    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
-        blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
-    )
-    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import chunk_kda_bwd_wy_dqkg
-
-    d_aqk = chunk_kda_bwd_daqk(
-        v_new,
+    dh, d_initial_state, dv = chunk_gdn_bwd_delta_h(
+        q,
+        k,
+        prepared.w,
+        cumulative_gate,
         d_output,
+        d_final_state,
+        initial_state,
+        metadata,
         scale,
-        chunk_size=64,
-        metadata=metadata,
+        autotune=autotune,
     )
-
-    # The reused KDA stages take the scalar gate directly and read grouped q/k; each returns
-    # dQ/dK per value head, summed below.
-    groups = v.shape[2] // q.shape[2]
-    if aqk is None:
-        aqk = (
-            chunk_gdn_recompute_aqk_dense(q, k, cumulative_gate, scale)
-            if metadata is None
-            else chunk_gdn_recompute_aqk_packed(q, k, cumulative_gate, scale, metadata)
-        )
-    dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
-        qg,
-        kg,
-        w,
-        d_output,
-        aqk,
-        gk=cumulative_gate,
-        h0=initial_state,
-        dht=d_final_state,
-        scale=scale,
-        chunk_size=64,
-        metadata=metadata,
-    )
-    prepared.w = prepared.qg = prepared.kg = None
-    del w, qg, kg, aqk
-    dq, dk, dv, dg_raw, db, d_raw_akk = chunk_kda_bwd_wy_dqkg(
+    dq, dk, dv, d_gate, db = chunk_gdn_bwd_wy(
         q,
         k,
         v,
-        v_new,
+        prepared.v_new,
+        prepared.w,
         cumulative_gate,
         beta,
         inverse,
-        h,
+        prepared.h,
         d_output,
         dh,
         dv,
         metadata,
-        scale=scale,
-        chunk_size=64,
-        fastmath=False,
-        autotune=False,
+        scale,
+        autotune=autotune,
     )
-    prepared.h = prepared.v_new = None
-    del h, v_new, dh
-    intra = (
-        chunk_gdn_bwd_intra_dense(
-            q,
-            k,
-            cumulative_gate,
-            beta,
-            d_aqk,
-            d_raw_akk,
-            dg_raw,
-        )
-        if metadata is None
-        else chunk_gdn_bwd_intra_packed(
-            q,
-            k,
-            cumulative_gate,
-            beta,
-            d_aqk,
-            d_raw_akk,
-            dg_raw,
-            metadata,
-        )
-    )
-    intra_dq, intra_dk, intra_db, d_gate = intra
-    del d_aqk, d_raw_akk, dg_raw
-    # ``chunk_kda_bwd_wy_dqkg`` returns fresh FP32 ``dq``/``dk``, so accumulating in place is
-    # the same FP32 add without a third full-size buffer.
-    assert dq.dtype == torch.float32 and dk.dtype == torch.float32
-    if groups > 1:
-        # One deterministic pass adds the two FP32 parts, sums each head group, and casts.
-        dq = group_sum(dq, groups, out_dtype=q.dtype, addend=intra_dq)
-        dk = group_sum(dk, groups, out_dtype=k.dtype, addend=intra_dk)
-    else:
-        dq = dq.add_(intra_dq).to(q.dtype)
-        dk = dk.add_(intra_dk).to(k.dtype)
-    del intra_dq, intra_dk
-    db = db + intra_db
     return dq, dk, dv, d_gate, db, d_initial_state
 
 

@@ -1,4 +1,4 @@
-"""Composed fixed-length and packed architecture-routed KDA forward and backward."""
+"""Composed fixed-length and packed Triton KDA forward and backward."""
 
 from __future__ import annotations
 
@@ -9,12 +9,10 @@ import torch
 
 from attn_gym._backends.cute import (
     get_device_properties,
-    normalize_compact_tensor,
     normalize_tma_rows,
     tensor_supports_tma_rows,
 )
 from attn_gym._backends.profiler import profiler_range
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
@@ -31,13 +29,6 @@ from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_trito
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
 _CHUNK_SIZE = 64
 _HEAD_DIM = 128
-
-
-def _normalize_state_cotangent(tensor: torch.Tensor) -> torch.Tensor:
-    """Preserve supported state strides and materialize broadcast cotangents."""
-    if tensor.stride(-1) == 1 and all(stride >= 0 for stride in tensor.stride()):
-        return tensor
-    return tensor.clone(memory_format=torch.contiguous_format)
 
 
 def _validate_private_abi(
@@ -508,18 +499,9 @@ def _prepare_chunk_kda_backward(
         )
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_private_abi(q, k, v, cumulative_gate, beta, initial_state)
-    if d_output is None:
-        d_output = v.new_zeros(v.shape)
-    elif metadata is not None:
-        d_output = normalize_compact_tensor(d_output)
-    else:
-        d_output = normalize_tma_rows(d_output)
+    d_output = v.new_zeros(v.shape) if d_output is None else d_output.contiguous()
     if d_final_state is not None:
-        d_final_state = _normalize_state_cotangent(d_final_state.float())
-    if not uses_legacy_cute(q.device):
-        d_output = d_output.contiguous()
-        if d_final_state is not None:
-            d_final_state = d_final_state.contiguous()
+        d_final_state = d_final_state.float().contiguous()
     return q, k, v, metadata, d_output, d_final_state
 
 
@@ -673,7 +655,6 @@ def _finish_chunk_kda_bwd(
     prepared: ChunkKDABwdPrepared,
     *,
     scale: float,
-    chunk_size: int,
     fastmath: bool,
     autotune: bool,
 ) -> tuple[
@@ -687,94 +668,46 @@ def _finish_chunk_kda_bwd(
     """Finish local gradients while releasing prepared tensors at their last use."""
     assert prepared.aqk is not None and prepared.akk is not None
     assert prepared.qg is not None and prepared.kg is not None and prepared.w is not None
-    use_triton_backend = not uses_legacy_cute(q.device)
-    range_backend = "triton" if use_triton_backend else "cute"
-    if not use_triton_backend:
-        # The legacy CuTe stages import CuTeDSL, which the Triton route must not need.
-        from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
-            blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
+    with profiler_range("kda/triton/backward_delta_h"):
+        dh, d_initial_state, dv = chunk_kda_bwd_delta_h_triton(
+            prepared.qg,
+            prepared.kg,
+            prepared.w,
+            do,
+            prepared.aqk,
+            gk=g,
+            initial_state=initial_state,
+            d_final_state=d_final_state,
+            scale=scale,
+            metadata=metadata,
+            fastmath=fastmath,
         )
-        from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import chunk_kda_bwd_intra
-        from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
-            chunk_kda_bwd_wy_dqkg,
-        )
-    with profiler_range(f"kda/{range_backend}/backward_delta_h"):
-        if use_triton_backend:
-            dh, d_initial_state, dv = chunk_kda_bwd_delta_h_triton(
-                prepared.qg,
-                prepared.kg,
-                prepared.w,
-                do,
-                prepared.aqk,
-                gk=g,
-                initial_state=initial_state,
-                d_final_state=d_final_state,
-                scale=scale,
-                metadata=metadata,
-                fastmath=fastmath,
-            )
-        else:
-            dh, d_initial_state, dv = blackwell_delta_h_bwd_dhu_dv_fused_dispatch(
-                prepared.qg,
-                prepared.kg,
-                prepared.w,
-                do,
-                prepared.aqk,
-                gk=g,
-                h0=initial_state,
-                dht=d_final_state,
-                scale=scale,
-                chunk_size=chunk_size,
-                metadata=metadata,
-                fastmath=fastmath,
-            )
     prepared.aqk = prepared.qg = prepared.kg = prepared.w = None
 
     assert prepared.v_new is not None and prepared.h is not None
-    with profiler_range(f"kda/{range_backend}/backward_wy_dqkg"):
-        if use_triton_backend:
-            dq, dk, dv, dg, db, dAkk = chunk_kda_bwd_wy_triton(
-                q,
-                k,
-                v,
-                prepared.v_new,
-                g,
-                beta,
-                prepared.akk,
-                prepared.h,
-                do,
-                dh,
-                dv,
-                metadata,
-                scale=scale,
-                fastmath=fastmath,
-            )
-        else:
-            dq, dk, dv, dg, db, dAkk = chunk_kda_bwd_wy_dqkg(
-                q,
-                k,
-                v,
-                prepared.v_new,
-                g,
-                beta,
-                prepared.akk,
-                prepared.h,
-                do,
-                dh,
-                dv,
-                metadata,
-                scale=scale,
-                chunk_size=chunk_size,
-                fastmath=fastmath,
-                autotune=autotune,
-            )
+    with profiler_range("kda/triton/backward_wy_dqkg"):
+        dq, dk, dv, dg, db, dAkk = chunk_kda_bwd_wy_triton(
+            q,
+            k,
+            v,
+            prepared.v_new,
+            g,
+            beta,
+            prepared.akk,
+            prepared.h,
+            do,
+            dh,
+            dv,
+            metadata,
+            scale=scale,
+            fastmath=fastmath,
+        )
     prepared.akk = prepared.h = prepared.v_new = None
     del dh
 
     assert prepared.d_aqk is not None
-    with profiler_range(f"kda/{range_backend}/backward_intra"):
-        intra_backward = chunk_kda_bwd_intra_triton if use_triton_backend else chunk_kda_bwd_intra
-        dq, dk, dg, db = intra_backward(
+    with profiler_range("kda/triton/backward_intra"):
+        dq, dk, dg, db = chunk_kda_bwd_intra_triton(
             q,
             k,
             g,
@@ -860,7 +793,6 @@ def chunk_kda_bwd(
         metadata,
         prepared,
         scale=scale,
-        chunk_size=chunk_size,
         fastmath=fastmath,
         autotune=autotune,
     )
