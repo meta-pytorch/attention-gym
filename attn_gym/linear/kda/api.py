@@ -22,10 +22,6 @@ import torch
 
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
-from attn_gym.linear._delta_rule.paged_state import (
-    WARPDRIVE_POOL_ALIGNMENT_BYTES,
-    state_pool_is_aligned,
-)
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_backend,
@@ -142,8 +138,8 @@ def chunk_kda(
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
             See :class:`attn_gym.linear.types.KernelOptions`. ``"backend"`` defaults to
-            ``"auto"``: warpdrive on SM100-family GPUs, except for the calls listed under "Chunk backend
-            selection" in ``docs/linear.md``, and the repo-local fused backend elsewhere.
+            ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed, and the
+            repo-local fused backend elsewhere ("Chunk backend selection" in ``docs/linear.md``).
             ``"autotune"`` (default ``True``) benchmarks candidate fused-kernel
             configurations; warpdrive accepts the option but uses its fixed schedule.
 
@@ -239,8 +235,7 @@ def paged_chunk_kda(
         beta: Per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
             Recurrence math remains FP32; BF16 affects persistent storage only. The pool base
-            and slot stride need only element alignment. The default backend runs pools whose
-            base or slot stride is not 16-byte aligned on the fused backend.
+            and slot stride need only element alignment.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence.
             Positive, unique indices select cache slots to read and advance;
             non-positive indices produce zero output and leave the cache untouched.
@@ -252,7 +247,7 @@ def paged_chunk_kda(
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
         kernel_options: Backend-specific options. ``"backend"`` selects the kernels as in
-            ``chunk_kda``; the default runs replay-backed calls on the fused backend.
+            ``chunk_kda``, for replay-backed calls too.
             ``split_backward`` and ``split_forward`` are not supported by this paged
             operation; ``schedule`` applies as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the repo-local fused kernels;
@@ -339,10 +334,7 @@ def paged_chunk_kda(
         if num_slots > 1 and replay_state.count.stride(0) == 0:
             raise ValueError("replay_state count tensor slots must not overlap")
         # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
-    fused_only = replay_state is not None or not state_pool_is_aligned(
-        state_cache, WARPDRIVE_POOL_ALIGNMENT_BYTES
-    )
-    backend = resolve_chunk_backend(options.backend, q, fused_only=fused_only)
+    backend = resolve_chunk_backend(options.backend, q)
     if backend == "warpdrive":
         return _warpdrive_paged_chunk_forward(
             q,

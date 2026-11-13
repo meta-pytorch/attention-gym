@@ -8,32 +8,18 @@ from dataclasses import dataclass
 
 import torch
 
-# Pool base and slot-origin alignment that the warpdrive paged kernels require.
-WARPDRIVE_POOL_ALIGNMENT_BYTES = 16
-
 
 def state_row_alignment(cache: torch.Tensor) -> int:
     """Return the largest power-of-two byte alignment, at most 16, of every row of a state tensor.
 
     That is the alignment shared by the base and every outer stride, so it covers each slot,
-    head and value row; the innermost mode is contiguous. Fake tensors have no address, so under
-    ``torch.compile`` the view offset stands in for the base: allocations themselves are aligned.
+    head and value row; the innermost mode is contiguous.
     """
     element_bytes = cache.element_size()
-    offsets = (
-        cache.storage_offset() * element_bytes
-        if torch.compiler.is_compiling()
-        else cache.data_ptr()
-    )
-    offsets |= 16
+    offsets = cache.data_ptr() | 16
     for stride in cache.stride()[:-1]:
         offsets |= stride * element_bytes
     return offsets & -offsets
-
-
-def state_pool_is_aligned(cache: torch.Tensor, alignment_bytes: int) -> bool:
-    """Return whether every state row of a pool is ``alignment_bytes``-aligned (at most 16)."""
-    return state_row_alignment(cache) >= alignment_bytes
 
 
 def validate_has_initial_state(
@@ -130,9 +116,7 @@ class PagedState:
 
 
 __all__ = [
-    "WARPDRIVE_POOL_ALIGNMENT_BYTES",
     "PagedState",
-    "state_pool_is_aligned",
     "state_row_alignment",
     "validate_has_initial_state",
 ]
