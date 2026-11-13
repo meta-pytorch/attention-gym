@@ -2884,8 +2884,13 @@ def _compile_chunk_kda_bwd_wy_dqkg(
     dg = tensor(cutlass.Float32, gate_shape)
     db = tensor(cutlass.Float32, (1, tokens, heads))
     dA = tensor(cutlass.Float32, (1, tokens, heads, chunk_size))
-    cu_seqlens = tensor(cutlass.Int32, (sequences,)) if ragged else None
-    chunk_offsets = tensor(cutlass.Int32, (sequences,)) if ragged else None
+    # Routing metadata is read one int32 at a time; sliced buffers need only element alignment.
+    cu_seqlens = (
+        make_fake_compact_tensor(cutlass.Int32, (sequences,), assumed_align=4) if ragged else None
+    )
+    chunk_offsets = (
+        make_fake_compact_tensor(cutlass.Int32, (sequences,), assumed_align=4) if ragged else None
+    )
     return compile_tvm_ffi(
         op,
         q,
