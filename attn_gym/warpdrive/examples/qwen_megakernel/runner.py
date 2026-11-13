@@ -57,6 +57,7 @@ records every CTA's work items and ``trace_region``s with the table row as paylo
 ``trace="iket"`` emits the same ranges for ``run-iket``.
 """
 
+import dataclasses
 import math
 
 import torch
@@ -86,6 +87,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     compile_megakernel,
     packed_mlp_shapes,
 )
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig, rope_cos_sin
 from attn_gym.warpdrive.examples.qwen_megakernel.schedule import (
     CONTEXT,
     DEPENDENCY_LATENCY,
@@ -153,12 +155,11 @@ __all__ = [
 ]
 
 
-def rope_table(max_len: int, device, theta: float = 1e6) -> torch.Tensor:
-    """(max_len, 2, HEAD_DIM) bf16 cos and sin, computed as HF does."""
-    inv_freq = 1.0 / (theta ** (torch.arange(0, HEAD_DIM, 2, device=device).float() / HEAD_DIM))
-    freqs = torch.arange(max_len, device=device, dtype=torch.float32)[:, None] * inv_freq
-    angles = torch.cat((freqs, freqs), dim=-1)
-    return torch.stack((angles.cos(), angles.sin()), dim=1).to(torch.bfloat16).contiguous()
+def rope_table(config: QwenConfig, max_len: int, device) -> torch.Tensor:
+    """(max_len, 2, HEAD_DIM) bf16 cos and sin of positions 0 .. max_len - 1, computed as HF
+    does (``rope_cos_sin``, so with the config's YaRN scaling)."""
+    positions = torch.arange(max_len, device=device, dtype=torch.float32)
+    return torch.stack(rope_cos_sin(config, positions), dim=1).to(torch.bfloat16).contiguous()
 
 
 def kernel_class(engine: str, stream_inputs: bool = False) -> type[QwenDecodeMegakernel]:
@@ -201,7 +202,9 @@ class QwenMegakernel:
             raise ValueError(f"max_len must be a multiple of {BLOCK}, got {max_len}")
         device = weights.embed.device
         self.max_len = max_len
-        self.op = op = kernel(model=weights.config, **config)
+        # The kernel reads RoPE from ``self.rope``: its scaling stays out of the compile key.
+        model = dataclasses.replace(weights.config, rope_scaling=None)
+        self.op = op = kernel(model=model, **config)
         self.workspace, self.max_ctas = op.work.launch_args(device)
         self.table = build_table(op, self.max_ctas, ops).to(device)
         rows_per_cta = -(-self.table.shape[0] // self.max_ctas)
@@ -221,7 +224,7 @@ class QwenMegakernel:
             shape = packed_mlp_shapes(op)[2]
             self.router = torch.zeros(shape, device=device, dtype=torch.bfloat16)
         self.weights = weights
-        self.rope = rope_table(max_len, device, weights.config.rope_theta)
+        self.rope = rope_table(weights.config, max_len, device)
         self.scratch = torch.zeros(op.scratch_layout.size, device=device, dtype=torch.int64)
         self.batch = op.batch
         # (batch, vocab); ``logits`` is token 0's row at batch one, the whole tensor otherwise.

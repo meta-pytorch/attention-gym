@@ -12,13 +12,13 @@ The conversation's KV cache carries over between turns; when the chat template r
 earlier turn differently the cache is rebuilt from the start.
 """
 
+import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import typer
-from rich.console import Console, Group
-from rich.live import Live
+from rich.console import Console
 from rich.text import Text
 
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
@@ -26,12 +26,24 @@ from attn_gym.warpdrive.examples.qwen_megakernel.bench import (
     decode_step_fast_batch,
     prepare_fast_weights,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel.ref import forward_tokens, load_qwen3_weights
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
+    YarnScaling,
+    checkpoint_dir,
+    forward_tokens,
+    load_qwen3_weights,
+)
 
 SYNC_EVERY = 8  # decode steps between host reads of the sampled tokens
+# Qwen3's 40,960-position checkpoints were pretrained on 32,768 tokens: Qwen's YaRN setup
+# scales from there. Checkpoints with longer native contexts (Qwen3-2507) scale from theirs.
+QWEN3_POSITIONS, QWEN3_PRETRAINED_CONTEXT = 40960, 32768
 
 app = typer.Typer(add_completion=False, help=__doc__.splitlines()[0])
 console = Console()
+
+
+class CacheFull(typer.BadParameter):
+    """A turn whose prompt and reply would not fit the KV cache."""
 
 
 @dataclass
@@ -79,12 +91,35 @@ BACKENDS = {"megakernel": Megakernel, "compile": Compiled}
 class Chat:
     """A conversation whose KV cache holds every token fed so far (positions 0 .. len - 1)."""
 
-    def __init__(self, model: str, backend: str, engine: str, max_len: int, thinking: bool):
+    def __init__(
+        self,
+        model: str,
+        backend: str,
+        engine: str,
+        max_len: int,
+        thinking: bool,
+        yarn_factor: float | None = None,
+    ):
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(model)
         self.weights = load_qwen3_weights(model)
         config = self.weights.config
+        hf_config = json.loads((checkpoint_dir(model) / "config.json").read_text())
+        native = hf_config["max_position_embeddings"]
+        original = QWEN3_PRETRAINED_CONTEXT if native == QWEN3_POSITIONS else native
+        if yarn_factor is None:  # only past the native context, as Qwen recommends
+            long = max_len > native and config.rope_scaling is None
+            yarn_factor = max_len / original if long else None
+        if yarn_factor is not None:
+            if yarn_factor and yarn_factor < 1:
+                raise typer.BadParameter(
+                    f"--yarn-factor must be 0 or at least 1, got {yarn_factor}"
+                )
+            params = {"factor": yarn_factor, "original_max_position_embeddings": original}
+            yarn = YarnScaling.from_hf(params, original) if yarn_factor else None
+            config = replace(config, rope_scaling=yarn)
+            self.weights = replace(self.weights, config=config)
         shape = (config.num_layers, config.num_kv_heads, max_len, config.head_dim)
         # Zeroed: the compiled step's masked SDPA reads rows past the position (0 * NaN is NaN).
         self.caches = [torch.zeros(shape, device="cuda", dtype=torch.bfloat16) for _ in "kv"]
@@ -154,11 +189,18 @@ class Chat:
             return logits.argmax().reshape(1)
         return torch.multinomial(torch.softmax(logits / temperature, dim=-1), 1)
 
-    def reply(self, prompt: str, max_new_tokens: int, temperature: float, on_token) -> Turn:
+    def reply(self, prompt: str, max_new_tokens: int | None, temperature: float, on_token) -> Turn:
+        """Answer ``prompt``, streaming through ``on_token``. ``max_new_tokens``: None decodes until a
+        stop token or a full KV cache."""
         self.messages.append({"role": "user", "content": prompt})
         ids = self.prompt_ids()
-        if len(ids) + max_new_tokens >= self.max_len:
-            raise typer.BadParameter(f"the conversation would pass max_len = {self.max_len}")
+        # Replays decode whole groups of SYNC_EVERY steps, writing K/V rows past the last kept
+        # token; this much room keeps every row inside the cache.
+        room = self.max_len - len(ids) - SYNC_EVERY - 1
+        max_new_tokens = room if max_new_tokens is None else max_new_tokens
+        if not 0 < max_new_tokens <= room:
+            self.messages.pop()
+            raise CacheFull(f"the conversation would pass max_len = {self.max_len}")
         graph, fed, sampled = self.decode_graph(temperature)  # before prefill: warm-up writes K/V
         start = time.perf_counter()
         token = self.sample(self.prefill(ids), temperature)
@@ -168,8 +210,6 @@ class Chat:
         # stream text and look for a stop token. Steps past a stop are discarded (their K/V rows
         # are overwritten by the next prefill).
         pos = len(self.cached)
-        if pos + max_new_tokens + SYNC_EVERY >= self.max_len:
-            raise typer.BadParameter(f"the conversation would pass max_len = {self.max_len}")
         fed.copy_(token)
         self.pos.fill_(pos - 1)  # the graph adds 1 before each step
         out: list[int] = []
@@ -205,21 +245,26 @@ def stats_line(tokens: int, seconds: float, prompt_tokens: int, prefill_s: float
     return line
 
 
-def run_turn(chat: Chat, prompt: str, max_new_tokens: int, temperature: float):
-    answer = Text()
-    with Live(console=console, refresh_per_second=15, transient=False) as live:
+def run_turn(chat: Chat, prompt: str, max_new_tokens: int | None, temperature: float):
+    """Stream the reply as plain text (appended, so replies taller than the terminal keep
+    scrolling), then its stats."""
+    shown = 0  # characters of the reply already written
 
-        def on_token(out, elapsed):
-            answer.plain = chat.tokenizer.decode(out, skip_special_tokens=True)
-            live.update(Group(answer, stats_line(len(out), elapsed, 0, 0.0)))
+    def write(text: str):
+        nonlocal shown
+        console.out(text[shown:], end="", highlight=False)
+        console.file.flush()
+        shown = len(text)
 
-        turn = chat.reply(prompt, max_new_tokens, temperature, on_token)
-        live.update(
-            Group(
-                Text(turn.text),
-                stats_line(turn.tokens, turn.decode_s, turn.prompt_tokens, turn.prefill_s),
-            )
-        )
+    def on_token(out, elapsed):
+        text = chat.tokenizer.decode(out, skip_special_tokens=True)
+        if not text.endswith("\ufffd"):  # wait for the rest of a multi-byte character
+            write(text)
+
+    turn = chat.reply(prompt, max_new_tokens, temperature, on_token)
+    write(turn.text)
+    console.print()
+    console.print(stats_line(turn.tokens, turn.decode_s, turn.prompt_tokens, turn.prefill_s))
 
 
 @app.command()
@@ -228,7 +273,15 @@ def main(
     backend: str = typer.Option("megakernel", help="megakernel or compile (torch.compile)"),
     engine: str = typer.Option("cuda_core", help="megakernel engine: cuda_core or tcgen05"),
     max_len: int = typer.Option(4096, help="KV cache capacity (tokens)"),
-    max_new_tokens: int = typer.Option(512, help="tokens per reply"),
+    yarn_factor: float | None = typer.Option(
+        None,
+        help="YaRN RoPE factor over the pretraining context (32K for Qwen3; 4 gives 128K, as "
+        "Qwen documents). Default: max_len / 32K when max_len passes the checkpoint's "
+        "max_position_embeddings and it has no RoPE scaling of its own; 0 turns YaRN off.",
+    ),
+    max_new_tokens: int | None = typer.Option(
+        None, help="cap on tokens per reply; default: until a stop token or a full KV cache"
+    ),
     temperature: float = typer.Option(0.0, help="0: greedy"),
     thinking: bool = typer.Option(False, help="Qwen3 thinking mode"),
     prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
@@ -237,11 +290,15 @@ def main(
         raise typer.BadParameter(f"backend must be one of {sorted(BACKENDS)}")
     label = f"the {engine} megakernel" if backend == "megakernel" else "torch.compile"
     with console.status(f"loading {model} and compiling {label}"):
-        chat = Chat(model, backend, engine, max_len, thinking)
+        chat = Chat(model, backend, engine, max_len, thinking, yarn_factor)
     if prompt is not None:
         run_turn(chat, prompt, max_new_tokens, temperature)
         return
-    console.print(f"[bold]{model}[/] on {label}. Empty line or Ctrl-D to quit.")
+    yarn = chat.weights.config.rope_scaling
+    rope = f", YaRN x{yarn.factor:g}" if yarn else ""
+    console.print(
+        f"[bold]{model}[/] on {label}, {max_len} tokens{rope}. Empty line or Ctrl-D to quit."
+    )
     while True:
         try:
             text = console.input("[bold cyan]you>[/] ")
@@ -249,7 +306,17 @@ def main(
             break
         if not text.strip():
             break
-        run_turn(chat, text, max_new_tokens, temperature)
+        try:
+            run_turn(chat, text, max_new_tokens, temperature)
+        except CacheFull:
+            console.print(
+                f"[yellow]The conversation filled max_len = {max_len}: starting over.[/]"
+            )
+            chat.messages, chat.cached = [], []
+            try:
+                run_turn(chat, text, max_new_tokens, temperature)
+            except CacheFull as error:
+                console.print(f"[red]{error}[/]")
 
 
 if __name__ == "__main__":

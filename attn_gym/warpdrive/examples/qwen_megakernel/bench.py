@@ -33,7 +33,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     make_decode_state,
     rms_norm,
     rope,
-    rope_angles,
+    rope_cos_sin,
 )
 
 
@@ -56,13 +56,13 @@ def prepare_fast_weights(
     weights: QwenWeights, max_len: int, gemm_rows: int = 16
 ) -> FastQwenWeights:
     positions = torch.arange(max_len, device=weights.embed.device)
-    angles = rope_angles(weights.config, positions.float())
+    cos, sin = rope_cos_sin(weights.config, positions.float())
     return FastQwenWeights(
         weights,
         torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1),
         torch.cat((weights.gate, weights.up), dim=-2),  # MoE: per expert
-        angles.cos().to(torch.bfloat16),
-        angles.sin().to(torch.bfloat16),
+        cos.to(torch.bfloat16),
+        sin.to(torch.bfloat16),
         positions,
         gemm_rows,
     )

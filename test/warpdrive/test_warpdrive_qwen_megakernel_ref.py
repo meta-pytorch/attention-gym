@@ -23,6 +23,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     make_decode_state,
     prompt_tokens,
     random_weights,
+    rope_cos_sin,
     validate_against_hf,
 )
 
@@ -99,6 +100,74 @@ def test_moe_decode_matches_hf(tmp_path: Path) -> None:
             torch.testing.assert_close(ours, theirs, atol=0.05, rtol=0.02)
             assert ours.argmax() == theirs.argmax()
             token = theirs.argmax()
+
+
+def test_yarn_decode_matches_hf(tmp_path: Path) -> None:
+    """A small random Qwen3 with YaRN RoPE (transformers 5's rope_parameters), saved by HF and
+    read back by load_qwen3_weights: cos and sin match Qwen3RotaryEmbedding, and decode logits
+    past the original context match Qwen3ForCausalLM. The legacy rope_scaling spelling parses
+    to the same scaling."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    torch.manual_seed(0)
+    yarn = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 64}
+    config = transformers.Qwen3Config(
+        hidden_size=512, num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=2,
+        head_dim=128, intermediate_size=1024, vocab_size=2048, max_position_embeddings=256,
+        rope_parameters={"rope_theta": 1e6, **yarn},
+    )  # fmt: skip
+    model = transformers.Qwen3ForCausalLM(config).to(torch.bfloat16).cuda().eval()
+    # .to() rounds the rotary inv_freq buffer to bf16; from_pretrained(dtype=bf16) keeps fp32.
+    rotary = transformers.models.qwen3.modeling_qwen3.Qwen3RotaryEmbedding(config)
+    model.model.rotary_emb = rotary.cuda()
+    model.save_pretrained(tmp_path)
+    weights = load_qwen3_weights(str(tmp_path))
+    scaling = weights.config.rope_scaling
+    assert (scaling.factor, scaling.original_max_position) == (4.0, 64)
+    legacy = {**config.to_dict(), "rope_scaling": yarn, "rope_theta": 1e6}
+    del legacy["rope_parameters"]
+    assert QwenConfig.from_hf(legacy).rope_scaling == scaling
+
+    positions = torch.arange(256, device="cuda")
+    x = torch.zeros(1, 256, 128, device="cuda")
+    hf_cos, hf_sin = model.model.rotary_emb(x, positions[None])
+    cos, sin = rope_cos_sin(weights.config, positions.float())
+    torch.testing.assert_close(cos, hf_cos[0], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(sin, hf_sin[0], atol=1e-6, rtol=1e-6)
+
+    ctx = 150  # past the 64-token original context
+    with torch.no_grad():
+        output = model(prompt_tokens(weights, ctx, 0)[None], use_cache=True, logits_to_keep=1)
+        caches, token, pos = make_decode_state(weights, ctx, ctx + 4, seed=0)
+        assert token == output.logits[0, -1].argmax()
+        for step in range(3):
+            ours = decode_step_ref(weights, token, pos + step, *caches)
+            output = model(token.reshape(1, 1), past_key_values=output.past_key_values)
+            theirs = output.logits[0, -1].float()
+            torch.testing.assert_close(ours, theirs, atol=0.05, rtol=0.02)
+            token = theirs.argmax()
+
+
+def test_rope_scaling_parsing() -> None:
+    """Configs without scaling, with transformers 5's rope_type "default", or with the legacy
+    "type" key parse; other scaling types are rejected rather than silently ignored."""
+    transformers = pytest.importorskip("transformers")
+    base = transformers.Qwen3Config().to_dict()
+    base.pop("rope_parameters", None)
+    base["rope_theta"] = 1e6
+    assert QwenConfig.from_hf({**base, "rope_scaling": None}).rope_scaling is None
+    default = {"rope_type": "default", "rope_theta": 1e6}
+    assert QwenConfig.from_hf({**base, "rope_parameters": default}).rope_scaling is None
+    legacy = {"type": "yarn", "factor": 2.0, "original_max_position_embeddings": 1024}
+    scaling = QwenConfig.from_hf({**base, "rope_scaling": legacy}).rope_scaling
+    assert (scaling.factor, scaling.original_max_position) == (2.0, 1024)
+    default_factor = {"rope_type": "yarn", "original_max_position_embeddings": 1024}
+    config = {**base, "max_position_embeddings": 4096, "rope_scaling": default_factor}
+    assert QwenConfig.from_hf(config).rope_scaling.factor == 4.0
+    with pytest.raises(ValueError, match="only YaRN"):
+        QwenConfig.from_hf({**base, "rope_scaling": {"rope_type": "linear", "factor": 2.0}})
 
 
 def test_error_budget_rejects_wrong_token_and_nonfinite_logits() -> None:

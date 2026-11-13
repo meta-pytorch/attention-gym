@@ -1,5 +1,6 @@
 """Qwen3 decode megakernel: each instruction alone, then whole decode steps."""
 
+import dataclasses
 import gc
 
 import pytest
@@ -15,6 +16,7 @@ from attn_gym.warpdrive.examples import qwen_megakernel as mk
 from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
+    YarnScaling,
     compare_logits,
     decode_step_ref,
     forward_tokens,
@@ -87,7 +89,7 @@ def cache_shape(config: QwenConfig) -> tuple[int, int, int, int]:
 
 
 def rope_at(pos: int):
-    table = mk.rope_table(pos + 1, "cuda")[pos]
+    table = mk.rope_table(QwenConfig(), pos + 1, "cuda")[pos]
     return table[0][None], table[1][None]
 
 
@@ -282,6 +284,33 @@ def test_odd_gqa_group_random_weights(engine):
     runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
     assert (runner.op.per_row, runner.op.heads_per_split) == (1, 6)
     caches, token, pos = make_decode_state(weights, 150, MAX_LEN, seed=3)
+    ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))
+    logits = runner(weights, token, pos, *ours)
+    ref = decode_step_ref(weights, token, pos, *theirs)
+    high = forward_tokens(weights, token.reshape(1), pos, *exact, dtype=torch.float32)
+    metrics = compare_logits(logits, ref, high)
+    assert metrics["passed"], metrics
+    for mine, oracle in zip(ours, exact):
+        torch.testing.assert_close(mine[:, :, pos], oracle[:, :, pos], atol=0.05, rtol=0.02)
+
+
+def test_yarn_rope_random_weights():
+    """A YaRN config past its original context: the runner's RoPE table follows the config's
+    scaling, so the step matches the reference, and it reuses the plain config's kernel."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("the megakernel requires an SM100-family GPU")
+    yarn = YarnScaling.from_hf({"factor": 8.0, "original_max_position_embeddings": 32}, 32)
+    config = QwenConfig(
+        hidden_size=1024, num_layers=2, num_q_heads=16, num_kv_heads=8,
+        intermediate_size=2048, vocab_size=4096, rope_scaling=yarn,
+    )  # fmt: skip
+    weights = random_weights(config)
+    plain = dataclasses.replace(weights, config=dataclasses.replace(config, rope_scaling=None))
+    mk.QwenMegakernel(plain, MAX_LEN)
+    compiled = mk.compile_megakernel.cache_info().currsize
+    runner = mk.QwenMegakernel(weights, MAX_LEN)
+    assert mk.compile_megakernel.cache_info().currsize == compiled  # the plain config's kernel
+    caches, token, pos = make_decode_state(weights, 200, MAX_LEN, seed=5)
     ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))
     logits = runner(weights, token, pos, *ours)
     ref = decode_step_ref(weights, token, pos, *theirs)
