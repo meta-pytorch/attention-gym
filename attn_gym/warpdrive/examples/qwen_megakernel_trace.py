@@ -28,6 +28,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel import (
     DOWN,
     GATEUP,
     LMHEAD,
+    NORM,
     OP_NAMES,
     OPROJ,
     QKV,
@@ -118,25 +119,40 @@ def input_edges(
 
 
 def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
-    """Mean us per layer, by instruction kind, from the producer phase's last row done to this
-    phase's last row done. QKV counts from layer 1, whose producer is the previous layer's
-    down; a MoE table's GATEUP counts from its ROUTER."""
+    """Mean us per layer, by phase, from the producer phase's last row done to this phase's last
+    row done. QKV counts from layer 1, whose producer is the previous layer's down; a MoE
+    table's GATEUP counts from its ROUTER. A streaming table's NORM rows are two phases,
+    NORM_IN (QKV's and the LM head's inputs) and NORM_POST (gate/up's), and QKV, the LM head
+    and dense gate/up count from them."""
     rows = table.tolist()
+    kinds = {row[0] for row in rows}
     producers = PRODUCER
-    if any(row[0] == ROUTER for row in rows):
+    if ROUTER in kinds:
         producers = MOE_PRODUCER
-    if any(row[0] == REDUCE for row in rows):
+    if REDUCE in kinds:
         producers = MOE_BATCH_PRODUCER
-    last: dict[tuple[int, int], int] = {}
+    # Phase name -> (producer phase, its layer offset).
+    after = {
+        OP_NAMES[op]: (OP_NAMES[producer], -1 if op in (QKV, LMHEAD) else 0)
+        for op, producer in producers.items()
+    }
+    if NORM in kinds:
+        after["NORM_IN"] = after["QKV"]
+        after["QKV"] = after["LMHEAD"] = ("NORM_IN", 0)
+        after["NORM_POST"] = ("OPROJ", 0)
+        if ROUTER not in kinds:
+            after["GATEUP"] = ("NORM_POST", 0)
+    last: dict[tuple[str, int], int] = {}
     for row, item in work_item_ranges(ranges, "compute").items():
-        key = tuple(rows[row][:2])  # (op, layer); the LM head's layer is the layer count
-        last[key] = max(last.get(key, 0), item.end_ns)
+        op, layer, a = rows[row][:3]  # the LM head's layer is the layer count
+        name = ("NORM_IN", "NORM_POST")[a] if op == NORM else OP_NAMES[op]
+        last[name, layer] = max(last.get((name, layer), 0), item.end_ns)
     spans: dict[str, list[int]] = {}
-    for (op, layer), end in last.items():
-        producer_layer = layer - 1 if op in (QKV, LMHEAD) else layer
-        producer = last.get((producers[op], producer_layer))
-        if producer is not None:
-            spans.setdefault(OP_NAMES[op], []).append(end - producer)
+    for (name, layer), end in last.items():
+        producer, offset = after[name]
+        start = last.get((producer, layer + offset))
+        if start is not None:
+            spans.setdefault(name, []).append(end - start)
     return {name: sum(v) / len(v) / 1e3 for name, v in spans.items()}
 
 

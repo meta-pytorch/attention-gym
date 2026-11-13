@@ -87,10 +87,12 @@ def test_batch_random_weights(batch):
     check_batch(random_weights(SMALL), batch)
 
 
-def test_batch_steps_atomic_schedule():
+@pytest.mark.parametrize("stream_inputs", [False, True])
+def test_batch_steps_atomic_schedule(stream_inputs):
     """17 sequences (MMA width 32) under the atomic schedule, three steps each across the KV block
     boundary at position 128, with unused cache rows NaN-poisoned: each step's logits stay within
-    the budget, only row pos changes, and the next step reads the reference's K/V rows."""
+    the budget, only row pos changes, and the next step reads the reference's K/V rows. Streamed
+    inputs: each launch's NORM and act flags must be its own."""
     require_sm100()
     weights = random_weights(SMALL)
     batch = 17
@@ -103,7 +105,14 @@ def test_batch_steps_atomic_schedule():
         ours_k[b][:, :, pos:] = float("nan")
         ours_v[b][:, :, pos:] = float("nan")
     theirs_k, theirs_v = ours_k.clone(), ours_v.clone()
-    runner = mk.QwenMegakernel(weights, MAX_LEN, engine="tcgen05", batch=batch, schedule="atomic")
+    runner = mk.QwenMegakernel(
+        weights,
+        MAX_LEN,
+        engine="tcgen05",
+        batch=batch,
+        schedule="atomic",
+        stream_inputs=stream_inputs,
+    )
     for step in range(3):
         steps = [pos + step for pos in positions]
         before_k = ours_k.clone()
@@ -275,14 +284,41 @@ def test_moe_batch_phase_spans_count_from_reduce():
     assert mk_trace.phase_spans(events, table)["QKV"] == 0.05
 
 
-def test_moe_batch_repeated_launches():
+def test_streamed_phase_spans_count_from_norm_rows():
+    """A streaming table's NORM rows are two phases: NORM_IN after the previous layer's down
+    (before QKV and the LM head), NORM_POST after o_proj (before gate/up)."""
+    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.profiler import Range
+
+    rows = [
+        [mk.DOWN, 0, 0, 0],
+        [mk.NORM, 1, 0, 0],
+        [mk.QKV, 1, 0, 0],
+        [mk.OPROJ, 1, 0, 0],
+        [mk.NORM, 1, 1, 0],
+        [mk.GATEUP, 1, 0, 0],
+        [mk.NORM, 2, 0, 0],  # the LM head's (layer == layers)
+        [mk.LMHEAD, 2, 0, 1],
+    ]
+    table = torch.tensor([words + [i] for i, words in enumerate(rows)])
+    ends = [100, 150, 200, 260, 300, 360, 400, 470]
+    events = [Range("compute", d - 10, d, (0,), payload=i) for i, d in enumerate(ends)]
+    spans = mk_trace.phase_spans(events, table)
+    expected = {"NORM_IN": 0.05, "QKV": 0.05, "NORM_POST": 0.04, "GATEUP": 0.06, "LMHEAD": 0.07}
+    assert {name: spans[name] for name in expected} == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("stream_inputs", [False, True])
+def test_moe_batch_repeated_launches(stream_inputs):
     """One runner, three launches with new tokens (atomic schedule): the routing, and with it
     which experts' rows are active or skip, changes every launch; each launch's expert lists,
     counts and epochs must be its own."""
     require_sm100()
     weights = random_weights(SMALL_MOE)
     k, v, tokens, positions = batch_state(weights, 4)
-    runner = mk.QwenMegakernel(weights, MAX_LEN, engine="tcgen05", batch=4, schedule="atomic")
+    runner = mk.QwenMegakernel(
+        weights, MAX_LEN, engine="tcgen05", batch=4, schedule="atomic", stream_inputs=stream_inputs
+    )
     active = []
     for step in range(3):
         steps = [pos + step for pos in positions]
@@ -314,3 +350,62 @@ def test_input_waits_count_reduce_rows():
         Range("reduce.poll", 120, 160, (0,), payload=0),
     ]
     assert mk_trace.input_waits(events, table) == {"REDUCE": 0.06}
+
+
+def streamed_matches_batch_one(weights, batch):
+    """Check that streamed logits and K/V cache prefixes are bit-identical to separate batch-one
+    tcgen05 runs, using one KV split for both."""
+    k, v, tokens, positions = batch_state(weights, batch)
+    streamed = mk.QwenMegakernel(
+        weights, MAX_LEN, engine="tcgen05", batch=batch, splits=1, stream_inputs=True
+    )
+    ours_k, ours_v = k.clone(), v.clone()
+    if batch == 1:  # the single-sequence call
+        logits = streamed(weights, tokens[0], positions[0], ours_k[0], ours_v[0]).clone()[None]
+    else:
+        logits = streamed.decode(tokens, positions, ours_k, ours_v).clone()
+    del streamed
+    single = mk.QwenMegakernel(weights, MAX_LEN, engine="tcgen05", splits=1)
+    for b, pos in enumerate(positions):
+        theirs_k, theirs_v = k[b].clone(), v[b].clone()
+        assert torch.equal(logits[b], single(weights, tokens[b], pos, theirs_k, theirs_v)), b
+        assert torch.equal(ours_k[b][:, :, : pos + 1], theirs_k[:, :, : pos + 1])
+        assert torch.equal(ours_v[b][:, :, : pos + 1], theirs_v[:, :, : pos + 1])
+
+
+@pytest.mark.parametrize("batch", [1, 17])
+def test_streamed_inputs_match_batch_one(batch):
+    """Streamed dense decoding matches batch-one tcgen05 logits and K/V cache prefixes bitwise."""
+    require_sm100()
+    streamed_matches_batch_one(random_weights(SMALL), batch)
+
+
+def test_streamed_inputs_moe():
+    """MoE shares QKV and LM-head inputs; expert rows gather into the per-CTA scratch."""
+    require_sm100()
+    for b, metrics in enumerate(check_moe_batch(random_weights(SMALL_MOE), 8, stream_inputs=True)):
+        assert metrics["passed"], (b, metrics)
+
+
+def test_streamed_inputs_free_the_ring():
+    """Streaming admits a batch-64 configuration that resident inputs cannot fit while retaining
+    at least eight weight-ring stages; it requires the tcgen05 engine."""
+    model = dataclasses.replace(SMALL, hidden_size=5120, num_q_heads=40, num_kv_heads=8)
+    with pytest.raises(ValueError, match="stages must be in"):
+        mk.QwenDecodeMegakernelTc(model=model, batch=64)
+    op = mk.QwenDecodeMegakernelTcStream(model=model, batch=64)
+    assert op.stages >= 8
+    with pytest.raises(ValueError, match="stream_inputs needs the tcgen05 engine"):
+        mk.QwenMegakernel(random_weights(SMALL, device="cpu"), MAX_LEN, stream_inputs=True)
+
+
+@pytest.mark.xdist_group("qwen-large-checkpoints")
+def test_streamed_inputs_checkpoint():
+    """Qwen3-8B at B = 32, past the batch its SMEM-resident inputs fit (16). Skips unless the
+    checkpoint is in the local HF cache."""
+    require_sm100()
+    hub = pytest.importorskip("huggingface_hub")
+    path = hub.try_to_load_from_cache("Qwen/Qwen3-8B", "config.json")
+    if not isinstance(path, str):
+        pytest.skip("Qwen3-8B is not in the local HF cache")
+    streamed_matches_batch_one(load_qwen3_weights(path), 32)

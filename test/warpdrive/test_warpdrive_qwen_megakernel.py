@@ -163,6 +163,34 @@ def test_single_instruction(weights, op, engine):
 
 
 @pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_gateup_sums_a_residual_wider_than_registers(engine):
+    """Batch-one gate/up sums h_in and o_proj's partials itself. Past 8192 hidden columns a
+    thread's share outgrows its registers and is staged through SMEM: h_mid and the activation
+    must match the reference either way."""
+    torch.manual_seed(2)
+    config = QwenConfig(
+        hidden_size=9216, num_layers=1, num_q_heads=8, num_kv_heads=8, intermediate_size=1024,
+        vocab_size=1024,
+    )  # fmt: skip
+    weights = random_weights(config)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.GATEUP,), engine=engine)
+    inputs = {}
+    for name in ("h_in", "o_part"):
+        shape = runner.values(name).shape
+        values = torch.randn(shape, device="cuda") / 4 if name == "o_part" else bf16_values(*shape)
+        runner.set_values(name, values)
+        inputs[name] = values
+    runner.step_info.copy_(torch.tensor([0, 10], dtype=torch.int32))
+    runner.launch(*[bf16_values(*cache_shape(config)).bfloat16() for _ in "kv"])
+    torch.cuda.synchronize()
+    h = (inputs["h_in"][0] + inputs["o_part"][0].sum(0).bfloat16()).bfloat16()
+    norm = rms_norm(h, weights.post_ln[0], 1e-6)
+    expected = F.silu(F.linear(norm, weights.gate[0])) * F.linear(norm, weights.up[0])
+    torch.testing.assert_close(runner.values("h_mid")[0], h.float())
+    torch.testing.assert_close(runner.values("act")[0], expected.float(), atol=1e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
 def test_oproj_instruction(weights, engine):
     """o_proj combines KV-split partials: split s carries weight 2^m_s and sum l_s."""
     torch.manual_seed(1)

@@ -59,7 +59,9 @@ def time_compiled(weights, caches, token, pos, batch, max_len, iters):
 
 
 @torch.no_grad()
-def sweep(weights, batches: list[int], ctx: int, iters: int, compiled: bool = True) -> list[dict]:
+def sweep(
+    weights, batches: list[int], ctx: int, iters: int, compiled: bool = True, stream: bool = False
+) -> list[dict]:
     """One row per engine and batch: step time in us and tokens per second."""
     max_len = ctx + 64
     caches, token, pos = make_decode_state(weights, ctx, max_len, seed=0)
@@ -81,23 +83,27 @@ def sweep(weights, batches: list[int], ctx: int, iters: int, compiled: bool = Tr
                     f"ctx={ctx} batch={batch} compiled baseline skipped: out of memory", flush=True
                 )
             torch.cuda.empty_cache()
-        try:
-            runner = QwenMegakernel(weights, max_len, engine="tcgen05", batch=batch)
-        except ValueError as error:  # the batch's GEMV inputs leave too few ring stages
-            print(f"ctx={ctx} batch={batch} skipped: {error}", flush=True)
-            continue
-        batched = [
-            c.expand(batch, *c.shape).contiguous() if batch > 1 else c.clone() for c in caches
-        ]
-        runner.decode(token.reshape(1).repeat(batch), [pos] * batch, *batched)
-        us = time_runner(runner, batched, iters)
-        rows.append(
-            {"engine": "tcgen05", "batch": batch, "ctx": ctx, "us": us,
-             "tokens_per_s": batch * 1e6 / us, "stages": runner.op.stages}
-        )  # fmt: skip
-        print(json.dumps(rows[-1]), flush=True)
-        del runner, batched
-        torch.cuda.empty_cache()
+        for streams in (False, True) if stream else (False,):
+            engine = "tcgen05_stream" if streams else "tcgen05"
+            try:
+                runner = QwenMegakernel(
+                    weights, max_len, engine="tcgen05", batch=batch, stream_inputs=streams
+                )
+            except ValueError as error:  # the batch's GEMV inputs leave too few ring stages
+                print(f"ctx={ctx} batch={batch} {engine} skipped: {error}", flush=True)
+                continue
+            batched = [
+                c.expand(batch, *c.shape).contiguous() if batch > 1 else c.clone() for c in caches
+            ]
+            runner.decode(token.reshape(1).repeat(batch), [pos] * batch, *batched)
+            us = time_runner(runner, batched, iters)
+            rows.append(
+                {"engine": engine, "batch": batch, "ctx": ctx, "us": us,
+                 "tokens_per_s": batch * 1e6 / us, "stages": runner.op.stages}
+            )  # fmt: skip
+            print(json.dumps(rows[-1]), flush=True)
+            del runner, batched
+            torch.cuda.empty_cache()
     return rows
 
 
@@ -110,19 +116,16 @@ def plot(rows: list[dict], title: str, path: Path):
     fig, (left, right) = plt.subplots(1, 2, figsize=(12, 4.8))
     for i, ctx in enumerate(sorted({r["ctx"] for r in rows})):
         color = f"C{i}"
-        tc = [r for r in rows if r["ctx"] == ctx and r["engine"] == "tcgen05"]
         cc = [r for r in rows if r["ctx"] == ctx and r["engine"] == "cuda_core"]
-        batches = [r["batch"] for r in tc]
-        left.plot(
-            batches,
-            [r["tokens_per_s"] for r in tc],
-            "-o",
-            color=color,
-            label=f"megakernel, ctx {ctx}",
-        )
-        right.plot(
-            batches, [r["us"] / 1e3 for r in tc], "-o", color=color, label=f"megakernel, ctx {ctx}"
-        )
+        series = (("tcgen05", "-o", "megakernel"), ("tcgen05_stream", ":^", "streamed inputs"))
+        for engine, style, name in series:
+            tc = [r for r in rows if r["ctx"] == ctx and r["engine"] == engine]
+            if not tc:
+                continue
+            batches = [r["batch"] for r in tc]
+            label = f"{name}, ctx {ctx}"
+            left.plot(batches, [r["tokens_per_s"] for r in tc], style, color=color, label=label)
+            right.plot(batches, [r["us"] / 1e3 for r in tc], style, color=color, label=label)
         base = [r for r in rows if r["ctx"] == ctx and r["engine"] == "compiled_graph"]
         if base:
             bb = [r["batch"] for r in base]
@@ -161,6 +164,11 @@ def main():
     parser.add_argument(
         "--skip-compile", action="store_true", help="skip the torch.compile + CUDA graph baseline"
     )
+    parser.add_argument(
+        "--stream-inputs",
+        action="store_true",
+        help="also time the megakernel with streamed GEMV inputs (QwenMegakernel(stream_inputs=True))",
+    )
     parser.add_argument("--output", type=Path, help="write the rows as JSON")
     parser.add_argument("--plot", type=Path, help="write a throughput / step-time plot")
     args = parser.parse_args()
@@ -171,7 +179,7 @@ def main():
     rows = [
         row
         for ctx in args.contexts
-        for row in sweep(weights, args.batches, ctx, args.iters, compiled)
+        for row in sweep(weights, args.batches, ctx, args.iters, compiled, args.stream_inputs)
     ]
     if args.output:
         args.output.write_text(json.dumps(rows, indent=1))
