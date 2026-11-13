@@ -35,6 +35,7 @@ from itertools import combinations
 from cutlass import cute
 
 from attn_gym.warpdrive.protocol import ProtocolError, current_trace
+from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 
 MODES = ("warn", "strict", "off")
 PTX = "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html"
@@ -98,8 +99,9 @@ RULES = {
     "barrier": Rule(
         "Warps of one role are ordered within a handle only by a barrier over the whole role "
         "between the two accesses (record it with named_barrier). Different warps are never "
-        "pipelined; PTX also requires tcgen05.wait::ld/st and tcgen05.fence::before/"
-        "after_thread_sync around that sync, which the diagnostic assumes rather than checks.",
+        "pipelined; PTX also requires tcgen05.wait::ld/st before that sync, which the "
+        "diagnostic assumes rather than checks, and tcgen05.fence::before/after_thread_sync "
+        "around it, which the recorded barriers of a tcgen05 role emit.",
         f"PTX ISA 9.5 9.7.18.6.2 and 9.7.18.6.3 "
         f"({PTX}#tcgen05-memory-consistency-model-inter-thread-sync)",
     ),
@@ -151,10 +153,13 @@ def named_barrier(barrier_id: int, number_of_threads: int):
     """Emit ``cute.arch.barrier`` and record it for the alias diagnostic.
 
     Only a barrier over the whole calling role (``number_of_threads == 32 * warps``)
-    orders its warps. ``NamedBarrier.sync()`` records the same event with an allocated ID.
+    orders its warps. A tcgen05 role fences both sides, as ``NamedBarrier.sync()`` does. ``NamedBarrier.sync()`` records the same event with an allocated ID.
     A hand-picked ID owned by the layer, a named channel or a ``NamedBarrier`` raises.
     """
+    trace = current_trace()
+    before_sync(trace)
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=number_of_threads)
+    after_sync(trace)
     # Static IDs can be checked for collisions with allocated barriers.
     _record(
         "barrier", threads=number_of_threads, id=barrier_id if type(barrier_id) is int else None

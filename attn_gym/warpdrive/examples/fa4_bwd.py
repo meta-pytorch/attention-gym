@@ -109,6 +109,7 @@ from attn_gym.warpdrive import (
     bulk_wait_group,
     fence_async_shared,
     role,
+    tcgen05_before_thread_sync,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
@@ -797,8 +798,11 @@ class FlashAttentionBackward(WarpSpecialized):
 
         Match ``Warps`` counting: finish every lane, then arrive once per warp on rank 0's
         full barrier. Rank 0 is the only target because the kernel runs on one CTA pair.
-        No fence is needed here: make_ds fenced sdS, and the caller waits for its S loads.
+        make_ds fenced sdS, and the caller completed its S loads, but the MMA role's dQ
+        overwrites the tail of S: PTX orders this role's tcgen05.ld of S before that write
+        only with ``tcgen05.fence::before_thread_sync`` ahead of the arrival (ISA 9.7.18.6.3).
         """
+        tcgen05_before_thread_sync()
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive(ds.full_barrier(0), peer_cta_rank_in_cluster=Int32(0))

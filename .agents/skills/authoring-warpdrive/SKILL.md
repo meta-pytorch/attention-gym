@@ -69,6 +69,9 @@ Follow the guide's lifecycle, prologue and launch sections. In particular:
 - For raw synchronization, overrides or opt-outs, explain the exact ordering supplied instead.
   Never suppress a check just to obtain a successful compile. Inspect unverified TMA/alias
   sites rather than interpreting silence as proof.
+- Raw waits and signals in a TMEM or MMA role need the tcgen05 thread-sync fences that managed
+  ones emit ([dropping down](../../../docs/warpdrive/dropping-down.md#tcgen05-thread-sync-fences-on-raw-synchronization));
+  run `ptx_check.check_tcgen05_sync` on the kernel's PTX to find a missing one.
 
 ## Validate and hand back
 

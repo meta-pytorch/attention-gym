@@ -1,14 +1,16 @@
 """Inject layer bugs that the GPU tests must catch.
 
-Each mutant patches one derivation. test_mutants.py runs its listed tests in a child
-pytest with ``-p warpdrive_fuzz.runtime_mutants`` and WDFUZZ_MUTANT set. Their kernels
-compile against the broken layer. Passing tests mean that failure class is not covered.
+Each mutant patches one derivation through a ``pytest.MonkeyPatch`` that stays active for the
+whole session, through every compile. test_mutants.py runs its listed tests in a child pytest
+with ``-p warpdrive_fuzz.runtime_mutants`` and WDFUZZ_MUTANT set. Their kernels compile against
+the broken layer. Passing tests mean that failure class is not covered.
 """
 
 from __future__ import annotations
 
 import os
 
+import pytest
 from cutlass import cute
 
 from attn_gym.warpdrive import channels, cluster, kernel, scheduling
@@ -24,7 +26,7 @@ from attn_gym.warpdrive.channels import (
 from attn_gym.warpdrive.tracing import wait_range
 
 
-def join_short():
+def join_short(mp):
     """Joins expect one warp fewer: the empty barrier completes before the last consumer."""
     orig = Channel.slot_counts
 
@@ -34,10 +36,10 @@ def join_short():
             return [c - 32 if c > 32 else c for c in counts]
         return counts
 
-    Channel.slot_counts = slot_counts
+    mp.setattr(Channel, "slot_counts", slot_counts)
 
 
-def warps_short():
+def warps_short(mp):
     """``Warps`` sides expect one warp fewer: a stage completes before its last warp arrives."""
     orig = Channel.slot_counts
 
@@ -47,10 +49,10 @@ def warps_short():
             return [c - 1 if c > 1 else c for c in counts]
         return counts
 
-    Channel.slot_counts = slot_counts
+    mp.setattr(Channel, "slot_counts", slot_counts)
 
 
-def ring_wait_phase():
+def ring_wait_phase(mp):
     """Ring consumers wait on the wrong parity (a fresh full barrier passes immediately)."""
 
     def wait(self, slot=None):
@@ -62,11 +64,11 @@ def ring_wait_phase():
             cute.arch.mbarrier_wait(self._full(index), phase)
         return Handle(self, index, phase, label, False)
 
-    ConsumerEnd.wait = wait
-    ConsumerEnd.consume = wait
+    mp.setattr(ConsumerEnd, "wait", wait)
+    mp.setattr(ConsumerEnd, "consume", wait)
 
 
-def slots_shared_phase():
+def slots_shared_phase(mp):
     """Using one slot flips every slot's phase bit (slots lose their independence)."""
     orig = _End._next
 
@@ -77,13 +79,15 @@ def slots_shared_phase():
             self._state = self._state ^ (((1 << chan.n) - 1) ^ (1 << slot))
         return out
 
-    _End._next = _next
+    mp.setattr(_End, "_next", _next)
 
 
-def static_stride():
+def static_stride(mp):
     """StaticPersistent strides one unit too far: items are skipped."""
-    scheduling.StaticPersistent.next_index = lambda self, index, problem: (
-        index + problem.units() + 1
+    mp.setattr(
+        scheduling.StaticPersistent,
+        "next_index",
+        lambda self, index, problem: index + problem.units() + 1,
     )
 
 
@@ -92,12 +96,12 @@ def _no_report(workspace, units):
     pass
 
 
-def atomic_no_reset():
+def atomic_no_reset(mp):
     """AtomicPersistent never reports or resets its counter: the next launch starts dirty."""
-    scheduling._report_finished = _no_report
+    mp.setattr(scheduling, "_report_finished", _no_report)
 
 
-def turn_no_wait():
+def turn_no_wait(mp):
     """Turnstile seats enter without waiting for their turn."""
 
     def __enter__(self):
@@ -105,10 +109,10 @@ def turn_no_wait():
         if e._ts.enabled:
             e._trace.record(e._ts.name, "turn", e._seat)
 
-    channels._TurnScope.__enter__ = __enter__
+    mp.setattr(channels._TurnScope, "__enter__", __enter__)
 
 
-def span_no_wait():
+def span_no_wait(mp):
     """A span's ``begin()`` does not wait: the consumer reads a stage before it is filled."""
 
     def begin(self, i):
@@ -116,15 +120,15 @@ def span_no_wait():
         self._progress.loop = channels.current_block()
         self._open(once="first")
 
-    Span.begin = begin
+    mp.setattr(Span, "begin", begin)
 
 
-def span_signal_first():
+def span_signal_first(mp):
     """A span signals in its loop's first iteration: the stage is published half filled."""
-    Span._trips = lambda self, i, op: 1
+    mp.setattr(Span, "_trips", lambda self, i, op: 1)
 
 
-def per_role_join_short():
+def per_role_join_short(mp):
     """Per-role consumer joins expect one warp fewer: each epoch's surplus arrivals complete
     the next phase early until the producer's parity wait misses a phase and hangs."""
     orig = Channel.slot_counts
@@ -135,10 +139,10 @@ def per_role_join_short():
             return [c - 32 if c > 32 else c for c in counts]
         return counts
 
-    Channel.slot_counts = slot_counts
+    mp.setattr(Channel, "slot_counts", slot_counts)
 
 
-def pair_join_short():
+def pair_join_short(mp):
     """Pair-scoped Threads joins expect one warp fewer on the leader's barrier."""
     orig = cluster.derive_scope
 
@@ -154,17 +158,17 @@ def pair_join_short():
                         counts[rank] = [c - 32 if c > 32 else c for c in counts[rank]]
         return scope
 
-    cluster.derive_scope = derive_scope
-    kernel.derive_scope = derive_scope
+    mp.setattr(cluster, "derive_scope", derive_scope)
+    mp.setattr(kernel, "derive_scope", derive_scope)
 
 
-def override_ignored():
+def override_ignored(mp):
     """Count overrides are dropped: barriers keep the derived counts, so per-warp manual
     arrivals (``signal=False`` plus an override) never complete a phase."""
-    kernel.apply_overrides = lambda chan, scope, clu: scope
+    mp.setattr(kernel, "apply_overrides", lambda chan, scope, clu: scope)
 
 
-def signal_false_signals():
+def signal_false_signals(mp):
     """``commit(signal=False)``/``release(signal=False)`` still signal: arrivals double."""
     orig_commit, orig_release = Handle.commit, Handle.release
 
@@ -178,22 +182,25 @@ def signal_false_signals():
         if not signal:
             self._end._signal(self.index)
 
-    Handle.commit, Handle.release = commit, release
+    mp.setattr(Handle, "commit", commit)
+    mp.setattr(Handle, "release", release)
 
 
-def decode_unguarded():
+def decode_unguarded(mp):
     """Mapping-decoded streams only: decode any index as if ``decodes_any_index`` were set."""
-    scheduling.IndexSchedule._decode = lambda self, index, problem, state: scheduling._keep_words(
-        problem.stream.mapping, index, problem.space, state
-    )[1:]
+
+    def _decode(self, index, problem, state):
+        return scheduling._keep_words(problem.stream.mapping, index, problem.space, state)[1:]
+
+    mp.setattr(scheduling.IndexSchedule, "_decode", _decode)
 
 
-def pdl_no_wait():
+def pdl_no_wait(mp):
     """``PdlWait`` issues no ``griddepcontrol.wait``: a dependent reads the table early."""
-    scheduling.PdlWait.wait = lambda self: None
+    mp.setattr(scheduling.PdlWait, "wait", lambda self: None)
 
 
-def raw_counts_wrong():
+def raw_counts_wrong(mp):
     """``Barriers(counts=...)`` initializes each barrier with twice its count."""
     orig = kernel.WarpSpecialized._barrier_plan
 
@@ -206,10 +213,10 @@ def raw_counts_wrong():
             out.append((name, o, counts))
         return out, off
 
-    kernel.WarpSpecialized._barrier_plan = _barrier_plan
+    mp.setattr(kernel.WarpSpecialized, "_barrier_plan", _barrier_plan)
 
 
-def umma_commit_early():
+def umma_commit_early(mp):
     """Replace tcgen05.commit with an elected arrive, publishing before MMA completion.
 
     The epilogue may read the accumulator before MMA writes finish, and TMA may overwrite
@@ -224,10 +231,10 @@ def umma_commit_early():
             return
         orig(self, mech, bar, fence, mask)
 
-    _End._arrive = _arrive
+    mp.setattr(_End, "_arrive", _arrive)
 
 
-def view_endpoint_stage():
+def view_endpoint_stage(mp):
     """``h.data``/``h.view`` address the endpoint's next ring stage instead of the handle's
     own: wrong whenever another handle of the end opened in between."""
     data, view = Handle.data.fget, Handle.view
@@ -240,11 +247,13 @@ def view_endpoint_stage():
         moved.index = h._end._state.index
         return moved
 
-    Handle.data = property(lambda self: data(at_endpoint(self)))
-    Handle.view = lambda self, *args, **kwargs: view(at_endpoint(self), *args, **kwargs)
+    mp.setattr(Handle, "data", property(lambda self: data(at_endpoint(self))))
+    mp.setattr(
+        Handle, "view", lambda self, *args, **kwargs: view(at_endpoint(self), *args, **kwargs)
+    )
 
 
-def shared_instance_static():
+def shared_instance_static(mp):
     """A shared body passes ``Instance`` the first instance's static index instead of the
     runtime one (the round-robin turns stay right)."""
     orig = kernel.WarpSpecialized._role_args
@@ -256,10 +265,10 @@ def shared_instance_static():
             for (_, ann), a in zip(unit[0].params, args)
         ]
 
-    kernel.WarpSpecialized._role_args = _role_args
+    mp.setattr(kernel.WarpSpecialized, "_role_args", _role_args)
 
 
-def unread_no_wait():
+def unread_no_wait(mp):
     """``consume_unread()`` releases without waiting: its arrival lands in the previous
     epoch's phase, so the producer refills a stage the other consumer still reads."""
 
@@ -267,10 +276,23 @@ def unread_no_wait():
         index, _, _ = self._next(slot, "wait")
         self._signal(index, fenced=False)
 
-    ConsumerEnd.consume_unread = consume_unread
+    mp.setattr(ConsumerEnd, "consume_unread", consume_unread)
 
 
-# mutant -> (patch, test file in test/warpdrive, test that fails or hangs with it applied)
+def no_after_thread_sync(mp):
+    """Managed waits skip ``tcgen05.fence::after_thread_sync``: a tcgen05 role's MMA or TMEM
+    access is no longer ordered after the wait it follows (PTX ISA 9.7.18.6.3). No current GPU
+    shows it; the PTX check must."""
+    mp.setattr(channels, "after_sync", lambda trace: None)
+
+
+def no_before_thread_sync(mp):
+    """Managed thread signals skip ``tcgen05.fence::before_thread_sync``: a tcgen05 role's
+    completed TMEM loads and stores are no longer ordered before its release."""
+    mp.setattr(channels, "before_sync", lambda trace: None)
+
+
+# mutant -> (patch(mp), test file in test/warpdrive, test that fails or hangs with it applied)
 MUTANTS = {
     "join_short": (join_short, "test_warpdrive.py", "test_multi_warp_arrival_counts"),
     "warps_short": (
@@ -355,6 +377,16 @@ MUTANTS = {
         "test_warpdrive_shared_body.py",
         "test_shared_body_matches_static_instances[True-ascending]",
     ),
+    "no_after_thread_sync": (
+        no_after_thread_sync,
+        "test_warpdrive_thread_sync.py",
+        "test_tcgen05_roles_alone_take_the_fences",
+    ),
+    "no_before_thread_sync": (
+        no_before_thread_sync,
+        "test_warpdrive_thread_sync.py",
+        "test_toy_ptx_is_fenced",
+    ),
     "unread_no_wait": (
         unread_no_wait,
         "test_warpdrive_consume_unread.py",
@@ -363,11 +395,10 @@ MUTANTS = {
 }
 
 
-def apply(name: str) -> None:
-    MUTANTS[name][0]()
-
-
 def pytest_configure(config) -> None:
-    """Apply ``WDFUZZ_MUTANT`` when loaded with ``-p warpdrive_fuzz.runtime_mutants``."""
+    """Apply ``WDFUZZ_MUTANT`` when loaded with ``-p warpdrive_fuzz.runtime_mutants``; the patch
+    is undone when the session ends."""
     if name := os.environ.get("WDFUZZ_MUTANT"):
-        apply(name)
+        mp = pytest.MonkeyPatch()
+        config.add_cleanup(mp.undo)
+        MUTANTS[name][0](mp)

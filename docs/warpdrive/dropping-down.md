@@ -109,6 +109,33 @@ This supplies **only** the local arrival, not fences or remote targets. `Threads
 from every bound thread. Other sparse counts need an override and your own participation
 and ordering argument.
 
+### tcgen05 thread-sync fences on raw synchronization
+
+Besides the standard memory-consistency mechanisms, PTX orders one thread's `tcgen05` operation
+(`mma`, `cp`, `shift`, `ld`, `st`) against another thread's through a synchronization when the
+signalling thread runs `tcgen05.fence::before_thread_sync` between its operations' completion
+and the signal, and the waiting thread runs `tcgen05.fence::after_thread_sync` between the wait
+and its next `tcgen05` operation ([ISA 9.7.18.6.3](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-memory-consistency-model-inter-thread-sync)).
+warpdrive uses this route.
+A `tcgen05.commit` performs the first fence for the MMAs it tracks, not for loads and stores.
+Managed waits and signals of a role that issues `tcgen05` operations (a `tmem: Tmem` or `Umma`
+role) emit both; raw ones in such a role need them by hand:
+
+```python
+from attn_gym.warpdrive import tcgen05_after_thread_sync, tcgen05_before_thread_sync
+
+cute.arch.mbarrier_wait(full, phase)
+tcgen05_after_thread_sync()
+...  # tcgen05.ld, then tcgen05.wait::ld (cute.arch.fence_view_async_tmem_load())
+tcgen05_before_thread_sync()
+cute.arch.mbarrier_arrive(empty)
+```
+
+`attn_gym.warpdrive.ptx_check.check_tcgen05_sync(ptx)` reports every intraprocedural path of a
+compiled kernel's PTX where one is missing, counting a guarded fence, commit or wait as possibly
+skipped and rejecting calls; `capture_ptx(dir)` dumps the PTX of an uncached compile. It does
+not check that an in-loop handoff completed its TMEM loads and stores before the signal.
+
 ### Override counts, bytes or masks
 
 ```python

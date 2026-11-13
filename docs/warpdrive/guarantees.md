@@ -141,10 +141,10 @@ What the layer supplies, checks and leaves to you:
     cross-warp SMEM check. Clusters are unverified.
 
     Annotations must cover actual accesses; raw pointers and `h.data` do not annotate later
-    uses. The model assumes TMEM loads finish before the next signal and the required
-    `tcgen05` thread-sync fences surround synchronization. Declare every TMEM user with
-    `tmem: Tmem` for allocation and teardown. Layouts, partitions, storage lifetimes and alias
-    ordering remain yours.
+    uses. The model assumes TMEM loads finish before the next signal and raw synchronization
+    carries the [thread-sync fences](#thread-sync) that managed synchronization emits. Declare
+    every TMEM user with `tmem: Tmem` for allocation and teardown. Layouts, partitions,
+    storage lifetimes and alias ordering remain yours.
 
 9. <a id="work"></a>**Work and configuration.** A correctly launched, drained built-in stream
     assigns each kept index to exactly one work unit and gives that unit's roles the same
@@ -174,26 +174,46 @@ What the layer supplies, checks and leaves to you:
     these adds ordering. Trace bookkeeping is process-global: compile in isolated processes,
     not concurrent threads.
 
-11. <a id="hardware-assumptions"></a>**Hardware assumptions.** Channels assume `tcgen05`
+11. <a id="thread-sync"></a>**tcgen05 thread-sync fences.** Besides the standard
+    memory-consistency mechanisms, PTX orders `tcgen05` operations of different threads through
+    a synchronization with `tcgen05.fence::before_thread_sync` between the signaller's
+    operations and its signal and `::after_thread_sync` between the waiter's wait and its
+    operations
+    ([ISA 9.7.18.6.3](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-memory-consistency-model-inter-thread-sync));
+    warpdrive uses this route. The fences are also compiler code-motion fences. A role issues
+    `tcgen05` operations when it takes `tmem: Tmem` or signals a channel side as `Umma`. In
+    such a role the layer emits `after_thread_sync` at role entry (after the CTA sync
+    publishing the TMEM address) and after every managed wait: acquire, wait, span begin, peek,
+    tail, turnstile turn, named channel wait, `NamedBarrier.sync()` and `alias.named_barrier`.
+    It emits
+    `before_thread_sync` before every managed thread signal: `Threads`/`Warps` arrivals, TMA
+    arming, named arrivals and syncs, turnstile passes. A `tcgen05.commit` (`Umma` signal)
+    performs it itself. Whether one synchronization carries `tcgen05` ordering depends on what
+    other roles do after theirs, so every one of these roles' synchronizations is fenced,
+    including waits for TMA fills. Each TMEM user fences before the teardown rendezvous and
+    the allocator warp after it (and around a pair's dealloc handshake) before
+    `tcgen05.dealloc`. Raw waits and signals (`Barriers`, external sides, barrier pointers,
+    native named barriers) need `tcgen05_before_thread_sync()`/`tcgen05_after_thread_sync()`
+    by hand ([dropping down](dropping-down.md#tcgen05-thread-sync-fences-on-raw-synchronization)).
+    `ptx_check.check_tcgen05_sync` checks every PTX path of a compiled kernel for both.
+
+    Historical cost ([PR #883](https://github.com/meta-pytorch/attention-gym/pull/883)): making
+    `tcgen05` ordering across managed thread synchronization explicit constrains compiler
+    instruction scheduling. The recorded before/after comparison found bit-identical outputs and
+    gradients across 66 cases (380 tensors); it did not demonstrate a wrong-answer failure from
+    the missing fences. In the measured GB300 builds the fences emitted no additional SASS
+    instructions, but kernel times changed: `kda_bprop` at K=128 +2.5–3.7%, `gdn_prefill`
+    +0.7–2.0%, `gdn_bprop` at d64 up to +1.9%, `kda_recompute` up to +2.2%; most other kernels
+    were within −2.5% to +1%. These are historical measurements for the tested builds, not an
+    overhead guarantee. When comparing against pre-fence revisions, account for the added
+    ordering constraints even if instruction counts are unchanged.
+
+12. <a id="hardware-assumptions"></a>**Hardware assumptions.** Channels assume `tcgen05`
     completion orders MMA SMEM reads before later generic writes; PTX states this proxy
     ordering for `cp.async.bulk` and `wgmma`, not `tcgen05`. Channels also assume CTA-scope
-    releases order reads before a remote refill, and omit
-    `tcgen05.fence::after_thread_sync` and `::before_thread_sync`, relying on execution and
-    compiler ordering. These are
-    [compiler code-motion fences](https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#tcgen05-special-sync-operations-fence)
-    too. Emit them explicitly around the handoff when needed:
+    releases order reads before a remote refill.
 
-    ```python
-    from cutlass._mlir.dialects import nvvm
-
-    h = acc.wait()
-    nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.AFTER_THREAD_SYNC)
-    ...  # TMEM work and its completion waits
-    nvvm.tcgen05_fence(kind=nvvm.Tcgen05FenceKind.BEFORE_THREAD_SYNC)
-    h.release()
-    ```
-
-12. **Reports and tests.** `describe()` checks declarations before compilation; body reports
+13. **Reports and tests.** `describe()` checks declarations before compilation; body reports
     appear after tracing or [cache restoration](cache.md#cached-builds-were-never-traced).
     Every trace starts from no reports, so an instance whose retrace fails shows none from an
     earlier trace.

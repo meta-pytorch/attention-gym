@@ -356,6 +356,9 @@ class RoleTrace:
         self.open_turns: set[str] = set()  # turnstiles whose turn this role holds here
         self.instance = instance  # a shared body's runtime instance index (kernel._dispatch)
         self.instances = instances  # the instances this trace stands for
+        # The role issues tcgen05 operations (a Tmem or Umma role): its managed waits and
+        # signals take the tcgen05 thread-sync fences (thread_sync.before_sync/after_sync).
+        self.tcgen05 = False
         self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
 
