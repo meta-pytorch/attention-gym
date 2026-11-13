@@ -240,7 +240,7 @@ def paged_chunk_kda(
         kernel_options: Backend-specific options. ``{"backend": "warpdrive"}`` selects
             the optional warpdrive backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
-            applies to the fused backend as in ``chunk_kda``. ``"autotune"`` (default
+            applies as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the repo-local fused kernels;
             warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
