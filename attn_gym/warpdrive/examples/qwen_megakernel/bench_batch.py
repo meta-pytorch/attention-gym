@@ -5,7 +5,7 @@ the batch, with the CUDA-core engine at batch one for reference.
 
 Every sequence decodes at the same context. CUDA-graph replay medians (`time_step`)::
 
-    python -m attn_gym.warpdrive.examples.bench_qwen_megakernel_batch \
+    python -m attn_gym.warpdrive.examples.qwen_megakernel.bench_batch \
         --model Qwen/Qwen3-0.6B --batches 1 2 4 8 16 32 64 --contexts 256 1024 --plot sweep.png
 
 Megakernel batches whose GEMV inputs do not fit in shared memory, and baseline batches that run
@@ -18,13 +18,13 @@ from pathlib import Path
 
 import torch
 
-from attn_gym.warpdrive.examples.bench_qwen_megakernel import (
+from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
+from attn_gym.warpdrive.examples.qwen_megakernel.bench import (
     decode_step_fast_batch,
     prepare_fast_weights,
     time_step,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import load_qwen3_weights, make_decode_state
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import load_qwen3_weights, make_decode_state
 
 
 def time_runner(runner, caches, iters: int) -> float:

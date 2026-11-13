@@ -17,7 +17,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from attn_gym.warpdrive.examples import qwen_megakernel_trace
 from attn_gym.warpdrive.examples.bench_support import (
     CudaBenchmarkStats,
     benchmark_cuda_graph_stats,
@@ -25,7 +24,8 @@ from attn_gym.warpdrive.examples.bench_support import (
     settle,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenWeights,
     compare_logits,
     decode_step_ref,
@@ -336,17 +336,17 @@ def measure_hbm_rooflines(buffer_gb: float = 2.0, iters: int = 100) -> dict[str,
 def trace_megakernel(
     weights, max_len: int, token, pos: int, caches, path: Path, engine: str = "cuda_core"
 ) -> dict:
-    """One warmed megakernel step traced with globaltimer (``qwen_megakernel_trace``): per-layer
+    """One warmed megakernel step traced with globaltimer (``trace``): per-layer
     phase spans and median input waits in us, and the Perfetto trace at ``path``."""
     runner = QwenMegakernel(weights, max_len, trace="globaltimer", engine=engine)
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
     path.parent.mkdir(parents=True, exist_ok=True)
-    with qwen_megakernel_trace.trace_session(runner, trace_path=str(path)) as session:
+    with mk_trace.trace_session(runner, trace_path=str(path)) as session:
         runner.launch(*caches)
     return {
         "trace": str(path),
-        "phase_span_us": qwen_megakernel_trace.phase_spans(session.ranges, runner.table),
-        "input_wait_us": qwen_megakernel_trace.input_waits(session.ranges, runner.table),
+        "phase_span_us": mk_trace.phase_spans(session.ranges, runner.table),
+        "input_wait_us": mk_trace.input_waits(session.ranges, runner.table),
     }
 
 
@@ -400,7 +400,7 @@ def main() -> None:
         "metadata": provenance(
             {
                 "bench": Path(__file__),
-                "reference": Path(__file__).with_name("qwen_megakernel_ref.py"),
+                "reference": Path(__file__).with_name("ref.py"),
                 "megakernel": Path(__file__).with_name("qwen_megakernel.py"),
             },
             vars(args),

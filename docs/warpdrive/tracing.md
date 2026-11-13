@@ -444,7 +444,7 @@ Two examples use it:
 python -m attn_gym.warpdrive.examples.schedule_views OUTDIR --ctas 152
 # the Qwen megakernel's instruction table under its latency model; --timeline overlays a
 # trace="globaltimer" capture with per-role tracks (overlay() in the module docstring writes it)
-python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html --model Qwen/Qwen3-32B --ctas 152
+python -m attn_gym.warpdrive.examples.qwen_megakernel.viz OUT.html --model Qwen/Qwen3-32B --ctas 152
 ```
 
 ![The Qwen megakernel's predicted timeline with its critical path](images/qwen_megakernel_schedule.png)

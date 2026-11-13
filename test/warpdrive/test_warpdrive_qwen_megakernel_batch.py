@@ -11,7 +11,7 @@ import torch
 pytest.importorskip("cutlass.cute")
 
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
     compare_logits,
     decode_step_ref,
@@ -275,7 +275,7 @@ def test_moe_batch_input_rows_cover_an_expert():
 
 def test_moe_batch_phase_spans_count_from_reduce():
     """With REDUCE rows the next layer's QKV counts from them, not from down."""
-    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
     from attn_gym.warpdrive.profiler import Range
 
     rows = [[mk.DOWN, 0, 0, 0], [mk.REDUCE, 0, 0, 0], [mk.QKV, 1, 0, 0]]
@@ -287,7 +287,7 @@ def test_moe_batch_phase_spans_count_from_reduce():
 def test_streamed_phase_spans_count_from_norm_rows():
     """A streaming table's NORM rows are two phases: NORM_IN after the previous layer's down
     (before QKV and the LM head), NORM_POST after o_proj (before gate/up)."""
-    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
     from attn_gym.warpdrive.profiler import Range
 
     rows = [
@@ -341,7 +341,7 @@ def test_moe_batch_repeated_launches(stream_inputs):
 
 
 def test_input_waits_count_reduce_rows():
-    from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
+    from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
     from attn_gym.warpdrive.profiler import Range
 
     table = torch.tensor([[mk.REDUCE, 0, 0, 0, 0]])

@@ -16,7 +16,7 @@ pytest.importorskip("cutlass.cute")
 import itertools
 
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples import qwen_megakernel_viz as mkv
+from attn_gym.warpdrive.examples.qwen_megakernel import viz as mkv
 from attn_gym.warpdrive.examples.schedule_views import (
     grouped_gemm_view,
     grouped_tiles_decode,

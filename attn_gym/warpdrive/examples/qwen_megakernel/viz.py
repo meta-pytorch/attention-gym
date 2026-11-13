@@ -12,7 +12,7 @@ come from ``WorkStream.assignment``, so they are the rows the kernel runs.
 "tracks": [[cta, track, name, table_row, start, end], ...]}``, times from any common origin;
 ``ctas`` and ``splits`` are optional and checked against the drawn table. ``tracks`` (optional)
 are every recorded range by role, drawn under a CTA when it is clicked. ``overlay`` builds the
-file from a ``trace="globaltimer"`` launch (``qwen_megakernel_trace``)::
+file from a ``trace="globaltimer"`` launch (``trace``)::
 
     runner = QwenMegakernel(weights, max_len, trace="globaltimer")
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
@@ -22,7 +22,7 @@ file from a ``trace="globaltimer"`` launch (``qwen_megakernel_trace``)::
 
 Draw it::
 
-    python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html \\
+    python -m attn_gym.warpdrive.examples.qwen_megakernel.viz OUT.html \\
         [--model Qwen/Qwen3-32B] [--ctas 152] [--splits 16] [--timeline capture.json] \
         [--engine tcgen05 [--batch 16] [--stream-inputs]]
 """
@@ -32,7 +32,7 @@ import json
 from pathlib import Path
 
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import QwenConfig
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 from attn_gym.warpdrive.profiler import Range
 from attn_gym.warpdrive.schedule_html import Item, Track, schedule_html
 from attn_gym.warpdrive.trace_session import role_tracks, work_item_ranges, work_item_spans

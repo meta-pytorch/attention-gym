@@ -11,8 +11,8 @@ pytest.importorskip("cutlass.cute")
 from attn_gym.testing.perfetto_trace import read_slices
 from attn_gym.warpdrive import ProtocolError, RoleConfig
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples import qwen_megakernel_trace as mk_trace
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
     compare_logits,
     decode_step_ref,

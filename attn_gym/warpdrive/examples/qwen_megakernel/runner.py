@@ -1,11 +1,7 @@
 """Qwen3 decode step as one persistent warpdrive kernel (a "megakernel").
 
-The code spans four modules: ``qwen_megakernel_core`` (scratch layout, tagged words, the CUDA-core
-GEMV engine, ``QwenDecodeMegakernel`` and its compile function), ``qwen_megakernel_tc`` (the tcgen05
-engine and streamed inputs), ``qwen_megakernel_schedule`` (the host's instruction table, cost model
-and CTA assignment) and this one (the ``QwenMegakernel`` runner, re-exporting the public names).
-Kernels compile from the core's imports plus their own module, so host-side edits recompile
-nothing.
+The code spans the modules of this package (see its ``__init__``). Kernels compile from ``core``'s
+imports plus their own module, so host-side edits recompile nothing.
 
 One kernel class serves the dense Qwen3 family: ``QwenDecodeMegakernel(model=QwenConfig)`` derives
 every tiling from the shape and ``check_model`` rejects what they do not cover (0.6B, 1.7B,
@@ -57,7 +53,7 @@ holds it (masked), after those loads completed.
 The step is latency-bound: about 140 dependent phases, each paying input propagation plus its
 row's latency (docs/warpdrive/examples.md). ``QwenMegakernel(trace="globaltimer")``
 records every CTA's work items and ``trace_region``s with the table row as payload
-(``qwen_megakernel_trace`` decodes them into phase spans and a Perfetto trace);
+(``trace`` decodes them into phase spans and a Perfetto trace);
 ``trace="iket"`` emits the same ranges for ``run-iket``.
 """
 
@@ -65,7 +61,7 @@ import math
 
 import torch
 
-from attn_gym.warpdrive.examples.qwen_megakernel_core import (
+from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
     ATTN,
     ATTN_SCALE,
@@ -90,7 +86,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel_core import (
     compile_megakernel,
     packed_mlp_shapes,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_schedule import (
+from attn_gym.warpdrive.examples.qwen_megakernel.schedule import (
     CONTEXT,
     DEPENDENCY_LATENCY,
     ROW_COST_MODELS,
@@ -104,7 +100,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel_schedule import (
     row_groups,
     weight_stages,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_tc import (
+from attn_gym.warpdrive.examples.qwen_megakernel.tc import (
     QwenDecodeMegakernelTc,
     QwenDecodeMegakernelTcStream,
     check_tc_model,
@@ -191,7 +187,7 @@ class QwenMegakernel:
     ):
         """``ops``: keep only these instruction kinds (tests). ``trace``: compile with ranges for
         the work items and ``trace_region``s, recorded by ``"globaltimer"``
-        (``qwen_megakernel_trace.trace_session`` decodes a launch) or ``"iket"`` (``run-iket``);
+        (``trace.trace_session`` decodes a launch) or ``"iket"`` (``run-iket``);
         ``waits`` adds the layer's wait ranges. ``engine``: the GEMV engine, ``"cuda_core"`` or
         ``"tcgen05"`` (``QwenDecodeMegakernelTc``). ``stream_inputs`` (tcgen05): stream GEMV
         inputs from global memory through an activation ring (``QwenDecodeMegakernelTcStream``).

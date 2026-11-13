@@ -278,12 +278,14 @@ HOST_ONLY = (
     "schedule_html.py",
     "trace_session.py",
     "examples/schedule_views.py",
-    "examples/qwen_megakernel_viz.py",
-    "examples/qwen_megakernel_trace.py",
+    "examples/qwen_megakernel/viz.py",
+    "examples/qwen_megakernel/trace.py",
+    "examples/qwen_megakernel/schedule.py",
+    "examples/qwen_megakernel/runner.py",
 )
 
 
-@pytest.mark.parametrize("example", ["gemm", "persistent_gemm", "fa4_bwd", "qwen_megakernel"])
+@pytest.mark.parametrize("example", ["gemm", "persistent_gemm", "fa4_bwd", "qwen_megakernel/core"])
 def test_host_only_modules_stay_out_of_compile_keys(example):
     """Renderers, trace decoding, the pipeline plan export and the root package's utilities do
     not invalidate kernels; of the profiler, only its device ops are inside the closure."""

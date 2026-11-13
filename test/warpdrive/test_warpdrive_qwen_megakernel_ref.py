@@ -9,13 +9,13 @@ pytest.importorskip("cutlass.cute")  # the bench module imports the megakernel
 
 import torch.nn.functional as F
 
-from attn_gym.warpdrive.examples import qwen_megakernel_ref as ref_module
-from attn_gym.warpdrive.examples.bench_qwen_megakernel import (
+from attn_gym.warpdrive.examples.qwen_megakernel import ref as ref_module
+from attn_gym.warpdrive.examples.qwen_megakernel.bench import (
     decode_step_fast,
     decode_step_fast_batch,
     prepare_fast_weights,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
     compare_logits,
     decode_step_ref,

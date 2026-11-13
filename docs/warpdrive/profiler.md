@@ -144,5 +144,5 @@ Run these as `python examples/profiler/<name>.py`:
 Implementation references: `attn_gym/warpdrive/{tracing,trace_session,pipeline_plan}.py` for
 warpdrive integration; and
 `test/profiler/` for recorder and analysis tests. The
-[`Qwen trace example`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel_trace.py)
+[`Qwen trace example`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/trace.py)
 shows instruction-row grouping and cross-CTA flows.
