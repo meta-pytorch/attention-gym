@@ -494,14 +494,14 @@ from a separate, milder factor. A sum concentrated on the first token of its 16-
 the backward no headroom: with the whole decay on one token of a 48-token sequence, dq and dgate
 were non-finite for 0 of 20 seeds at `-86.5`, 1 of 20 at `-86.9` and 10 of 20 at `-87.3`.
 Upstream cuDNN Frontend behaves identically. FP16 cannot hold the in-chunk decay factors (their
-ratio reaches `2^121` at a uniform `-5.25`), so the warpdrive FP16 forward forms the in-chunk
-products from TF32 decay operands and follows the BF16 forward contract: on the workload above,
-output relative RMS error stayed at 0.05% from `-0.5` to `-5.25` and for the Kimi-style gates
-(fused FP16: 0.08%), and the forward is non-finite past the same `-126 * ln(2)` bound. The FP16
-backward still stages its decay operands in FP16 and does not support usual model-range gates:
-its gradients are non-finite from a uniform gate of about `-1`, so the default backend runs FP16
-KDA on the fused kernels. These limits are not checked at runtime. The training example uses the
-Kimi-style FP32 transform
+ratio reaches `2^121` at a uniform `-5.25`), so warpdrive FP16 forms the in-chunk products from
+TF32 decay operands and computes the state-gradient products from the unscaled cotangent and
+`K_restore`, whose factors stay at or below one; it follows the BF16 contract above. On the
+workload above (plus ragged sequences), FP16 relative RMS errors from a uniform `-0.1` to `-5.25`
+and for Kimi-style gates were 0.05% on the output, 0.03-0.06% on dq, dk, dv and dbeta and
+0.05-0.14% on dgate, against 0.08%, 0.03-0.09% and 0.11-0.20% for fused FP16; the forward is
+non-finite past the same `-126 * ln(2)` bound. These limits are not checked at runtime. The
+training example uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
