@@ -68,6 +68,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -143,7 +144,6 @@ from .ragged import (
 from .umma import SWIZZLE_128B, MmaDesc, instr_desc, mma_ss, mma_ts, smem_desc
 
 B_T = 64
-DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 BOX = 64  # 16-bit elements per 128-byte swizzle row
 BOX_BYTES = B_T * BOX * 2  # one 64 x 64 16-bit box
@@ -158,7 +158,6 @@ WORK_ITEM_FIELDS = 10
 WORK_ITEM_DSTATE_DST = 9
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 _SCALAR_DTYPES = {
     torch.float32: "Float32",
     torch.bfloat16: "BFloat16",
@@ -348,8 +347,8 @@ class GdnBprop(WarpSpecialized):
         """``column_fold_delay`` is a test hook: the ``clock64`` cycles cg0's warp 1 idles
         before it reads the dGate column partials, so a test can order those reads after warp
         0's next sKK write (see cg0's column fold). Production builds keep 0."""
-        if d not in DIMS:
-            raise ValueError(f"the bprop serves d_k = d_v in {DIMS}, got {d}")
+        if d not in HEAD_DIMS:
+            raise ValueError(f"the bprop serves d_k = d_v in {HEAD_DIMS}, got {d}")
         self.dtype_name, self.d = dtype_name, d
         self.use_initial_state = use_initial_state
         self.use_dstate_in = use_dstate_in
@@ -2424,7 +2423,7 @@ def gdn_bprop(
     the device's SM count. ``op`` (a ``GdnBprop`` with ``enable_trace("globaltimer")``) and its
     ``trace`` buffer capture a role timeline. ``tma_slots`` (``ragged.new_tma_slots``, at
     least ``op.tma_slot_rows(heads)`` rows) is allocated when omitted."""
-    if q.dtype not in _IO_DTYPES or any(t.dtype != q.dtype for t in (k, v, do, checkpoints)):
+    if q.dtype not in IO_DTYPE_NAMES or any(t.dtype != q.dtype for t in (k, v, do, checkpoints)):
         raise TypeError("q, k, v, do and checkpoints must share a 16-bit dtype")
     if beta.dtype != torch.float32 or dgate.dtype != torch.float32 or dbeta.dtype != torch.float32:
         raise TypeError("beta, dgate and dbeta must be fp32")
@@ -2439,7 +2438,7 @@ def gdn_bprop(
     )
     if op is None:
         flags = (use_initial_state, dstate_in is not None, dstate0 is not None)
-        op, fn = _compiled(_IO_DTYPES[q.dtype], q.shape[-1], *flags, *dtypes)
+        op, fn = _compiled(IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags, *dtypes)
     else:
         fn = compile_gdn_bprop(op, *dtypes)
     workspace, sms = op.work.launch_args(q.device)

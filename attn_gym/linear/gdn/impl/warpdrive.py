@@ -9,6 +9,7 @@ from torch import Tensor
 
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.linear.gdn.impl.warpdrive_ops import (
     chunk_gdn_warpdrive_packed_bwd_op,
     chunk_gdn_warpdrive_packed_bwd_with_state_op,
@@ -19,9 +20,6 @@ from attn_gym.linear.gdn.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 
-_SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
-_WARPDRIVE_DIM = 128
-
 
 def _validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
     """Validate the Q/K/V dtypes and head dimensions the scalar-GDN warpdrive kernels support.
@@ -30,9 +28,9 @@ def _validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None
     (``cast_to_kernel_dtypes``), and the registered operators copy operands their launchers
     cannot address.
     """
-    if q.shape[-1] != _WARPDRIVE_DIM or value.shape[-1] != _WARPDRIVE_DIM:
-        raise ValueError("the warpdrive GDN backend requires K=V=128")
-    if q.dtype not in _SUPPORTED_IO_DTYPES or k.dtype != q.dtype or value.dtype != q.dtype:
+    if q.shape[-1] != value.shape[-1] or q.shape[-1] not in HEAD_DIMS:
+        raise ValueError(f"the warpdrive GDN backend requires K=V in {HEAD_DIMS}")
+    if q.dtype not in IO_DTYPE_NAMES or k.dtype != q.dtype or value.dtype != q.dtype:
         raise TypeError("q, k, and value must share dtype float16 or bfloat16")
 
 

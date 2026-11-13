@@ -55,6 +55,7 @@ from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.arch import inline_ptx
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Consumer,
     LastEntry,
@@ -105,13 +106,11 @@ from .ragged import (
 from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts, smem_desc
 
 B_T = 64
-STATE_DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 STAGES = 3  # K, V, T and gate rings
 WORK_ITEM_FIELDS = 10
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 
 
 @dataclass(frozen=True)
@@ -156,8 +155,8 @@ class GdnSummary(WarpSpecialized):
     128 and fp32 states."""
 
     def __init__(self, dtype_name: str, d_k: int, d_v: int):
-        if d_k not in STATE_DIMS or d_v not in STATE_DIMS:
-            raise ValueError(f"the GDN summary serves d_k, d_v in {STATE_DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"the GDN summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         self.dtype_name, self.d_k, self.d_v = dtype_name, d_k, d_v
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         self.bpe = bpe = self.io_dtype.width // 8
@@ -790,7 +789,7 @@ def gdn_summary(
 ) -> None:
     """Fill ``state_h`` / ``state_m`` for the work table (see the module docstring for the
     layouts); ``tinv`` holds ``gdn_tinv``'s tiles over the same pieces."""
-    if k.dtype not in _IO_DTYPES or v.dtype != k.dtype or tinv.dtype != k.dtype:
+    if k.dtype not in IO_DTYPE_NAMES or v.dtype != k.dtype or tinv.dtype != k.dtype:
         raise TypeError(f"k, v and tinv must share a 16-bit dtype, got {k.dtype}/{v.dtype}")
     if state_h.dtype != torch.float32 or state_m.dtype != torch.float32:
         raise TypeError("the summary states are fp32")
@@ -802,7 +801,7 @@ def gdn_summary(
     for state in (state_h, state_m):
         if not state.is_contiguous() or state.data_ptr() % 16:
             raise ValueError("the summary states must be contiguous and 16-byte aligned")
-    op = GdnSummary(_IO_DTYPES[k.dtype], k.shape[-1], v.shape[-1])
+    op = GdnSummary(IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1])
     fn = compile_gdn_summary(op)
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)

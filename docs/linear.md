@@ -101,7 +101,7 @@ and portable Triton kernels on other supported architectures. The `K = V = 64` b
 portable Triton on every architecture.
 
 The warpdrive chunk backend requires the optional `linear` dependencies and an SM100-family GPU,
-FP16/BF16 Q/K/V, and `K = V = 128`. Like the fused backend it runs gate, beta, and entry
+FP16/BF16 Q/K/V, and `K = V` of 64 or 128. Like the fused backend it runs gate, beta, and entry
 states in FP32 (returning their gradients in the caller's dtypes), packs dense batches into one
 sequence per row, and copies operands whose layout its kernels cannot address. It uses the same
 scalar natural-log gate contract and exact execution by default.

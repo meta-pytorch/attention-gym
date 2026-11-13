@@ -50,6 +50,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
     Consumer,
     Local,
@@ -109,7 +110,6 @@ from .ragged import (
     tma_slot_rows,
 )
 
-DIMS = (64, 128)
 LOG2_E = 1.4426950408889634
 RAW_STAGES = 2
 CTAS_PER_SM = 4
@@ -155,8 +155,8 @@ class KdaPrep(WarpSpecialized):
     any float dtype (its loads follow the traced tensor). ``num_sm`` sizes the grid."""
 
     def __init__(self, io: str, gate: str, d_k: int, num_sm: int):
-        if d_k not in DIMS:
-            raise ValueError(f"the KDA prep serves d_k in {DIMS}, got {d_k}")
+        if d_k not in HEAD_DIMS:
+            raise ValueError(f"the KDA prep serves d_k in {HEAD_DIMS}, got {d_k}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.num_sm = io, gate, d_k, num_sm

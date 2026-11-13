@@ -58,6 +58,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -156,7 +157,6 @@ from .umma import (
     smem_desc,
 )
 
-DIMS = (64, 128)
 LOG2_E = 1.4426950408889634
 RAW_STAGES = 8
 SCHED_STAGES = 8
@@ -243,8 +243,8 @@ class KdaPrefill(WarpSpecialized):
         paged_state: int,
         num_ctas: int,
     ):
-        if d_k not in DIMS or d_v not in DIMS:
-            raise ValueError(f"the KDA prefill serves d_k, d_v in {DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"the KDA prefill serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         if paged_state and not (use_initial_state and store_final_state):

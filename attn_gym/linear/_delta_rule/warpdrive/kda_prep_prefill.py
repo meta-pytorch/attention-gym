@@ -52,6 +52,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -127,7 +128,6 @@ from .ragged import (
 from .umma import SWIZZLE_32B, SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_op, smem_desc
 
 D_V = 64  # value tile width: the driver only runs the prep scheme under the d_v split
-DIMS = (64, 128)
 RAW_STAGES = 8
 REC_STAGES = 4
 SCHED_STAGES = 8
@@ -224,8 +224,8 @@ class KdaPrepPrefill(WarpSpecialized):
         paged_state: int,
         num_ctas: int,
     ):
-        if d_k not in DIMS:
-            raise ValueError(f"the KDA prep prefill serves d_k in {DIMS}, got {d_k}")
+        if d_k not in HEAD_DIMS:
+            raise ValueError(f"the KDA prep prefill serves d_k in {HEAD_DIMS}, got {d_k}")
         if paged_state and not (use_initial_state and store_final_state):
             raise ValueError("paged state routes one pool in and out")
         self.io, self.d_k, self.tiles_per_head, self.num_ctas = io, d_k, tiles_per_head, num_ctas
