@@ -139,6 +139,7 @@ def _run_paged_gdn(prefix=0):
 
 SERVED = {
     "chunk_kda bf16": lambda: _run_kda(),
+    "chunk_kda fp16": lambda: _run_kda(dtype=torch.float16),
     "chunk_kda fp32 (runs in bf16)": lambda: _run_kda(dtype=torch.float32),
     "chunk_kda with states": lambda: _run_kda(
         initial_state=torch.zeros(1, 2, 128, 128, device="cuda"), output_final_state=True
@@ -148,11 +149,10 @@ SERVED = {
     "chunk_gdn d128": lambda: _run_gdn(),
     "chunk_gdn d64": lambda: _run_gdn(dim=64),
     "paged_chunk_kda aligned pool": lambda: _run_paged_kda(),
+    "paged_chunk_kda fp16": lambda: _run_paged_kda(dtype=torch.float16),
     "paged_chunk_gdn aligned pool": lambda: _run_paged_gdn(),
 }
 ROUTED_TO_FUSED = {
-    "chunk_kda fp16": lambda: _run_kda(dtype=torch.float16),
-    "paged_chunk_kda fp16": lambda: _run_paged_kda(dtype=torch.float16),
     "paged_chunk_kda replay_state": lambda: _run_paged_kda(replay=True),
     "paged_chunk_kda misaligned pool": lambda: _run_paged_kda(prefix=1),
     "paged_chunk_gdn misaligned pool": lambda: _run_paged_gdn(prefix=1),
@@ -210,7 +210,7 @@ def test_explicit_backends_are_never_rerouted(monkeypatch, dispatched, capabilit
     fused, warpdrive = {"backend": "fused"}, {"backend": "warpdrive"}
     _run_kda(kernel_options=fused)
     _run_gdn(kernel_options=fused)
-    _run_kda(dtype=torch.float16, kernel_options=warpdrive)
+    _run_paged_kda(prefix=1, kernel_options=warpdrive)
     _run_gdn(kernel_options=warpdrive)
     assert dispatched == ["fused", "fused", "warpdrive", "warpdrive"]
     with pytest.raises(ValueError, match="paged chunk replay requires"):
@@ -246,7 +246,7 @@ def _two_sequences():
     ("name", "expected"),
     [
         ("kda bf16", "warpdrive"),
-        ("kda fp16", "fused"),
+        ("kda fp16", "warpdrive"),
         ("kda fastmath=False", "warpdrive"),
         ("gdn bf16", "warpdrive"),
         ("gdn fp16", "warpdrive"),
@@ -278,7 +278,7 @@ def test_default_reproduces_the_selected_backend(name, expected):
 @needs_warpdrive
 @pytest.mark.parametrize(
     ("name", "warpdrive"),
-    [("kda bf16", True), ("kda fp16", False), ("kda fastmath=False", True), ("gdn bf16", True)],
+    [("kda bf16", True), ("kda fp16", True), ("kda fastmath=False", True), ("gdn bf16", True)],
 )
 def test_default_stages_select_like_the_public_op(name, warpdrive):
     """The staged entry points behind context parallelism resolve the default as the ops do."""
