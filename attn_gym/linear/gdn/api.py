@@ -167,7 +167,8 @@ def paged_chunk_gdn(
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
         beta: Floating per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
-            Recurrence math remains FP32; BF16 affects persistent storage only.
+            Recurrence math remains FP32; BF16 affects persistent storage only. The pool base
+            and slot stride need only element alignment.
         state_indices: Contiguous int32 slot indices, one per logical sequence. Positive,
             unique indices select slots to advance; non-positive indices produce zero output
             and leave the cache untouched.
@@ -179,13 +180,12 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend, which
-            requires 16-byte-aligned pool bases and slot origins. Split schedules are not
-            supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
-            of the repo-local factor and output kernels. When ``False``, and always under
-            ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
-            The recurrence that advances ``state_cache`` and the warpdrive backend always use
-            fixed configurations.
+            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend. Split schedules
+            are not supported. ``"autotune"`` (default ``True``) benchmarks candidate
+            configurations of the repo-local factor and output kernels. When ``False``, and
+            always under ``torch.use_deterministic_algorithms(True)``, they launch fixed
+            configurations. The recurrence that advances ``state_cache`` and the warpdrive
+            backend always use fixed configurations.
 
         state_checkpoints: Optional periodic snapshots written into caller-chosen slots of a
             state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary

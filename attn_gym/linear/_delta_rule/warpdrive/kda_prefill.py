@@ -102,18 +102,18 @@ from .kda_common import (
     FINAL_DST,
     TORCH_NAMES,
     WORK_ITEM_FIELDS,
-    as_i32,
     beta_residual,
     box128,
     decay_fragment_offsets,
     decay_stage_addresses,
+    gate_offset,
     lds_16_f32,
     lds_f32,
     lds_v2_f32,
     lds_v4,
     lds_v4_f32,
     load_rows,
-    load_state_16,
+    load_state,
     mask_pair,
     mma_decay_16x16,
     opaque_i32,
@@ -121,7 +121,8 @@ from .kda_common import (
     raw_beta_wait,
     resolve_paged_state,
     spin_wait,
-    stg_v4,
+    state_align_suffix,
+    store_state_32,
     sts_f32,
     sts_tf32x8,
     swz32,
@@ -237,8 +238,10 @@ class KdaPrefill(WarpSpecialized):
 
     ``d_v`` is the tile width (64 under the d_v split, ``tiles_per_head = 2``). The static state
     flags and ``paged_state`` (0 none, 1 routes, 2 routes + fresh-slot mask) select code; the
-    state dtype follows the traced tensors.
-    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
+    state dtype follows the traced tensors. ``state_align`` is the byte alignment of every state
+    row: below 16 only for a paged pool with unaligned rows (NOTE [Unaligned state rows] in
+    kda_common). ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and
+    reciprocal."""
 
     def __init__(
         self,
@@ -252,6 +255,7 @@ class KdaPrefill(WarpSpecialized):
         paged_state: int,
         num_ctas: int,
         fastmath: bool = True,
+        state_align: int = 16,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA prefill serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
@@ -263,6 +267,7 @@ class KdaPrefill(WarpSpecialized):
         self.tiles_per_head, self.num_ctas = tiles_per_head, num_ctas
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         self.paged_state, self.fastmath = paged_state, fastmath
+        self.state_align = state_align
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         gate_bytes = self.gate_dtype.width // 8
@@ -391,7 +396,8 @@ class KdaPrefill(WarpSpecialized):
         flags = f"{int(self.use_initial_state)}{int(self.store_final_state)}{self.paged_state}"
         return (
             f"wd_kda_prefill_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
-            f"_t{self.tiles_per_head}_f{flags}" + ("" if self.fastmath else "_nofm")
+            f"_t{self.tiles_per_head}_f{flags}{state_align_suffix(self.state_align)}"
+            + ("" if self.fastmath else "_nofm")
         )
 
     # ---- work decode -------------------------------------------------------------------
@@ -765,13 +771,7 @@ class KdaPrefill(WarpSpecialized):
             dim_base = half * 64 + lane_in_row * 8
             for grp in cutlass.range_constexpr(2):
                 f_dim = dim_base + grp * 4
-                f_seg = f_dim // 32
-                idx = (
-                    f_seg * (B_T * 32)
-                    + decay_row * 32
-                    + swz128(decay_row ^ f_seg, f_dim - f_seg * 32, 4)
-                )
-                exp_g += lds_v4_f32(s_ex + 4 * idx)
+                exp_g += lds_v4_f32(s_ex + gate_offset(decay_row, f_dim, d_k))
 
         # ---- K decay / K inv / K restore ---------------------------------------------------
         kd_pack = []
@@ -784,13 +784,7 @@ class KdaPrefill(WarpSpecialized):
             exp_last = []
             for grp in cutlass.range_constexpr(2):
                 f_dim = dim_base + grp * 4
-                f_seg = f_dim // 32
-                idx = (
-                    f_seg * (B_T * 32)
-                    + (B_T - 1) * 32
-                    + swz128((B_T - 1) ^ f_seg, f_dim - f_seg * 32, 4)
-                )
-                exp_last += lds_v4_f32(s_ex + 4 * idx)
+                exp_last += lds_v4_f32(s_ex + gate_offset(B_T - 1, f_dim, d_k))
             for p in cutlass.range_constexpr(4):
                 r0 = half * 8 + 2 * p
                 kd0, kd1 = fmul2(raw_k[r0], raw_k[r0 + 1], exp_g[r0], exp_g[r0 + 1])
@@ -893,14 +887,7 @@ class KdaPrefill(WarpSpecialized):
                 for b in cutlass.range_constexpr(dk_halves):
                     scaled = []
                     for grp in cutlass.range_constexpr(8):
-                        dim = b * 32 + grp * 4
-                        seg = dim // 32
-                        idx = (
-                            seg * (B_T * 32)
-                            + (B_T - 1) * 32
-                            + swz128((B_T - 1) ^ seg, dim - seg * 32, 4)
-                        )
-                        f = lds_v4_f32(s_ex + 4 * idx)
+                        f = lds_v4_f32(s_ex + gate_offset(B_T - 1, b * 32 + grp * 4, d_k))
                         for t in cutlass.range_constexpr(2):
                             s0, s1 = fmul2(
                                 state[b * 32 + grp * 4 + 2 * t],
@@ -1131,17 +1118,13 @@ class KdaPrefill(WarpSpecialized):
         soon as it is stored) and fp32 state decayed by the first chunk's exp2(g_last)."""
         _l, lane_base, cols, _lo, _hi, _pc, _pcx, value_dim, _rv = geo
         io = self.io_dtype
-        st = params.state_in
-        addr = (st.iterator + st.layout((seed_row, head_o, value_dim + v_offset, 0))).toint()
-        sbytes = st.element_type.width // 8
+        src = params.state_in[seed_row, head_o, value_dim + v_offset, None]
         for half in cutlass.range_constexpr(2):
             blocks = range(half * (self.d_k // 32), (half + 1) * (self.d_k // 32))
-            vecs = []
-            for i in cutlass.range_constexpr(blocks.start, blocks.stop):
-                vals = load_state_16(addr + i * 16 * sbytes, st.element_type)
-                if cutlass.const_expr(self.paged_state > 0):
-                    vals = [Float32(cutlass.select_(load_initial, v, Float32(0.0))) for v in vals]
-                vecs.append(vals)
+            vals = load_state(cute.local_tile(src, (self.d_k // 2,), (half,)), self.state_align)
+            if cutlass.const_expr(self.paged_state > 0):
+                vals = [Float32(cutlass.select_(load_initial, v, Float32(0.0))) for v in vals]
+            vecs = [vals[16 * j : 16 * j + 16] for j in range(len(blocks))]
             for j, i in enumerate(blocks):
                 words = [
                     fp32_to_fp16(vecs[j][2 * p], vecs[j][2 * p + 1], dtype=io) for p in range(8)
@@ -1152,14 +1135,7 @@ class KdaPrefill(WarpSpecialized):
             for j, i in enumerate(blocks):
                 scaled = []
                 for grp in cutlass.range_constexpr(4):
-                    dim = i * 16 + grp * 4
-                    seg = dim // 32
-                    idx = (
-                        seg * (B_T * 32)
-                        + (B_T - 1) * 32
-                        + swz128((B_T - 1) ^ seg, dim - seg * 32, 4)
-                    )
-                    f = lds_v4_f32(s_ex + 4 * idx)
+                    f = lds_v4_f32(s_ex + gate_offset(B_T - 1, i * 16 + grp * 4, self.d_k))
                     for t in cutlass.range_constexpr(2):
                         s0, s1 = fmul2(
                             vecs[j][grp * 4 + 2 * t],
@@ -1274,13 +1250,7 @@ class KdaPrefill(WarpSpecialized):
             for j in cutlass.range_constexpr(half_blocks):
                 for grp in cutlass.range_constexpr(4):
                     dim = (half_blocks + j) * 16 + grp * 4
-                    seg = dim // 32
-                    idx = (
-                        seg * (B_T * 32)
-                        + (B_T - 1) * 32
-                        + swz128((B_T - 1) ^ seg, dim - seg * 32, 4)
-                    )
-                    f = lds_v4_f32(s_ex + 4 * idx)
+                    f = lds_v4_f32(s_ex + gate_offset(B_T - 1, dim, d_k))
                     for t in cutlass.range_constexpr(2):
                         k = j * 16 + grp * 4 + 2 * t
                         scaled[k], scaled[k + 1] = fmul2(
@@ -1413,28 +1383,11 @@ class KdaPrefill(WarpSpecialized):
                 row = final_dst
                 if cutlass.const_expr(self.paged_state > 0):
                     row = slot
-                addr = (out.iterator + out.layout((row, head_o, value_dim + v_offset, 0))).toint()
-                obytes = out.element_type.width // 8
-                for kb in cutlass.range_constexpr(0, self.d_k, 32):
-                    vals = tmem_ld("32x32b", 32, lane_base + cols["state"] + kb)
+                dst = out[row, head_o, value_dim + v_offset, None]
+                for i in cutlass.range_constexpr(self.d_k // 32):
+                    vals = tmem_ld("32x32b", 32, lane_base + cols["state"] + i * 32)
                     if row_valid:
-                        if cutlass.const_expr(out.element_type is Float32):
-                            for g in cutlass.range_constexpr(8):
-                                stg_v4(
-                                    addr + (kb + g * 4) * obytes,
-                                    [as_i32(vals[g * 4 + t]) for t in range(4)],
-                                )
-                        else:
-                            for g in cutlass.range_constexpr(4):
-                                words = [
-                                    fp32_to_fp16(
-                                        vals[g * 8 + 2 * t],
-                                        vals[g * 8 + 2 * t + 1],
-                                        dtype=out.element_type,
-                                    )
-                                    for t in range(4)
-                                ]
-                                stg_v4(addr + (kb + g * 8) * obytes, words)
+                        store_state_32(cute.local_tile(dst, (32,), (i,)), vals, self.state_align)
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:

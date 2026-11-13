@@ -111,7 +111,7 @@ from .kda_common import (
     lds_v4,
     lds_v4_f32,
     load_rows,
-    load_state_16,
+    load_state,
     mma_decay_16x16,
     opaque_i32,
     sts_f32,
@@ -936,11 +936,10 @@ class KdaBpropSummary(WarpSpecialized):
     def seed(self, params, dh, cols, seq, head, value_dim, seed):
         """``d_final_state`` row -> D (decayed by the item's last chunk's exp2(g_last)) and its
         16-bit copy D16."""
-        st = params.d_final_state
-        src = (st.iterator + st.layout((seq, head, value_dim, 0))).toint()
+        src = params.d_final_state[seq, head, value_dim, None]
         s_scale = dh.data.iterator.toint()
         for i in cutlass.range(self.d_k // 16, unroll=1):
-            vals = load_state_16(src + i * 64, Float32)
+            vals = load_state(cute.local_tile(src, (16,), (i,)))
             vals = [cutlass.select_(seed, v, Float32(0.0)) for v in vals]
             if cutlass.const_expr(self.tf32_decay):  # D16 = fp16(dS_end)
                 words = [

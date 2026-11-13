@@ -110,7 +110,7 @@ from .kda_common import (
     lds_v4,
     lds_v4_f32,
     load_rows,
-    load_state_16,
+    load_state,
     mask_pair,
     mma_decay_16x16,
     opaque_i32,
@@ -1036,15 +1036,12 @@ class KdaRecompute(WarpSpecialized):
         words."""
         _l, lane_base, cols, _lo, _hi, value_dim, row_valid = geo
         io = self.io_dtype
-        st = params.state_in
-        addr = (st.iterator + st.layout((batch, head, value_dim, 0))).toint()
-        sbytes = st.element_type.width // 8
+        src = params.state_in[batch, head, value_dim, None]
         half_blocks = self.d_k // 32
         for half in cutlass.range_constexpr(2):
             blocks = range(half * half_blocks, (half + 1) * half_blocks)
-            vecs = []
-            for i in cutlass.range_constexpr(blocks.start, blocks.stop):
-                vecs.append(load_state_16(addr + i * 16 * sbytes, st.element_type))
+            vals = load_state(cute.local_tile(src, (self.d_k // 2,), (half,)))
+            vecs = [vals[16 * j : 16 * j + 16] for j in range(half_blocks)]
             packed = []
             for j, i in enumerate(blocks):
                 words = [

@@ -213,20 +213,144 @@ def as_i32(value):
     return inline_ptx("mov.b32 $0, $1;", write_only_types=[Int32], read_only_args=[value])
 
 
+def state_align_suffix(state_align: int) -> str:
+    """Kernel-name tag of a state row alignment; empty for the default 16 bytes."""
+    return "" if state_align == 16 else f"_a{state_align}"
+
+
+# NOTE [Unaligned state rows]
+# A paged pool carved from packed byte pages may place a state row at any element offset, so
+# its 16-byte blocks start at a per-row runtime misalignment ``m = addr & 15``. Each thread owns
+# one row, so element loads and stores would split every warp access into 32 scattered words
+# (measured up to 2.6x the aligned prefill time on state-bound GB300 calls). Instead the row
+# keeps its 16-byte vector accesses on the enclosing aligned blocks and realigns in registers:
+# words move by ``m // 4`` through two levels of selects and, for an odd BF16 offset, by one
+# more half word through a funnel shift (measured 1.0-1.2x the aligned time). Loads read only
+# blocks that hold a byte of the row, so they never leave its allocation. Stores write the
+# interior blocks whole and the two partial end blocks element by element, so no byte outside
+# the row is written.
+
+
+def _shift_word(words, j: int, odd, high):
+    """``words[j + shift]`` for a runtime ``shift`` in ``[0, 3]`` given as its two bits."""
+    low_pair = cutlass.select_(odd, words[j + 1], words[j])
+    high_pair = cutlass.select_(odd, words[j + 3], words[j + 2])
+    return cutlass.select_(high, high_pair, low_pair)
+
+
 @cute.jit
-def load_state_16(addr, dtype: cutlass.Constexpr):
-    """16 consecutive state values at global ``addr`` (fp32 or bf16) as fp32."""
-    vals = []
-    if cutlass.const_expr(dtype is cutlass.Float32):
-        for g in cutlass.range_constexpr(4):
-            for w in ldg_v4(addr + g * 16):
-                vals.append(as_f32(w))
+def shift_words(words, shift, count: cutlass.Constexpr[int]):
+    """``words[j + shift]`` for ``j < count``, with ``shift`` a runtime value in ``[0, 3]``."""
+    odd, high = (shift & 1) != 0, (shift & 2) != 0
+    # A comprehension, not range_constexpr: half-row loads shift 65 words, past its unroll warning.
+    return [_shift_word(words, j, odd, high) for j in range(count)]
+
+
+@cute.jit
+def funnel_half(low, high):
+    """The 32-bit word that starts half way into ``low`` (``(high:low) >> 16``)."""
+    return inline_ptx(
+        "shf.r.clamp.b32 $0, $1, $2, 16;", write_only_types=[Int32], read_only_args=[low, high]
+    )
+
+
+@cute.jit
+def realign_words(words, misalignment, count: cutlass.Constexpr[int]):
+    """``count`` words of the byte stream that starts ``misalignment`` (runtime, a multiple of
+    two below 16) bytes into ``words``; needs ``count + 4`` words."""
+    shifted = shift_words(words, misalignment >> 2, count + 1)
+    half = ((misalignment >> 1) & 1) != 0
+    return [
+        cutlass.select_(half, funnel_half(shifted[j], shifted[j + 1]), shifted[j])
+        for j in range(count)
+    ]
+
+
+@cute.jit
+def load_state(tile, align: cutlass.Constexpr[int] = 16):
+    """The fp32 or bf16 state values of the global ``tile`` (a multiple of 16 bytes) as fp32.
+    Below 16-byte ``align``, the row is realigned in registers (NOTE [Unaligned state rows])."""
+    dtype = tile.element_type
+    blocks = cute.size(tile) * (dtype.width // 8) // 16
+    addr = tile.iterator.toint()
+    words = []
+    if cutlass.const_expr(align < 16):
+        misalignment = addr & 15
+        base = addr - misalignment
+        for g in cutlass.range_constexpr(blocks):
+            words += ldg_v4(base + g * 16)
+        # The values spill into one more block unless the tile is aligned; reread the last one
+        # then, so the load stays on blocks of the row.
+        words += ldg_v4(
+            base + blocks * 16 - cutlass.select_(misalignment == 0, Int64(16), Int64(0))
+        )
+        words = realign_words(words, misalignment, 4 * blocks)
     else:
-        for g in cutlass.range_constexpr(2):
-            for w in ldg_v4(addr + g * 16):
-                lo, hi = f16x2_to_f32(w, dtype=dtype)
-                vals += [lo, hi]
+        for g in cutlass.range_constexpr(blocks):
+            words += ldg_v4(addr + g * 16)
+    vals = []
+    for w in words:
+        if cutlass.const_expr(dtype is cutlass.Float32):
+            vals.append(as_f32(w))
+        else:
+            lo, hi = f16x2_to_f32(w, dtype=dtype)
+            vals += [lo, hi]
     return vals
+
+
+@cute.jit
+def store_unaligned_state_32(tile, vals):
+    """Store 32 fp32 ``vals`` into the element-aligned global ``tile`` (NOTE [Unaligned state
+    rows])."""
+    dtype = tile.element_type
+    element_bytes = dtype.width // 8
+    if cutlass.const_expr(dtype is Float32):
+        words = [as_i32(v) for v in vals]
+    else:
+        words = [fp32_to_fp16(vals[2 * j], vals[2 * j + 1], dtype=dtype) for j in range(16)]
+    blocks = len(words) // 4
+    addr = tile.iterator.toint()
+    misalignment = addr & 15
+    base = addr - misalignment
+    if misalignment == 0:
+        for g in cutlass.range_constexpr(blocks):
+            stg_v4(base + g * 16, words[4 * g : 4 * g + 4])
+    else:
+        # A head of 16 - misalignment bytes up to the first 16-byte boundary, blocks - 1 full
+        # blocks from base + 16 holding the values from that byte on, and a tail of
+        # misalignment bytes.
+        interior = realign_words(words, 16 - misalignment, len(words) - 4)
+        for g in cutlass.range_constexpr(blocks - 1):
+            stg_v4(base + (g + 1) * 16, interior[4 * g : 4 * g + 4])
+        head_elems = (16 - misalignment) // element_bytes
+        tail_elems = misalignment // element_bytes
+        for e in cutlass.range_constexpr(16 // element_bytes - 1):
+            if e < head_elems:
+                tile[e] = vals[e].to(dtype)
+            if e < tail_elems:
+                tile[31 - e] = vals[31 - e].to(dtype)
+
+
+@cute.jit
+def store_state_32(tile, vals, align: cutlass.Constexpr[int] = 16):
+    """Store 32 fp32 ``vals`` into the global ``tile`` as its dtype (fp32, or bf16 rounded to
+    nearest even). Below 16-byte ``align``, the row is realigned in registers (NOTE [Unaligned
+    state rows])."""
+    if cutlass.const_expr(align < 16):
+        store_unaligned_state_32(tile, vals)
+    else:
+        dtype = tile.element_type
+        addr = tile.iterator.toint()
+        if cutlass.const_expr(dtype is Float32):
+            for g in cutlass.range_constexpr(8):
+                stg_v4(addr + g * 16, [as_i32(vals[g * 4 + t]) for t in range(4)])
+        else:
+            for g in cutlass.range_constexpr(4):
+                words = [
+                    fp32_to_fp16(vals[g * 8 + 2 * t], vals[g * 8 + 2 * t + 1], dtype=dtype)
+                    for t in range(4)
+                ]
+                stg_v4(addr + g * 16, words)
 
 
 @cute.jit
