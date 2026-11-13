@@ -5,8 +5,9 @@
 # and the table phase of kernel/{gdn,kda}_chain_prologue_f16.py), rewritten by Attention Gym in
 # 2026 on CuTeDSL 4.6.2 APIs (cute.arch shuffles and barriers, SmemAllocator tensors, the raw
 # NVVM cp.async op, inline PTX vector loads and stores) in place of cutlass.experimental. The
-# piece tables, work tables and fp32 state chain are the upstream ones bit for bit; the per-piece
-# TMA-descriptor arrays the upstream chain prologues also built are gone.
+# piece tables, work tables and the 8-row fp32 state chain are the upstream ones bit for bit; the
+# per-piece TMA-descriptor arrays the upstream chain prologues also built are gone. Attention Gym
+# added the 3xTF32 tensor-core walk of 16-row blocks and the paired forward/transposed launch.
 #
 # CuTeDSL traces if-expressions as device selects, which min/max builtins do not reproduce on
 # dynamic values, and a nested `if` guards its loads, which a merged `a and b` condition would not.
@@ -22,6 +23,9 @@ fills slots in proportion to its length. Their summaries ``H_j`` (state from a z
 
     X_{j+1} = X_j @ M_j + H_j                       (forward)
     X_j     = X_{j+1} @ M_j^T + G_j                 (transpose: the backward, H playing G)
+
+8-row blocks chain on FMA, 16-row blocks on tensor cores in 3xTF32 (fp32 accurate); a backward
+runs its two chains, which share ``M``, in one launch.
 
 Layouts, fp32: ``H``, ``X`` ``[num_seqs * pieces, HO, V, K]``, ``M`` ``[num_seqs * pieces, HO,
 K, K]`` (contiguous), ``seed`` ``[num_seqs, HO, V, K]`` (fp32 or bf16). Slots are flat in
@@ -52,7 +56,15 @@ from attn_gym.warpdrive.cache import (
 )
 from attn_gym.warpdrive.compat import SmemAllocator
 
-from .ptx import f16x2_to_f32, ld_global_v, ld_shared_f32, st_global_v, st_shared_f32
+from .ptx import (
+    f16x2_to_f32,
+    ld_global_v,
+    ld_shared_f32,
+    mma_tf32,
+    st_global_v,
+    st_shared_f32,
+    tf32_lo,
+)
 from .work_tables import (
     INT32_MAX,
     OPT_LEVEL,
@@ -78,6 +90,10 @@ CHAIN_LANES = 32
 CHAIN_THREADS = CHAIN_WARPS * CHAIN_LANES
 CHAIN_K_TILE = 8
 CHAIN_M_BUFFERS = 2
+# The tensor-core walk (16-row blocks): four warps, M three buffers deep.
+CHAIN_MMA_WARPS = 4
+CHAIN_MMA_THREADS = CHAIN_MMA_WARPS * CHAIN_LANES
+CHAIN_MMA_M_BUFFERS = 3
 
 # ---- piece rule ------------------------------------------------------------------------------
 
@@ -132,13 +148,15 @@ def piece_table_layout(num_seqs: int, pieces: int, heads_out: int) -> PieceTable
     )
 
 
-def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm):
-    """State rows per chain CTA: ``dim_v // 16`` (16 CTAs per (sequence, head)) when that grid
-    fits the SMs and every warp keeps a whole row of the state and of upstream's M product
-    (``dim_k * rows // dim_v`` rows, kept so the geometry matches), else ``dim_v // 8``."""
+def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm, chains=1):
+    """State rows per chain CTA of a launch running ``chains`` chains: ``dim_v // 16`` (16
+    CTAs per (chain, sequence, head)) when that grid fits the SMs and every warp keeps a whole
+    row of the state and of upstream's M product (``dim_k * rows // dim_v`` rows, kept so the
+    geometry matches), else ``dim_v // 8`` (16 rows at ``dim_v = 128``: the tensor-core walk
+    of :func:`state_chain_kernel`)."""
     rows = dim_v // 16
     if (
-        num_seqs * heads_out * 16 <= num_sm
+        chains * num_seqs * heads_out * 16 <= num_sm
         and rows >= CHAIN_WARPS
         and (dim_k * rows // dim_v >= CHAIN_WARPS)
     ):
@@ -535,8 +553,8 @@ def prefetch_m(sM, mM, buf_words, slot, heads_out, h, tidx, dim_k: cutlass.Const
     cute.arch.cp_async_commit_group()
 
 
-@cute.kernel
-def state_chain_kernel(
+@cute.jit
+def chain_walk_fma(
     dim_k: cutlass.Constexpr[int],
     rows: cutlass.Constexpr[int],
     transpose: cutlass.Constexpr[bool],
@@ -545,15 +563,18 @@ def state_chain_kernel(
     mM: cute.Tensor,
     mX: cute.Tensor,
     mSeed: cute.Tensor | None,
-    mMainRows: cute.Tensor,
-    mSeedIndices: cute.Tensor | None,
+    seed_seq: Int32,
+    h: Int32,
+    row0: Int32,
+    seq_base: Int32,
+    count: Int32,
+    tidx: Int32,
+    sWalk: cute.Tensor,
+    sPart: cute.Tensor,
+    sM: cute.Tensor,
 ):
-    """CTA ``(seq, h, c)`` chains state rows ``[c * rows, (c + 1) * rows)`` over the
-    sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``, writing each
-    slot's incoming state to ``X``. Eight warps (two row groups times four k slices, lane ``l``
-    owning ``K / 32`` columns); each ``M_j`` is staged whole in SMEM by double-buffered
-    ``cp.async`` and read as 8-wide k tiles, the four slice partials added to ``H_j`` in slice
-    order by the row owner. A one-slot sequence copies its seed into ``X``."""
+    """State rows ``[row0, row0 + rows)`` of head ``h`` chained over the ``count`` slots from
+    ``seq_base`` (see :func:`state_chain_kernel`)."""
     K = cutlass.const_expr(dim_k)
     cols = cutlass.const_expr(K // CHAIN_LANES)
     k_slice = cutlass.const_expr(K // CHAIN_K_WARPS)
@@ -561,32 +582,11 @@ def state_chain_kernel(
     m_words = cutlass.const_expr(K * K)
     group_rows = cutlass.const_expr(rows // CHAIN_ROW_GROUPS)
     own_rows = cutlass.const_expr(rows // CHAIN_WARPS)
-
-    cute.arch.griddepcontrol_wait()
-    tidx = Int32(cute.arch.thread_idx()[0])
     warp = tidx // Int32(CHAIN_LANES)
     lane = tidx % Int32(CHAIN_LANES)
     k_warp = warp % Int32(CHAIN_K_WARPS)
     row_group = warp // Int32(CHAIN_K_WARPS)
     col0 = lane * Int32(cols)
-    bid = cute.arch.block_idx()
-    seq = Int32(bid[0])
-    h = Int32(bid[1])
-    seed_seq = seq
-    if cutlass.const_expr(mSeedIndices is not None):
-        seed_seq = Int32(mSeedIndices[seq])
-    row0 = Int32(bid[2]) * Int32(rows)
-
-    # ---- walk bounds -------------------------------------------------------------------------
-    row_base = Int32(mMainRows[seq])
-    seq_base = row_base // heads_out
-    filled = (Int32(mMainRows[seq + 1]) - row_base) // heads_out
-    count = filled if filled > Int32(0) else Int32(1)
-
-    smem = SmemAllocator()
-    sWalk = smem.allocate_tensor(Float32, cute.make_layout(rows * K), 16)
-    sPart = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_K_WARPS * rows * K), 16)
-    sM = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_M_BUFFERS * m_words), 128)
     acc = cute.make_rmem_tensor((group_rows * cols,), Float32)
     m_tile = cute.make_rmem_tensor((CHAIN_K_TILE * cols,), Float32)
     cur = cute.make_rmem_tensor((own_rows * cols,), Float32)
@@ -726,6 +726,405 @@ def state_chain_kernel(
                 store_row_shared(sWalk.iterator + (op_row * K + col0), total, cols)
             cute.arch.barrier()
             i = i + Int32(1)
+
+
+@cute.jit
+def m_swizzle(row, dim_k: cutlass.Constexpr[int], transpose: cutlass.Constexpr[bool]):
+    """XOR applied to the 16-byte chunk index of SMEM row ``row`` of ``M`` so each 16-byte
+    gather of :func:`chain_operands` hits distinct bank groups: the forward reads rows ``4``
+    apart (swizzle ``2 t``), the transposed chain rows :func:`chain_n_tiles` apart."""
+    if cutlass.const_expr(transpose):
+        return ((row // Int32(chain_n_tiles(dim_k))) % Int32(2)) * Int32(4)
+    return ((row // Int32(4)) % Int32(4)) * Int32(2)
+
+
+def chain_n_tiles(dim_k: int) -> int:
+    """8-column mma tiles per warp: the warps split the ``dim_k`` output columns."""
+    return dim_k // (8 * CHAIN_MMA_WARPS)
+
+
+@cute.jit
+def prefetch_m_tile(
+    sM, mM, buf_words, slot, heads_out, h, tidx, dst_words, dim_k: cutlass.Constexpr[int]
+):
+    """``cp.async`` of ``M[slot, h]`` (contiguous ``dim_k x dim_k`` fp32) into the SMEM buffer
+    at ``buf_words``, then commit the group: thread ``tid`` copies chunks ``tid + q *
+    CHAIN_MMA_THREADS`` to the swizzled word offsets ``dst_words[q % P] + (q // P) * P *
+    CHAIN_MMA_THREADS * 4`` of the swizzle period ``P = len(dst_words)`` (:func:`m_copy_words`)."""
+    K = dim_k
+    src = mM.iterator + (
+        (Int64(slot) * Int64(heads_out) + Int64(h)) * Int64(K * K) + Int64(tidx) * Int64(4)
+    )
+    period = cutlass.const_expr(len(dst_words))
+    for q in cutlass.range_constexpr(K * K // 4 // CHAIN_MMA_THREADS):
+        dst = sM.iterator + (
+            buf_words
+            + dst_words[q % period]
+            + Int32((q // period) * period * 4 * CHAIN_MMA_THREADS)
+        )
+        mlir_nvvm.cp_async_shared_global(
+            dst.llvm_ptr,
+            (src + Int64(q * 4 * CHAIN_MMA_THREADS)).llvm_ptr,
+            16,
+            mlir_nvvm.LoadCacheModifierKind.CG,
+        )
+    cute.arch.cp_async_commit_group()
+
+
+@cute.jit
+def m_copy_words(tidx, dim_k: cutlass.Constexpr[int], transpose: cutlass.Constexpr[bool]):
+    """Swizzled SMEM word offsets of thread ``tidx``'s :func:`prefetch_m_tile` chunks over one
+    period of the swizzle, which repeats every 16 rows."""
+    passes = cutlass.const_expr(max(1, 16 * dim_k // 4 // CHAIN_MMA_THREADS))
+    words = []
+    for q in cutlass.range_constexpr(passes):
+        chunk = tidx + Int32(q * CHAIN_MMA_THREADS)
+        row = chunk // Int32(dim_k // 4)
+        words.append(
+            row * Int32(dim_k)
+            + ((chunk % Int32(dim_k // 4)) ^ m_swizzle(row, dim_k, transpose)) * Int32(4)
+        )
+    return words
+
+
+@cute.jit
+def walk_step(i, count, transpose: cutlass.Constexpr[bool]):
+    """Slot offset of walk index ``i``: forward from the first slot, transposed from the last."""
+    return i if cutlass.const_expr(not transpose) else count - Int32(1) - i
+
+
+@cute.jit
+def chain_walk_mma(
+    dim_k: cutlass.Constexpr[int],
+    rows: cutlass.Constexpr[int],
+    transpose: cutlass.Constexpr[bool],
+    heads_out: Int32,
+    mH: cute.Tensor,
+    mM: cute.Tensor,
+    mX: cute.Tensor,
+    mSeed: cute.Tensor | None,
+    seed_seq: Int32,
+    h: Int32,
+    row0: Int32,
+    seq_base: Int32,
+    count: Int32,
+    tidx: Int32,
+    sX: cute.Tensor,
+    sM: cute.Tensor,
+):
+    """State rows ``[row0, row0 + rows)`` of head ``h`` chained over the ``count`` slots from
+    ``seq_base`` (see :func:`state_chain_kernel`) on tensor cores.
+
+    Each step is ``X @ M_j`` (``M_j^T`` transposed) on m16n8k8 tf32 mma.sync in 3xTF32
+    (``hi * hi + hi * lo + lo * hi``, fp32 accurate). Warp ``w`` owns output columns
+    ``[w * K / W, (w + 1) * K / W)`` over the whole k range, so no partials cross warps; of its
+    ``T = K / (8 W)`` n tiles, tile ``nt`` column ``v`` is ``w * K / W + T * v + nt``, which
+    gives lane ``(g, t) = (lane // 4, lane % 4)`` the ``T`` contiguous B columns ``T * g + nt``
+    and the ``2 T`` contiguous output columns ``2 T t + e``. In k step ``2 kc + s`` the lane
+    takes k ``16 kc + 4 t + 2 s`` for the fragment's k slot ``t`` and the next k for slot ``t +
+    4``. The state is kept in SMEM in that A fragment order (one 16-byte fragment per lane and
+    k step) in two buffers swapped each step; ``M_j`` arrives by ``cp.async``
+    ``CHAIN_MMA_M_BUFFERS - 1`` steps ahead; one CTA barrier per step."""
+    K = cutlass.const_expr(dim_k)
+    n_tiles = cutlass.const_expr(chain_n_tiles(K))
+    m_tiles = cutlass.const_expr(rows // 16)
+    k_chunks = cutlass.const_expr(K // 16)
+    x_words = cutlass.const_expr(rows * K)
+    m_words = cutlass.const_expr(K * K)
+    frag = cutlass.const_expr(m_tiles * n_tiles * 4)
+    row_cols = cutlass.const_expr(2 * n_tiles)
+    warp = tidx // Int32(CHAIN_LANES)
+    lane = tidx % Int32(CHAIN_LANES)
+    g = lane // Int32(4)
+    t = lane % Int32(4)
+    n_base = warp * Int32(K // CHAIN_MMA_WARPS)
+    # A fragment blocks (128 words each) of k chunk kc: per m tile, the two k-step parities.
+    a_blocks = [
+        [[(mt * k_chunks + kc) * 2 + s for s in range(2)] for mt in range(m_tiles)]
+        for kc in range(k_chunks)
+    ]
+    # Per (term, k-step parity) accumulators: hi * hi, hi * lo and lo * hi.
+    acc = cute.make_rmem_tensor((6 * frag,), Float32)
+    # The lane's state: rows (m tile, half) = mt * 16 + 8 * half + g, columns col0 + e.
+    cur = cute.make_rmem_tensor((m_tiles * 2 * row_cols,), Float32)
+    state_rows = [Int32(mt * 16 + half * 8) + g for mt in range(m_tiles) for half in range(2)]
+    col0 = n_base + t * Int32(row_cols)
+    # Its A-order SMEM words, column pair p = (col0 + 2 p, + 1): k chunk, k-step parity and the
+    # lane (g, t') holding them as k slots t', t' + 4.
+    x_out_words = []
+    for p in cutlass.range_constexpr(n_tiles):
+        col = col0 + Int32(2 * p)
+        x_out_words.append(
+            ((col // Int32(16)) * Int32(2) + (col % Int32(4)) // Int32(2)) * Int32(128)
+            + (g * Int32(4) + (col % Int32(16)) // Int32(4)) * Int32(4)
+        )
+    # Swizzled word offsets of the lane's M gathers: transposed, rows n_base + T g + nt from
+    # chunk 4 kc + t, at 4 (kc ^ (g % 2)) + t; forward, rows 16 kc + 4 t + e (swizzle 2 t) from
+    # column n_base + T g.
+    b_col = n_base + Int32(n_tiles) * g
+    if cutlass.const_expr(transpose):
+        parity = g % Int32(2)
+        b_words = [
+            b_col * Int32(K) + Int32(16) * (Int32(p) ^ parity) + t * Int32(4) for p in range(2)
+        ]
+    else:
+        b_words = [
+            t * Int32(4 * K) + ((b_col // Int32(4)) ^ (t * Int32(2))) * Int32(4) + b_col % Int32(4)
+        ]
+    copy_words = m_copy_words(tidx, K, transpose)
+
+    # ---- seeds -------------------------------------------------------------------------------
+    for r in cutlass.range_constexpr(m_tiles * 2):
+        if cutlass.const_expr(mSeed is not None):
+            vals = load_row_f32(
+                mSeed, element_addr(mSeed, seed_seq, h, row0 + state_rows[r], col0), row_cols
+            )
+        else:
+            vals = [Float32(0.0)] * row_cols
+        for e in cutlass.range_constexpr(row_cols):
+            cur[r * row_cols + e] = vals[e]
+
+    if count == Int32(1):
+        for r in cutlass.range_constexpr(m_tiles * 2):
+            store_row_f32(
+                element_addr(mX, seq_base, h, row0 + state_rows[r], col0),
+                [cur[r * row_cols + e] for e in range(row_cols)],
+                row_cols,
+            )
+    else:
+        # M of walk index j sits in buffer j % CHAIN_MMA_M_BUFFERS; a step without a prefetch
+        # commits an empty group so the wait below always leaves the same groups in flight.
+        for j in cutlass.range_constexpr(CHAIN_MMA_M_BUFFERS - 1):
+            if Int32(j) < count:
+                prefetch_m_tile(
+                    sM,
+                    mM,
+                    Int32(j * m_words),
+                    seq_base + walk_step(Int32(j), count, transpose),
+                    heads_out,
+                    h,
+                    tidx,
+                    copy_words,
+                    K,
+                )
+            else:
+                cute.arch.cp_async_commit_group()
+        publish_state(sX, Int32(0), cur, x_out_words, m_tiles, n_tiles, K)
+
+        # ---- walk ----------------------------------------------------------------------------
+        i = Int32(0)
+        while i < count:
+            slot = seq_base + walk_step(i, count, transpose)
+            cute.arch.cp_async_wait_group(CHAIN_MMA_M_BUFFERS - 2)
+            cute.arch.barrier()
+            # After the copy wait (which would also wait for these loads) and ahead of the next
+            # copies (which would delay them).
+            piece_h = []
+            for r in cutlass.range_constexpr(m_tiles * 2):
+                row = row0 + state_rows[r]
+                store_row_f32(
+                    element_addr(mX, slot, h, row, col0),
+                    [cur[r * row_cols + e] for e in range(row_cols)],
+                    row_cols,
+                )
+                piece_h += load_row_f32(mH, element_addr(mH, slot, h, row, col0), row_cols)
+            ahead = i + Int32(CHAIN_MMA_M_BUFFERS - 1)
+            if ahead < count:
+                prefetch_m_tile(
+                    sM,
+                    mM,
+                    (ahead % Int32(CHAIN_MMA_M_BUFFERS)) * Int32(m_words),
+                    seq_base + walk_step(ahead, count, transpose),
+                    heads_out,
+                    h,
+                    tidx,
+                    copy_words,
+                    K,
+                )
+            else:
+                cute.arch.cp_async_commit_group()
+            m_ptr = sM.iterator + (i % Int32(CHAIN_MMA_M_BUFFERS)) * Int32(m_words)
+            x_ptr = sX.iterator + (i % Int32(2)) * Int32(x_words) + lane * Int32(4)
+
+            # ---- X @ M over 16-wide k chunks; chunk kc + 1 loads while kc multiplies --------
+            acc.fill(0.0)
+            operands = chain_operands(x_ptr, m_ptr, a_blocks[0], b_words, 0, n_tiles, K, transpose)
+            for kc in cutlass.range_constexpr(k_chunks):
+                a_hi, w_vals = operands
+                if cutlass.const_expr(kc + 1 < k_chunks):
+                    operands = chain_operands(
+                        x_ptr, m_ptr, a_blocks[kc + 1], b_words, kc + 1, n_tiles, K, transpose
+                    )
+                a_lo = [[[tf32_lo(x) for x in a] for a in pair] for pair in a_hi]
+                for nt in cutlass.range_constexpr(n_tiles):
+                    w_lo = [tf32_lo(w) for w in w_vals[nt]]
+                    for mt in cutlass.range_constexpr(m_tiles):
+                        f = (mt * n_tiles + nt) * 4
+                        for s in cutlass.range_constexpr(2):
+                            b_hi = w_vals[nt][2 * s : 2 * s + 2]
+                            b_lo = w_lo[2 * s : 2 * s + 2]
+                            for term, (a_op, b_op) in enumerate(
+                                (
+                                    (a_hi[mt][s], b_hi),
+                                    (a_hi[mt][s], b_lo),
+                                    (a_lo[mt][s], b_hi),
+                                )
+                            ):
+                                base = (term * 2 + s) * frag + f
+                                out = mma_tf32([acc[base + q] for q in range(4)], a_op, b_op)
+                                for q in cutlass.range_constexpr(4):
+                                    acc[base + q] = out[q]
+
+            # ---- H_j plus the products, published for the next step -------------------------
+            # Fragment value q of (mt, nt) is row half q // 2, column (q % 2) * T + nt.
+            for mt in cutlass.range_constexpr(m_tiles):
+                for nt in cutlass.range_constexpr(n_tiles):
+                    for q in cutlass.range_constexpr(4):
+                        f = (mt * n_tiles + nt) * 4 + q
+                        c = ((mt * 2 + q // 2) * row_cols) + (q % 2) * n_tiles + nt
+                        small = (acc[2 * frag + f] + acc[3 * frag + f]) + (
+                            acc[4 * frag + f] + acc[5 * frag + f]
+                        )
+                        cur[c] = piece_h[c] + ((acc[f] + acc[frag + f]) + small)
+            publish_state(
+                sX,
+                Int32(x_words) - (i % Int32(2)) * Int32(x_words),
+                cur,
+                x_out_words,
+                m_tiles,
+                n_tiles,
+                K,
+            )
+            i = i + Int32(1)
+
+
+@cute.jit
+def chain_operands(
+    x_ptr,
+    m_ptr,
+    blocks,
+    b_words,
+    kc: cutlass.Constexpr[int],
+    n_tiles: cutlass.Constexpr[int],
+    dim_k: cutlass.Constexpr[int],
+    transpose: cutlass.Constexpr[bool],
+):
+    """``(a, w)`` of k chunk ``kc`` (see :func:`chain_walk`): the state's A fragments per (m
+    tile, k-step parity) and, per n tile, the M words ``w[nt][e]`` at k ``16 kc + 4 t + e``."""
+    a = [[ld_shared_f32(x_ptr + Int32(block * 128), 4) for block in pair] for pair in blocks]
+    if cutlass.const_expr(transpose):
+        w = [
+            ld_shared_f32(m_ptr + (b_words[kc % 2] + Int32(nt * dim_k + 32 * (kc // 2))), 4)
+            for nt in range(n_tiles)
+        ]
+    else:
+        rows = [
+            ld_shared_f32(m_ptr + (b_words[0] + Int32((16 * kc + e) * dim_k)), n_tiles)
+            for e in range(4)
+        ]
+        w = [[rows[e][nt] for e in range(4)] for nt in range(n_tiles)]
+    return a, w
+
+
+@cute.jit
+def publish_state(
+    sX,
+    buf_words,
+    cur,
+    x_out_words,
+    m_tiles: cutlass.Constexpr[int],
+    n_tiles: cutlass.Constexpr[int],
+    dim_k: cutlass.Constexpr[int],
+):
+    """Store the lane's state ``cur`` into the state buffer at ``buf_words`` in A fragment
+    order: rows ``g`` and ``g + 8`` of a column pair, ``(X[g, c], X[g + 8, c], X[g, c + 1],
+    X[g + 8, c + 1])``, are one A fragment of the next step."""
+    row_cols = cutlass.const_expr(2 * n_tiles)
+    for mt in cutlass.range_constexpr(m_tiles):
+        lo, hi = (mt * 2) * row_cols, (mt * 2 + 1) * row_cols
+        for p in cutlass.range_constexpr(n_tiles):
+            vals = [cur[lo + 2 * p], cur[hi + 2 * p], cur[lo + 2 * p + 1], cur[hi + 2 * p + 1]]
+            word = buf_words + x_out_words[p] + Int32(mt * dim_k // 16 * 2 * 128)
+            st_shared_f32(sX.iterator + word, vals)
+
+
+@cute.kernel
+def state_chain_kernel(
+    dim_k: cutlass.Constexpr[int],
+    rows: cutlass.Constexpr[int],
+    transpose: cutlass.Constexpr[bool],
+    heads_out: Int32,
+    mH: cute.Tensor,
+    mM: cute.Tensor,
+    mX: cute.Tensor,
+    mSeed: cute.Tensor | None,
+    mMainRows: cute.Tensor,
+    mSeedIndices: cute.Tensor | None,
+    mG: cute.Tensor | None,
+    mDX: cute.Tensor | None,
+    mDSeed: cute.Tensor | None,
+):
+    """CTA ``(seq, h, c)`` chains state rows ``[c * rows, (c + 1) * rows)`` over the
+    sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``, writing each
+    slot's incoming state to ``X``. Blocks of a multiple of 16 rows run on tensor cores
+    (:func:`chain_walk_mma`, four warps); 8-row blocks, which give few-head grids twice the
+    CTAs, on FMA (:func:`chain_walk_fma`: eight warps, two row groups times four k slices,
+    lane ``l`` owning ``K / 32`` columns; each ``M_j`` is staged whole in SMEM by
+    double-buffered ``cp.async`` and read as 8-wide k tiles, the four slice partials added to
+    ``H_j`` in slice order by the row owner). A one-slot sequence copies its seed into ``X``.
+
+    With ``mG`` bound the grid's ``c`` extent doubles: its lower half runs this chain forward
+    and its upper half the transposed chain of ``(mG, mDX, mDSeed)`` over the same ``M``, the
+    backward's two independent chains in one launch."""
+    K = cutlass.const_expr(dim_k)
+    m_words = cutlass.const_expr(K * K)
+
+    cute.arch.griddepcontrol_wait()
+    tidx = Int32(cute.arch.thread_idx()[0])
+    bid = cute.arch.block_idx()
+    seq = Int32(bid[0])
+    h = Int32(bid[1])
+    seed_seq = seq
+    if cutlass.const_expr(mSeedIndices is not None):
+        seed_seq = Int32(mSeedIndices[seq])
+    row_block = Int32(bid[2])
+
+    # ---- walk bounds -------------------------------------------------------------------------
+    row_base = Int32(mMainRows[seq])
+    seq_base = row_base // heads_out
+    filled = (Int32(mMainRows[seq + 1]) - row_base) // heads_out
+    count = filled if filled > Int32(0) else Int32(1)
+
+    smem = SmemAllocator()
+    if cutlass.const_expr(rows % 16 == 0):
+        walk_fn = chain_walk_mma
+        sX = smem.allocate_tensor(Float32, cute.make_layout(2 * rows * K), 16)
+        sM = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_MMA_M_BUFFERS * m_words), 128)
+        walk = (sX, sM)
+    else:
+        walk_fn = chain_walk_fma
+        sWalk = smem.allocate_tensor(Float32, cute.make_layout(rows * K), 16)
+        sPart = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_K_WARPS * rows * K), 16)
+        sM = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_M_BUFFERS * m_words), 128)
+        walk = (sWalk, sPart, sM)
+    walk_args = (seq_base, count, tidx, *walk)
+    if cutlass.const_expr(mG is None):
+        walk_fn(
+            K, rows, transpose, heads_out, mH, mM, mX, mSeed, seed_seq, h,
+            row_block * Int32(rows), *walk_args,
+        )  # fmt: skip
+    else:
+        blocks = Int32(cute.arch.grid_dim()[2]) // Int32(2)
+        if row_block < blocks:
+            walk_fn(
+                K, rows, False, heads_out, mH, mM, mX, mSeed, seed_seq, h,
+                row_block * Int32(rows), *walk_args,
+            )  # fmt: skip
+        else:
+            walk_fn(
+                K, rows, True, heads_out, mG, mM, mDX, mDSeed, seed_seq, h,
+                (row_block - blocks) * Int32(rows), *walk_args,
+            )  # fmt: skip
     cute.arch.griddepcontrol_launch_dependents()
 
 
@@ -744,16 +1143,36 @@ def launch_state_chain(
     mMainRows: cute.Tensor,
     mSeedIndices: cute.Tensor | None,
     stream: cuda.CUstream,
+    *,
+    reverse: tuple | None = None,
 ) -> None:
     """Chain the pieces' summaries into every slot's incoming state ``X`` (``transpose``: the
     backward recurrence over ``M^T``, last slot first), seeded by ``mSeed`` (zero when None,
-    row ``mSeedIndices[seq]`` when bound); ``rows`` from :func:`chain_rows_per_cta`. Callable
-    from a launch bundle's ``@cute.jit`` host."""
+    row ``mSeedIndices[seq]`` when bound); ``rows`` from :func:`chain_rows_per_cta`. With
+    ``reverse = (mG, mDX, mDSeed)`` the same launch also runs the transposed chain of ``mG``
+    over ``mM`` into ``mDX`` (``transpose`` must be False). Callable from a launch bundle's
+    ``@cute.jit`` host."""
+    if cutlass.const_expr(reverse is not None):
+        assert not transpose, "the paired launch chains forward and transposed"
+    mG, mDX, mDSeed = reverse if cutlass.const_expr(reverse is not None) else (None,) * 3
+    chains = 1 if cutlass.const_expr(reverse is None) else 2
     state_chain_kernel(
-        dim_k, rows, transpose, heads_out, mH, mM, mX, mSeed, mMainRows, mSeedIndices
+        dim_k,
+        rows,
+        transpose,
+        heads_out,
+        mH,
+        mM,
+        mX,
+        mSeed,
+        mMainRows,
+        mSeedIndices,
+        mG,
+        mDX,
+        mDSeed,
     ).launch(
-        grid=(num_seqs, heads_out, dim_v // rows),
-        block=(CHAIN_THREADS, 1, 1),
+        grid=(num_seqs, heads_out, chains * (dim_v // rows)),
+        block=(CHAIN_MMA_THREADS if cutlass.const_expr(rows % 16 == 0) else CHAIN_THREADS, 1, 1),
         stream=stream,
         use_pdl=True,
     )
@@ -877,13 +1296,17 @@ def compile_state_chain(
     seed_dtype_name: str | None,
     routed: bool,
     use_int64_offsets: bool,
+    paired: bool = False,
+    reverse_seed_dtype_name: str | None = None,
 ):
-    """Compile :func:`launch_state_chain`; every extent but ``V`` / ``K`` is symbolic (int64
-    with ``use_int64_offsets``)."""
+    """Compile :func:`launch_state_chain`, ``paired`` with its transposed chain; every extent
+    but ``V`` / ``K`` is symbolic (int64 with ``use_int64_offsets``)."""
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     @cute.jit
-    def entry(heads_out, num_seqs, mH, mM, mX, mSeed, mMainRows, mSeedIndices, stream):
+    def entry(
+        heads_out, num_seqs, mH, mM, mX, mSeed, mMainRows, mSeedIndices, mG, mDX, mDSeed, stream
+    ):
         launch_state_chain(
             dim_v,
             dim_k,
@@ -898,6 +1321,7 @@ def compile_state_chain(
             mMainRows,
             mSeedIndices,
             stream,
+            reverse=(mG, mDX, mDSeed) if paired else None,
         )
 
     def state(dtype, d):
@@ -908,7 +1332,9 @@ def compile_state_chain(
             assumed_align=16,
         )
 
-    seed_dtype = None if seed_dtype_name is None else getattr(cutlass, seed_dtype_name)
+    def seed_state(dtype_name):
+        return None if dtype_name is None else state(getattr(cutlass, dtype_name), dim_v)
+
     return compile_tvm_ffi(
         entry,
         Int32(0),
@@ -916,12 +1342,16 @@ def compile_state_chain(
         state(Float32, dim_v),
         make_fake_compact_tensor(Float32, (sym(), sym(), dim_k, dim_k), assumed_align=16),
         state(Float32, dim_v),
-        None if seed_dtype is None else state(seed_dtype, dim_v),
+        seed_state(seed_dtype_name),
         _int32_vector(sym),
         _int32_vector(sym) if routed else None,
+        state(Float32, dim_v) if paired else None,
+        state(Float32, dim_v) if paired else None,
+        seed_state(reverse_seed_dtype_name),
         opt_level=OPT_LEVEL,
         name=f"wd_state_chain_{dim_v}_{dim_k}_{rows}_{int(transpose)}_"
-        f"{(seed_dtype_name or 'none').lower()}_{int(routed)}_i64{int(use_int64_offsets)}",
+        f"{(seed_dtype_name or 'none').lower()}_{int(routed)}_i64{int(use_int64_offsets)}_"
+        f"p{int(paired)}{(reverse_seed_dtype_name or 'none').lower()}",
     )
 
 
@@ -939,9 +1369,11 @@ def state_chain(
     transpose: bool = False,
     rows: int | None = None,
     use_int64_offsets: bool = False,
+    reverse: tuple | None = None,
 ) -> None:
     """Run :func:`launch_state_chain` standalone: ``state_x[slot]`` receives every slot's
-    incoming state from ``state_h`` / ``state_m`` and the per-sequence ``seed``."""
+    incoming state from ``state_h`` / ``state_m`` and the per-sequence ``seed``; ``reverse =
+    (state_g, state_dx, dseed)`` pairs it with the transposed chain of ``state_g``."""
     _, heads_out, dim_v, dim_k = state_h.shape
     num_seqs = main_rows.numel() - 1
     if rows is None:
@@ -951,7 +1383,9 @@ def state_chain(
             num_seqs,
             heads_out,
             torch.cuda.get_device_properties(state_h.device).multi_processor_count,
+            chains=1 if reverse is None else 2,
         )
+    state_g, state_dx, dseed = (None,) * 3 if reverse is None else reverse
     fn = compile_state_chain(
         dim_v,
         dim_k,
@@ -960,8 +1394,22 @@ def state_chain(
         None if seed is None else _STATE_DTYPES[seed.dtype],
         seed_indices is not None,
         use_int64_offsets,
+        reverse is not None,
+        None if dseed is None else _STATE_DTYPES[dseed.dtype],
     )
-    fn(heads_out, num_seqs, state_h, state_m, state_x, seed, main_rows, seed_indices)
+    fn(
+        heads_out,
+        num_seqs,
+        state_h,
+        state_m,
+        state_x,
+        seed,
+        main_rows,
+        seed_indices,
+        state_g,
+        state_dx,
+        dseed,
+    )
 
 
 for _kernel in (chain_table_kernel, state_chain_kernel):
