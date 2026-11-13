@@ -20,7 +20,8 @@ from attn_gym.linear.gdn.impl.warpdrive_ops import (
 )
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
-_WARPDRIVE_DIM = 128
+# Equal key and value head dimensions served by the GDN kernels.
+_WARPDRIVE_DIMS = (64, 128)
 
 
 def _validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
@@ -30,8 +31,8 @@ def _validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None
     (``cast_to_kernel_dtypes``), and the registered operators copy operands their launchers
     cannot address.
     """
-    if q.shape[-1] != _WARPDRIVE_DIM or value.shape[-1] != _WARPDRIVE_DIM:
-        raise ValueError("the warpdrive GDN backend requires K=V=128")
+    if q.shape[-1] != value.shape[-1] or q.shape[-1] not in _WARPDRIVE_DIMS:
+        raise ValueError("the warpdrive GDN backend requires K=V in {64, 128}")
     if q.dtype not in _SUPPORTED_IO_DTYPES or k.dtype != q.dtype or value.dtype != q.dtype:
         raise TypeError("q, k, and value must share dtype float16 or bfloat16")
 

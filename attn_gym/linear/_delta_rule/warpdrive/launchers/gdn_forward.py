@@ -14,6 +14,7 @@ from attn_gym.linear._delta_rule.validation import resolve_scale
 from attn_gym.linear._delta_rule.warpdrive.drivers.gdn import gdn_forward
 
 _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
+_HEAD_DIMS = (64, 128)
 
 
 def validate_available(q: torch.Tensor) -> None:
@@ -50,13 +51,13 @@ def run_forward_on_current_device(
     initial_state = paged_state.cache if paged_state is not None else state
     scale = resolve_scale(scale, q.shape[-1])
     validate_available(q)
-    if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
-        raise ValueError("q must have shape [1, T, HK, 128]")
+    if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] not in _HEAD_DIMS:
+        raise ValueError(f"q must have shape [1, T, HK, K] with K in {_HEAD_DIMS}")
     if k.shape != q.shape:
         raise ValueError("k must match q")
     _, tokens, key_heads, key_dim = q.shape
-    if value.ndim != 4 or value.shape[:2] != (1, tokens) or value.shape[-1] != 128:
-        raise ValueError("value must have shape [1, T, H, 128]")
+    if value.ndim != 4 or value.shape[:2] != (1, tokens) or value.shape[-1] != key_dim:
+        raise ValueError(f"value must have shape [1, T, H, {key_dim}]")
     heads = value.shape[2]
     if heads % key_heads:
         raise ValueError("value heads must be a positive multiple of query/key heads")
@@ -94,7 +95,7 @@ def run_forward_on_current_device(
         if output_final_state:
             raise ValueError("paged state advances the pool in place; drop output_final_state")
     elif initial_state is not None:
-        expected_state = (num_sequences, heads, 128, key_dim)
+        expected_state = (num_sequences, heads, key_dim, key_dim)
         if initial_state.shape != expected_state or initial_state.dtype != torch.float32:
             raise TypeError(f"initial_state must be float32 with shape {expected_state}")
         if not initial_state.is_cuda or initial_state.device != q.device:
