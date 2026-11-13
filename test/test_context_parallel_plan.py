@@ -159,28 +159,58 @@ def test_routing_flattens_to_fixed_leaves_across_layouts():
     """Graph wrappers copy tensor leaves and require all other leaves to stay equal."""
     # Same span length per rank, 5 fragments then 3, under one cap.
     tables = [FRAGMENTS, [[(0, 6)], [(6, 12)], [(12, 16)]]]
-    (captured, spec), (fresh, fresh_spec) = (
-        pytree.tree_flatten(
-            ContextParallelRouting.from_fragments(
-                (0, 5, 12, 16),
-                table,
-                cp_rank=1,
-                device="cpu",
-                slots=3,
-                max_subsequences=4,
-                conv_history=2,
-            )
+    routings = [
+        ContextParallelRouting.from_fragments(
+            (0, 5, 12, 16),
+            table,
+            cp_rank=1,
+            device="cpu",
+            slots=3,
+            max_subsequences=4,
+            conv_history=2,
         )
         for table in tables
-    )
+    ]
+    (captured, spec), (fresh, fresh_spec) = map(pytree.tree_flatten, routings)
     assert fresh_spec == spec
-    assert sum(isinstance(leaf, torch.Tensor) for leaf in captured) == 11  # every routing tensor
+    assert {id(leaf) for leaf in captured if isinstance(leaf, torch.Tensor)} == {
+        id(value) for value in vars(routings[0]).values() if isinstance(value, torch.Tensor)
+    }
     for captured_leaf, fresh_leaf in zip(captured, fresh):
         if isinstance(captured_leaf, torch.Tensor):
             assert captured_leaf.shape == fresh_leaf.shape
             assert captured_leaf.dtype == fresh_leaf.dtype
         else:
             assert captured_leaf == fresh_leaf
+
+
+@pytest.mark.parametrize("fragments", FRAGMENT_TABLES)
+@pytest.mark.parametrize("cu_seqlens", LAYOUTS)
+def test_checkpoint_links_partition_the_original_chains(cu_seqlens, fragments):
+    for rank in range(len(fragments)):
+        plan = ContextParallelPlan.from_fragments(cu_seqlens, fragments, rank)
+        routing = plan.routing("cpu", slots=plan.slots + 2)
+        for sources, links in (
+            (routing.predecessors, routing.predecessor_links),
+            (routing.successors, routing.successor_links),
+        ):
+            seen = set()
+            for root, (_, _, is_root) in enumerate(links.tolist()):
+                assert is_root in (0, 1)
+                if not is_root:
+                    continue
+                row, prefix = root, []
+                while row != -1:
+                    assert 0 <= row < routing.slots
+                    assert row not in seen
+                    length, following, root_flag = links[row].tolist()
+                    assert root_flag == (row == root)
+                    chain = sources[row, :length].tolist()
+                    assert chain[: len(prefix)] == prefix
+                    assert length == int((sources[row] != routing.world * routing.slots).sum())
+                    seen.add(row)
+                    prefix, row = chain, following
+            assert seen == set(range(routing.slots))
 
 
 def test_plan_cuts_fragments_at_sequences_and_orders_neighbors():

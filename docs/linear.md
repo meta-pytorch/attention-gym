@@ -663,6 +663,14 @@ entry state or exit cotangent; the collective in between is the caller's.
 [`examples/linear/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/delta_rule_context_parallel.py)
 builds contiguous and zig-zag fragment lists in a dozen lines.
 
+Routed folds use one **root-fold policy**, without a workload-dependent switch. Nonempty chains
+for the same document on a rank share a root: its kernel program keeps the accumulator between
+linked checkpoints rather than restarting each prefix from zero. Backward does the same in reverse
+order. The `predecessor_links` and `successor_links` rows contain `(length, next_row, is_root)`;
+empty and padded rows are singleton roots that produce zero. This preserves the sequential IEEE
+FP32 arithmetic and requires no additional communication. It removes repeated prefix work but can
+cost some parallelism for short chains.
+
 ### Communication: the all-gather recipe
 
 **Reference recipe** (`attn_gym.linear.context_parallel.context_parallel_chunk`, bound as
@@ -705,7 +713,7 @@ routing tensors, so a CUDA Graph captured around it replays for any document lay
 table within the routing caps: capture with `plan.routing(device, slots=S, max_subsequences=N)`
 (at most `S` fragments per rank, `N` segments per span, the same span length), then copy each new
 layout's routing tensors into the captured ones (`test/test_context_parallel_distributed.py`
-checks three layout/table pairs). Eager callers pass no caps.
+checks small and highly fragmented layout changes). Eager callers pass no caps.
 
 The host plan is not rerun by graph replay. Before each replay, build the new plan outside
 capture, arrange the new inputs in its span order, and copy its routing values into the existing

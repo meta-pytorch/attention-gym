@@ -8,14 +8,15 @@
 
 Maps are ``[bias; transition]`` packed ``[V + K, K]`` per head (``attn_gym.linear.context_parallel``):
 applying one to a V-major state is ``state @ A + B``, and every state row depends only on the
-same row before it. A program owns ``BM`` rows of one head for one output row of the chain
-table and walks that row's slots serially, one ``[BM, K] @ [K, K]`` dot per slot, so the whole
-table folds in a single launch instead of one batched matmul per chain step.
+same row before it. An independent program owns ``BM`` rows of one head and walks one source
+chain. A linked program carries its accumulator across nested chains, storing each requested
+state without repeating the prefix. Both use one ``[BM, K] @ [K, K]`` dot per applied slot
+and fold the table in one launch instead of one batched matmul per chain step.
 
-The chain table is the routing's ``[rows, L]`` index tensor (padded with an identity slot), so
-the grid and the trip count are fixed by the layout bounds and the launch replays inside a
-captured CUDA Graph while the indices change in place. Trailing padding slots are not applied,
-so a padded chain is bitwise the same chain unpadded.
+The routing's ``[rows, L]`` source table is padded with an identity slot. Launch grids depend
+on capacity; trip counts come from non-padding indices or checkpoint links. Both paths replay
+inside a captured CUDA Graph while routing values change in place. Trailing padding slots
+are not applied, so a padded chain is bitwise the same chain unpadded.
 
 The dots run in IEEE FP32 (``input_precision="ieee"``): the chain is latency-bound on small
 dots, where one FMA pass beats three tensor-core passes, and the result matches the batched
@@ -27,6 +28,8 @@ from __future__ import annotations
 import torch
 import triton
 import triton.language as tl
+
+from attn_gym._backends.triton.utils import ptr_offset
 
 
 @triton.jit
@@ -93,4 +96,80 @@ def fold_slots_fused(maps: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
     return states
 
 
-__all__ = ["fold_slots_fused"]
+@triton.jit(do_not_specialize=["chain_stride"])
+def fold_slots_linked_kernel(
+    maps,
+    sources,
+    links,
+    states,
+    chain_stride: tl.int32,
+    H: tl.constexpr,
+    V: tl.constexpr,
+    K: tl.constexpr,
+    BM: tl.constexpr,
+):
+    """Fold a root's linked rows, keeping its accumulator between checkpoints."""
+    row = tl.program_id(0).to(tl.int64)
+    head = tl.program_id(1).to(tl.int64)
+    rows = tl.program_id(2) * BM + tl.arange(0, BM)
+    cols = tl.arange(0, K)
+    is_root = tl.load(links + ptr_offset((row, 2), (3, 1)))
+    if is_root == 0:
+        return
+    acc = tl.zeros([BM, K], dtype=tl.float32)
+    start = 0
+    while row != -1:
+        end = tl.load(links + ptr_offset((row, 0), (3, 1)))
+        for step in tl.range(start, end, num_stages=2):
+            slot = tl.load(sources + ptr_offset((row, step), (chain_stride, 1))).to(tl.int64)
+            base = maps + ptr_offset((slot, head), (H * (V + K) * K, (V + K) * K))
+            transition = tl.load(base + ptr_offset((V + cols[:, None], cols[None, :]), (K, 1)))
+            bias = tl.load(base + ptr_offset((rows[:, None], cols[None, :]), (K, 1)))
+            acc = tl.dot(acc, transition, input_precision="ieee") + bias
+        output_offset = ptr_offset(
+            (row, head, rows[:, None], cols[None, :]), (H * V * K, V * K, K, 1)
+        )
+        tl.store(states + output_offset, acc)
+        row = tl.load(links + ptr_offset((row, 1), (3, 1))).to(tl.int64)
+        start = end
+
+
+def fold_slots_linked(
+    maps: torch.Tensor, sources: torch.Tensor, links: torch.Tensor
+) -> torch.Tensor:
+    """Fold nested source chains once, storing the state at each linked row.
+
+    Each int32 link row is (length, next row, is_root). Roots own disjoint, acyclic
+    chains ending at next row -1; continuation rows have is_root zero. Empty rows are singleton
+    roots with is_root one.
+    The caller builds links on the host and updates them together with sources.
+    Singleton roots also represent independent folds without changing arithmetic.
+    """
+    _, heads, packed, key = maps.shape
+    value = packed - key
+    rows, chain = sources.shape
+    if links.shape != (rows, 3) or links.dtype != torch.int32:
+        raise ValueError("links must be int32 with shape [source rows, 3]")
+    if sources.dtype != torch.int64:
+        raise ValueError("sources must be int64")
+    if links.device != sources.device or maps.device != sources.device:
+        raise ValueError("maps, sources and links must be on the same device")
+    states = maps.new_empty((rows, heads, value, key))
+    if rows == 0 or chain == 0:
+        return states.zero_()
+    fold_slots_linked_kernel[(rows, heads, value // 32)](
+        maps.contiguous(),
+        sources.contiguous(),
+        links.contiguous(),
+        states,
+        chain,
+        heads,
+        value,
+        key,
+        32,
+        num_warps=8,
+    )
+    return states
+
+
+__all__ = ["fold_slots_fused", "fold_slots_linked"]

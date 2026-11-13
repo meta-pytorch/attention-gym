@@ -63,6 +63,10 @@ TABLES = {
     "uneven": ((0, 384), [[(0, 64), (128, 192), (256, 384)], [(64, 128), (192, 256)]]),
     "empty-document": ((0, 40, 40, 100, 384), [[(0, 96), (288, 384)], [(96, 192), (192, 288)]]),
     "documents": ((0, 100, 260, 384), [[(0, 100), (260, 384)], [(100, 260)]]),
+    "fragmented": (
+        (0, 384),
+        [[(i * 6, (i + 1) * 6) for i in range(rank, 64, 2)] for rank in range(2)],
+    ),
 }
 
 
@@ -206,13 +210,36 @@ def _check_case(
         local_cotangents.append(_exit_cotangent(plan, d_final, exit_states.shape[0]))
     grads = torch.autograd.grad(local_outputs, local, grad_outputs=local_cotangents)
 
+    independent_inputs = tuple(t[:, ids].clone().requires_grad_() for t in operands)
+    with patch.object(
+        cp_impl,
+        "_fold_routed_slots",
+        lambda gathered, sources, links: cp_impl.fold_slots(gathered, sources),
+    ):
+        independent_output, independent_exit = cp(
+            *independent_inputs, routing=plan.routing(device), group=dist.group.WORLD
+        )
+        independent_outputs = (
+            (independent_output, independent_exit) if final_state_loss else (independent_output,)
+        )
+        independent_grads = torch.autograd.grad(
+            independent_outputs, independent_inputs, grad_outputs=local_cotangents
+        )
+
     # Unlike the attention summaries, the halo uses a differentiable functional all-gather.
     qkv = torch.randn(1, cu_seqlens[-1], CHANNELS, device=device, generator=generator)
+    history_rows = max(
+        MAX_SUBSEQUENCES,
+        *(
+            len(ContextParallelPlan.from_fragments(cu_seqlens, fragments, rank).subsequences)
+            for rank in range(2)
+        ),
+    )
     d_histories = torch.randn(
-        2, MAX_SUBSEQUENCES, CONV_HISTORY, CHANNELS, device=device, generator=generator
+        2, history_rows, CONV_HISTORY, CHANNELS, device=device, generator=generator
     )
     local_qkv = qkv[:, ids].clone().requires_grad_()
-    routing = plan.routing(device, max_subsequences=MAX_SUBSEQUENCES, conv_history=CONV_HISTORY)
+    routing = plan.routing(device, max_subsequences=history_rows, conv_history=CONV_HISTORY)
     history = context_parallel_conv_history(local_qkv, routing, dist.group.WORLD)
     (d_qkv,) = torch.autograd.grad(history, local_qkv, grad_outputs=d_histories[cp_rank])
 
@@ -239,6 +266,12 @@ def _check_case(
     _assert_matches_unsharded(
         plan, ids, (local_output, grads, exit_states), (output, expected_grads, final)
     )
+    for actual, expected in zip(
+        (local_output, exit_states, *grads),
+        (independent_output, independent_exit, *independent_grads),
+        strict=True,
+    ):
+        assert torch.equal(actual, expected)
     if table == "documents":
         for ref_output, ref_grads in ((solo_output, solo_grads), (output, expected_grads)):
             for actual, expected in zip(
@@ -352,7 +385,7 @@ def _conv_history_oracle(
     Also returns the global gradient of every rank's history loss: each rank's cotangent scattered
     onto the tokens its histories read, which the collective's backward must deliver to the owner.
     """
-    history = qkv.new_zeros(MAX_SUBSEQUENCES, CONV_HISTORY, qkv.shape[-1])
+    history = qkv.new_zeros(d_histories.shape[1], CONV_HISTORY, qkv.shape[-1])
     d_qkv = torch.zeros_like(qkv)
     for owner, d_history in enumerate(d_histories):
         plan = ContextParallelPlan.from_fragments(layout, fragments, owner)
@@ -365,40 +398,50 @@ def _conv_history_oracle(
     return history, d_qkv
 
 
-def _replay_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
+def _replay_main(
+    cp_rank: int, world: int, port: int, op_name: str, fragmented: bool = False
+) -> None:
     chunk, cp = OPS[op_name]
     assert world == 2, "the tables above are written for two ranks"
     tokens = LAYOUTS[0][-1]
+    cases = list(zip(LAYOUTS[::-1], REPLAY_TABLES[::-1], strict=True))
+    slots, max_subsequences = SLOTS, MAX_SUBSEQUENCES
+    if fragmented:
+        slots = 32
+        max_subsequences = slots + max(len(layout) - 2 for layout in LAYOUTS)
+        fragments = [[(i * 6, (i + 1) * 6) for i in range(rank, 64, 2)] for rank in range(world)]
+        fragments[1].reverse()
+        cases.insert(0, ((0, tokens), fragments))
     with _process_group(cp_rank, world, port) as device:
         generator = torch.Generator(device=device).manual_seed(1)
 
         def sample():
             # One cotangent per possible document; the layout decides which rows are used. Every
             # rank draws every rank's history cotangent to build the oracle gradient.
-            operands, d_output, d_final = _sample(op_name, tokens, MAX_SUBSEQUENCES, generator)
+            operands, d_output, d_final = _sample(op_name, tokens, max_subsequences, generator)
             qkv = torch.randn(1, tokens, CHANNELS, device=device, generator=generator)
             d_histories = torch.randn(
-                world, MAX_SUBSEQUENCES, CONV_HISTORY, CHANNELS, device=device, generator=generator
+                world, max_subsequences, CONV_HISTORY, CHANNELS, device=device, generator=generator
             )
             return operands, d_output, d_final, qkv, d_histories
 
         # Static buffers the graph reads: the span inputs, the routing tensors, the cotangents.
         # The exit-state cotangent is per span segment and zero except on terminal rows, which
         # is how a caller masks the final-state loss to true document ends under replay.
-        caps = {"slots": SLOTS, "max_subsequences": MAX_SUBSEQUENCES, "conv_history": CONV_HISTORY}
+        caps = {"slots": slots, "max_subsequences": max_subsequences, "conv_history": CONV_HISTORY}
         plan = ContextParallelPlan.from_fragments(LAYOUTS[0], REPLAY_TABLES[0], cp_rank)
         routing = plan.routing(device, **caps)
         ids = plan.global_token_ids(device)
         operands, d_output, _, qkv, d_histories = sample()
         local = [t[:, ids].clone().requires_grad_() for t in (*operands, qkv)]
         local_d_output = d_output[:, ids].clone()
-        local_d_exit = torch.zeros(MAX_SUBSEQUENCES, HEADS, HEAD_DIM, HEAD_DIM, device=device)
+        local_d_exit = torch.zeros(max_subsequences, HEADS, HEAD_DIM, HEAD_DIM, device=device)
         local_d_history = d_histories[cp_rank].clone()
 
         def step():
             *span, local_qkv = local
             output, exit_states = cp(*span, routing=routing, group=dist.group.WORLD)
-            assert exit_states.shape[0] == MAX_SUBSEQUENCES
+            assert exit_states.shape[0] == max_subsequences
             grads = torch.autograd.grad(
                 (output, exit_states), span, grad_outputs=(local_d_output, local_d_exit)
             )
@@ -421,7 +464,7 @@ def _replay_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
             dist.barrier()
 
             # Start away from the captured pair; every step changes both documents and table.
-            for layout, fragments in zip(LAYOUTS[::-1], REPLAY_TABLES[::-1], strict=True):
+            for layout, fragments in cases:
                 new_plan = ContextParallelPlan.from_fragments(layout, fragments, cp_rank)
                 ids = new_plan.global_token_ids(device)
                 operands, d_output, d_final, qkv, d_histories = sample()
@@ -435,7 +478,7 @@ def _replay_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
                     value = getattr(new_routing, field.name)
                     if isinstance(value, torch.Tensor):
                         getattr(routing, field.name).copy_(value)
-                local_d_exit.copy_(_exit_cotangent(new_plan, d_final, MAX_SUBSEQUENCES))
+                local_d_exit.copy_(_exit_cotangent(new_plan, d_final, max_subsequences))
                 graph.replay()
                 torch.cuda.synchronize()
 
@@ -463,5 +506,25 @@ def _replay_main(cp_rank: int, world: int, port: int, op_name: str) -> None:
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="NCCL graph replay needs two GPUs")
 @pytest.mark.parametrize("op_name", list(OPS))
-def test_one_captured_graph_replays_across_document_layouts(op_name):
-    _spawn(_replay_main, (op_name,))
+@pytest.mark.parametrize("fragmented", [False, True], ids=["small", "fragmented"])
+def test_one_captured_graph_replays_across_document_layouts(op_name, fragmented):
+    _spawn(_replay_main, (op_name, fragmented))
+
+
+@pytest.mark.parametrize("op_name", list(OPS))
+def test_backward_detects_fold_link_mutation(op_name):
+    with _process_group(0, 1, _free_port()) as device:
+        plan = ContextParallelPlan.from_fragments((0, 192), [[(0, 64), (64, 128), (128, 192)]], 0)
+        routing = plan.routing(device)
+        generator = torch.Generator(device=device).manual_seed(869)
+        inputs, d_output, _ = _sample(op_name, 192, 1, generator)
+        inputs = tuple(t.requires_grad_() for t in inputs)
+        output, _ = OPS[op_name][1](
+            *inputs,
+            routing=routing,
+            group=dist.group.WORLD,
+            kernel_options={"autotune": False},
+        )
+        routing.successor_links.add_(0)
+        with pytest.raises(RuntimeError, match="modified by an inplace operation"):
+            torch.autograd.grad(output, inputs, d_output)
