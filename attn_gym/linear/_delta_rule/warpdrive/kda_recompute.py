@@ -62,6 +62,9 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
+    BEFORE_FENCE_COVERED,
+    BOTH_FENCES_COVERED,
     Barriers,
     Consumer,
     Instance,
@@ -163,16 +166,17 @@ TSTATE_COUNTS = (4, 4, 1, 1, 4, 8, 1, 1, 1, 1)
 
 
 @cute.jit
-def _raw_beta_wait(raw, beta, n):
+def _raw_beta_wait(raw, beta, n, fence: cutlass.Constexpr[bool] = True):
     """CG1's waits on chunk ``n``'s ``raw`` and ``beta`` stages, driven by one shared counter
     (the upstream raw_index): both are ``RAW_STAGES``-stage rings CG1 consumes once per chunk, in
-    order; then ``tcgen05.fence::after_thread_sync`` as after a managed wait in a TMEM role.
-    Returns the stage."""
+    order; then ``tcgen05.fence::after_thread_sync`` as after a managed wait in a TMEM role
+    (``fence=False`` omits it, ``AFTER_FENCE_COVERED``). Returns the stage."""
     stage = n % RAW_STAGES
     phase = (n // RAW_STAGES) & 1
     cute.arch.mbarrier_wait(raw.full_barrier(stage), phase)
     cute.arch.mbarrier_wait(beta.full_barrier(stage), phase)
-    tcgen05_after_thread_sync()
+    if cutlass.const_expr(fence):
+        tcgen05_after_thread_sync()
     return stage
 
 
@@ -356,8 +360,11 @@ class KdaRecompute(WarpSpecialized):
         )
 
     @cute.jit
-    def next_tile(self, sched):
-        with sched.consume() as h:
+    def next_tile(self, sched, skip_fence=None):
+        """The next tile of the item list; ``skip_fence`` as for the consume (its reason is
+        ``AFTER_FENCE_COVERED``/``BEFORE_FENCE_COVERED``)."""
+        reason = BEFORE_FENCE_COVERED if skip_fence == "before" else AFTER_FENCE_COVERED
+        with sched.consume(skip_fence=skip_fence, reason=reason) as h:
             tile = h.data[0]
         return sched, tile
 
@@ -563,7 +570,7 @@ class KdaRecompute(WarpSpecialized):
                 for local in cutlass.range((stage + cum_base) & 1, n_local, 2, unroll=1):
                     c = cum_base + local
                     if raw_next < c:  # the other instance's chunk: release its stage
-                        raw.consume_unread()
+                        raw.consume_unread(skip_fence="both", reason=BOTH_FENCES_COVERED)
                     raw_next = c + 1
                     chunk = compute_start + local
                     raw, kk, restore = self.cg0_chunk(
@@ -595,7 +602,7 @@ class KdaRecompute(WarpSpecialized):
                 if write_end > first:
                     rows_before += write_end - first
                 cum_base += n_local
-                sched, tile = self.next_tile(sched)
+                sched, tile = self.next_tile(sched, skip_fence="before")
             work.advance()
         return raw, kk, restore, sched, work
 
@@ -633,7 +640,7 @@ class KdaRecompute(WarpSpecialized):
         channel_rows = d_k // 4
         store_rows = B_T * channel_rows // 32
         store_row_base = (lane // channel_rows) * store_rows
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
         rh.access("K", read=True, by="threads")
         rh.access("Gate", read=True, by="threads")
         g_stage_bytes = d_k * B_T * (self.gate_dtype.width // 8)
@@ -681,8 +688,8 @@ class KdaRecompute(WarpSpecialized):
                 value = g[row_off]
                 idx = prefix_offsets[row_off % 8] + row_off * 32
             sts_f32(s_ex + 4 * idx, value)
-        barrier.sync(aligned=True)
-        warp_arrive(self.barrier_ptr("exchange") + ex_stage)
+        barrier.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
+        warp_arrive(self.barrier_ptr("exchange") + ex_stage, fence=False)
 
         # ---- raw K rows (zeroed past the sequence end), exp2(g) of the row --------------------
         k_stage = rh.index * (d_k * B_T * 2)
@@ -738,7 +745,7 @@ class KdaRecompute(WarpSpecialized):
                 ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])
                 kr_pack.append(fp32_to_fp16(kr0, kr1, dtype=io))
-        kh = kk.acquire()
+        kh = kk.acquire(skip_fence="both", reason=BOTH_FENCES_COVERED)
         kh.access("Kdecay", write=True, by="threads")
         kh.access("Kinv", write=True, by="threads")
         decay_stage = kh.index * (d_k * B_T * 2)
@@ -747,7 +754,7 @@ class KdaRecompute(WarpSpecialized):
             st_shared_v4(params.s_kinv + off, ki_pack[4 * half : 4 * half + 4])
             st_shared_v4(params.s_kdecay + off, kd_pack[4 * half : 4 * half + 4])
         kh.commit()
-        with restore.produce() as qh:
+        with restore.produce(skip_fence="before", reason=BEFORE_FENCE_COVERED) as qh:
             qh.access(write=True, by="threads")
             decay_stage = qh.index * (d_k * B_T * 2)
             for half in cutlass.range_constexpr(dk_halves):
@@ -799,7 +806,7 @@ class KdaRecompute(WarpSpecialized):
         packed state operand words: raw side of the ``ckpt`` ring (see ``__init__``)."""
         stage = row_index % CKPT_STAGES
         full = self.barrier_ptr("ckpt")
-        spin_wait(full + CKPT_STAGES + stage, ((row_index // CKPT_STAGES) + 1) & 1)
+        spin_wait(full + CKPT_STAGES + stage, ((row_index // CKPT_STAGES) + 1) & 1, fence=False)
         if ckpt_valid:
             for b in cutlass.range_constexpr(self.d_k // 64):
                 for wg in cutlass.range_constexpr(4):
@@ -893,9 +900,8 @@ class KdaRecompute(WarpSpecialized):
                 n_raw += n_local
                 if n_local > 0:
                     with self.trace_region("sacc_r.wait"):
-                        spin_wait(
-                            tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1
-                        )  # the last update
+                        # The last update; the next item's fenced waits precede its TMEM accesses.
+                        spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1, fence=False)
                     n_upd += 1
                 sched, tile = self.next_tile(sched)
             work.advance()
@@ -924,7 +930,9 @@ class KdaRecompute(WarpSpecialized):
         checkpoint row, Y (carrying the seeded state), U."""
         lane, lane_base, cols, _lo, _hi, _vd, _rv = geo
         io = self.io_dtype
-        eh = exchange.wait()
+        # Without an initial state no seed loads TMEM before the next fenced wait.
+        skip = None if self.use_initial_state else "after"
+        eh = exchange.wait(skip_fence=skip, reason=AFTER_FENCE_COVERED)
         s_ex = params.s_g + eh.index * (self.d_k * B_T * 4)
         if cutlass.const_expr(self.gate != "fp32"):
             s_ex = params.s_ex + eh.index * (self.d_k * B_T * 4)
@@ -1040,7 +1048,7 @@ class KdaRecompute(WarpSpecialized):
     def zero_row(self, params, ckpt, geo):
         """Chunk 0's checkpoint row with no initial state: zeros."""
         _l, _lb, _c, _lo, _hi, value_dim, row_valid = geo
-        ch = ckpt.acquire()
+        ch = ckpt.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         ch.access(write=True, by="threads")
         zero = Int32(0)
         if row_valid:
@@ -1057,7 +1065,7 @@ class KdaRecompute(WarpSpecialized):
         the managed commit's 4."""
         cute.arch.fence_view_async_shared()
         warp_arrive(ch.full_barrier)
-        ch.commit()
+        ch.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return ckpt
 
     @cute.jit
@@ -1123,7 +1131,7 @@ class KdaRecompute(WarpSpecialized):
         io = self.io_dtype
         d_k = self.d_k
         half_blocks = d_k // 32
-        stage = _raw_beta_wait(raw, beta, n_raw)
+        stage = _raw_beta_wait(raw, beta, n_raw, fence=False)
         with self.trace_region("sacc_r.wait"):
             spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1)
         n_upd += 1
@@ -1165,7 +1173,7 @@ class KdaRecompute(WarpSpecialized):
             tmem_st("32x32b", lane_base + cols["state"] + (half_blocks + j) * 16, scaled[j])
         # ---- the right key half of the chunk's checkpoint row -------------------------------
         if store_row:
-            with ckpt.produce() as ch:
+            with ckpt.produce(skip_fence="after", reason=AFTER_FENCE_COVERED) as ch:
                 ch.access(write=True, by="threads")
                 if row_valid:
                     for j in cutlass.range_constexpr(half_blocks):
@@ -1378,7 +1386,7 @@ class KdaRecompute(WarpSpecialized):
                     seeded = compute_start == 0
                 for local in cutlass.range(write_end - compute_start, unroll=1):
                     have_state = local > 0 or seeded
-                    kh = kk.wait()
+                    kh = kk.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     kh.access("Kdecay", read=True, by="umma")
                     desc_kd = desc_opaque(
                         smem_desc(params.s_kdecay + kh.index * stage_bytes, 16, 1024, SWIZZLE_128B)
@@ -1405,10 +1413,10 @@ class KdaRecompute(WarpSpecialized):
                         umma_commit(tstate + KS, elect)
                     kh.release(signal=False)  # the role's elected lane commits (below)
                     umma_commit(kh.empty_barrier, elect)
-                    qh = restore.wait()
+                    qh = restore.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     qh.access(read=True, by="umma")
                     # ---- U = T Y ----------------------------------------------------------------
-                    th = tinv.wait()
+                    th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     th.access(read=True, by="umma")
                     desc_t = desc_opaque(
                         smem_desc(params.s_tinv + th.index * (B_T * B_T * 2), 16, 256, SWIZZLE_32B)

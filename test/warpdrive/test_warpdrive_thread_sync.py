@@ -4,9 +4,10 @@ PTX orders tcgen05 operations of different threads through a synchronization onl
 ``tcgen05.fence::before_thread_sync`` before the signal and ``::after_thread_sync`` after the
 wait (ISA 9.7.18.6.3). The checker (``ptx_check``) is exercised on hand-written PTX, then run on
 the PTX of compiled kernels: the layer fences every managed wait and signal of a role that
-issues tcgen05 operations, and the TMEM teardown.
+issues tcgen05 operations, except where a call skips a fence, and the TMEM teardown.
 """
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +36,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
+from attn_gym.warpdrive.protocol import fence_skip
 from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
 
 # ---- the checker on hand-written PTX ----------------------------------------------------
@@ -244,7 +246,8 @@ class SyncToy(WarpSpecialized):
     meets the other at a ``NamedBarrier`` and loads the other's. Only the layer orders these
     TMEM accesses across threads."""
 
-    def __init__(self):
+    def __init__(self, skip: str | None = None):
+        self.skip = skip  # b's fwd consume skips this fence (a needed one)
         self.fwd = Ring(2, Threads, Warps, commit_fence="tmem_store", release_fence="tmem_load")
         self.back = Ring(
             1, Threads, Threads, sync="named", commit_fence="tmem_store", release_fence="tmem_load"
@@ -272,7 +275,9 @@ class SyncToy(WarpSpecialized):
     def b(self, ctx, *, fwd: Consumer, back: Producer, tmem: Tmem, me: Local):
         for _ in cutlass.range(EPOCHS, unroll=1):
             token = fwd.try_wait()
-            with fwd.consume(token=token) as h:
+            skip = self.skip
+            reason = None if skip is None else f"test: the {skip} fence is needed"
+            with fwd.consume(token=token, skip_fence=skip, reason=reason) as h:
                 value = _ld(_addr(tmem, "x", me) + h.index * 32)
             with back.produce():
                 _st(_addr(tmem, "y", me), value + 7)
@@ -325,6 +330,30 @@ def test_toy_ptx_is_fenced(requires_blackwell, tmp_path):
     assert not found, "\n".join(f.describe() for f in found)
     assert text.count("tcgen05.fence::after_thread_sync") >= 6
     assert text.count("tcgen05.fence::before_thread_sync") >= 6
+
+
+def test_skips_name_a_fence_the_call_emits_and_a_reason():
+    with pytest.raises(ValueError, match="one of"):
+        fence_skip("all", "r", "kv.wait")
+    with pytest.raises(ValueError, match="one of"):
+        fence_skip("after", "r", "kv.release", ("before",))
+    with pytest.raises(ValueError, match="non-empty reason"):
+        fence_skip("after", " ", "kv.wait")
+    assert fence_skip(None, "a reason alone skips nothing", "kv.wait") is None
+
+
+@pytest.mark.parametrize("skip", ["after", "before"])
+def test_skip_on_a_needed_fence_is_caught(requires_blackwell, tmp_path, skip):
+    """``b`` loads TMEM right after its fwd wait and releases fwd right after that load
+    completes, so both fences of that handle are needed: skipping either leaves a PTX path the
+    checker reports, and ``describe()`` names the skip, its reason and what it dropped."""
+    op = SyncToy(skip)
+    _, found = _ptx_findings(compile_toy, op, tmp_path)
+    rule = "after_thread_sync" if skip == "after" else "before_thread_sync"
+    assert found and all(rule in f.describe() for f in found), [f.describe() for f in found]
+    text = op.describe()
+    assert re.search(rf"skip {skip} @ test_warpdrive_thread_sync\.py:\d+ \(fwd\.wait\)", text)
+    assert f"b: skipped {skip}\n    'test: the {skip} fence is needed'" in text
 
 
 def test_tcgen05_roles_alone_take_the_fences(requires_blackwell, tmp_path):

@@ -5,8 +5,10 @@ d_v split, the gate dtype, the prefill variant) without either cache and runs
 ``ptx_check.check_tcgen05_sync`` on every path of its PTX: a tcgen05 operation after a wait
 needs ``tcgen05.fence::after_thread_sync``, a signal after a tcgen05 operation needs
 ``::before_thread_sync`` (PTX ISA 9.7.18.6.3). The layer emits both on managed synchronization;
-the kernels' raw signals emit their own. The configurations are those the public ops and drivers
-build (recorded over test/gdn, test/kda and test/linear). Launch bundles run the same kernel
+the kernels' raw signals emit their own. Calls that skip a fence another one already provides
+(``skip_fence=``, a raw helper's ``fence=False``) are proven only here, per configuration. The
+configurations are those the public ops and drivers build (recorded over test/gdn, test/kda and
+test/linear). Launch bundles run the same kernel
 classes; the paged prefill states compile only inside a warmup-forward bundle, so those bundles
 are cases too. Compile-only: a few seconds each.
 """

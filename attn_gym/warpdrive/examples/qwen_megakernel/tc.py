@@ -9,6 +9,7 @@ from cutlass import BFloat16, Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
     Consumer,
     Local,
     Producer,
@@ -23,6 +24,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ATTN,
+    COMPUTE_TMEM_FENCED,
     COMPUTE_WARPS,
     DOWN,
     DOWN_SPLITS,
@@ -79,7 +81,7 @@ class TcGen05Gemv:
 
     def input_ready(self, chans, new):
         xin = chans[1]
-        with xin.produce():
+        with xin.produce(skip_fence="before", reason=COMPUTE_TMEM_FENCED):
             pass
         return (chans[0], xin, *chans[2:])
 
@@ -88,7 +90,7 @@ class TcGen05Gemv:
         w, acc = chans[0], chans[2]
         (t_acc,) = env
         for _ in cutlass.range(k_tiles, unroll=1):
-            with w.consume():
+            with w.consume(skip_fence="both", reason=COMPUTE_TMEM_FENCED):
                 pass
         vals = cute.make_rmem_tensor((self.n,), Float32)
         vals.fill(0.0)
@@ -264,7 +266,9 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
                             dst = t_acc[None, None, None, d.index]
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                             for kt in cutlass.range(k_tiles, unroll=1):
-                                with w.consume() as h:
+                                # Streamed inputs: the xa wait fences the MMAs.
+                                skip = None if xa is None else "after"
+                                with w.consume(skip_fence=skip, reason=AFTER_FENCE_COVERED) as h:
                                     a_stage = w_base + h.index * (STAGE_BYTES // 2)
                                     if cutlass.const_expr(xa is None):
                                         col = (xbuf % self.x_buffers) * self.x_stride
@@ -311,13 +315,13 @@ class TcGen05StreamGemv(TcGen05Gemv):
     @cute.jit
     def input_ready(self, chans, new):
         w, xin, acc, xready = chans
-        with xin.produce():
+        with xin.produce(skip_fence="before", reason=COMPUTE_TMEM_FENCED):
             pass
         if new:
             # The compute warps wrote the scratch with generic stores; the load warp reads it
             # with bulk copies (async proxy).
             cute.arch.fence_proxy("async.global")
-            with xready.produce():
+            with xready.produce(skip_fence="before", reason=COMPUTE_TMEM_FENCED):
                 pass
         return (w, xin, acc, xready)
 
@@ -427,7 +431,8 @@ class QwenDecodeMegakernelTcStream(QwenDecodeMegakernelTc):
         )
         # Generic stores, then the flag: the consumers' bulk copies read them (async proxy).
         cute.arch.fence_proxy("async.global")
-        self.csync.sync()  # also: every thread has read red before the next row rewrites it
+        # Also: every thread has read red before the next row rewrites it.
+        self.csync.sync(skip_fence="before", reason=COMPUTE_TMEM_FENCED)
         if tid == 0:
             cute.arch.fence_acq_rel_gpu()
             publish(p.x_flags, slot * self.batch + t, Float32(0.0), epoch)

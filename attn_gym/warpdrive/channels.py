@@ -78,10 +78,12 @@ from attn_gym.warpdrive.cluster import (
 from attn_gym.warpdrive.compat import NATIVE_MULTI_ADVANCE, mbarrier_arrive
 from attn_gym.warpdrive.fences import FENCE_KINDS, derived_fences
 from attn_gym.warpdrive.protocol import (
+    FENCE_SKIPS,
     Lifetime,
     Lineage,
     ProtocolError,
     current_block,
+    fence_skip,
     user_site,
 )
 from attn_gym.warpdrive.storage import SmemBuffer, StageView, project, stage_extent
@@ -773,14 +775,21 @@ class Handle(_Stage):
     ``full_barrier``/``barrier`` and ``empty_barrier`` (this CTA's pointers; a pair's peer has
     its barriers at the same offsets). ``commit(signal=False)``/``release(signal=False)`` close
     the handle for the checker while the caller signals the barrier itself.
+
+    ``skip_fence=..., reason=...`` on the call that opened the handle (``acquire``, ``wait``,
+    ``span``) also covers its closing signal, which a ``with`` block runs implicitly; a
+    ``commit``/``release`` that passes its own replaces it.
     """
 
-    def __init__(self, end, index, phase, label, is_producer: bool, opened: bool = True):
+    def __init__(
+        self, end, index, phase, label, is_producer: bool, opened: bool = True, skip=None
+    ):
         self._end = end
         self.index = index
         self.phase = phase
         self._label = label
         self._is_producer = is_producer
+        self._skip = skip  # the opening call's FenceSkip, which also covers the close
         # Trace-time lifetime record, shared by loop-carried copies of this handle.
         key = index if end._chan.fixed else None
         self.rec = HandleRecord(
@@ -869,13 +878,20 @@ class Handle(_Stage):
     def _owner(self):
         return self.rec
 
-    def commit(self, signal: bool = True, wait: bool = False):
+    def _close_skip(self, skip_fence, reason, op: str, allowed=("before",)):
+        """The ``FenceSkip`` of a closing call: its own, else the opening call's."""
+        skip = fence_skip(skip_fence, reason, f"{self.describe()} {op}", allowed)
+        return self._skip if skip is None else skip
+
+    def commit(self, signal: bool = True, wait: bool = False, *, skip_fence=None, reason=None):
         """Producer: publish the stage by signalling full. ``signal=False``: the caller signals
         the full barrier itself, with the derived (or overridden) counts.
 
         ``wait=True`` (named channels only) makes the commit a rendezvous: the producer threads
         also wait on the full barrier. When it returns every producer and consumer thread has
-        arrived, and the producer threads see each other's writes made before the commit."""
+        arrived, and the producer threads see each other's writes made before the commit.
+        ``skip_fence="before"`` (``"after"``/``"both"`` with ``wait=True``) and ``reason``
+        drop the tcgen05 thread-sync fences this signal emits (``thread_sync.py``)."""
         if wait and not self._end._chan.named:
             raise ProtocolError(
                 f"{self._end._trace.role_name}: commit(wait=True) on {self.describe()}: only a "
@@ -883,14 +899,15 @@ class Handle(_Stage):
             )
         if wait and not signal:
             raise ProtocolError("commit(wait=True) signals the full barrier; drop signal=False")
+        skip = self._close_skip(skip_fence, reason, "commit", FENCE_SKIPS if wait else ("before",))
         self._close(True, "commit" if signal else "commit(raw signal)")
         if wait:
             trace = self._end._trace
             trace.record(self._end._chan.name, "rendezvous", self._label, order=self.rec.order)
             _fence(self._end._chan.commit_fence)
-            self._end._named_wait(self._end._chan.full_barriers, self.index, "commit")
+            self._end._named_wait(self._end._chan.full_barriers, self.index, "commit", skip)
         elif signal:
-            self._end._signal(self.index)
+            self._end._signal(self.index, skip=skip)
 
     def retire(self):
         """Producer: close without publishing, for a final acquire whose stage is never filled
@@ -903,12 +920,14 @@ class Handle(_Stage):
             )
         self._close(True, "retire")
 
-    def release(self, signal: bool = True):
+    def release(self, signal: bool = True, *, skip_fence=None, reason=None):
         """Consumer: hand the stage back by signalling empty. ``signal=False``: the caller
-        signals the empty barrier itself, with the derived (or overridden) counts."""
+        signals the empty barrier itself, with the derived (or overridden) counts.
+        ``skip_fence="before"`` and ``reason`` as for ``commit``."""
+        skip = self._close_skip(skip_fence, reason, "release")
         self._close(False, "release" if signal else "release(raw signal)")
         if signal:
-            self._end._signal(self.index)
+            self._end._signal(self.index, skip=skip)
 
     def _close(
         self,
@@ -966,8 +985,8 @@ class Span(Handle):
     int ``n``. The stage is this role's only between that wait and the signal.
     """
 
-    def __init__(self, end, index, phase, label, is_producer: bool):
-        super().__init__(end, index, phase, label, is_producer, opened=False)
+    def __init__(self, end, index, phase, label, is_producer: bool, skip=None):
+        super().__init__(end, index, phase, label, is_producer, opened=False, skip=skip)
         end._rec.spans.append(self.rec)  # held from here, not only from begin()
         self._progress = _SpanProgress()
         end._trace.checks.append(self._check_begun)
@@ -1023,24 +1042,26 @@ class Span(Handle):
             bar = end._empty(self.index) if self._is_producer else end._full(self.index)
             with wait_range(end._trace, f"{end._chan.name}.{op}"):
                 _parity_wait(bar, self.phase, end._chan.wait)
-            after_sync(end._trace)
+            after_sync(end._trace, self._skip)
 
         if_generate(i == 0, wait)
 
-    def commit(self, i=None, *, signal: bool = True):
+    def commit(self, i=None, *, signal: bool = True, skip_fence=None, reason=None):
         """Producer: publish the stage, in the last iteration of ``begin``'s loop when given
-        its index ``i``, else here, after that loop. ``signal=False`` as for ``Handle``."""
-        self._finish(True, "commit", i, signal)
+        its index ``i``, else here, after that loop. ``signal=False`` and ``skip_fence`` as for
+        ``Handle``."""
+        self._finish(True, "commit", i, signal, self._close_skip(skip_fence, reason, "commit"))
 
-    def release(self, i=None, *, signal: bool = True):
+    def release(self, i=None, *, signal: bool = True, skip_fence=None, reason=None):
         """Consumer: hand the stage back, in the last iteration of ``begin``'s loop when given
-        its index ``i``, else here, after that loop. ``signal=False`` as for ``Handle``."""
-        self._finish(False, "release", i, signal)
+        its index ``i``, else here, after that loop. ``signal=False`` and ``skip_fence`` as for
+        ``Handle``."""
+        self._finish(False, "release", i, signal, self._close_skip(skip_fence, reason, "release"))
 
     def retire(self):
         raise ProtocolError(f"{self._where('retire()')}: a span cannot be retired; commit it")
 
-    def _finish(self, producer: bool, op: str, i, signal: bool):
+    def _finish(self, producer: bool, op: str, i, signal: bool, skip):
         if isinstance(i, bool):  # Handle's positional `signal`, which Span takes by keyword
             raise ProtocolError(
                 f"{self._where(f'{op}({i})')}: a span's {op}() takes the loop index (or "
@@ -1067,9 +1088,9 @@ class Span(Handle):
         if not signal:
             return
         if i is None:
-            self._end._signal(self.index)
+            self._end._signal(self.index, skip=skip)
         else:
-            if_generate(i == trips - 1, lambda: self._end._signal(self.index))
+            if_generate(i == trips - 1, lambda: self._end._signal(self.index, skip=skip))
 
 
 class Preview(_Stage):
@@ -1366,13 +1387,13 @@ class _End:
         # Ring stages have consecutive IDs and one count.
         return Int32(barriers[0]._allocated_id()) + index, barriers[0].threads
 
-    def _named_wait(self, barriers, index, op):
+    def _named_wait(self, barriers, index, op, skip=None):
         """``bar.sync`` on a named channel's slot: an arrival and a wait, so in a tcgen05 role
         it takes both thread-sync fences."""
-        before_sync(self._trace)
+        before_sync(self._trace, skip)
         with wait_range(self._trace, f"{self._chan.name}.{op}"):
             _named_sync(*self._named(barriers, index))
-        after_sync(self._trace)
+        after_sync(self._trace, skip)
 
     def _named_arrive(self, barriers, index):
         _named_arrive(*self._named(barriers, index))
@@ -1495,8 +1516,9 @@ class _End:
         table = sc.full_targets if isinstance(self, ProducerEnd) else sc.empty_targets
         return {r: table.get(r, ()) for r in self.ctas}
 
-    def _signal(self, index, fenced: bool = True):
-        """Signal stage ``index``; ``fenced=False`` skips the channel's fences."""
+    def _signal(self, index, fenced: bool = True, skip=None):
+        """Signal stage ``index``; ``fenced=False`` skips the channel's fences, ``skip`` (a
+        ``FenceSkip``) the thread-sync fence."""
         chan = self._chan
         producer = isinstance(self, ProducerEnd)
         side = "producer" if producer else "consumer"
@@ -1506,7 +1528,7 @@ class _End:
         fence = chan.fences(side, self._role) if fenced else ()
         if chan.named:
             _fence(fence)
-            before_sync(self._trace)
+            before_sync(self._trace, skip)
             self._named_arrive(chan.full_barriers if producer else chan.empty_barriers, index)
             return
         self._arrive(
@@ -1514,9 +1536,10 @@ class _End:
             self._full(index) if producer else self._empty(index),
             fence,
             chan.scope.full_mask if producer else chan.scope.empty_mask,
+            skip,
         )
 
-    def _arrive(self, mech, bar, fence, mask):
+    def _arrive(self, mech, bar, fence, mask, skip=None):
         """Signal ``bar`` in each CTA of ``self.targets``; ``mask``: the ``tcgen05.commit``
         multicast mask (an int, or ``{rank: mask}``)."""
         _fence(fence)
@@ -1543,10 +1566,10 @@ class _End:
                 else:
                     cute.nvgpu.tcgen05.commit(bar)
         elif mech is Threads:
-            before_sync(self._trace)
+            before_sync(self._trace, skip)
             self._thread_arrive(bar)
         elif mech is Warps:
-            before_sync(self._trace)
+            before_sync(self._trace, skip)
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 self._thread_arrive(bar)
@@ -1757,7 +1780,7 @@ class _End:
             self._trace.checks.append(check_back_edge)
         return token.ready
 
-    def _span(self, slot, op: str) -> Span:
+    def _span(self, slot, op: str, skip) -> Span:
         """Take the next stage for ``span``, without waiting for it."""
         chan, producer = self._chan, isinstance(self, ProducerEnd)
         if chan.named or (producer and isinstance(chan.producer, Tma)):
@@ -1769,9 +1792,9 @@ class _End:
             )
         index, phase, label = self._next(slot, op)
         self._trace.record(chan.name, op, label, order=self._rec.taken(slot) - 1, span=True)
-        return Span(self, index, phase, label, producer)
+        return Span(self, index, phase, label, producer, skip)
 
-    def _take(self, slot, token, op: str):
+    def _take(self, slot, token, op: str, skip):
         """Take the next stage for ``acquire``/``wait``: check ``token`` before advancing, then
         wait for empty (producer) or full (consumer). Only an mbarrier wait may be skipped when
         the token's probe found it ready. Returns (index, phase, label)."""
@@ -1783,12 +1806,13 @@ class _End:
         self._trace.record(chan.name, op, label, order=self._rec.taken(slot) - 1)
         if chan.named:
             self._check_turn("producer" if producer else "consumer", op)
-            self._named_wait(chan.empty_barriers if producer else chan.full_barriers, index, op)
+            barriers = chan.empty_barriers if producer else chan.full_barriers
+            self._named_wait(barriers, index, op, skip)
         else:
             with wait_range(self._trace, f"{chan.name}.{op}"):
                 bar = self._empty(index) if producer else self._full(index)
                 _wait(bar, phase, ready, chan.wait)
-            after_sync(self._trace)
+            after_sync(self._trace, skip)
         return index, phase, label
 
 
@@ -1799,29 +1823,38 @@ class ProducerEnd(_End):
         hardware-dependent time: it is one probe, not a latency bound."""
         return self._probe(slot, "try_acquire", self._empty)
 
-    def acquire(self, slot=None, *, token=None) -> Handle:
+    def acquire(self, slot=None, *, token=None, skip_fence=None, reason=None) -> Handle:
         """Wait until the stage is empty; returns a handle to commit or retire. ``token``: this
         end's ``try_acquire()`` of the same stage; the wait runs only if that probe failed. A
-        ``Tma`` producer arms the stage's bytes here either way, once."""
-        index, phase, label = self._take(slot, token, "acquire")
+        ``Tma`` producer arms the stage's bytes here either way, once.
+
+        ``skip_fence="after"`` drops the tcgen05 thread-sync fence after the wait,
+        ``"before"`` the ones before the handle's arrivals (TMA arming, a named wait, the
+        closing commit), ``"both"`` all of them; ``reason`` says why the role needs none there
+        (``docs/warpdrive/guarantees.md``, thread-sync)."""
+        skip = fence_skip(skip_fence, reason, f"{self._chan.name}.acquire")
+        index, phase, label = self._take(slot, token, "acquire", skip)
         if isinstance(self._chan.producer, Tma):  # never a named channel (Threads only)
-            self._arm(self._full(index))
-        return Handle(self, index, phase, label, True)
+            self._arm(self._full(index), skip)
+        return Handle(self, index, phase, label, True, skip=skip)
 
     produce = acquire  # ``with end.produce(...) as h:`` reads better for nested scopes
 
-    def span(self, slot=None) -> Span:
+    def span(self, slot=None, *, skip_fence=None, reason=None) -> Span:
         """Take the next stage without waiting, to fill it across the iterations of a counted
         loop: ``begin(i)`` waits until it is empty in the first iteration, ``commit(i)``
-        publishes it in the last (``commit()`` after the loop)."""
-        return self._span(slot, "acquire")
+        publishes it in the last (``commit()`` after the loop). ``skip_fence`` as for
+        ``acquire``."""
+        return self._span(
+            slot, "acquire", fence_skip(skip_fence, reason, f"{self._chan.name}.span")
+        )
 
-    def _arm(self, full):
+    def _arm(self, full, skip=None):
         """Expect the stage's transaction bytes on every waited full barrier. In a cross-CTA
         channel one CTA arms each barrier, once, with the bytes of every CTA's copies that
         complete there, as CUTLASS's ``PipelineTmaUmma`` does."""
         scope = self._chan.scope
-        before_sync(self._trace)  # arming is an arrival
+        before_sync(self._trace, skip)  # arming is an arrival
         if not scope.pair:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(full, scope.tx)
@@ -1837,9 +1870,11 @@ class ProducerEnd(_End):
         else:
             _arm_if(full, scope.tx, targets, tuple(arms), self._chan.cluster.size)
 
-    def tail(self):
+    def tail(self, *, skip_fence=None, reason=None):
         """Wait until every stage this end filled has been released. The layer emits this at
-        role exit on pair-scoped channels whose consumer signals from another CTA."""
+        role exit on pair-scoped channels whose consumer signals from another CTA.
+        ``skip_fence="after"`` and ``reason`` as for ``acquire``."""
+        skip = fence_skip(skip_fence, reason, f"{self._chan.name}.tail", ("after",))
         self._check_current()
         self._trace.record(self._chan.name, "tail", None)
         n = self._chan.n
@@ -1853,7 +1888,7 @@ class ProducerEnd(_End):
                 for _ in range(n):
                     cute.arch.mbarrier_wait(self._empty(st.index), st.phase)
                     st.advance()
-        after_sync(self._trace)
+        after_sync(self._trace, skip)
 
 
 class ConsumerEnd(_End):
@@ -1863,33 +1898,36 @@ class ConsumerEnd(_End):
         is one probe, not a latency bound."""
         return self._probe(slot, "try_wait", self._full)
 
-    def wait(self, slot=None, *, token=None) -> Handle:
+    def wait(self, slot=None, *, token=None, skip_fence=None, reason=None) -> Handle:
         """Wait until the stage is full; returns a handle to release. ``token``: this end's
-        ``try_wait()`` of the same stage; the wait runs only if that probe failed."""
-        index, phase, label = self._take(slot, token, "wait")
-        handle = Handle(self, index, phase, label, False)
+        ``try_wait()`` of the same stage; the wait runs only if that probe failed.
+        ``skip_fence`` as for ``acquire`` (``"before"``: the release's fence)."""
+        skip = fence_skip(skip_fence, reason, f"{self._chan.name}.wait")
+        index, phase, label = self._take(slot, token, "wait", skip)
+        handle = Handle(self, index, phase, label, False, skip=skip)
         if self._rec.previews:  # never on a named channel, which cannot peek
             self._adopt(slot, handle.rec)
         return handle
 
     consume = wait
 
-    def consume_unread(self, slot=None):
+    def consume_unread(self, slot=None, *, skip_fence=None, reason=None):
         """Wait for the next epoch and release it at once, without accessing it: a joining
         consumer passing over an epoch another role or instance processes. The release runs
         no fence, because the end made no access to order: between the wait and the release
         nothing runs, so this end's reads of the stage all precede an earlier, fenced release.
-        A previewed epoch was read through its preview, so its release keeps the fences."""
+        A previewed epoch was read through its preview, so its release keeps the fences.
+        ``skip_fence`` as for ``wait``."""
         previewed = any(p._key == slot for p in self._rec.previews)
-        handle = self.wait(slot)
+        handle = self.wait(slot, skip_fence=skip_fence, reason=reason)
         handle._close(False, "release", fenced=previewed)
-        self._signal(handle.index, fenced=previewed)
+        self._signal(handle.index, fenced=previewed, skip=handle._skip)
 
-    def span(self, slot=None) -> Span:
+    def span(self, slot=None, *, skip_fence=None, reason=None) -> Span:
         """Take the next stage without waiting, to read it across the iterations of a counted
         loop: ``begin(i)`` waits until it is full in the first iteration, ``release(i)`` hands
-        it back in the last (``release()`` after the loop)."""
-        span = self._span(slot, "wait")
+        it back in the last (``release()`` after the loop). ``skip_fence`` as for ``wait``."""
+        span = self._span(slot, "wait", fence_skip(skip_fence, reason, f"{self._chan.name}.span"))
         if self._rec.previews:
             self._adopt(slot, span.rec)
         return span
@@ -1924,16 +1962,18 @@ class ConsumerEnd(_End):
         advance_state(self._state, n)
         self._advanced(None, 0 if dynamic else n)
 
-    def peek(self, slot=None) -> Preview:
+    def peek(self, slot=None, *, skip_fence=None, reason=None) -> Preview:
         """Wait until the stage the next ``wait`` takes is full and return a read-only
-        ``Preview`` of it, without advancing, arriving or opening a handle."""
+        ``Preview`` of it, without advancing, arriving or opening a handle.
+        ``skip_fence="after"`` and ``reason`` as for ``wait``."""
+        skip = fence_skip(skip_fence, reason, f"{self._chan.name}.peek", ("after",))
         self._probeable("peek")
         index, phase, label = self._current(slot, "peek")
         self._check_hold(slot, "peek")
         self._trace.record(self._chan.name, "peek", label)
         with wait_range(self._trace, f"{self._chan.name}.peek"):
             _parity_wait(self._full(index), phase, self._chan.wait)
-        after_sync(self._trace)
+        after_sync(self._trace, skip)
         preview = Preview(self, index, phase, slot)
         self._rec.previews.append(preview)
         self._trace.opened(preview._life)
@@ -2104,14 +2144,16 @@ class TurnEnd:
     def __new_from_mlir_values__(self, values):
         return TurnEnd(self._ts, self._bars, self._seat, self._trace, Int32(values[0]))
 
-    def turn(self):
-        """``with seat.turn():`` runs the body when it is this seat's turn, then passes it on."""
-        return _TurnScope(self)
+    def turn(self, *, skip_fence=None, reason=None):
+        """``with seat.turn():`` runs the body when it is this seat's turn, then passes it on.
+        ``skip_fence`` drops the thread-sync fence after the turn's wait (``"after"``), before
+        its pass (``"before"``) or both, as for ``acquire``."""
+        return _TurnScope(self, fence_skip(skip_fence, reason, f"{self._ts.name}.turn"))
 
 
 class _TurnScope:
-    def __init__(self, end: TurnEnd):
-        self._end = end
+    def __init__(self, end: TurnEnd, skip=None):
+        self._end, self._skip = end, skip
 
     def __enter__(self):
         e = self._end
@@ -2120,14 +2162,14 @@ class _TurnScope:
             e._trace.record(e._ts.name, "turn", e._seat)
             with wait_range(e._trace, f"{e._ts.name}.turn"):
                 cute.arch.mbarrier_wait(e._bars + e._seat, e._phase)
-            after_sync(e._trace)
+            after_sync(e._trace, self._skip)
 
     def __exit__(self, exc_type, exc, tb):
         e = self._end
         e._trace.open_turns.discard(e._ts.name)
         if exc_type is None and e._ts.enabled:
             nxt = (e._seat + 1) % len(e._ts.parties)
-            before_sync(e._trace)
+            before_sync(e._trace, self._skip)
             cute.arch.mbarrier_arrive(e._bars + nxt)
             e._phase = e._phase ^ 1
             e._trace.record(e._ts.name, "pass", nxt)

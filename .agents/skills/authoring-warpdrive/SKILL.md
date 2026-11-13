@@ -71,7 +71,10 @@ Follow the guide's lifecycle, prologue and launch sections. In particular:
   sites rather than interpreting silence as proof.
 - Raw waits and signals in a TMEM or MMA role need the tcgen05 thread-sync fences that managed
   ones emit ([dropping down](../../../docs/warpdrive/dropping-down.md#tcgen05-thread-sync-fences-on-raw-synchronization));
-  run `ptx_check.check_tcgen05_sync` on the kernel's PTX to find a missing one.
+  run `ptx_check.check_tcgen05_sync` on the kernel's PTX to find a missing one. Drop a
+  redundant managed fence only with `skip_fence=..., reason=...`
+  ([skip a fence](../../../docs/warpdrive/dropping-down.md#skip-a-redundant-thread-sync-fence)),
+  and rerun that check over every configuration the skip depends on.
 
 ## Validate and hand back
 

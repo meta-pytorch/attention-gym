@@ -34,7 +34,7 @@ from itertools import combinations
 
 from cutlass import cute
 
-from attn_gym.warpdrive.protocol import ProtocolError, current_trace
+from attn_gym.warpdrive.protocol import ProtocolError, current_trace, fence_skip
 from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 
 MODES = ("warn", "strict", "off")
@@ -149,17 +149,20 @@ def bulk_wait_group(n: int, *, read: bool = True):
     _record("bulk_wait", n=n, read=read)
 
 
-def named_barrier(barrier_id: int, number_of_threads: int):
+def named_barrier(barrier_id: int, number_of_threads: int, *, skip_fence=None, reason=None):
     """Emit ``cute.arch.barrier`` and record it for the alias diagnostic.
 
     Only a barrier over the whole calling role (``number_of_threads == 32 * warps``)
-    orders its warps. A tcgen05 role fences both sides, as ``NamedBarrier.sync()`` does. ``NamedBarrier.sync()`` records the same event with an allocated ID.
-    A hand-picked ID owned by the layer, a named channel or a ``NamedBarrier`` raises.
+    orders its warps. A tcgen05 role fences both sides, as ``NamedBarrier.sync()`` does, and
+    ``skip_fence``/``reason`` drop them as there. ``NamedBarrier.sync()`` records the same
+    event with an allocated ID. A hand-picked ID owned by the layer, a named channel or a
+    ``NamedBarrier`` raises.
     """
     trace = current_trace()
-    before_sync(trace)
+    skip = fence_skip(skip_fence, reason, "alias.named_barrier")
+    before_sync(trace, skip)
     cute.arch.barrier(barrier_id=barrier_id, number_of_threads=number_of_threads)
-    after_sync(trace)
+    after_sync(trace, skip)
     # Static IDs can be checked for collisions with allocated barriers.
     _record(
         "barrier", threads=number_of_threads, id=barrier_id if type(barrier_id) is int else None

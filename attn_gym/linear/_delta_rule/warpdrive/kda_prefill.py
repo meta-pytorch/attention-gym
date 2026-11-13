@@ -59,6 +59,9 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
+    BEFORE_FENCE_COVERED,
+    BOTH_FENCES_COVERED,
     Barriers,
     Consumer,
     Instance,
@@ -399,8 +402,11 @@ class KdaPrefill(WarpSpecialized):
         )
 
     @cute.jit
-    def next_tile(self, sched):
-        with sched.consume() as h:
+    def next_tile(self, sched, skip_fence=None):
+        """The next tile of the item list; ``skip_fence`` as for the consume (its reason is
+        ``AFTER_FENCE_COVERED``/``BEFORE_FENCE_COVERED``)."""
+        reason = BEFORE_FENCE_COVERED if skip_fence == "before" else AFTER_FENCE_COVERED
+        with sched.consume(skip_fence=skip_fence, reason=reason) as h:
             tile = h.data[0]
         return sched, tile
 
@@ -599,7 +605,7 @@ class KdaPrefill(WarpSpecialized):
                 for local in cutlass.range((stage + cum_base) & 1, n_local, 2, unroll=1):
                     c = cum_base + local
                     if raw_next < c:  # the other instance's chunk: release its stage
-                        raw.consume_unread()
+                        raw.consume_unread(skip_fence="both", reason=BOTH_FENCES_COVERED)
                     raw_next = c + 1
                     raw, kk, qk = self.cg0_chunk(
                         params,
@@ -626,7 +632,7 @@ class KdaPrefill(WarpSpecialized):
                         sin_col,
                     )
                 cum_base += n_local
-                sched, tile = self.next_tile(sched)
+                sched, tile = self.next_tile(sched, skip_fence="before")
             work.advance()
         return raw, kk, qk, sched, work
 
@@ -662,7 +668,7 @@ class KdaPrefill(WarpSpecialized):
         channel_rows = d_k // 4
         store_rows = B_T * channel_rows // 32
         store_row_base = (lane // channel_rows) * store_rows
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
         rh.access("Q", read=True, by="threads")
         rh.access("K", read=True, by="threads")
         rh.access("Gate", read=True, by="threads")
@@ -710,8 +716,8 @@ class KdaPrefill(WarpSpecialized):
                 value = g[row_off]
                 idx = prefix_offsets[row_off % 8] + row_off * 32
             sts_f32(s_ex + 4 * idx, value)
-        barrier.sync(aligned=True)
-        warp_arrive(self.barrier_ptr("exchange") + (c & (self.ex_stages - 1)))
+        barrier.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
+        warp_arrive(self.barrier_ptr("exchange") + (c & (self.ex_stages - 1)), fence=False)
 
         # ---- raw Q / K rows (zeroed past the sequence end), exp2(g) of the row ---------------
         qk_stage = rh.index * (d_k * B_T * 2)
@@ -774,7 +780,7 @@ class KdaPrefill(WarpSpecialized):
                 ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])
                 kr_pack.append(fp32_to_fp16(kr0, kr1, dtype=io))
-        kh = kk.acquire()
+        kh = kk.acquire(skip_fence="both", reason=BOTH_FENCES_COVERED)
         kh.access("Kdecay", write=True, by="threads")
         kh.access("Kinv", write=True, by="threads")
         decay_stage = kh.index * (d_k * B_T * 2)
@@ -799,7 +805,7 @@ class KdaPrefill(WarpSpecialized):
         for half in cutlass.range_constexpr(dk_halves):
             off = decay_stage + 2 * box128(decay_row, half * 64 + lane_in_row * 8)
             st_shared_v4(params.s_krestore + off, kr_pack[4 * half : 4 * half + 4])
-        qh.commit()
+        qh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- left key half of the state: fp16 operand, then decay by exp2(g_last) -----------
         if c > 0:  # the previous chunk's left update has landed
@@ -973,9 +979,8 @@ class KdaPrefill(WarpSpecialized):
                 n_raw += n_local
                 if n_local > 0:
                     with self.trace_region("sacc_r.wait"):
-                        spin_wait(
-                            tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1
-                        )  # the last update
+                        # The last update; drain_o's O wait fences its TMEM loads.
+                        spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1, fence=False)
                     n_upd += 1
                     o_acc, o_smem = self.drain_o(params, o_acc, o_smem, geo, active)
                 final_dst = params.work_items[tile, FINAL_DST]
@@ -1020,7 +1025,9 @@ class KdaPrefill(WarpSpecialized):
         state), U."""
         lane, lane_base, cols, _lo, _hi, _pc, _pcx, _vd, _rv = geo
         io = self.io_dtype
-        eh = exchange.wait()
+        # Without an initial state no seed loads TMEM before the next fenced wait.
+        skip = None if self.use_initial_state else "after"
+        eh = exchange.wait(skip_fence=skip, reason=AFTER_FENCE_COVERED)
         s_ex = params.s_g + eh.index * (self.d_k * B_T * 4)
         if cutlass.const_expr(self.gate != "fp32"):
             s_ex = params.s_ex + eh.index * (self.d_k * B_T * 4)
@@ -1176,7 +1183,7 @@ class KdaPrefill(WarpSpecialized):
         io = self.io_dtype
         d_k = self.d_k
         half_blocks = d_k // 32
-        stage = raw_beta_wait(raw, beta, n_raw, RAW_STAGES)
+        stage = raw_beta_wait(raw, beta, n_raw, RAW_STAGES, fence=False)
         with self.trace_region("sacc_r.wait"):
             spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1)
         n_upd += 1
@@ -1205,7 +1212,7 @@ class KdaPrefill(WarpSpecialized):
                 words.append(fp32_to_fp16(state[4 * m], state[4 * m + 1], dtype=io))
                 words.append(fp32_to_fp16(state[4 * m + 2], state[4 * m + 3], dtype=io))
             tmem_st("16x128b", lane_base + cols["sin"] + d_k // 4, words)
-        eh = exchange.wait()
+        eh = exchange.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         s_ex = params.s_g + eh.index * (d_k * B_T * 4)
         if cutlass.const_expr(self.gate != "fp32"):
             s_ex = params.s_ex + eh.index * (d_k * B_T * 4)
@@ -1287,8 +1294,8 @@ class KdaPrefill(WarpSpecialized):
         # Publish the staged O only now: its smem_async commit fence (MEMBAR.ALL.CTA) stalls the
         # warp, which between SIN_R and Y lay on the per-chunk recurrence; here it overlaps the
         # U wait (0.9% at d128, 3% at d64). Needs QS_STAGES >= 2 (see its declaration).
-        oh.commit()
-        oa.release()
+        oh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+        oa.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         n_u = self.stage_u(tstate, n_u, geo)
         raw_beta_release(raw, beta, stage)
         eh.release(signal=False)  # signal-only channel (see __init__)
@@ -1328,11 +1335,13 @@ class KdaPrefill(WarpSpecialized):
         o_hi = [Float32(0.0)] * 8
         if cutlass.const_expr(self.d_v == 128):
             o_hi = tmem_ld("16x256b", 2, lane_base + (16 << 16) + cols["qs"] + oa.index * B_T)
-        with o_smem.produce() as oh:
+        # Without a final state store, no TMEM access follows before the next fenced wait.
+        skip = None if self.store_final_state else "after"
+        with o_smem.produce(skip_fence=skip, reason=AFTER_FENCE_COVERED) as oh:
             self.stage_o(params, oh, o_lo, o_hi, ov_lo, ov_hi, active)
         # Unlike cg1_chunk, no TMEM store follows these loads before the release: wait for them.
         cute.arch.fence_view_async_tmem_load()
-        oa.release()
+        oa.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return o_acc, o_smem
 
     @cute.jit
@@ -1652,15 +1661,16 @@ class KdaPrefill(WarpSpecialized):
                     seeded = compute_start == 0
                 for local in cutlass.range(write_end - compute_start, unroll=1):
                     have_state = local > 0 or seeded
-                    kh = kk.wait()
+                    kh = kk.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     kh.access("Kdecay", read=True, by="umma")
                     desc_kd = desc_opaque(
                         smem_desc(params.s_kdecay + kh.index * stage_bytes, 16, 1024, SWIZZLE_128B)
                     )
-                    qh = qk.wait()
+                    qh = qk.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     qh.access("Qdecay", read=True, by="umma")
                     qh.access("Krestore", read=True, by="umma")
-                    oh = o_acc.acquire()
+                    # Every MMA below follows a fenced spin wait.
+                    oh = o_acc.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     qs = qs_col + oh.index * B_T
                     # KS and QS under one branch: a second ``have_state`` branch after the managed
                     # acquire made ptxas wrap the QS MMAs in per-lane ELECT loops.
@@ -1704,7 +1714,7 @@ class KdaPrefill(WarpSpecialized):
                     kh.release(signal=False)  # the role's elected lane commits (below)
                     umma_commit(kh.empty_barrier, elect)
                     # ---- U = T_inv Y ------------------------------------------------------------
-                    th = tinv.wait()
+                    th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     th.access(read=True, by="umma")
                     desc_t = desc_opaque(
                         smem_desc(params.s_tinv + th.index * (B_T * B_T * 2), 16, 256, SWIZZLE_32B)

@@ -62,6 +62,12 @@ EXPERT_GROUPS = 4  # batched MoE: rows per expert, each a quarter of its gate/up
 COMPUTE_WARPS = 8
 ROWS_PER_WARP = ROWS // COMPUTE_WARPS
 COMPUTE_THREADS = 32 * COMPUTE_WARPS
+# Reason for the compute role's thread-sync fence skips (tcgen05 engines; the CUDA-core one
+# issues no tcgen05 ops, so they are no-ops there).
+COMPUTE_TMEM_FENCED = (
+    "the compute warps touch TMEM only in the engine's acc loads, which the acc wait and release "
+    "fence"
+)
 
 QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER, REDUCE, NORM = range(9)
 ALL_OPS = (QKV, ATTN, OPROJ, GATEUP, DOWN, LMHEAD, ROUTER, REDUCE, NORM)
@@ -861,7 +867,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 if new:
                     ks = cutlass.select_((op == OPROJ) | (op == DOWN), b, 0)
                     self.prologue(p, op, layer, a, ks, epoch, xbuf, tid, warp, lane, row)
-                    self.csync.sync()
+                    self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
                 chans = self.engine.input_ready(chans, new)
                 chans = self.gemv(p, chans, env, op, layer, a, b, epoch, xbuf, warp, lane, row)
                 if cutlass.const_expr(self.moe_batched):
@@ -927,7 +933,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 for r in cutlass.range_constexpr(k):
                     p.exp[t * k + r] = Float32(chosen[r])
                     p.exp[batch * k + t * k + r] = weights[r]
-        self.csync.sync()
+        self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
         if tid < self.experts:
             count = Int32(0)
             base = (layer * self.experts + tid) * batch
@@ -938,7 +944,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
                         publish(p.e_weight, base + count, p.exp[batch * k + t * k + r], epoch)
                         count = count + 1
             publish(p.e_count, layer * self.experts + tid, Float32(count), epoch)
-        self.csync.sync()  # EXP is reused by the next row
+        # EXP is reused by the next row.
+        self.csync.sync(skip_fence="before", reason=COMPUTE_TMEM_FENCED)
 
     @cute.jit
     def reduce_slots(self, p: MegakernelParams, layer, a, epoch, tid, row):
@@ -1095,7 +1102,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if cutlass.const_expr(group_warps > 1):  # across the group's warps (every warp syncs)
             if lane == 0:
                 p.red[warp] = ss
-            self.csync.sync()
+            self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
             first = warp // group_warps * group_warps
             ss = Float32(0.0)
             for i in cutlass.range_constexpr(group_warps):
@@ -1129,7 +1136,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         entries = 2 * batch * k
         count = self.expert_count(p, layer, e, epoch)
         base = (layer * self.experts + e) * batch
-        self.csync.sync()  # the previous expert row's epilogue has read its list
+        # The previous expert row's epilogue has read its list.
+        self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
         for i in cutlass.range(tid, count, COMPUTE_THREADS, unroll=1):
             vals = cute.make_rmem_tensor((2,), Float32)
             fetch([(p.e_entry, base + i, 1), (p.e_weight, base + i, 1)], vals, epoch)
@@ -1137,7 +1145,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             p.exp[entries + batch + i] = vals[1]
         if tid == 0:
             p.exp[entries + 2 * batch] = Float32(count)
-        self.csync.sync()
+        self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
         for i in cutlass.range(warp, count, COMPUTE_WARPS, unroll=1):
             entry = Int32(p.exp[entries + i])
             t = entry // k
@@ -1373,7 +1381,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             if cutlass.const_expr(self.shares_mlp):
                 if op == GATEUP:  # every CTA's down rows bulk-read this act chunk
                     cute.arch.fence_proxy("async.global")
-                    self.csync.sync()
+                    self.csync.sync(skip_fence="before", reason=COMPUTE_TMEM_FENCED)
                     if warp * 32 + lane == 0:
                         cute.arch.fence_acq_rel_gpu()
                         chunks = self.inter // SHARED_CHUNK
@@ -1554,10 +1562,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
         else:
             p.qkvs[word] = raw[0]
             p.qkvs[word + 1] = raw[1]
-        self.csync.sync()
+        self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
         if warp < heads + 1:
             self.head_norm_rope(p.qkvs, warp * HEAD_DIM + 2 * lane, norm, cos, sin)
-        self.csync.sync()
+        self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
         q = cute.make_rmem_tensor((heads, 16), Float32)
         for hq in cutlass.range_constexpr(heads):
             qh = self.head_vec(p.qkvs, hq * HEAD_DIM, d0)
@@ -1575,7 +1583,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             blk0, blk1 = self.split_blocks(pos, split)
             for blk in cutlass.range(blk0, blk1, unroll=1):
                 sc = cute.make_rmem_tensor((heads, 2), Float32)  # (head, i)
-                with w.consume() as h:
+                with w.consume(skip_fence="both", reason=COMPUTE_TMEM_FENCED) as h:
                     sK = h.data["KV"]
                     for i in cutlass.range_constexpr(2):
                         pt = 8 * warp + 4 * i + g
@@ -1601,7 +1609,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     lsum[hq] = lsum[hq] * alpha + pr[hq, 0] + pr[hq, 1]
                     for e in cutlass.range_constexpr(16):
                         o[hq, e] = o[hq, e] * alpha
-                with w.consume() as h:
+                with w.consume(skip_fence="both", reason=COMPUTE_TMEM_FENCED) as h:
                     sV = h.data["KV"]
                     for i in cutlass.range_constexpr(2):
                         pt = 8 * warp + 4 * i + g
@@ -1666,7 +1674,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                         if j == 0:
                             att[COMPUTE_WARPS, heads * HEAD_DIM + hq] = score
                             att[COMPUTE_WARPS, heads * HEAD_DIM + heads + hq] = Float32(1.0)
-        self.csync.sync()
+        self.csync.sync(skip_fence="both", reason=COMPUTE_TMEM_FENCED)
         # Thread t merges dim t % HEAD_DIM of q head t // HEAD_DIM; with one q head, threads
         # HEAD_DIM.. sit out (their head's ATT columns do not exist).
         if cutlass.const_expr(heads * HEAD_DIM < COMPUTE_THREADS):
@@ -1674,7 +1682,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 self.merge_partials(p, layer, group, split, t, last, tid, epoch)
         else:
             self.merge_partials(p, layer, group, split, t, last, tid, epoch)
-        self.csync.sync()  # the next attention row rewrites att and qkvs
+        # The next attention row rewrites att and qkvs.
+        self.csync.sync(skip_fence="before", reason=COMPUTE_TMEM_FENCED)
         return w
 
     @cute.jit

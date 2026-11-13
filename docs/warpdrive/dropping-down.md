@@ -136,6 +136,26 @@ compiled kernel's PTX where one is missing, counting a guarded fence, commit or 
 skipped and rejecting calls; `capture_ptx(dir)` dumps the PTX of an uncached compile. It does
 not check that an in-loop handoff completed its TMEM loads and stores before the signal.
 
+### Skip a redundant thread-sync fence
+
+Each fence costs a stall, and the layer fences every managed synchronization of a `tcgen05`
+role. Where another fence of the same kind already covers every path, drop the managed one at
+the call site:
+
+```python
+from attn_gym.warpdrive import AFTER_FENCE_COVERED
+
+kh = k.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)  # q's wait fences the MMAs
+qh = q.wait()
+...  # tcgen05.mma reading both stages
+```
+
+`skip_fence` is `"before"`, `"after"` or `"both"`; on `acquire`, `wait` and `span` the
+`"before"` part is the handle's closing signal, so a `with` block takes it from the opening
+call. `skip_fence=None` ignores `reason`, which keeps a configuration-dependent skip one call.
+Run `check_tcgen05_sync` on every configuration the skips depend on: the layer records them in
+`describe()` but does not prove them ([thread-sync](guarantees.md#thread-sync)).
+
 ### Override counts, bytes or masks
 
 ```python

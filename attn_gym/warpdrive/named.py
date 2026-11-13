@@ -21,7 +21,7 @@ from cutlass._mlir import ir
 
 from attn_gym.warpdrive.alias import RoleEvents
 from attn_gym.warpdrive.channels import _named_arrive, _named_sync
-from attn_gym.warpdrive.protocol import ProtocolError, current_trace
+from attn_gym.warpdrive.protocol import ProtocolError, current_trace, fence_skip
 from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 from attn_gym.warpdrive.tracing import wait_range
 
@@ -86,17 +86,22 @@ class NamedBarrier:
             )
         return self._id
 
-    def sync(self, *, aligned: bool = False):
+    def sync(self, *, aligned: bool = False, skip_fence=None, reason=None):
         """Arrive and wait for ``threads`` arrivals in this generation.
 
-        With wait tracing enabled, records a ``<name>.sync`` range.
+        With wait tracing enabled, records a ``<name>.sync`` range. In a tcgen05 role,
+        ``skip_fence="before"|"after"|"both"`` and ``reason`` drop the thread-sync fences
+        around it (``thread_sync.py``).
         """
-        _sync(self.name, self._allocated_id(), self.threads, aligned)
+        skip = fence_skip(skip_fence, reason, f"{self.name}.sync")
+        _sync(self.name, self._allocated_id(), self.threads, aligned, skip)
         self._record("barrier")
 
-    def arrive(self, *, aligned: bool = False):
-        """Arrive without waiting; the generation completes when ``threads`` have arrived."""
-        _arrive(self._allocated_id(), self.threads, aligned)
+    def arrive(self, *, aligned: bool = False, skip_fence=None, reason=None):
+        """Arrive without waiting; the generation completes when ``threads`` have arrived.
+        ``skip_fence="before"`` and ``reason`` as for ``sync``."""
+        skip = fence_skip(skip_fence, reason, f"{self.name}.arrive", ("before",))
+        _arrive(self._allocated_id(), self.threads, aligned, skip)
         self._record("barrier_arrive")
 
     def _record(self, kind: str):
@@ -161,12 +166,14 @@ class _IndexedBarrier:
     def _id(self):
         return Int32(self._group.barriers[0]._allocated_id()) + self._index
 
-    def sync(self, *, aligned: bool = False):
-        _sync(self._group.name, self._id(), self._group.threads, aligned)
+    def sync(self, *, aligned: bool = False, skip_fence=None, reason=None):
+        skip = fence_skip(skip_fence, reason, f"{self._group.name}[i].sync")
+        _sync(self._group.name, self._id(), self._group.threads, aligned, skip)
         self._record("barrier")
 
-    def arrive(self, *, aligned: bool = False):
-        _arrive(self._id(), self._group.threads, aligned)
+    def arrive(self, *, aligned: bool = False, skip_fence=None, reason=None):
+        skip = fence_skip(skip_fence, reason, f"{self._group.name}[i].arrive", ("before",))
+        _arrive(self._id(), self._group.threads, aligned, skip)
         self._record("barrier_arrive")
 
     def _record(self, kind: str):
@@ -186,21 +193,22 @@ class _IndexedBarrier:
             trace.event("barrier_native", barrier=nb)
 
 
-def _sync(name: str, barrier_id, threads: int, aligned: bool):
+def _sync(name: str, barrier_id, threads: int, aligned: bool, skip=None):
     """Arrive and wait; with wait tracing enabled, inside a ``<name>.sync`` range. A tcgen05
-    role fences both sides (``channels.before_sync``/``after_sync``)."""
+    role fences both sides (``channels.before_sync``/``after_sync``) unless ``skip`` names
+    them."""
     trace = current_trace()
-    before_sync(trace)
+    before_sync(trace, skip)
     with wait_range(trace, f"{name}.sync"):
         if aligned:
             cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
         else:
             _named_sync(barrier_id, threads)
-    after_sync(trace)
+    after_sync(trace, skip)
 
 
-def _arrive(barrier_id, threads: int, aligned: bool):
-    before_sync(current_trace())
+def _arrive(barrier_id, threads: int, aligned: bool, skip=None):
+    before_sync(current_trace(), skip)
     if aligned:
         cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads)
     else:

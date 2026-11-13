@@ -283,13 +283,22 @@ def no_after_thread_sync(mp):
     """Managed waits skip ``tcgen05.fence::after_thread_sync``: a tcgen05 role's MMA or TMEM
     access is no longer ordered after the wait it follows (PTX ISA 9.7.18.6.3). No current GPU
     shows it; the PTX check must."""
-    mp.setattr(channels, "after_sync", lambda trace: None)
+    mp.setattr(channels, "after_sync", lambda trace, skip=None: None)
 
 
 def no_before_thread_sync(mp):
     """Managed thread signals skip ``tcgen05.fence::before_thread_sync``: a tcgen05 role's
     completed TMEM loads and stores are no longer ordered before its release."""
-    mp.setattr(channels, "before_sync", lambda trace: None)
+    mp.setattr(channels, "before_sync", lambda trace, skip=None: None)
+
+
+def skip_covers_needed_fence(mp):
+    """Every ``skip_fence=`` override drops both thread-sync fences of its call, so an override on
+    a call with one redundant fence also drops the needed one: the persistent GEMM epilogue's
+    syncs around its TMA store."""
+    from attn_gym.warpdrive.protocol import FenceSkip
+
+    mp.setattr(FenceSkip, "covers", lambda self, kind: True)
 
 
 # mutant -> (patch(mp), test file in test/warpdrive, test that fails or hangs with it applied)
@@ -386,6 +395,11 @@ MUTANTS = {
         no_before_thread_sync,
         "test_warpdrive_thread_sync.py",
         "test_toy_ptx_is_fenced",
+    ),
+    "skip_covers_needed_fence": (
+        skip_covers_needed_fence,
+        "test_warpdrive_thread_sync.py",
+        "test_persistent_gemm_ptx_is_fenced[cta]",
     ),
     "unread_no_wait": (
         unread_no_wait,
