@@ -311,15 +311,41 @@ window are skipped, so each key is attended once and the incomplete block holdin
   correctness oracle and supports every shape.
 - `impl="fused"` (default) runs a Triton split-K kernel and an LSE merge on CUDA, under
   `torch.compile(fullgraph=True, dynamic=True)` and CUDA graph capture. Batch, sequence count,
-  and split count are runtime values, so changing batches do not recompile. The split count
-  comes from a wave-occupancy model of the GPU's SMs. It needs fp16/bf16 inputs, power-of-two
-  head dims of at least 16, and at most 16K elements of `group x head_dim` per KV head (for
-  example 16 x 256 or 32 x 512). Quantized caches (FP8/FP4 DeepSeek formats) are not supported
-  yet; DeepSeek V3.2's 576-wide latent needs the reference path.
+  split count, sparse capacity, and page-table extents are runtime values. For up to 3
+  (row, KV head) pairs, tile widths are
+  bucketed to 16/32/64 keys as the sparse budget grows, targeting 128 tiles. Larger grids use
+  64-key tiles split by a wave-occupancy model of the GPU's SMs (32 keys for wider head
+  dimensions). For fixed head dimensions and sparse budget, changing batches compile at most
+  three tile configurations: small grids use four or eight warps. Larger grids use two warps
+  for QSA, and eight for wide heads or large head groups to avoid register spills.
+  Small grids over a shared cache use one tile per split for budgets of at most 256 tiles,
+  including the incomplete final block. Larger budgets keep a loop. Splits store unnormalized
+  accumulators and softmax statistics so normalization happens once in the merge. It needs
+  fp16/bf16 inputs, power-of-two head dims of at least 16, and at most 16K elements of
+  `group x head_dim` per KV head (for example 16 x 256 or 32 x 512). Quantized caches (FP8/FP4
+  DeepSeek formats) are not supported yet; DeepSeek V3.2's 576-wide latent needs the reference
+  path.
 
+The fused backend accepts caches with a contiguous feature dimension and arbitrary outer strides,
+including layouts whose relative offsets require int64 addressing. Sparse capacities within the
+same tile bucket reuse the producer kernel; the merge specializes on a power-of-two split bucket.
+Out-of-range positive block ids are ignored before block-to-token multiplication.
 
-The split kernel stores unnormalized accumulators, maxima, and denominators. The merge
-normalizes once, avoiding per-split division and logarithms.
+On B200 with Qwen3.8-Flash-Next QSA shapes (24/2 heads per rank at TP1, 6/1 at TP4, BF16,
+head dim 256, four-token index blocks, page 64, context 32,771), cold-cache batch-1 timings are:
+
+| Per-rank shape | Selected blocks | Fused | vLLM attention | Speedup |
+|---|---:|---:|---:|---:|
+| TP4, 6/1 heads | 512 | 6.83 us | 9.89 us | 1.45x |
+| TP1, 24/2 heads | 512 | 8.37 us | 10.53 us | 1.26x |
+| TP4, 6/1 heads | 2048 | 9.18 us | 18.08 us | 1.97x |
+| TP1, 24/2 heads | 2048 | 11.71 us | 23.63 us | 2.02x |
+
+The comparison uses vLLM's native QSA kernel at commit `9f03b510c335` and excludes its
+index-expansion kernel. With 512-block budgets at batch 256, both reach roughly 5 TB/s and
+perform within 2% of each other; this is about 63% of advertised B200 bandwidth and 72% of a
+separately measured 6.95 TB/s streaming-read ceiling. Timings depend on the cache state and
+whether the context ends on a complete index block.
 
 The benchmark supports `--cold` to evict K/V from L2 before each call while keeping routing
 metadata warm, and `--json <path>` to save results. Cold timings use GPU timestamps from the
