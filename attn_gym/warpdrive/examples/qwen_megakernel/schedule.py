@@ -39,9 +39,9 @@ from attn_gym.warpdrive.examples.qwen_megakernel.tc import QwenDecodeMegakernelT
 # 1 + ring * max(0, 8 - stages). Attention rows cost base[ATTN] plus ``attn_kv`` per KV block
 # of their split at CONTEXT tokens. Batched MoE expert rows use the expected cost under uniform
 # routing, with skipped rows costing zero. Fitted to globaltimer captures of compute work items,
-# excluding polls (GB300, ctx 1024: Qwen3-0.6B to 14B and 30B-A3B; CUDA cores at batch one,
+# excluding polls (GB200, ctx 1024: Qwen3-0.6B to 14B and 30B-A3B; CUDA cores at batch one,
 # tcgen05 at batches 1 to 64), predicting step times within ~15% on those captures.
-# Producer waits add DEPENDENCY_LATENCY.
+# Producer waits add DEPENDENCY_LATENCY; batch-one rows reusing their CTA's input, REUSED_INPUT.
 @dataclass(frozen=True)
 class RowCostModel:
     base: dict[int, float]
@@ -72,6 +72,10 @@ ROW_COST_MODELS = {
 }  # fmt: skip
 CONTEXT = 1024  # the context the table is balanced for: one table serves every length
 DEPENDENCY_LATENCY = 1.0
+# A batch-one GEMV row whose input its CTA's previous row already wrote skips the prologue
+# (including MoE routing, so moe_gateup): it costs its weight stages plus REUSED_INPUT.
+REUSED_INPUT = 0.2
+GEMV_KINDS = (QKV, OPROJ, GATEUP, DOWN, ROUTER, LMHEAD)
 
 
 def weight_stages(op: QwenDecodeMegakernel) -> dict[int, int]:
@@ -97,6 +101,11 @@ def weight_stages(op: QwenDecodeMegakernel) -> dict[int, int]:
 
 def row_cost(op: QwenDecodeMegakernel, ctas: int) -> dict[int, float]:
     """Each row kind's cost under ``ROW_COST_MODELS`` on ``ctas`` CTAs."""
+    return row_costs(op, ctas)[0]
+
+
+def row_costs(op: QwenDecodeMegakernel, ctas: int) -> tuple[dict[int, float], dict[int, float]]:
+    """``row_cost``, and each kind's cost when the row reuses its CTA's GEMV input (batch one)."""
     model = ROW_COST_MODELS["tcgen05" if isinstance(op, QwenDecodeMegakernelTc) else "cuda_core"]
     stages, batch = weight_stages(op), op.batch
     concurrent = collections.Counter(
@@ -109,7 +118,7 @@ def row_cost(op: QwenDecodeMegakernel, ctas: int) -> dict[int, float]:
         return stages[kind] * max(model.stage_min, share) * ring
 
     blocks = math.ceil(math.ceil(CONTEXT / BLOCK) / op.splits)  # per attention split
-    cost = {}
+    cost, reused = {}, {}
     for kind in range(len(OP_NAMES)):
         extra = model.per_token.get(kind, 0.0) * (batch - 1)
         if kind == ATTN:
@@ -120,9 +129,23 @@ def row_cost(op: QwenDecodeMegakernel, ctas: int) -> dict[int, float]:
             cost[kind] = active * (row + (model.expert_gateup if kind == GATEUP else 0.0))
         else:
             cost[kind] = model.base[kind] + extra + streaming(kind, concurrent[kind])
+            reused[kind] = REUSED_INPUT + streaming(kind, concurrent[kind])
             if op.moe and kind == GATEUP:
                 cost[kind] += model.moe_gateup
-    return cost
+    return cost, reused
+
+
+def input_key(op: QwenDecodeMegakernel, words: list[int]) -> tuple[tuple | None, bool]:
+    """``(key, fresh)``: the GEMV input a batch-one row reads (``next_input``'s key; None outside
+    batch-one GEMV rows), and whether it writes that input even when its CTA holds it (row 0 of
+    layer 0's QKV publishes h_in[0], with ``sums_parts`` row 0 of the h_mid op publishes h_mid).
+    A row reuses the input of its CTA's previous GEMV row with the same key."""
+    kind, layer, a, b = words
+    if op.batch > 1 or op.streams_inputs or kind not in GEMV_KINDS:
+        return None, True
+    mid = ROUTER if op.moe else GATEUP
+    fresh = a == 0 and ((kind == QKV and layer == 0) or (op.sums_parts and kind == mid))
+    return (kind, layer, b if kind in (OPROJ, DOWN) else 0), fresh
 
 
 # One instruction: table words (op, layer, a, b), the producer groups it waits for, and the
@@ -190,7 +213,7 @@ def build_table(
     to ``ctas`` CTAs for the static one."""
     rows = instruction_rows(op, ops)
     if isinstance(op.work.schedule, StaticPersistent):
-        table = assign_static(rows, ctas, row_cost(op, ctas))
+        table = assign_static(op, rows, ctas)
     else:
         table = [words for words, _, _ in rows]
     return torch.tensor([words + [i] for i, words in enumerate(table)], dtype=torch.int32)
@@ -242,7 +265,7 @@ def _row_groups(op: QwenDecodeMegakernel, kind: int, layer: int, a: int, b: int)
 
 
 class RowSpan(NamedTuple):
-    """Where and when the ``row_cost`` model runs a row (us from launch), and what it waited on."""
+    """Where and when the ``row_costs`` model runs a row (us from launch), and what it waited on."""
 
     cta: int
     start: float
@@ -251,36 +274,48 @@ class RowSpan(NamedTuple):
     after: int | None  # the row that set its start: its latest gate, or its CTA's previous row
 
 
-def list_schedule(rows: list[Row], ctas: int, cost: dict[int, float]) -> list[RowSpan]:
-    """Greedy list schedule of dependency-ordered rows onto ``ctas`` CTAs under the ``cost``
-    model (``row_cost``): each row goes to the CTA that can start it first, once every
-    producer group it waits for has finished plus ``DEPENDENCY_LATENCY``."""
+def list_schedule(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[RowSpan]:
+    """Greedy list schedule of dependency-ordered rows onto ``ctas`` CTAs under ``op``'s
+    ``row_costs``: each row goes to the CTA that finishes it first, starting once every producer
+    group it waits for has finished plus ``DEPENDENCY_LATENCY``. A row costs less on the CTA whose
+    previous GEMV row wrote the same input (``input_key``)."""
+    cost, reused = row_costs(op, ctas)
     last: dict[tuple, int] = {}  # producer group -> its last-finishing row so far
     tail: list[int | None] = [None] * ctas  # each CTA's previous row
     free = [0.0] * ctas  # when each CTA's previous row ends
+    held: list[tuple | None] = [None] * ctas  # each CTA's GEMV input key
     spans: list[RowSpan] = []
     for i, (words, deps, group) in enumerate(rows):
         gates = tuple(last[d] for d in deps if d in last)
         gate = max(gates, key=lambda g: spans[g].end, default=None)
         ready = spans[gate].end + DEPENDENCY_LATENCY if gate is not None else 0.0
-        cta = min(range(ctas), key=lambda c: (max(free[c], ready), c))
+        key, fresh = input_key(op, words)
+        costs = [
+            reused[words[0]]
+            if key is not None and not fresh and held[c] == key
+            else cost[words[0]]
+            for c in range(ctas)
+        ]
+        cta = min(range(ctas), key=lambda c: (max(free[c], ready) + costs[c], c))
         start = max(free[cta], ready)
         after = gate if gate is not None and ready >= free[cta] else tail[cta]
-        spans.append(RowSpan(cta, start, start + cost[words[0]], gates, after))
+        spans.append(RowSpan(cta, start, start + costs[cta], gates, after))
         tail[cta], free[cta] = i, spans[i].end
+        if words[0] in GEMV_KINDS:
+            held[cta] = key
         if group not in last or spans[i].end >= spans[last[group]].end:
             last[group] = i
     return spans
 
 
-def assign_static(rows: list[Row], ctas: int, cost: dict[int, float]) -> list[list[int]]:
+def assign_static(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[list[int]]:
     """``list_schedule``'s per-CTA row lists laid out ``[slot][cta]`` for ``StaticPersistent``
     (CTA b runs rows b, b + ctas, ...); short lists are padded with dropped rows.
 
     Each list keeps the dependency order, so with every CTA resident the earliest unfinished
     row always has its producers finished: no deadlock."""
     lists: list[list[list[int]]] = [[] for _ in range(ctas)]
-    for (words, _, _), span in zip(rows, list_schedule(rows, ctas, cost)):
+    for (words, _, _), span in zip(rows, list_schedule(op, rows, ctas)):
         lists[span.cta].append(words)
     slots = max(len(rows) for rows in lists)
     padding = [-1] * (WORDS - 1)

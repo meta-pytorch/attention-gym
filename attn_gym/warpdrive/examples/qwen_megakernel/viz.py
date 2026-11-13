@@ -1,7 +1,7 @@
 """The Qwen3 megakernel's static schedule, drawn per CTA (``schedule_html``).
 
 ``build_table`` assigns the step's instructions to CTAs by list schedule over a latency model
-(``list_schedule``: ``row_cost`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
+(``list_schedule``: ``row_costs`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
 them out ``[slot][cta]`` for ``StaticPersistent`` (``assign_static``). The page shows each
 CTA's rows coloured by op and shaded by layer, their predicted start and end, the rows that
 gate them (the last row of each producer group) and the predicted critical path. CTA rows
@@ -85,7 +85,7 @@ def megakernel_view(
     splits = op.splits
     rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
     cost = mk.row_cost(op, ctas)
-    pred = mk.list_schedule(rows, ctas, cost)
+    pred = mk.list_schedule(op, rows, ctas)
     by_cta: list[list[int]] = [[] for _ in range(ctas)]
     for i, p in enumerate(pred):
         by_cta[p.cta].append(i)
@@ -140,7 +140,8 @@ def megakernel_view(
             ),
             "Predicted cost per item (us): "
             + ", ".join(f"{mk.OP_NAMES[k]} {c:.1f}" for k, c in cost.items())
-            + f", plus {mk.DEPENDENCY_LATENCY:g} us per dependency.",
+            + f", plus {mk.DEPENDENCY_LATENCY:g} us per dependency; a batch-one GEMV row "
+            f"reusing its CTA's input costs its weight stages plus {mk.REUSED_INPUT:g} us.",
         ],
     )
 

@@ -89,6 +89,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
 from attn_gym.warpdrive.examples.qwen_megakernel.schedule import (
     CONTEXT,
     DEPENDENCY_LATENCY,
+    REUSED_INPUT,
     ROW_COST_MODELS,
     RowCostModel,
     RowSpan,
@@ -124,6 +125,7 @@ __all__ = [
     "QKV",
     "QWEN3_0_6B",
     "REDUCE",
+    "REUSED_INPUT",
     "ROUTER",
     "ROWS",
     "ROW_COST_MODELS",

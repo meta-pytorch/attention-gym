@@ -152,7 +152,7 @@ def test_megakernel_model_and_traced_overlay():
     ctas, splits = 61, 4
     op = mk.QwenDecodeMegakernel(splits=splits)
     rows = mk.instruction_rows(op)
-    pred = mk.list_schedule(rows, ctas, mk.row_cost(op, ctas))
+    pred = mk.list_schedule(op, rows, ctas)
     for p in pred:
         assert all(p.start >= pred[g].end + mk.DEPENDENCY_LATENCY - 1e-9 for g in p.gates)
         if p.after is None:
