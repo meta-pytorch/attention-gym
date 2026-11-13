@@ -565,7 +565,10 @@ Token-at-a-time decode groups floating-point additions differently than 64-row `
 training, so decode drifts from training numerics.
 [`examples/linear/kda_zero_drift_decode.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_zero_drift_decode.py)
 replays the current partial chunk with `chunk_kda` from the last FP32 boundary state, which
-makes decode output bitwise-identical to training.
+makes decode output bitwise-identical to training. On the Triton fused kernels, a 16-token
+subchunk whose cumulative gate falls by more than `64 * ln(2)` (about 44) in some key channel
+shifts that key block's factors by a decision that reads all of its rows, so a partial-chunk
+replay that ends inside such a subchunk can differ from training at rounding level.
 
 For replay-backed `paged_chunk_kda`, a serving engine can plan its pool before allocating
 device memory. `ReplayState.slot_layout(num_heads, head_dim)` returns the per-slot shape and

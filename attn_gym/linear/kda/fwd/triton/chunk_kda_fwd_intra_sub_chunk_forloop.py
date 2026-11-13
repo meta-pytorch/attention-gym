@@ -29,6 +29,9 @@ from attn_gym.linear.kda.utils import (
     gather,
 )
 
+# See NOTE [Causal gate reference].
+CAUSAL_REBASE_SHIFT = tl.constexpr(64.0)
+
 
 @triton.heuristics(
     {
@@ -135,17 +138,6 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 Aqk_off = Aqk + ptr_offset((bos, i_h), (H * BT, BT))
                 Akk_off = Akk + ptr_offset((bos, i_h), (H * BC, BC))
 
-                o_k = tl.arange(0, BK)
-                m_qkg = m_c[:, None] & (o_k[None, :] < K)
-                q_offsets = o_c[:, None] * q_stride_t + o_k[None, :]
-                k_offsets = o_c[:, None] * k_stride_t + o_k[None, :]
-                g_offsets = ptr_offset(
-                    (o_c[:, None], o_k[None, :]),
-                    (H * K, 1),
-                )
-                b_q = tl.load(q_off + q_offsets, mask=m_qkg, other=0.0)
-                b_k = tl.load(k_off + k_offsets, mask=m_qkg, other=0.0)
-                b_g = tl.load(g_off + g_offsets, mask=m_qkg, other=0.0)
                 b_beta = tl.load(
                     beta_off + ptr_offset((o_c,), (H,)),
                     mask=m_c,
@@ -158,25 +150,46 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
                 # point: the two factors round separately, so the reference row is part of
                 # the numerics. See NOTE [Causal gate reference].
                 normref_idx = 0 if CAUSAL_NORMREF else min(BC // 2, T_local - i_ti - 1)
-                if USE_GATHER:
-                    b_gn = gather(b_g, tl.full([1, BK], normref_idx, dtype=tl.int16), axis=0)
-                else:
-                    p_gn = g_off + ptr_offset(
-                        (i_ti + normref_idx, o_k),
+                b_Aqk = tl.zeros([BC, BC], dtype=tl.float32)
+                b_Akk = tl.zeros([BC, BC], dtype=tl.float32)
+                for i_k in tl.static_range(0, K, BK):
+                    o_k = i_k + tl.arange(0, BK)
+                    m_qkg = m_c[:, None] & (o_k[None, :] < K)
+                    q_offsets = o_c[:, None] * q_stride_t + o_k[None, :]
+                    k_offsets = o_c[:, None] * k_stride_t + o_k[None, :]
+                    g_offsets = ptr_offset(
+                        (o_c[:, None], o_k[None, :]),
                         (H * K, 1),
                     )
-                    b_gn = tl.load(p_gn, mask=o_k < K, other=0.0)
-                    b_gn = b_gn[None, :]
+                    b_q = tl.load(q_off + q_offsets, mask=m_qkg, other=0.0)
+                    b_k = tl.load(k_off + k_offsets, mask=m_qkg, other=0.0)
+                    b_g = tl.load(g_off + g_offsets, mask=m_qkg, other=0.0)
+                    if USE_GATHER:
+                        b_gn = gather(b_g, tl.full([1, BK], normref_idx, dtype=tl.int16), axis=0)
+                    else:
+                        p_gn = g_off + ptr_offset(
+                            (i_ti + normref_idx, o_k),
+                            (H * K, 1),
+                        )
+                        b_gn = tl.load(p_gn, mask=o_k < K, other=0.0)
+                        b_gn = b_gn[None, :]
 
-                b_gm = (b_g - b_gn).to(tl.float32)
+                    b_gm = (b_g - b_gn).to(tl.float32)
+                    if CAUSAL_NORMREF:
+                        # Padded rows hold -g_0 >= 0 for nonpositive gates; with positive
+                        # gates they can only force a shift, which stays within range.
+                        b_span = tl.min(tl.min(b_gm, axis=1), axis=0)
+                        b_gm += tl.where(b_span < -CAUSAL_REBASE_SHIFT, CAUSAL_REBASE_SHIFT, 0.0)
 
-                b_gq = tl.where(m_c[:, None], exp2(b_gm, FASTMATH), 0.0)
-                b_gk = tl.where(m_c[:, None], exp2(-b_gm, FASTMATH), 0.0)
+                    b_gq = tl.where(m_c[:, None], exp2(b_gm, FASTMATH), 0.0)
+                    b_gk = tl.where(m_c[:, None], exp2(-b_gm, FASTMATH), 0.0)
 
-                b_kgt = tl.trans(b_k * b_gk)
+                    b_kgt = tl.trans(b_k * b_gk)
 
-                b_Aqk = tl.dot(b_q * b_gq, b_kgt) * scale
-                b_Akk = tl.dot(b_k * b_gq, b_kgt) * b_beta[:, None]
+                    b_Aqk = tl.dot(b_q * b_gq, b_kgt, b_Aqk)
+                    b_Akk = tl.dot(b_k * b_gq, b_kgt, b_Akk)
+                b_Aqk *= scale
+                b_Akk *= b_beta[:, None]
 
                 o_i = tl.arange(0, BC)
                 m_Aqk = o_i[:, None] >= o_i[None, :]
@@ -220,14 +233,25 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
 # the reference at or before every query; a midpoint reference reduces the exponent span
 # but makes early outputs depend on a future gate through rounding.
 #
-# A gate contributes at most |lower_bound| * log2(e) per token interval, so keeping the
-# factors within the FP32 exponent range requires
+# A gate contributes at most |lower_bound| * log2(e) per token interval. Row 0 spans 15
+# intervals, so its query factors 2^{g_i - g_0} fall to 2^-128 at the 5.914 fused bound
+# (``constants.py``), below the 2^-126 FP32 normal range that the flush-to-zero fastmath
+# exp2 keeps; that dropped the last rows' diagonal terms (the non-fast exp2 keeps them only as
+# subnormals). A key block (the BK channels of one loop step) whose span
+# min_{i,c} (g_ic - g_0c) over the subchunk is below -64 is therefore evaluated as
+# 2^{g_i - g_0 + 64} * 2^{g_0 - g_j - 64}, as the SM100 CuTe engine evaluates every block.
+# Either way both factors stay within 2^±64, so they remain normal while
+# |lower_bound| <= 190 / (15 * log2(e)) = 8.78, and Q/K entries must stay below 2^64 in
+# magnitude. Leaving flatter blocks unshifted keeps tiny keys there: shifted, a 2^-100 key
+# underflows to 2^-164 before its product with a 2^58 query. A shifted block still loses
+# gated Q/K entries below 2^-62, like the engine. The span reads later rows, so an earlier
+# output can depend on a later gate, but only through rounding of the shifted exponent once
+# the span crosses -64. The 8-interval midpoint needs no shift up to 10.9. Custom gate
+# producers must honor the fused bound.
 #
-#     |lower_bound| <= 128 / (span_steps * log2(e)).
-#
-# For BC=16, row 0 spans 15 intervals and gives a 5.915 limit; the 8-interval midpoint
-# would give 11.09. The fused training integration enforces the bound derived in
-# ``constants.py``; custom gate producers must honor the same limit.
+# The kernel sits at the 255-register limit. With fastmath one block covers all 128 channels;
+# the span reduction made the non-fast exp2 spill (1.25x the time), so that mode walks K in
+# 32-channel blocks instead.
 def chunk_kda_fwd_intra_diagonal(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -283,7 +307,8 @@ def chunk_kda_fwd_intra_diagonal(
         K=key_dim,
         BT=chunk_size,
         BC=subchunk_size,
-        BK=triton.next_power_of_2(key_dim),
+        # See NOTE [Causal gate reference] for the non-fast key block.
+        BK=key_dim if fastmath else 32,
         num_sequences=0 if metadata is None else metadata.cu_seqlens.shape[0] - 1,
         USE_GATHER=IS_GATHER_SUPPORTED,
         CAUSAL_NORMREF=True,
