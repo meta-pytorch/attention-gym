@@ -206,7 +206,7 @@ def _mma_sync(
     M_BLOCKS = M // 16
     N_FRAGS = N // 8
     a_stride = len(a_frag) // M_BLOCKS
-    tag = "tf32" if dtype is cutlass.Float32 else io_tag(dtype)
+    tag = io_tag(dtype)
     a_regs = ",".join(f"${4 + i}" for i in range(a_words))
     b_regs = ",".join(f"${4 + a_words + i}" for i in range(b_words))
     c0 = 4 + a_words + b_words
@@ -236,6 +236,20 @@ def _mma_sync(
 
 
 @cute.jit
+def tf32_round(x):
+    """fp32 ``x`` rounded to the nearest tf32 (ties away from zero) as a tf32 MMA operand: the
+    bits of ``x`` plus half a tf32 ulp (``0x1000``). The mma reads only the top 19 bits (see
+    ``tf32_lo``), so for finite ``x`` its products equal those of ``cvt.rna.tf32.f32``, which
+    ptxas emits as three instructions (an infinity test, the add and a mask) instead of this
+    one add; CUTLASS calls the rounding ``round_half_ulp_truncate``."""
+    return inline_ptx(
+        "{ .reg .b32 t; mov.b32 t, $1; add.s32 $0, t, 4096; }",
+        write_only_types=[cutlass.Int32],
+        read_only_args=[x],
+    )
+
+
+@cute.jit
 def tf32_lo(x):
     """``x - tf32(x)`` (exact in fp32) for 3xTF32 products: the tf32 mma reads only the top 19
     bits of an fp32 operand, so ``x`` itself is the high part and this the low part."""
@@ -249,8 +263,8 @@ def tf32_lo(x):
 
 @cute.jit
 def mma_tf32(acc, a, b):
-    """``acc[4] + A[16, 8] @ B[8, 8]`` (m16n8k8 tf32 mma.sync) of fp32 fragments ``a[4]`` and
-    ``b[2]`` (read as tf32); returns the four fp32 outputs."""
+    """``acc[4] + A[16, 8] @ B[8, 8]`` (m16n8k8 tf32 mma.sync) of 32-bit fragments ``a[4]`` and
+    ``b[2]`` (fp32 values read as tf32, or their bits); returns the four fp32 outputs."""
     return list(
         inline_ptx(
             "{ .reg .b32 a<4>, b<2>; mov.b32 a0, $4; mov.b32 a1, $5; mov.b32 a2, $6; "
@@ -295,9 +309,19 @@ def mma_step_k8(
 
 @cute.jit
 def mma_step_tf32(acc, a_frag, b_frag, *, M: cutlass.Constexpr[int], N: cutlass.Constexpr[int]):
-    """``acc[M, N] += A[M, 8] @ B[8, N]`` with m16n8k8 tf32 mma.sync on fp32-bit fragments: four
-    A words (rows g, g + 8 at columns t, t + 4) and two B words per 8 columns."""
-    _mma_sync(acc, a_frag, b_frag, 0, M, N, cutlass.Float32, "m16n8k8", 4, 2)
+    """``acc[M, N] += A[M, 8] @ B[8, N]`` (``mma_tf32`` per 16 x 8 block) on 32-bit fragments:
+    four A words per 16 rows (rows g, g + 8 at columns t, t + 4) and two B words per 8
+    columns."""
+    for m_block in cutlass.range_constexpr(M // 16):
+        for n_frag in cutlass.range_constexpr(N // 8):
+            s = (m_block * (N // 8) + n_frag) * 4
+            out = mma_tf32(
+                [acc[s + i] for i in range(4)],
+                [a_frag[4 * m_block + i] for i in range(4)],
+                [b_frag[2 * n_frag + i] for i in range(2)],
+            )
+            for i in cutlass.range_constexpr(4):
+                acc[s + i] = out[i]
 
 
 @cute.jit
