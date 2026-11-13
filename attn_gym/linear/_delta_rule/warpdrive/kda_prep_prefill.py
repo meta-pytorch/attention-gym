@@ -87,7 +87,6 @@ from .kda_common import (
     FINAL_DST,
     TORCH_NAMES,
     WORK_ITEM_FIELDS,
-    as_i32,
     box128,
     lds_v2_f32,
     lds_v4_f32,
@@ -96,7 +95,8 @@ from .kda_common import (
     opaque_i32,
     resolve_paged_state,
     spin_wait,
-    stg_v4,
+    state_align_suffix,
+    store_state_32,
     umma_commit,
     warp_arrive,
 )
@@ -212,7 +212,8 @@ class KdaPrepPrefill(WarpSpecialized):
     """Warpdrive prep-fed KDA prefill for ``io`` fp16/bf16 records, V and O.
 
     The static state flags and ``paged_state`` (0 none, 1 routes, 2 routes + fresh-slot mask)
-    select code; the state dtype follows the traced tensors."""
+    select code; the state dtype follows the traced tensors. ``state_align`` is the byte
+    alignment of every state row, as in ``KdaPrefill``."""
 
     def __init__(
         self,
@@ -223,6 +224,7 @@ class KdaPrepPrefill(WarpSpecialized):
         store_final_state: bool,
         paged_state: int,
         num_ctas: int,
+        state_align: int = 16,
     ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the KDA prep prefill serves d_k in {HEAD_DIMS}, got {d_k}")
@@ -231,6 +233,7 @@ class KdaPrepPrefill(WarpSpecialized):
         self.io, self.d_k, self.tiles_per_head, self.num_ctas = io, d_k, tiles_per_head, num_ctas
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         self.paged_state = paged_state
+        self.state_align = state_align
         self.io_dtype = io_t = CUTE_DTYPES[io]
         io_b = io_t.width // 8
         plan = self.smem_plan = SmemPlan()
@@ -297,7 +300,10 @@ class KdaPrepPrefill(WarpSpecialized):
 
     def get_name(self) -> str:
         flags = f"{int(self.use_initial_state)}{int(self.store_final_state)}{self.paged_state}"
-        return f"wd_kda_prep_prefill_{self.io}_k{self.d_k}_t{self.tiles_per_head}_f{flags}"
+        return (
+            f"wd_kda_prep_prefill_{self.io}_k{self.d_k}_t{self.tiles_per_head}_f{flags}"
+            f"{state_align_suffix(self.state_align)}"
+        )
 
     # ---- work decode -------------------------------------------------------------------
 
@@ -726,7 +732,7 @@ class KdaPrepPrefill(WarpSpecialized):
             blocks = range(half * (self.d_k // 32), (half + 1) * (self.d_k // 32))
             vecs = []
             for i in cutlass.range_constexpr(blocks.start, blocks.stop):
-                vals = load_state_16(addr + i * 16 * sbytes, st.element_type)
+                vals = load_state_16(addr + i * 16 * sbytes, st.element_type, self.state_align)
                 if cutlass.const_expr(self.paged_state > 0):
                     vals = [Float32(cutlass.select_(load_initial, v, Float32(0.0))) for v in vals]
                 vecs.append(vals)
@@ -826,23 +832,7 @@ class KdaPrepPrefill(WarpSpecialized):
                 for kb in cutlass.range_constexpr(0, self.d_k, 32):
                     vals = tmem_ld("32x32b", 32, cols["state"] + kb)
                     if row_valid:
-                        if cutlass.const_expr(out.element_type is Float32):
-                            for g in cutlass.range_constexpr(8):
-                                stg_v4(
-                                    addr + (kb + g * 4) * obytes,
-                                    [as_i32(vals[g * 4 + t]) for t in range(4)],
-                                )
-                        else:
-                            for g in cutlass.range_constexpr(4):
-                                words = [
-                                    fp32_to_fp16(
-                                        vals[g * 8 + 2 * t],
-                                        vals[g * 8 + 2 * t + 1],
-                                        dtype=out.element_type,
-                                    )
-                                    for t in range(4)
-                                ]
-                                stg_v4(addr + (kb + g * 8) * obytes, words)
+                        store_state_32(addr, kb * obytes, vals, out.element_type, self.state_align)
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:

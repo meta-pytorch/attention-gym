@@ -17,6 +17,7 @@ import cutlass
 import torch
 
 from attn_gym._backends.cute.utils import validate_tma_tensor
+from attn_gym.linear._delta_rule.paged_state import state_row_alignment
 
 from .gdn_tinv import B_T as GDN_B_T
 from .gdn_tinv import tinv_rows
@@ -224,9 +225,16 @@ def validate_kda_forward_operands(q, k, v, gate, beta, o, cu_seqlens):
     return tokens, heads_out, num_seqs
 
 
-def validate_kda_forward_states(q, v, heads_out, num_seqs, **states):
+def paged_state_align(pool: torch.Tensor) -> int:
+    """The state row alignment a paged prefill compiles for: 16 bytes, or the element size for a
+    pool whose rows are not all 16-byte aligned (NOTE [Unaligned state rows] in kda_common)."""
+    return 16 if state_row_alignment(pool) == 16 else pool.element_size()
+
+
+def validate_kda_forward_states(q, v, heads_out, num_seqs, *, align: int = 16, **states):
     """Check ``name=(state, routed)`` ``[rows, HO, V, K]`` states: at least ``num_seqs`` rows
-    unless routed through an index table (a paged pool or seed/final indices)."""
+    unless routed through an index table (a paged pool or seed/final indices), and ``align``-byte
+    aligned bases."""
     validate_cuda_tensors(q, **{name: state for name, (state, _) in states.items()})
     for name, (state, routed) in states.items():
         if state is not None:
@@ -235,6 +243,7 @@ def validate_kda_forward_states(q, v, heads_out, num_seqs, **states):
                 state,
                 (None, heads_out, v.shape[2], q.shape[2]),
                 STATE_DTYPES,
+                align=align,
                 min_rows=0 if routed else num_seqs,
             )
 

@@ -238,9 +238,9 @@ def paged_chunk_kda(
             conversion are internal, matching :func:`chunk_kda`.
         beta: Per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
-            Recurrence math remains FP32; BF16 affects persistent storage only. warpdrive
-            requires 16-byte-aligned pool bases and slot origins; the default backend runs
-            other pools on the fused backend.
+            Recurrence math remains FP32; BF16 affects persistent storage only. The pool base
+            and slot stride need only element alignment. The default backend runs pools whose
+            base or slot stride is not 16-byte aligned on the fused backend.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence.
             Positive, unique indices select cache slots to read and advance;
             non-positive indices produce zero output and leave the cache untouched.
