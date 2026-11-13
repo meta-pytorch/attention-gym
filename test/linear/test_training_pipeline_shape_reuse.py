@@ -163,6 +163,11 @@ def test_training_pipeline_reuses_backend_specializations(variant: str, isolated
             assert entries == expected_entries
 
 
+@pytest.mark.xfail(
+    torch.__version__ < "2.16.0.dev0",
+    reason="dynamo in torch 2.14 asserts in lift_tracked_freevar_to_input on the l2norm "
+    "autograd.Function; passes on 2.16 nightly",
+)
 @pytest.mark.parametrize("variant", ["kda", "gdn"])
 def test_training_pipeline_dynamic_fullgraph(variant: str, fresh_compile_cache):
     """The composed public forward and its backward accept varying packed capacities."""

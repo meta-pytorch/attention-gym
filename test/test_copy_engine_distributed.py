@@ -1,6 +1,7 @@
 """Check the copy-engine all-gather and ring channel against NCCL references on two GPUs."""
 
 import os
+import re
 import socket
 import time
 
@@ -180,7 +181,11 @@ def test_desynced_ranks_trap_instead_of_hanging(tmp_path) -> None:
             if process.is_alive():
                 process.kill()
     message = (tmp_path / "rank1.log").read_text()
-    assert "SymmetricMemory::wait_signal: rank 1 failed to receive signal from rank 0" in message
+    # Torch builds print "SymmetricMemory::wait_signal: rank 1 ..." or
+    # "CUDASymmetricMemory::wait_signal rank 1 ...".
+    assert re.search(
+        r"SymmetricMemory::wait_signal:? rank 1 failed to receive signal from rank 0", message
+    ), message
 
 
 def _domain_worker(rank: int, port: int) -> None:
