@@ -57,6 +57,10 @@ pytestmark = [
 
 _DEFAULT_SCALE = 128**-0.5
 
+# Replay-backed paged KDA runs on either chunk backend and must reproduce that backend's own
+# unsplit chunk execution bit for bit.
+_replay_backends = pytest.mark.parametrize("backend", ["fused", "warpdrive"])
+
 
 def _inputs(
     *,
@@ -1459,6 +1463,7 @@ def test_paged_chunk_kda_validates_public_contract():
         paged_chunk_kda(q.requires_grad_(), k, v, gate, beta, pool, slots)
 
 
+@_replay_backends
 @pytest.mark.parametrize(
     "num_sequences,tokens,heads,active",
     [
@@ -1471,6 +1476,7 @@ def test_paged_chunk_kda_replay_prefill_scaling(
     tokens: int,
     heads: int,
     active: bool,
+    backend: str,
 ):
     """Replay prefill supports large feature grids and many short requests."""
     if active:
@@ -1479,7 +1485,7 @@ def test_paged_chunk_kda_replay_prefill_scaling(
         )
         expected, _ = chunk_kda(
             *inputs,
-            kernel_options={"schedule": "static", "autotune": False},
+            kernel_options={"backend": backend, "schedule": "static", "autotune": False},
         )
         state_indices = torch.arange(1, num_sequences + 1, device="cuda", dtype=torch.int32)
         num_slots = num_sequences + 1
@@ -1511,7 +1517,7 @@ def test_paged_chunk_kda_replay_prefill_scaling(
         state_cache,
         state_indices,
         cu_seqlens=cu_seqlens,
-        kernel_options={"schedule": "persistent", "autotune": False},
+        kernel_options={"backend": backend, "schedule": "persistent", "autotune": False},
         replay_state=replay_state,
     )
 
@@ -1523,6 +1529,7 @@ def test_paged_chunk_kda_replay_prefill_scaling(
     )
 
 
+@_replay_backends
 @pytest.mark.parametrize(
     "prefill_tokens,total_tokens,slots",
     [
@@ -1546,6 +1553,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
     prefill_tokens: int,
     total_tokens: int,
     slots: tuple[int, ...],
+    backend: str,
 ):
     """Execution partitioning and cache routing preserve canonical chunk results."""
     torch.manual_seed(48)
@@ -1558,7 +1566,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
         v,
         gate,
         beta,
-        kernel_options={"schedule": "static", "autotune": False},
+        kernel_options={"backend": backend, "schedule": "static", "autotune": False},
     )
     state_indices = torch.tensor(slots, device="cuda", dtype=torch.int32)
     padding = state_indices <= 0
@@ -1591,7 +1599,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
             state_cache,
             state_indices,
             has_initial_state=padding,
-            kernel_options={"schedule": "static", "autotune": False},
+            kernel_options={"backend": backend, "schedule": "static", "autotune": False},
             replay_state=replay_state,
         )
     ]
@@ -1605,7 +1613,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
                 beta[:, position : position + 1],
                 state_cache,
                 state_indices,
-                kernel_options={"schedule": "static", "autotune": False},
+                kernel_options={"backend": backend, "schedule": "static", "autotune": False},
                 replay_state=replay_state,
             )
         )
@@ -1625,7 +1633,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
             gate[:, :completed_tokens],
             beta[:, :completed_tokens],
             output_final_state=True,
-            kernel_options={"schedule": "static", "autotune": False},
+            kernel_options={"backend": backend, "schedule": "static", "autotune": False},
         )
         assert expected_boundary is not None
         expected_state = expected_boundary[state_indices > 0]
@@ -1640,6 +1648,7 @@ def test_paged_chunk_kda_replay_matches_unsplit_chunk_execution(
     )
 
 
+@_replay_backends
 @pytest.mark.parametrize(
     "slots,has_initial_state,pending_slot",
     [
@@ -1652,6 +1661,7 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
     slots: tuple[int, int],
     has_initial_state: tuple[bool, bool],
     pending_slot: int | None,
+    backend: str,
 ):
     """Packed replay uses logical sequence metadata while reading batch row zero."""
     torch.manual_seed(51)
@@ -1685,7 +1695,7 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
             expected_state,
             state_indices[sequence : sequence + 1],
             has_initial_state=initial_flags[sequence : sequence + 1],
-            kernel_options={"schedule": "static", "autotune": False},
+            kernel_options={"backend": backend, "schedule": "static", "autotune": False},
             replay_state=expected_replay,
         )
 
@@ -1699,7 +1709,7 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
         state_indices,
         cu_seqlens=cu_seqlens,
         has_initial_state=initial_flags,
-        kernel_options={"schedule": "static", "autotune": False},
+        kernel_options={"backend": backend, "schedule": "static", "autotune": False},
         replay_state=replay_state,
     )
 
@@ -1711,8 +1721,9 @@ def test_paged_chunk_kda_packed_replay_matches_independent_sequences(
     )
 
 
+@_replay_backends
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
-def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
+def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str, backend: str):
     """Compile and CUDA-graph replay the public decode and packed-prefill routes."""
     torch.manual_seed(49 if mode == "decode" else 52)
     q, k, v, gate, beta = (
@@ -1760,7 +1771,7 @@ def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
             state_indices,
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
-            kernel_options={"schedule": "static", "autotune": False},
+            kernel_options={"backend": backend, "schedule": "static", "autotune": False},
             replay_state=replay_state,
         )
 
@@ -1810,6 +1821,7 @@ def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
     )
 
 
+@_replay_backends
 @pytest.mark.parametrize(
     "mode,shapes",
     [
@@ -1826,7 +1838,7 @@ def test_paged_chunk_kda_replay_compile_and_cuda_graph(mode: str):
     ],
 )
 def test_paged_chunk_kda_replay_shapes_reuse_compiled_kernels(
-    mode: str, shapes: list[tuple[int, int, int]], triton_compiles
+    mode: str, shapes: list[tuple[int, int, int]], triton_compiles, backend: str
 ):
     """New batch sizes and prefill lengths reuse the compiled replay-cache kernels."""
     from triton.runtime.jit import KernelInterface
@@ -1859,7 +1871,7 @@ def test_paged_chunk_kda_replay_shapes_reuse_compiled_kernels(
             state_cache,
             torch.arange(1, requests + 1, device="cuda", dtype=torch.int32),
             cu_seqlens=cu_seqlens,
-            kernel_options={"schedule": "static", "autotune": False},
+            kernel_options={"backend": backend, "schedule": "static", "autotune": False},
             replay_state=replay_state,
         )
     assert replay_kernels
