@@ -21,7 +21,7 @@ from attn_gym.linear.gdn.impl.warpdrive_ops import (
 )
 
 
-def _validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
+def validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
     """Validate the Q/K/V dtypes and head dimensions the scalar-GDN warpdrive kernels support.
 
     ``chunk_gdn`` casts gate, beta, and entry states to FP32 before dispatch
@@ -159,7 +159,7 @@ def chunk_forward(
             raise ValueError(f"{name} currently requires a no-state call")
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
-    _validate_warpdrive_constraints(q, k, value)
+    validate_warpdrive_constraints(q, k, value)
 
     batch = q.shape[0]
     output_shape = value.shape
@@ -219,7 +219,7 @@ def paged_chunk_forward(
         (q, k, value, gate, beta, state_cache),
         "paged_chunk_gdn is inference-only; call under torch.no_grad() or torch.inference_mode()",
     )
-    _validate_warpdrive_constraints(q, k, value)
+    validate_warpdrive_constraints(q, k, value)
 
     batch = q.shape[0]
     output_shape = value.shape
@@ -243,4 +243,4 @@ def paged_chunk_forward(
     return output.reshape(output_shape)
 
 
-__all__ = ["chunk_forward", "paged_chunk_forward"]
+__all__ = ["chunk_forward", "paged_chunk_forward", "validate_warpdrive_constraints"]

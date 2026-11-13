@@ -19,7 +19,7 @@ from attn_gym.linear.context_parallel import (
     context_parallel_chunk,
 )
 from attn_gym.linear.gdn.stages import chunk_gdn_prepare, chunk_gdn_prepare_backward
-from attn_gym.types import TuningOptions
+from attn_gym.linear.types import SplitOptions
 
 
 def context_parallel_gdn(
@@ -32,12 +32,13 @@ def context_parallel_gdn(
     routing: ContextParallelRouting,
     group: dist.ProcessGroup,
     scale: float | None = None,
-    kernel_options: TuningOptions | None = None,
+    kernel_options: SplitOptions | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run fused ``chunk_gdn`` over this rank's span with state exchanged by all-gather.
+    """Run ``chunk_gdn`` over this rank's span with state exchanged by all-gather.
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
-    ``scale`` and the ``"autotune"`` kernel option follow ``chunk_gdn``.
+    ``scale`` and ``kernel_options`` follow ``chunk_gdn``, without the split schedules.
+    ``kernel_options={"backend": "warpdrive"}`` selects warpdrive for the local pass and summaries.
     """
     stages = StagedOp(
         partial(chunk_gdn_prepare, scale=scale, kernel_options=kernel_options),

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import itertools
 from collections.abc import Callable
 from functools import partial
 from typing import NamedTuple
@@ -57,6 +58,7 @@ class Op(NamedTuple):
     factory: Callable[..., Inputs]  # (tokens, *, key_heads, value_heads, seed, dtype)
     key_heads: int
     value_heads: int
+    warpdrive: bool = False  # Packed-only stages whose handles have no chunk metadata.
 
     def make_inputs(self, tokens: int, seed: int, dtype: torch.dtype = torch.bfloat16) -> Inputs:
         return self.factory(
@@ -186,17 +188,31 @@ requires_warpdrive = pytest.mark.skipif(
     or not cuda_runs_sm100_kernels(),
     reason="warpdrive requires CuTeDSL on an SM100-family GPU",
 )
+# The warpdrive stages dispatch as their public ops do, so the public gradients are the oracle.
 KDA_WARPDRIVE = KDA._replace(
     chunk=partial(chunk_kda, kernel_options=WARPDRIVE),
     prepare=partial(chunk_kda_prepare, kernel_options=WARPDRIVE),
+    warpdrive=True,
 )
+GDN_WARPDRIVE = GDN._replace(
+    chunk=partial(chunk_gdn, kernel_options=WARPDRIVE),
+    prepare=partial(chunk_gdn_prepare, kernel_options=WARPDRIVE),
+    warpdrive=True,
+)
+WARPDRIVE_OPS = [
+    pytest.param(KDA_WARPDRIVE, id="kda-warpdrive", marks=requires_warpdrive),
+    pytest.param(GDN_WARPDRIVE, id="gdn-warpdrive", marks=requires_warpdrive),
+    pytest.param(
+        GDN_WARPDRIVE._replace(key_heads=1), id="gdn-warpdrive-gqa", marks=requires_warpdrive
+    ),
+]
 op_param = pytest.mark.parametrize(
     "op",
     [
         pytest.param(KDA, id="kda"),
-        pytest.param(KDA_WARPDRIVE, id="kda-warpdrive", marks=requires_warpdrive),
         pytest.param(GDN, id="gdn"),
         pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
+        *WARPDRIVE_OPS,
     ],
 )
 
@@ -528,32 +544,36 @@ def test_state_grad_summary_matches_zero_and_identity_probes(op):
 
 
 @requires_kda_target
-@requires_warpdrive
+@pytest.mark.parametrize("op", WARPDRIVE_OPS[:2])
 @pytest.mark.parametrize("bounds", [(0, 72), (72, 200)], ids=["partial-tail", "aligned-offset"])
-def test_warpdrive_state_summaries_replay_under_cuda_graph(bounds):
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_warpdrive_state_summaries_replay_under_cuda_graph(op, bounds, direction):
     """The lazily factored span reads its ranges on the device, so capture never syncs."""
-    q, k, v, gate, beta = KDA.make_inputs(200, seed=7)
+    q, k, v, gate, beta = op.make_inputs(200, seed=7)
     cu_seqlens = torch.tensor([0, 72, 200], dtype=torch.int32, device="cuda")
-    prepared = chunk_kda_prepare(
-        q, k, v, gate, beta, cu_seqlens=cu_seqlens, kernel_options=WARPDRIVE
-    )
+    prepared = op.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+    if direction == "forward":
+        summarize, changed = prepared.state_summaries, prepared.saved.v
+    else:
+        grads = op.prepare_backward(prepared.saved, torch.ones_like(v), None, scale=0.1)
+        summarize, changed = grads.state_grad_summaries, grads.d_output
     bounds = bounds_of(bounds)
-    expected = prepared.state_summaries(bounds)
+    expected = summarize(bounds)
 
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        prepared.state_summaries(bounds)
+        summarize(bounds)
     torch.cuda.current_stream().wait_stream(stream)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        captured = prepared.state_summaries(bounds)
+        captured = summarize(bounds)
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(captured, expected, atol=0, rtol=0)
     # Replay must recompute from the captured inputs rather than replay stale results.
-    prepared.saved.v.mul_(0.5)
-    fresh = prepared.state_summaries(bounds)
+    changed.mul_(0.5)
+    fresh = summarize(bounds)
     graph.replay()
     torch.cuda.synchronize()
     assert not torch.equal(captured, expected)
@@ -561,12 +581,92 @@ def test_warpdrive_state_summaries_replay_under_cuda_graph(bounds):
 
 
 @requires_kda_target
-def test_warpdrive_prepare_rejects_split_schedules():
+@pytest.mark.parametrize("op", WARPDRIVE_OPS)
+def test_warpdrive_stages_ignore_the_default_dtype(op):
+    """The FP32 summaries and scratch name their dtype: a float64 default changes no bit."""
+    inputs = op.make_inputs(200, seed=11)
+    cu_seqlens = torch.tensor([0, 72, 200], dtype=torch.int32, device="cuda")
+    bounds = bounds_of((0, 72), (72, 200))
+    state = torch.randn(2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda") / 8
+
+    def stages():
+        prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens)
+        grads = op.prepare_backward(
+            prepared.saved, torch.ones_like(inputs[2]), state, scale=prepared.scale
+        )
+        return (
+            prepared.state_summaries(bounds),
+            grads.state_grad_summaries(bounds),
+            *prepared.run(state, output_final_state=True),
+            *grads.run(state),
+        )
+
+    expected = stages()
+    default = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        actual = stages()
+    finally:
+        torch.set_default_dtype(default)
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@requires_kda_target
+@requires_warpdrive
+def test_warpdrive_gdn_stateless_stages_match_the_public_op():
+    """Without states, the staged passes run the public op's no-state kernels bit for bit."""
+    inputs = GDN_WARPDRIVE.make_inputs(320, seed=15)
+    cu_seqlens = torch.tensor([0, 100, 320], dtype=torch.int32, device="cuda")
+    leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+    expected, _ = GDN_WARPDRIVE.chunk(*leaves, cu_seqlens=cu_seqlens)
+    d_output = torch.randn_like(expected)
+    expected_grads = torch.autograd.grad(expected, leaves, d_output)
+
+    prepared = GDN_WARPDRIVE.prepare(*inputs, cu_seqlens=cu_seqlens)
+    output, final_state = prepared.run()
+    grads = chunk_gdn_prepare_backward(prepared.saved, d_output, None, scale=prepared.scale)
+    *actual_grads, d_initial_state = grads.run()
+    assert final_state is None and d_initial_state is None
+    for got, want in zip((output, *actual_grads), (expected, *expected_grads), strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+@requires_kda_target
+@pytest.mark.parametrize("op", [KDA, GDN], ids=["kda", "gdn"])
+def test_warpdrive_prepare_rejects_split_schedules(op):
     """The option check precedes the availability check, so this needs no warpdrive install."""
-    q, k, v, gate, beta = KDA.make_inputs(128, seed=8)
+    q, k, v, gate, beta = op.make_inputs(128, seed=8)
     for option in ("split_backward", "split_forward"):
         with pytest.raises(ValueError, match="split schedules"):
-            chunk_kda_prepare(q, k, v, gate, beta, kernel_options={**WARPDRIVE, option: True})
+            op.prepare(q, k, v, gate, beta, kernel_options={**WARPDRIVE, option: True})
+
+
+@requires_kda_target
+@pytest.mark.parametrize("op", WARPDRIVE_OPS[:2])
+def test_warpdrive_summaries_select_whole_subsequences(op):
+    """Selected, reordered, repeated and empty bounds return the matching rows bitwise.
+
+    Unselected subsequences are skipped on the device, which must not change a selected row.
+    """
+    tokens, lengths = 300, (72, 0, 150, 78)
+    inputs = op.make_inputs(tokens, seed=13)
+    offsets = [0, *torch.tensor(lengths).cumsum(0).tolist()]
+    cu_seqlens = torch.tensor(offsets, dtype=torch.int32, device="cuda")
+    rows = list(itertools.pairwise(offsets))
+    d_output = torch.randn(
+        inputs[2].shape, device="cuda", generator=torch.Generator(device="cuda").manual_seed(14)
+    ).to(inputs[2].dtype)
+    prepared = op.prepare(*inputs, cu_seqlens=cu_seqlens)
+    grads = op.prepare_backward(prepared.saved, d_output, None, scale=prepared.scale)
+    identity = torch.eye(HEAD_DIM, device="cuda").expand(op.value_heads, -1, -1)
+    for summarize in (prepared.state_summaries, grads.state_grad_summaries):
+        every = summarize(bounds_of(*rows))
+        selected = summarize(bounds_of(rows[3], (0, 0), rows[0], rows[3]))
+        for got, index in zip(selected[[0, 2, 3]], (3, 0, 3), strict=True):
+            torch.testing.assert_close(got, every[index], atol=0, rtol=0)
+        assert not selected[1, :, :HEAD_DIM].any()
+        torch.testing.assert_close(selected[1, :, HEAD_DIM:], identity, atol=0, rtol=0)
 
 
 class RankResult(NamedTuple):
@@ -601,7 +701,7 @@ def simulate_context_parallel(
         for r in ranks
     ]
     if (
-        op is not KDA_WARPDRIVE
+        not op.warpdrive
     ):  # warpdrive runs packed-only; the fused stages are dense iff chunk-aligned.
         for handle, routing in zip(prepared, routings, strict=True):
             dense = routing.cu_seqlens.shape[0] == 2 and routing.tokens % CHUNK_SIZE == 0
