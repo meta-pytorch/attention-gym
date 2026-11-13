@@ -211,3 +211,17 @@ def test_kda_recompute_reuses_one_compile_across_runtime_shapes():
     info = kda_recompute.compile_kda_recompute.cache_info()
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(shapes), info
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("gate_value", [-1.0, -5.25])
+def test_recompute_model_range_gates(dtype: torch.dtype, gate_value: float) -> None:
+    """Uniform model-range gates: fp16 forms KK from tf32 decay operands, whose 16-token
+    exponent range (2^121 at -5.25) an fp16 operand cannot hold."""
+    lens = [70, 33]
+    k, v, gate, beta, cu, state = _inputs(
+        lens, 2, 2, 128, 128, dtype, torch.float32, torch.float32
+    )
+    gate = torch.full_like(gate, gate_value)
+    ckpt = _run(k, v, gate, beta, cu, state, _table(lens, 2, cu))
+    _check(ckpt, _reference(k, v, gate, beta, lens, 2, state), cu, dtype)
