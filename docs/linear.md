@@ -19,23 +19,16 @@ With `impl="fused"`, the chunk operations (`chunk_gdn`, `paged_chunk_gdn`, `chun
 `context_parallel_gdn`/`context_parallel_kda`) run one of two kernel families, chosen by
 `kernel_options["backend"]`:
 
-- `"auto"` (default): warpdrive on SM100-family GPUs for every call it serves, when CuTeDSL (the
-  `[linear]` extra) is installed; the repo-local fused kernels everywhere else.
+- `"auto"` (default): warpdrive on SM100-family GPUs when CuTeDSL (the `[linear]` extra) is
+  installed; the repo-local fused kernels everywhere else.
 - `"fused"`: the repo-local kernels (CuTe on SM100-family GPUs, Triton elsewhere).
 - `"warpdrive"`: the warpdrive kernels, on any SM100-family GPU (SM100, SM103, and SM107 with
   CuTeDSL 4.8+); raises where they cannot run.
 
-On SM100-family GPUs, `"auto"` runs these calls on the fused backend:
-
-| Call | Reason |
-| --- | --- |
-| `paged_chunk_kda` with `replay_state` | replay-backed decode and prefill exist only on the fused backend |
-| `paged_chunk_gdn`/`paged_chunk_kda` with a pool base or slot stride that is not 16-byte aligned | warpdrive's paged kernels require that alignment |
-
-The choice depends only on the device, `replay_state`, and pool alignment, never on sizes, so a
-compiled graph or captured CUDA Graph keeps one backend. A staged backward handle follows its
-forward tape. `split_forward` and `split_backward` still require an explicit
-`"warpdrive"`. Explicit `"fused"` and `"warpdrive"` are never rerouted.
+The choice depends only on the device, never on sizes, so a compiled graph or captured CUDA
+Graph keeps one backend. A staged backward handle follows its forward tape. `split_forward` and
+`split_backward` still require an explicit `"warpdrive"`. Explicit `"fused"` and `"warpdrive"`
+are never rerouted.
 
 What changes when the default runs warpdrive (it was the fused backend before), as measured on
 GB300 (SM103); there are no SM107 (Rubin) performance numbers yet:
