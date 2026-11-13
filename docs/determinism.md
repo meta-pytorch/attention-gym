@@ -194,7 +194,9 @@ Pass `kernel_options={"backend": "fused"}` to get the fused guarantees above ins
 - **Across batch compositions: not bitwise.** The plan (forward and backward piece chains, the
   KDA value split and its prep pass, the piece length of the staged and context-parallel
   summaries) follows the packed shape and the SM count, so a sequence's bits can change with
-  the other sequences packed beside it, and between GPU models with different SM counts.
+  the other sequences packed beside it, and between GPU models with different SM counts. When
+  the summaries split, the staged `run` reuses their pieces, so its bits follow that piece
+  length too and differ from the public op's on the same stream.
   [Document-aligned fragments](linear.md#document-aligned-fragments-cp-invariant-bits) gives
   measured examples.
 - **Against the fused backend: never bitwise.** KDA chunks at 16 tokens on warpdrive and at 64

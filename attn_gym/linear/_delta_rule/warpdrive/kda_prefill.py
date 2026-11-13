@@ -2069,13 +2069,14 @@ def compile_kda_prefill(op: KdaPrefill, beta_name: str, state_name: str | None):
             dtype, (tokens, h, d), stride_divisibility=tma_divisibility(dtype)
         )
 
-    state = None
-    if state_name is not None:
-        state = make_fake_strided_tensor(
+    def state():
+        # Separate row extents: a chain-mode prefill reads piece states and stores sequences.
+        return make_fake_strided_tensor(
             CUTE_DTYPES[state_name],
             (cute.sym_int(), heads, dv_full, op.d_k),
             stride_divisibility=4,
         )
+
     return compile_tvm_ffi(
         op,
         packed(io, hq, op.d_k),
@@ -2083,9 +2084,9 @@ def compile_kda_prefill(op: KdaPrefill, beta_name: str, state_name: str | None):
         packed(io, hv, dv_full),
         packed(op.gate_dtype, heads, op.d_k),
         make_fake_strided_tensor(CUTE_DTYPES[beta_name], (tokens, heads), contiguous_dim=None),
-        state if op.use_initial_state else None,
+        state() if op.use_initial_state else None,
         packed(io, heads, dv_full),
-        state if op.store_final_state else None,
+        state() if op.store_final_state else None,
         None,
         None,
         # Compact like the bundle prologues' tables (a dynamic row stride costs a few %).

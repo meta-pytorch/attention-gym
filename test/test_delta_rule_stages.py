@@ -258,7 +258,8 @@ def test_summary_algebra_ignores_the_float32_matmul_mode():
 @requires_kda_target
 @op_param
 def test_prepare_run_matches_chunk_op_with_packed_initial_state(op):
-    """``prepare`` + ``run`` is the public op's own kernel sequence, so results are bitwise equal."""
+    """``prepare`` + ``run`` is the public op's own kernel sequence, so results are bitwise equal
+    (no warpdrive summary splits at these lengths; test_wd_staged_pieces.py covers splits)."""
     q, k, v, gate, beta = op.make_inputs(320, seed=1)
     cu_seqlens = torch.tensor([0, 100, 320], dtype=torch.int32, device="cuda")
     initial_state = torch.randn(2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
