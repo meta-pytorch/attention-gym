@@ -1,8 +1,8 @@
 """Route fused delta-rule stages between legacy CuTeDSL kernels and portable Triton kernels.
 
-Every stage of the fused ``chunk_kda``/``chunk_gdn`` pipelines and their context-parallel
-summaries has a portable Triton implementation that runs on every supported CUDA architecture.
-On SM100-family GPUs some stages still default to legacy CuTeDSL kernels (the
+Every stage of the fused ``chunk_kda``/``chunk_gdn`` pipelines, their context-parallel summaries
+and the fused gate transform has a portable Triton implementation that runs on every supported
+CUDA architecture. On SM100-family GPUs some stages still default to legacy CuTeDSL kernels (the
 ``kda/{fwd,bwd}/cute`` and ``_delta_rule/cute`` modules, not the warpdrive backend). Setting
 ``ATTN_GYM_LEGACY_CUTE=0`` routes those stages to Triton there too, so the portable pipeline can
 be validated and measured on Blackwell before the legacy kernels are deleted. Callers read the
