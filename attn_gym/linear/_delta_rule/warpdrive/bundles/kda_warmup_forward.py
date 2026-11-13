@@ -228,6 +228,7 @@ def _compile_warmup_forward(
     prep: bool,
     use_int64_offsets: bool,
     paged_state: int = 0,
+    fastmath: bool = True,
 ):
     """Compile the warmup / uncut forward host for one static config over fake tensors that repeat
     the standalone builds' placeholders; absent tensors have a None dtype. ``paged_state`` is 0
@@ -242,10 +243,10 @@ def _compile_warmup_forward(
         if d_v // tiles_per_head != kda_prep_prefill.D_V:
             raise ValueError("the KDA prep prefill runs 64-column value tiles")
         prefill_op = kda_prep_prefill.KdaPrepPrefill(io, d_k, tiles_per_head, *states)
-        prep_op = kda_prep.KdaPrep(io, gate_name, d_k, num_sms)
+        prep_op = kda_prep.KdaPrep(io, gate_name, d_k, num_sms, fastmath)
     else:
         prefill_op = kda_prefill.KdaPrefill(
-            io, gate_name, d_k, d_v // tiles_per_head, tiles_per_head, *states
+            io, gate_name, d_k, d_v // tiles_per_head, tiles_per_head, *states, fastmath
         )
     if prep:
         prep_signatures = [
@@ -284,6 +285,7 @@ def _compile_warmup_forward(
         "kda_warmup_forward_"
         + "_".join(str(int(flag)) for flag in static)
         + f"_split_{split_tag}_{dtype_names}"
+        + ("" if fastmath else "_nofm")
     )
     return compile_tvm_ffi(
         warmup_forward_host,
@@ -500,6 +502,7 @@ def build_warmup_forward(
     prep_row_count=None,
     state_indices=None,
     has_initial_state=None,
+    fastmath=True,
 ):
     """Compile (persisted per static config: dtypes, dims, the split-K
     geometry, the d_v split, state presence, the int64 ABI) the warmup or uncut forward launch over
@@ -508,7 +511,8 @@ def build_warmup_forward(
     current Torch stream. ``state_indices`` (int32 per sequence) and the optional uint8
     ``has_initial_state`` select paged state: ``state_in`` and ``state_out`` are then one pool
     routed per sequence (null, fresh and resumed slots). The warpdrive KDA prefills route state
-    through ``state_indices`` only and write no checkpoints."""
+    through ``state_indices`` only and write no checkpoints. ``fastmath=False`` selects the
+    non-flushing gate exponentials."""
     if not log_gate:
         raise ValueError("the warpdrive KDA prefills take natural-log gates")
     if seed_indices is not None or final_indices is not None:
@@ -603,6 +607,7 @@ def build_warmup_forward(
         bool(prep),
         use_int64_offsets,
         paged_state,
+        bool(fastmath),
     )
     return compiled, facts
 

@@ -28,6 +28,7 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     split: bool = False,
     initial_state: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -44,6 +45,7 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     d_initial_state)``; the last is ``None`` unless ``initial_state`` was given. ``dgate`` is zero
     past ``cu_seqlens[-1]``; the other token gradients are unspecified there.
     The approximate forgetting-horizon ``split`` schedule requires a no-state call.
+    ``fastmath=False`` selects the non-flushing gate exponentials.
     """
     scale = resolve_scale(scale, q.shape[-1])
     if not q.is_cuda:
@@ -104,6 +106,7 @@ def chunk_delta_rule_bwd_warpdrive_packed(
             split=split,
             initial_state=initial_state,
             d_final_state=d_final_state,
+            fastmath=fastmath,
         )
         return (*(grad.unsqueeze(0) for grad in gradients), d_initial_state)
 
