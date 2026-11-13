@@ -608,7 +608,9 @@ which varies about 5x across prompts on the deep models.
   of eight or more one warp each.
 - **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
   assigns rows to CTAs with an engine-specific row-latency model (`row_cost`, fitted to
-  traced work items across batch sizes), and `assign_static` lays the table out
+  traced work items across batch sizes), placing each row on the CTA that finishes it first (at
+  batch one a row costs less on a CTA whose previous GEMV row wrote the same input: it skips the
+  prologue), and `assign_static` lays the table out
   `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
   `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
   resident (the reason for `cooperative=True`) the earliest unfinished row can always run.
