@@ -110,12 +110,15 @@ from .kda_common import (
     load_rows,
     load_state_16,
     mask_pair,
+    mma_tf32_16x16,
     opaque_i32,
     raw_beta_release,
     spin_wait,
     sts_f32,
+    sts_tf32x8,
     swz32,
     swz128,
+    tf32_fragment_offsets,
     umma_commit,
     warp_arrive,
 )
@@ -203,7 +206,8 @@ class KdaRecomputeParams:
     s_ex: Int32
     s_kdecay: Int32
     s_krestore: Int32
-    s_kinv: Int32
+    s_kinv: Int32  # fp32 (tf32) under fp16 io
+    s_kdecay32: Int32  # fp16 io only: the tf32 copy of K_decay
     s_tinv: Int32
     s_ckpt: Int32
     s_beta: Int32
@@ -238,6 +242,8 @@ class KdaRecompute(WarpSpecialized):
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         gate_bytes = self.gate_dtype.width // 8
+        # fp16 computes KK from tf32 decay tiles (``kda_common``).
+        self.tf32_decay = io == "fp16"
         # An fp32 gate is exchanged in place (exp2 prefixes over the raw gate stage); a 16-bit
         # gate exchanges through its own 4-stage fp32 buffer.
         self.ex_stages = RAW_STAGES if gate == "fp32" else 4
@@ -254,7 +260,11 @@ class KdaRecompute(WarpSpecialized):
         }
         if gate != "fp32":
             buf["Exchange"] = plan.buffer("Exchange", f32, align=1024)
-        buf["Kinv"] = plan.buffer("Kinv", io_t, align=1024)
+        if self.tf32_decay:
+            for name in ("Kinv", "Kdecay32"):
+                buf[name] = plan.buffer(name, f32, align=1024)
+        else:
+            buf["Kinv"] = plan.buffer("Kinv", io_t, align=1024)
         buf["Beta"] = plan.buffer("Beta", f32, align=1024)
         buf["Ckpt"] = plan.buffer("Ckpt", io_t, align=1024)
         self.buf = buf
@@ -289,7 +299,7 @@ class KdaRecompute(WarpSpecialized):
             {"mma": Umma, "regmma": Warps},
             producer_sharing=rr,
             commit_fence=smem_commit,
-            buffer={"Kdecay": buf["Kdecay"], "Kinv": buf["Kinv"]},
+            buffer={k: buf[k] for k in ("Kdecay", "Kinv", "Kdecay32") if k in buf},
         )
         self.restore = Ring(
             DECAY_STAGES,
@@ -735,6 +745,8 @@ class KdaRecompute(WarpSpecialized):
         kd_pack = []
         ki_pack = []
         kr_pack = []
+        kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (fp16 io)
+        ki32 = []
         for half in cutlass.range_constexpr(dk_halves):
             dim_base = half * 64 + lane_in_row * 8
             exp_last = []
@@ -754,7 +766,11 @@ class KdaRecompute(WarpSpecialized):
                 inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=self.fastmath)
                 inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=self.fastmath)
                 ki0, ki1 = fmul2(raw_k[r0], raw_k[r0 + 1], inv0, inv1)
-                ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
+                if cutlass.const_expr(self.tf32_decay):
+                    kd32 += [kd0, kd1]
+                    ki32 += [ki0, ki1]
+                else:
+                    ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])
                 kr_pack.append(fp32_to_fp16(kr0, kr1, dtype=io))
         kh = kk.acquire(skip_fence="both", reason=BOTH_FENCES_COVERED)
@@ -763,8 +779,20 @@ class KdaRecompute(WarpSpecialized):
         decay_stage = kh.index * (d_k * B_T * 2)
         for half in cutlass.range_constexpr(dk_halves):
             off = decay_stage + 2 * box128(decay_row, half * 64 + lane_in_row * 8)
-            st_shared_v4(params.s_kinv + off, ki_pack[4 * half : 4 * half + 4])
+            if cutlass.const_expr(self.tf32_decay):
+                for base, vals in ((params.s_kinv, ki32), (params.s_kdecay32, kd32)):
+                    sts_tf32x8(
+                        base + 2 * decay_stage,
+                        decay_row,
+                        half * 64 + lane_in_row * 8,
+                        vals[8 * half : 8 * half + 8],
+                        d_k,
+                    )
+            else:
+                st_shared_v4(params.s_kinv + off, ki_pack[4 * half : 4 * half + 4])
             st_shared_v4(params.s_kdecay + off, kd_pack[4 * half : 4 * half + 4])
+        if cutlass.const_expr(self.tf32_decay):
+            kh.access("Kdecay32", write=True, by="threads")
         kh.commit()
         with restore.produce(skip_fence="before", reason=BEFORE_FENCE_COVERED) as qh:
             qh.access(write=True, by="threads")
@@ -1246,6 +1274,9 @@ class KdaRecompute(WarpSpecialized):
         t_idx = t_row * B_T + swz32(t_row, t_col)
         ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
         kd_offs = [opaque_i32(swz128(kd_row, kd_row * 64 + i * 16 + kd_col)) for i in range(4)]
+        if cutlass.const_expr(self.tf32_decay):
+            a_offs32 = tf32_fragment_offsets(lane, self.d_k, b_operand=False)
+            b_offs32 = tf32_fragment_offsets(lane, self.d_k, b_operand=True)
         row_lo = lane // 4
         row_hi = row_lo + 8
         while work.valid:
@@ -1262,11 +1293,22 @@ class KdaRecompute(WarpSpecialized):
                     acc = cute.make_rmem_tensor((8,), Float32)
                     for i in cutlass.range_constexpr(8):
                         acc[i] = Float32(0.0)
-                    for i in cutlass.range_constexpr(self.d_k // 16):
-                        box = (i // 4) * (B_T * 64)
-                        kif = ldmatrix(params.s_kinv + stage + 2 * (ki_offs[i % 4] + box), 4)
-                        kdf = ldmatrix(params.s_kdecay + stage + 2 * (kd_offs[i % 4] + box), 4)
-                        mma_step(acc, kdf, kif, k_step=0, M=16, N=16, dtype=io)
+                    if cutlass.const_expr(self.tf32_decay):
+                        kh.access("Kdecay32", read=True, by="threads")
+                        mma_tf32_16x16(
+                            acc,
+                            params.s_kdecay32 + 2 * stage,
+                            params.s_kinv + 2 * stage,
+                            a_offs32,
+                            b_offs32,
+                            self.d_k,
+                        )
+                    else:
+                        for i in cutlass.range_constexpr(self.d_k // 16):
+                            box = (i // 4) * (B_T * 64)
+                            kif = ldmatrix(params.s_kinv + stage + 2 * (ki_offs[i % 4] + box), 4)
+                            kdf = ldmatrix(params.s_kdecay + stage + 2 * (kd_offs[i % 4] + box), 4)
+                            mma_step(acc, kdf, kif, k_step=0, M=16, N=16, dtype=io)
                     bh = beta.wait()
                     bh.access(read=True, by="threads")
                     s_beta = params.s_beta + bh.index * (B_T * 4)
@@ -1518,6 +1560,7 @@ class KdaRecompute(WarpSpecialized):
             s_kdecay=addr["Kdecay"],
             s_krestore=addr["Krestore"],
             s_kinv=addr["Kinv"],
+            s_kdecay32=addr.get("Kdecay32", addr["Kinv"]),
             s_tinv=addr["Tinv"],
             s_ckpt=addr["Ckpt"],
             s_beta=addr["Beta"],
@@ -1590,6 +1633,8 @@ class KdaRecompute(WarpSpecialized):
             "Beta": cute.make_layout((B_T, RAW_STAGES)),
             "Ckpt": cute.make_layout((d_k * d_v, CKPT_STAGES)),
         }
+        if cutlass.const_expr(self.tf32_decay):
+            layouts["Kdecay32"] = cute.make_layout((d_k * B_T, DECAY_STAGES))
         if cutlass.const_expr(self.gate != "fp32"):
             layouts["Exchange"] = cute.make_layout((d_k * B_T, self.ex_stages))
         bound = self.work.bind((self.num_ctas, 1, 1))
