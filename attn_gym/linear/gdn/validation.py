@@ -7,6 +7,17 @@ import torch
 from attn_gym.linear._delta_rule.validation import validate_delta_rule_inputs
 
 
+def cast_to_kernel_dtypes(
+    gate: torch.Tensor, beta: torch.Tensor, initial_state: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Cast the gate, beta and entry state to the FP32 the GDN chunk kernels compute in.
+
+    Q/K/V run as given. Each cast is an autograd op, so gradients come back in the caller's
+    dtypes (a BF16 entry state gets a BF16 cotangent).
+    """
+    return gate.float(), beta.float(), None if initial_state is None else initial_state.float()
+
+
 def validate_gdn_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -44,4 +55,4 @@ def validate_gdn_inputs(
         )
 
 
-__all__ = ["validate_gdn_inputs"]
+__all__ = ["cast_to_kernel_dtypes", "validate_gdn_inputs"]

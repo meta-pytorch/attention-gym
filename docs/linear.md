@@ -101,8 +101,10 @@ and portable Triton kernels on other supported architectures. The `K = V = 64` b
 portable Triton on every architecture.
 
 The warpdrive chunk backend requires the optional `linear` dependencies and an SM100-family GPU,
-FP16/BF16 Q/K/V, FP32 state, and `K = V = 128` contract. It uses the same scalar natural-log gate
-contract and exact execution by default.
+FP16/BF16 Q/K/V, and `K = V = 128`. Like the fused backend it runs gate, beta, and entry
+states in FP32 (returning their gradients in the caller's dtypes), packs dense batches into one
+sequence per row, and copies operands whose layout its kernels cannot address. It uses the same
+scalar natural-log gate contract and exact execution by default.
 
 #### Scalar gate numerical range
 
@@ -483,16 +485,17 @@ The current fused KDA kernel requires key and value dimensions of 128. A pool ma
 stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[num_slots]`.
 
 `chunk_kda(..., kernel_options={"backend": "warpdrive"})` selects an opt-in SM100-family
-FP16/BF16 training backend for
-applications that already hold per-token natural-log gate increments. Q/K/V share one dtype. It uses
+training backend for applications that already hold per-token natural-log gate increments. It
+applies the fused backend's dtype policy: Q/K/V that share FP16 or BF16 run as given, FP32 or mixed
+Q/K/V run in BF16, gate, beta, and the entry state run in FP32, the output keeps `q.dtype`, and
+every gradient comes back in its operand's dtype. It uses
 warpdrive CuTeDSL kernels (CuTeDSL 4.6.2 or newer, the `[linear]` extra) and has no cuDNN Frontend
 runtime dependency. Like the other
 implementations, it returns `(output, final_state)`; request the latter with
-`output_final_state=True`. Dense no-state calls with complete 64-token chunks use the dense kernels
-and partial tails take the packed path with synthesized boundaries; packed/stateful calls pass
-explicit contiguous int32 boundaries and FP32 `[N, H, V, K]` states. Q/K/V/gate/state accept
-TMA-compatible innermost modes with aligned dynamic outer strides; beta requires an element-aligned
-contiguous inner mode. By default the forward uses the unsplit recurrence:
+`output_final_state=True`. Dense calls, including `B > 1`, run as one packed sequence per batch
+row. Operands with TMA-compatible innermost modes and aligned outer strides (beta: an
+element-aligned contiguous inner mode) are passed without copies; others are copied first, as in
+the fused backend. By default the forward uses the unsplit recurrence:
 one persistent work item per sequence and head, which leaves the GPU underused for a few
 long sequences at low head counts. FP16 and BF16 use unsplit backward execution by default; eligible
 packed no-state long contexts may use the warpdrive backward with one unsplit work item per

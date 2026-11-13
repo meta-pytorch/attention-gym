@@ -31,6 +31,8 @@ def pack_dense_batch(
     """
     batch, tokens = tensors[0].shape[:2]
     cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=tensors[0].device) * tokens
+    if batch == 1:  # already one packed row: skip a host-side view per tensor
+        return cu_seqlens, *tensors
     return cu_seqlens, *(
         tensor.reshape(1, batch * tokens, *tensor.shape[2:]) for tensor in tensors
     )

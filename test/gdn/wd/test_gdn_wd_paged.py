@@ -142,7 +142,7 @@ def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride() -> None:
             cu_seqlens=cu_seqlens,
             kernel_options=_WARPDRIVE,
         )
-    with torch.no_grad(), pytest.raises(TypeError, match="initial_state must be float32"):
+    with torch.no_grad(), pytest.raises(TypeError, match="state pool must use float32"):
         paged_chunk_gdn(
             q.detach(),
             k,

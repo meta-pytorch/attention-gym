@@ -20,7 +20,7 @@ from attn_gym.linear.gdn.ops import chunk_forward as fused_chunk_forward
 from attn_gym.linear.gdn.ops import paged_chunk_forward as fused_paged_chunk_forward
 from attn_gym.linear.gdn.ops import recurrent_decode_forward
 from attn_gym.linear.gdn.ops import recurrent_forward as fused_recurrent_forward
-from attn_gym.linear.gdn.validation import validate_gdn_inputs
+from attn_gym.linear.gdn.validation import cast_to_kernel_dtypes, validate_gdn_inputs
 from attn_gym.linear.types import (
     RECURRENT_OPTION_SPEC,
     SPLIT_OPTION_SPEC,
@@ -96,6 +96,7 @@ def chunk_gdn(
     validate_gdn_inputs(q, k, v, gate, beta, initial_state, cu_seqlens)
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
+        gate, beta, initial_state = cast_to_kernel_dtypes(gate, beta, initial_state)
         if options["backend"] == "warpdrive":
             return warpdrive_chunk_forward(
                 q,
@@ -202,6 +203,7 @@ def paged_chunk_gdn(
         has_initial_state,
     )
     scale = resolve_scale(scale, q.shape[-1])
+    gate, beta, _ = cast_to_kernel_dtypes(gate, beta, None)
     if options["backend"] == "warpdrive":
         return warpdrive_paged_chunk_forward(
             q,
