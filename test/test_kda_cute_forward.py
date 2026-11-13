@@ -14,13 +14,13 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym._backends import tune as tune_module
-from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
 
 pytest.importorskip("cutlass")
 
 from attn_gym.linear import ReplayState, chunk_kda, paged_chunk_kda
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd as _chunk_kda_bwd_module
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
@@ -49,8 +49,8 @@ from attn_gym.testing.kda import cumulative_sequence_offsets
 # These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
 pytestmark = [
     pytest.mark.skipif(
-        not cuda_runs_sm100_kernels(),
-        reason="the CuTeDSL KDA forward pipeline requires an SM100-family GPU",
+        not torch.cuda.is_available() or not uses_legacy_cute(torch.device("cuda")),
+        reason="the CuTeDSL KDA pipeline requires an SM100-family GPU and the legacy CuTe route",
     ),
     pytest.mark.usefixtures("fused_chunk_default"),
 ]

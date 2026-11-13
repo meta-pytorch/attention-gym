@@ -7,13 +7,13 @@ from typing import NamedTuple
 
 import torch
 
-from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute import (
     get_device_properties,
     normalize_compact_tensor,
     normalize_tma_rows,
 )
 from attn_gym._backends.triton.utils import requires_int64_offsets
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.span import zero_state
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.triton.group_sum import group_sum
@@ -58,12 +58,8 @@ def validate_supported_device(q: torch.Tensor) -> None:
 
 
 def use_blackwell_backward(q: torch.Tensor, v: torch.Tensor) -> bool:
-    """Select the fixed-D128 CuTe backward only on SM100-family targets."""
-    properties = get_device_properties(q.device)
-    return (
-        runs_sm100_kernels((properties.major, properties.minor))
-        and q.shape[-1] == v.shape[-1] == 128
-    )
+    """Select the fixed-D128 legacy CuTe backward only on SM100-family targets."""
+    return q.shape[-1] == v.shape[-1] == 128 and uses_legacy_cute(q.device)
 
 
 def require_fp32(**tensors: torch.Tensor | None) -> None:
