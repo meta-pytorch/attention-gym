@@ -302,8 +302,7 @@ def test_gdn_wd_backward_fake_preserves_leading_strides() -> None:
 
 # Each case is a fresh subprocess (a device assert poisons the CUDA context). Every state mode
 # runs eager and compiled, and every invalid-offset class (nonzero start, decreasing, past the
-# end) reaches both; test_ragged_chunk_scheduler_rejects_invalid_boundaries covers the shared
-# validator's individual branches.
+# end) reaches both; test_wd_invalid_offsets.py covers the other warpdrive schedules.
 @pytest.mark.parametrize(
     ("mode", "compiled", "offsets"),
     [

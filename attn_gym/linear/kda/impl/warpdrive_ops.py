@@ -9,6 +9,7 @@ import importlib
 import torch
 
 from attn_gym.linear._delta_rule.paged_state import PagedState
+from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
 # and exported programs that reference them still load.
@@ -133,6 +134,7 @@ def _packed_fwd_paged_cuda(
 ):
     if state_cache.dtype != torch.float32:
         raise TypeError("the warpdrive KDA state pool must use float32")
+    validate_packed_offsets_tensor(cu_seqlens, q.device)
     backend = _backend(q)
     paged_state = PagedState.validate(
         state_cache,

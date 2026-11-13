@@ -1,4 +1,4 @@
-"""Reject malformed warpdrive metadata before launching device-side validation on any CUDA GPU."""
+"""Reject malformed warpdrive metadata before launching the backend on any CUDA GPU."""
 
 from __future__ import annotations
 
@@ -23,12 +23,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 )
 @pytest.mark.parametrize("invalid", ["rank", "empty", "short", "dtype", "cpu"])
 def test_raw_forward_rejects_metadata_before_device_reads(op, invalid: str, monkeypatch):
-    """Raw callers must not reach the offset kernel with a malformed metadata tensor."""
-    from attn_gym.linear._delta_rule.triton import chunk_scheduler
-
-    scheduler = Mock(side_effect=AssertionError("malformed metadata reached the scheduler"))
+    """Raw callers must not reach the warpdrive kernels with a malformed metadata tensor."""
     backend = Mock(side_effect=AssertionError("malformed metadata reached the warpdrive backend"))
-    monkeypatch.setattr(chunk_scheduler, "_prepare_ragged_chunk_offsets", scheduler)
     monkeypatch.setattr(warpdrive_ops, "_forward_backend", backend)
     q = torch.zeros(1, 8, 1, 128, dtype=torch.bfloat16, device="cuda")
     gate = torch.zeros(1, 8, 1, device="cuda")
@@ -50,5 +46,4 @@ def test_raw_forward_rejects_metadata_before_device_reads(op, invalid: str, monk
         trailing = (128**-0.5,)
     with pytest.raises(TypeError, match="int32 vector on q.device"):
         op(*args, offsets, *trailing)
-    scheduler.assert_not_called()
     backend.assert_not_called()

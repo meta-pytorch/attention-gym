@@ -32,13 +32,14 @@ from .plan import int32
 # Staged KDA tensors: natural-log FP32 channel gate, FP32 post-sigmoid beta, normalized keys.
 
 
-@triton.jit(do_not_specialize=["rows"])
+@triton.jit(debug=True, do_not_specialize=["rows", "tokens"])
 def _select_summary_work(
     cu,
     bounds,
     work,
     count,
     rows,
+    tokens,
     HEADS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
     FIELDS: tl.constexpr,
@@ -48,11 +49,17 @@ def _select_summary_work(
     ``rows == 0`` selects every sequence; ``ROW_BLOCK`` is a power of two covering ``rows``, the
     only shape the kernel specializes on. Row layout follows ``work_tables.py``:
     ``[seq, head, write_start, write_end, compute_start, compute_end, token_start, token_stop,
-    final_dst, dstate_dst]``.
+    final_dst, dstate_dst]``. Like the other warpdrive prologues (``check_packed_offsets``), it
+    aborts with ``invalid packed cu_seqlens`` unless the offsets start at zero, never decrease,
+    and end within the ``tokens`` packed tokens, so the summary kernels never address through
+    them.
     """
     seq = tl.program_id(0)
     head = tl.program_id(1)
     start, stop = tl.load(cu + seq), tl.load(cu + seq + 1)
+    valid = (start <= stop) & ((seq != 0) | (start == 0))
+    valid &= (seq != tl.num_programs(0) - 1) | (stop <= tokens)
+    tl.device_assert(valid, "invalid packed cu_seqlens")
     bound = tl.arange(0, ROW_BLOCK)
     lo = tl.load(bounds + 2 * bound, bound < rows, other=-1)
     hi = tl.load(bounds + 2 * bound + 1, bound < rows, other=-1)
@@ -140,7 +147,9 @@ class _Launch:
     counters: torch.Tensor
 
     @classmethod
-    def prepare(cls, cu_seqlens: torch.Tensor, heads: int, bounds: torch.Tensor | None) -> _Launch:
+    def prepare(
+        cls, cu_seqlens: torch.Tensor, tokens: int, heads: int, bounds: torch.Tensor | None
+    ) -> _Launch:
         device = cu_seqlens.device
         sequences = cu_seqlens.shape[0] - 1
         work_items = torch.empty(
@@ -154,6 +163,7 @@ class _Launch:
             work_items,
             work_count,
             rows,
+            tokens,
             heads,
             max(1, triton.next_power_of_2(rows)),
             WORK_ITEM_FIELDS,
@@ -271,7 +281,7 @@ def build_state_summaries(
         dim_v, dim_k = v.shape[-1], k.shape[-1]
         maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
         if _launches(k.shape[1], bounds):
-            launch = _Launch.prepare(cu_seqlens, heads, bounds)
+            launch = _Launch.prepare(cu_seqlens, k.shape[1], heads, bounds)
             _forward_summary(
                 k[0],
                 v[0],
@@ -317,7 +327,7 @@ def build_state_grad_summaries(
         if not _launches(q.shape[1], bounds):
             return _summary_rows(maps, cu_seqlens, bounds)
         if transpose_forward_transition:
-            forward = _Launch.prepare(cu_seqlens, heads, bounds)
+            forward = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds)
             state = torch.empty(
                 sequences, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
             )
@@ -328,7 +338,7 @@ def build_state_grad_summaries(
             maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
         elif dim_v != dim_k:
             raise ValueError("the identity reverse probe requires V == K")
-        launch = _Launch.prepare(cu_seqlens, heads, bounds)
+        launch = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds)
         _reverse_summary(
             q[0],
             k[0],
