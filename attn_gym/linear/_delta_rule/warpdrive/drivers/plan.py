@@ -55,6 +55,62 @@ class ChainCost(NamedTuple):
     overhead_tokens: int
 
 
+# NOTE [Summary split cost]
+# A staged summary walks each subsequence's chunks serially, one CTA per (subsequence, head), so
+# a few long subsequences leave most SMs idle. Cut into pieces of ``span`` chunks, the pieces
+# run in parallel and their maps compose on the state chain, one step per piece. In chunk steps
+# of the uncut summary, a subsequence of n chunks then costs
+#
+#     span * (1 + cost.fill * fill) + ceil(n / span) * cost.compose + cost.overhead
+#
+# instead of n, where fill = min(1, kernels * pieces * heads / num_sm) is the share of the SMs
+# the ``cost.kernels`` concurrent summary kernels' pieces occupy. The host sees only the span's
+# token count, so n assumes equal subsequences; the span is the cheapest one of at least
+# SUMMARY_MIN_TOKENS tokens whose pieces fit one wave, and the summary splits when that beats n.
+# Each SummaryCost was fitted on a 152-SM GB300 (SM103) to CUDA-graph timings of the summary
+# entry points, BF16, 1 and 2 subsequences of 512-16384 tokens at 1-16 heads, spans of 2-152
+# pieces (2026-11-13). Over those 240 shapes the chosen span was within 8% of the fastest one
+# (or of uncut where that won) except GDN's forward on 2x4096 tokens at 16 heads, left uncut at
+# 1.2x the best split. No measured winner had pieces shorter than SUMMARY_MIN_TOKENS.
+SUMMARY_MIN_TOKENS = 128
+
+
+class SummaryCost(NamedTuple):
+    """One summary direction's split cost; see NOTE [Summary split cost]."""
+
+    compose: float  # one composition step, in summary chunk steps
+    overhead: float  # the planner, scratch clears and the chain's fixed cost, in chunk steps
+    fill: float  # slowdown of a piece's chunk steps on a full grid
+    kernels: int = 1  # summary kernels sharing the SMs at once
+
+
+def summary_span(
+    tokens: int, num_seqs: int, heads: int, device, *, b_t: int, cost: SummaryCost
+) -> int:
+    """Chunks per piece of a split summary, 0 to run every subsequence uncut (see NOTE
+    [Summary split cost])."""
+    return _summary_span(tokens, num_seqs, heads, _num_sm(device), b_t, cost)
+
+
+@functools.lru_cache(maxsize=256)
+def _summary_span(
+    tokens: int, num_seqs: int, heads: int, num_sm: int, b_t: int, cost: SummaryCost
+) -> int:
+    num_seqs = max(1, num_seqs)
+    chunks = -(-tokens // (b_t * num_seqs))
+    wave = num_sm // (max(1, heads) * cost.kernels)
+    best, best_cost = 0, chunks - cost.overhead
+    for pieces in range(2, wave // num_seqs + 1):
+        span = -(-chunks // pieces)
+        if span * b_t < SUMMARY_MIN_TOKENS:
+            break
+        fill = min(1.0, cost.kernels * num_seqs * pieces * heads / num_sm)
+        split = span * (1 + cost.fill * fill) + -(-chunks // span) * cost.compose
+        if split < best_cost:
+            best, best_cost = span, split
+    return best
+
+
 def int32(n: int, device) -> torch.Tensor:
     return torch.empty(n, dtype=torch.int32, device=device)
 

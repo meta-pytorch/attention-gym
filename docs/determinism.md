@@ -192,10 +192,11 @@ Pass `kernel_options={"backend": "fused"}` to get the fused guarantees above ins
   the same inputs and shapes reproduces the output, final-state and gradient bits
   (`test/test_linear_default_backend.py`).
 - **Across batch compositions: not bitwise.** The plan (forward and backward piece chains, the
-  KDA value split and its prep pass) follows the packed shape and the SM count, so a
-  sequence's bits can change with the other sequences packed beside it, and between GPU models
-  with different SM counts. [Document-aligned
-  fragments](linear.md#document-aligned-fragments-cp-invariant-bits) gives measured examples.
+  KDA value split and its prep pass, the piece length of the staged and context-parallel
+  summaries) follows the packed shape and the SM count, so a sequence's bits can change with
+  the other sequences packed beside it, and between GPU models with different SM counts.
+  [Document-aligned fragments](linear.md#document-aligned-fragments-cp-invariant-bits) gives
+  measured examples.
 - **Against the fused backend: never bitwise.** KDA chunks at 16 tokens on warpdrive and at 64
   on the fused kernels; GDN chunks at 64 on both but with different kernels.
 - **CUDA-graph replay: bitwise** for the same inputs. A graph captured at a larger capacity

@@ -762,6 +762,9 @@ LAYOUTS = {
     "one-document-dense": ((0, 384), [[(0, 192)], [(192, 384)]]),
     # Same, cut mid-chunk: whole subsequences that fall back to a packed schedule.
     "one-document-partial-chunk": ((0, 384), [[(0, 200)], [(200, 384)]]),
+    # A long document beside a short one: warpdrive splits the long subsequences' summaries into
+    # pieces in both directions (NOTE [Summary split cost]).
+    "long-document-split": ((0, 3000, 3100), [[(0, 1500)], [(1500, 3100)]]),
 }
 # Routing and summary composition do not depend on the input dtype: FP16 runs one packed
 # multi-fragment layout and the dense one, which between them reach both kernel schedules.
