@@ -20,6 +20,11 @@ GATE_LOWER_BOUND_SAFETY_MARGIN = 1e-3
 MAX_GATE_LOWER_BOUND_MAGNITUDE = (
     FP32_EXPONENT_BUDGET / (GATE_SPAN_STEPS * LOG2_E) - GATE_LOWER_BOUND_SAFETY_MARGIN
 )
+# Per-token gate magnitude the warpdrive BF16 kernels (the SM100-family default) support: past a
+# uniform -5.25 their gradient error grows quickly, and from -126 ln 2 per aligned 16-token sum
+# (a uniform -5.45) results stop being finite. Empirical, unlike the fused bound above; see the
+# KDA gate contract in docs/linear.md.
+WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE = 5.25
 
 
 __all__ = [
@@ -29,4 +34,5 @@ __all__ = [
     "LN2",
     "LOG2_E",
     "MAX_GATE_LOWER_BOUND_MAGNITUDE",
+    "WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE",
 ]

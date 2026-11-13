@@ -19,6 +19,9 @@ requires_blackwell = pytest.mark.skipif(
     reason="the BF16 KDA intra engine requires an SM100-family GPU",
 )
 
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = pytest.mark.usefixtures("fused_chunk_default")
+
 
 def test_warpdrive_precision_request_is_rejected_before_cuda_dispatch(monkeypatch):
     warpdrive = importlib.import_module("attn_gym.linear.kda.impl.warpdrive")

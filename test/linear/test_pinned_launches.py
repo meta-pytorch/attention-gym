@@ -31,10 +31,14 @@ from attn_gym.testing import cumulative_sequence_offsets
 from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import make_kda_test_inputs
 
-pytestmark = pytest.mark.skipif(
-    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8),
-    reason="fused delta-rule kernels require CUDA capability 8.0+",
-)
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(
+        not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8),
+        reason="fused delta-rule kernels require CUDA capability 8.0+",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 TOKENS = 192
 Tensors = tuple[torch.Tensor, ...]

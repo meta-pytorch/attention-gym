@@ -14,9 +14,10 @@ K3 model. Launch with:
 
 Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to vary the recipe.
 ``--partition documents`` assigns whole documents to ranks (``document_aligned_fragments``): no
-document crosses ranks, so the delta-rule op exchanges no state and its result is bitwise
-independent of the CP degree (``test/test_context_parallel_distributed.py``, table ``documents``).
-``--core-backend warpdrive`` runs each rank's local KDA or GDN pass on warpdrive (SM100 family).
+document crosses ranks, so the delta-rule op exchanges no state, and with ``--core-backend fused``
+its result is bitwise independent of the CP degree (``test/test_context_parallel_distributed.py``,
+table ``documents``). ``--core-backend`` selects each rank's local KDA or GDN kernels: ``auto``
+(the default: warpdrive on SM100-family GPUs), ``fused`` (repo-local), or ``warpdrive``.
 ``--cuda-graph`` checks a changed-input replay; ``--profile`` writes a merged native Perfetto
 trace. ``--no-validate`` skips the unsharded reference at scales where it does not fit. Batch
 construction, loss/backward, and capture are shown in ``delta_rule_training.py`` and imported here.
@@ -260,14 +261,15 @@ def main(
         typer.Option(
             "--core-backend",
             "--kda-backend",
-            help="Local KDA/GDN chunk kernels: fused or warpdrive (SM100).",
+            help="Local KDA/GDN chunk kernels: auto (warpdrive on SM100-family GPUs), fused, or "
+            "warpdrive.",
         ),
-    ] = CoreBackendOption.FUSED,
+    ] = CoreBackendOption.AUTO,
     fastmath: Annotated[
         bool,
         typer.Option(
             help="Permit approximate gating math (default); --no-fastmath requests non-fast "
-            "math and is unsupported by native warpdrive KDA."
+            "math, which auto runs on repo-local KDA kernels and explicit warpdrive KDA rejects."
         ),
     ] = True,
     batch_size: Annotated[
@@ -355,15 +357,13 @@ def main(
             ContextParallelDeltaRuleAttention,
             **model_options,
             group=dist.group.WORLD,
-            kernel_options={"backend": core_backend.value}
-            if core_backend is CoreBackendOption.WARPDRIVE
-            else None,
+            kernel_options=core_backend.kernel_options(),
         )
         model = make_model()
 
         # --validate checks outputs and gradients against the complete unsharded model.
         if validate:
-            reference = DeltaRuleAttention(**model_options)
+            reference = DeltaRuleAttention(**model_options, kernel_options={"backend": "fused"})
             reference.load_state_dict(model.state_dict())
             validate_against_reference(model, reference, batch)
             del reference  # Free the full-model oracle before capturing a graph pool.

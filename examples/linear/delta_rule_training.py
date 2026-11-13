@@ -71,6 +71,7 @@ from attn_gym.linear.context_parallel import ContextParallelPlan, ContextParalle
 from attn_gym.linear.gdn import chunk_gdn
 from attn_gym.linear.kda import (
     MAX_GATE_LOWER_BOUND_MAGNITUDE,
+    WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE,
     active_token_mask,
     causal_conv1d,
     chunk_kda,
@@ -121,8 +122,13 @@ class ComputeDTypeOption(str, Enum):
 class CoreBackendOption(str, Enum):
     """Chunk-core kernel families selectable through ``kernel_options``."""
 
+    AUTO = "auto"
     FUSED = "fused"
     WARPDRIVE = "warpdrive"
+
+    def kernel_options(self) -> KernelOptions | None:
+        """Return the chunk-core options; ``AUTO`` keeps the op's default."""
+        return None if self is CoreBackendOption.AUTO else {"backend": self.value}
 
 
 def packed_sequence_metadata(
@@ -173,9 +179,11 @@ class DeltaRuleAttention(nn.Module):
     and the bounded ``gate_transform``; ``variant="gdn"`` learns one softplus log decay per head
     through ``a_proj``. ``lower_bound`` applies to the KDA gate only; ``fastmath`` applies to
     both fused gates and to the KDA core. Its default ``True`` permits approximate math;
-    reference execution keeps ordinary PyTorch math, and native warpdrive KDA rejects ``False``.
-    ``kernel_options`` are passed through to the chunk
-    core (``{"backend": "warpdrive"}`` selects the SM100 warpdrive kernels for either variant).
+    reference execution keeps ordinary PyTorch math, and the default chunk backend runs ``False``
+    on the repo-local kernels (explicit warpdrive KDA rejects it). ``kernel_options`` are passed
+    through to the chunk core, whose default runs warpdrive on SM100-family GPUs for either variant;
+    ``{"backend": "fused"}`` keeps the repo-local kernels. Unless the KDA core is pinned to the
+    repo-local kernels, ``lower_bound`` must respect warpdrive's narrower gate range.
 
     Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
@@ -218,14 +226,17 @@ class DeltaRuleAttention(nn.Module):
             raise ValueError(f"variant must be 'kda' or 'gdn', got {variant!r}")
         if variant == "kda" and (not math.isfinite(lower_bound) or lower_bound > 0.0):
             raise ValueError(f"lower_bound must be finite and nonpositive, got {lower_bound}")
-        if (
-            variant == "kda"
-            and backend == "fused"
-            and lower_bound < -MAX_GATE_LOWER_BOUND_MAGNITUDE
-        ):
+        # Default calls may run warpdrive, whose gate range is narrower than the fused kernels'.
+        core_backend = (kernel_options or {}).get("backend", "auto")
+        max_magnitude = (
+            MAX_GATE_LOWER_BOUND_MAGNITUDE
+            if core_backend == "fused"
+            else WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE
+        )
+        if variant == "kda" and backend == "fused" and lower_bound < -max_magnitude:
             raise ValueError(
-                f"the fused backend requires lower_bound >= "
-                f"{-MAX_GATE_LOWER_BOUND_MAGNITUDE:.3f}, got {lower_bound}"
+                f"the {core_backend} KDA core requires lower_bound >= {-max_magnitude:.3f}, "
+                f"got {lower_bound}"
             )
         if backend == "fused" and (
             (variant == "kda" and head_dim != 128)
@@ -906,13 +917,17 @@ def main(
     ] = None,
     core_backend: Annotated[
         CoreBackendOption,
-        typer.Option(help="Chunk kernels for the fused backend: repo-local or warpdrive (SM100)."),
-    ] = CoreBackendOption.FUSED,
+        typer.Option(
+            help="Chunk kernels for the fused backend: auto (warpdrive on SM100-family GPUs), "
+            "repo-local fused, or warpdrive."
+        ),
+    ] = CoreBackendOption.AUTO,
     fastmath: Annotated[
         bool,
         typer.Option(
             help="Permit approximate gating math (default); --no-fastmath requests non-fast "
-            "math and is unsupported by native warpdrive KDA. Reference math is unchanged."
+            "math, which auto runs on repo-local KDA kernels and explicit warpdrive KDA "
+            "rejects. Reference math is unchanged."
         ),
     ] = True,
     steps: Annotated[int, typer.Option(min=1, help="Number of optimizer steps.")] = 2,
@@ -964,11 +979,7 @@ def main(
         short_conv_kernel_size=short_conv_kernel_size,
         backend=backend.value,
         fastmath=fastmath,
-        kernel_options=(
-            {"backend": core_backend.value}
-            if core_backend is CoreBackendOption.WARPDRIVE
-            else None
-        ),
+        kernel_options=core_backend.kernel_options(),
         compute_dtype=(None if compute_dtype is None else getattr(torch, compute_dtype.value)),
         device=device,
     )

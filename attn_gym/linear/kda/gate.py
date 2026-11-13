@@ -33,7 +33,10 @@ def bound_gate(
         raw_gate: Floating-point projection output shaped ``[B, T, H, D]``.
         A_log: FP32 per-head log scale shaped ``[H]``.
         dt_bias: FP32 per-channel bias shaped ``[H, D]``.
-        lower_bound: Finite nonpositive gate floor.
+        lower_bound: Finite nonpositive gate floor. For ``chunk_kda`` keep it at or above
+            ``-WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`` (about ``-5.25``) when the call runs
+            warpdrive, the BF16 default on SM100-family GPUs, and at or above
+            ``-MAX_GATE_LOWER_BOUND_MAGNITUDE`` (about ``-5.914``) on the fused backend.
         fastmath: Allow approximate gating exponentials (default ``True``). ``False`` selects
             non-fast forward and backward math. Reference execution uses normal PyTorch math
             for either value; ``chunk_kda`` has its own flag.

@@ -120,6 +120,20 @@ def requires_blackwell() -> None:
 
 
 @pytest.fixture
+def fused_chunk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make chunk calls that name no ``kernel_options["backend"]`` run the fused kernels.
+
+    For modules that test the repo-local fused kernels through the public default, which runs
+    warpdrive on SM100-family GPUs (docs/linear.md, "Chunk backend selection").
+    """
+    from attn_gym.linear import types
+
+    for spec in (types.SPLIT_OPTION_SPEC, types.KERNEL_OPTION_SPEC):
+        accepted, _ = spec["backend"]
+        monkeypatch.setitem(spec, "backend", (accepted, "fused"))
+
+
+@pytest.fixture
 def traced_compiles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep this test's compiles out of the jit_cache disk cache (``CUTE_DSL_NO_CACHE``).
 

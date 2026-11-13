@@ -641,11 +641,11 @@ def test_warpdrive_document_aligned_spans_are_bitwise_equal(kda_plan_comparison)
 def test_warpdrive_kernel_options_are_strict() -> None:
     from attn_gym.linear.kda.validation import ResolvedKernelOptions, resolve_kernel_options
 
-    fused = ResolvedKernelOptions(
-        "fused", split_backward=False, split_forward=False, autotune=True
+    default = ResolvedKernelOptions(
+        "auto", split_backward=False, split_forward=False, autotune=True
     )
-    assert resolve_kernel_options(None) == fused
-    assert resolve_kernel_options({}) == fused
+    assert resolve_kernel_options(None) == default
+    assert resolve_kernel_options({}) == default
     assert resolve_kernel_options({"backend": "warpdrive", "split_backward": True}) == (
         ResolvedKernelOptions("warpdrive", split_backward=True, split_forward=False, autotune=True)
     )
@@ -654,7 +654,7 @@ def test_warpdrive_kernel_options_are_strict() -> None:
     )
     with pytest.raises(ValueError, match="unsupported chunk_kda kernel options"):
         resolve_kernel_options({"unknown": True})
-    with pytest.raises(ValueError, match="must be 'fused' or 'warpdrive'"):
+    with pytest.raises(ValueError, match="must be 'auto', 'fused', or 'warpdrive'"):
         resolve_kernel_options({"backend": "triton"})
     for name in ("split_backward", "split_forward"):
         with pytest.raises(TypeError, match="must be a bool"):

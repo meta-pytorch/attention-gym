@@ -62,6 +62,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 from attn_gym.linear.kda.validation import (
+    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
     validate_warpdrive_fastmath,
@@ -273,9 +274,10 @@ def chunk_kda_prepare(
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
-    Pass the same value to ``chunk_kda_prepare_backward``. Native warpdrive requires ``True``.
-    ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both summaries with
-    warpdrive's kernels. Split schedules are not available with entry states. ``"autotune"``
+    Pass the same value to ``chunk_kda_prepare_backward``. ``"backend"`` selects the kernels
+    of the local pass and both summaries as in ``chunk_kda``, so the default runs warpdrive on
+    SM100-family GPUs except for FP16 and ``fastmath=False``; explicit warpdrive requires
+    ``fastmath=True``. Split schedules are not available with entry states. ``"autotune"``
     follows ``chunk_kda``.
     """
     backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
@@ -293,6 +295,7 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
+    backend = resolve_kda_backend(backend, q, k, v, fastmath=fastmath)
     if backend == "warpdrive":
         validate_warpdrive_available(q)
         if cu_seqlens is None:
