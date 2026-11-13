@@ -138,8 +138,9 @@ What the table does not constrain:
 CUDA Graph replay follows from that bound. ``plan.routing(device)`` turns a layout into device
 tensors: the span's ``cu_seqlens``, one ``[start, stop)`` per fragment for the summary launches
 (empty when the fragment sends nothing), per-fragment predecessor and successor slots as flat
-indices padded with an identity slot, and per-segment source maps. Eager callers take the default
-sizes. For replay, pass the caps the loader promises never to exceed, ``routing(device, slots=S,
+indices padded with an identity slot, links between their prefix checkpoints, and per-segment
+source maps. Eager callers take the default sizes. For replay, pass the caps the loader promises
+never to exceed, ``routing(device, slots=S,
 max_subsequences=N)``: every layout within them, whatever its documents or fragment table, yields
 identically shaped tensors, so ``context_parallel_chunk``, which reads every index from them, is
 captured once and replayed after copying the next layout's tensors in place. The span length is the
@@ -305,6 +306,11 @@ class ContextParallelRouting:
             indices of the slots before each fragment in its sequence, in token order, padded
             with ``world * slots`` (the identity).
         successors: Same for each fragment's successors, in reverse token order.
+        predecessor_links: ``int32 [slots, 3]`` checkpoint links: chain length, next local
+            row (or -1), and number of checkpoints on a root (zero on continuation rows).
+            Linked rows are increasing prefixes of one document's predecessor chain.
+        successor_links: Same for reverse folds, grouped by each fragment's last document.
+            Copy links together with their source tables when replacing a captured layout.
         entry_sources: ``int64 [max_subsequences]`` local fragment whose folded predecessors are
             a segment's entry state, or ``slots`` for a segment that starts its sequence.
         exit_sources: Same for exit cotangents: the fragment whose folded successors apply, or
@@ -328,6 +334,8 @@ class ContextParallelRouting:
     reverse_sources: torch.Tensor
     predecessors: torch.Tensor
     successors: torch.Tensor
+    predecessor_links: torch.Tensor
+    successor_links: torch.Tensor
     entry_sources: torch.Tensor
     exit_sources: torch.Tensor
     terminal: torch.Tensor
@@ -571,12 +579,47 @@ class ContextParallelPlan:
             reverse_sources=tensor(reverse_sources, torch.int64),
             predecessors=tensor(predecessors, torch.int64),
             successors=tensor(successors, torch.int64),
+            predecessor_links=tensor(
+                _checkpoint_links(self.predecessors, self.fragments, slots, reverse=False),
+                torch.int32,
+            ),
+            successor_links=tensor(
+                _checkpoint_links(self.successors, self.fragments, slots, reverse=True),
+                torch.int32,
+            ),
             entry_sources=tensor(entry_sources, torch.int64),
             exit_sources=tensor(exit_sources, torch.int64),
             terminal=tensor(terminal, torch.bool),
             tail_sources=tensor(tail_sources, torch.int64),
             conv_sources=tensor(conv_sources, torch.int64),
         )
+
+
+def _checkpoint_links(
+    chains: Sequence[Sequence[Slot]],
+    fragments: Sequence[Fragment],
+    slots: int,
+    *,
+    reverse: bool,
+) -> list[list[int]]:
+    """Link this rank's nonempty chains by document, in increasing prefix length."""
+    links = [[0, -1, 1] for _ in range(slots)]
+    documents: dict[int, list[int]] = {}
+    for row, (chain, fragment) in enumerate(zip(chains, fragments, strict=True)):
+        links[row][0] = len(chain)
+        if chain:
+            document = fragment[-1 if reverse else 0].sequence
+            documents.setdefault(document, []).append(row)
+    for rows in documents.values():
+        rows.sort(key=lambda row: len(chains[row]))
+        for previous, following in pairwise(rows):
+            # The plan's exact tiling makes these chains strictly nested prefixes.
+            assert len(chains[previous]) < len(chains[following])
+            assert chains[following][: len(chains[previous])] == chains[previous]
+            links[previous][1] = following
+            links[following][2] = 0
+        links[rows[0]][2] = len(rows)
+    return links
 
 
 def _all_gather_slots(local_slots: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
@@ -601,6 +644,14 @@ def fold_slots(gathered: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
     return fold_slots_fused(gathered.flatten(0, 1), sources)
 
 
+def _fold_routed_slots(
+    gathered: torch.Tensor, sources: torch.Tensor, links: torch.Tensor
+) -> torch.Tensor:
+    from attn_gym.linear._delta_rule.triton.fold_slots import fold_slots_linked
+
+    return fold_slots_linked(gathered.flatten(0, 1), sources, links)
+
+
 def _scatter_folds(folded: torch.Tensor, sources: torch.Tensor) -> torch.Tensor:
     """Map ``[slots, ...]`` folded states onto span segments; source ``slots`` selects zero."""
     return torch.cat((folded, folded.new_zeros(1, *folded.shape[1:])))[sources]
@@ -612,7 +663,10 @@ def compose_entry_states(gathered: torch.Tensor, routing: ContextParallelRouting
     ``gathered`` is ``[world, slots, HV, V + K, K]``; the result is
     ``[max_subsequences, HV, V, K]``, zero for every segment that starts its sequence.
     """
-    return _scatter_folds(fold_slots(gathered, routing.predecessors), routing.entry_sources)
+    return _scatter_folds(
+        _fold_routed_slots(gathered, routing.predecessors, routing.predecessor_links),
+        routing.entry_sources,
+    )
 
 
 def compose_exit_cotangents(
@@ -623,7 +677,10 @@ def compose_exit_cotangents(
     ``d_final_state`` is the loss's own cotangent on every segment's exit state (zeros where the
     loss does not touch it); the fold adds what flows back from other ranks.
     """
-    incoming = _scatter_folds(fold_slots(gathered, routing.successors), routing.exit_sources)
+    incoming = _scatter_folds(
+        _fold_routed_slots(gathered, routing.successors, routing.successor_links),
+        routing.exit_sources,
+    )
     return incoming + d_final_state
 
 
@@ -783,8 +840,10 @@ class _ContextParallelChunk(torch.autograd.Function):
             routing.reverse_bounds,
             routing.reverse_sources,
             routing.successors,
+            routing.successor_links,
             routing.exit_sources,
         )
+        ctx.saved_count = len(saved)
         ctx.saved_type = type(saved)
         ctx.scale = prepared.scale
         ctx.routing = routing
@@ -796,7 +855,7 @@ class _ContextParallelChunk(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, d_output, d_final_state):
-        *saved, initial_state = ctx.saved_tensors[:-4]
+        *saved, initial_state = ctx.saved_tensors[: ctx.saved_count + 1]
         routing = ctx.routing
         if d_final_state is None:  # set_materialize_grads(False): the loss ignores the states
             d_final_state = torch.zeros_like(initial_state)
