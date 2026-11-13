@@ -106,6 +106,7 @@ def make_kda_test_inputs(
     seed: int = 41,
     gate_scale: float = 5.0,
     gate_value: float | None = None,
+    sigmoid_gate_bound: float | None = None,
     log_uniform_gate: bool = True,
     sigmoid_beta: bool = False,
     dtype: torch.dtype = torch.bfloat16,
@@ -113,7 +114,11 @@ def make_kda_test_inputs(
     value_scale: float = 1.0,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Create deterministic public KDA inputs with model-range values and log gates."""
+    """Create deterministic public KDA inputs with model-range values and log gates.
+
+    ``gate_value`` gives uniform gates; ``sigmoid_gate_bound`` Kimi-style bounded gates
+    ``-bound * sigmoid(2 z)`` with standard normal ``z``.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     shape = (batch, tokens, heads, 128)
     if normalize_qk:
@@ -127,6 +132,9 @@ def make_kda_test_inputs(
     value = (_model_rows(shape, generator) * value_scale).to(dtype)
     if gate_value is not None:
         gate = torch.full(shape, gate_value, device="cuda")
+    elif sigmoid_gate_bound is not None:
+        z = torch.randn(shape, device="cuda", generator=generator)
+        gate = -sigmoid_gate_bound * torch.sigmoid(2 * z)
     elif log_uniform_gate:
         gate = (
             torch.empty(shape, device="cuda")

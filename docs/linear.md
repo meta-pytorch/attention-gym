@@ -501,9 +501,22 @@ the bound. On the same relative-RMS workload the forward error also roughly doub
 from a separate, milder factor. A sum concentrated on the first token of its 16-token box leaves
 the backward no headroom: with the whole decay on one token of a 48-token sequence, dq and dgate
 were non-finite for 0 of 20 seeds at `-86.5`, 1 of 20 at `-86.9` and 10 of 20 at `-87.3`.
-Upstream cuDNN Frontend behaves identically. warpdrive stages these MMA operands in the Q/K dtype
-rather than TF32, so warpdrive FP16 does not support usual model-range gates. These limits are not
-checked at runtime. The training example uses the Kimi-style FP32 transform
+Upstream cuDNN Frontend behaves identically. FP16 cannot hold the in-chunk decay factors (their
+ratio reaches `2^121` at a uniform `-5.25`), so the warpdrive FP16 forward forms the in-chunk
+products from TF32 decay operands and shares the BF16 forward's finiteness bound: it is
+non-finite past the same `-126 * ln(2)` bound. On the workload above, output relative RMS error
+stayed at 0.05% from `-0.5` to `-5.25` and for the Kimi-style gates (fused FP16: 0.08%). Finite
+does not mean accurate near the bound, in either dtype: a decayed operand too small for its TF32
+(BF16) operand rounds to zero before the inverse decay cancels it. With sixteen `-5.45` gates,
+`k = e0` and a query component of `2^-13` on that channel (`scale=1`, only the last token
+writing a unit value), the output was 0 instead of `2^-13`, with or without `fastmath`. The
+products with the recurrent state also still read FP16 `Q_decay` and `K_decay`, which flush below
+the FP16 range: with five `-3.5` gates, an entry-state value of 4096, a unit query selecting it
+and `beta = 0`, warpdrive and fused FP16 both returned 0 where the exact output is the
+FP16-normal `1.03e-4` (BF16: `1.03e-4`). The FP16 backward still stages its decay operands in
+FP16 and does not support usual model-range gates: its gradients are non-finite from a uniform
+gate of about `-1`. These limits are not checked at runtime. The training example uses the
+Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
