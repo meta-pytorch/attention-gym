@@ -551,6 +551,15 @@ replay_state.count.zero_()
 The current fused KDA kernel requires key and value dimensions of 128. A pool may pad the
 stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[num_slots]`.
 
+Replay runs on either chunk backend. Triton kernels maintain the replay caches for both, and the
+prefix and tail chunk passes run on the backend that `kernel_options["backend"]` selects. The
+result reproduces that backend's `chunk_kda` over the whole stream bit for bit whenever both run
+the same plan. The fused backend has a single plan. warpdrive's plan depends on how many sequences
+are packed: with few sequences times heads per GPU it splits the value dimension, and that split
+rounds differently from the unsplit plan. A replay step can therefore differ, at rounding level,
+from a `chunk_kda` call that packs a different number of sequences
+([Determinism](determinism.md#warpdrive-chunk-kernels)).
+
 `chunk_kda` runs the warpdrive training backend by default on SM100-family GPUs
 ([Chunk backend selection](#chunk-backend-selection)); `kernel_options={"backend": "warpdrive"}`
 forces it. It applies the fused backend's dtype policy: Q/K/V that share FP16 or

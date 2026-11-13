@@ -4,10 +4,13 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only, resolve_scale
+from attn_gym.linear.kda.impl.replay import replay_paged_chunk_forward
 from attn_gym.linear.kda.impl.warpdrive_ops import (
     chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
     chunk_warpdrive_packed_bwd_with_state_op,
@@ -19,6 +22,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 from attn_gym.linear.kda.validation import cast_to_kernel_dtypes
+from attn_gym.linear.types import ReplayState
 
 
 def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
@@ -207,16 +211,60 @@ def paged_chunk_forward(
     cu_seqlens: torch.Tensor | None,
     has_initial_state: torch.Tensor | None,
     scale: float,
+    replay_state: ReplayState | None = None,
 ) -> torch.Tensor:
-    """Advance selected state-cache slots with the warpdrive KDA kernel."""
+    """Advance selected state-cache slots with the warpdrive KDA kernels, optionally through
+    replay-backed decode and prefill."""
     require_inference_only(
-        (q, k, value, gate, beta, state_cache),
+        (q, k, value, gate, beta, state_cache, *(replay_state or ())),
         "paged_chunk_kda is inference-only; call under torch.no_grad() or torch.inference_mode()",
     )
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
     validate_warpdrive_constraints(q, value)
+    paged_forward = partial(_paged_chunk_state_forward, scale=scale)
+    if replay_state is None:
+        return paged_forward(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            state_cache,
+            state_indices,
+            cu_seqlens=cu_seqlens,
+            has_initial_state=has_initial_state,
+        )
+    return replay_paged_chunk_forward(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        replay_state,
+        cu_seqlens=cu_seqlens,
+        has_initial_state=has_initial_state,
+        chunk_forward=partial(chunk_forward, scale=scale),
+        paged_forward=paged_forward,
+    )
 
+
+def _paged_chunk_state_forward(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    value: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    state_cache: torch.Tensor,
+    state_indices: torch.Tensor,
+    *,
+    cu_seqlens: torch.Tensor | None,
+    has_initial_state: torch.Tensor | None,
+    scale: float,
+) -> torch.Tensor:
+    """Advance selected state-cache slots with the paged warpdrive KDA forward."""
     output_dtype, output_shape = q.dtype, value.shape
     q, k, value, gate, beta = cast_to_kernel_dtypes(q, k, value, gate, beta)
     if cu_seqlens is None:

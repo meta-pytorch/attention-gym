@@ -252,7 +252,7 @@ def paged_chunk_kda(
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
         kernel_options: Backend-specific options. ``"backend"`` selects the kernels as in
-            ``chunk_kda``; replay-backed calls run only on the fused backend.
+            ``chunk_kda``; the default runs replay-backed calls on the fused backend.
             ``split_backward`` and ``split_forward`` are not supported by this paged
             operation; ``schedule`` applies as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the repo-local fused kernels;
@@ -304,8 +304,6 @@ def paged_chunk_kda(
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
-        if options.backend == "warpdrive":
-            raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
         num_slots = state_cache.shape[0]
         layout = ReplayState.slot_layout(q.shape[2], q.shape[3], value_dim=v.shape[3])
         for name, tensor, (slot_shape, expected_dtype) in zip(
@@ -357,6 +355,7 @@ def paged_chunk_kda(
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
             scale=resolve_scale(None, q.shape[-1]),
+            replay_state=replay_state,
         )
     return _fused_paged_chunk_forward(
         q,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import torch
 
 from attn_gym._backends.autotune import should_autotune
@@ -14,6 +16,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear.kda.impl.replay import replay_paged_chunk_forward
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -22,11 +25,6 @@ from attn_gym.linear.kda.ops import (
     chunk_fwd_ragged_paged_op,
     chunk_fwd_ragged_with_state_op,
     chunk_fwd_with_state_op,
-    chunk_replay_commit_op,
-    chunk_replay_prefill_commit_op,
-    chunk_replay_prefill_prepare_op,
-    chunk_replay_prepare_op,
-    chunk_replay_state_gather_op,
 )
 from attn_gym.linear.kda.validation import cast_to_kernel_dtypes
 from attn_gym.linear.types import ReplayState
@@ -306,144 +304,25 @@ def paged_chunk_forward(
             schedule=schedule,
         )
 
-    replay_q, replay_k, replay_v, replay_gate, replay_beta, replay_count = replay_state
-    if cu_seqlens is None and q.shape[1] == 1:
-        (
-            active_q,
-            active_k,
-            active_v,
-            active_gate,
-            active_beta,
-            active_state,
-            active_counts,
-        ) = chunk_replay_prepare_op(
-            q.to(torch.bfloat16),
-            k.to(torch.bfloat16),
-            v.to(torch.bfloat16),
-            gate.float(),
-            beta.float(),
-            state_cache,
-            replay_q,
-            replay_k,
-            replay_v,
-            replay_gate,
-            replay_beta,
-            replay_count,
-            state_indices,
-            has_initial_state,
-        )
-        output, final_state = chunk_forward(
-            active_q,
-            active_k,
-            active_v,
-            active_gate,
-            active_beta,
-            active_state,
+    return replay_paged_chunk_forward(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        state_cache,
+        state_indices,
+        replay_state,
+        cu_seqlens=cu_seqlens,
+        has_initial_state=has_initial_state,
+        chunk_forward=partial(
+            chunk_forward,
             scale=q.shape[-1] ** -0.5,
-            output_final_state=True,
             fastmath=True,
             autotune=autotune,
             schedule=schedule,
-        )
-        assert final_state is not None
-        chunk_replay_commit_op(
-            final_state,
-            state_indices,
-            has_initial_state,
-            active_counts,
-            state_cache,
-            replay_count,
-        )
-        return (
-            output[
-                torch.arange(
-                    active_counts.shape[0],
-                    dtype=torch.int64,
-                    device=active_counts.device,
-                ),
-                active_counts,
-            ]
-            .unsqueeze(1)
-            .to(q.dtype)
-        )
-
-    if cu_seqlens is None:
-        cu_seqlens = torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device) * q.shape[1]
-    (
-        prefix_q,
-        prefix_k,
-        prefix_v,
-        prefix_gate,
-        prefix_beta,
-        prefix_cu_seqlens,
-        output_route,
-        tail_q,
-        tail_k,
-        tail_v,
-        tail_gate,
-        tail_beta,
-        tail_counts,
-    ) = chunk_replay_prefill_prepare_op(
-        q.to(torch.bfloat16),
-        k.to(torch.bfloat16),
-        v.to(torch.bfloat16),
-        gate.float(),
-        beta.float(),
-        state_cache,
-        replay_q,
-        replay_k,
-        replay_v,
-        replay_gate,
-        replay_beta,
-        replay_count,
-        state_indices,
-        has_initial_state,
-        cu_seqlens,
-    )
-    prefix_output = _paged_chunk_state_forward(
-        prefix_q,
-        prefix_k,
-        prefix_v,
-        prefix_gate,
-        prefix_beta,
-        state_cache,
-        state_indices,
-        cu_seqlens=prefix_cu_seqlens,
-        has_initial_state=has_initial_state,
-        autotune=autotune,
-        schedule=schedule,
-    )
-    tail_output, _ = chunk_forward(
-        tail_q,
-        tail_k,
-        tail_v,
-        tail_gate,
-        tail_beta,
-        chunk_replay_state_gather_op(state_cache, state_indices),
-        scale=q.shape[-1] ** -0.5,
-        output_final_state=False,
-        fastmath=True,
-        autotune=autotune,
-        schedule=schedule,
-    )
-    return chunk_replay_prefill_commit_op(
-        prefix_output,
-        tail_output,
-        output_route,
-        tail_q,
-        tail_k,
-        tail_v,
-        tail_gate,
-        tail_beta,
-        tail_counts,
-        state_indices,
-        replay_q,
-        replay_k,
-        replay_v,
-        replay_gate,
-        replay_beta,
-        replay_count,
-        q,
+        ),
+        paged_forward=partial(_paged_chunk_state_forward, autotune=autotune, schedule=schedule),
     )
 
 
