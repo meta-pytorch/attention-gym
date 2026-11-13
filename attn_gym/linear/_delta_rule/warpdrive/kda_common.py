@@ -12,6 +12,7 @@ import cutlass
 import torch
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.arch import inline_ptx
+from cutlass.cute.nvgpu import tcgen05
 
 from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
@@ -315,6 +316,23 @@ def ldg_l2_f32(addr, dtype: cutlass.Constexpr):
     )
 
 
+def gate_tile(d_k: int):
+    """Layout of the in-place exp2(g) gate exchange in fp32 elements, indexed by ``(row,
+    channel)`` after ``gate_offset``'s segment fold: one ``[16, 32]`` tile of 128-byte rows per
+    32-channel segment, whose 16-byte chunks ``Swizzle<3, 2, 3>`` XORs with ``row & 7``."""
+    rows = cute.make_layout((B_T, (4, 8, d_k // 32)), stride=(32, (1, 4, B_T * 32)))
+    return cute.make_composed_layout(cute.make_swizzle(3, 2, 3), 0, rows)
+
+
+@cute.jit
+def gate_offset(row, dim, d_k: cutlass.Constexpr[int]):
+    """Byte offset of exp2(g) ``(row, dim)`` in the gate exchange, where chunk ``c`` of segment
+    ``s`` sits at ``c ^ (row ^ s) & 7`` so a row's eight-lane reads span two segments without
+    bank conflicts. A CuTe swizzle XORs one bit field, so the segment's part is folded into the
+    column before ``gate_tile`` applies the row's."""
+    return 4 * cute.crd2idx((row, dim ^ ((dim >> 5) << 2)), gate_tile(d_k))
+
+
 # ---- TF32 decay operands (fp16 io) -------------------------------------------------------
 # NOTE [TF32 decay operands]
 # With g the per-channel prefix log2 decay of a 16-token chunk, the in-chunk products are
@@ -323,75 +341,111 @@ def ldg_l2_f32(addr, dtype: cutlass.Constexpr):
 # fp16 can turn one into zero and the other into infinity before they multiply: their ratio spans
 # the whole 16-token gate sum (about 2^121 at the gate bound). That is why the fp16 kernels form
 # these operands (Q_decay or K_decay, and K_inv) in fp32 and round them to tf32 for m16n8k8 tf32
-# mma.sync: they need the exponent range, not accumulator precision.
+# mma.sync (and, in the backward, tcgen05 ``.kind::tf32``): they need the exponent range, not
+# accumulator precision.
 #
-# The operands are fp32 ``[16, d_k]`` tiles with one layout, ``tf32_tile``, which both the row
-# stores (``sts_tf32x8``) and the fragment loads (``tf32_fragment_offsets``) index by
-# (row, column). Rows are 16-byte chunks of four fp32 columns; the layout places logical chunk
-# ``c = (c4, c3 c2 c1, c0)`` at physical chunk ``(c4, c0, c3 c2 c1 ^ row & 7)``, so the eight
-# rows each ``ldmatrix`` matrix reads, and the eight chunks ``2 l + c0`` that eight lanes of a
-# row store, land in distinct 16-byte bank groups.
+# The operands are fp32 ``[16, d_k]`` tiles in one of two layouts (``tf32_tile``), which both the
+# row stores (``sts_tf32x8``) and the fragment loads (``tf32_fragment_offsets``) index by
+# (row, column). Rows are 16-byte chunks of four fp32 columns.
+# - mma.sync only (``umma=False``): rows of ``4 d_k`` bytes; logical chunk
+#   ``c = (c4, c3 c2 c1, c0)`` sits at physical chunk ``(c4, c0, c3 c2 c1 ^ row & 7)``, so the
+#   eight rows each ``ldmatrix`` matrix reads, and the eight chunks ``2 l + c0`` that eight lanes
+#   of a row store, land in distinct 16-byte bank groups.
+# - also a tcgen05 MN-major operand (``umma=True``): CuTe's ``MN_SW128_32B`` atom
+#   (SWIZZLE_128B_BASE32B) tiled rows first, so 2048-byte boxes of 32 columns hold the 16 rows of
+#   128 bytes, the 32-byte unit XORed with ``row & 3`` (2-way conflicts on those reads and stores).
 
 
-def tf32_tile(d_k: int):
-    """Layout of a tf32 decay tile in fp32 elements, indexed by ``(row, column)`` (NOTE [TF32
-    decay operands]): the column permutation, then ``Swizzle<3, 2, log2(d_k) - 2>`` XORs the
-    chunk bits ``c3 c2 c1`` with ``row & 7``."""
+def tf32_tile(d_k: int, umma: bool = False):
+    """Layout of a tf32 decay tile (NOTE [TF32 decay operands]). mma.sync: in fp32 elements,
+    indexed by ``(row, column)``, the column permutation, then ``Swizzle<3, 2, log2(d_k) - 2>``
+    XORs the chunk bits ``c3 c2 c1`` with ``row & 7``. ``umma``: in bytes, indexed by
+    ``(column, row)``, the ``MN_SW128_32B`` atom tiled to ``[max(d_k, 32), 16]`` rows first (a
+    16-column tile uses half of one box); the atom's swizzle acts on byte offsets."""
+    if umma:
+        atom = tcgen05.make_smem_layout_atom(tcgen05.SmemLayoutAtomKind.MN_SW128_32B, Float32)
+        tiled = cute.tile_to_shape(atom, (max(d_k, 32), B_T), (1, 0))
+        to_bytes = cute.make_layout(cute.cosize(tiled.outer), stride=4)
+        return cute.make_composed_layout(atom.inner, 0, cute.composition(to_bytes, tiled.outer))
     perm = cute.make_layout((B_T, (4, 2, 8, d_k // 64)), stride=(d_k, (1, 32, 4, 64)))
     return cute.make_composed_layout(cute.make_swizzle(3, 2, d_k.bit_length() - 3), 0, perm)
 
 
 @cute.jit
-def tf32_offset(row, dim, d_k: cutlass.Constexpr[int]):
+def tf32_offset(row, dim, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr[bool] = False):
     """Byte offset of fp32 ``(row, dim)`` in a tf32 decay tile."""
+    if cutlass.const_expr(umma):
+        return cute.crd2idx((dim, row), tf32_tile(d_k, True))
     return 4 * cute.crd2idx((row, dim), tf32_tile(d_k))
 
 
 @cute.jit
-def sts_tf32x8(base, row, dim, values, d_k: cutlass.Constexpr[int]):
+def sts_tf32x8(
+    base, row, dim, values, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr = False
+):
     """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32 and store
     them into the tile at ``base``."""
     words = [cute.arch.cvt_f32_tf32(v) for v in values]
     for half in cutlass.range_constexpr(2):
-        st_shared_v4(base + tf32_offset(row, dim + 4 * half, d_k), words[4 * half : 4 * half + 4])
+        st_shared_v4(
+            base + tf32_offset(row, dim + 4 * half, d_k, umma), words[4 * half : 4 * half + 4]
+        )
 
 
-def tf32_fragment_offsets(lane, d_k: int, *, b_operand: bool):
-    """This lane's ``ldmatrix.x4`` row offsets of k-steps ``0..7`` (add ``256 * (ks // 8)`` for
-    k-step ``ks``). With ``lane = r + 8 u + 16 v``, k-step ``s`` reads ``(r + 8 u, 8 s + 4 v)``
-    for the A fragment of rows ``[0, 16)`` and, swapping ``u`` and ``v``, ``(r + 8 v, 8 s + 4 u)``
-    for the B fragment of tokens ``[0, 16)``. The swizzle only permutes a row's chunks, so step
-    ``s`` is step 0 XOR the row-0 offset of column ``8 s``. Evaluating ``tf32_tile`` at every
-    step instead lengthened the roles' setup code and measured about 9% slower FP16 prefill."""
+def _tf32_period(umma: bool) -> tuple[int, int]:
+    """K steps after which a tile's row offsets repeat, and the bytes the next period adds."""
+    return (4, 2048) if umma else (8, 256)
+
+
+def tf32_fragment_offsets(lane, d_k: int, *, b_operand: bool, umma: bool = False):
+    """This lane's ``ldmatrix.x4`` row offsets of the first period of k-steps (see
+    ``mma_tf32_16x16``). With ``lane = r + 8 u + 16 v``, k-step ``s`` reads
+    ``(r + 8 u, 8 s + 4 v)`` for the A fragment of rows ``[0, 16)`` and, swapping ``u`` and
+    ``v``, ``(r + 8 v, 8 s + 4 u)`` for the B fragment of tokens ``[0, 16)``. Within a period
+    the swizzle only permutes a row's units, so step ``s`` is step 0 XOR the row-0 offset of
+    column ``8 s``. Evaluating ``tf32_tile`` at every step instead lengthened the roles' setup
+    code and measured about 9% slower FP16 prefill."""
     r, u, v = lane % 8, (lane // 8) % 2, lane // 16
     if b_operand:
         u, v = v, u
-    base = tf32_offset(r + 8 * u, 4 * v, d_k)
-    return [opaque_i32(base ^ tf32_offset(0, 8 * ks, d_k)) for ks in range(8)]
+    period, _ = _tf32_period(umma)
+    base = tf32_offset(r + 8 * u, 4 * v, d_k, umma)
+    return [opaque_i32(base ^ tf32_offset(0, 8 * ks, d_k, umma)) for ks in range(period)]
 
 
 @cute.jit
-def mma_tf32_16x16(acc, s_a, s_b, a_offs, b_offs, d_k: cutlass.Constexpr[int]):
+def mma_tf32_16x16(
+    acc, s_a, s_b, a_offs, b_offs, d_k: cutlass.Constexpr[int], umma: cutlass.Constexpr = False
+):
     """``acc[16, 16] += A B^T`` over ``d_k`` columns of two tf32 decay tiles (A rows at ``s_a``,
     B rows at ``s_b``), in the m16n8k16 accumulator layout."""
+    period, box = _tf32_period(umma)
     for ks in cutlass.range_constexpr(d_k // 8):
-        box = (ks // 8) * 256
-        af = ldmatrix(s_a + a_offs[ks % 8] + box, 4)
-        bf = ldmatrix(s_b + b_offs[ks % 8] + box, 4)
+        step = (ks // period) * box
+        af = ldmatrix(s_a + a_offs[ks % period] + step, 4)
+        bf = ldmatrix(s_b + b_offs[ks % period] + step, 4)
         mma_step_tf32(acc, af, bf, M=16, N=16)
 
 
 @cute.jit
 def mma_decay_16x16(
-    acc, s_a, s_kinv, stage, a_offs, b_offs, d_k: cutlass.Constexpr[int], dtype: cutlass.Constexpr
+    acc,
+    s_a,
+    s_kinv,
+    stage,
+    a_offs,
+    b_offs,
+    d_k: cutlass.Constexpr[int],
+    dtype: cutlass.Constexpr,
+    umma: cutlass.Constexpr = False,
 ):
     """``acc[16, 16] += A K_inv^T`` over ``d_k`` columns of one decay stage, ``A`` the decayed
     rows (K_decay for KK, Q_decay for A) at ``s_a + stage`` and K_inv at ``s_kinv + stage``:
-    tf32 tiles (offsets from ``tf32_fragment_offsets``) when ``dtype`` is Float32, else
-    ``dtype`` tiles of 64-column 128-byte-swizzled boxes (element offsets of the first box's
-    four 16-column steps)."""
+    tf32 tiles (offsets from ``tf32_fragment_offsets``, ``umma`` selecting their layout) when
+    ``dtype`` is Float32, else ``dtype`` tiles of 64-column 128-byte-swizzled boxes (element
+    offsets of the first box's four 16-column steps)."""
     if cutlass.const_expr(dtype is Float32):
-        mma_tf32_16x16(acc, s_a + stage, s_kinv + stage, a_offs, b_offs, d_k)
+        mma_tf32_16x16(acc, s_a + stage, s_kinv + stage, a_offs, b_offs, d_k, umma)
     else:
         for i in cutlass.range_constexpr(d_k // 16):
             box = (i // 4) * (B_T * 64)
