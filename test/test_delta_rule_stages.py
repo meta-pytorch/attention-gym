@@ -57,10 +57,6 @@ class Op(NamedTuple):
     factory: Callable[..., Inputs]  # (tokens, *, key_heads, value_heads, seed, dtype)
     key_heads: int
     value_heads: int
-    # warpdrive stages reproduce its native stateful backward bitwise (public_gradients would route
-    # the no-state case through the no-state op).
-    # Other variants use public_gradients directly.
-    backward: Callable[..., tuple[torch.Tensor, ...]] | None = None
 
     def make_inputs(self, tokens: int, seed: int, dtype: torch.dtype = torch.bfloat16) -> Inputs:
         return self.factory(
@@ -87,32 +83,6 @@ class Op(NamedTuple):
         terms = [(output, d_output), (final_state, d_final_state)]
         outputs, cotangents = zip(*(term for term in terms if term[1] is not None), strict=True)
         return torch.autograd.grad(outputs, leaves, cotangents)
-
-
-def warpdrive_native_gradients(
-    inputs: Inputs,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-    d_output: torch.Tensor | None,
-    d_final_state: torch.Tensor | None,
-    *,
-    scale: float | None = None,
-) -> tuple[torch.Tensor, ...]:
-    """The native stateful warpdrive backward, which the warpdrive staged handle runs."""
-    from attn_gym.linear.kda.impl import warpdrive_ops
-
-    q, k, v, gate, beta = inputs
-    if cu_seqlens is None:
-        cu_seqlens = torch.tensor([0, q.shape[1]], dtype=torch.int32, device=q.device)
-    operands = (q, k, v, gate, beta, torch.zeros_like(v) if d_output is None else d_output)
-    scale = HEAD_DIM**-0.5 if scale is None else scale
-    if initial_state is None:
-        return warpdrive_ops.chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
-            *operands, cu_seqlens, d_final_state, scale
-        )
-    return warpdrive_ops.chunk_warpdrive_packed_bwd_with_state_op(
-        *operands, cu_seqlens, initial_state.contiguous(), d_final_state, scale
-    )
 
 
 def assert_sharded_matches(
@@ -219,7 +189,6 @@ requires_warpdrive = pytest.mark.skipif(
 KDA_WARPDRIVE = KDA._replace(
     chunk=partial(chunk_kda, kernel_options=WARPDRIVE),
     prepare=partial(chunk_kda_prepare, kernel_options=WARPDRIVE),
-    backward=warpdrive_native_gradients,
 )
 op_param = pytest.mark.parametrize(
     "op",
@@ -425,9 +394,8 @@ def assert_summary_parts_match(summary, fused, oracle, index: int) -> None:
     ],
 )
 def test_prepare_backward_run_matches_chunk_op_gradients(op, state, loss, packing, scale):
-    """All six staged gradients match the selected backward bitwise, including optional losses.
+    """All six staged gradients match the public op's backward bitwise, including optional losses.
 
-    warpdrive uses its native stateful backward and also checks BF16 agreement with the public op.
     The matrix covers entry-state layouts, packed/dense schedules, and default/custom scales.
     """
     inputs = op.make_inputs(320, seed=7)
@@ -451,9 +419,7 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, state, loss, packin
     )
 
     d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
-    gradients = partial(
-        op.backward or op.public_gradients, inputs, initial_state, cu_seqlens, scale=scale
-    )
+    gradients = partial(op.public_gradients, inputs, initial_state, cu_seqlens, scale=scale)
     if loss == "output-only":
         expected = gradients(d_output, None)
         d_final_state = torch.zeros_like(d_final_state)
@@ -480,16 +446,6 @@ def test_prepare_backward_run_matches_chunk_op_gradients(op, state, loss, packin
         torch.testing.assert_close(
             got, want, atol=0, rtol=0, msg=lambda m, name=name: f"{name}: {m}"
         )
-    if op.backward is not None:
-        # The native kernel is not the public op's backward; it must still agree with it to
-        # within the two kernels' BF16 rounding (both are FP32-accumulated over the same graph).
-        public = op.public_gradients(
-            inputs, initial_state, cu_seqlens, d_output, d_final_state, scale=scale
-        )
-        for name, got, want in zip(names, actual, public, strict=True):
-            assert_relative_rms_within(
-                got.float(), want.float(), f"{name} vs public op", max_eps=4.0
-            )
 
 
 @requires_kda_target
@@ -736,7 +692,7 @@ def test_simulated_context_parallel_matches_unsharded_op(op, cu_seqlens, layout,
     generator = torch.Generator(device="cuda").manual_seed(5)
     d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
     d_final_state = torch.randn(final_state.shape, device="cuda", generator=generator)
-    expected_grads = (op.backward or op.public_gradients)(
+    expected_grads = op.public_gradients(
         (q, k, v, gate, beta), None, offsets, d_output, d_final_state
     )
 

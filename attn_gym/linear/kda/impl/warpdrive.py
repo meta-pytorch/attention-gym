@@ -6,11 +6,10 @@ from __future__ import annotations
 
 import torch
 
-from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
-from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only, resolve_scale
 from attn_gym.linear.kda.impl.warpdrive_ops import (
+    chunk_warpdrive_packed_bwd_with_state_op,
     chunk_warpdrive_packed_fwd_op,
     chunk_warpdrive_packed_fwd_paged_op,
     chunk_warpdrive_packed_fwd_with_initial_state_op,
@@ -18,10 +17,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     chunk_warpdrive_packed_local_bwd_op,
     validate_warpdrive_available,
 )
-from attn_gym.linear.kda.ops import chunk_bwd_recompute_factors_with_state_grad_op
 from attn_gym.linear.kda.validation import cast_to_kernel_dtypes, validate_warpdrive_fastmath
-
-_CHUNK_SIZE = 64
 
 
 def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
@@ -29,25 +25,13 @@ def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) ->
     return torch.zeros_like(value) if d_output is None else d_output.contiguous()
 
 
-def _compact_beta(beta: torch.Tensor) -> torch.Tensor:
-    """Copy beta into a contiguous, 128-byte-aligned buffer for the composed stateful backward.
-
-    The warpdrive forward only asks for an element-aligned contiguous inner mode, but the fused
-    stateful backward's TVM-FFI ABI rejects token-strided or misaligned beta.
-    """
-    # Dynamo cannot trace the alignment check, so compiled backward always copies.
-    if not torch.compiler.is_compiling() and beta.is_contiguous() and beta.data_ptr() % 128 == 0:
-        return beta
-    return beta.clone(memory_format=torch.contiguous_format)
-
-
 class ChunkKdaWarpdrive(torch.autograd.Function):
-    """Attach a backward to the warpdrive forward: its own without an entry state, fused with one.
+    """Attach warpdrive's BT16 backward to the warpdrive forward.
 
     The kernel choice depends only on whether an entry state is present, never on the span
     length, so a document's bits do not depend on the span it is packed into. With an entry
-    state the fused stateful backward carries the state cotangent in FP32 between chunks
-    (``test/linear/test_delta_rule_state_precision.py``); warpdrive's BT16 backward requantizes it.
+    state the backward carries the state cotangent in FP32 across chunks, chain pieces and work
+    items (``test/linear/test_delta_rule_state_precision.py``).
     """
 
     @staticmethod
@@ -91,39 +75,24 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         q, k, value, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
         d_output = normalize_output_grad(d_output, value)
         if initial_state is None:
-            dq, dk, dv, d_gate, d_beta = chunk_warpdrive_packed_local_bwd_op(
+            gradients = chunk_warpdrive_packed_local_bwd_op(
                 q, k, value, gate, beta, d_output, cu_seqlens, ctx.split_backward, ctx.scale
             )
-            d_initial_state = None
+            gradients = (*gradients, None)
         else:
-            beta = _compact_beta(beta)
-            # The fused stateful backward chunks each subsequence on its own 64-token grid.
-            chunk_offsets = prepare_ragged_chunk_metadata(
-                cu_seqlens, q.shape[1], _CHUNK_SIZE
-            ).chunk_offsets
-            cumulative_gate = _plain_gate_scan_op(gate, cu_seqlens, chunk_offsets, False)
-            dq, dk, dv, d_cumulative, d_beta, d_initial_state = (
-                chunk_bwd_recompute_factors_with_state_grad_op(
-                    q,
-                    k,
-                    value,
-                    cumulative_gate,
-                    beta,
-                    cu_seqlens,
-                    chunk_offsets,
-                    d_output,
-                    d_final_state,
-                    initial_state,
-                    ctx.scale,
-                    False,
-                    False,
-                    "auto",
-                )
+            gradients = chunk_warpdrive_packed_bwd_with_state_op(
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                d_output,
+                cu_seqlens,
+                initial_state,
+                d_final_state,
+                ctx.scale,
             )
-            d_gate = _plain_gate_scan_op(
-                d_cumulative.contiguous(), cu_seqlens, chunk_offsets, True
-            )
-        return dq, dk, dv, d_gate, d_beta, d_initial_state, None, None, None, None, None
+        return *gradients, None, None, None, None, None
 
 
 def validate_warpdrive_constraints(q: torch.Tensor, value: torch.Tensor) -> None:

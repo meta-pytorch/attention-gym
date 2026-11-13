@@ -86,9 +86,7 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
     cotangents within the FP16 normal range, for example through loss scaling, or use BF16 when
     state magnitudes can leave it. Use L2-normalized Q/K with FP16, as the training example does:
     unnormalized Q/K or unusually large V can likewise push attention, solve, and value
-    intermediates outside the FP16 range between FP32-accumulating GEMMs. The warpdrive KDA backend
-    additionally applies the per-chunk decay to the carried state, and to the state cotangent of
-    its no-state local backward, through a diagonal MMA in the Q/K/V dtype rather than in FP32.
+    intermediates outside the FP16 range between FP32-accumulating GEMMs.
 
 The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and equal `K = V` of 64 or 128, but has no cuDNN runtime dependency. Kernels contract raw QK/KK
@@ -497,11 +495,10 @@ row. Operands with TMA-compatible innermost modes and aligned outer strides (bet
 element-aligned contiguous inner mode) are passed without copies; others are copied first, as in
 the fused backend. By default the forward uses the unsplit recurrence:
 one persistent work item per sequence and head, which leaves the GPU underused for a few
-long sequences at low head counts. FP16 and BF16 use unsplit backward execution by default; eligible
-packed no-state long contexts may use the warpdrive backward with one unsplit work item per
-sequence and head. Callers that guarantee normalized keys, post-sigmoid beta, and nonpositive decay
-increments may set `split_backward` and/or `split_forward` to `True` in a warpdrive
-`kernel_options` mapping to opt into approximate forgetting-horizon splitting: a sequence is cut
+long sequences at low head counts. The backward, with or without states, runs warpdrive's own
+BT16 kernels and is exact by default. Callers that guarantee normalized keys, post-sigmoid beta,
+and nonpositive decay increments may set `split_backward` and/or `split_forward` to `True` in a
+warpdrive `kernel_options` mapping to opt into approximate forgetting-horizon splitting: a sequence is cut
 only where its cumulative decay has crossed the kernel's threshold, and each cut item rebuilds its
 entry state from zero over a short warmup window. Gates that never forget produce no cuts and
 reproduce the unsplit result exactly; when cuts are accepted the result stays within the
@@ -524,8 +521,6 @@ strides over only the active work. Below roughly a quarter of capacity active, p
 bitwise identical. For packed inputs it requires the TMA output path (Hopper or newer). The
 warpdrive backend accepts every `schedule` value and ignores it: its persistent grids follow the SM
 count and always stride over the active work only, so it needs no option for over-captured graphs.
-Exception: stateful KDA training (an entry state or `output_final_state=True`) still runs the
-fused backward with the `auto` schedule.
 
 ### Fast math and precision
 
