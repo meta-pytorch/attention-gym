@@ -41,12 +41,6 @@ from attn_gym.linear.gdn.fwd.triton.chunk_gdn_fwd_recurrence import (
     chunk_gdn_fwd_recurrence_dense,
     chunk_gdn_fwd_recurrence_packed,
 )
-from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
-    blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
-)
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
-    chunk_kda_bwd_wy_dqkg,
-)
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 
@@ -539,6 +533,12 @@ def _finish_chunk_gdn_bwd(
             autotune=autotune,
         )
         return dq, dk, dv, d_gate, db, d_initial_state
+
+    # The legacy CuTe stages import CuTeDSL, which the Triton route above must not need.
+    from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+        blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
+    )
+    from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import chunk_kda_bwd_wy_dqkg
 
     d_aqk = chunk_kda_bwd_daqk(
         v_new,

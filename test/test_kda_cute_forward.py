@@ -22,7 +22,8 @@ pytest.importorskip("cutlass")
 from attn_gym.linear import ReplayState, chunk_kda, paged_chunk_kda
 from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd as _chunk_kda_bwd_module
+from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as _intra_module
+from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_wy_dqkg_fused as _wy_module
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
     ChunkKdaBwdIntraConfig,
     chunk_kda_bwd_intra,
@@ -839,13 +840,14 @@ def test_kda_offset_width_specializations_match(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("attribute", "kernel", "config_type"),
+    ("module", "attribute", "kernel", "config_type"),
     (
-        ("chunk_kda_bwd_intra", chunk_kda_bwd_intra, ChunkKdaBwdIntraConfig),
-        ("chunk_kda_bwd_wy_dqkg", chunk_kda_bwd_wy_dqkg, ChunkKdaBwdWyDqkgConfig),
+        (_intra_module, "chunk_kda_bwd_intra", chunk_kda_bwd_intra, ChunkKdaBwdIntraConfig),
+        (_wy_module, "chunk_kda_bwd_wy_dqkg", chunk_kda_bwd_wy_dqkg, ChunkKdaBwdWyDqkgConfig),
     ),
+    ids=["intra", "wy_dqkg"],
 )
-def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
+def test_backward_tuning_configs(monkeypatch, module, attribute, kernel, config_type):
     """Keep each explicit and tuned schedule equivalent to its default."""
     torch.manual_seed(5)
     inputs = _inputs(tokens=320, heads=2)
@@ -860,7 +862,8 @@ def test_backward_tuning_configs(monkeypatch, attribute, kernel, config_type):
 
     gradients = []
     for launch in launches:
-        monkeypatch.setattr(_chunk_kda_bwd_module, attribute, launch)
+        # The composed backward imports the legacy stages from their modules at call time.
+        monkeypatch.setattr(module, attribute, launch)
         cloned_inputs = _clone_inputs(inputs)
         output, _ = chunk_kda(*cloned_inputs)
         gradients.append(torch.autograd.grad(output, cloned_inputs, d_output))

@@ -149,10 +149,7 @@ def _chunk_backend():
     try:
         return importlib.import_module("attn_gym.linear.kda.fwd.cute.chunk_kda_fwd")
     except ImportError as error:
-        raise ImportError(
-            "chunk_kda(impl='fused') requires the optional CuTeDSL backend: "
-            "pip install attn-gym[linear]"
-        ) from error
+        raise ImportError("chunk_kda(impl='fused') requires CUDA with Triton support") from error
 
 
 def _recurrent_backend():

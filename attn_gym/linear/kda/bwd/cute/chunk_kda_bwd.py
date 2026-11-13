@@ -9,13 +9,6 @@ import torch
 from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
-from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
-    blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
-)
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import chunk_kda_bwd_intra
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
-    chunk_kda_bwd_wy_dqkg,
-)
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
@@ -132,6 +125,15 @@ def _finish_chunk_kda_bwd(
     assert prepared.qg is not None and prepared.kg is not None and prepared.w is not None
     use_triton_backend = not uses_legacy_cute(q.device)
     range_backend = "triton" if use_triton_backend else "cute"
+    if not use_triton_backend:
+        # The legacy CuTe stages import CuTeDSL, which the Triton route must not need.
+        from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
+            blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
+        )
+        from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import chunk_kda_bwd_intra
+        from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
+            chunk_kda_bwd_wy_dqkg,
+        )
     with profiler_range(f"kda/{range_backend}/backward_delta_h"):
         if use_triton_backend:
             dh, d_initial_state, dv = chunk_kda_bwd_delta_h_triton(
@@ -207,8 +209,8 @@ def _finish_chunk_kda_bwd(
 
     assert prepared.d_aqk is not None
     with profiler_range(f"kda/{range_backend}/backward_intra"):
-        backward_intra = chunk_kda_bwd_intra_triton if use_triton_backend else chunk_kda_bwd_intra
-        dq, dk, dg, db = backward_intra(
+        intra_backward = chunk_kda_bwd_intra_triton if use_triton_backend else chunk_kda_bwd_intra
+        dq, dk, dg, db = intra_backward(
             q,
             k,
             g,
