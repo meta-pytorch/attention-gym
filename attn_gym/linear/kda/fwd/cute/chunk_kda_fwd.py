@@ -13,11 +13,11 @@ from attn_gym._backends.cute import (
     tensor_supports_tma_rows,
 )
 from attn_gym._backends.profiler import profiler_range
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
-from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 # TODO: Revisit model-approved chunk sizes: this is a major performance lever,
 # but it changes the KDA decomposition and rounding order, so it can affect numerics.
@@ -508,7 +508,7 @@ def _prepare_chunk_kda_backward(
         d_output = normalize_tma_rows(d_output)
     if d_final_state is not None:
         d_final_state = _normalize_state_cotangent(d_final_state.float())
-    if not is_sm100_kda_target(q.device):
+    if not uses_legacy_cute(q.device):
         d_output = d_output.contiguous()
         if d_final_state is not None:
             d_final_state = d_final_state.contiguous()
