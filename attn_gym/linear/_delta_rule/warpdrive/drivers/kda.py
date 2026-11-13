@@ -335,7 +335,9 @@ def kda_backward(
             **schedule,
             b_t=B_T,
             **_GATE_FLAGS,
-            chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
+            chain_rows=chain_rows_per_cta(
+                dim_v, dim_k, num_seqs, heads_out, plan.num_sm, chains=2
+            ),
             num_sm=plan.num_sm,
         )
         run_chain_backward(launch, **buffers, **schedule)
