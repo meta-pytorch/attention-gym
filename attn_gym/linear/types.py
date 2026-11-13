@@ -15,6 +15,34 @@ from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOptions, resolve_impl
 
 
+class StateCheckpoints(NamedTuple):
+    """Caller-owned periodic FP32 snapshots for paged GDN and KDA prefill.
+
+    ``states`` is a contiguous buffer shaped ``[capacity, H, V, K]``. Sequence ``i``
+    writes its post-update states every ``every_n_tokens`` tokens, measured from that
+    sequence's start in this call. The interval must be a positive multiple of 64.
+    A final state exactly on an interval boundary is included; incomplete intervals
+    produce no snapshot.
+
+    ``cu_checkpoint_offsets`` is contiguous int32 on the input device, shaped ``[N + 1]``.
+    It starts at zero and its adjacent differences must equal
+    ``sequence_length // every_n_tokens``, including for inactive sequences. Its final
+    value must not exceed ``capacity``. These value constraints are caller responsibilities:
+    no device-to-host synchronization is performed to check them.
+
+    Inactive sequences (non-positive state indices) and unused capacity are not written.
+    Both tensors must be on the input device. The writable buffer must not alias any
+    input, including the state cache and checkpoint offsets. Snapshots come directly from
+    the FP32 recurrence accumulator, even when the persistent state cache uses BF16.
+    Checkpointing is inference-only and currently requires the repo-local fused backend
+    without KDA replay state.
+    """
+
+    states: torch.Tensor
+    cu_checkpoint_offsets: torch.Tensor
+    every_n_tokens: int
+
+
 class ReplayState(NamedTuple):
     """Persistent token cache used by replay-backed paged KDA.
 
@@ -140,6 +168,7 @@ __all__ = [
     "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
+    "StateCheckpoints",
     "TuningOptions",
     "resolve_gate_transform",
     "resolve_impl",

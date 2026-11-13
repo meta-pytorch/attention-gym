@@ -13,6 +13,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_meta
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._lazy import register_lazy_cuda_impls
+from attn_gym.linear.types import StateCheckpoints
 
 _CHUNK_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
@@ -53,7 +54,9 @@ torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune) "
+    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune, "
+    "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
+    "int checkpoint_interval=0) "
     "-> Tensor",
 )
 _RECURRENT_ARGS = (
@@ -230,6 +233,9 @@ def _chunk_fwd_packed_paged_fake(
     capacity: int,
     scale: float,
     autotune: bool,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> torch.Tensor:
     return torch.empty(v.shape, dtype=q.dtype, device=v.device)
 
@@ -566,6 +572,7 @@ def paged_chunk_forward(
     has_initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Normalize inputs and advance selected state-cache slots with chunk GDN."""
     _validate_fused_chunk_qkv(q, k, v)
@@ -598,6 +605,7 @@ def paged_chunk_forward(
         metadata.capacity,
         scale,
         autotune,
+        *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
     )
     return output.reshape(output_shape)
 

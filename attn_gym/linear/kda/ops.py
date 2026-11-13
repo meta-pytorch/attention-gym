@@ -48,7 +48,9 @@ torch.library.define(
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
     "Tensor cu_seqlens, "
-    "Tensor chunk_offsets, bool autotune, str schedule) -> Tensor",
+    "Tensor chunk_offsets, bool autotune, str schedule, "
+    "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
+    "int checkpoint_interval=0) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_replay_prepare",
@@ -158,7 +160,9 @@ torch.library.define(
     "(Tensor k, Tensor w, Tensor u, Tensor gk, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, "
     "Tensor? chunk_offsets, "
-    "SymInt capacity, bool fastmath=True) -> (Tensor, Tensor)",
+    "SymInt capacity, bool fastmath=True, "
+    "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
+    "int checkpoint_interval=0) -> (Tensor, Tensor)",
 )
 
 
@@ -353,6 +357,9 @@ def _chunk_fwd_ragged_paged_fake(
     chunk_offsets: torch.Tensor,
     autotune: bool,
     schedule: str,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> torch.Tensor:
     del (
         k,
@@ -763,6 +770,9 @@ def _delta_h_paged_fake(
     chunk_offsets: torch.Tensor | None,
     capacity: int,
     fastmath: bool = True,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del w, gk, state_cache, state_indices, has_initial_state, cu_seqlens, chunk_offsets
     del fastmath

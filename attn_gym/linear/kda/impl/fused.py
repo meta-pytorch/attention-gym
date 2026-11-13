@@ -28,7 +28,7 @@ from attn_gym.linear.kda.ops import (
     chunk_replay_prepare_op,
     chunk_replay_state_gather_op,
 )
-from attn_gym.linear.types import ReplayState
+from attn_gym.linear.types import ReplayState, StateCheckpoints
 
 _HEAD_DIM = 128
 
@@ -288,6 +288,7 @@ def paged_chunk_forward(
     autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     replay_state: ReplayState | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Run paged chunk prefill or replay-backed decode."""
     _validate_fused_constraints(q, v)
@@ -309,6 +310,7 @@ def paged_chunk_forward(
             has_initial_state=has_initial_state,
             autotune=autotune,
             schedule=schedule,
+            state_checkpoints=state_checkpoints,
         )
 
     replay_q, replay_k, replay_v, replay_gate, replay_beta, replay_count = replay_state
@@ -465,6 +467,7 @@ def _paged_chunk_state_forward(
     has_initial_state: torch.Tensor | None,
     autotune: bool,
     schedule: ScheduleRequest,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Run the original paged state-only chunk path."""
     output_dtype = q.dtype
@@ -496,6 +499,7 @@ def _paged_chunk_state_forward(
         metadata.chunk_offsets,
         autotune,
         schedule.value,
+        *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
     )
     return output.reshape(output_shape).to(output_dtype)
 
