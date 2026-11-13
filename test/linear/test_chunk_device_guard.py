@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("family", ["gdn", "kda"])
-@pytest.mark.parametrize("backend", ["fused", "cudnn"])
+@pytest.mark.parametrize("backend", ["fused", "warpdrive"])
 @pytest.mark.parametrize("packed", [False, True], ids=["dense", "packed"])
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_forward_and_backward_follow_tensor_device(
@@ -22,7 +22,7 @@ def test_forward_and_backward_follow_tensor_device(
     with torch.cuda.device(1):
         if torch.cuda.get_device_capability() < (8, 0):
             pytest.skip("the fused chunk cores require CUDA capability 8.0 or newer")
-        if backend == "cudnn":
+        if backend == "warpdrive":
             pytest.importorskip("cutlass.experimental")
             if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
                 pytest.skip("the cuDNN backend requires SM100/SM103")

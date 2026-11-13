@@ -28,10 +28,10 @@ SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 class ResolvedKernelOptions(NamedTuple):
-    """Validated ``chunk_kda`` backend selection, cuDNN switches, tuning request, and ragged
+    """Validated ``chunk_kda`` backend selection, warpdrive switches, tuning request, and ragged
     launch schedule."""
 
-    backend: Literal["fused", "cudnn"]
+    backend: Literal["fused", "warpdrive"]
     split_backward: bool
     split_forward: bool
     autotune: bool
@@ -49,11 +49,11 @@ def resolve_kernel_options(
     return ResolvedKernelOptions(**options, schedule=schedule)
 
 
-def validate_cudnn_fastmath(fastmath: bool) -> None:
-    """Reject a precision request that the native cuDNN KDA kernels cannot honor."""
+def validate_warpdrive_fastmath(fastmath: bool) -> None:
+    """Reject a precision request that the native warpdrive KDA kernels cannot honor."""
     if not fastmath:
         raise ValueError(
-            "cuDNN KDA cannot honor fastmath=False; "
+            "warpdrive KDA cannot honor fastmath=False; "
             "use fastmath=True or the repo-local fused backend"
         )
 
@@ -102,6 +102,6 @@ def validate_kda_inputs(
 __all__ = [
     "SUPPORTED_INPUT_DTYPES",
     "resolve_kernel_options",
-    "validate_cudnn_fastmath",
     "validate_kda_inputs",
+    "validate_warpdrive_fastmath",
 ]

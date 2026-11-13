@@ -16,11 +16,11 @@ Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to
 ``--partition documents`` assigns whole documents to ranks (``document_aligned_fragments``): no
 document crosses ranks, so the delta-rule op exchanges no state and its result is bitwise
 independent of the CP degree (``test/test_context_parallel_distributed.py``, table ``documents``).
-``--core-backend cudnn`` selects the KDA cuDNN backend (SM100/SM103). ``--cuda-graph`` checks a
-changed-input replay; ``--profile`` writes a merged native Perfetto trace. ``--no-validate`` skips
-the unsharded reference at scales where it does not fit. Batch construction, loss/backward, and
-capture are shown in ``delta_rule_training.py`` and imported here. Numerical assertions, trace
-export, and benchmark reporting live in ``attn_gym.testing``.
+``--core-backend warpdrive`` selects the KDA warpdrive backend (SM100/SM103). ``--cuda-graph``
+checks a changed-input replay; ``--profile`` writes a merged native Perfetto trace.
+``--no-validate`` skips the unsharded reference at scales where it does not fit. Batch
+construction, loss/backward, and capture are shown in ``delta_rule_training.py`` and imported here.
+Numerical assertions, trace export, and benchmark reporting live in ``attn_gym.testing``.
 """
 
 from __future__ import annotations
@@ -263,14 +263,14 @@ def main(
         typer.Option(
             "--core-backend",
             "--kda-backend",
-            help="Local KDA chunk kernels: fused or cuDNN (SM100).",
+            help="Local KDA chunk kernels: fused or warpdrive (SM100).",
         ),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
         bool,
         typer.Option(
             help="Permit approximate gating math (default); --no-fastmath requests non-fast "
-            "math and is unsupported by native cuDNN KDA."
+            "math and is unsupported by native warpdrive KDA."
         ),
     ] = True,
     batch_size: Annotated[
@@ -353,13 +353,14 @@ def main(
             "compute_dtype": getattr(torch, compute_dtype.value),
             "device": device,
         }
-        # The reference keeps the repo-local core; only each rank's local KDA pass may use cuDNN.
+        # The reference keeps the repo-local core; only each rank's local KDA pass may use
+        # warpdrive.
         make_model = partial(
             ContextParallelDeltaRuleAttention,
             **model_options,
             group=dist.group.WORLD,
             kernel_options={"backend": core_backend.value}
-            if core_backend is CoreBackendOption.CUDNN
+            if core_backend is CoreBackendOption.WARPDRIVE
             else None,
         )
         model = make_model()

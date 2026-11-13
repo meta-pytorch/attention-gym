@@ -321,21 +321,23 @@ def test_impl_accepts_enum_and_string(function):
 
 
 def test_chunk_kernel_options_are_strict():
-    """Keep the repo-local path as default and validate the cuDNN opt-in selector."""
+    """Keep the repo-local path as default and validate the warpdrive opt-in selector."""
     inputs = make_inputs(sequence=2)
     for name in ("split_backward", "split_forward"):
         with pytest.raises(TypeError, match="must be a bool"):
-            chunk_gdn(*inputs[:-1], kernel_options={"backend": "cudnn", name: 1})
-        with pytest.raises(ValueError, match=f"{name} requires.*cudnn"):
+            chunk_gdn(*inputs[:-1], kernel_options={"backend": "warpdrive", name: 1})
+        with pytest.raises(ValueError, match=f"{name} requires.*warpdrive"):
             chunk_gdn(*inputs[:-1], kernel_options={name: True})
-        with pytest.raises(ValueError, match="cuDNN GDN backend requires CUDA"):
-            chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "cudnn", name: True})
+        with pytest.raises(ValueError, match="warpdrive GDN backend requires CUDA"):
+            chunk_gdn(
+                *inputs[:-1], impl="fused", kernel_options={"backend": "warpdrive", name: True}
+            )
     with pytest.raises(ValueError, match="unsupported chunk_gdn kernel options: unknown"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"unknown": True})
-    with pytest.raises(ValueError, match="must be 'fused' or 'cudnn'"):
+    with pytest.raises(ValueError, match="must be 'fused' or 'warpdrive'"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "other"})
-    with pytest.raises(ValueError, match="cuDNN GDN backend requires CUDA"):
-        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "cudnn"})
+    with pytest.raises(ValueError, match="warpdrive GDN backend requires CUDA"):
+        chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "warpdrive"})
 
 
 def test_recurrent_kernel_options_are_strict():

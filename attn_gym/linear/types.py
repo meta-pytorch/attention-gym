@@ -55,14 +55,14 @@ class ReplayState(NamedTuple):
 class BackendOptions(TuningOptions, total=False):
     """Backend selection and tuning shared by optimized linear-attention operations."""
 
-    backend: Literal["fused", "cudnn"]
-    """Select the repo-local fused backend or the optional cuDNN backend."""
+    backend: Literal["fused", "warpdrive"]
+    """Select the repo-local fused backend or the optional warpdrive backend."""
 
 
 class SplitOptions(BackendOptions, total=False):
-    """Approximate cuDNN forgetting-horizon split schedules for chunk KDA and chunk GDN.
+    """Approximate warpdrive forgetting-horizon split schedules for chunk KDA and chunk GDN.
 
-    Both default to ``False``, require ``backend="cudnn"``, and reject calls with recurrent
+    Both default to ``False``, require ``backend="warpdrive"``, and reject calls with recurrent
     state. They help only when ``B * H`` does not fill the GPU and every head forgets quickly.
     """
 
@@ -99,7 +99,7 @@ class RecurrentKernelOptions(TuningOptions, total=False):
 # Accepted values and defaults of the option dicts above; see ``KernelOptionSpec``.
 SPLIT_OPTION_SPEC: KernelOptionSpec = {
     **TUNING_OPTION_SPEC,
-    "backend": (("fused", "cudnn"), "fused"),
+    "backend": (("fused", "warpdrive"), "fused"),
     "split_backward": (bool, False),
     "split_forward": (bool, False),
 }

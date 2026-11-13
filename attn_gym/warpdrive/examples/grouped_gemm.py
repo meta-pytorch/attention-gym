@@ -15,7 +15,7 @@ mode supplies the clipping edge, and the third has stride N to select the real r
 ``rows`` valid rows ending at ``end`` starts at ``(EDGE_ROWS - rows, n, end)``. Stores past the
 group's end fall outside the view and are dropped. The base stays within one tile of C: a base
 ``2^30`` rows early faulted on stores whenever another context's exception preempted the kernel
-(see ``attn_gym/linear/_delta_rule/frost/ragged.py``).
+(see ``attn_gym/linear/_delta_rule/warpdrive/ragged.py``).
 Ragged A loads can read the next group's rows, but only into accumulator rows never stored.
 """
 

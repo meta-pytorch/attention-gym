@@ -40,7 +40,7 @@ def context_parallel_kda(
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
     ``scale``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``.
     Forward, backward, and their summaries share the same math policy.
-    ``kernel_options={"backend": "cudnn"}`` selects cuDNN for the local pass and summaries
+    ``kernel_options={"backend": "warpdrive"}`` selects warpdrive for the local pass and summaries
     and requires ``fastmath=True``.
     """
     stages = _kda_stages(scale, fastmath, kernel_options)

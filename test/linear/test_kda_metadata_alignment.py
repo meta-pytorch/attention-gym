@@ -13,11 +13,13 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
-@pytest.mark.parametrize(("backend", "byte_offset"), [("fused", 4), ("fused", 16), ("cudnn", 16)])
+@pytest.mark.parametrize(
+    ("backend", "byte_offset"), [("fused", 4), ("fused", 16), ("warpdrive", 16)]
+)
 def test_stateful_backward_accepts_sliced_cu_seqlens(
     backend: str, byte_offset: int, compiled: bool
 ):
-    if backend == "cudnn":
+    if backend == "warpdrive":
         pytest.importorskip("cutlass.experimental")
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("the cuDNN backend requires SM100/SM103")

@@ -8,7 +8,7 @@ A collection of examples and tools for PyTorch's `flex_attention` API (`torch.nn
   [`docs/masks.md`](docs/masks.md) for the full list.
 - **Score mods** (`attn_gym/mods/`) — `score_mod` functions; see [`docs/mods.md`](docs/mods.md).
 - **Linear attention** (`attn_gym/linear/`) — KDA and GDN chunked/recurrent operators and short
-  convolution, with reference, Triton, CuTeDSL, and cuDNN-derived (frost) backends; see
+  convolution, with reference, Triton, CuTeDSL, and cuDNN-frontend-derived warpdrive backends; see
   [`docs/linear.md`](docs/linear.md).
 - **Sparse attention** (`attn_gym/sparse/`) — `lightning_indexer` Top-K selection and
   `gather_attn`; see [`docs/sparse.md`](docs/sparse.md).

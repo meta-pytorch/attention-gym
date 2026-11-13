@@ -27,7 +27,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _cudnn_available() -> bool:
+def _warpdrive_available() -> bool:
     try:
         import cutlass.cute  # noqa: F401
     except ImportError:
@@ -35,9 +35,9 @@ def _cudnn_available() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
 
 
-_CUDNN_SKIP = pytest.mark.skipif(
-    not _cudnn_available(),
-    reason="the cuDNN backend requires CuTeDSL on SM100/SM103",
+_WARPDRIVE_SKIP = pytest.mark.skipif(
+    not _warpdrive_available(),
+    reason="the warpdrive backend requires CuTeDSL on SM100/SM103",
 )
 # Documented limitations: only the contract assertions may fail, and they must keep failing.
 _FP16_STATE_RANGE = pytest.mark.xfail(
@@ -57,7 +57,7 @@ _FAMILIES = ("gdn", "kda")
 _DTYPES = (pytest.param(torch.bfloat16, id="bf16"), pytest.param(torch.float16, id="fp16"))
 _BACKENDS = (
     pytest.param(None, id="fused"),
-    pytest.param({"backend": "cudnn"}, id="cudnn", marks=_CUDNN_SKIP),
+    pytest.param({"backend": "warpdrive"}, id="warpdrive", marks=_WARPDRIVE_SKIP),
 )
 
 

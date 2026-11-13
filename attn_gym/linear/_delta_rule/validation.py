@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import functools
 import sys
+import warnings
 from collections.abc import Iterable, Mapping
 from numbers import Real
 from typing import Any
@@ -79,17 +81,34 @@ def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str)
         raise RuntimeError(message)
 
 
+@functools.cache
+def warn_cudnn_backend_renamed() -> None:
+    """Warn once per process that ``backend="cudnn"`` is the deprecated name of ``"warpdrive"``."""
+    warnings.warn(
+        "kernel_options['backend']='cudnn' is deprecated and runs the same kernels as "
+        "'warpdrive'; pass 'backend': 'warpdrive'",
+        FutureWarning,
+        stacklevel=4,
+    )
+
+
 def resolve_chunk_kernel_options(
     kernel_options: Mapping[str, object] | None, spec: KernelOptionSpec, *, op_name: str
 ) -> dict[str, Any]:
     """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
-    Split schedules require ``backend="cudnn"``.
+    Split schedules require ``backend="warpdrive"``. The backend's former name, ``"cudnn"``, still
+    selects it and warns once per process, outside ``torch.compile`` tracing (Dynamo cannot trace
+    ``warnings.warn`` in a full graph).
     """
+    if kernel_options is not None and kernel_options.get("backend") == "cudnn":
+        if not torch.compiler.is_compiling():
+            warn_cudnn_backend_renamed()
+        kernel_options = {**kernel_options, "backend": "warpdrive"}
     options = validate_kernel_options(kernel_options, spec, op_name=op_name)
     for name in ("split_backward", "split_forward"):
-        if options[name] and options["backend"] != "cudnn":
-            raise ValueError(f"{name} requires kernel_options['backend']='cudnn'")
+        if options[name] and options["backend"] != "warpdrive":
+            raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")
     return options
 
 

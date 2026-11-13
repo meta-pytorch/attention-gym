@@ -170,16 +170,16 @@ opt-out records name the shared trace, `cg0[*]`, since no single instance is bei
 
 **When it pays.** Each copy of a role's loop occupies instruction cache while its instance
 runs it, and all instances run at once. One copy halves that footprint for two instances,
-at the cost of a few runtime index operations. Measured when the frost kernels opted in (GB300,
+at the cost of a few runtime index operations. Measured when the warpdrive kernels opted in (GB300,
 CuTeDSL 4.8.1, torch.profiler kernel time, median of interleaved runs on one GPU):
 
 | Kernel, shape | Static SASS (instructions) | Time, per-instance bodies → shared |
 |---|---|---|
-| frost GDN T pass (`gdn_tinv`), 4x4096 H16 | 3848 → 2680 | 23.9 → 23.4 us |
-| frost GDN T pass, 1x131072 H2 | 3848 → 2680 | 26.1 → 25.2 us |
-| frost KDA prefill, 8x4096 H32 d128 | 3448 → 2784 | 447.5 → 446.0 us |
-| frost KDA recompute, 8x4096 H32 d128 | 3232 → 2536 | 565.0 → 559.2 us |
-| frost KDA recompute, 2x8192 H64 d64 | 2640 → 2160 | 360.4 → 369.4 us |
+| warpdrive GDN T pass (`gdn_tinv`), 4x4096 H16 | 3848 → 2680 | 23.9 → 23.4 us |
+| warpdrive GDN T pass, 1x131072 H2 | 3848 → 2680 | 26.1 → 25.2 us |
+| warpdrive KDA prefill, 8x4096 H32 d128 | 3448 → 2784 | 447.5 → 446.0 us |
+| warpdrive KDA recompute, 8x4096 H32 d128 | 3232 → 2536 | 565.0 → 559.2 us |
+| warpdrive KDA recompute, 2x8192 H64 d64 | 2640 → 2160 | 360.4 → 369.4 us |
 
 In the KDA prefill the shared body cut instruction-cache misses (ncu
 `sm__icc_requests_lookup_miss`) from 1.78M to 52K per launch, below the upstream kernel's 67K,

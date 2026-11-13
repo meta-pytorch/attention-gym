@@ -114,13 +114,17 @@ def kda_inputs() -> tuple[torch.Tensor, ...]:
 
 
 REFERENCE_OPTIONS = {
-    "chunk_kda": (linear.chunk_kda, kda_inputs, {"autotune": False, "backend": "cudnn"}),
+    "chunk_kda": (linear.chunk_kda, kda_inputs, {"autotune": False, "backend": "warpdrive"}),
     "recurrent_kda": (
         linear.recurrent_kda,
         kda_inputs,
         {"autotune": False, "batch_invariant": True},
     ),
-    "chunk_gdn": (linear.chunk_gdn, delta_rule_inputs, {"autotune": False, "backend": "cudnn"}),
+    "chunk_gdn": (
+        linear.chunk_gdn,
+        delta_rule_inputs,
+        {"autotune": False, "backend": "warpdrive"},
+    ),
     "recurrent_gdn": (
         linear.recurrent_gdn,
         delta_rule_inputs,

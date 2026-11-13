@@ -102,4 +102,4 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
 Attention Gym-authored code is released under the BSD 3-Clause License. Code derived from
 third-party projects retains the licenses and notices included alongside its source, such as the
 cuDNN-frontend-derived kernels described in
-[`attn_gym/linear/_delta_rule/frost/LICENSING.md`](attn_gym/linear/_delta_rule/frost/LICENSING.md).
+[`attn_gym/linear/_delta_rule/warpdrive/LICENSING.md`](attn_gym/linear/_delta_rule/warpdrive/LICENSING.md).
