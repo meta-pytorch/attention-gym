@@ -113,3 +113,50 @@ def test_ragged_custom_op_registrations():
         rtol=2e-2,
         atol=2e-3,
     )
+
+
+def test_ragged_backward_ignores_akk_capacity_slack():
+    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
+
+    lengths = [65, 63]
+    active_tokens, physical_tokens = sum(lengths), 256
+    q, k, v, increments, beta = make_kda_test_inputs(
+        physical_tokens,
+        heads=2,
+        seed=7,
+        gate_scale=1 / 16,
+    )
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    gate = torch.zeros_like(increments)
+    gate[:, :active_tokens] = chunk_cumsum_ref(
+        increments[:, :active_tokens],
+        64,
+        cu_seqlens=cu_seqlens,
+    )
+    metadata = prepare_ragged_chunk_metadata(cu_seqlens, physical_tokens, 64)
+    aqk, akk = chunk_kda_fwd_factors(q, k, gate, beta, _DEFAULT_SCALE, metadata)
+    clean_akk = akk.clone()
+    clean_akk[:, active_tokens:] = 0
+    poisoned_akk = akk.clone()
+    poisoned_akk[:, active_tokens:] = float("nan")
+    common = (
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        aqk,
+        metadata.cu_seqlens,
+        metadata.chunk_offsets,
+        torch.randn_like(v),
+        None,
+        None,
+        _DEFAULT_SCALE,
+        False,
+        False,
+        "auto",
+    )
+    expected = chunk_bwd_op(*common[:6], clean_akk, *common[6:])
+    actual = chunk_bwd_op(*common[:6], poisoned_akk, *common[6:])
+    for got, ref in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got[:, :active_tokens], ref[:, :active_tokens], rtol=0, atol=0)

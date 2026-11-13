@@ -102,23 +102,6 @@ torch.library.define(
     + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 
-_CHUNK_BWD_RECOMPUTE_ARGS = (
-    "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
-    "Tensor? cu_seqlens, Tensor? chunk_offsets, Tensor? d_output, "
-    "Tensor? d_final_state, {initial_state}, float scale, bool fastmath, bool autotune, "
-    "str schedule)"
-)
-torch.library.define(
-    "attn_gym::kda_chunk_bwd_recompute_factors",
-    _CHUNK_BWD_RECOMPUTE_ARGS.format(initial_state="Tensor? initial_state")
-    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor)",
-)
-torch.library.define(
-    "attn_gym::kda_chunk_bwd_recompute_factors_with_state_grad",
-    _CHUNK_BWD_RECOMPUTE_ARGS.format(initial_state="Tensor initial_state")
-    + " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
-)
-
 _RECURRENT_FWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta,"
     " Tensor? initial_state, Tensor? cu_seqlens, float scale, bool autotune,"
@@ -205,10 +188,6 @@ register_lazy_cuda_impls(
         "kda_chunk_fwd_ragged_paged": "_chunk_kda_fwd_ragged_paged_cuda",
         "kda_chunk_bwd": "_chunk_kda_bwd_cuda",
         "kda_chunk_bwd_with_state_grad": "_chunk_kda_bwd_with_state_grad_cuda",
-        "kda_chunk_bwd_recompute_factors": "_chunk_kda_bwd_recompute_factors_cuda",
-        "kda_chunk_bwd_recompute_factors_with_state_grad": (
-            "_chunk_kda_bwd_recompute_factors_with_state_grad_cuda"
-        ),
     },
 )
 register_lazy_cuda_impls(
@@ -571,52 +550,6 @@ def _chunk_bwd_with_state_grad_fake(
     )
 
 
-@torch.library.register_fake("attn_gym::kda_chunk_bwd_recompute_factors")
-def _chunk_bwd_recompute_factors_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cumulative_gate: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    chunk_offsets: torch.Tensor | None,
-    d_output: torch.Tensor | None,
-    d_final_state: torch.Tensor | None,
-    initial_state: torch.Tensor | None,
-    scale: float,
-    fastmath: bool,
-    autotune: bool,
-    schedule: str,
-):
-    del cu_seqlens, chunk_offsets, d_output, d_final_state, initial_state
-    del scale, fastmath, autotune, schedule
-    return _chunk_bwd_fake_common(q, k, v, cumulative_gate, beta)
-
-
-@torch.library.register_fake("attn_gym::kda_chunk_bwd_recompute_factors_with_state_grad")
-def _chunk_bwd_recompute_factors_with_state_grad_fake(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cumulative_gate: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    chunk_offsets: torch.Tensor | None,
-    d_output: torch.Tensor | None,
-    d_final_state: torch.Tensor | None,
-    initial_state: torch.Tensor,
-    scale: float,
-    fastmath: bool,
-    autotune: bool,
-    schedule: str,
-):
-    del cu_seqlens, chunk_offsets, d_output, d_final_state, scale, fastmath, autotune, schedule
-    return (
-        *_chunk_bwd_fake_common(q, k, v, cumulative_gate, beta),
-        initial_state.new_empty(initial_state.shape, dtype=torch.float32),
-    )
-
-
 @torch.library.register_fake("attn_gym::kda_recurrent_fwd")
 def _recurrent_fwd_fake(
     q: torch.Tensor,
@@ -781,10 +714,6 @@ chunk_replay_state_gather_op = torch.ops.attn_gym.kda_chunk_replay_state_gather.
 chunk_replay_prefill_commit_op = torch.ops.attn_gym.kda_chunk_replay_prefill_commit.default
 chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
 chunk_bwd_with_state_grad_op = torch.ops.attn_gym.kda_chunk_bwd_with_state_grad.default
-chunk_bwd_recompute_factors_op = torch.ops.attn_gym.kda_chunk_bwd_recompute_factors.default
-chunk_bwd_recompute_factors_with_state_grad_op = (
-    torch.ops.attn_gym.kda_chunk_bwd_recompute_factors_with_state_grad.default
-)
 recurrent_fwd_op = torch.ops.attn_gym.kda_recurrent_fwd.default
 recurrent_fwd_no_state_op = torch.ops.attn_gym.kda_recurrent_fwd_no_state.default
 recurrent_fwd_paged_op = torch.ops.attn_gym.kda_recurrent_fwd_paged.default
@@ -889,8 +818,6 @@ def recurrent_decode_forward(
 
 __all__ = [
     "chunk_bwd_op",
-    "chunk_bwd_recompute_factors_op",
-    "chunk_bwd_recompute_factors_with_state_grad_op",
     "chunk_bwd_with_state_grad_op",
     "chunk_fwd_op",
     "chunk_fwd_ragged_op",
