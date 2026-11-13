@@ -569,6 +569,31 @@ per second at ctx 256 / 1024: B=1 410 / 407 (the batch-one kernel), B=2 442 / 44
 817, B=8 1401 / 1326, B=16 1925 / 1771, B=32 2279 / 2052. At small batches most of the 1024
 expert rows per layer only skip; a device-built list of active experts would remove them.
 
+**Streamed inputs.** `QwenMegakernel(..., engine="tcgen05", batch=B, stream_inputs=True)`
+(`QwenDecodeMegakernelTcStream`) keeps GEMV inputs in global memory and stages chunks in
+shared memory, leaving room for the weight ring. With resident inputs, batches above 16
+on 8B and 14B, or 8 on 32B, no longer fit. NORM rows, one per token, normalize QKV and
+LM-head inputs into a shared bf16 buffer. For dense models, they also normalize gate/up
+inputs, and gate/up epilogues write their activations into that buffer. NORM rows publish
+an epoch flag per token; gate/up publishes one per 64-column chunk. A dedicated warp polls
+these flags and bulk-copies chunks into the activation ring read by the MMAs. For dense
+models with equal KV split counts, each sequence's results are bit-identical to the
+tcgen05 kernel at batch one. o_proj, the MoE router and expert rows still build inputs in
+per-CTA scratch. The table compares megakernel throughput (the faster of resident and
+streamed inputs) with `torch.compile` + CUDA graph, in tokens per second on GB300 at
+ctx 1024. Each cell is megakernel / compiled:
+
+| model | B=16 | B=32 | B=64 |
+|---|---:|---:|---:|
+| 1.7B | | 10598 / 5020 | 11282 / 5875 |
+| 8B | 2946 / 2342 | 4325 / 3301 | 5256 / 4166 |
+| 14B | 1767 / 1764 | 2502 / 2581 | 2999 / 3464 |
+| 32B | 845 / 934 | 1244 / 1439 | 1452 / 2055 |
+
+In these measurements, resident inputs are faster at B = 8 and below; NORM rows add a
+dependency hop per phase. Attention on CUDA cores is the largest remaining cost on 14B
+and 32B.
+
 The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
 which varies about 5x across prompts on the deep models.
@@ -576,8 +601,15 @@ which varies about 5x across prompts on the deep models.
 <details markdown="1">
 <summary>How the megakernel runs the model</summary>
 
+- **Code.** `qwen_megakernel_core.py` holds the base kernel and the CUDA-core engine,
+  `qwen_megakernel_tc.py` the tcgen05 engine and streamed inputs, `qwen_megakernel_schedule.py`
+  the host's instruction table and CTA assignment, and `qwen_megakernel.py` the
+  `QwenMegakernel` runner. One prologue builds every GEMV input: a group of
+  `8 // min(batch, 8)` warps per token, so batch one uses all eight warps per token and a batch
+  of eight or more one warp each.
 - **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
-  assigns rows to CTAs with a row-latency model and `assign_static` lays the table out
+  assigns rows to CTAs with an engine-specific row-latency model (`row_cost`, fitted to
+  traced work items across batch sizes), and `assign_static` lays the table out
   `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
   `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
   resident (the reason for `cooperative=True`) the earliest unfinished row can always run.

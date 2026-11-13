@@ -150,8 +150,9 @@ def test_megakernel_model_and_traced_overlay():
     items and regions are not spans but go on their role's tracks, regions one level down.
     The overlay lands on the rows' drawn items."""
     ctas, splits = 61, 4
-    rows = mk.instruction_rows(mk.QwenDecodeMegakernel(splits=splits))
-    pred = mk.list_schedule(rows, ctas)
+    op = mk.QwenDecodeMegakernel(splits=splits)
+    rows = mk.instruction_rows(op)
+    pred = mk.list_schedule(rows, ctas, mk.row_cost(op, ctas))
     for p in pred:
         assert all(p.start >= pred[g].end + mk.DEPENDENCY_LATENCY - 1e-9 for g in p.gates)
         if p.after is None:

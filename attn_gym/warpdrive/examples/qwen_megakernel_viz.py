@@ -1,7 +1,7 @@
 """The Qwen3 megakernel's static schedule, drawn per CTA (``schedule_html``).
 
 ``build_table`` assigns the step's instructions to CTAs by list schedule over a latency model
-(``list_schedule``: ``ROW_COST`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
+(``list_schedule``: ``row_cost`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
 them out ``[slot][cta]`` for ``StaticPersistent`` (``assign_static``). The page shows each
 CTA's rows coloured by op and shaded by layer, their predicted start and end, the rows that
 gate them (the last row of each producer group) and the predicted critical path. CTA rows
@@ -23,7 +23,8 @@ file from a ``trace="globaltimer"`` launch (``qwen_megakernel_trace``)::
 Draw it::
 
     python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html \\
-        [--model Qwen/Qwen3-32B] [--ctas 152] [--splits 16] [--timeline capture.json]
+        [--model Qwen/Qwen3-32B] [--ctas 152] [--splits 16] [--timeline capture.json] \
+        [--engine tcgen05 [--batch 16] [--stream-inputs]]
 """
 
 import argparse
@@ -60,6 +61,8 @@ def _label(words, deps, table_row: int, rows: int) -> str:
             what = f"ROUTER layer {layer} · experts {a * rows}-{a * rows + rows - 1}"
         case mk.GATEUP:
             what = f"GATEUP layer {layer} · tile {a}"
+        case mk.NORM:
+            what = f"NORM layer {layer} · {('ln_in', 'ln_post')[a]} · token {b}"
         case mk.REDUCE:
             what = f"REDUCE layer {layer} · columns {a * rows}-{a * rows + rows - 1}"
         case _:
@@ -75,12 +78,13 @@ def megakernel_view(
     model: QwenConfig = mk.QWEN3_0_6B,
     name: str = "Qwen3-0.6B",
     engine: str = "cuda_core",
+    batch: int = 1,
+    stream_inputs: bool = False,
 ) -> str:
-    kernel = mk.QwenDecodeMegakernelTc if engine == "tcgen05" else mk.QwenDecodeMegakernel
-    op = kernel(splits=splits, model=model)
+    op = mk.kernel_class(engine, stream_inputs)(splits=splits, model=model, batch=batch)
     splits = op.splits
     rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
-    cost = mk.row_cost(op)
+    cost = mk.row_cost(op, ctas)
     pred = mk.list_schedule(rows, ctas, cost)
     by_cta: list[list[int]] = [[] for _ in range(ctas)]
     for i, p in enumerate(pred):
@@ -121,7 +125,8 @@ def megakernel_view(
     path = critical_path(pred)
     return schedule_html(
         f"{name} decode step",
-        f"{len(rows):,} work items · {ctas} CTAs · {splits} KV splits",
+        f"{len(rows):,} work items · {ctas} CTAs · {splits} KV splits · batch {batch} · "
+        f"{engine}{' · streamed inputs' if stream_inputs else ''}",
         items,
         by_cta,
         critical=path,
@@ -194,10 +199,15 @@ def main():
     )
     parser.add_argument("--timeline", type=Path, help="measured spans (see the docstring)")
     parser.add_argument("--engine", choices=("cuda_core", "tcgen05"), default="cuda_core")
+    parser.add_argument("--batch", type=int, default=1, help="sequences per step (tcgen05)")
+    parser.add_argument(
+        "--stream-inputs", action="store_true", help="streamed GEMV inputs (tcgen05)"
+    )
     args = parser.parse_args()
     model = load_config(args.model)
+    kernel = mk.kernel_class(args.engine, args.stream_inputs)
     if args.splits is None:
-        args.splits = mk.QwenDecodeMegakernel(model=model).splits
+        args.splits = kernel(model=model, batch=args.batch).splits
     measured = json.loads(args.timeline.read_text()) if args.timeline else None
     for key in ("ctas", "splits"):  # the capture must be of the drawn table
         if measured and measured.get(key, getattr(args, key)) != getattr(args, key):
@@ -205,7 +215,16 @@ def main():
                 f"the capture ran with {key} = {measured[key]}; pass --{key} {measured[key]}"
             )
     name = Path(args.model).name
-    view = megakernel_view(args.ctas, args.splits, measured, model, name, args.engine)
+    view = megakernel_view(
+        args.ctas,
+        args.splits,
+        measured,
+        model,
+        name,
+        args.engine,
+        args.batch,
+        args.stream_inputs,
+    )
     args.out.write_text(view)
     print(args.out)
 
