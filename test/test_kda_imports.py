@@ -80,6 +80,34 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
         recurrent_kda(q, k, v, gate, beta, impl='reference')
         chunk_kda(q, k, v, gate, beta, impl='reference')
         assert callable(recurrent_kda_decode)
+
+        builtins.__import__ = original_import
+
+        from torch._dynamo.testing import CompileCounter
+        from torch._subclasses.fake_tensor import FakeTensorMode
+        from attn_gym.linear import ReplayState
+
+        for tokens in (1, 2):
+            with FakeTensorMode():
+                q = torch.empty(2, tokens, 2, 128, dtype=torch.bfloat16, device="cuda")
+                gate = torch.empty_like(q, dtype=torch.float32)
+                beta = torch.empty(2, tokens, 2, device="cuda")
+                state = torch.empty(4, 2, 128, 128, device="cuda")
+                indices = torch.empty(2, dtype=torch.int32, device="cuda")
+                replay = ReplayState(*(
+                    torch.empty((4, *shape), dtype=dtype, device="cuda")
+                    for shape, dtype in ReplayState.slot_layout(2, 128)
+                ))
+                counter = CompileCounter()
+                compiled = torch.compile(paged_chunk_kda, backend=counter, fullgraph=True)
+                output = compiled(
+                    q, q, q, gate, beta, state, indices,
+                    replay_state=replay, kernel_options={"autotune": False},
+                )
+                if counter.frame_count != 1:
+                    raise RuntimeError("paged KDA must trace as one graph")
+                if (output.shape, output.dtype, output.device) != (q.shape, q.dtype, q.device):
+                    raise RuntimeError("paged KDA returned incorrect output metadata")
         """
     )
 
