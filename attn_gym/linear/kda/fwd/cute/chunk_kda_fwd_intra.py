@@ -17,13 +17,6 @@ from attn_gym._backends.profiler import profiler_range
 from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
-    chunk_kda_fwd_inter_solve_cute,
-    chunk_kda_fwd_inter_solve_ragged_cute,
-    chunk_kda_fwd_k4b_dense_cute,
-    chunk_kda_fwd_k4b_ragged_cute,
-)
-from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_engine_fwd
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
     chunk_kda_fwd_intra_diagonal,
 )
@@ -63,6 +56,15 @@ def chunk_kda_fwd_factors(
         )
         AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata, fastmath=fastmath)
         return Aqk, chunk_kda_fwd_k4b_triton(AkkOD, Akkd, metadata, output_dtype=q.dtype)
+
+    # The legacy CuTe stages import CuTeDSL, which the Triton route above must not need.
+    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
+        chunk_kda_fwd_inter_solve_cute,
+        chunk_kda_fwd_inter_solve_ragged_cute,
+        chunk_kda_fwd_k4b_dense_cute,
+        chunk_kda_fwd_k4b_ragged_cute,
+    )
+    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_engine_fwd
 
     if q.dtype == torch.float16:
         # The engine stores two-sided diagonal rebase factors in the I/O dtype. Their
