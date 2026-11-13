@@ -51,7 +51,8 @@ def compile_quietly(op, name: str):
 
 
 def record_arch_calls(monkeypatch, labels: dict[str, str]) -> list[str]:
-    """Record ``labels[name]`` each time tracing calls ``cute.arch.<name>``."""
+    """Record ``labels[name]`` each time tracing calls ``cute.arch.<name>``, outside the TMEM
+    teardown (its drain waits are not channel fences)."""
     emitted = []
     for name, label in labels.items():
         original = getattr(cute.arch, name)
@@ -61,6 +62,14 @@ def record_arch_calls(monkeypatch, labels: dict[str, str]) -> list[str]:
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(cute.arch, name, record)
+    teardown = WarpSpecialized._tmem_teardown
+
+    def quiet_teardown(self, unit, *args):
+        start = len(emitted)
+        teardown(self, unit, *args)
+        del emitted[start:]
+
+    monkeypatch.setattr(WarpSpecialized, "_tmem_teardown", quiet_teardown)
     return emitted
 
 

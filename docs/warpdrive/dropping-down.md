@@ -153,7 +153,9 @@ qh = q.wait()
 `skip_fence` is `"before"`, `"after"` or `"both"`; on `acquire`, `wait` and `span` the
 `"before"` part is the handle's closing signal, so a `with` block takes it from the opening
 call. `skip_fence=None` ignores `reason`, which keeps a configuration-dependent skip one call.
-Run `check_tcgen05_sync` on every configuration the skips depend on: the layer records them in
+`tmem.skip_teardown_drain("load"|"store"|"both", reason=...)` drops a role's TMEM teardown
+waits when it issues no access of that kind or completes the last one on every path. Run
+`check_tcgen05_sync` on every configuration the skips depend on: the layer records them in
 `describe()` but does not prove them ([thread-sync](guarantees.md#thread-sync)).
 
 ### Override counts, bytes or masks

@@ -69,7 +69,8 @@ skipped synchronization and math. Keep state explicit; raw CuTeDSL remains avail
 * ``tcgen05_before_thread_sync()``/``tcgen05_after_thread_sync()`` fence raw signals and
   waits that order tcgen05 operations across threads; managed ones in roles that issue tcgen05
   operations emit them. ``skip_fence=..., reason=...`` on a managed wait or signal drops one
-  that another fence provides (``AFTER_FENCE_COVERED`` and the like).
+  that another fence provides (``AFTER_FENCE_COVERED`` and the like);
+  ``TmemView.skip_teardown_drain`` drops teardown waits with nothing left to complete.
 * ``unchecked(check, reason=...)`` disables one trace-time check at one site.
   ``describe()`` records the reason, line and suppressed checks.
 * Copies using barrier pointers the layer did not supply stay legal and mark TMA checks

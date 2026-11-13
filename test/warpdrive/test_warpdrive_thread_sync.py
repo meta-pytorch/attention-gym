@@ -36,7 +36,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
-from attn_gym.warpdrive.protocol import fence_skip
+from attn_gym.warpdrive.protocol import fence_skip, teardown_skip
 from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
 
 # ---- the checker on hand-written PTX ----------------------------------------------------
@@ -311,7 +311,7 @@ def _ptx_findings(build, op, tmp_path):
         build.__wrapped__(op)
     (path,) = out.glob("*.ptx")
     text = read_ptx(path)
-    return text, check_tcgen05_sync(text)
+    return text, check_tcgen05_sync(text, teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
 
 
 def test_toy_hands_tmem_back_and_forth(requires_blackwell):
@@ -339,6 +339,8 @@ def test_skips_name_a_fence_the_call_emits_and_a_reason():
         fence_skip("after", "r", "kv.release", ("before",))
     with pytest.raises(ValueError, match="non-empty reason"):
         fence_skip("after", " ", "kv.wait")
+    with pytest.raises(ValueError, match="one of"):
+        teardown_skip("ld", "r")
     assert fence_skip(None, "a reason alone skips nothing", "kv.wait") is None
 
 
@@ -367,6 +369,24 @@ def test_tcgen05_roles_alone_take_the_fences(requires_blackwell, tmp_path):
     assert [op._issues_tcgen05(r) for r in op._ws_roles] == [
         r.role in ("mma", "epilogue") for r in op._ws_roles
     ]
+
+
+def test_teardown_completes_tmem_accesses(requires_blackwell, tmp_path):
+    """The GEMM epilogue's last tcgen05.ld is completed by nothing but the teardown: it waits for
+    its loads (its release's fence orders them), then meets the MMA warp; the allocator warp
+    fences again before tcgen05.dealloc. Nothing issues a TMEM store, and the MMA warp no load,
+    so the roles skip those teardown waits (``skip_teardown_drain``)."""
+    from attn_gym.warpdrive.examples.gemm import Gemm, compile_gemm
+
+    op = Gemm()
+    text, found = _ptx_findings(compile_gemm, op, tmp_path)
+    assert not found, "\n".join(f.describe() for f in found)
+    teardown = rf"barrier\.sync\s+{TMEM_TEARDOWN_BARRIER_ID},"
+    assert len(re.findall(teardown, text)) == sum(r.uses_tmem for r in op._ws_roles) == 2
+    wait = r"tcgen05\.wait::ld[^;]*;\s*(?:tcgen05\.fence::before_thread_sync;\s*)?"
+    assert len(re.findall(wait + teardown, text)) == text.count("tcgen05.wait::ld") == 1
+    assert "tcgen05.wait::st" not in text
+    assert re.search(r"tcgen05\.fence::after_thread_sync;[^;]*;\s*tcgen05\.dealloc", text)
 
 
 @pytest.mark.parametrize("pair", [False, True], ids=["cta", "pair"])

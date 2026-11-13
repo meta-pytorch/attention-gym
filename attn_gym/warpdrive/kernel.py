@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import cutlass
 from cutlass import Int32, Uint32, cute, pipeline
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 
 from attn_gym.warpdrive import alias, fences, liveness, named, ownership, tracing
 from attn_gym.warpdrive.alias import RoleEvents
@@ -1692,7 +1692,7 @@ class WarpSpecialized(metaclass=_KernelType):
             raise ProtocolError(f"{name}: trace ranges {ranges.names} left open at role exit")
         self._record_role(unit, instance, trace)
         if r.uses_tmem:
-            self._tmem_teardown(unit)
+            self._tmem_teardown(unit, trace)
 
     def _record_role(self, unit: tuple[RoleInstance, ...], instance, trace: RoleTrace):
         """Check a traced role body and keep its results, under each instance it ran as, for
@@ -1740,12 +1740,14 @@ class WarpSpecialized(metaclass=_KernelType):
                     return True
         return False
 
-    def _tmem_teardown(self, unit: tuple[RoleInstance, ...]):
+    def _tmem_teardown(self, unit: tuple[RoleInstance, ...], trace: RoleTrace):
         """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp.
 
-        Each user thread orders its tcgen05 operations before the rendezvous
-        (``tcgen05.fence::before_thread_sync``), and the allocator warp orders the dealloc after
-        it (``::after_thread_sync``), as PTX requires across threads (ISA 9.7.18.6.3)."""
+        Each user thread completes its TMEM loads and stores (``tcgen05.wait::ld``/``::st``,
+        unless the role skipped them with ``TmemView.skip_teardown_drain``) and orders them
+        before the rendezvous (``tcgen05.fence::before_thread_sync``); the allocator warp orders
+        the dealloc after it (``::after_thread_sync``), as PTX requires across threads (ISA
+        9.7.18.6.3)."""
         r = unit[0]
         # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
         # peer has no leader-only TMEM roles, so its count is smaller).
@@ -1755,9 +1757,21 @@ class WarpSpecialized(metaclass=_KernelType):
             for c in self.cluster.ctas(r.cta)
         }
         count = rank_value(threads, self.cluster.rank)
+        # Complete this thread's TMEM loads and stores: tcgen05.ld/st are asynchronous, and
+        # neither a register dependency on loaded values nor the rendezvous below completes them
+        # (PTX ISA 9.7.18.6.4.5). MMAs and copies complete through their commits, which their
+        # consumers waited for. Then order them before the rendezvous and so the dealloc.
+        # NOTE: tcgen05.wait blocks until the executing thread's own earlier loads (stores)
+        # complete, so every TMEM user waits here: the allocator warp cannot complete them after
+        # the rendezvous. A role whose every path already completed its accesses of a kind (or
+        # issues none) may skip that wait: the before fence below still orders those completed
+        # accesses before the rendezvous, and the allocator's after fence orders the dealloc
+        # after it (ISA 9.7.18.6.3). Keeping it is not free: ptxas takes a .sync.aligned wait as
+        # a convergence point and may regenerate the roles dispatched after this one.
+        _teardown_drain(trace)
+        tcgen05_before_thread_sync()
         # Roles reach this from different code sites after per-lane mbarrier spins, so use
         # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
-        tcgen05_before_thread_sync()
         _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
         if self._ws_tmem_alloc_role in unit:
             self._free_tmem(self._ws_tmem.retrieve_ptr(cutlass.Float32))
@@ -2105,6 +2119,20 @@ def _runs(warps: list[int]) -> list[range]:
         else:
             runs.append(range(w, w + 1))
     return runs
+
+
+def _teardown_drain(trace: RoleTrace):
+    """The role's ``tcgen05.wait::ld`` and ``::st`` at the TMEM teardown, except those it
+    skipped (``TmemView.skip_teardown_drain``)."""
+    skip = trace.teardown_skip
+    for kind, wait in (
+        ("wait::ld", nvvm.Tcgen05WaitKind.LOAD),
+        ("wait::st", nvvm.Tcgen05WaitKind.STORE),
+    ):
+        if skip is not None and skip.covers(kind):
+            skip.suppress(kind, trace.role_name)
+        else:
+            nvvm.tcgen05_wait(kind=wait)
 
 
 def _in_warpgroups(warp_idx, groups: tuple[int, ...]):

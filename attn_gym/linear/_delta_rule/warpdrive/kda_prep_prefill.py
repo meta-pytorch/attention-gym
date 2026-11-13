@@ -843,9 +843,6 @@ class KdaPrepPrefill(WarpSpecialized):
                                     for t in range(4)
                                 ]
                                 stg_v4(addr + (kb + g * 8) * obytes, words)
-                # The CTA's last item has no later TMEM store to order these loads before
-                # teardown frees TMEM.
-                cute.arch.fence_view_async_tmem_load()
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:

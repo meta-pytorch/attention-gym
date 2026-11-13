@@ -1120,9 +1120,6 @@ class KdaSummary(WarpSpecialized):
                                     addr + (kb + g * 4) * 4,
                                     [as_i32(vals[g * 4 + t]) for t in range(4)],
                                 )
-                # The CTA's last piece has no later TMEM store to order these loads before
-                # teardown frees TMEM.
-                cute.arch.fence_view_async_tmem_load()
         else:
             for _chain, out, row, valid in outs:
                 if valid:  # cold: empty pieces

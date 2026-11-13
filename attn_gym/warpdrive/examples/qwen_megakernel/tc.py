@@ -49,6 +49,9 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 
 TC_MIN_N = 16  # MMA N >= 16 at M = 128; batch one uses column 0 (the others: shifted x)
 TC_ROWS, TC_TILE_K = 128, 64  # a stage: one 128 x 64 SW128 K-major MMA operand (16 KB)
+COMPUTE_TMEM_DRAINED = (
+    "the compute warps issue no tcgen05.st and complete each acc load at its release"
+)
 
 
 @dataclass(frozen=True)
@@ -212,6 +215,7 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
         tmem: Tmem,
     ):
         t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
+        tmem.skip_teardown_drain(reason=COMPUTE_TMEM_DRAINED)
         chans, work = self.compute_loop(p, (w, xin, acc), work, me, env=(t_acc,))
         return (*chans, work)
 
@@ -237,6 +241,7 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
         input ``xs[xbuf]``, or with streamed inputs the activation chunk ``xload`` copied into ``xa``."""
         tiled_mma = p.tiled_mma
         t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
+        tmem.skip_teardown_drain(reason="the MMA warp issues no tcgen05.ld or tcgen05.st")
         w_base = self.buffer("W").iterator
         s_rows = self.x_rows
         # B row n, column k at element (k // 8) * S * 8 + 8n + k % 8 (``x_index``). With one stored
@@ -522,6 +527,7 @@ class QwenDecodeMegakernelTcStream(QwenDecodeMegakernelTc):
         tmem: Tmem,
     ):
         t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
+        tmem.skip_teardown_drain(reason=COMPUTE_TMEM_DRAINED)
         chans, work = self.compute_loop(p, (w, xin, acc, xready), work, me, env=(t_acc,))
         return (*chans, work)
 

@@ -125,6 +125,7 @@ class Gemm(WarpSpecialized):
     ):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
+        tmem.skip_teardown_drain(reason="the MMA warp issues no tcgen05.ld or tcgen05.st")
         ab = ab.views(A=params.tCrA, B=params.tCrB)
         while work.valid:
             with acc.produce() as a:
@@ -158,6 +159,7 @@ class Gemm(WarpSpecialized):
             cute.zipped_divide(params.acc_fake, params.epi_tiler)[None, 0],
         ).get_slice(tidx)
         tAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
+        tmem.skip_teardown_drain("store", reason="the epilogue only loads from TMEM")
         rows, cols = params.mC.shape
         while work.valid:
             m, n, _ = work.item

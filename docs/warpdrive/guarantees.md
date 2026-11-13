@@ -21,7 +21,8 @@ What the layer supplies, checks and leaves to you:
     the declared block/cluster shape and work-index bounds. You must enter `begin_roles()`
     and `run_roles()` convergently, initialize `Barriers(counts=None)` before dispatch, and
     respect CUDA resource limits. User indices, pointer arithmetic, layouts, numerical results
-    and arbitrary async work at exit are not validated.
+    and arbitrary async work at exit are not validated, except TMEM: every TMEM user completes
+    its `tcgen05.ld`/`st` at role exit ([teardown](#thread-sync)).
 
 2. <a id="lifetimes"></a>**Ends and lifetimes.** Return every managed end, work cursor and
     turnstile seat. Helpers return updated state; callers reassign it. The lineage check
@@ -141,7 +142,8 @@ What the layer supplies, checks and leaves to you:
     cross-warp SMEM check. Clusters are unverified.
 
     Annotations must cover actual accesses; raw pointers and `h.data` do not annotate later
-    uses. The model assumes TMEM loads finish before the next signal and raw synchronization
+    uses. The model assumes TMEM loads finish before the next signal (the teardown drain covers
+    role exit) and raw synchronization
     carries the [thread-sync fences](#thread-sync) that managed synchronization emits. Declare
     every TMEM user with `tmem: Tmem` for allocation and teardown. Layouts, partitions,
     storage lifetimes and alias ordering remain yours.
@@ -165,8 +167,8 @@ What the layer supplies, checks and leaves to you:
     Raw accessors do not validate pointer bounds or ownership; restoring old `end.state`
     can silently break the protocol.
 
-    `skip_fence=...` drops a redundant `tcgen05` thread-sync fence
-    ([thread-sync](#thread-sync)); it needs a reason and changes no check.
+    `skip_fence=...` and `skip_teardown_drain(...)` drop redundant `tcgen05` thread-sync work
+    ([thread-sync](#thread-sync)); they need a reason and change no check.
 
     `unchecked(check, reason=...)` accepts exactly `"tma"`, `"fence"` and `"liveness"`.
     Respectively, it excludes copies through barrier pointers obtained inside the block,
@@ -193,9 +195,12 @@ What the layer supplies, checks and leaves to you:
     arming, named arrivals and syncs, turnstile passes. A `tcgen05.commit` (`Umma` signal)
     performs it itself. Whether one synchronization carries `tcgen05` ordering depends on what
     other roles do after theirs, so every one of these roles' synchronizations is fenced,
-    including waits for TMA fills. Each TMEM user fences before the teardown rendezvous and
-    the allocator warp after it (and around a pair's dealloc handshake) before
-    `tcgen05.dealloc`. Raw waits and signals (`Barriers`, external sides, barrier pointers,
+    including waits for TMA fills. At role exit every TMEM user completes its loads and stores
+    (`tcgen05.wait::ld`/`::st`: neither a register dependency nor a barrier does) and fences
+    before the teardown rendezvous; the allocator warp fences after it (after a pair's dealloc
+    handshake) before `tcgen05.dealloc`. MMAs and copies are not drained there: they complete
+    through their commits, which their consumers waited for. In-loop handoffs still need their
+    own completion before the signal (`release_fence="tmem_load"`). Raw waits and signals (`Barriers`, external sides, barrier pointers,
     native named barriers) need `tcgen05_before_thread_sync()`/`tcgen05_after_thread_sync()`
     by hand ([dropping down](dropping-down.md#tcgen05-thread-sync-fences-on-raw-synchronization)).
     With ptxas on GB300 each fence measured as a stall, needed or not. A fence is redundant
@@ -205,7 +210,11 @@ What the layer supplies, checks and leaves to you:
     out of such a fence with `skip_fence="before"|"after"|"both"` and `reason=...`
     (`AFTER_FENCE_COVERED`, `BEFORE_FENCE_COVERED`, `BOTH_FENCES_COVERED`); on `acquire`,
     `wait` or `span` it also covers the handle's closing signal. The synchronization, the
-    channel's declared fences and every check stay. `describe()` lists each skip with its
+    channel's declared fences and every check stay. Likewise
+    `tmem.skip_teardown_drain("load"|"store"|"both", reason=...)` drops a role's teardown
+    waits when every path already completed its accesses of that kind or it issues none:
+    ptxas reads the `.sync.aligned` wait as a convergence point and may regenerate the roles
+    dispatched after it even when it waits for nothing. `describe()` lists each skip with its
     reason, site and the instructions it dropped; the layer does not prove the skip safe.
     `ptx_check.check_tcgen05_sync` checks every
     intraprocedural PTX path of a compiled kernel for both fences and the teardown drain; it
