@@ -54,7 +54,8 @@ def recording(driver, name):
 
 
 for driver in (gdn, kda):
-    driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD = 0
+    for costs in (driver.CHAIN_COST_FWD, driver.CHAIN_COST_BWD):
+        costs.update({dim: cost._replace(overhead_tokens=0) for dim, cost in costs.items()})
     for name in (
         "build_warmup_forward",
         "build_chain_forward",

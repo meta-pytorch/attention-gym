@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+from typing import NamedTuple
 
 import torch
 
@@ -27,6 +28,31 @@ from ..work_tables import (
 
 # Value tiles of the unchained d_v split.
 DV_SPLIT_TILES = 2
+
+# NOTE [Chain plan cost]
+# An exact chain of ``pieces`` slots per sequence runs x = tokens / (num_seqs * pieces) tokens
+# per slot, but its summaries, state chain and extra launches make each token dearer and add
+# fixed work. In tokens of the unchained plan it replaces (the uncut table backward, the d_v
+# split forward), which costs x * pieces on the critical path, the chain costs
+#
+#     x * (cost.piece + CHAIN_FILL_COST * fill) + cost.overhead_tokens
+#
+# where fill = min(1, num_seqs * pieces * heads_out / num_sm) is the share of the SMs the chain
+# grid occupies (a full grid slows every piece); the plan chains when that is cheaper. Each
+# driver's ChainCost per direction and head dimension was fitted on a 152-SM GB300 (SM103) to
+# CUDA-graph timings, BF16, no state (benchmarks/warpdrive_chain_plans.py, 2026-11-12): at D=128
+# single sequences 1x{512..16384} at H in {2..48} and 2-8 sequence packs up to 64 tiles, at D=64
+# (GDN) 1x{512..16384} at H in {2..64} and 2-8 sequence packs up to 128 tiles. At the geometry's
+# piece count the chosen plan was never more than 2% slower than the faster of the two at D=128,
+# and at D=64 never slower.
+CHAIN_FILL_COST = 1.5
+
+
+class ChainCost(NamedTuple):
+    """One driver direction's chain cost; see NOTE [Chain plan cost]."""
+
+    piece: float  # unchained tokens per chain token on an idle grid
+    overhead_tokens: int
 
 
 def int32(n: int, device) -> torch.Tensor:
@@ -49,11 +75,12 @@ def _chain_pieces(
     heads_out: int,
     num_sm: int,
     b_t: int,
-    min_tokens_per_piece: int,
+    cost: ChainCost,
     *,
     reverse: bool = False,
 ) -> int:
-    """Pieces per sequence of the exact chain, 0 when pieces would be short."""
+    """Pieces per sequence of the exact chain, 0 when it would not pay for itself (see NOTE
+    [Chain plan cost])."""
     pieces = choose_pieces(
         num_seqs=num_seqs,
         heads_out=heads_out,
@@ -62,9 +89,12 @@ def _chain_pieces(
         b_t=b_t,
         reverse=reverse,
     )
-    if pieces and tokens < min_tokens_per_piece * pieces * num_seqs:
-        pieces = 0
-    return pieces
+    if not pieces:
+        return 0
+    fill = min(1.0, num_seqs * pieces * heads_out / num_sm)
+    tokens_per_piece = tokens / (num_seqs * pieces)
+    saved = tokens_per_piece * (pieces - cost.piece - CHAIN_FILL_COST * fill)
+    return pieces if saved >= cost.overhead_tokens else 0
 
 
 @dataclass
@@ -91,16 +121,21 @@ class ForwardPlan:
         device,
         *,
         b_t: int,
-        min_chain_tokens_per_piece: int,
+        chain_cost: ChainCost,
     ):
         num_sm = _num_sm(device)
-        pieces = _chain_pieces(
-            tokens, num_seqs, heads_out, num_sm, b_t, min_chain_tokens_per_piece
-        )
-        # Upstream splits d_v only at a slot budget of exactly two; any unchained plan whose two
-        # CTAs per tile fit in one wave gains (GDN 1x2048: 67 -> 58 us, 1x8192: 220 -> 193 us).
-        dv = not pieces and dim_v == 128 and num_sm // (num_seqs * heads_out) >= DV_SPLIT_TILES
-        return cls(pieces, DV_SPLIT_TILES if dv else 1, num_sm)
+        pieces = _chain_pieces(tokens, num_seqs, heads_out, num_sm, b_t, chain_cost)
+        return cls(pieces, 1, num_sm) if pieces else cls.uncut(num_seqs, heads_out, dim_v, num_sm)
+
+    @classmethod
+    def uncut(cls, num_seqs: int, heads_out: int, dim_v: int, num_sm: int):
+        """The unchained plan, for shapes the chain does not serve (paged prefill) or loses on.
+
+        Upstream splits d_v only at a slot budget of exactly two; any unchained plan whose two
+        CTAs per tile fit in one wave gains (GDN 1x2048: 67 -> 58 us, 1x8192: 220 -> 193 us).
+        """
+        dv = dim_v == 128 and num_sm // (num_seqs * heads_out) >= DV_SPLIT_TILES
+        return cls(0, DV_SPLIT_TILES if dv else 1, num_sm)
 
 
 @dataclass
@@ -123,12 +158,10 @@ class BackwardPlan:
         device,
         *,
         b_t: int,
-        min_chain_tokens_per_piece: int,
+        chain_cost: ChainCost,
     ):
         num_sm = _num_sm(device)
-        pieces = _chain_pieces(
-            tokens, num_seqs, heads_out, num_sm, b_t, min_chain_tokens_per_piece, reverse=True
-        )
+        pieces = _chain_pieces(tokens, num_seqs, heads_out, num_sm, b_t, chain_cost, reverse=True)
         return cls(pieces, num_sm)
 
 
