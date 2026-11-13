@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 
 from attn_gym._backends.profiler import profiler_range
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
     blackwell_delta_h_bwd_dhu_dv_fused_dispatch,
@@ -19,11 +20,11 @@ from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
 )
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_intra import chunk_kda_bwd_intra_triton
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton import chunk_kda_bwd_wy_triton
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_factors
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
-from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 
 @dataclass
@@ -129,7 +130,7 @@ def _finish_chunk_kda_bwd(
     """Finish local gradients while releasing prepared tensors at their last use."""
     assert prepared.aqk is not None and prepared.akk is not None
     assert prepared.qg is not None and prepared.kg is not None and prepared.w is not None
-    use_triton_backend = not is_sm100_kda_target(q.device)
+    use_triton_backend = not uses_legacy_cute(q.device)
     range_backend = "triton" if use_triton_backend else "cute"
     with profiler_range(f"kda/{range_backend}/backward_delta_h"):
         if use_triton_backend:
@@ -205,8 +206,9 @@ def _finish_chunk_kda_bwd(
     del dh
 
     assert prepared.d_aqk is not None
-    with profiler_range("kda/cute/backward_intra"):
-        dq, dk, dg, db = chunk_kda_bwd_intra(
+    with profiler_range(f"kda/{range_backend}/backward_intra"):
+        backward_intra = chunk_kda_bwd_intra_triton if use_triton_backend else chunk_kda_bwd_intra
+        dq, dk, dg, db = backward_intra(
             q,
             k,
             g,

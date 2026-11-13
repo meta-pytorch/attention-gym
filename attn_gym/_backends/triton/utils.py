@@ -41,6 +41,22 @@ def exp2(x, FASTMATH: tl.constexpr = True):
 
 
 @triton.jit
+def prefetch_l2(pointers):
+    """Request the cache lines at ``pointers`` into L2 without holding registers.
+
+    Pass one in-bounds pointer per 128-byte line.
+    """
+    tl.inline_asm_elementwise(
+        "prefetch.global.L2 [$1]; mov.u32 $0, 0;",
+        "=r,l",
+        [pointers],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
 def offset_strides(strides, USE_INT64_OFFSETS: tl.constexpr):
     """Select address width before multiplying runtime strides and indices."""
     result = ()
