@@ -48,6 +48,7 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
+from attn_gym.linear.types import StateCheckpoints
 
 
 def validate_supported_device(q: torch.Tensor) -> None:
@@ -326,6 +327,9 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     capacity: int,
     scale: float,
     autotune: bool,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> torch.Tensor:
     """Run packed scalar GDN while advancing selected cache slots in place.
 
@@ -370,6 +374,11 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         has_initial_state=has_initial_state,
         output_final_state=False,
         metadata=metadata,
+        state_checkpoints=(
+            StateCheckpoints(checkpoint_states, cu_checkpoint_offsets, checkpoint_interval)
+            if checkpoint_states is not None
+            else None
+        ),
     )
     assert final_state is None
     return chunk_gdn_fwd_output_packed(

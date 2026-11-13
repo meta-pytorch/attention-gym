@@ -76,9 +76,10 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
 
     Every optimized GDN and KDA path (repo-local fused and warpdrive) carries the recurrent state
     from `initial_state` to `final_state`, and the state cotangent from `d_final_state` to
-    `d_initial_state`, in FP32 accumulators with FP32 decay. The chunk-entry state that each
-    chunk reads, the per-chunk state checkpoints, and the per-chunk state-cotangent tape are
-    staged in the Q/K/V dtype because they are tensor-core operands. BF16 shares the FP32
+    `d_initial_state`, in FP32 accumulators with FP32 decay. Internal chunk-entry states and
+    state-cotangent tapes are staged in the Q/K/V dtype because they are tensor-core operands.
+    Caller-owned `StateCheckpoints` instead store post-update snapshots directly from the FP32
+    accumulator. For the internal tapes, BF16 shares the FP32
     exponent range, so this only costs mantissa precision. FP16 also limits the range: state
     values that round beyond the FP16 finite range (about 65504) become non-finite when a chunk
     reads them, and cotangent values in the FP16 subnormal range (below `2^-14`) lose precision
@@ -163,6 +164,45 @@ elementwise kernels run per decode step.
 ::: attn_gym.linear.recurrent_gdn
 
 ::: attn_gym.linear.recurrent_gdn_decode
+
+### Prefill state checkpoints (GDN and KDA)
+
+Both `paged_chunk_gdn` and `paged_chunk_kda` accept `state_checkpoints=StateCheckpoints(...)`
+to write periodic FP32 snapshots into caller-owned storage while still advancing the ordinary
+state cache. The output remains a single tensor. Checkpointing requires the repo-local fused
+backend and is not supported together with KDA `replay_state`.
+
+```python
+from attn_gym.linear import StateCheckpoints, paged_chunk_gdn
+
+# Packed sequence lengths are 600 and 300; checkpoint every 256 tokens.
+# Sequence 0 produces snapshots at 256 and 512; sequence 1 produces one at 256.
+checkpoints = StateCheckpoints(
+    states=torch.empty(3, heads, value_dim, key_dim, device="cuda", dtype=torch.float32),
+    cu_checkpoint_offsets=torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32),
+    every_n_tokens=256,
+)
+output = paged_chunk_gdn(
+    q, k, v, gate, beta, state_cache, state_indices,
+    cu_seqlens=cu_seqlens, state_checkpoints=checkpoints,
+)
+# paged_chunk_kda accepts the same state_checkpoints argument.
+```
+
+Boundaries are measured from each sequence's start **in this call**, not from its absolute
+prefix-cache position. The interval must be a positive multiple of 64. Snapshots contain the
+state **after** that many tokens, including a final state exactly on an interval; incomplete
+intervals do not produce a snapshot. Each snapshot is written directly from the FP32 recurrence
+accumulator in public `[H, V, K]` order, not copied from the lower-precision internal
+chunk-entry tape. Snapshots are not rounded to the persistent cache dtype.
+
+For CUDA graphs, allocate a fixed-capacity `states` buffer and update the offsets on device
+between replays. Counts must equal `sequence_length // every_n_tokens` for every sequence,
+including null routes, and the terminal offset must fit the buffer. Null-route rows and unused
+capacity are left untouched. These offset values and the absence of aliasing with inputs are
+caller responsibilities; validation checks tensor metadata without synchronizing with the host.
+
+::: attn_gym.linear.StateCheckpoints
 
 ## Gate Transforms
 

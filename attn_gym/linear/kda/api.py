@@ -28,6 +28,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
+    validate_state_checkpoints,
 )
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
@@ -46,6 +47,7 @@ from attn_gym.linear.types import (
     KernelOptions,
     RecurrentKernelOptions,
     ReplayState,
+    StateCheckpoints,
     resolve_impl,
 )
 from attn_gym.types import validate_kernel_options
@@ -211,6 +213,7 @@ def paged_chunk_kda(
     has_initial_state: torch.Tensor | None = None,
     kernel_options: KernelOptions | None = None,
     replay_state: ReplayState | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk KDA while advancing a paged state cache in place.
 
@@ -263,6 +266,10 @@ def paged_chunk_kda(
             captured bucket. Graph replay may change packed offsets, slot routing, initialization
             flags, and replay counts while tensor shapes remain fixed to that bucket.
 
+        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
+            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+            Requires the fused backend and cannot be combined with ``replay_state``.
+
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
@@ -288,6 +295,12 @@ def paged_chunk_kda(
     options = resolve_kernel_options(kernel_options, op_name="paged_chunk_kda")
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
+    validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
+    if state_checkpoints is not None:
+        if options.backend != "fused":
+            raise ValueError("state_checkpoints requires the fused backend")
+        if replay_state is not None:
+            raise ValueError("state_checkpoints does not support replay_state")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
         if options.backend != "fused":
@@ -353,6 +366,7 @@ def paged_chunk_kda(
         autotune=should_autotune(options.autotune),
         schedule=options.schedule,
         replay_state=replay_state,
+        state_checkpoints=state_checkpoints,
     )
 
 

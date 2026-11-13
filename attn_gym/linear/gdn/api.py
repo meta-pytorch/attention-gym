@@ -12,6 +12,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
+    validate_state_checkpoints,
 )
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
 from attn_gym.linear.gdn.impl.warpdrive import chunk_forward as warpdrive_chunk_forward
@@ -26,6 +27,7 @@ from attn_gym.linear.types import (
     SPLIT_OPTION_SPEC,
     Impl,
     RecurrentKernelOptions,
+    StateCheckpoints,
     resolve_impl,
 )
 from attn_gym.linear.types import SplitOptions as KernelOptions
@@ -151,6 +153,7 @@ def paged_chunk_gdn(
     has_initial_state: torch.Tensor | None = None,
     scale: float | None = None,
     kernel_options: KernelOptions | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
 
@@ -184,6 +187,10 @@ def paged_chunk_gdn(
             The recurrence that advances ``state_cache`` and the warpdrive backend always use
             fixed configurations.
 
+        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
+            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+            Requires the fused backend.
+
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
@@ -201,6 +208,9 @@ def paged_chunk_gdn(
         state_indices,
         has_initial_state,
     )
+    validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
+    if state_checkpoints is not None and options["backend"] != "fused":
+        raise ValueError("state_checkpoints requires the fused backend")
     scale = resolve_scale(scale, q.shape[-1])
     if options["backend"] == "warpdrive":
         return warpdrive_paged_chunk_forward(
@@ -227,6 +237,7 @@ def paged_chunk_gdn(
         has_initial_state=has_initial_state,
         scale=scale,
         autotune=should_autotune(options["autotune"]),
+        state_checkpoints=state_checkpoints,
     )
 
 

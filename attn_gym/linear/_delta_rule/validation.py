@@ -13,6 +13,7 @@ import torch
 
 from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
+from attn_gym.linear.types import StateCheckpoints
 from attn_gym.types import KernelOptionSpec, validate_kernel_options
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -242,6 +243,43 @@ def validate_paged_state(
     )
 
 
+def validate_state_checkpoints(
+    checkpoints: StateCheckpoints | None,
+    q: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+) -> None:
+    """Check snapshot metadata without reading device-resident offsets."""
+    if checkpoints is None:
+        return
+    if not isinstance(checkpoints, StateCheckpoints):
+        raise TypeError("state_checkpoints must be a StateCheckpoints instance")
+    states, offsets, interval = checkpoints
+    if type(interval) is not int:
+        raise TypeError("state_checkpoints.every_n_tokens must be an int")
+    if interval <= 0 or interval % 64:
+        raise ValueError("state_checkpoints.every_n_tokens must be a positive multiple of 64")
+    if states.ndim != 4 or states.shape[1:] != (v.shape[2], v.shape[-1], q.shape[-1]):
+        raise ValueError("state_checkpoints.states must have shape [capacity, H, V, K]")
+    if states.dtype != torch.float32:
+        raise TypeError("state_checkpoints.states must use float32")
+    if not states.is_contiguous():
+        raise ValueError("state_checkpoints.states must be contiguous")
+    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    if offsets.shape != (num_sequences + 1,):
+        raise ValueError("state_checkpoints.cu_checkpoint_offsets must have shape [N + 1]")
+    if offsets.dtype != torch.int32:
+        raise TypeError("state_checkpoints.cu_checkpoint_offsets must use int32")
+    if not offsets.is_contiguous():
+        raise ValueError("state_checkpoints.cu_checkpoint_offsets must be contiguous")
+    if states.device != q.device or offsets.device != q.device:
+        raise ValueError("state_checkpoints tensors must be on the input device")
+    require_inference_only(
+        (states,),
+        "state_checkpoints is inference-only; call under torch.no_grad() or torch.inference_mode()",
+    )
+
+
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
     "require_inference_only",
@@ -253,4 +291,5 @@ __all__ = [
     "validate_has_initial_state",
     "validate_packed_offsets_tensor",
     "validate_paged_state",
+    "validate_state_checkpoints",
 ]
