@@ -6,6 +6,7 @@ them); tokens are scalar tensors.
 """
 
 import json
+import math
 from dataclasses import dataclass, fields
 from pathlib import Path
 
@@ -14,11 +15,70 @@ import torch.nn.functional as F
 
 
 @dataclass(frozen=True)
+class YarnScaling:
+    """YaRN RoPE scaling (HF ``rope_type: "yarn"``), which Qwen3 enables past its 32K pretraining
+    context by adding it to ``config.json``. RoPE frequencies that rotate fewer than ``beta_slow``
+    times over ``original_max_position`` are interpolated (divided by ``factor``), those rotating more
+    than ``beta_fast`` times are kept, a linear ramp blends between, and cos and sin are scaled
+    by ``attention_factor``."""
+
+    factor: float
+    original_max_position: int
+    attention_factor: float
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    truncate: bool = True
+
+    @classmethod
+    def from_hf(cls, params: dict, max_position: int) -> "YarnScaling":
+        """HF's YaRN parameters (``rope_scaling`` or transformers 5's ``rope_parameters``), with its
+        defaults: the original context defaults to ``max_position``, the factor to their ratio."""
+        original = params.get("original_max_position_embeddings") or max_position
+        factor = params.get("factor") or max_position / original
+
+        def mscale(scale, m=1.0):
+            return 1.0 if scale <= 1 else 0.1 * m * math.log(scale) + 1.0
+
+        attention_factor = params.get("attention_factor")
+        if attention_factor is None:
+            m, m_all = params.get("mscale"), params.get("mscale_all_dim")
+            attention_factor = (
+                mscale(factor, m) / mscale(factor, m_all) if m and m_all else mscale(factor)
+            )
+        return cls(
+            factor=float(factor),
+            original_max_position=int(original),
+            attention_factor=float(attention_factor),
+            beta_fast=float(params.get("beta_fast") or 32),
+            beta_slow=float(params.get("beta_slow") or 1),
+            truncate=bool(params.get("truncate", True)),
+        )
+
+    def ramp(self, dim: int, base: float, device) -> torch.Tensor:
+        """(dim // 2,) fp32 weight of each frequency's interpolated value: 0 for the fast
+        frequencies kept as trained, 1 for the slow ones divided by ``factor``."""
+
+        def correction_dim(rotations):
+            ratio = self.original_max_position / (rotations * 2 * math.pi)
+            return dim * math.log(ratio) / (2 * math.log(base))
+
+        low, high = correction_dim(self.beta_fast), correction_dim(self.beta_slow)
+        if self.truncate:
+            low, high = math.floor(low), math.ceil(high)
+        low, high = max(low, 0), min(high, dim - 1)
+        if low == high:
+            high += 0.001  # HF's guard against a zero-width ramp
+        linear = (torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)
+        return linear.clamp(0, 1).to(device)
+
+
+@dataclass(frozen=True)
 class QwenConfig:
     """A Qwen3 shape; the defaults are Qwen3-0.6B's. ``num_experts > 0`` makes every layer's MLP a
     mixture of experts (Qwen3-MoE): ``experts_per_token`` of them, each ``moe_intermediate_size``
     wide, chosen per token by a softmax router, with top-k weights renormalized when
-    ``norm_topk_prob``. ``intermediate_size`` is then unused."""
+    ``norm_topk_prob``. ``intermediate_size`` is then unused. ``rope_scaling``: YaRN, or None for
+    plain RoPE."""
 
     hidden_size: int = 1024
     num_layers: int = 28
@@ -33,6 +93,7 @@ class QwenConfig:
     experts_per_token: int = 0
     moe_intermediate_size: int = 0
     norm_topk_prob: bool = True
+    rope_scaling: YarnScaling | None = None
 
     @property
     def is_moe(self) -> bool:
@@ -55,6 +116,14 @@ class QwenConfig:
                 "moe_intermediate_size": config["moe_intermediate_size"],
                 "norm_topk_prob": config.get("norm_topk_prob", True),
             }
+        # Plain RoPE configs carry no scaling or (transformers 5) rope_type "default".
+        rope = config.get("rope_scaling") or config.get("rope_parameters") or {}
+        kind = rope.get("rope_type", rope.get("type", "default"))
+        if kind not in ("default", "yarn"):
+            raise ValueError(f"unsupported RoPE scaling {kind!r}: only YaRN is implemented")
+        scaling = None
+        if kind == "yarn":
+            scaling = YarnScaling.from_hf(rope, config["max_position_embeddings"])
         return cls(
             hidden_size=config["hidden_size"],
             num_layers=config["num_hidden_layers"],
@@ -66,6 +135,7 @@ class QwenConfig:
             rms_eps=config["rms_norm_eps"],
             # transformers 5 saves it under rope_parameters.
             rope_theta=config.get("rope_theta") or config["rope_parameters"]["rope_theta"],
+            rope_scaling=scaling,
             **moe,
         )
 
@@ -128,22 +198,27 @@ class QwenWeights:
         }
 
 
+def checkpoint_dir(path_or_repo: str) -> Path:
+    """The local directory of a checkpoint: a Hub repo (downloaded if needed), a checkpoint
+    directory, or a file inside one."""
+    from huggingface_hub import snapshot_download  # optional: the oracle needs only torch
+
+    checkpoint = Path(path_or_repo)
+    if checkpoint.is_file():
+        return checkpoint.parent
+    if checkpoint.is_dir():
+        return checkpoint
+    return Path(snapshot_download(path_or_repo, allow_patterns=["*.json", "*.safetensors"]))
+
+
 def load_qwen3_weights(
     path_or_repo: str = "Qwen/Qwen3-0.6B", device: str | torch.device = "cuda"
 ) -> QwenWeights:
     """Load a Qwen3 safetensors checkpoint, single-file or sharded, with its ``config.json``:
     a Hub repo, a checkpoint directory, or a file inside one."""
-    # Optional dependencies: importing the oracle needs only torch.
-    from huggingface_hub import snapshot_download
-    from safetensors.torch import load_file
+    from safetensors.torch import load_file  # optional: the oracle needs only torch
 
-    checkpoint = Path(path_or_repo)
-    if checkpoint.is_file():
-        checkpoint = checkpoint.parent
-    elif not checkpoint.is_dir():
-        checkpoint = Path(
-            snapshot_download(path_or_repo, allow_patterns=["*.json", "*.safetensors"])
-        )
+    checkpoint = checkpoint_dir(path_or_repo)
     tensors = {}
     for shard in sorted(checkpoint.glob("*.safetensors")):
         tensors.update(load_file(str(shard), device=str(device)))
@@ -281,12 +356,22 @@ def rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     return x * cos + rotated * sin
 
 
-def rope_angles(config: QwenConfig, positions: torch.Tensor) -> torch.Tensor:
-    """fp32 rotate-half RoPE angles, (len(positions), head_dim), for fp32 ``positions``."""
-    exponents = torch.arange(0, config.head_dim, 2, device=positions.device).float()
-    inv_freq = 1.0 / (config.rope_theta ** (exponents / config.head_dim))
+def rope_cos_sin(config: QwenConfig, positions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """fp32 rotate-half RoPE cos and sin, each (len(positions), head_dim), for fp32
+    ``positions``, as HF computes them (with YaRN when ``config.rope_scaling`` is set)."""
+    dim, base = config.head_dim, config.rope_theta
+    pos_freqs = base ** (torch.arange(0, dim, 2, device=positions.device).float() / dim)
+    inv_freq = 1.0 / pos_freqs
+    yarn = config.rope_scaling
+    if yarn is not None:
+        ramp = yarn.ramp(dim, base, positions.device)
+        inv_freq = 1.0 / (yarn.factor * pos_freqs) * ramp + inv_freq * (1 - ramp)
     freqs = positions[:, None] * inv_freq[None, :]
-    return torch.cat((freqs, freqs), dim=-1)
+    angles = torch.cat((freqs, freqs), dim=-1)
+    cos, sin = angles.cos(), angles.sin()
+    if yarn is not None:
+        cos, sin = cos * yarn.attention_factor, sin * yarn.attention_factor
+    return cos, sin
 
 
 def forward_tokens(
@@ -315,8 +400,7 @@ def forward_tokens(
     count = tokens.numel()
     x = F.embedding(tokens.reshape(-1), weights.embed).to(dtype)
     positions = torch.arange(pos, pos + count, device=x.device, dtype=torch.float32)
-    angles = rope_angles(config, positions)
-    cos, sin = angles.cos().to(dtype)[:, None, :], angles.sin().to(dtype)[:, None, :]
+    cos, sin = (t.to(dtype)[:, None, :] for t in rope_cos_sin(config, positions))
     group = config.num_q_heads // config.num_kv_heads  # q heads per kv head
     for layer in range(config.num_layers):
         # Upcast one layer at a time: an fp32 oracle of a 32B model fits beside its bf16 weights.
