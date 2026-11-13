@@ -840,10 +840,14 @@ class QwenDecodeMegakernel(WarpSpecialized):
             if op == ATTN:
                 t, split = self.attn_token(b)
                 pos = p.step[t, 1]
-                w = self.attention(
-                    p, chans[0], layer, a, split, t, pos, epoch, tid, warp, lane, row
-                )
-                chans = (w, *chans[1:])
+                blk0, blk1 = self.split_blocks(pos, split)
+                if (blk0 == blk1) & (split != self.splits - 1):
+                    self.publish_empty_partial(p, layer, a, split, t, epoch, tid)
+                else:
+                    w = self.attention(
+                        p, chans[0], layer, a, split, t, pos, epoch, tid, warp, lane, row
+                    )
+                    chans = (w, *chans[1:])
             elif op == REDUCE:
                 self.reduce_slots(p, layer, a, epoch, tid, row)
             elif op == NORM:  # only in tables of kernels that share inputs
@@ -1465,6 +1469,23 @@ class QwenDecodeMegakernel(WarpSpecialized):
             elif self.engine.owns_row(warp, lane) & (i < count):
                 index = self.slot_index(t, layer, rank, tile * self.rows + row)
                 publish(p.e_part, index, v, epoch)
+
+    @cute.jit
+    def publish_empty_partial(self, p: MegakernelParams, layer, group, split, t, epoch, tid):
+        """An attention row whose split has no KV blocks at this position (short contexts leave
+        most splits empty) and does not hold the new token (the last split): its partial is empty,
+        m = -1e30 and l = 0 (zero weight in o_proj's merge) and O = 0, published at once without
+        waiting for QKV. Such a split never appends the new K/V row: that is the split whose
+        block holds pos, or the last split when pos starts a new block."""
+        heads = self.per_row
+        if tid < heads * HEAD_DIM:
+            hq = tid // HEAD_DIM
+            d = tid % HEAD_DIM
+            publish(p.attn_o, self.attn_o_index(t, layer, group, split, hq, d), 0.0, epoch)
+            if d == 0:
+                ml = self.attn_ml_index(t, layer, group, hq, split, 0)
+                publish(p.attn_ml, ml, Float32(-1e30), epoch)
+                publish(p.attn_ml, ml + 1, Float32(0.0), epoch)
 
     @cute.jit
     def attention(
