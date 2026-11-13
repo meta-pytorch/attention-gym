@@ -10,6 +10,9 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 
 CUTE_CAPABLE = cuda_runs_sm100_kernels()
 
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = pytest.mark.usefixtures("fused_chunk_default")
+
 
 def test_requires_int64_abi_covers_oversized_singleton_strides():
     """Reject the i32 signature for every inventoried ABI boundary case.
