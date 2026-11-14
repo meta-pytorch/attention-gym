@@ -49,15 +49,20 @@ pytestmark = [
 
 CU_SEQLENS = (0, 40, 232, 384)
 HEADS, HEAD_DIM = 2, 128
-# The unsharded op and its context-parallel binding.
+# The unsharded op and its context-parallel binding, per backend (the default runs warpdrive on
+# SM100-family GPUs).
+FUSED = {"backend": "fused"}
 WARPDRIVE = {"backend": "warpdrive"}
 OPS = {
-    "kda": (chunk_kda, context_parallel_kda),
-    "gdn": (chunk_gdn, context_parallel_gdn),
-    "gdn-warpdrive": (
-        partial(chunk_gdn, kernel_options=WARPDRIVE),
-        partial(context_parallel_gdn, kernel_options=WARPDRIVE),
-    ),
+    f"{name}{suffix}": (
+        partial(chunk, kernel_options=options),
+        partial(context_parallel, kernel_options=options),
+    )
+    for name, chunk, context_parallel in (
+        ("kda", chunk_kda, context_parallel_kda),
+        ("gdn", chunk_gdn, context_parallel_gdn),
+    )
+    for suffix, options in (("", FUSED), ("-warpdrive", WARPDRIVE))
 }
 requires_warpdrive = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -140,7 +145,7 @@ def _sample(op_name: str, tokens: int, documents: int, generator: torch.Generato
     q = torch.nn.functional.normalize(randn(1, tokens, HEADS, HEAD_DIM), dim=-1).bfloat16()
     k = torch.nn.functional.normalize(randn(1, tokens, HEADS, HEAD_DIM), dim=-1).bfloat16()
     v = randn(1, tokens, HEADS, HEAD_DIM).bfloat16()
-    gate_shape = (1, tokens, HEADS) + ((HEAD_DIM,) if op_name == "kda" else ())
+    gate_shape = (1, tokens, HEADS) + ((HEAD_DIM,) if op_name.startswith("kda") else ())
     gate = -torch.rand(gate_shape, device=device, generator=generator)
     beta = torch.rand(1, tokens, HEADS, device=device, generator=generator)
     d_output = randn(1, tokens, HEADS, HEAD_DIM).bfloat16()

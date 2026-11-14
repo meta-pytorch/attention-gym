@@ -321,7 +321,7 @@ def test_impl_accepts_enum_and_string(function):
 
 
 def test_chunk_kernel_options_are_strict():
-    """Keep the repo-local path as default and validate the warpdrive opt-in selector."""
+    """Validate the backend selector and require an explicit warpdrive for split schedules."""
     inputs = make_inputs(sequence=2)
     for name in ("split_backward", "split_forward"):
         with pytest.raises(TypeError, match="must be a bool"):
@@ -334,7 +334,7 @@ def test_chunk_kernel_options_are_strict():
             )
     with pytest.raises(ValueError, match="unsupported chunk_gdn kernel options: unknown"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"unknown": True})
-    with pytest.raises(ValueError, match="must be 'fused' or 'warpdrive'"):
+    with pytest.raises(ValueError, match="must be 'auto', 'fused', or 'warpdrive'"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "other"})
     with pytest.raises(ValueError, match="warpdrive GDN backend requires CUDA"):
         chunk_gdn(*inputs[:-1], impl="fused", kernel_options={"backend": "warpdrive"})

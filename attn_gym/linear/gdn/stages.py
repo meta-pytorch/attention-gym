@@ -27,7 +27,10 @@ from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import prepare_span, zero_state
-from attn_gym.linear._delta_rule.validation import resolve_chunk_kernel_options
+from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_backend,
+    resolve_chunk_kernel_options,
+)
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
     chunk_gdn_recompute_aqk_dense,
     chunk_gdn_recompute_aqk_packed,
@@ -223,8 +226,8 @@ def chunk_gdn_prepare(
     """Run the factor half of ``chunk_gdn`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
-    one packed stream. ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both
-    summaries with warpdrive's kernels; split schedules are not available with entry states.
+    one packed stream. ``"backend"`` selects the kernels of the local pass and both summaries as
+    in ``chunk_gdn``; split schedules are not available with entry states.
     ``"autotune"`` follows ``chunk_gdn``.
     """
     options = resolve_chunk_kernel_options(
@@ -232,8 +235,9 @@ def chunk_gdn_prepare(
     )
     if options["split_backward"] or options["split_forward"]:
         raise ValueError("split schedules are not supported by chunk_gdn_prepare")
-    autotune, warpdrive = options["autotune"], options["backend"] == "warpdrive"
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
+    autotune = options["autotune"]
+    warpdrive = resolve_chunk_backend(options["backend"], q) == "warpdrive"
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
         raise ValueError("staged/context-parallel chunk_gdn currently requires K=V=128")

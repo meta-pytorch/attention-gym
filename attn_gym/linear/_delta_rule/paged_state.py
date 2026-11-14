@@ -8,6 +8,28 @@ from dataclasses import dataclass
 
 import torch
 
+# Pool base and slot-origin alignment that the warpdrive paged kernels require.
+WARPDRIVE_POOL_ALIGNMENT_BYTES = 16
+
+
+def state_pool_is_aligned(cache: torch.Tensor, alignment_bytes: int) -> bool:
+    """Return whether a pool's base and slot origins are ``alignment_bytes``-aligned.
+
+    Fake tensors have no address, so under ``torch.compile`` the view offset stands in for the
+    base: allocations themselves are aligned.
+    """
+    element_bytes = cache.element_size()
+    if alignment_bytes % element_bytes:
+        raise ValueError("alignment must be a multiple of the state element size")
+    base = (
+        cache.storage_offset() * element_bytes
+        if torch.compiler.is_compiling()
+        else cache.data_ptr()
+    )
+    return (
+        base % alignment_bytes == 0 and cache.stride(0) % (alignment_bytes // element_bytes) == 0
+    )
+
 
 def validate_has_initial_state(
     has_initial_state: torch.Tensor | None,
@@ -98,12 +120,7 @@ class PagedState:
 
     def require_alignment(self, alignment_bytes: int) -> PagedState:
         """Refine the common contract with a backend's pointer-alignment requirement."""
-        element_bytes = self.cache.element_size()
-        if alignment_bytes % element_bytes:
-            raise ValueError("alignment must be a multiple of the state element size")
-        if self.cache.data_ptr() % alignment_bytes or self.cache.stride(0) % (
-            alignment_bytes // element_bytes
-        ):
+        if not state_pool_is_aligned(self.cache, alignment_bytes):
             raise TypeError(
                 f"the paged state pool base and slot origins must be {alignment_bytes}-byte aligned"
             )
@@ -115,4 +132,9 @@ class PagedState:
         return None if self.has_initial_state is None else self.has_initial_state.view(torch.uint8)
 
 
-__all__ = ["PagedState", "validate_has_initial_state"]
+__all__ = [
+    "WARPDRIVE_POOL_ALIGNMENT_BYTES",
+    "PagedState",
+    "state_pool_is_aligned",
+    "validate_has_initial_state",
+]

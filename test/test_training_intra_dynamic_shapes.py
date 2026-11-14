@@ -31,10 +31,14 @@ from attn_gym.testing.kda import (
     make_kda_test_inputs,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="KDA intra requires CUDA capability >= 8.0",
-)
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="KDA intra requires CUDA capability >= 8.0",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 
 def intra_inputs(tokens: int, dtype: torch.dtype, *, strided: bool = False):

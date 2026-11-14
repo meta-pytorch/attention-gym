@@ -61,7 +61,7 @@ def test_warm_gdn_call_validates_once_and_skips_full_cache_key(monkeypatch):
     assert calls == {}
 
 
-def test_gdn_chain_changing_shapes_matches_default(monkeypatch):
+def test_gdn_chain_changing_shapes_matches_fused(monkeypatch):
     """The chain launches are keyed without the batch shape; a later shape must still get its
     own plan, piece geometry and validation instead of a replay of the previous one."""
     for costs in (gdn_driver.CHAIN_COST_FWD, gdn_driver.CHAIN_COST_BWD):
@@ -73,6 +73,6 @@ def test_gdn_chain_changing_shapes_matches_default(monkeypatch):
         assert gdn_driver.ForwardPlan.build(tokens, len(lengths), 2, 128, device).chain
         assert gdn_driver.BackwardPlan.build(tokens, len(lengths), 2, 128, device).chain
         actual = _gdn_step(lengths)
-        expected = _gdn_step(lengths, kernel_options=None)
+        expected = _gdn_step(lengths, kernel_options={"backend": "fused"})
         for got, want in zip(actual, expected, strict=True):
             torch.testing.assert_close(got, want, rtol=2e-2, atol=2e-2)
