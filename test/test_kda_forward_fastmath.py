@@ -5,8 +5,8 @@ import importlib
 import pytest
 import torch
 
-from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.linear import chunk_kda
+from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV, uses_legacy_cute
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.testing.kda import cumulative_sequence_offsets, kda_reference, make_kda_test_inputs
 
@@ -14,13 +14,18 @@ requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
     reason="the fused KDA core requires CUDA capability 8.0 or newer",
 )
-requires_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or not runs_sm100_kernels(torch.cuda.get_device_capability()),
-    reason="the BF16 KDA intra engine requires an SM100-family GPU",
-)
 
 # These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
 pytestmark = pytest.mark.usefixtures("fused_chunk_default")
+
+
+@pytest.fixture(params=["routed", "triton"])
+def route(request, monkeypatch) -> None:
+    """Run the routed fused stages, or force SM100-family GPUs off the legacy CuTe stages."""
+    if request.param == "triton":
+        if not uses_legacy_cute(torch.device("cuda")):
+            pytest.skip("the routed stages are already the Triton stages")
+        monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
 
 
 def test_warpdrive_accepts_both_precision_requests(monkeypatch):
@@ -38,7 +43,8 @@ def test_warpdrive_accepts_both_precision_requests(monkeypatch):
             chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "warpdrive"}, **kwargs)
 
 
-@requires_blackwell
+@requires_cuda
+@pytest.mark.usefixtures("route")
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
     """Both fastmath modes keep a decayed term that crosses a 16-token strip boundary.
@@ -46,7 +52,8 @@ def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
     The intra engine splits each pair's decay into two strip-rebased factors. Rebasing at the
     strip's first row put this pair's row factor at exp(-88), which the flush-to-zero ``ex2``
     of ``fastmath=True`` zeroed; the engine now shifts the rebase by 2^64, so both factors stay
-    normal and the engine has no fastmath switch.
+    normal and the engine has no fastmath switch. The Triton diagonal stage shifts its row-0
+    rebase the same way once a key block's gate span needs it.
     """
     pytest.importorskip("cutlass")
     q = torch.zeros(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
@@ -72,27 +79,55 @@ def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
         torch.testing.assert_close(dbeta[0, 15, 0], golden[0].to(beta.dtype), rtol=0, atol=0)
 
 
-@requires_blackwell
+@requires_cuda
+@pytest.mark.usefixtures("route")
+@pytest.mark.parametrize("fastmath", [False, True])
 @pytest.mark.parametrize("gate_value", [-5.9, -MAX_GATE_LOWER_BOUND_MAGNITUDE])
-def test_default_fastmath_gate_gradient_at_gate_bound(gate_value):
-    """The default fastmath keeps the gate gradient accurate at constant gates near the bound.
+def test_gate_gradient_at_gate_bound(gate_value, fastmath):
+    """Both fastmath modes keep the gate gradient accurate at constant gates near the bound.
 
     The backward intra kernel used to derive each row's in-subchunk factor from its
     earlier-key factor, which the flush-to-zero exp2 zeroed for a 16-row subchunk's last row,
-    dropping that row's in-subchunk terms (rel-L2 0.8-3.2 across seeds).
+    dropping that row's in-subchunk terms (rel-L2 0.8-3.2 across seeds). The Triton forward
+    diagonal stage's row-0 query factors fell below the normal range the same way (rel-L2
+    1.5e-2 on dgate and 0.15 on the output at -5.9 with fastmath).
     """
     pytest.importorskip("cutlass")
     inputs = make_kda_test_inputs(128, normalize_qk=True, gate_value=gate_value, seed=3)
     generator = torch.Generator(device="cuda").manual_seed(4)
     d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
     leaves = [value.detach().clone().requires_grad_() for value in inputs]
-    output, _ = chunk_kda(*leaves, kernel_options={"autotune": False})
+    output, _ = chunk_kda(*leaves, fastmath=fastmath, kernel_options={"autotune": False})
     (d_gate,) = torch.autograd.grad(output, leaves[3], d_output)
     reference = [value.detach().double().requires_grad_() for value in inputs]
     expected, _ = kda_reference(*reference, output_final_state=False)
     (expected_d_gate,) = torch.autograd.grad(expected, reference[3], d_output.double())
     error = (d_gate.double() - expected_d_gate).norm() / expected_d_gate.norm()
     assert error < 1e-2
+
+
+@requires_cuda
+@pytest.mark.parametrize("fastmath", [False, True])
+def test_triton_forward_keeps_small_keys_at_a_flat_gate(monkeypatch, fastmath):
+    """The Triton diagonal stage keeps a tiny key whose terms are representable.
+
+    The stage shifted every rebase by 2^64 to keep steep-gate factors normal, so a ``2^-100``
+    key became ``2^-164`` before the product and every diagonal term was lost although no gate
+    needed the shift (the outputs ``(t + 1) 2^-42`` came out zero).
+    """
+    monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
+    q = torch.zeros(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    q[..., 0], k[..., 0] = 2.0**58, 2.0**-100
+    v = torch.ones_like(q)
+    gate = torch.zeros(q.shape, device="cuda")
+    beta = torch.ones(q.shape[:-1], device="cuda")
+    output, _ = chunk_kda(
+        q, k, v, gate, beta, scale=1.0, fastmath=fastmath, kernel_options={"autotune": False}
+    )
+    tokens = torch.arange(1, 65, device="cuda", dtype=torch.float64)
+    expected = (tokens * 2.0**-42)[None, :, None, None].expand(q.shape)
+    torch.testing.assert_close(output.double(), expected, rtol=1e-2, atol=0)
 
 
 @requires_cuda
