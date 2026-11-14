@@ -550,7 +550,9 @@ def test_state_grad_summary_matches_zero_and_identity_probes(op):
 @pytest.mark.parametrize("bounds", [(0, 72), (72, 200)], ids=["partial-tail", "aligned-offset"])
 @pytest.mark.parametrize("direction", ["forward", "reverse"])
 def test_warpdrive_state_summaries_replay_under_cuda_graph(op, bounds, direction):
-    """The lazily factored span reads its ranges on the device, so capture never syncs."""
+    """The lazily factored span reads its ranges on the device, so capture never syncs, and a
+    replay with other ranges in the captured tensor summarizes those (GDN computes chunk
+    inverses only for the summarized sequences, selected on the device)."""
     q, k, v, gate, beta = op.make_inputs(200, seed=7)
     cu_seqlens = torch.tensor([0, 72, 200], dtype=torch.int32, device="cuda")
     prepared = op.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
@@ -580,6 +582,30 @@ def test_warpdrive_state_summaries_replay_under_cuda_graph(op, bounds, direction
     torch.cuda.synchronize()
     assert not torch.equal(captured, expected)
     torch.testing.assert_close(captured, fresh, atol=0, rtol=0)
+    other = (72, 200) if bounds[0, 0].item() == 0 else (0, 72)
+    bounds.copy_(bounds_of(other))
+    fresh = summarize(bounds)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(captured, fresh, atol=0, rtol=0)
+
+
+@requires_kda_target
+@pytest.mark.parametrize("op", WARPDRIVE_OPS[:2])
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_warpdrive_summaries_of_a_subset_match_those_of_every_sequence(op, direction):
+    """Summarizing some sequences gives bitwise the maps of summarizing all of them, in any
+    order, beside an identity row: the selection changes which work runs, not its results."""
+    q, k, v, gate, beta = op.make_inputs(330, seed=12)
+    cu_seqlens = torch.tensor([0, 72, 200, 330], dtype=torch.int32, device="cuda")
+    prepared = op.prepare(q, k, v, gate, beta, cu_seqlens=cu_seqlens)
+    summarize = prepared.state_summaries
+    if direction == "reverse":
+        grads = op.prepare_backward(prepared.saved, torch.ones_like(v), None, scale=0.1)
+        summarize = grads.state_grad_summaries
+    every = summarize(bounds_of((0, 72), (72, 200), (200, 330)))
+    subset = summarize(bounds_of((200, 330), (5, 5), (0, 72)))
+    assert torch.equal(subset[0], every[2]) and torch.equal(subset[2], every[0])
 
 
 @requires_kda_target

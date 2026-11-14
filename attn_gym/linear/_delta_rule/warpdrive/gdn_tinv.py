@@ -186,12 +186,21 @@ class GdnTinv(WarpSpecialized):
 
     Beta may be fp32 or 16-bit; its loads follow the traced tensor's element type."""
 
-    def __init__(self, dtype_name: str, d_k: int, *, beta_dtype: str | None = None):
+    def __init__(
+        self,
+        dtype_name: str,
+        d_k: int,
+        *,
+        beta_dtype: str | None = None,
+        select_bounds: bool = False,
+    ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the chunk-factor pass serves d_k in {HEAD_DIMS}, got {d_k}")
         self.dtype_name, self.d_k = dtype_name, d_k
         # Standalone compiles read these; a bundle's host passes its own tensors (None).
         self.beta_dtype = beta_dtype
+        # The row table lists only the sequences a bounds operand selects (the summaries').
+        self.select_bounds = select_bounds
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         self.smem_plan = SmemPlan()
         k_buf = self.smem_plan.buffer("K", self.io_dtype, align=1024)
@@ -643,12 +652,16 @@ class GdnTinv(WarpSpecialized):
         tinv: cute.Tensor,  # (tinv rows, heads, 64, 64)
         rows: cute.Tensor,  # (tinv rows, 4) int32
         row_count: cute.Tensor,  # (1,) int32
+        bounds: cute.Tensor | None,  # (R, 2) int32 token ranges, with select_bounds
         workspace: cute.Tensor,
         tma_slots: cute.Tensor,  # (>= self.tma_slot_rows(heads), 16) int64
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        self.launch(k, gate, beta, cu_seqlens, tinv, rows, row_count, tma_slots, max_ctas, stream)
+        self.launch(
+            k, gate, beta, cu_seqlens, tinv, rows, row_count, tma_slots, max_ctas, stream,
+            bounds=bounds,
+        )  # fmt: skip
 
     @cute.jit
     def launch(
@@ -664,10 +677,12 @@ class GdnTinv(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
         emit_row_table: cutlass.Constexpr[bool] = True,
+        bounds: cute.Tensor | None = None,
     ):
         """Launch the row-table kernel (unless the caller already built ``rows`` and
         ``row_count`` on this stream) and the T pass; callable from another ``@cute.jit``
-        host, such as a fused launch bundle."""
+        host, such as a fused launch bundle. ``bounds`` restricts the table to the sequences
+        overlapping its ranges; their tiles land at their usual rows."""
         io = self.io_dtype
         heads = Int32(gate.shape[1])
         key_group = heads // Int32(k.shape[1])
@@ -701,7 +716,7 @@ class GdnTinv(WarpSpecialized):
             cpasync.CopyBulkTensorTileS2GOp(), mTinv, box_layout, (B_T, B_T)
         )
         if cutlass.const_expr(emit_row_table):
-            emit_rows(cu_seqlens, Int32(k.shape[0]), rows, row_count).launch(
+            emit_rows(cu_seqlens, Int32(k.shape[0]), rows, row_count, bounds).launch(
                 grid=(1, 1, 1), block=(32, 1, 1), stream=stream
             )
         # One CTA per SM, each owning a contiguous block of the (device-counted) tiles.
@@ -729,12 +744,18 @@ class GdnTinv(WarpSpecialized):
 
 
 @cute.kernel
-def emit_rows(cu_seqlens: cute.Tensor, tokens: Int32, rows: cute.Tensor, row_count: cute.Tensor):
+def emit_rows(
+    cu_seqlens: cute.Tensor,
+    tokens: Int32,
+    rows: cute.Tensor,
+    row_count: cute.Tensor,
+    bounds: cute.Tensor | None,
+):
     """One warp: check ``cu_seqlens`` against ``tokens``, then the row table of 64-token chunks
-    (``work_tables.emit_chunk_rows``)."""
+    (``work_tables.emit_chunk_rows``), of the sequences ``bounds`` selects when given."""
     lane = Int32(cute.arch.thread_idx()[0])
     check_packed_offsets(cu_seqlens, tokens, lane, 32)
-    emit_chunk_rows(B_T, cu_seqlens, rows, row_count, lane)
+    emit_chunk_rows(B_T, cu_seqlens, rows, row_count, lane, bounds)
 
 
 def bundle_hook(io_dtype, d_k: int, num_sm: int, log_gate: bool) -> tuple[GdnTinv, int]:
@@ -767,6 +788,9 @@ def compile_gdn_tinv(op: GdnTinv):
         make_fake_strided_tensor(io, (rows, heads, B_T, B_T), stride_divisibility=8),
         make_fake_strided_tensor(i32, (rows, 4), contiguous_dim=None),
         make_fake_strided_tensor(i32, (1,)),
+        make_fake_strided_tensor(i32, (cute.sym_int(), 2), contiguous_dim=None)
+        if op.select_bounds
+        else None,
         make_fake_strided_tensor(i32, (cute.sym_int(),)),
         fake_tma_slots(),
         Int32(1),
@@ -782,9 +806,13 @@ def gdn_tinv(
     tinv: torch.Tensor,
     rows: torch.Tensor,
     row_count: torch.Tensor,
+    *,
+    bounds: torch.Tensor | None = None,
 ) -> None:
     """Fill ``tinv``, ``rows`` and ``row_count`` for packed ``k [T, HK, D]`` and ``[T, H]``
-    natural-log ``gate`` / ``beta`` (see the module docstring for the layouts)."""
+    natural-log ``gate`` / ``beta`` (see the module docstring for the layouts). ``bounds``
+    (``int32 [R, 2]`` token ranges on the device) restricts the pass to the sequences overlapping
+    a nonempty range; the other sequences' rows are left unwritten."""
     if k.dtype not in IO_DTYPE_NAMES or tinv.dtype != k.dtype:
         raise TypeError(f"k and tinv must share a 16-bit dtype, got {k.dtype}/{tinv.dtype}")
     if gate.dtype != torch.float32 or beta.dtype not in _BETA_DTYPES:
@@ -793,9 +821,12 @@ def gdn_tinv(
     if heads % k.shape[1] or tinv.shape[1:] != (heads, B_T, B_T):
         raise ValueError("tinv must be [rows, heads, 64, 64] with heads a multiple of k heads")
     op = GdnTinv.get_or_build(
-        IO_DTYPE_NAMES[k.dtype], k.shape[-1], beta_dtype=_BETA_DTYPES[beta.dtype]
+        IO_DTYPE_NAMES[k.dtype],
+        k.shape[-1],
+        beta_dtype=_BETA_DTYPES[beta.dtype],
+        select_bounds=bounds is not None,
     )
     fn = compile_gdn_tinv(op)
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)
-    fn(k, gate, beta, cu_seqlens, tinv, rows, row_count, workspace, slots, sms)
+    fn(k, gate, beta, cu_seqlens, tinv, rows, row_count, bounds, workspace, slots, sms)
