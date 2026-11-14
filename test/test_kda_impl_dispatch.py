@@ -12,6 +12,8 @@ import torch.nn.functional as F
 
 from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.linear import Impl, KernelOptions, chunk_kda, recurrent_kda
+from attn_gym.linear._delta_rule import routing
+from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV, uses_legacy_cute
 from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.kda.utils import is_sm100_kda_target
 
@@ -42,6 +44,29 @@ def test_sm100_kda_route_is_exact(monkeypatch, capability, expected):
     is_sm100_kda_target.cache_clear()
     assert is_sm100_kda_target(torch.device("cuda")) is expected
     is_sm100_kda_target.cache_clear()
+
+
+@pytest.mark.parametrize("capability", [(9, 0), (10, 0), (10, 3), (10, 7), (12, 0)])
+@pytest.mark.parametrize("legacy", [None, "1", "0"])
+def test_legacy_cute_route_needs_sm100_and_no_opt_out(monkeypatch, capability, legacy):
+    """Only SM100-family GPUs run legacy CuTe stages, and ``ATTN_GYM_LEGACY_CUTE=0`` opts out."""
+
+    class Properties:
+        major, minor = capability
+
+    monkeypatch.setattr(routing, "get_device_properties", lambda _device: Properties())
+    if legacy is None:
+        monkeypatch.delenv(LEGACY_CUTE_ENV, raising=False)
+    else:
+        monkeypatch.setenv(LEGACY_CUTE_ENV, legacy)
+    expected = runs_sm100_kernels(capability) and legacy != "0"
+    assert uses_legacy_cute(torch.device("cuda")) is expected
+
+
+def test_legacy_cute_route_rejects_unknown_setting(monkeypatch):
+    monkeypatch.setenv(LEGACY_CUTE_ENV, "false")
+    with pytest.raises(ValueError, match=LEGACY_CUTE_ENV):
+        uses_legacy_cute(torch.device("cuda"))
 
 
 def _inputs(

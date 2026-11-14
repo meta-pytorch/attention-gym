@@ -5,10 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 
-CUTE_CAPABLE = cuda_runs_sm100_kernels()
+# These tests force the legacy CuTe kernels' wide ABI through the public routes.
+CUTE_CAPABLE = torch.cuda.is_available() and uses_legacy_cute(torch.device("cuda"))
 
 # These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
 pytestmark = pytest.mark.usefixtures("fused_chunk_default")
