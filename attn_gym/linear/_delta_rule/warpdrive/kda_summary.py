@@ -59,7 +59,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, standalone_dtype
 from attn_gym.warpdrive import (
     Barriers,
     Consumer,
@@ -203,7 +203,15 @@ class KdaSummary(WarpSpecialized):
     ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
     def __init__(
-        self, io: str, gate: str, d_k: int, d_v: int, num_ctas: int, fastmath: bool = True
+        self,
+        io: str,
+        gate: str,
+        d_k: int,
+        d_v: int,
+        num_ctas: int,
+        fastmath: bool = True,
+        *,
+        beta_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
@@ -211,6 +219,8 @@ class KdaSummary(WarpSpecialized):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.d_v, self.num_ctas = io, gate, d_k, d_v, num_ctas
         self.fastmath = fastmath
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.beta_dtype = beta_dtype
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         # fp16 computes KK from tf32 decay tiles (``kda_common``).
@@ -1582,7 +1592,7 @@ class KdaSummary(WarpSpecialized):
 
 
 @jit_cache
-def compile_kda_summary(op: KdaSummary, beta_name: str):
+def compile_kda_summary(op: KdaSummary):
     """Compile for dynamic tokens, heads, pieces and work rows."""
     io, i32 = op.io_dtype, cutlass.Int32
     tokens, hk, hv, heads, rows, pieces = (cute.sym_int() for _ in range(6))
@@ -1602,7 +1612,7 @@ def compile_kda_summary(op: KdaSummary, beta_name: str):
         packed(io, hk, op.d_k),
         packed(io, hv, op.d_v),
         packed(op.gate_dtype, heads, op.d_k),
-        make_fake_strided_tensor(CUTE_DTYPES[beta_name], (tokens, heads)),
+        make_fake_strided_tensor(CUTE_DTYPES[standalone_dtype(op, "beta_dtype")], (tokens, heads)),
         state(op.d_v, op.d_k),
         state(op.d_k, op.d_k),
         # Compact like the chain prologue's table: a dynamic row stride measured 3-5% slower.
@@ -1641,14 +1651,15 @@ def kda_summary(
         raise ValueError("work_items must be compact and beta contiguous over heads")
     if scheduler is None:
         scheduler = torch.zeros(1, dtype=torch.int32, device=k.device)
-    op = KdaSummary(
+    op = KdaSummary.get_or_build(
         TORCH_NAMES[k.dtype],
         TORCH_NAMES[gate.dtype],
         k.shape[-1],
         v.shape[-1],
         torch.cuda.get_device_properties(k.device).multi_processor_count,
         fastmath,
+        beta_dtype=TORCH_NAMES[beta.dtype],
     )
-    fn = compile_kda_summary(op, TORCH_NAMES[beta.dtype])
+    fn = compile_kda_summary(op)
     slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), k.device)
     fn(k, v, gate, beta, state_h, state_m, work_items, work_count, scheduler, slots)

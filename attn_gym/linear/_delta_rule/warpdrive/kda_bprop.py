@@ -90,7 +90,7 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.arch import inline_ptx
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, standalone_dtype
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -392,12 +392,16 @@ class KdaBprop(WarpSpecialized):
         use_dstate0: bool,
         num_ctas: int,
         fastmath: bool = True,
+        *,
+        beta_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA bprop serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if io not in ("fp16", "bf16") or gate not in ("fp32", io):
             raise ValueError(f"io must be fp16/bf16 and the gate fp32 or io, got {io}, {gate}")
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.beta_dtype = beta_dtype
         self.use_initial_state = use_initial_state
         self.use_dstate_in, self.use_dstate0 = use_dstate_in, use_dstate0
         self.num_ctas, self.fastmath = num_ctas, fastmath
@@ -3053,7 +3057,7 @@ def uncut_work_items(cu_seqlens: torch.Tensor, heads: int):
 
 
 @jit_cache
-def compile_kda_bprop(op: KdaBprop, beta_name: str):
+def compile_kda_bprop(op: KdaBprop):
     """Compile for dynamic tokens, heads, sequences, checkpoint rows and work rows."""
     io, i32 = op.io_dtype, cutlass.Int32
     tokens, hq, hk, hv, heads, rows, ckpt_rows = (cute.sym_int() for _ in range(7))
@@ -3068,7 +3072,7 @@ def compile_kda_bprop(op: KdaBprop, beta_name: str):
             Float32, (cute.sym_int(), heads, op.d_v, op.d_k), stride_divisibility=4
         )
 
-    beta_t = CUTE_DTYPES[beta_name]
+    beta_t = CUTE_DTYPES[standalone_dtype(op, "beta_dtype")]
     return compile_tvm_ffi(
         op,
         packed(io, hq, op.d_k),
@@ -3129,7 +3133,7 @@ def kda_bprop(
 
     dq, dk, dv = per_head(d_k, q.dtype), per_head(d_k, q.dtype), per_head(d_v, q.dtype)
     dgate, dbeta = torch.empty_like(gate), torch.empty_like(beta)
-    op = KdaBprop(
+    op = KdaBprop.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
         d_k,
@@ -3138,9 +3142,10 @@ def kda_bprop(
         d_final_state is not None,
         d_initial_state is not None,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
+        beta_dtype=TORCH_NAMES[beta.dtype],
     )
     table, count, scheduler = work if work is not None else uncut_work_items(cu_seqlens, heads)
-    fn = compile_kda_bprop(op, TORCH_NAMES[beta.dtype])
+    fn = compile_kda_bprop(op)
     fn(
         q, k, v, do, gate, beta, checkpoints, dq, dk, dv, dgate, dbeta, d_final_state,
         d_initial_state, table, count, scheduler,

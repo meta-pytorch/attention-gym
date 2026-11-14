@@ -73,7 +73,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES, standalone_dtype
 from attn_gym.warpdrive import (
     Barriers,
     Consumer,
@@ -227,11 +227,21 @@ class Item:
 class GdnRecompute(WarpSpecialized):
     """Warpdrive GDN checkpoint-series recompute for fp16/bf16 ``d_k, d_v`` in {64, 128}."""
 
-    def __init__(self, dtype_name: str, d_k: int, d_v: int, use_initial_state: bool):
+    def __init__(
+        self,
+        dtype_name: str,
+        d_k: int,
+        d_v: int,
+        use_initial_state: bool,
+        *,
+        state_dtype: str | None = None,
+    ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the recompute serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         self.dtype_name, self.d_k, self.d_v = dtype_name, d_k, d_v
         self.use_initial_state = use_initial_state
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.state_dtype = state_dtype
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         # Upstream's register split: the compute group takes 256 when it also seeds the state.
         compute_regs, other_regs = (256, 24) if use_initial_state else (232, 48)
@@ -1090,7 +1100,7 @@ def bundle_hook(io_dtype, d_k: int, d_v: int, use_initial_state: bool, num_sm: i
 
 
 @jit_cache
-def compile_gdn_recompute(op: GdnRecompute, state_dtype_name: str | None):
+def compile_gdn_recompute(op: GdnRecompute):
     """Compile for dynamic tokens, heads, sequences, work rows and checkpoint rows."""
     io = op.io_dtype
     i32 = cutlass.Int32
@@ -1098,7 +1108,7 @@ def compile_gdn_recompute(op: GdnRecompute, state_dtype_name: str | None):
     tinv_rows, ckpt_rows, items = (cute.sym_int() for _ in range(3))
     state = None
     if op.use_initial_state:
-        state_dtype = getattr(cutlass, state_dtype_name)
+        state_dtype = getattr(cutlass, standalone_dtype(op, "state_dtype"))
         state = make_fake_strided_tensor(
             state_dtype,
             (seqs, heads, op.d_v, op.d_k),
@@ -1152,10 +1162,17 @@ def gdn_recompute(
         raise TypeError(f"state_in must be fp32 or bf16, got {state_in.dtype}")
     if scheduler is None:
         scheduler = torch.zeros(2, dtype=torch.int32, device=k.device)
-    if op is None:
-        op = GdnRecompute(IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1], state_in is not None)
     state_name = None if state_in is None else _STATE_DTYPES[state_in.dtype].__name__
-    fn = compile_gdn_recompute(op, state_name)
+    if op is None:
+        op = GdnRecompute.get_or_build(
+            IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1], state_in is not None,
+            state_dtype=state_name,
+        )  # fmt: skip
+    elif op.state_dtype != state_name:
+        raise ValueError(
+            f"op was built for state_dtype={op.state_dtype}, state_in is {state_name}"
+        )
+    fn = compile_gdn_recompute(op)
     workspace, sms = op.work.launch_args(k.device)
     if max_ctas is not None:
         sms = max_ctas

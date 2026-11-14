@@ -172,25 +172,35 @@ GATE_KERNELS = [
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 0, 152),
-        ("fp32", "fp32"),
+        {"beta_dtype": "fp32", "state_dtype": "fp32"},
     ),
-    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), ("fp32",)),
-    ("kda_summary", "KdaSummary", ("bf16", "fp32", 128, 128, 152), ("fp32",)),
-    ("kda_recompute", "KdaRecompute", ("bf16", "fp32", 128, 128, True, 152), ("fp32", "fp32")),
-    ("kda_bprop", "KdaBprop", ("bf16", "fp32", 128, 128, True, True, True, 152), ("fp32",)),
-    ("kda_bprop_summary", "KdaBpropSummary", ("bf16", 128, 128, True), ()),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32"}),
+    ("kda_summary", "KdaSummary", ("bf16", "fp32", 128, 128, 152), {"beta_dtype": "fp32"}),
+    (
+        "kda_recompute",
+        "KdaRecompute",
+        ("bf16", "fp32", 128, 128, True, 152),
+        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+    ),
+    (
+        "kda_bprop",
+        "KdaBprop",
+        ("bf16", "fp32", 128, 128, True, True, True, 152),
+        {"beta_dtype": "fp32"},
+    ),
+    ("kda_bprop_summary", "KdaBpropSummary", ("bf16", 128, 128, True), {}),
 ]
 
 
 @pytest.mark.parametrize("case", GATE_KERNELS, ids=lambda case: case[0])
 def test_fastmath_false_compiles_no_flushing_math(requires_blackwell, tmp_path, case) -> None:
     """Every kernel that exponentiates gates emits non-FTZ ``ex2``/``rcp`` and no FTZ op."""
-    module, cls, args, compile_args = case
+    module, cls, args, dtypes = case
     mod = importlib.import_module(f"{PACKAGE}.{module}")
     with capture_ptx(tmp_path) as out, warnings.catch_warnings():
         warnings.simplefilter("ignore")
         getattr(mod, f"compile_{module}").__wrapped__(
-            getattr(mod, cls)(*args, fastmath=False), *compile_args
+            getattr(mod, cls)(*args, fastmath=False, **dtypes)
         )
     (path,) = out.glob("*.ptx")
     ptx = read_ptx(path)

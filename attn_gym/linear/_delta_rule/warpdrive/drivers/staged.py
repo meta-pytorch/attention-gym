@@ -301,7 +301,7 @@ def forward_from_pieces(
     )  # fmt: skip
     o = torch.empty(tokens, heads, dim_v, dtype=q.dtype, device=q.device)
     launch = pieces.launch
-    op = kda_prefill.KdaPrefill(
+    op = kda_prefill.KdaPrefill.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
         dim_k,
@@ -312,8 +312,10 @@ def forward_from_pieces(
         0,
         _num_sm(q.device),
         fastmath,
+        beta_dtype=TORCH_NAMES[beta.dtype],
+        state_dtype="fp32",
     )
-    fn = kda_prefill.compile_kda_prefill(op, TORCH_NAMES[beta.dtype], "fp32")
+    fn = kda_prefill.compile_kda_prefill(op)
     fn(
         q, k, v, gate, beta, states, o, final, None, None, launch.work_items, launch.work_count,
         _scheduler(q.device), new_tma_slots(op.tma_slot_rows(heads), q.device), scale,
@@ -422,11 +424,11 @@ def backward_pieces(
         )
 
     def recompute(states, checkpoints) -> None:
-        op = kda_recompute.KdaRecompute(
+        op = kda_recompute.KdaRecompute.get_or_build(
             TORCH_NAMES[k.dtype], TORCH_NAMES[gate.dtype], dim_k, dim_v, True, _num_sm(device),
-            fastmath,
+            fastmath, beta_dtype=TORCH_NAMES[beta.dtype], state_dtype="fp32",
         )  # fmt: skip
-        kda_recompute.compile_kda_recompute(op, TORCH_NAMES[beta.dtype], "fp32")(
+        kda_recompute.compile_kda_recompute(op)(
             k, v, gate, beta, states, checkpoints, launch.work_items, launch.work_count,
             _scheduler(device), new_tma_slots(op.tma_slot_rows(heads), device),
         )  # fmt: skip
@@ -467,11 +469,11 @@ def backward_from_pieces(
     dq, dk, dv, dgate, dbeta = (torch.empty_like(t) for t in (q, k, v, gate, beta))
     _zero_tail_rows(dgate, cu_seqlens)
     launch = pieces.launch
-    op = kda_bprop.KdaBprop(
+    op = kda_bprop.KdaBprop.get_or_build(
         TORCH_NAMES[q.dtype], TORCH_NAMES[gate.dtype], dim_k, dim_v, True, True, d_initial_state,
-        _num_sm(q.device), fastmath,
+        _num_sm(q.device), fastmath, beta_dtype=TORCH_NAMES[beta.dtype],
     )  # fmt: skip
-    kda_bprop.compile_kda_bprop(op, TORCH_NAMES[beta.dtype])(
+    kda_bprop.compile_kda_bprop(op)(
         q, k, v, d_output, gate, beta, pieces.checkpoints, dq, dk, dv, dgate, dbeta, exits,
         dstate0, launch.work_items, launch.work_count, _scheduler(q.device),
         new_tma_slots(op.tma_slot_rows(heads), q.device), scale, None,
