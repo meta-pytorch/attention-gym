@@ -206,7 +206,7 @@ def _mma_sync(
     M_BLOCKS = M // 16
     N_FRAGS = N // 8
     a_stride = len(a_frag) // M_BLOCKS
-    tag = io_tag(dtype)
+    tag = "tf32" if dtype is cutlass.Float32 else io_tag(dtype)
     a_regs = ",".join(f"${4 + i}" for i in range(a_words))
     b_regs = ",".join(f"${4 + a_words + i}" for i in range(b_words))
     c0 = 4 + a_words + b_words
@@ -291,6 +291,13 @@ def mma_step_k8(
 ):
     """``acc[M, N] += A[M, 8] @ B[8, N]`` with m16n8k8 mma.sync on packed fragments."""
     _mma_sync(acc, a_frag, b_frag, k_step, M, N, dtype, "m16n8k8", 2, 1)
+
+
+@cute.jit
+def mma_step_tf32(acc, a_frag, b_frag, *, M: cutlass.Constexpr[int], N: cutlass.Constexpr[int]):
+    """``acc[M, N] += A[M, 8] @ B[8, N]`` with m16n8k8 tf32 mma.sync on fp32-bit fragments: four
+    A words (rows g, g + 8 at columns t, t + 4) and two B words per 8 columns."""
+    _mma_sync(acc, a_frag, b_frag, 0, M, N, cutlass.Float32, "m16n8k8", 4, 2)
 
 
 @cute.jit
