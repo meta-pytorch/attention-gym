@@ -74,7 +74,8 @@ def gemm(a, b, out, ab_stages=4):
 - A memo hit restores no trace record: the instance already holds the record its first call
   restored or traced, so `describe()` and the reports are unaffected.
 
-Keep the objects a kernel's settings hold (cluster, schedules, maps,
+Compile functions take only the kernel: every compile-time choice, operand dtypes included, is
+a constructor argument. Keep the objects a kernel's settings hold (cluster, schedules, maps,
 readiness) immutable, as warpdrive's own frozen dataclasses are.
 
 Any `jit_cache` argument can opt in: a first argument with a `__cute_memo__` dict attribute,

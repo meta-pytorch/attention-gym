@@ -61,7 +61,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, standalone_dtype
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -227,12 +227,17 @@ class KdaRecompute(WarpSpecialized):
         use_initial_state: bool,
         num_ctas,
         fastmath: bool = True,
+        *,
+        beta_dtype: str | None = None,
+        state_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA recompute serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.beta_dtype, self.state_dtype = beta_dtype, state_dtype
         self.use_initial_state, self.num_ctas = use_initial_state, num_ctas
         self.fastmath = fastmath
         # One cg0 body for both instances is 1% faster at d_k = 128 (8x4096 H32: 559 vs 565 us)
@@ -1666,7 +1671,7 @@ def checkpoint_rows(tokens: int, num_sequences: int) -> int:
 
 
 @jit_cache
-def compile_kda_recompute(op: KdaRecompute, beta_name: str, state_name: str | None):
+def compile_kda_recompute(op: KdaRecompute):
     """Compile for dynamic tokens, heads, sequences, work rows and checkpoint rows."""
     io, i32 = op.io_dtype, cutlass.Int32
     tokens, hk, hv, heads, rows, ckpt_rows = (cute.sym_int() for _ in range(6))
@@ -1677,9 +1682,9 @@ def compile_kda_recompute(op: KdaRecompute, beta_name: str, state_name: str | No
         )
 
     state = None
-    if state_name is not None:
+    if op.use_initial_state:
         state = make_fake_strided_tensor(
-            CUTE_DTYPES[state_name],
+            CUTE_DTYPES[standalone_dtype(op, "state_dtype")],
             (cute.sym_int(), heads, op.d_v, op.d_k),
             stride_divisibility=4,
         )
@@ -1688,7 +1693,9 @@ def compile_kda_recompute(op: KdaRecompute, beta_name: str, state_name: str | No
         packed(io, hk, op.d_k),
         packed(io, hv, op.d_v),
         packed(op.gate_dtype, heads, op.d_k),
-        make_fake_strided_tensor(CUTE_DTYPES[beta_name], (tokens, heads), contiguous_dim=None),
+        make_fake_strided_tensor(
+            CUTE_DTYPES[standalone_dtype(op, "beta_dtype")], (tokens, heads), contiguous_dim=None
+        ),
         state,
         make_fake_strided_tensor(io, (ckpt_rows, heads, op.d_v, op.d_k), stride_divisibility=8),
         make_fake_strided_tensor(i32, (rows, WORK_ITEM_FIELDS), contiguous_dim=None),
@@ -1721,15 +1728,16 @@ def kda_recompute(
         raise TypeError("checkpoints must have the io dtype")
     if scheduler is None:
         scheduler = torch.zeros(1, dtype=torch.int32, device=k.device)
-    op = KdaRecompute(
+    op = KdaRecompute.get_or_build(
         TORCH_NAMES[k.dtype],
         TORCH_NAMES[gate.dtype],
         k.shape[-1],
         v.shape[-1],
         initial_state is not None,
         torch.cuda.get_device_properties(k.device).multi_processor_count,
+        beta_dtype=TORCH_NAMES[beta.dtype],
+        state_dtype=None if initial_state is None else TORCH_NAMES[initial_state.dtype],
     )
-    state_name = None if initial_state is None else TORCH_NAMES[initial_state.dtype]
-    fn = compile_kda_recompute(op, TORCH_NAMES[beta.dtype], state_name)
+    fn = compile_kda_recompute(op)
     slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), k.device)
     fn(k, v, gate, beta, initial_state, checkpoints, work_items, work_count, scheduler, slots)

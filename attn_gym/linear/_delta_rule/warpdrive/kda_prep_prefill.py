@@ -52,7 +52,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, standalone_dtype
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -225,6 +225,8 @@ class KdaPrepPrefill(WarpSpecialized):
         paged_state: int,
         num_ctas: int,
         state_align: int = 16,
+        *,
+        state_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the KDA prep prefill serves d_k in {HEAD_DIMS}, got {d_k}")
@@ -232,6 +234,8 @@ class KdaPrepPrefill(WarpSpecialized):
             raise ValueError("paged state routes one pool in and out")
         self.io, self.d_k, self.tiles_per_head, self.num_ctas = io, d_k, tiles_per_head, num_ctas
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.state_dtype = state_dtype
         self.paged_state = paged_state
         self.state_align = state_align
         self.io_dtype = io_t = CUTE_DTYPES[io]
@@ -1242,7 +1246,7 @@ def record_rows(cu_seqlens: torch.Tensor) -> torch.Tensor:
 
 
 @jit_cache
-def compile_kda_prep_prefill(op: KdaPrepPrefill, state_name: str | None):
+def compile_kda_prep_prefill(op: KdaPrepPrefill):
     """Compile for dynamic tokens, heads, sequences, record rows and work rows."""
     io, i32 = op.io_dtype, cutlass.Int32
     tokens, hv, heads, rows, items = (cute.sym_int() for _ in range(5))
@@ -1255,9 +1259,9 @@ def compile_kda_prep_prefill(op: KdaPrepPrefill, state_name: str | None):
         return make_fake_strided_tensor(dtype, (rows, heads, *tail), stride_divisibility=8)
 
     state = None
-    if state_name is not None:
+    if op.use_initial_state or op.store_final_state:
         state = make_fake_strided_tensor(
-            CUTE_DTYPES[state_name],
+            CUTE_DTYPES[standalone_dtype(op, "state_dtype")],
             (cute.sym_int(), heads, dv_full, op.d_k),
             stride_divisibility=4,
         )
@@ -1319,7 +1323,7 @@ def kda_prep_prefill(
         if x is not None:
             state_name = TORCH_NAMES[x.dtype]
     tiles = d_v // D_V
-    op = KdaPrepPrefill(
+    op = KdaPrepPrefill.get_or_build(
         TORCH_NAMES[v.dtype],
         d_k,
         tiles,
@@ -1327,9 +1331,10 @@ def kda_prep_prefill(
         final is not None,
         0,
         torch.cuda.get_device_properties(v.device).multi_processor_count,
+        state_dtype=state_name,
     )
     table, count, scheduler = uncut_work_items(cu_seqlens, heads, tiles)
-    fn = compile_kda_prep_prefill(op, state_name)
+    fn = compile_kda_prep_prefill(op)
     fn(
         v,
         k_decay,
