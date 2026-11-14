@@ -9,7 +9,9 @@ rendezvous completes its loads and stores. The layer emits the fences on managed
 synchronization and the drain at teardown; the kernels' raw signals emit their own fences.
 Calls that skip a fence another one already provides (``skip_fence=``, a raw helper's
 ``fence=False``) are proven only here, per configuration. The configurations are those the public ops and drivers
-build (recorded over test/gdn, test/kda and test/linear). Launch bundles run the same kernel
+build (recorded over test/gdn, test/kda and test/linear). Each kernel case also traces with
+strict alias and fence diagnostics and allows only the audited fence entries in
+``FENCE_UNVERIFIED``. Launch bundles run the same kernel
 classes; the paged prefill states compile only inside a warmup-forward bundle, so those bundles
 are cases too. Compile-only: a few seconds each.
 """
@@ -17,6 +19,7 @@ are cases too. Compile-only: a few seconds each.
 from __future__ import annotations
 
 import importlib
+import warnings
 
 import pytest
 
@@ -24,6 +27,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 
+from attn_gym.warpdrive.fences import FENCE_KINDS
 from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
 from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
 
@@ -226,6 +230,126 @@ BUNDLES = [
 ]
 
 
+# Fence-check entries that stay "unverified" on these kernels, each audited against the code and
+# keyed by its report line (channel, side, effective fences): the fence is the one PTX requires,
+# and the check cannot see why. Accesses go through raw inline PTX (stmatrix, st.shared,
+# tcgen05.ld/st) or raw tmem.ptr/cols column lookups, so no annotation is recorded while the
+# handle is open; TMEM accesses count against every open handle (``fences._seen``), so another
+# channel's TMEM traffic inside a hold looks unmatched. Proxy rule: generic SMEM accesses
+# followed by async-proxy ones (TMA, tcgen05.mma operands) need fence.proxy.async in each
+# accessing thread before its signal (PTX ISA 9.7.10.28.2, 9.7.18.6.5). TMEM: a tcgen05.st handed
+# on needs tcgen05.wait::st, a tcgen05.ld handed to another warp's writer needs tcgen05.wait::ld
+# (9.7.18.6.2, 9.7.18.6.4.4). Any other unverified entry (another fence at an audited site among
+# them), an unverified requirement the check names by fence kind, any missing fence, or any alias
+# finding fails.
+_GENERIC_TO_UMMA = "generic stmatrix/st.shared writes read by tcgen05.mma need smem_async"
+_GENERIC_TO_TMA = "generic stores read by a TMA store need smem_async"
+_TILES = (
+    "the tinv/a/da/dm tiles share the Inter stage at fixed offsets and bind no buffer (binding "
+    "Inter to all four would alias them); stmatrix writes read by tcgen05.mma need smem_async"
+)
+FENCE_UNVERIFIED = {
+    ("gdn_bprop", "q release_fence none"): (
+        "cg1's ldmatrix reads of sQ are followed by its explicit fence_async_shared before the "
+        "release, so the TMA refill needs no further fence"
+    ),
+    ("gdn_bprop", "v release_fence none"): (
+        "cg1 reads sV, writes U over it, and the u commit's smem_async runs in every thread "
+        "before v's release: the TMA refill is ordered after a fence.proxy.async"
+    ),
+    ("gdn_bprop", "do release_fence none"): (
+        "as v: the u commit's smem_async precedes do's release"
+    ),
+    ("gdn_bprop", "dm commit_fence smem_async"): _GENERIC_TO_UMMA + " (dM, no buffer bound)",
+    ("gdn_bprop", "u commit_fence smem_async"): _GENERIC_TO_UMMA + " (U over sV, no buffer bound)",
+    ("gdn_bprop", "z commit_fence smem_async"): _GENERIC_TO_UMMA + " (Z in sdQ, no buffer bound)",
+    ("gdn_bprop", "dq commit_fence smem_async"): _GENERIC_TO_TMA,
+    ("gdn_bprop", "dk commit_fence smem_async"): (
+        _GENERIC_TO_TMA + " (cg2); cg1 uses sdK as scratch and signals raw without a fence, "
+        "but cg2 overwrites every scratch byte after dgate_cg1 and fences before its commit, so "
+        "the TMA read cannot observe cg1's writes"
+    ),
+    ("gdn_bprop", "dv commit_fence smem_async"): _GENERIC_TO_UMMA + " and by a TMA store",
+    ("gdn_bprop_summary", "a_acc release_fence tmem_load"): (
+        "pairwise's tcgen05.ld of a precedes the next QK MMA write (wait::ld); the do_prime "
+        "stores inside the hold are handed on by do_prime's own wait::st"
+    ),
+    ("gdn_bprop_summary", "do_prime commit_fence tmem_store"): (
+        "tcgen05.st read by tcgen05.mma needs wait::st; the MMA side's tmem.ptr is raw"
+    ),
+    ("gdn_bprop_summary", "trip release_fence tmem_load+tmem_store"): (
+        "du loads dvdk/dy before MMA overwrites (wait::ld) and stores du/dvdk the next MMAs "
+        "read (wait::st); the MMA side's tmem.ptr is raw"
+    ),
+    ("gdn_bprop_summary", "dstate release_fence tmem_load+tmem_store"): (
+        "state loads dstate before MMA writes (wait::ld) and stores the rescaled dstate the MMA "
+        "reads (wait::st); its dstate_in stores in the same loop are dstate_in's"
+    ),
+    ("gdn_bprop_summary", "dstate_in commit_fence tmem_store"): (
+        "tcgen05.st read by tcgen05.mma needs wait::st; the dstate accesses in the same loop are "
+        "handed on by dstate's release"
+    ),
+    ("gdn_tinv", "tile commit_fence smem_async"): (
+        "the tile's generic writes are verified; the unmatched access is the TMEM acc load inside "
+        "the hold, ordered by acc's own tmem_load release"
+    ),
+    ("gdn_prefill", "cg0 release_fence tmem_load"): (
+        "compute0's tcgen05.ld (raw tmem.ptr column) precedes the MMA warp's overwrite: wait::ld"
+    ),
+    ("gdn_prefill", "o commit_fence smem_async"): (
+        _GENERIC_TO_TMA + "; sO is allocated ahead of the layer for the SMEM order, so o binds "
+        "no buffer"
+    ),
+    ("kda_prefill", "kk commit_fence smem_async"): (
+        _GENERIC_TO_UMMA + " (Kdecay); the epilogue consumer reads only Kinv, which the check "
+        "reports as a missing Kdecay access"
+    ),
+    ("kda_prefill", "qk commit_fence smem_async"): (
+        _GENERIC_TO_UMMA + " (Krestore); the epilogue reads only Qdecay"
+    ),
+    ("kda_prep", "raw release_fence smem_async"): (
+        "warp 0 refills the stage by TMA after the empty wait (external producer); consumers "
+        "read it, and with an fp32 gate write it, generically: smem_async"
+    ),
+    ("kda_prep_prefill", "o_acc release_fence tmem_load"): (
+        "cg1's tcgen05.ld of qs precedes the MMA's qs writes, with no pipelining st: wait::ld"
+    ),
+    ("kda_bprop", "decay commit_fence smem_async"): (
+        _GENERIC_TO_UMMA + " (Qdecay/Kdecay); qk_raw's tcgen05.st inside the hold is qk_raw's"
+    ),
+    ("kda_bprop", "qk_raw commit_fence tmem_store"): (
+        "tcgen05.st read by cg2's tcgen05.ld: wait::st"
+    ),
+    ("kda_bprop", "qk_raw release_fence tmem_load"): (
+        "cg2's tcgen05.ld precedes cg0's overwrite four chunks later: wait::ld; the state_in and "
+        "dkd loads inside the hold are those channels'"
+    ),
+    ("kda_bprop", "state_in commit_fence tmem_store"): (
+        "tcgen05.st read by tcgen05.mma and cg2's tcgen05.ld: wait::st"
+    ),
+    ("kda_bprop", "state_in release_fence tmem_load"): (
+        "cg2's tcgen05.ld before cg0's overwrite: wait::ld"
+    ),
+    ("kda_bprop", "tinv commit_fence smem_async"): _TILES,
+    ("kda_bprop", "a commit_fence smem_async"): _TILES,
+    ("kda_bprop", "da commit_fence smem_async"): _TILES,
+    ("kda_bprop", "dm commit_fence smem_async"): _TILES,
+    ("kda_bprop", "dqk release_fence tmem_load"): (
+        "cg2's tcgen05.ld of dq/dkr/dki/dkd precede the next MMA writes: wait::ld completes all"
+    ),
+    ("kda_bprop", "dstate commit_fence smem_async"): (
+        _GENERIC_TO_UMMA + " and by cg2's generic loads"
+    ),
+    ("kda_bprop", "dq commit_fence smem_async"): _GENERIC_TO_TMA,
+    ("kda_bprop", "dk commit_fence none"): (
+        "no fence of its own: the same threads' dq commit runs fence.proxy.async after these "
+        "stores and before dk's arrival, which orders every prior generic access"
+    ),
+    ("kda_bprop", "dgate commit_fence smem_async"): _GENERIC_TO_TMA,
+    ("kda_bprop", "dv commit_fence smem_async"): _GENERIC_TO_UMMA + " and by a TMA store",
+}
+
+
 def _kernel_id(case) -> str:
     module, cls, args, _ = case
     return "-".join([module, cls, *map(str, args)])
@@ -234,6 +358,17 @@ def _kernel_id(case) -> str:
 def _bundle_id(case) -> str:
     module, args = case
     return "-".join([module, *(getattr(a, "__name__", str(a)) for a in args)])
+
+
+def _unaudited(module: str, op) -> list[str]:
+    """The fence results of ``op``'s trace that ``FENCE_UNVERIFIED`` does not audit."""
+    out = []
+    for r in op._ws_fences.results if op._ws_fences else []:
+        site = f"{r.channel} {r.key} {'+'.join(r.fences) or 'none'}"
+        named = [u for u in r.unverified if u.startswith(FENCE_KINDS)]  # "tmem_load: ..."
+        if r.status != "covered" and ((module, site) not in FENCE_UNVERIFIED or named):
+            out.append(r.describe())
+    return out
 
 
 def _check(tmp_path, build, *args):
@@ -245,10 +380,36 @@ def _check(tmp_path, build, *args):
 
 
 @pytest.mark.parametrize("case", KERNELS, ids=_kernel_id)
-def test_kernel_ptx_is_fenced(requires_blackwell, tmp_path, case):
+def test_kernel_ptx_and_reports(requires_blackwell, tmp_path, case):
+    """Every PTX path is fenced and drained; with strict diagnostics (a missing fence or alias
+    hazard raises) the trace leaves no alias finding and only allowlisted fence entries."""
     module, cls, args, compile_args = case
     mod = importlib.import_module(f"{PACKAGE}.{module}")
-    _check(tmp_path, getattr(mod, COMPILE[module]), getattr(mod, cls)(*args), *compile_args)
+    op = getattr(mod, cls)(*args)
+    op.alias_check = "strict"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # the reports are asserted below
+        _check(tmp_path, getattr(mod, COMPILE[module]), op, *compile_args)
+    unaudited = _unaudited(module, op)
+    assert not unaudited, "\n".join(unaudited)
+    flagged = [r.describe() for r in op._ws_alias.results if r.status != "no hazard found"]
+    assert not flagged, "\n".join(flagged)
+
+
+def test_dropped_audited_fence_fails(requires_blackwell, tmp_path):
+    """cg2 loads Q/K from the qk_raw TMEM ring and releases it to cg0's overwrite; without its
+    wait::ld the PTX stays fenced and the entry stays unverified, but with no fence: the
+    allowlist must reject it."""
+    from attn_gym.linear._delta_rule.warpdrive.kda_bprop import KdaBprop, compile_kda_bprop
+
+    op = KdaBprop("bf16", "fp32", 128, 128, True, True, True, 152)
+    op.qk_raw.release_fence = ()
+    op.alias_check = "strict"
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        _check(tmp_path, compile_kda_bprop, op, "fp32")
+    unaudited = _unaudited("kda_bprop", op)
+    assert len(unaudited) == 1 and "qk_raw release_fence none" in unaudited[0], unaudited
 
 
 @pytest.mark.parametrize("case", BUNDLES, ids=_bundle_id)
