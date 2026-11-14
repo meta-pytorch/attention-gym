@@ -307,6 +307,61 @@ def test_paired_state_chains_match_fp64(lens, pieces, heads, dim_v, dim_k, seed_
             assert torch.isnan(out[~filled]).all()
 
 
+def final_reference(main_rows, h, m, seed_state, transpose):
+    """The state leaving each sequence's walk: its seed chained through every one of its slots,
+    a one-slot sequence included."""
+    heads = h.shape[1]
+    main_rows = main_rows.tolist()
+    finals = []
+    for seq in range(len(main_rows) - 1):
+        base = main_rows[seq] // heads
+        count = max((main_rows[seq + 1] - main_rows[seq]) // heads, 1)
+        cur = seed_state[seq].double()
+        for step in reversed(range(count)) if transpose else range(count):
+            mj = m[base + step].double()
+            cur = cur @ (mj.transpose(-1, -2) if transpose else mj) + h[base + step].double()
+        finals.append(cur)
+    return torch.stack(finals)
+
+
+@pytest.mark.parametrize(
+    ("lens", "pieces", "heads", "dim_v", "dim_k"),
+    [*STATE_CASES, ([300, 64, 0, 5000], 6, 2, 128, 128)],
+)
+@pytest.mark.parametrize("transpose", [False, True])
+@pytest.mark.parametrize("maps", [False, True], ids=["states", "maps"])
+def test_state_chain_final_matches_fp64(lens, pieces, heads, dim_v, dim_k, transpose, maps):
+    """``final`` receives each sequence's seed composed through all its slots, one-slot
+    sequences included, while every slot's incoming state still lands in ``X``. A map chain
+    (``H`` with only the bias rows of a ``[bias; transition]`` state) seeds ``[0; I]`` itself
+    and adds no bias to the transition rows."""
+    main_rows, h, m, seed_state, _ = state_case(
+        lens, pieces, heads, dim_v, dim_k, torch.float32, False
+    )
+    if maps:
+        rows = dim_v + dim_k
+        identity = torch.zeros(len(lens), heads, rows, dim_k, device="cuda")
+        identity[:, :, dim_v:] = torch.eye(dim_k, device="cuda")
+        state_h = torch.cat((h, h.new_zeros(*h.shape[:2], dim_k, dim_k)), dim=2)
+        ref = state_chain_reference(main_rows, state_h, m, identity, None, transpose)
+        ref_final = final_reference(main_rows, state_h, m, identity, transpose)
+        seed_state = None
+    else:
+        rows, state_h = dim_v, h
+        ref = state_chain_reference(main_rows, h, m, seed_state, None, transpose)
+        ref_final = final_reference(main_rows, h, m, seed_state, transpose)
+    filled = ~torch.isnan(ref[:, 0, 0, 0])
+    # 8-row blocks walk on FMA, 16 and 32 on tensor cores; a block never straddles the bias.
+    for walk_rows in (r for r in (8, 16, 32) if dim_v % r == 0 and dim_k % r == 0):
+        x = torch.full_like(ref, float("nan"), dtype=torch.float32)
+        final = torch.full_like(ref_final, float("nan"), dtype=torch.float32)
+        pc().state_chain(
+            h, m, x, main_rows, seed=seed_state, transpose=transpose, rows=walk_rows, final=final
+        )
+        torch.testing.assert_close(x[filled].double(), ref[filled], atol=1e-4, rtol=1e-4)
+        torch.testing.assert_close(final.double(), ref_final, atol=1e-4, rtol=1e-4)
+
+
 def test_state_chain_reuses_one_compile_across_runtime_shapes():
     pc().compile_state_chain.cache_clear()
     cases = [([32768], 4, 2), ([1, 2, 3, 4], 3, 5), ([900] * 20, 2, 1)]

@@ -4,9 +4,9 @@
 
 Forward maps pack [B; A] for ``exit = entry @ A + B``; reverse maps pack [C; R] for
 ``d_entry = d_exit @ R + C``. Native state/operand rounding makes these approximate affine
-maps, not bitwise reconstruction of an ordinary unsharded warpdrive run. The v1.30 summary kernels
-run every sequence uncut, so the arithmetic is independent of sequence ownership and packed
-token count (:mod:`attn_gym.linear._delta_rule.warpdrive.drivers.summary`).
+maps, not bitwise reconstruction of an ordinary unsharded warpdrive run. Long sequences on few
+heads split into pieces whose maps compose on the device, so the bits follow the span's shapes
+and SM count (:mod:`attn_gym.linear._delta_rule.warpdrive.drivers.summary`).
 """
 
 from __future__ import annotations
