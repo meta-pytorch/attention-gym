@@ -273,6 +273,40 @@ def test_state_chain_matches_fp64(
         assert torch.isnan(x[~filled]).all()
 
 
+@pytest.mark.parametrize(("lens", "pieces", "heads", "dim_v", "dim_k"), STATE_CASES)
+@pytest.mark.parametrize(
+    ("seed_dtype", "routed"),
+    [(None, False), (torch.float32, False), (torch.bfloat16, True)],
+)
+def test_paired_state_chains_match_fp64(lens, pieces, heads, dim_v, dim_k, seed_dtype, routed):
+    """One launch running the forward chain of ``h`` and the transposed chain of ``g`` over the
+    same ``m`` (the backward's pair) matches both references, on both row-block widths."""
+    main_rows, h, m, seed_state, indices = state_case(
+        lens, pieces, heads, dim_v, dim_k, seed_dtype, routed
+    )
+    _, g, _, dseed, _ = state_case(lens, pieces, heads, dim_v, dim_k, seed_dtype, routed, seed=1)
+    ref = state_chain_reference(main_rows, h, m, seed_state, indices, False)
+    ref_t = state_chain_reference(main_rows, g, m, dseed, indices, True)
+    filled = ~torch.isnan(ref[:, 0, 0, 0])
+    for rows in {r for r in (dim_v // 16, dim_v // 8) if r >= pc().CHAIN_WARPS}:
+        x, dx = torch.full_like(h, float("nan")), torch.full_like(g, float("nan"))
+        pc().state_chain(
+            h,
+            m,
+            x,
+            main_rows,
+            seed=seed_state,
+            seed_indices=indices,
+            rows=rows,
+            reverse=(g, dx, dseed),
+        )
+        for out, expected in ((x, ref), (dx, ref_t)):
+            torch.testing.assert_close(
+                out[filled].double(), expected[filled], atol=1e-4, rtol=1e-4
+            )
+            assert torch.isnan(out[~filled]).all()
+
+
 def test_state_chain_reuses_one_compile_across_runtime_shapes():
     pc().compile_state_chain.cache_clear()
     cases = [([32768], 4, 2), ([1, 2, 3, 4], 3, 5), ([900] * 20, 2, 1)]
