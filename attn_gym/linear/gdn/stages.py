@@ -4,12 +4,13 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Staged fused GDN around the affine state boundary; see ``attn_gym.linear.kda.stages``.
+"""Staged GDN around the affine state boundary; see ``attn_gym.linear.kda.stages``.
 
 The gated delta rule is KDA with one scalar decay per head instead of a per-channel vector, so
-its summaries reuse the per-channel summary kernels with the gate broadcast across channels. The
-handles follow the same protocol as the KDA stages and plug into
-``attn_gym.linear.context_parallel`` unchanged.
+the fused summaries reuse the per-channel summary kernels with the gate broadcast across
+channels. ``kernel_options={"backend": "warpdrive"}`` runs the local pass and the summaries with
+warpdrive's GDN kernels instead. The handles follow the same protocol as the KDA stages and plug
+into ``attn_gym.linear.context_parallel`` unchanged.
 """
 
 from __future__ import annotations
@@ -21,11 +22,12 @@ from typing import NamedTuple
 import torch
 
 from attn_gym._backends.autotune import should_autotune
-from attn_gym._backends.cute import normalize_compact_tensor
+from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import prepare_span, zero_state
+from attn_gym.linear._delta_rule.validation import resolve_chunk_kernel_options
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
     chunk_gdn_recompute_aqk_dense,
     chunk_gdn_recompute_aqk_packed,
@@ -40,9 +42,18 @@ from attn_gym.linear.gdn.impl.chunk import (
     reject_int64_offsets,
     resolve_backward_metadata,
 )
+from attn_gym.linear.gdn.impl.warpdrive import validate_warpdrive_constraints
+from attn_gym.linear.gdn.impl.warpdrive_ops import (
+    chunk_gdn_warpdrive_packed_bwd_op,
+    chunk_gdn_warpdrive_packed_bwd_with_state_op,
+    chunk_gdn_warpdrive_packed_fwd_op,
+    chunk_gdn_warpdrive_packed_fwd_with_initial_state_op,
+    chunk_gdn_warpdrive_packed_fwd_with_state_op,
+    validate_warpdrive_available,
+)
 from attn_gym.linear.gdn.ops import _validate_fused_chunk_qkv
 from attn_gym.linear.gdn.validation import validate_gdn_inputs
-from attn_gym.types import TUNING_OPTION_SPEC, TuningOptions, validate_kernel_options
+from attn_gym.linear.types import SPLIT_OPTION_SPEC, SplitOptions
 
 
 def _vector_gate(cumulative_gate: torch.Tensor, key_dim: int) -> torch.Tensor:
@@ -66,6 +77,33 @@ class ChunkGDNSaved(NamedTuple):
     inverse: torch.Tensor
     cu_seqlens: torch.Tensor | None
     chunk_offsets: torch.Tensor | None
+
+
+class ChunkGDNWarpdriveSaved(NamedTuple):
+    """Forward tensors a warpdrive ``chunk_gdn_prepare`` stores for ``chunk_gdn_prepare_backward``.
+
+    warpdrive recomputes its factors from the raw FP32 ``gate`` in every pass, so the tape holds
+    only the inputs. It always runs packed, so ``cu_seqlens`` is never ``None``.
+    """
+
+    q: torch.Tensor
+    k: torch.Tensor
+    v: torch.Tensor
+    gate: torch.Tensor
+    beta: torch.Tensor
+    cu_seqlens: torch.Tensor
+
+
+def _zero_states(saved: ChunkGDNWarpdriveSaved) -> torch.Tensor:
+    """FP32 ``[N, HV, V, K]`` zeros, one per packed sequence."""
+    q, v = saved.q, saved.v
+    sequences = saved.cu_seqlens.shape[0] - 1
+    return q.new_zeros(sequences, v.shape[2], v.shape[-1], q.shape[-1], dtype=torch.float32)
+
+
+def _normalize_warpdrive_state(state: torch.Tensor | None) -> torch.Tensor | None:
+    """FP32 state as warpdrive's launchers read it through TMA; other layouts are copied."""
+    return None if state is None else normalize_tma_tensor(state.float())
 
 
 @dataclass
@@ -119,6 +157,58 @@ class ChunkGDNPrepared:
         return output, final_state if output_final_state else None
 
 
+@dataclass
+class ChunkGDNWarpdrivePrepared:
+    """Forward handle whose ``run`` and summaries are warpdrive's GDN kernels.
+
+    warpdrive keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from its
+    own summary pass (``gdn_summary``: the exit state from a zero entry state for ``B``, the
+    transition for ``A``) in the same 64-token chunks as the local pass. The backward handle is
+    :class:`ChunkGDNWarpdriveBackward`.
+    """
+
+    saved: ChunkGDNWarpdriveSaved
+    scale: float
+
+    def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
+
+        Rows follow NOTE [Summary ranges are subsequences] in ``attn_gym.linear.kda.stages``.
+        """
+        # Lazy import keeps the optional warpdrive backend out of the fused import path.
+        from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
+            build_warpdrive_gdn_state_summaries,
+        )
+
+        saved = self.saved
+        return build_warpdrive_gdn_state_summaries(
+            saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
+        )
+
+    def run(
+        self,
+        initial_state: torch.Tensor | None = None,
+        *,
+        output_final_state: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Finish the local forward from one FP32 ``[N, HV, V, K]`` entry state per sequence.
+
+        Dispatches as the public warpdrive ``chunk_gdn`` does, so the bits match it.
+        """
+        saved = self.saved
+        inputs = (saved.q, saved.k, saved.v, saved.gate, saved.beta)
+        if initial_state is None and not output_final_state:
+            return chunk_gdn_warpdrive_packed_fwd_op(
+                *inputs, saved.cu_seqlens, False, self.scale
+            ), None
+        if initial_state is None:
+            initial_state = _zero_states(saved)
+        args = (*inputs, _normalize_warpdrive_state(initial_state), saved.cu_seqlens, self.scale)
+        if output_final_state:
+            return chunk_gdn_warpdrive_packed_fwd_with_state_op(*args)
+        return chunk_gdn_warpdrive_packed_fwd_with_initial_state_op(*args), None
+
+
 def chunk_gdn_prepare(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -128,23 +218,40 @@ def chunk_gdn_prepare(
     *,
     cu_seqlens: torch.Tensor | None = None,
     scale: float | None = None,
-    kernel_options: TuningOptions | None = None,
-) -> ChunkGDNPrepared:
-    """Run the factor half of fused ``chunk_gdn`` and return a handle for summaries and output.
+    kernel_options: SplitOptions | None = None,
+) -> ChunkGDNPrepared | ChunkGDNWarpdrivePrepared:
+    """Run the factor half of ``chunk_gdn`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
-    one packed stream. ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
+    one packed stream. ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both
+    summaries with warpdrive's kernels; split schedules are not available with entry states.
+    ``"autotune"`` follows ``chunk_gdn``.
     """
-    autotune = validate_kernel_options(
-        kernel_options, TUNING_OPTION_SPEC, op_name="chunk_gdn_prepare"
-    )["autotune"]
+    options = resolve_chunk_kernel_options(
+        kernel_options, SPLIT_OPTION_SPEC, op_name="chunk_gdn_prepare"
+    )
+    if options["split_backward"] or options["split_forward"]:
+        raise ValueError("split schedules are not supported by chunk_gdn_prepare")
+    autotune, warpdrive = options["autotune"], options["backend"] == "warpdrive"
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
         raise ValueError("staged/context-parallel chunk_gdn currently requires K=V=128")
+    if warpdrive:
+        validate_warpdrive_available(q)
+        if cu_seqlens is None:
+            # warpdrive's stateful kernels are packed-only; arange keeps the launch capture-safe.
+            cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
     q, k, v, beta, metadata, cu_seqlens, chunk_offsets, scale = prepare_span(
         q, k, v, beta, cu_seqlens=cu_seqlens, scale=scale
     )
+    if warpdrive:
+        assert cu_seqlens is not None
+        gate = normalize_compact_tensor(gate.float())
+        validate_warpdrive_constraints(q, k, v)
+        return ChunkGDNWarpdrivePrepared(
+            ChunkGDNWarpdriveSaved(q, k, v, gate, beta, cu_seqlens), scale
+        )
     cumulative_gate = normalize_compact_tensor(
         _plain_gate_scan_op(gate.float().unsqueeze(-1), cu_seqlens, chunk_offsets, False).squeeze(
             -1
@@ -239,29 +346,109 @@ class ChunkGDNBackward:
         )
 
 
+@dataclass
+class ChunkGDNWarpdriveBackward:
+    """Backward handle whose ``run`` and reverse maps are warpdrive's GDN kernels.
+
+    Each subsequence's ``[C; R]`` map pairs the entry cotangent of its outputs under a zero exit
+    cotangent (``gdn_bprop_summary``, ``C``) with the forward transition transposed (``R``, the
+    exact adjoint). Nothing is consumed, so ``run`` and ``state_grad_summaries`` may be called in
+    either order.
+    """
+
+    saved: ChunkGDNWarpdriveSaved
+    d_output: torch.Tensor
+    initial_state: torch.Tensor | None
+    scale: float
+
+    def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
+        """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
+
+        Rows follow NOTE [Summary ranges are subsequences] in ``attn_gym.linear.kda.stages``.
+        """
+        from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
+            build_warpdrive_gdn_state_grad_summaries,
+        )
+
+        saved = self.saved
+        return build_warpdrive_gdn_state_grad_summaries(
+            saved.q,
+            saved.k,
+            saved.v,
+            saved.gate,
+            saved.beta,
+            self.d_output,
+            saved.cu_seqlens,
+            self.scale,
+            bounds=bounds,
+        )
+
+    def run(
+        self, d_final_state: torch.Tensor | None = None
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+    ]:
+        """Run warpdrive's backward from one FP32 ``[N, HV, V, K]`` exit cotangent per sequence.
+
+        Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)``; the last is ``None`` when the
+        forward ran without an entry state. An absent ``d_final_state`` skips the cotangent load
+        and gives the token gradients of an explicit zero. Dispatches as the public warpdrive
+        ``chunk_gdn`` backward does: without an entry state or a state cotangent it runs the
+        no-state kernel (the public op's when its forward returned no final state), otherwise the
+        stateful one, from a zero entry state if the forward had none.
+        """
+        saved = self.saved
+        operands = (saved.q, saved.k, saved.v, saved.gate, saved.beta, self.d_output)
+        if self.initial_state is None and d_final_state is None:
+            grads = chunk_gdn_warpdrive_packed_bwd_op(
+                *operands, saved.cu_seqlens, False, self.scale
+            )
+            return (*grads, None)
+        initial_state = _zero_states(saved) if self.initial_state is None else self.initial_state
+        *grads, d_initial_state = chunk_gdn_warpdrive_packed_bwd_with_state_op(
+            *operands,
+            initial_state,
+            _normalize_warpdrive_state(d_final_state),
+            saved.cu_seqlens,
+            self.scale,
+        )
+        return (*grads, None if self.initial_state is None else d_initial_state)
+
+
 def chunk_gdn_prepare_backward(
-    saved: ChunkGDNSaved,
+    saved: ChunkGDNSaved | ChunkGDNWarpdriveSaved,
     d_output: torch.Tensor | None,
     initial_state: torch.Tensor | None,
     *,
     scale: float,
-    kernel_options: TuningOptions | None = None,
-) -> ChunkGDNBackward:
+    kernel_options: SplitOptions | None = None,
+) -> ChunkGDNBackward | ChunkGDNWarpdriveBackward:
     """Recompute the local backward tensors before any reverse-summary exchange.
 
     ``initial_state`` is the entry state the forward ``run`` consumed and ``scale`` is the forward
     handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
-    ``kernel_options`` accepts ``"autotune"``, which follows ``chunk_gdn``.
+    ``kernel_options`` accepts the forward's options; ``"autotune"`` follows ``chunk_gdn``. The
+    tape selects the backend: a warpdrive tape (:class:`ChunkGDNWarpdriveSaved`) returns
+    :class:`ChunkGDNWarpdriveBackward`.
     """
-    autotune = validate_kernel_options(
-        kernel_options, TUNING_OPTION_SPEC, op_name="chunk_gdn_prepare_backward"
+    autotune = resolve_chunk_kernel_options(
+        kernel_options, SPLIT_OPTION_SPEC, op_name="chunk_gdn_prepare_backward"
     )["autotune"]
-    metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     scale = float(scale)
     if d_output is None:
         d_output = torch.zeros_like(saved.v)
     else:
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
+    if isinstance(saved, ChunkGDNWarpdriveSaved):
+        return ChunkGDNWarpdriveBackward(
+            saved, d_output, _normalize_warpdrive_state(initial_state), scale
+        )
+    metadata = resolve_backward_metadata(saved.q, saved.cu_seqlens, saved.chunk_offsets)
     if initial_state is not None:
         initial_state = normalize_compact_tensor(initial_state.float())
     reject_int64_offsets(d_output, initial_state)
@@ -283,6 +470,9 @@ __all__ = [
     "ChunkGDNBackward",
     "ChunkGDNPrepared",
     "ChunkGDNSaved",
+    "ChunkGDNWarpdriveBackward",
+    "ChunkGDNWarpdrivePrepared",
+    "ChunkGDNWarpdriveSaved",
     "chunk_gdn_prepare",
     "chunk_gdn_prepare_backward",
 ]

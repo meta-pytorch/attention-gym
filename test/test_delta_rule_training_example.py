@@ -50,16 +50,16 @@ def test_example_validates_public_gate_configuration():
         make(variant="mamba")
     with pytest.raises(ValueError, match="kernel_options apply only"):
         make(kernel_options={"backend": "warpdrive"}, backend="reference")
-    with pytest.raises(ValueError, match="takes only the autotune kernel option"):
-        ContextParallelDeltaRuleAttention(
-            hidden_size=128,
-            num_heads=1,
-            head_dim=128,
-            variant="gdn",
-            backend="fused",
-            kernel_options={"backend": "warpdrive"},
-            group=None,
-        )
+    # context_parallel_gdn runs on warpdrive too, so the CP module forwards the backend choice.
+    ContextParallelDeltaRuleAttention(
+        hidden_size=128,
+        num_heads=1,
+        head_dim=128,
+        variant="gdn",
+        backend="fused",
+        kernel_options={"backend": "warpdrive"},
+        group=None,
+    )
 
 
 @pytest.mark.parametrize("variant", ["kda", "gdn"])

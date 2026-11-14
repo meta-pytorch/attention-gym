@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Native v1.30 affine state summaries for context-parallel KDA.
+"""Native v1.30 affine state summaries for context-parallel KDA and GDN.
 
 Forward maps pack ``[B; A]`` for ``exit = entry @ A + B``; reverse maps pack ``[C; R]`` for
 ``d_entry = d_exit @ R + C``. One ``kda_summary`` launch writes both B (the zero-seeded final
 state H) and A (the stored-domain transition ``M_buf``); one ``kda_bprop_summary`` launch writes
-C (the entry cotangent under a zero exit cotangent). Every work item is the whole, uncut
-sequence, so the arithmetic is independent of sequence ownership and packed token count.
+C (the entry cotangent under a zero exit cotangent). GDN does the same in its own 64-token chunks
+with ``gdn_summary`` and ``gdn_bprop_summary``, after one ``gdn_tinv`` pass for the chunk
+inverses both read. Every work item is the whole, uncut sequence, so the arithmetic is
+independent of sequence ownership and packed token count.
 
 Bounds select whole packed sequences on device: a Triton selector writes one uncut work item
 per (sequence, head) and neutralizes unrequested sequences to zero width, and a gather maps each
@@ -16,6 +18,7 @@ replays; nothing here synchronizes with the host.
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import torch
@@ -24,13 +27,14 @@ import triton.language as tl
 
 from attn_gym._backends.cute.utils import initialized_cuda_device
 from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
-from attn_gym.utils import cdiv
+from attn_gym.utils import cdiv, fork_join_streams
 
-from .. import kda_bprop_summary, kda_summary
+from .. import gdn_bprop_summary, gdn_summary, gdn_tinv, kda_bprop_summary, kda_common, kda_summary
 from ..work_tables import WORK_ITEM_FIELDS
 from .plan import int32
 
-# Staged KDA tensors: natural-log FP32 channel gate, FP32 post-sigmoid beta, normalized keys.
+# Staged tensors: natural-log FP32 gate (per channel for KDA, per head for GDN), FP32
+# post-sigmoid beta, normalized keys.
 
 
 @triton.jit(debug=True, do_not_specialize=["rows", "tokens"])
@@ -44,16 +48,17 @@ def _select_summary_work(
     HEADS: tl.constexpr,
     ROW_BLOCK: tl.constexpr,
     FIELDS: tl.constexpr,
+    CHUNK: tl.constexpr,
 ):
     """Write one uncut native work item per sequence/head, zero-width unless a bound selects it.
 
     ``rows == 0`` selects every sequence; ``ROW_BLOCK`` is a power of two covering ``rows``, the
-    only shape the kernel specializes on. Row layout follows ``work_tables.py``:
-    ``[seq, head, write_start, write_end, compute_start, compute_end, token_start, token_stop,
-    final_dst, dstate_dst]``. Like the other warpdrive prologues (``check_packed_offsets``), it
-    aborts with ``invalid packed cu_seqlens`` unless the offsets start at zero, never decrease,
-    and end within the ``tokens`` packed tokens, so the summary kernels never address through
-    them.
+    only shape the kernel specializes on besides the summary kernel's ``CHUNK`` size. Row layout
+    follows ``work_tables.py``: ``[seq, head, write_start, write_end, compute_start, compute_end,
+    token_start, token_stop, final_dst, dstate_dst]``. Like the other warpdrive prologues
+    (``check_packed_offsets``), it aborts with ``invalid packed cu_seqlens`` unless the offsets
+    start at zero, never decrease, and end within the ``tokens`` packed tokens, so the summary
+    kernels never address through them.
     """
     seq = tl.program_id(0)
     head = tl.program_id(1)
@@ -66,7 +71,7 @@ def _select_summary_work(
     hi = tl.load(bounds + 2 * bound + 1, bound < rows, other=-1)
     matched = tl.sum(((lo == start) & (hi == stop) & (lo < hi)).to(tl.int32), 0) > 0
     stop = tl.where((rows == 0) | matched, stop, start)
-    chunks = tl.cdiv(stop - start, 16)
+    chunks = tl.cdiv(stop - start, CHUNK)
     fields = tl.arange(0, 16)
     row = tl.where((fields == 0) | (fields >= 8), seq, tl.where(fields == 1, head, 0))
     row = tl.where((fields == 3) | (fields == 5), chunks, row)
@@ -149,7 +154,12 @@ class _Launch:
 
     @classmethod
     def prepare(
-        cls, cu_seqlens: torch.Tensor, tokens: int, heads: int, bounds: torch.Tensor | None
+        cls,
+        cu_seqlens: torch.Tensor,
+        tokens: int,
+        heads: int,
+        bounds: torch.Tensor | None,
+        chunk: int,
     ) -> _Launch:
         device = cu_seqlens.device
         sequences = cu_seqlens.shape[0] - 1
@@ -168,6 +178,7 @@ class _Launch:
             heads,
             max(1, triton.next_power_of_2(rows)),
             WORK_ITEM_FIELDS,
+            chunk,
         )
         return cls(work_items, work_count, int32(2, device))
 
@@ -230,6 +241,31 @@ def _validate(tensors: dict[str, torch.Tensor], cu_seqlens: torch.Tensor, bounds
         raise ValueError(f"v must have V in {HEAD_DIMS}")
     if tensors["gate"].shape != k.shape or tensors["beta"].shape != k.shape[:3]:
         raise ValueError("gate and beta must match k's token and head extents")
+    _validate_operands(tensors, cu_seqlens, bounds)
+
+
+def _validate_gdn(tensors: dict[str, torch.Tensor], cu_seqlens: torch.Tensor, bounds) -> None:
+    """GDN shapes: ``q``/``k`` ``[1, T, HK, K]``, ``v``/``d_output`` ``[1, T, H, V]`` with ``HK``
+    dividing ``H``, and per-head ``gate``/``beta`` ``[1, T, H]``."""
+    k, v = tensors["k"], tensors["v"]
+    if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] not in HEAD_DIMS:
+        raise ValueError(f"k must have shape [1, T, HK, K] with K in {HEAD_DIMS}")
+    if v.ndim != 4 or v.shape[:2] != k.shape[:2] or v.shape[-1] not in HEAD_DIMS:
+        raise ValueError(f"v must have shape [1, T, H, V] with V in {HEAD_DIMS}")
+    if v.shape[2] % k.shape[2]:
+        raise ValueError("the value head count must be a multiple of the key head count")
+    if "q" in tensors and tensors["q"].shape != k.shape:
+        raise ValueError("q must match k's shape")
+    if "d_output" in tensors and tensors["d_output"].shape != v.shape:
+        raise ValueError("d_output must match v's shape")
+    if tensors["gate"].shape != v.shape[:3] or tensors["beta"].shape != v.shape[:3]:
+        raise ValueError("gate and beta must match v's token and head extents")
+    _validate_operands(tensors, cu_seqlens, bounds)
+
+
+def _validate_operands(tensors: dict[str, torch.Tensor], cu_seqlens: torch.Tensor, bounds) -> None:
+    """Dtype, device and ``bounds`` checks shared by both variants."""
+    k = tensors["k"]
     if k.dtype not in (torch.float16, torch.bfloat16) or any(
         tensors[name].dtype != k.dtype for name in ("q", "v", "d_output") if name in tensors
     ):
@@ -282,7 +318,7 @@ def build_state_summaries(
         dim_v, dim_k = v.shape[-1], k.shape[-1]
         maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
         if _launches(k.shape[1], bounds):
-            launch = _Launch.prepare(cu_seqlens, k.shape[1], heads, bounds)
+            launch = _Launch.prepare(cu_seqlens, k.shape[1], heads, bounds, kda_common.B_T)
             _forward_summary(
                 k[0],
                 v[0],
@@ -328,7 +364,7 @@ def build_state_grad_summaries(
         if not _launches(q.shape[1], bounds):
             return _summary_rows(maps, cu_seqlens, bounds)
         if transpose_forward_transition:
-            forward = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds)
+            forward = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds, kda_common.B_T)
             state = torch.empty(
                 sequences, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
             )
@@ -339,7 +375,7 @@ def build_state_grad_summaries(
             maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
         elif dim_v != dim_k:
             raise ValueError("the identity reverse probe requires V == K")
-        launch = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds)
+        launch = _Launch.prepare(cu_seqlens, q.shape[1], heads, bounds, kda_common.B_T)
         _reverse_summary(
             q[0],
             k[0],
@@ -354,7 +390,9 @@ def build_state_grad_summaries(
         )
         if not transpose_forward_transition:
             identity = (
-                torch.eye(dim_k, device=q.device).expand(sequences, heads, -1, -1).contiguous()
+                torch.eye(dim_k, dtype=torch.float32, device=q.device)
+                .expand(sequences, heads, -1, -1)
+                .contiguous()
             )
             _reverse_summary(
                 q[0],
@@ -371,4 +409,128 @@ def build_state_grad_summaries(
         return _summary_rows(maps, cu_seqlens, bounds)
 
 
-__all__ = ["build_state_grad_summaries", "build_state_summaries"]
+@functools.cache
+def _side_stream(device: torch.device) -> torch.cuda.Stream:
+    return torch.cuda.Stream(device)
+
+
+def _gdn_tinv(
+    k: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor, cu_seqlens: torch.Tensor
+) -> torch.Tensor:
+    """``gdn_tinv``'s chunk-inverse tiles for every sequence: both GDN summaries read them."""
+    tokens, heads = gate.shape
+    rows = gdn_tinv.tinv_rows(tokens, cu_seqlens.shape[0] - 1)
+    tinv = torch.empty(rows, heads, gdn_tinv.B_T, gdn_tinv.B_T, dtype=k.dtype, device=k.device)
+    row_table = int32(rows * 4, k.device).view(rows, 4)
+    gdn_tinv.gdn_tinv(k, gate, beta, cu_seqlens, tinv, row_table, int32(1, k.device))
+    return tinv
+
+
+def build_gdn_state_summaries(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    *,
+    bounds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return FP32 ``[R, H, V + K, K]`` GDN maps packed as ``[B; A]`` for whole packed sequences.
+
+    Inputs use the staged layout: ``k`` ``[1, T, HK, K]``, ``v`` ``[1, T, H, V]``, FP32
+    natural-log ``gate`` and FP32 ``beta`` ``[1, T, H]``. Bounds follow
+    :func:`build_state_summaries`.
+    """
+    _validate_gdn({"k": k, "v": v, "gate": gate, "beta": beta}, cu_seqlens, bounds)
+    with initialized_cuda_device(k):
+        sequences, heads = cu_seqlens.shape[0] - 1, v.shape[2]
+        dim_v, dim_k = v.shape[-1], k.shape[-1]
+        if not _launches(k.shape[1], bounds):
+            maps = _identity_maps(sequences, heads, dim_v, dim_k, k.device)
+            return _summary_rows(maps, cu_seqlens, bounds)
+        k, v, gate, beta = k[0], v[0], gate[0], beta[0]
+        tinv = _gdn_tinv(k, gate, beta, cu_seqlens)
+        launch = _Launch.prepare(cu_seqlens, k.shape[0], heads, bounds, gdn_summary.B_T)
+        # Every sequence has a work item, so the kernel writes every map, empty ones as [0; I].
+        maps = torch.empty(
+            sequences, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=k.device
+        )
+        gdn_summary.gdn_summary(
+            k,
+            v,
+            gate,
+            tinv,
+            maps[:, :, :dim_v],
+            maps[:, :, dim_v:],
+            launch.work_items,
+            launch.work_count,
+        )
+        return _summary_rows(maps, cu_seqlens, bounds)
+
+
+def build_gdn_state_grad_summaries(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    d_output: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    scale: float,
+    *,
+    bounds: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Return FP32 ``[R, H, V + K, K]`` GDN maps packed as ``[C; R]`` for whole packed sequences.
+
+    C is the native entry cotangent under a zero exit cotangent and R is ``A.T`` from the forward
+    summary. Inputs follow :func:`build_gdn_state_summaries`, with ``q`` shaped like ``k`` and
+    ``d_output`` like ``v``; bounds follow :func:`build_state_summaries`.
+    """
+    _validate_gdn(
+        {"q": q, "k": k, "v": v, "gate": gate, "beta": beta, "d_output": d_output},
+        cu_seqlens,
+        bounds,
+    )
+    with initialized_cuda_device(q):
+        sequences, heads = cu_seqlens.shape[0] - 1, v.shape[2]
+        dim_v, dim_k = v.shape[-1], k.shape[-1]
+        if not _launches(q.shape[1], bounds):
+            maps = _identity_maps(sequences, heads, dim_v, dim_k, q.device)
+            return _summary_rows(maps, cu_seqlens, bounds)
+        q, k, v, gate, beta, d_output = (t[0] for t in (q, k, v, gate, beta, d_output))
+        tinv = _gdn_tinv(k, gate, beta, cu_seqlens)
+        launch = _Launch.prepare(cu_seqlens, q.shape[0], heads, bounds, gdn_summary.B_T)
+        maps = torch.empty(
+            sequences, heads, dim_v + dim_k, dim_k, dtype=torch.float32, device=q.device
+        )
+        items = (launch.work_items, launch.work_count)
+
+        def transition() -> torch.Tensor:
+            exit_state = torch.empty(  # unused
+                sequences, heads, dim_v, dim_k, dtype=torch.float32, device=q.device
+            )
+            transition = torch.empty(
+                sequences, heads, dim_k, dim_k, dtype=torch.float32, device=q.device
+            )
+            gdn_summary.gdn_summary(k, v, gate, tinv, exit_state, transition, *items)
+            return transition
+
+        def bias() -> None:
+            gdn_bprop_summary.gdn_bprop_summary(
+                q, k, gate, d_output, tinv, maps[:, :, :dim_v], *items, scale=scale
+            )
+
+        # Both passes run one CTA per selected (sequence, head), a fraction of the SMs: overlap.
+        _, transition = fork_join_streams(
+            torch.cuda.current_stream(q.device), _side_stream(q.device), transition, bias
+        )
+        maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
+        return _summary_rows(maps, cu_seqlens, bounds)
+
+
+__all__ = [
+    "build_gdn_state_grad_summaries",
+    "build_gdn_state_summaries",
+    "build_state_grad_summaries",
+    "build_state_summaries",
+]
