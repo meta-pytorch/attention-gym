@@ -49,14 +49,14 @@ def _reference(k, gate, beta, lens, heads):
     return out
 
 
-def _run(k, gate, beta, cu, lens, heads):
+def _run(k, gate, beta, cu, lens, heads, bounds=None):
     from attn_gym.linear._delta_rule.warpdrive import gdn_tinv
 
     rows = gdn_tinv.tinv_rows(sum(lens), len(lens))
     tinv = torch.full((rows, heads, B_T, B_T), float("nan"), dtype=k.dtype, device="cuda")
     table = torch.full((rows, 4), -1, dtype=torch.int32, device="cuda")
     count = torch.zeros(1, dtype=torch.int32, device="cuda")
-    gdn_tinv.gdn_tinv(k, gate, beta, cu, tinv, table, count)
+    gdn_tinv.gdn_tinv(k, gate, beta, cu, tinv, table, count, bounds=bounds)
     return tinv, table, count
 
 
@@ -90,6 +90,31 @@ def test_gdn_tinv_matches_reference(lens, heads, key_heads, d_k, dtype, beta_dty
     for row, (ref, n) in _reference(k, gate, beta, lens, heads).items():
         got = tinv[row, :, :n, :n].double()
         torch.testing.assert_close(got, ref, atol=atol, rtol=0, msg=f"tile row {row}")
+
+
+def test_gdn_tinv_bounds_compute_only_the_selected_sequences():
+    """A bounds operand lists only the sequences overlapping a nonempty range, past the row-table
+    warp's first 32 sequences too; their tiles are bitwise the full pass's at the same rows and
+    the other rows stay unwritten."""
+    lens = (7,) * 40 + (200, 65)
+    k, gate, beta, cu = _inputs(lens, 3, 1, 128, torch.bfloat16, torch.float32)
+    full_tinv, full_table, full_count = _run(k, gate, beta, cu, lens, 3)
+    starts = cu.tolist()
+    selected = (3, 40, 41)
+    ranges = [[starts[b], starts[b + 1]] for b in selected] + [[starts[5], starts[5]]]
+    bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
+    tinv, table, count = _run(k, gate, beta, cu, lens, 3, bounds=bounds)
+
+    every = full_table[: full_count.item()].tolist()
+    expected = [row for row in every if row[1] in selected]
+    assert count.item() == len(expected)
+    assert table[: len(expected)].tolist() == expected
+    for chunk, sequence, start, _ in every:
+        row = start // B_T + sequence + chunk
+        if sequence in selected:
+            assert torch.equal(tinv[row], full_tinv[row]), row
+        else:
+            assert tinv[row].isnan().all(), row
 
 
 def test_gdn_tinv_reuses_one_compile_across_runtime_shapes():

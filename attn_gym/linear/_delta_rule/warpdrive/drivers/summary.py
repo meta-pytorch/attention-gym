@@ -635,16 +635,38 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
     return torch.cuda.Stream(device)
 
 
+# NOTE [Summary-only chunk inverses]
+# A context-parallel rank summarizes only the documents that continue on its neighbours, usually
+# its first and last, yet the chunk-inverse pass both GDN summaries read used to run over every
+# local document: with many short documents it was ~40% of the summary launch. The bounds now
+# reach gdn_tinv's row-table warp, which lists only the sequences (or pieces) overlapping a
+# summarized range. Tiles keep their rows (row = start // 64 + sequence + chunk, from the table
+# entry, not its position), the count stays on the device, and the grid is still shape-sized, so
+# a CUDA Graph replays for other bounds. GPU time per call on GB300, first + last document
+# summarized, before -> after: 16 x 2048 tokens at 16 heads 120 -> 88 us forward and 201 -> 168
+# us reverse; 64 x 512 at 16 heads 210 -> 170 / 353 -> 317; 8 x 4096 at 32 heads 194 -> 143 /
+# 340 -> 289; 4 x 1024 at 8 heads unchanged (42 / 78). The staged local passes read every tile
+# and keep the full table.
+
+
 def _gdn_tinv(
-    k: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor, cu_seqlens: torch.Tensor
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    bounds: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``gdn_tinv``'s chunk-inverse tiles for every sequence (or piece) of ``cu_seqlens``: both
-    GDN summaries read them."""
+    """``gdn_tinv``'s chunk-inverse tiles for the sequences (or pieces) of ``cu_seqlens``: both
+    GDN summaries read them. With ``bounds``, only those overlapping a summarized range: the
+    rest of a rank's documents would cost up to ~45% of a summary launch (NOTE [Summary-only
+    chunk inverses])."""
     tokens, heads = gate.shape
     rows = gdn_tinv.tinv_rows(tokens, cu_seqlens.shape[0] - 1)
     tinv = torch.empty(rows, heads, gdn_tinv.B_T, gdn_tinv.B_T, dtype=k.dtype, device=k.device)
     row_table = int32(rows * 4, k.device).view(rows, 4)
-    gdn_tinv.gdn_tinv(k, gate, beta, cu_seqlens, tinv, row_table, int32(1, k.device))
+    gdn_tinv.gdn_tinv(
+        k, gate, beta, cu_seqlens, tinv, row_table, int32(1, k.device), bounds=bounds
+    )
     return tinv
 
 
@@ -658,7 +680,7 @@ def _gdn_launch(
 ) -> tuple[_Launch, torch.Tensor]:
     """The selected work and the chunk inverses of its sequences or pieces."""
     launch = _Launch.prepare(cu_seqlens, k.shape[0], gate.shape[1], bounds, gdn_summary.B_T, cost)
-    tinv = _gdn_tinv(k, gate, beta, launch.cu_pieces if launch.split else cu_seqlens)
+    tinv = _gdn_tinv(k, gate, beta, launch.cu_pieces if launch.split else cu_seqlens, bounds)
     return launch, tinv
 
 

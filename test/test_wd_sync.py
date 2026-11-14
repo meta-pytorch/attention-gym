@@ -116,6 +116,7 @@ KERNELS = [
     ("gdn_summary", "GdnSummary", ("fp16", 64, 128), {}),
     ("gdn_tinv", "GdnTinv", ("bf16", 128), {"beta_dtype": "fp32"}),
     ("gdn_tinv", "GdnTinv", ("bf16", 64), {"beta_dtype": "fp32"}),
+    ("gdn_tinv", "GdnTinv", ("bf16", 128), {"beta_dtype": "fp32", "select_bounds": True}),
     (
         "kda_bprop",
         "KdaBprop",

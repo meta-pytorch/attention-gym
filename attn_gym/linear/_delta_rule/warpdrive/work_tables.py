@@ -1668,10 +1668,12 @@ def order_storage():
 
 
 @cute.jit
-def emit_chunk_rows(b_t: cutlass.Constexpr[int], cu_seqlens, mRows, mCount, lane_idx):
+def emit_chunk_rows(b_t: cutlass.Constexpr[int], cu_seqlens, mRows, mCount, lane_idx, bounds=None):
     """One warp: the chunk row table, one ``(chunk, batch, batch_start, batch_end)`` entry per
     chunk in sequence order, and the row count; lanes scan the chunk counts of 32 sequences at
-    a time and write their rows."""
+    a time and write their rows. With ``bounds`` (``int32 [R, 2]`` token ranges), only sequences
+    overlapping a nonempty range get rows: the table stays in sequence order and the count on
+    the device."""
     n_batch = Int32(cu_seqlens.shape[0]) - Int32(1)
     carry = Int32(0)
     for b0 in cutlass.range(0, n_batch, 32, unroll=1):
@@ -1683,6 +1685,14 @@ def emit_chunk_rows(b_t: cutlass.Constexpr[int], cu_seqlens, mRows, mCount, lane
             batch_start = cu_at(cu_seqlens, b)
             batch_end = cu_at(cu_seqlens, b + Int32(1))
             n_chunks = (batch_end - batch_start + Int32(b_t - 1)) // Int32(b_t)
+            if cutlass.const_expr(bounds is not None):
+                selected = False
+                for r in cutlass.range(Int32(bounds.shape[0]), unroll=1):
+                    lo, hi = bounds[r, 0], bounds[r, 1]
+                    if lo < hi and lo < batch_end and batch_start < hi:
+                        selected = True
+                if not selected:
+                    n_chunks = Int32(0)
         incl = n_chunks
         for offset in [1, 2, 4, 8, 16]:
             n = cute.arch.shuffle_sync_up(incl, offset, mask_and_clamp=0)
