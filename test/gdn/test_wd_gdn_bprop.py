@@ -142,11 +142,41 @@ def test_gdn_bprop_column_fold_waits_for_slow_reader():
     q, k, v, gate, beta = (x[0] for x in (q, k, v, gate, beta))
     do = torch.randn_like(v)
     args = (q, k, v, gate, beta, do, cu, lens, None, None, 128**-0.5)
-    delayed = gdn_bprop.GdnBprop("bf16", 128, False, False, False, column_fold_delay=20000)
+    delayed = gdn_bprop.GdnBprop(
+        "bf16", 128, False, False, False, column_fold_delay=20000, gate_dtype_name="fp32"
+    )
     expected = _wd_backward(*args)
     actual = _wd_backward(*args, op=delayed)
     for name, got, want in zip(NAMES[:5], actual[:5], expected[:5], strict=True):
         assert torch.equal(got, want), name
+
+
+def test_gdn_bprop_checks_a_supplied_op_against_the_operands():
+    """A supplied op runs when its constructor arguments are the ones the operands need, bit for
+    bit like the wrapper's own. One built without the entry state would skip chunk 0's
+    checkpoint and return wrong gradients, so it raises even with matching dtypes, as does one
+    built for another gate dtype; compiling an op on its own without its dtypes raises too."""
+    from attn_gym.linear._delta_rule.warpdrive import gdn_bprop
+
+    lens = (300, 129)
+    q, k, v, gate, beta, state, cu = make_gdn_test_inputs(lens, value_heads=2, seed=3)
+    q, k, v, gate, beta = (x[0] for x in (q, k, v, gate, beta))
+    do = torch.randn_like(v)
+    args = (q, k, v, gate, beta, do, cu, lens, state, None, 128**-0.5)
+    dtypes = {"gate_dtype_name": "fp32", "dstate0_dtype": "fp32"}
+    supplied = gdn_bprop.GdnBprop("bf16", 128, True, False, True, **dtypes)
+    for got, want in zip(_wd_backward(*args, op=supplied), _wd_backward(*args), strict=True):
+        assert torch.equal(got, want)
+    stateless = gdn_bprop.GdnBprop("bf16", 128, False, False, True, **dtypes)
+    with pytest.raises(ValueError, match="use_initial_state"):
+        _wd_backward(*args, op=stateless)
+    other_gate = gdn_bprop.GdnBprop(
+        "bf16", 128, True, False, True, gate_dtype_name="bf16", dstate0_dtype="fp32"
+    )
+    with pytest.raises(ValueError, match="gate_dtype_name"):
+        _wd_backward(*args, op=other_gate)
+    with pytest.raises(ValueError, match="needs gate_dtype_name="):
+        gdn_bprop.compile_gdn_bprop(gdn_bprop.GdnBprop("bf16", 128, False, False, False))
 
 
 @pytest.mark.parametrize("state_mode", ["none", "cotangent"])

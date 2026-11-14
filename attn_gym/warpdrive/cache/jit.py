@@ -25,6 +25,7 @@ import pickle
 import tempfile
 import threading
 import time
+import weakref
 from collections.abc import Callable, Hashable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -363,7 +364,8 @@ def jit_cache(
     A first argument with a ``__cute_memo__`` dict (a warpdrive kernel) remembers the build
     it was served, keyed by the remaining arguments, so the next call with the same object is a
     dictionary lookup. The object replaces that dict whenever anything its key reads changes;
-    ``cache_clear()`` and a new compile target retire every entry.
+    ``cache_clear()`` and a new compile target retire every entry and remove it from the memos
+    of arguments still alive, so a kernel kept for reuse holds no build the cache dropped.
 
     Args:
         persistent: False keeps only the process-local cache.
@@ -401,6 +403,9 @@ def jit_cache(
     # all of them at once (cache_clear, a fork, or another target).
     memo_token = object()
     memo_target = None
+    # Arguments whose memos hold entries under memo_token, by id, for retire_memos to empty; a
+    # collected argument drops out.
+    memo_owners: dict[int, weakref.ref] = {}
 
     def reset_after_fork() -> None:
         nonlocal cache_pid, hits, misses, state_lock
@@ -520,13 +525,40 @@ def jit_cache(
             with state_lock:
                 hits += 1
             return compiled
-        # Filled into the dict read before the lookup: a change during it retires the entry.
-        compiled = memo[memo_key] = lookup(args, kwargs, target)
+        compiled = lookup(args, kwargs, target)
+        memoize(args[0], memo, memo_key, compiled)
         return compiled
+
+    def memoize(owner: Any, memo: dict, memo_key: tuple[object, Any], compiled: T) -> None:
+        """Fill ``owner``'s memo (the dict read before the lookup) unless a retirement ran during
+        the lookup, tracking ``owner`` so that the next retirement empties it."""
+        with state_lock:
+            if memo_key[0] is not memo_token:
+                return
+            owner_id = id(owner)
+            if owner_id not in memo_owners:
+
+                def forget(ref: weakref.ref, owner_id: int = owner_id) -> None:
+                    if memo_owners.get(owner_id) is ref:
+                        del memo_owners[owner_id]
+
+                try:
+                    memo_owners[owner_id] = weakref.ref(owner, forget)
+                except TypeError:  # an owner retirement cannot reach keeps no memo
+                    return
+            memo[memo_key] = compiled
 
     def retire_memos(target: CompileTarget | None = None) -> None:
         nonlocal memo_token, memo_target
-        memo_token, memo_target = object(), target
+        with state_lock:
+            retired, memo_token, memo_target = memo_token, object(), target
+            owners = [ref() for ref in memo_owners.values()]
+            memo_owners.clear()
+        for owner in owners:
+            memo = getattr(owner, "__cute_memo__", None)
+            for key in list(memo or ()):
+                if key[0] is retired:
+                    memo.pop(key, None)
 
     def lookup(args: tuple[Any, ...], kwargs: dict[str, Any], target: CompileTarget) -> T:
         nonlocal hits

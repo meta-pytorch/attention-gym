@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import importlib.util
 import multiprocessing
 import os
@@ -7,6 +8,7 @@ import struct
 import sys
 import threading
 import time
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import NamedTuple
@@ -312,6 +314,48 @@ def test_cached_calls_restore_the_trace_record(isolated_cache):
     assert compile_kernel.is_cached(TracedConfig("a"))
     next(isolated_cache.rglob("*.trace")).unlink()
     assert not compile_kernel.is_cached(TracedConfig("a"))
+
+
+class MemoOwner:
+    """A reusable argument with a ``__cute_memo__``, as a warpdrive kernel has."""
+
+    def __init__(self):
+        self.__cute_memo__ = {}
+
+    def __cute_cache_key__(self) -> str:
+        return "owner"
+
+
+def test_retired_builds_leave_the_memos_of_live_arguments(isolated_cache, monkeypatch):
+    """``cache_clear()`` and a new compile target remove this function's builds from the memos
+    of arguments still alive (a kernel kept by ``get_or_build``), so launch -> clear -> launch
+    cycles hold one build and a cleared one is freed; another function's entries stay."""
+
+    @cute_cache.jit_cache(persistent=False)
+    def compile_kernel(owner: MemoOwner) -> FakeCompiled:
+        return FakeCompiled("kernel")
+
+    @cute_cache.jit_cache(persistent=False)
+    def compile_other(owner: MemoOwner) -> FakeCompiled:
+        return FakeCompiled("other")
+
+    target = cute_target.CompileTarget("first")
+    monkeypatch.setattr(cute_cache, "get_compile_target", lambda: target)
+    owner = MemoOwner()
+    other = compile_other(owner)
+    first = weakref.ref(compile_kernel(owner))
+    for _ in range(3):
+        compile_kernel.cache_clear()
+        compile_kernel(owner)
+    gc.collect()
+    assert first() is None
+    assert len(owner.__cute_memo__) == 2  # one build of each function
+    target = cute_target.CompileTarget("second")
+    current = weakref.ref(compile_kernel(owner))  # retires the other target's build
+    compile_kernel.cache_clear()
+    gc.collect()
+    assert current() is None
+    assert list(owner.__cute_memo__.values()) == [other]
 
 
 def test_runtime_cache_includes_compile_target(isolated_cache, monkeypatch):

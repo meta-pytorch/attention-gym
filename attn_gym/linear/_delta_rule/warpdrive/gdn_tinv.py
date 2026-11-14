@@ -54,7 +54,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES, standalone_dtype
 from attn_gym.warpdrive import (
     Consumer,
     Instance,
@@ -186,10 +186,12 @@ class GdnTinv(WarpSpecialized):
 
     Beta may be fp32 or 16-bit; its loads follow the traced tensor's element type."""
 
-    def __init__(self, dtype_name: str, d_k: int):
+    def __init__(self, dtype_name: str, d_k: int, *, beta_dtype: str | None = None):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the chunk-factor pass serves d_k in {HEAD_DIMS}, got {d_k}")
         self.dtype_name, self.d_k = dtype_name, d_k
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.beta_dtype = beta_dtype
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         self.smem_plan = SmemPlan()
         k_buf = self.smem_plan.buffer("K", self.io_dtype, align=1024)
@@ -745,7 +747,7 @@ def bundle_hook(io_dtype, d_k: int, num_sm: int, log_gate: bool) -> tuple[GdnTin
 
 
 @jit_cache
-def compile_gdn_tinv(op: GdnTinv, beta_dtype_name: str):
+def compile_gdn_tinv(op: GdnTinv):
     """Compile for dynamic tokens, heads, sequences and tile rows."""
     io = op.io_dtype
     tokens, key_heads, heads, rows = (cute.sym_int() for _ in range(4))
@@ -753,7 +755,7 @@ def compile_gdn_tinv(op: GdnTinv, beta_dtype_name: str):
     k = make_fake_strided_tensor(io, (tokens, key_heads, op.d_k), stride_divisibility=8)
     gate = make_fake_strided_tensor(Float32, (tokens, heads), contiguous_dim=None)
     beta = make_fake_strided_tensor(
-        _CUTE_DTYPES[beta_dtype_name], (tokens, heads), contiguous_dim=None
+        _CUTE_DTYPES[standalone_dtype(op, "beta_dtype")], (tokens, heads), contiguous_dim=None
     )
     i32 = cutlass.Int32
     return compile_tvm_ffi(
@@ -790,8 +792,10 @@ def gdn_tinv(
     heads = gate.shape[1]
     if heads % k.shape[1] or tinv.shape[1:] != (heads, B_T, B_T):
         raise ValueError("tinv must be [rows, heads, 64, 64] with heads a multiple of k heads")
-    op = GdnTinv.get_or_build(IO_DTYPE_NAMES[k.dtype], k.shape[-1])
-    fn = compile_gdn_tinv(op, _BETA_DTYPES[beta.dtype])
+    op = GdnTinv.get_or_build(
+        IO_DTYPE_NAMES[k.dtype], k.shape[-1], beta_dtype=_BETA_DTYPES[beta.dtype]
+    )
+    fn = compile_gdn_tinv(op)
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)
     fn(k, gate, beta, cu_seqlens, tinv, rows, row_count, workspace, slots, sms)

@@ -67,7 +67,12 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
+from attn_gym.linear._delta_rule.wd_support import (
+    HEAD_DIMS,
+    IO_DTYPE_NAMES,
+    check_supplied_op,
+    standalone_dtype,
+)
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -157,12 +162,10 @@ WORK_ITEM_FIELDS = 10
 WORK_ITEM_DSTATE_DST = 9
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_SCALAR_DTYPES = {
-    torch.float32: "Float32",
-    torch.bfloat16: "BFloat16",
-    torch.float16: "Float16",
-}
-_STATE_DTYPES = {torch.float32: "Float32", torch.bfloat16: "BFloat16"}
+# Gate and state dtypes, by the names every warpdrive constructor's dtype keywords use.
+_OPERAND_DTYPES = {**_CUTE_DTYPES, "fp32": cutlass.Float32}
+_SCALAR_DTYPES = {**IO_DTYPE_NAMES, torch.float32: "fp32"}
+_STATE_DTYPES = {torch.float32: "fp32", torch.bfloat16: "bf16"}
 
 # The raw TMEM-chain signals: (name, arriving role). Arrival counts follow the role: one
 # tcgen05.commit from the MMA warp, or every thread of a compute group. The comment names what
@@ -342,6 +345,9 @@ class GdnBprop(WarpSpecialized):
         use_dstate0: bool,
         *,
         column_fold_delay: int = 0,
+        gate_dtype_name: str | None = None,
+        dstate_in_dtype: str | None = None,
+        dstate0_dtype: str | None = None,
     ):
         """``column_fold_delay`` is a test hook: the ``clock64`` cycles cg0's warp 1 idles
         before it reads the dGate column partials, so a test can order those reads after warp
@@ -351,6 +357,9 @@ class GdnBprop(WarpSpecialized):
         self.dtype_name, self.d = dtype_name, d
         self.use_initial_state = use_initial_state
         self.use_dstate_in = use_dstate_in
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.gate_dtype_name = gate_dtype_name
+        self.dstate_in_dtype, self.dstate0_dtype = dstate_in_dtype, dstate0_dtype
         self.use_dstate0 = use_dstate0
         self.column_fold_delay = column_fold_delay
         self.io_dtype = _CUTE_DTYPES[dtype_name]
@@ -2324,9 +2333,7 @@ def bundle_hook(
 
 
 @jit_cache
-def compile_gdn_bprop(
-    op: GdnBprop, gate_dtype: str, dstate_in_dtype: str | None, dstate0_dtype: str | None
-):
+def compile_gdn_bprop(op: GdnBprop):
     """Compile for dynamic tokens, heads, sequences, work rows and checkpoint rows."""
     io, d, i32 = op.io_dtype, op.d, cutlass.Int32
     tokens, q_heads, k_heads, v_heads, heads = (cute.sym_int() for _ in range(5))
@@ -2338,10 +2345,10 @@ def compile_gdn_bprop(
     def scalar(dtype):
         return make_fake_strided_tensor(dtype, (tokens, heads), contiguous_dim=None)
 
-    def state(dtype_name, rows):
-        if dtype_name is None:
+    def state(name, used, rows):
+        if not used:
             return None
-        dtype = getattr(cutlass, dtype_name)
+        dtype = _OPERAND_DTYPES[standalone_dtype(op, name)]
         return make_fake_strided_tensor(
             dtype, (rows, heads, d, d), stride_divisibility=tma_divisibility(dtype)
         )
@@ -2351,7 +2358,7 @@ def compile_gdn_bprop(
         tile(q_heads),
         tile(k_heads),
         tile(v_heads),
-        scalar(getattr(cutlass, gate_dtype)),
+        scalar(_OPERAND_DTYPES[standalone_dtype(op, "gate_dtype_name")]),
         scalar(Float32),
         tile(heads),
         make_fake_strided_tensor(io, (ckpt_rows, heads, d, d), stride_divisibility=8),
@@ -2360,8 +2367,8 @@ def compile_gdn_bprop(
         tile(heads),
         scalar(Float32),
         scalar(Float32),
-        state(dstate_in_dtype, seqs),
-        state(dstate0_dtype, dst_seqs),
+        state("dstate_in_dtype", op.use_dstate_in, seqs),
+        state("dstate0_dtype", op.use_dstate0, dst_seqs),
         make_fake_strided_tensor(i32, (items, WORK_ITEM_FIELDS), contiguous_dim=None),
         make_fake_strided_tensor(i32, (1,)),
         make_fake_strided_tensor(i32, (cute.sym_int(),)),
@@ -2422,15 +2429,21 @@ def gdn_bprop(
         raise ValueError("the bprop needs d_k == d_v")
     if scheduler is None:
         scheduler = torch.zeros(2, dtype=torch.int32, device=q.device)
-    dtypes = (
-        _SCALAR_DTYPES[gate.dtype],
-        _dtype_name(dstate_in, _STATE_DTYPES),
-        _dtype_name(dstate0, _STATE_DTYPES),
-    )
+    config = {
+        "dtype_name": IO_DTYPE_NAMES[q.dtype],
+        "d": q.shape[-1],
+        "use_initial_state": use_initial_state,
+        "use_dstate_in": dstate_in is not None,
+        "use_dstate0": dstate0 is not None,
+        "gate_dtype_name": _SCALAR_DTYPES[gate.dtype],
+        "dstate_in_dtype": _dtype_name(dstate_in, _STATE_DTYPES),
+        "dstate0_dtype": _dtype_name(dstate0, _STATE_DTYPES),
+    }
     if op is None:
-        flags = (use_initial_state, dstate_in is not None, dstate0 is not None)
-        op = GdnBprop.get_or_build(IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags)
-    fn = compile_gdn_bprop(op, *dtypes)
+        op = GdnBprop.get_or_build(**config)
+    else:
+        check_supplied_op(op, config)
+    fn = compile_gdn_bprop(op)
     workspace, sms = op.work.launch_args(q.device)
     if tma_slots is None:
         tma_slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), q.device)
