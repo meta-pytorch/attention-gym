@@ -9,6 +9,7 @@ import torch
 from attn_gym.linear._delta_rule.span import pack_dense_batch
 from attn_gym.linear._delta_rule.validation import require_inference_only, resolve_scale
 from attn_gym.linear.kda.impl.warpdrive_ops import (
+    chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
     chunk_warpdrive_packed_bwd_with_state_op,
     chunk_warpdrive_packed_fwd_op,
     chunk_warpdrive_packed_fwd_paged_op,
@@ -28,8 +29,8 @@ def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) ->
 class ChunkKdaWarpdrive(torch.autograd.Function):
     """Attach warpdrive's BT16 backward to the warpdrive forward.
 
-    The kernel choice depends only on whether an entry state is present, never on the span
-    length, so a document's bits do not depend on the span it is packed into. With an entry
+    The kernel choice depends only on which states the call carries, never on the span length,
+    so a document's bits do not depend on the span it is packed into. With an entry
     state the backward carries the state cotangent in FP32 across chunks, chain pieces and work
     items (``test/linear/test_delta_rule_state_precision.py``).
     """
@@ -51,13 +52,24 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         ctx.split_backward = split_backward
         ctx.scale = scale
-        if initial_state is None:
+        if output_final_state:
+            # A zero entry state has no cotangent: the backward then skips every state access.
+            entry_state = initial_state
+            if entry_state is None:
+                entry_state = torch.zeros(
+                    cu_seqlens.shape[0] - 1,
+                    q.shape[2],
+                    value.shape[-1],
+                    q.shape[3],
+                    dtype=torch.float32,
+                    device=q.device,
+                )
+            output, final_state = chunk_warpdrive_packed_fwd_with_state_op(
+                q, k, value, gate, beta, entry_state, cu_seqlens, scale
+            )
+        elif initial_state is None:
             output = chunk_warpdrive_packed_fwd_op(
                 q, k, value, gate, beta, cu_seqlens, split_forward, scale
-            )
-        elif output_final_state:
-            output, final_state = chunk_warpdrive_packed_fwd_with_state_op(
-                q, k, value, gate, beta, initial_state, cu_seqlens, scale
             )
         else:
             output = chunk_warpdrive_packed_fwd_with_initial_state_op(
@@ -74,9 +86,14 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
     def backward(ctx, d_output: torch.Tensor | None, d_final_state: torch.Tensor | None = None):
         q, k, value, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
         d_output = normalize_output_grad(d_output, value)
-        if initial_state is None:
+        if initial_state is None and d_final_state is None:
             gradients = chunk_warpdrive_packed_local_bwd_op(
                 q, k, value, gate, beta, d_output, cu_seqlens, ctx.split_backward, ctx.scale
+            )
+            gradients = (*gradients, None)
+        elif initial_state is None:
+            gradients = chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
+                q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, ctx.scale
             )
             gradients = (*gradients, None)
         else:
@@ -141,15 +158,6 @@ def chunk_forward(
         initial_state = initial_state.float()
         if initial_state.stride(-1) != 1:
             initial_state = initial_state.contiguous()
-    elif output_final_state:
-        initial_state = torch.zeros(
-            cu_seqlens.shape[0] - 1,
-            q.shape[2],
-            value.shape[-1],
-            q.shape[3],
-            dtype=torch.float32,
-            device=q.device,
-        )
     result = ChunkKdaWarpdrive.apply(
         q,
         k,
