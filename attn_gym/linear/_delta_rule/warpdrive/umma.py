@@ -29,24 +29,38 @@ SWIZZLE_NONE = 0
 SWIZZLE_128B = 2
 SWIZZLE_64B = 4
 SWIZZLE_32B = 6
+# 128-byte swizzle with 32-byte atomicity (Swizzle<2,5,2>: 4 rows x 128 B atoms), the layout
+# MN-major ``.kind::tf32`` operands require.
+SWIZZLE_128B_BASE32B = 1
 
-_INPUT_FORMAT = {cutlass.Float16: 0, cutlass.BFloat16: 1}
+# ``Float32`` stands for a tf32 operand of ``.kind::tf32``.
+_INPUT_FORMAT = {cutlass.Float16: 0, cutlass.BFloat16: 1, cutlass.Float32: 2}
 _OUTPUT_FORMAT = {cutlass.Float16: 0, cutlass.Float32: 1}
 
 
 def instr_desc(
-    c_dtype, a_dtype, b_dtype, *, m: int, n: int, a_mn_major: bool = False, b_mn_major=False
+    c_dtype,
+    a_dtype,
+    b_dtype,
+    *,
+    m: int,
+    n: int,
+    a_mn_major: bool = False,
+    b_mn_major=False,
+    b_negate: bool = False,
 ) -> int:
-    """``.kind::f16`` instruction descriptor: dense, no negation, no saturation.
+    """``.kind::f16`` (or, for ``Float32`` operands, ``.kind::tf32``) instruction descriptor:
+    dense, no saturation, B optionally negated.
 
-    Bits: [4, 6) D format, [7, 10) A format, [10, 13) B format, 15/16 A/B MN-major,
-    [17, 23) N >> 3, [24, 29) M >> 4 (PTX ISA, "Instruction descriptor")."""
+    Bits: [4, 6) D format, [7, 10) A format, [10, 13) B format, 14 negate B, 15/16 A/B
+    MN-major, [17, 23) N >> 3, [24, 29) M >> 4 (PTX ISA, "Instruction descriptor")."""
     if m % 16 or n % 8 or not (64 <= m <= 256) or not (8 <= n <= 256):
         raise ValueError(f"unsupported tcgen05 tile M={m}, N={n}")
     return (
         _OUTPUT_FORMAT[c_dtype] << 4
         | _INPUT_FORMAT[a_dtype] << 7
         | _INPUT_FORMAT[b_dtype] << 10
+        | int(b_negate) << 14
         | int(a_mn_major) << 15
         | int(b_mn_major) << 16
         | (n >> 3) << 17
@@ -318,3 +332,32 @@ def mma_ts_all_op(desc: cutlass.Constexpr, tmem_a, desc_b_base, tmem_d, accumula
             acc,
             issue,
         )
+
+
+@cute.jit
+def mma_ss_tf32_op(
+    idesc: cutlass.Constexpr[int],
+    desc_a_base,
+    desc_b_base,
+    a_step: cutlass.Constexpr[int],
+    b_step: cutlass.Constexpr[int],
+    k_steps: cutlass.Constexpr[int],
+    tmem_d,
+    accumulate,
+    issue,
+):
+    """``k_steps`` K = 8 steps of an SMEM x SMEM ``.kind::tf32`` MMA, advancing the A and B
+    descriptors ``a_step`` / ``b_step`` bytes per step, from the lanes where ``issue`` holds.
+    ``accumulate`` applies to the first step; later steps always accumulate."""
+    for k in cutlass.range_constexpr(k_steps):
+        acc = accumulate if cutlass.const_expr(k == 0) else cutlass.Boolean(True)
+        if issue:
+            nvvm.tcgen05_mma(
+                nvvm.Tcgen05MMAKind.TF32,
+                nvvm.CTAGroupKind.CTA_1,
+                _tmem_ptr(tmem_d),
+                Int64(desc_a_base + ((k * a_step) >> 4)).ir_value(),
+                Int64(desc_b_base + ((k * b_step) >> 4)).ir_value(),
+                Int32(idesc).ir_value(),
+                cutlass.Boolean(acc).ir_value(),
+            )
