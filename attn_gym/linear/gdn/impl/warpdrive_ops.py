@@ -14,7 +14,11 @@ import importlib
 import torch
 from torch import Tensor
 
-from attn_gym._backends.cute import normalize_tma_tensor, tensor_supports_contiguous_dim
+from attn_gym._backends.cute import normalize_tma_tensor
+from attn_gym.linear._delta_rule.operand_layout import (
+    normalize_cu_seqlens,
+    normalize_scalar_rows,
+)
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
@@ -51,22 +55,6 @@ torch.library.define(
     "Tensor initial_state, Tensor? d_final_state, Tensor cu_seqlens, float scale) "
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
-
-
-def _normalize_scalar_tensor(tensor: Tensor) -> Tensor:
-    """Copy only scalar rows that cannot satisfy their contiguous-head ABI."""
-    return (
-        tensor
-        if tensor_supports_contiguous_dim(tensor, alignment_bytes=4)
-        else tensor.clone(memory_format=torch.contiguous_format)
-    )
-
-
-def _normalize_cu_seqlens(cu_seqlens: Tensor) -> Tensor:
-    """Copy routing metadata only when its raw launcher ABI requires it."""
-    if cu_seqlens.is_contiguous() and cu_seqlens.data_ptr() % 8 == 0:
-        return cu_seqlens
-    return cu_seqlens.clone(memory_format=torch.contiguous_format)
 
 
 def _empty_with_layout(template: Tensor) -> Tensor:
@@ -130,8 +118,8 @@ def _packed_fwd_cuda(
     """Run the fixed-arity forward launcher; its prologue kernel checks the packed boundaries."""
     value_template = value
     q, k, value = (normalize_tma_tensor(tensor) for tensor in (q, k, value))
-    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
-    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    gate, beta = (normalize_scalar_rows(tensor) for tensor in (gate, beta))
+    cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     output, _ = _forward_backend().run_forward(
         q,
@@ -163,8 +151,8 @@ def _packed_fwd_with_initial_state_cuda(
     q, k, value, initial_state = (
         normalize_tma_tensor(tensor) for tensor in (q, k, value, initial_state)
     )
-    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
-    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    gate, beta = (normalize_scalar_rows(tensor) for tensor in (gate, beta))
+    cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     output, _ = _forward_backend().run_forward(
         q,
@@ -195,8 +183,8 @@ def _packed_fwd_with_state_cuda(
     q, k, value, initial_state = (
         normalize_tma_tensor(tensor) for tensor in (q, k, value, initial_state)
     )
-    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
-    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    gate, beta = (normalize_scalar_rows(tensor) for tensor in (gate, beta))
+    cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     output, final_state = _forward_backend().run_forward(
         q,
@@ -230,8 +218,8 @@ def _packed_fwd_paged_cuda(
         raise TypeError("the warpdrive GDN state pool must use float32")
     value_template = value
     q, k, value = (normalize_tma_tensor(tensor) for tensor in (q, k, value))
-    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
-    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    gate, beta = (normalize_scalar_rows(tensor) for tensor in (gate, beta))
+    cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     backend = _forward_backend()
     paged_state = PagedState.validate(
@@ -272,8 +260,8 @@ def _packed_bwd_cuda(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     templates = (q, k, value, gate, beta)
     q, k, value, d_output = (normalize_tma_tensor(tensor) for tensor in (q, k, value, d_output))
-    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
-    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    gate, beta = (normalize_scalar_rows(tensor) for tensor in (gate, beta))
+    cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     dq, dk, dv, dgate, dbeta, d_initial_state = _backward_backend().chunk_gdn_bwd_warpdrive_packed(
         q,
         k,
@@ -310,8 +298,8 @@ def _packed_bwd_with_state_cuda(
     )
     if d_final_state is not None:
         d_final_state = normalize_tma_tensor(d_final_state)
-    gate, beta = (_normalize_scalar_tensor(tensor) for tensor in (gate, beta))
-    cu_seqlens = _normalize_cu_seqlens(cu_seqlens)
+    gate, beta = (normalize_scalar_rows(tensor) for tensor in (gate, beta))
+    cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     dq, dk, dv, dgate, dbeta, d_initial_state = _backward_backend().chunk_gdn_bwd_warpdrive_packed(
         q,
         k,

@@ -307,7 +307,7 @@ def chunk_kda_prepare(
     if backend == "warpdrive":
         assert metadata is not None and cu_seqlens is not None and chunk_offsets is not None
         gate = normalize_compact_tensor(gate)
-        validate_warpdrive_constraints(q, k, v, gate, beta, None, cu_seqlens)
+        validate_warpdrive_constraints(q, v)
         saved = ChunkKDAWarpdriveSaved(
             q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets
         )

@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import torch
 
-from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
@@ -20,10 +19,9 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 from attn_gym.linear.kda.ops import chunk_bwd_recompute_factors_with_state_grad_op
-from attn_gym.linear.kda.validation import validate_warpdrive_fastmath
+from attn_gym.linear.kda.validation import cast_to_kernel_dtypes, validate_warpdrive_fastmath
 
 _CHUNK_SIZE = 64
-_SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 
 
 def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
@@ -128,36 +126,16 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         return dq, dk, dv, d_gate, d_beta, d_initial_state, None, None, None, None, None
 
 
-def validate_warpdrive_constraints(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    value: torch.Tensor,
-    gate: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    cu_seqlens: torch.Tensor | None,
-) -> None:
-    """Validate only the additional layout, dtype, and shape constraints of warpdrive."""
+def validate_warpdrive_constraints(q: torch.Tensor, value: torch.Tensor) -> None:
+    """Validate the device and head dimensions the warpdrive KDA kernels support.
+
+    Dtypes and layouts are normalized instead: ``cast_to_kernel_dtypes`` applies the fused
+    dtype policy and the registered operators copy operands their launchers cannot address.
+    """
     if not q.is_cuda:
         raise ValueError("the warpdrive KDA backend requires CUDA tensors")
-    if q.shape[0] != 1 or q.shape[-1] != 128 or value.shape[-1] != 128:
-        raise ValueError("the warpdrive backend requires B=1 and K=V=128")
-    if q.dtype not in _SUPPORTED_IO_DTYPES or k.dtype != q.dtype or value.dtype != q.dtype:
-        raise TypeError("q, k, and value must share dtype float16 or bfloat16")
-    if gate.dtype != torch.float32 or beta.dtype != torch.float32:
-        raise TypeError("gate and beta must be float32")
-    if initial_state is not None and initial_state.dtype != torch.float32:
-        raise TypeError("initial_state must be float32")
-    if not torch.compiler.is_compiling():
-        tma_tensors = (q, k, value, gate) + (() if initial_state is None else (initial_state,))
-        if any(not tensor_supports_tma(tensor) for tensor in tma_tensors):
-            raise TypeError(
-                "warpdrive q, k, value, gate, and state require a TMA-compatible inner mode"
-            )
-        if not tensor_supports_contiguous_dim(beta, alignment_bytes=4):
-            raise TypeError("warpdrive beta requires a contiguous, element-aligned inner mode")
-        if cu_seqlens is not None and cu_seqlens.data_ptr() % 8:
-            raise TypeError("warpdrive cu_seqlens must be 8-byte aligned")
+    if q.shape[-1] != 128 or value.shape[-1] != 128:
+        raise ValueError("the warpdrive KDA backend requires K=V=128")
 
 
 def chunk_forward(
@@ -184,10 +162,17 @@ def chunk_forward(
         raise ValueError("split_forward currently requires a no-state call")
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
+    validate_warpdrive_constraints(q, value)
 
+    output_dtype, output_shape = q.dtype, value.shape
+    q, k, value, gate, beta = cast_to_kernel_dtypes(q, k, value, gate, beta)
     if cu_seqlens is None:
-        cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * q.shape[1]
-    if output_final_state and initial_state is None:
+        cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
+    if initial_state is not None:
+        initial_state = initial_state.float()
+        if initial_state.stride(-1) != 1:
+            initial_state = initial_state.contiguous()
+    elif output_final_state:
         initial_state = torch.zeros(
             cu_seqlens.shape[0] - 1,
             q.shape[2],
@@ -196,7 +181,6 @@ def chunk_forward(
             dtype=torch.float32,
             device=q.device,
         )
-    validate_warpdrive_constraints(q, k, value, gate, beta, initial_state, cu_seqlens)
     result = ChunkKdaWarpdrive.apply(
         q,
         k,
@@ -210,9 +194,8 @@ def chunk_forward(
         split_forward,
         output_final_state,
     )
-    if output_final_state:
-        return result
-    return result, None
+    output, final_state = result if output_final_state else (result, None)
+    return output.reshape(output_shape).to(output_dtype), final_state
 
 
 def paged_chunk_forward(
@@ -235,17 +218,12 @@ def paged_chunk_forward(
     )
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
+    validate_warpdrive_constraints(q, value)
 
-    batch = q.shape[0]
-    output_shape = value.shape
+    output_dtype, output_shape = q.dtype, value.shape
+    q, k, value, gate, beta = cast_to_kernel_dtypes(q, k, value, gate, beta)
     if cu_seqlens is None:
         cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
-    elif batch != 1:
-        raise ValueError("packed cu_seqlens require q to have batch size one")
-    else:
-        cu_seqlens = cu_seqlens.contiguous()
-
-    validate_warpdrive_constraints(q, k, value, gate, beta, state_cache, cu_seqlens)
     output = chunk_warpdrive_packed_fwd_paged_op(
         q,
         k,
@@ -258,7 +236,7 @@ def paged_chunk_forward(
         cu_seqlens,
         scale,
     )
-    return output.reshape(output_shape)
+    return output.reshape(output_shape).to(output_dtype)
 
 
 __all__ = ["chunk_forward", "paged_chunk_forward"]

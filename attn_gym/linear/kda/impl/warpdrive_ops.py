@@ -5,9 +5,15 @@
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 
 import torch
 
+from attn_gym._backends.cute import normalize_tma_tensor
+from attn_gym.linear._delta_rule.operand_layout import (
+    normalize_cu_seqlens,
+    normalize_scalar_rows,
+)
 from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
@@ -73,7 +79,43 @@ def validate_warpdrive_available(q: torch.Tensor) -> None:
     _backend(q)
 
 
+def _normalize_operands(q, k, value, gate, beta, cu_seqlens, *states):
+    """Copy only the operands whose layout the launchers reject; ``states`` may hold ``None``."""
+    return (
+        *(normalize_tma_tensor(tensor) for tensor in (q, k, value, gate)),
+        normalize_scalar_rows(beta),
+        normalize_cu_seqlens(cu_seqlens),
+        *(None if state is None else normalize_tma_tensor(state) for state in states),
+    )
+
+
+def _empty_like_token_operand(tensor: torch.Tensor) -> torch.Tensor:
+    """Allocate a ``[1, T, ...]`` result as the launchers do: like the operand's token rows."""
+    return torch.empty_like(tensor[0]).unsqueeze(0)
+
+
+def _restore_layout(
+    result: torch.Tensor,
+    normalized: torch.Tensor,
+    template: torch.Tensor,
+    allocate: Callable[[torch.Tensor], torch.Tensor] = _empty_like_token_operand,
+) -> torch.Tensor:
+    """Give a result computed from a normalized operand the layout ``allocate(template)`` that
+    the fake declares. The launchers allocate results like their operand, so a result whose
+    operand was not copied already has it. The expected strides come from a meta-device
+    allocation, so storage is allocated only when the layout differs and a copy is needed."""
+    if normalized is template:
+        return result
+    expected = allocate(template.to("meta")).stride()
+    if result.stride() == expected:
+        return result
+    out = torch.empty_strided(result.shape, expected, dtype=result.dtype, device=result.device)
+    return out.copy_(result)
+
+
 def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
+    template = value
+    q, k, value, gate, beta, cu_seqlens = _normalize_operands(q, k, value, gate, beta, cu_seqlens)
     output, _ = _backend(q).run_forward(
         q,
         k,
@@ -86,10 +128,14 @@ def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale):
         output_final_state=False,
         split=split,
     )
-    return output
+    return _restore_layout(output, value, template)
 
 
 def _packed_fwd_with_initial_state_cuda(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
+    template = value
+    q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
+        q, k, value, gate, beta, cu_seqlens, initial_state
+    )
     output, _ = _backend(q).run_forward(
         q,
         k,
@@ -101,10 +147,14 @@ def _packed_fwd_with_initial_state_cuda(q, k, value, gate, beta, initial_state, 
         scale=scale,
         output_final_state=False,
     )
-    return output
+    return _restore_layout(output, value, template)
 
 
 def _packed_fwd_with_state_cuda(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
+    template, state_template = value, initial_state
+    q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
+        q, k, value, gate, beta, cu_seqlens, initial_state
+    )
     output, final_state = _backend(q).run_forward(
         q,
         k,
@@ -117,7 +167,10 @@ def _packed_fwd_with_state_cuda(q, k, value, gate, beta, initial_state, cu_seqle
         output_final_state=True,
     )
     assert final_state is not None
-    return output, final_state
+    return (
+        _restore_layout(output, value, template),
+        _restore_layout(final_state, initial_state, state_template, torch.empty_like),
+    )
 
 
 def _packed_fwd_paged_cuda(
@@ -134,6 +187,9 @@ def _packed_fwd_paged_cuda(
 ):
     if state_cache.dtype != torch.float32:
         raise TypeError("the warpdrive KDA state pool must use float32")
+    template = value
+    # The pool is advanced in place, so it is validated rather than copied.
+    q, k, value, gate, beta, cu_seqlens = _normalize_operands(q, k, value, gate, beta, cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     backend = _backend(q)
     paged_state = PagedState.validate(
@@ -158,53 +214,57 @@ def _packed_fwd_paged_cuda(
         scale=scale,
         output_final_state=False,
     )
-    return output
+    return _restore_layout(output, value, template)
 
 
-def _packed_local_bwd_cuda(q, k, value, gate, beta, d_output, cu_seqlens, split, scale):
+def _packed_bwd_cuda(
+    q, k, value, gate, beta, d_output, cu_seqlens, initial_state, d_final_state, scale, split
+):
     from attn_gym.linear._delta_rule.warpdrive.launchers.backward import (
         chunk_delta_rule_bwd_warpdrive_packed,
     )
 
-    return chunk_delta_rule_bwd_warpdrive_packed(
-        q,
-        k,
-        value,
-        gate,
-        beta,
+    templates = (q, k, value, gate, beta)
+    *normalized, cu_seqlens, d_output, initial_state, d_final_state = _normalize_operands(
+        q, k, value, gate, beta, cu_seqlens, d_output, initial_state, d_final_state
+    )
+    *gradients, d_initial_state = chunk_delta_rule_bwd_warpdrive_packed(
+        *normalized,
         d_output,
         cu_seqlens,
         scale=scale,
         split=split,
+        initial_state=initial_state,
+        d_final_state=d_final_state,
+    )
+    return (
+        *(
+            _restore_layout(*operand)
+            for operand in zip(gradients, normalized, templates, strict=True)
+        ),
+        d_initial_state,
+    )
+
+
+def _packed_local_bwd_cuda(q, k, value, gate, beta, d_output, cu_seqlens, split, scale):
+    return _packed_bwd_cuda(
+        q, k, value, gate, beta, d_output, cu_seqlens, None, None, scale, split
     )[:5]
 
 
 def _packed_bwd_with_state_cuda(
     q, k, value, gate, beta, d_output, cu_seqlens, initial_state, d_final_state, scale
 ):
-    from attn_gym.linear._delta_rule.warpdrive.launchers.backward import (
-        chunk_delta_rule_bwd_warpdrive_packed,
-    )
-
-    return chunk_delta_rule_bwd_warpdrive_packed(
-        q,
-        k,
-        value,
-        gate,
-        beta,
-        d_output,
-        cu_seqlens,
-        scale=scale,
-        initial_state=initial_state,
-        d_final_state=d_final_state,
+    return _packed_bwd_cuda(
+        q, k, value, gate, beta, d_output, cu_seqlens, initial_state, d_final_state, scale, False
     )
 
 
 def _packed_bwd_with_exit_cotangent_cuda(
     q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, scale
 ):
-    return _packed_bwd_with_state_cuda(
-        q, k, value, gate, beta, d_output, cu_seqlens, None, d_final_state, scale
+    return _packed_bwd_cuda(
+        q, k, value, gate, beta, d_output, cu_seqlens, None, d_final_state, scale, False
     )[:5]
 
 
@@ -232,19 +292,19 @@ torch.library.impl(
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd")
 def _packed_fwd_fake(q, k, value, gate, beta, cu_seqlens, split, scale):
     del q, k, gate, beta, cu_seqlens, split, scale
-    return torch.empty_like(value)
+    return _empty_like_token_operand(value)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_with_initial_state")
 def _packed_fwd_with_initial_state_fake(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
     del q, k, gate, beta, initial_state, cu_seqlens, scale
-    return torch.empty_like(value)
+    return _empty_like_token_operand(value)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_with_state")
 def _packed_fwd_with_state_fake(q, k, value, gate, beta, initial_state, cu_seqlens, scale):
     del q, k, gate, beta, cu_seqlens, scale
-    return torch.empty_like(value), torch.empty_like(initial_state)
+    return _empty_like_token_operand(value), torch.empty_like(initial_state)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_paged")
@@ -260,12 +320,12 @@ def _packed_fwd_paged_fake(
     cu_seqlens,
     scale,
 ):
-    return torch.empty_like(value)
+    return _empty_like_token_operand(value)
 
 
 def _token_gradients_fake(q, k, value, gate, beta):
-    """One compact gradient per token operand, as the backward launchers allocate them."""
-    return tuple(torch.empty_like(tensor[0]).unsqueeze(0) for tensor in (q, k, value, gate, beta))
+    """One gradient per token operand, as the backward launchers allocate them."""
+    return tuple(_empty_like_token_operand(tensor) for tensor in (q, k, value, gate, beta))
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_local_bwd")

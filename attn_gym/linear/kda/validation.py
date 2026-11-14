@@ -49,6 +49,27 @@ def resolve_kernel_options(
     return ResolvedKernelOptions(**options, schedule=schedule)
 
 
+def cast_to_kernel_dtypes(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Cast chunk operands to the dtypes the KDA chunk kernels compute in.
+
+    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16. Gate and beta
+    run in FP32. Callers return the output in the original ``q.dtype``. Each cast is an autograd
+    op, so gradients come back in the caller's dtypes.
+    """
+    kernel_dtype = (
+        q.dtype
+        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
+        else torch.bfloat16
+    )
+    return (
+        *(tensor.to(kernel_dtype) for tensor in (q, k, v)),
+        gate.float(),
+        beta.float(),
+    )
+
+
 def validate_warpdrive_fastmath(fastmath: bool) -> None:
     """Reject a precision request that the native warpdrive KDA kernels cannot honor."""
     if not fastmath:
@@ -101,6 +122,7 @@ def validate_kda_inputs(
 
 __all__ = [
     "SUPPORTED_INPUT_DTYPES",
+    "cast_to_kernel_dtypes",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_warpdrive_fastmath",

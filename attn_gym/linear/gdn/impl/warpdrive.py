@@ -23,25 +23,17 @@ _SUPPORTED_IO_DTYPES = (torch.float16, torch.bfloat16)
 _WARPDRIVE_DIM = 128
 
 
-def _validate_warpdrive_constraints(
-    q: Tensor,
-    k: Tensor,
-    value: Tensor,
-    gate: Tensor,
-    beta: Tensor,
-    initial_state: Tensor | None,
-) -> None:
-    """Validate the scalar-GDN restrictions imposed by the raw warpdrive launchers."""
-    if not q.is_cuda:
-        raise ValueError("the warpdrive GDN backend requires CUDA tensors")
-    if q.shape[0] != 1 or q.shape[-1] != _WARPDRIVE_DIM or value.shape[-1] != _WARPDRIVE_DIM:
-        raise ValueError("the warpdrive backend requires B=1 and K=V=128")
+def _validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
+    """Validate the Q/K/V dtypes and head dimensions the scalar-GDN warpdrive kernels support.
+
+    ``chunk_gdn`` casts gate, beta, and entry states to FP32 before dispatch
+    (``cast_to_kernel_dtypes``), and the registered operators copy operands their launchers
+    cannot address.
+    """
+    if q.shape[-1] != _WARPDRIVE_DIM or value.shape[-1] != _WARPDRIVE_DIM:
+        raise ValueError("the warpdrive GDN backend requires K=V=128")
     if q.dtype not in _SUPPORTED_IO_DTYPES or k.dtype != q.dtype or value.dtype != q.dtype:
         raise TypeError("q, k, and value must share dtype float16 or bfloat16")
-    if gate.dtype != torch.float32 or beta.dtype != torch.float32:
-        raise TypeError("gate and beta must be float32")
-    if initial_state is not None and initial_state.dtype != torch.float32:
-        raise TypeError("initial_state must be float32")
 
 
 class ChunkGdnWarpdrivePacked(torch.autograd.Function):
@@ -158,7 +150,10 @@ def chunk_forward(
     split_backward: bool = False,
     split_forward: bool = False,
 ) -> tuple[Tensor, Tensor | None]:
-    """Run scalar GDN through the warpdrive backend behind the shared chunk contract."""
+    """Run scalar GDN through the warpdrive backend behind the shared chunk contract.
+
+    Gate, beta, and the entry state arrive in FP32 (``chunk_gdn`` casts them).
+    """
     if not q.is_cuda:
         raise ValueError("the warpdrive GDN backend requires CUDA tensors")
     for name, enabled in (("split_backward", split_backward), ("split_forward", split_forward)):
@@ -166,28 +161,24 @@ def chunk_forward(
             raise ValueError(f"{name} currently requires a no-state call")
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
+    _validate_warpdrive_constraints(q, k, value)
 
-    gate, beta = (tensor.to(dtype=torch.float32) for tensor in (gate, beta))
     batch = q.shape[0]
     output_shape = value.shape
     if cu_seqlens is None:
         cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
     elif batch != 1:
         raise ValueError("packed cu_seqlens require q to have batch size one")
-    else:
-        cu_seqlens = cu_seqlens.contiguous()
 
-    if output_final_state and initial_state is None:
+    if initial_state is None and output_final_state:
         initial_state = torch.zeros(
             cu_seqlens.shape[0] - 1,
             value.shape[2],
-            _WARPDRIVE_DIM,
-            _WARPDRIVE_DIM,
+            value.shape[3],
+            q.shape[3],
             dtype=torch.float32,
             device=q.device,
         )
-
-    _validate_warpdrive_constraints(q, k, value, gate, beta, initial_state)
 
     result = ChunkGdnWarpdrivePacked.apply(
         q,
@@ -230,18 +221,14 @@ def paged_chunk_forward(
         (q, k, value, gate, beta, state_cache),
         "paged_chunk_gdn is inference-only; call under torch.no_grad() or torch.inference_mode()",
     )
+    _validate_warpdrive_constraints(q, k, value)
 
-    gate, beta = (tensor.to(dtype=torch.float32) for tensor in (gate, beta))
     batch = q.shape[0]
     output_shape = value.shape
     if cu_seqlens is None:
         cu_seqlens, q, k, value, gate, beta = pack_dense_batch(q, k, value, gate, beta)
     elif batch != 1:
         raise ValueError("packed cu_seqlens require q to have batch size one")
-    else:
-        cu_seqlens = cu_seqlens.contiguous()
-
-    _validate_warpdrive_constraints(q, k, value, gate, beta, state_cache)
 
     output = chunk_gdn_warpdrive_packed_fwd_paged_op(
         q,
