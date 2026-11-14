@@ -56,8 +56,9 @@ FENCE_SKIPS = ("before", "after", "both")
 @dataclass
 class FenceSkip:
     """A per-call opt-out of automatic tcgen05 thread-sync work, with its reason, site and the
-    instructions it suppressed. ``skips`` holds ``"before"``/``"after"`` (thread-sync fences).
-    The synchronization itself, completion waits and every check stay."""
+    instructions it suppressed. ``skips`` holds ``"before"``/``"after"`` (thread-sync fences)
+    or ``"wait::ld"``/``"wait::st"`` (teardown waits). The synchronization itself, other
+    completion waits and every check stay."""
 
     skips: tuple[str, ...]
     reason: str
@@ -131,6 +132,14 @@ def fence_skip(skip_fence: str | None, reason: str | None, op: str, allowed=FENC
     if skip_fence not in allowed:
         raise ValueError(f"{op}: skip_fence={skip_fence!r}; one of {allowed}")
     return _skip(("before", "after") if skip_fence == "both" else (skip_fence,), reason, op)
+
+
+def teardown_skip(waits: str, reason: str) -> FenceSkip:
+    """The ``FenceSkip`` of ``TmemView.skip_teardown_drain(waits, reason=...)``."""
+    kinds = {"load": ("wait::ld",), "store": ("wait::st",), "both": ("wait::ld", "wait::st")}
+    if waits not in kinds:
+        raise ValueError(f"skip_teardown_drain({waits!r}); one of {tuple(kinds)}")
+    return _skip(kinds[waits], reason, "TMEM teardown drain")
 
 
 def _skip(skips: tuple[str, ...], reason, op: str) -> FenceSkip:
@@ -411,6 +420,7 @@ class RoleTrace:
         # The role issues tcgen05 operations (a Tmem or Umma role): its managed waits and
         # signals take the tcgen05 thread-sync fences (thread_sync.before_sync/after_sync).
         self.tcgen05 = False
+        self.teardown_skip = None  # TmemView.skip_teardown_drain's FenceSkip
         self._blocks: list = []  # (block, key, kind) of every region an event was recorded in
         self.root = current_block()
 

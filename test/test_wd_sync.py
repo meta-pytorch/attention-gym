@@ -4,11 +4,12 @@ Each case compiles one kernel class over a static configuration (state flags, he
 d_v split, the gate dtype, the prefill variant) without either cache and runs
 ``ptx_check.check_tcgen05_sync`` on every path of its PTX: a tcgen05 operation after a wait
 needs ``tcgen05.fence::after_thread_sync``, a signal after a tcgen05 operation needs
-``::before_thread_sync`` (PTX ISA 9.7.18.6.3). The layer emits both on managed synchronization;
-the kernels' raw signals emit their own. Calls that skip a fence another one already provides
-(``skip_fence=``, a raw helper's ``fence=False``) are proven only here, per configuration. The
-configurations are those the public ops and drivers build (recorded over test/gdn, test/kda and
-test/linear). Launch bundles run the same kernel
+``::before_thread_sync`` (PTX ISA 9.7.18.6.3), and every path reaching the TMEM teardown
+rendezvous completes its loads and stores. The layer emits the fences on managed
+synchronization and the drain at teardown; the kernels' raw signals emit their own fences.
+Calls that skip a fence another one already provides (``skip_fence=``, a raw helper's
+``fence=False``) are proven only here, per configuration. The configurations are those the public ops and drivers
+build (recorded over test/gdn, test/kda and test/linear). Launch bundles run the same kernel
 classes; the paged prefill states compile only inside a warmup-forward bundle, so those bundles
 are cases too. Compile-only: a few seconds each.
 """
@@ -23,6 +24,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 
+from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
 from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
 
 PACKAGE = "attn_gym.linear._delta_rule.warpdrive"
@@ -238,7 +240,7 @@ def _check(tmp_path, build, *args):
     with capture_ptx(tmp_path) as out:
         build.__wrapped__(*args)  # uncached: a cached kernel has no PTX
     (path,) = out.glob("*.ptx")
-    findings = check_tcgen05_sync(read_ptx(path))
+    findings = check_tcgen05_sync(read_ptx(path), teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
     assert not findings, "\n".join(f.describe() for f in findings)
 
 

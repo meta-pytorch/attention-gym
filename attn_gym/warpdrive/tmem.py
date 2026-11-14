@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from attn_gym.warpdrive.protocol import ProtocolError, ProtocolLog
+from attn_gym.warpdrive.protocol import ProtocolError, ProtocolLog, teardown_skip
 
 TMEM_COLS = 512
 
@@ -135,6 +135,22 @@ class TmemView:
         if self._trace is not None:
             self._trace.event("raw", storage=("tmem", name))
         return col
+
+    def skip_teardown_drain(self, waits: str = "both", *, reason: str):
+        """Skip this role's ``tcgen05.wait::ld`` (``waits="load"``), ``::st`` (``"store"``) or
+        both at the TMEM teardown. Only for a role whose every thread, on every path to its
+        exit, issues no access of that kind or completes its last one with an unconditional
+        wait (a ``tmem_load``/``tmem_store`` release fence). ``reason`` says which;
+        ``describe()`` records it. The rendezvous, its thread-sync fences and the PTX check of
+        the drain stay. Call it once in the role body."""
+        if self._trace is None:
+            raise ProtocolError("skip_teardown_drain() runs in a traced role body")
+        if self._trace.teardown_skip is not None:
+            raise ProtocolError(
+                f"{self._role}: skip_teardown_drain() twice; the first is at "
+                f"{self._trace.teardown_skip.site}"
+            )
+        self._trace.teardown_skip = teardown_skip(waits, reason)
 
     def ptr(self, name: str, slot: int = 0):
         """FP32 TMEM pointer to ``name[slot]``."""

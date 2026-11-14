@@ -293,12 +293,18 @@ def no_before_thread_sync(mp):
 
 
 def skip_covers_needed_fence(mp):
-    """Every ``skip_fence=`` override drops both thread-sync fences of its call, so an override on
-    a call with one redundant fence also drops the needed one: the persistent GEMM epilogue's
-    syncs around its TMA store."""
+    """Every ``skip_fence=`` override drops both thread-sync fences of its call (and every teardown
+    skip both waits), so an override on a call with one redundant fence also drops the needed
+    one: the persistent GEMM epilogue's syncs around its TMA store."""
     from attn_gym.warpdrive.protocol import FenceSkip
 
     mp.setattr(FenceSkip, "covers", lambda self, kind: True)
+
+
+def teardown_no_drain(mp):
+    """The TMEM teardown skips tcgen05.wait::ld/st: a role's last loads may still be in flight
+    when the allocator warp frees TMEM. No current GPU shows it; the PTX check must."""
+    kernel._teardown_drain = lambda trace: None
 
 
 # mutant -> (patch(mp), test file in test/warpdrive, test that fails or hangs with it applied)
@@ -400,6 +406,11 @@ MUTANTS = {
         skip_covers_needed_fence,
         "test_warpdrive_thread_sync.py",
         "test_persistent_gemm_ptx_is_fenced[cta]",
+    ),
+    "teardown_no_drain": (
+        teardown_no_drain,
+        "test_warpdrive_thread_sync.py",
+        "test_teardown_completes_tmem_accesses",
     ),
     "unread_no_wait": (
         unread_no_wait,

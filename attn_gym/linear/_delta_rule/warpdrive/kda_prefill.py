@@ -181,8 +181,9 @@ assert QS_STAGES >= 2, "CG1's late o_acc release needs two O accumulator slots"
 # The TMEM loads need no tcgen05.wait::ld where the same warp issues a tcgen05.st after them
 # and completes it (wait::st) before the signal that lets the MMA overwrite their columns: a
 # warp's ld -> st pair is pipelined (PTX ISA 9.7.18.6.2), while a register dependency orders no
-# memory (9.7.18.6.4.5). Each load names its store; drain_o and final_state have none and wait
-# for their loads (final_state's can be the role's last TMEM access before teardown frees TMEM).
+# memory (9.7.18.6.4.5). Each load names its store; drain_o has none and waits for its loads.
+# final_state's loads precede the next item's stores, or on the CTA's last item the layer's
+# teardown, which completes every TMEM user's loads before the allocator warp frees TMEM.
 SIN_L, SIN_R, KS, U, YIN, UIN, SACC_L, SACC_R = 0, 1, 2, 3, 4, 5, 6, 8
 TSTATE_COUNTS = (4, 4, 1, 1, 4, 8, 1, 1, 1, 1)
 
@@ -1382,9 +1383,6 @@ class KdaPrefill(WarpSpecialized):
                                     for t in range(4)
                                 ]
                                 stg_v4(addr + (kb + g * 8) * obytes, words)
-                # The CTA's last item has no later TMEM store to order these loads before
-                # teardown frees TMEM.
-                cute.arch.fence_view_async_tmem_load()
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:
