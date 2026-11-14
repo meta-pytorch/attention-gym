@@ -118,6 +118,7 @@ def warmup_backward_host(
         work_items,
         scheduler_all,
         stream,
+        tail_rows=dgate,
     )
     recompute_op.launch(
         k,

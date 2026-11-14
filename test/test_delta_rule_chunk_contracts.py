@@ -1,12 +1,15 @@
 """Shared chunk ownership and torch-only operator metadata contracts."""
 
 import ast
+import importlib.util
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule import chunk_ops, chunk_schedule
 
 
@@ -83,3 +86,56 @@ def test_shared_chunk_infrastructure_does_not_import_variants(module_path: str) 
             assert not module.startswith(("attn_gym.linear.kda", "attn_gym.linear.gdn")), (
                 f"{module_path}:{node.lineno} imports variant-owned {module}"
             )
+
+
+requires_warpdrive = pytest.mark.skipif(
+    not cuda_runs_sm100_kernels() or importlib.util.find_spec("cutlass") is None,
+    reason="the warpdrive backward requires an SM100-family GPU and CuTeDSL",
+)
+
+
+@requires_warpdrive
+@pytest.mark.usefixtures("nan_filled_empty")
+@pytest.mark.parametrize("plan", ["uncut", "chain"])
+@pytest.mark.parametrize(("family", "heads"), [("kda", 3), ("kda", 40), ("gdn", 3)])
+def test_warpdrive_backward_zeroes_only_the_dgate_tail(monkeypatch, family, heads, plan):
+    """The backward prologue zeroes ``dgate`` from ``cu_seqlens[-1]`` on. KDA rows of 3 and 40
+    heads are narrower and wider than one prologue CTA; GDN rows hold one value per head."""
+    from attn_gym.linear._delta_rule.warpdrive.drivers import gdn, kda
+    from attn_gym.linear._delta_rule.warpdrive.launchers.backward import (
+        chunk_delta_rule_bwd_warpdrive_packed,
+    )
+    from attn_gym.linear._delta_rule.warpdrive.launchers.gdn_backward import (
+        chunk_gdn_bwd_warpdrive_packed,
+    )
+
+    driver, backward = (
+        (kda, chunk_delta_rule_bwd_warpdrive_packed)
+        if family == "kda"
+        else (gdn, chunk_gdn_bwd_warpdrive_packed)
+    )
+    build = driver.BackwardPlan.build
+    pieces = 4 if plan == "chain" else 0
+    monkeypatch.setattr(
+        driver.BackwardPlan, "build", lambda *args: replace(build(*args), pieces=pieces)
+    )
+    cases = ((256, (191, 256, 255, 0)),)
+    if plan == "uncut":
+        cases = ((1, (0, 1)), (16, (16, 3)), (65, (64, 0)), *cases)
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    for tokens, ends in cases:
+        q, k, v = (
+            torch.nn.functional.normalize(
+                torch.randn(1, tokens, heads, 128, device="cuda", generator=generator), dim=-1
+            ).bfloat16()
+            for _ in range(3)
+        )
+        gate_shape = q.shape if family == "kda" else q.shape[:3]
+        gate = -torch.rand(gate_shape, device="cuda", generator=generator)
+        beta = torch.rand(q.shape[:3], device="cuda", generator=generator)
+        for end in ends:
+            cu_seqlens = torch.tensor([0, end // 2, end], dtype=torch.int32, device="cuda")
+            dgate = backward(q, k, v, gate, beta, torch.ones_like(v), cu_seqlens)[3]
+            assert dgate.shape == gate.shape
+            assert not dgate[:, end:].any(), (tokens, end)
+            assert dgate[:, :end].isfinite().all(), (tokens, end)

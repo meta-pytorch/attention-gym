@@ -333,6 +333,7 @@ def test_state_summary_matches_zero_and_identity_probes(op):
         pytest.param(KDA, id="kda"),
         pytest.param(GDN, id="gdn"),
         pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
+        *WARPDRIVE_OPS,
     ],
 )
 def test_fixed_capacity_intermediates_may_be_uninitialized(op):

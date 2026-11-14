@@ -75,6 +75,8 @@ from .work_tables import (
     emit_chunk_rows,
     order_body,
     order_storage,
+    prologue_ctas,
+    zero_inactive_rows,
 )
 
 CHAIN_MIN_PIECES = 3
@@ -355,14 +357,87 @@ def chain_table_kernel(
     scheduler: cute.Tensor,
     rows: cute.Tensor | None,
     row_count: cute.Tensor | None,
+    tail_rows: cute.Tensor | None,
 ):
-    """Every block checks ``cu_seqlens`` against ``tokens`` and builds the piece table; block 0
-    then orders the main (and summary) work tables and zeroes the scheduler counters, block 1
-    (bound ``rows``) builds the chunk row table of the pieces on its first warp."""
+    """Every block checks ``cu_seqlens`` against ``tokens``. The table blocks build the piece
+    table; block 0 then orders the main (and summary) work tables and zeroes the scheduler
+    counters, and block 1 (bound ``rows``) builds the pieces' chunk row table on its first warp.
+    With ``tail_rows`` bound, the blocks after them zero the gate cotangent's inactive rows
+    (:func:`~work_tables.zero_inactive_rows`)."""
     cute.arch.griddepcontrol_wait()
     cute.arch.griddepcontrol_launch_dependents()
     tidx = Int32(cute.arch.thread_idx()[0])
     check_packed_offsets(cu_seqlens, tokens, tidx, ORDER_THREADS)
+    if cutlass.const_expr(tail_rows is None):
+        chain_tables_body(
+            b_t,
+            rows_b_t,
+            tidx,
+            pieces,
+            heads_out,
+            num_seqs,
+            cu_seqlens,
+            cu_pieces,
+            main_rows,
+            summary_rows,
+            main_count,
+            summary_count,
+            work_items,
+            work_items_summary,
+            scheduler,
+            rows,
+            row_count,
+        )
+    else:
+        table_ctas = Int32(1 if cutlass.const_expr(rows is None) else 2)
+        tail_block = Int32(cute.arch.block_idx()[0]) - table_ctas
+        if tail_block >= Int32(0):
+            workers = Int32(cute.arch.grid_dim()[0]) - table_ctas
+            zero_inactive_rows(tail_rows, cu_seqlens, tokens, tail_block, workers, tidx)
+        else:
+            chain_tables_body(
+                b_t,
+                rows_b_t,
+                tidx,
+                pieces,
+                heads_out,
+                num_seqs,
+                cu_seqlens,
+                cu_pieces,
+                main_rows,
+                summary_rows,
+                main_count,
+                summary_count,
+                work_items,
+                work_items_summary,
+                scheduler,
+                rows,
+                row_count,
+            )
+
+
+@cute.jit
+def chain_tables_body(
+    b_t: cutlass.Constexpr[int],
+    rows_b_t: cutlass.Constexpr[int],
+    tidx,
+    pieces: Int32,
+    heads_out: Int32,
+    num_seqs: Int32,
+    cu_seqlens: cute.Tensor,
+    cu_pieces: cute.Tensor,
+    main_rows: cute.Tensor,
+    summary_rows: cute.Tensor,
+    main_count: cute.Tensor,
+    summary_count: cute.Tensor,
+    work_items: cute.Tensor,
+    work_items_summary: cute.Tensor | None,
+    scheduler: cute.Tensor,
+    rows: cute.Tensor | None,
+    row_count: cute.Tensor | None,
+):
+    """The table blocks of :func:`chain_table_kernel`: the piece table on every block, then the
+    ordered work tables on block 0 and the chunk row table on block 1."""
     piece_table_body(
         pieces, b_t, heads_out, tidx, num_seqs, cu_seqlens, cu_pieces, main_rows, summary_rows
     )
@@ -431,12 +506,13 @@ def launch_chain_tables(
     rows: cute.Tensor | None = None,
     row_count: cute.Tensor | None = None,
     rows_b_t: cutlass.Constexpr[int] = 0,
+    tail_rows: cute.Tensor | None = None,
 ) -> None:
     """The chain prologue: check ``cu_seqlens`` against the ``tokens`` packed tokens
     (:func:`~work_tables.check_packed_offsets`), then the piece table of ``cu_seqlens``, its
-    work tables and, with ``rows``, the chunk row table of ``rows_b_t``-token chunks of the
-    pieces. Callable from a launch bundle's ``@cute.jit`` host; the next launch waits on it
-    through PDL."""
+    work tables, with ``rows`` the chunk row table of ``rows_b_t``-token chunks of the pieces,
+    and with ``tail_rows`` the zeroed inactive rows of a backward's gate cotangent. Callable
+    from a launch bundle's ``@cute.jit`` host; the next launch waits on it through PDL."""
     chain_table_kernel(
         b_t,
         rows_b_t,
@@ -455,8 +531,9 @@ def launch_chain_tables(
         scheduler,
         rows,
         row_count,
+        tail_rows,
     ).launch(
-        grid=(1 if cutlass.const_expr(rows is None) else 2, 1, 1),
+        grid=(prologue_ctas(tokens, rows, tail_rows), 1, 1),
         block=(ORDER_THREADS, 1, 1),
         stream=stream,
         use_pdl=True,
