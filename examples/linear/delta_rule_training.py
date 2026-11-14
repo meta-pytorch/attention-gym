@@ -180,9 +180,9 @@ class DeltaRuleAttention(nn.Module):
     through ``a_proj``. ``lower_bound`` applies to the KDA gate only; ``fastmath`` applies to
     both fused gates and to the KDA core. Its default ``True`` permits approximate math;
     reference execution keeps ordinary PyTorch math. ``kernel_options`` are passed
-    through to the chunk core, whose default runs warpdrive on SM100-family GPUs for either variant;
-    ``{"backend": "fused"}`` keeps the repo-local kernels. Unless the KDA core is pinned to the
-    repo-local kernels, ``lower_bound`` must respect warpdrive's narrower gate range.
+    through to the chunk core, whose default runs warpdrive on SM100-family GPUs for either
+    variant; ``{"backend": "fused"}`` runs the Triton kernels. Unless the KDA core is pinned to the
+    Triton kernels, ``lower_bound`` must respect warpdrive's narrower gate range.
 
     Set ``mask_inactive_capacity=True`` when a packed input reserves physical rows
     beyond ``cu_seqlens[-1]``. The endpoint may then change across CUDA Graph replay
@@ -918,7 +918,7 @@ def main(
         CoreBackendOption,
         typer.Option(
             help="Chunk kernels for the fused backend: auto (warpdrive on SM100-family GPUs), "
-            "repo-local fused, or warpdrive."
+            "Triton fused, or warpdrive."
         ),
     ] = CoreBackendOption.AUTO,
     fastmath: Annotated[

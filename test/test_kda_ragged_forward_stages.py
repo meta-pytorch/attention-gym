@@ -5,13 +5,12 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.fwd.factors import chunk_kda_fwd_intra
 
 pytestmark = pytest.mark.skipif(
-    not cuda_runs_sm100_kernels(),
-    reason="the CuTe KDA forward stages require an SM100-family GPU",
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+    reason="the fused KDA forward stages require CUDA capability 8.0 or newer",
 )
 
 

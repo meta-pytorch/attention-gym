@@ -32,8 +32,10 @@ Notes:
 - `--prerelease allow` is required for the `flash-attn-4` beta in `[tests]`.
   `[tests]` omits FlashAttention on aarch64, so its transitive CuTeDSL pin does not apply
   there or to linear-only installs. When updating CuTeDSL, run
-  `pytest -n 6 test/test_kda_bwd_wy_compile.py` to catch NVVM binding changes without a
-  Blackwell GPU, then validate forward/backward numerics on supported hardware.
+  `CUTE_DSL_ARCH=sm_100a pytest -n 6 test/warpdrive/test_warpdrive_liveness_configs.py`,
+  which compiles the shipped warpdrive configurations to SM100 binaries without launching
+  them, to catch NVVM binding changes without a Blackwell GPU; then validate forward/backward
+  numerics on supported hardware.
 - A `.venv` symlink into another worktree is not isolation: its editable `.pth` still
   points at that worktree, so pytest imports the other checkout's `attn_gym`. Replace it
   with a real per-worktree env.

@@ -23,11 +23,12 @@ either metric alone can hide a different class of regression.
 ## Optional backends and hardware gates
 
 The repo advertises portable fallbacks (Triton, reference) next to optional fast paths
-(CuTeDSL on sm90+/sm100). A test must not assume the fast path is selected just because the
-shape qualifies: gate fast-path-only tests with a module-level capability constant (see
-`CUTE_CAPABLE` in `test/test_kda_int64_offsets.py` and `test/test_gate_transform.py`) and assert
-the production selector's choice (`selector(inputs) == expected and CUTE_CAPABLE`) so the
-portable route is tested on machines without the optional dependency.
+(CuTeDSL warpdrive on sm100). A test must not assume the fast path is selected just because the
+shape qualifies: gate fast-path-only tests with a module-level capability marker (see
+`requires_warpdrive` in `test/test_delta_rule_stages.py`), pin the portable chunk kernels with
+the `fused_chunk_default` fixture so they also run on sm100, and test the production selector's
+choice directly (`test/test_linear_default_backend.py`) so the portable route is tested on
+machines without the optional dependency.
 
 Extreme-input tests must compare values, including every gradient, against the reference, not
 only `isfinite`. Overflow-safe rewrites (`max(z, 0) + log1p(exp(-|z|))`) and cancellation-prone

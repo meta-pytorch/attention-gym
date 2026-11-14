@@ -14,10 +14,10 @@ Coordinate system
 Scheduling views
 ----------------
 
-``GridScheduler`` supports three launch geometries; ``subtask`` is terminology
+``GridScheduler`` supports two launch geometries; ``subtask`` is terminology
 for only the flattened one:
 
-1. **Flat-task scheduling** (Triton): a kernel supplies only its number of
+1. **Flat-task scheduling**: a kernel supplies only its number of
    kernel-specific work coordinates per chunk. The scheduler sees that count,
    not whether the coordinate means a head, channel tile, or
    ``(head, output-tile)`` pair. The kernel flattens and later decodes::
@@ -29,18 +29,12 @@ for only the flattened one:
    ``w, w + num_workers, w + 2 * num_workers, ...``. Here a subtask is CTA-level
    parallel work, not an inner loop.
 
-2. **Chunk-axis scheduling** (CuTeDSL): the scheduler controls only the chunk
-   grid axis. Pair, head, and tile coordinates remain explicit grid axes, and
-   each CTA strides over chunks for one fixed combination of those coordinates.
-   This path neither passes nor decodes a ``subtasks_per_chunk`` value.
-
-3. **Sequence-axis scheduling**: recurrence kernels persist the sequence-head
+2. **Sequence-axis scheduling**: recurrence kernels persist the sequence-head
    axis while retaining the value tile as an explicit grid axis. Kernels derive
    the active sequence extent from ``cu_seqlens`` during replay.
 
 The value three in the worked example below is therefore illustrative only for
-flat-task scheduling; it is not derived from ``cu_seqlens`` and does not describe
-the CuTeDSL grid.
+flat-task scheduling; it is not derived from ``cu_seqlens``.
 
 Shared routing metadata
 -----------------------
@@ -126,7 +120,7 @@ def _multiprocessor_count(device: torch.device) -> int:
 
 @dataclass(frozen=True)
 class GridScheduler:
-    """Map ragged work onto launch grids for Triton and CuTeDSL kernels.
+    """Map ragged work onto Triton launch grids.
 
     The runtime work count depends on sequence lengths, but CUDA Graph
     capture fixes the launch shape at ``metadata.capacity``. Static kernels
@@ -177,22 +171,6 @@ class GridScheduler:
         """Return the bounded worker count for a flat ``(chunk, subtask)`` list."""
         sm_count = _multiprocessor_count(torch.device(device))
         return min(self.metadata.capacity * subtasks_per_chunk, sm_count * self.ctas_per_sm)
-
-    def num_chunk_workers(self, device: torch.device | str) -> int:
-        """Determine the persistent grid size along the chunk axis for this device.
-
-        CuTeDSL kernels retain their natural grid dimensions for the remaining
-        axes (pair, head, ...), while this helper sizes only the chunk axis. These
-        small CTAs are latency bound, so measured performance improves as chunk
-        parallelism increases; cap that axis at one worker per SM, independently
-        of the number of subtasks per chunk.
-        """
-        sm_count = _multiprocessor_count(torch.device(device))
-        if self.metadata.capacity == 0:
-            return 0
-        # Power-of-two quantization keeps the TVM-FFI compile cache small when
-        # eager callers vary the capacity below the SM count.
-        return min(1 << (self.metadata.capacity - 1).bit_length(), sm_count)
 
     def resolve_flat(
         self,
@@ -251,15 +229,6 @@ class GridScheduler:
             workers,
             "a sequence-persistent kernel",
         )
-
-    def resolve_chunk(
-        self,
-        request: ScheduleRequest,
-        device: torch.device | str,
-    ) -> ResolvedSchedule:
-        """Resolve scheduling when only the chunk axis is persistent."""
-        workers = self.num_chunk_workers(device)
-        return self._resolve(request, True, self.metadata.capacity, workers, "a ragged kernel")
 
 
 @triton.jit(debug=True, do_not_specialize=["num_sequences", "tokens"])

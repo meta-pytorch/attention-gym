@@ -6,10 +6,52 @@
 
 """Portable Triton forward affine summaries for delta-rule context parallelism.
 
-Each program scans one work item (row layout in ``work_items.py``), keeping one
-FP32 ``[128, BN]`` augmented-state tile resident while scanning BT64 chunks. Raw compact-layout pointers avoid host tensor
-descriptors, allocations, and synchronization in the launch path, so a warmed
-specialization can be captured directly by a CUDA Graph.
+One local shard of a delta-rule sequence acts on the recurrent state as an affine
+map ``H_out = H_in @ A + B``. This kernel computes that summary directly from the
+shared per-chunk WY factors (``kg``, ``w``, ``u``, ``cumulative_gate`` as produced
+by ``chunk_kda_fwd_intra``) instead of running the full recurrence twice with
+zero/identity probe states (see ``examples/linear/delta_rule_context_parallel.py``).
+
+Math (K-first augmented state ``X`` of shape ``[K, V + K]``, fp32):
+
+    X = [0 | I]
+    per 64-token chunk c:
+        Tmp        = W[c] @ X                 # [BT, V + K]
+        Tmp[:, :V] = U[c] - Tmp[:, :V]
+        Tmp[:, V:] =      - Tmp[:, V:]
+        X          = diag(exp2(gk_last[c])) @ X + Kg[c]^T @ Tmp
+
+The output is the V-first packed transpose ``X^T`` of shape ``[H, V + K, K]``:
+rows ``[0:V]`` hold the state bias and rows ``[V:V+K]`` the state transition.
+These are distinct from KDA's token-token query/key matrix ``A``.
+
+Terms (see also NOTE [Terminology] in ``attn_gym.linear.context_parallel``):
+
+    chunk         64 tokens (``BT``). The factor kernels lay chunks from each subsequence's
+                  first token, so every subsequence has its own chunk grid.
+    range         one row of ``bounds``: ``[start, stop)`` of whole chunks inside one
+                  subsequence of the span (the staged contract only promises whole
+                  subsequences, NOTE [Summary ranges are subsequences] in
+                  ``attn_gym.linear.kda.stages``), which gets its own
+                  ``[bias; transition]`` summary. ``R`` = number of rows. A range never spans
+                  two documents; a row with ``start == stop`` scans nothing and yields the
+                  identity.
+    column tile   a ``BN``-wide slice of the ``V + K = 256`` augmented-state columns. One
+                  program owns the ``[K, BN]`` state tile ``X[:, cols]`` for one head and one
+                  work item; tiles ``< V / BN`` hold bias columns, the rest transition
+                  columns.
+
+The context-parallel routing passes exactly one range per fragment a rank owns: that
+fragment's *last* subsequence, or an empty range when it ends its document. A fragment is one
+contiguous global token range, so only its last subsequence can continue on another rank and
+only its first can be continued; interior subsequences are whole documents that start from
+zero. ``R`` therefore equals the rank's fragment count, while each row is one subsequence's
+range (NOTE [Terminology], "Summary work is bounded by fragments").
+
+Each program scans one work item (row layout and *partial* in ``work_items.py``), keeping one
+FP32 ``[128, BN]`` augmented-state tile resident while scanning BT64 chunks. Raw
+compact-layout pointers avoid host tensor descriptors, allocations, and synchronization in the
+launch path, so a warmed specialization can be captured directly by a CUDA Graph.
 """
 
 from __future__ import annotations

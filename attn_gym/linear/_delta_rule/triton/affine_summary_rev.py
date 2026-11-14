@@ -6,6 +6,12 @@
 
 """Portable Triton reverse affine summaries for delta-rule context parallelism.
 
+The local backward recurrence is affine in its incoming final-state cotangent:
+``dH_in = dH_out @ R + C``. This kernel evaluates the recurrence on ``[K, BN]`` tiles of the
+augmented FP32 state ``X = [0 | I]`` and returns its V-first packed transpose
+``[local_bias; reverse_transition]``. Terms (chunk, range, column tile) are defined in
+``affine_summary_fwd``.
+
 Each program scans one work item (row layout in ``work_items.py``), keeping one
 FP32 ``[128, BN]`` augmented-state tile resident while scanning BT64 chunks backward. Raw compact-layout pointers avoid host
 tensor descriptors, allocations, and synchronization in the launch path, so a

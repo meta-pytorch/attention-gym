@@ -25,8 +25,7 @@ reaches an earlier or later subchunk still leaves the normal range once its deca
 have made the term normal ("Fast math and precision" in ``docs/linear.md``). The earlier-key
 row factor ``2^(g_i - g_first)`` is formed as ``2^(g_i - g_mid) * 2^(g_mid - g_first)``:
 deriving it directly would flush to zero for the last rows at steep gates while their
-in-subchunk terms still matter. Matrix products run in TF32 with FP32 accumulation, matching
-the CuTe kernel in ``kda/bwd/cute/chunk_kda_bwd_intra.py``.
+in-subchunk terms still matter. Matrix products run in TF32 with FP32 accumulation.
 """
 
 from __future__ import annotations

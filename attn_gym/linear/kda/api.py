@@ -102,7 +102,7 @@ def chunk_kda(
             ``fastmath=True`` results stop being finite once an aligned 16-token per-channel sum
             reaches ``-126 * ln(2)`` (a uniform gate of ``-5.45``; ``-128 * ln(2)`` with
             ``fastmath=False``). The common ``-5`` bound stays comparable to the fused backend.
-            Calls that run the repo-local fused backend require approximately ``[-5.914, 0]``
+            Calls that run the Triton fused backend require approximately ``[-5.914, 0]``
             (``MAX_GATE_LOWER_BOUND_MAGNITUDE``). The KDA gate contract in ``docs/linear.md``
             gives the measurements. These limits are not checked at runtime and do not apply to
             reference or recurrent execution.
@@ -138,8 +138,9 @@ def chunk_kda(
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
             See :class:`attn_gym.linear.types.KernelOptions`. ``"backend"`` defaults to
-            ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed, and the
-            repo-local fused backend elsewhere ("Chunk backend selection" in ``docs/linear.md``).
+            ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed, and
+            the Triton ``"fused"`` backend elsewhere ("Chunk backend selection" in
+            ``docs/linear.md``).
             ``"autotune"`` (default ``True``) benchmarks candidate fused-kernel
             configurations; warpdrive accepts the option but uses its fixed schedule.
 
@@ -250,7 +251,7 @@ def paged_chunk_kda(
             ``chunk_kda``, for replay-backed calls too.
             ``split_backward`` and ``split_forward`` are not supported by this paged
             operation; ``schedule`` applies as in ``chunk_kda``. ``"autotune"`` (default
-            ``True``) benchmarks candidate configurations of the repo-local fused kernels;
+            ``True``) benchmarks candidate configurations of the Triton fused kernels;
             warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five

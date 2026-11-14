@@ -80,12 +80,12 @@ def chunk_gdn(
             and equal ``K = V`` of 64 or 128; ``"reference"`` uses eager PyTorch.
         kernel_options: Backend-specific options for fused execution. ``"backend"`` defaults to
             ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed, the
-            repo-local fused backend elsewhere; ``"fused"`` and ``"warpdrive"`` force one.
+            Triton ``"fused"`` backend elsewhere; ``"fused"`` and ``"warpdrive"`` force one.
             With ``{"backend": "warpdrive"}``, ``split_forward`` and ``split_backward`` opt into
             its approximate forgetting-horizon split schedules (see
             :class:`attn_gym.linear.types.SplitOptions`) for calls without ``initial_state`` or
             ``output_final_state``. ``"autotune"`` (default ``True``) benchmarks candidate
-            configurations of the repo-local fused kernels; winners are cached and reused. When
+            configurations of the Triton fused kernels; winners are cached and reused. When
             ``False``, and always under ``torch.use_deterministic_algorithms(True)``, the forward
             and backward launch fixed configurations, so bits repeat across processes and
             winner-cache states on one GPU model and software stack. The warpdrive backend always
@@ -180,7 +180,7 @@ def paged_chunk_gdn(
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. ``"backend"`` selects the kernels as in ``chunk_gdn``.
             Split schedules are not supported. ``"autotune"``
-            (default ``True``) benchmarks candidate configurations of the repo-local factor and
+            (default ``True``) benchmarks candidate configurations of the Triton factor and
             output kernels. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
             The recurrence that advances ``state_cache`` and the warpdrive backend always use
