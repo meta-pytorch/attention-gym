@@ -521,8 +521,8 @@ def _chunk_kda_bwd_shared(
     v: torch.Tensor,
     cumulative_gate: torch.Tensor,
     beta: torch.Tensor,
-    Aqk: torch.Tensor | None,
-    Akk: torch.Tensor | None,
+    Aqk: torch.Tensor,
+    Akk: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
     chunk_offsets: torch.Tensor | None,
     d_output: torch.Tensor | None,
@@ -533,7 +533,7 @@ def _chunk_kda_bwd_shared(
     autotune: bool,
     schedule: str,
 ):
-    """Run the opaque composed backward with saved or recomputed factors."""
+    """Run the opaque composed backward from saved factors."""
     from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd import chunk_kda_bwd
 
     q, k, v, metadata, d_output, d_final_state = _prepare_chunk_kda_backward(
@@ -548,7 +548,6 @@ def _chunk_kda_bwd_shared(
         d_final_state,
         initial_state,
     )
-    assert (Aqk is None) == (Akk is None)
     return chunk_kda_bwd(
         q,
         k,
@@ -568,43 +567,6 @@ def _chunk_kda_bwd_shared(
     )
 
 
-def _chunk_kda_bwd_recompute_factors_shared(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cumulative_gate: torch.Tensor,
-    beta: torch.Tensor,
-    cu_seqlens: torch.Tensor | None,
-    chunk_offsets: torch.Tensor | None,
-    d_output: torch.Tensor | None,
-    d_final_state: torch.Tensor | None,
-    initial_state: torch.Tensor | None,
-    scale: float,
-    fastmath: bool,
-    autotune: bool,
-    schedule: str,
-):
-    """Keep the recomputed-factor backward opaque to AOTAutograd."""
-    return _chunk_kda_bwd_shared(
-        q,
-        k,
-        v,
-        cumulative_gate,
-        beta,
-        None,
-        None,
-        cu_seqlens,
-        chunk_offsets,
-        d_output,
-        d_final_state,
-        initial_state,
-        scale,
-        fastmath,
-        autotune,
-        schedule,
-    )
-
-
 def _chunk_kda_bwd_cuda(*args) -> tuple[torch.Tensor, ...]:
     """Drop the unused state gradient to match the no-state operator schema."""
     dq, dk, dv, dg, db, _d_initial_state = _chunk_kda_bwd_shared(*args)
@@ -614,22 +576,3 @@ def _chunk_kda_bwd_cuda(*args) -> tuple[torch.Tensor, ...]:
 def _chunk_kda_bwd_with_state_grad_cuda(*args) -> tuple[torch.Tensor, ...]:
     """Preserve the state gradient required by the stateful operator schema."""
     return _chunk_kda_bwd_shared(*args)
-
-
-def _chunk_kda_bwd_recompute_factors_cuda(*args) -> tuple[torch.Tensor, ...]:
-    """Drop the recomputed state gradient for the no-state operator schema."""
-    dq, dk, dv, dg, db, _d_initial_state = _chunk_kda_bwd_recompute_factors_shared(*args)
-    return dq, dk, dv, dg, db
-
-
-def _chunk_kda_bwd_recompute_factors_with_state_grad_cuda(
-    *args,
-) -> tuple[torch.Tensor, ...]:
-    """Preserve the recomputed state gradient for the stateful operator schema."""
-    return _chunk_kda_bwd_recompute_factors_shared(*args)
-
-
-__all__ = [
-    "_chunk_kda_bwd_recompute_factors_cuda",
-    "_chunk_kda_bwd_recompute_factors_with_state_grad_cuda",
-]
