@@ -25,8 +25,8 @@ from attn_gym._backends.autotune import should_autotune
 from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import RaggedChunkMetadata
-from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.span import prepare_span, zero_state
+from attn_gym.linear._delta_rule.summaries import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_backend,
     resolve_chunk_kernel_options,

@@ -3,6 +3,11 @@
 import pytest
 import torch
 
+pytest.importorskip(
+    "attn_gym.linear._delta_rule.cute.affine_summary_fwd",
+    reason="legacy CuTe kernel is not installed",
+)
+
 pytest.importorskip("cutlass")
 
 from test_delta_affine_summary import (
