@@ -33,7 +33,9 @@ from attn_gym.warpdrive import (
     named_barrier,
     role,
 )
+from attn_gym.warpdrive.alias import RoleEvents, completion
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive.protocol import Event
 
 
 @jit_cache
@@ -164,8 +166,11 @@ def test_diagnostic_emits_no_device_code():
 
 
 class RingTmemHandoff(Model):
-    def __init__(self, stages: int):
-        self.acc = Ring(stages, Umma, Threads)
+    """The MMA writes S on ``acc``; the epilogue reads P (in S) and releases, waiting for its
+    loads first (``tmem_load``) unless ``waited=False``."""
+
+    def __init__(self, stages: int, waited: bool = True):
+        self.acc = Ring(stages, Umma, Threads, release_fence="tmem_load" if waited else ())
         self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
 
     @role(warps=4)
@@ -183,6 +188,58 @@ class RingTmemHandoff(Model):
             with acc.consume():
                 tmem.access("P", read=True)
         return acc
+
+
+class RingTmemHandoffBesideControl(RingTmemHandoff):
+    """``RingTmemHandoff(1, waited=False)`` with a second one-stage ring held around both
+    accesses. Its thread arrivals cannot complete the MMA write, so that handoff fails with a
+    hazard; ``acc`` alone still orders the pair up to the unrecorded load wait."""
+
+    def __init__(self):
+        super().__init__(1, waited=False)
+        self.ctl = Ring(1, Threads, Threads)
+
+    @role(warps=4)
+    @cute.jit
+    def mma(self, ctx, *, acc: Producer, ctl: Producer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ctl.produce(), acc.produce():
+                tmem.access("S", write=True, by="umma")
+        return acc, ctl
+
+    @role(warps=range(4))
+    @cute.jit
+    def epilogue(self, ctx, *, acc: Consumer, ctl: Consumer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with ctl.consume(), acc.consume():
+                tmem.access("P", read=True)
+        return acc, ctl
+
+
+class UmmaReadReleasedByThreads(Model):
+    """``prod`` writes TMEM S without waiting for its stores and hands it over on ``s``; the
+    consumer's MMA reads P (in S) and releases ``s`` with a thread arrival, which does not
+    complete the MMA read before ``prod`` rewrites S."""
+
+    def __init__(self):
+        self.s = Slots(1, Threads, Threads)
+        self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
+
+    @role(warps=0)
+    @cute.jit
+    def prod(self, ctx, *, s: Producer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with s.produce(0):
+                tmem.access("S", write=True)
+        return s
+
+    @role(warps=1)
+    @cute.jit
+    def cons(self, ctx, *, s: Consumer, tmem: Tmem):
+        for _ in cutlass.range(ctx.n, unroll=1):
+            with s.consume(0):
+                tmem.access("P", read=True, by="umma")
+        return s
 
 
 # One role, no synchronization between iterations: an MMA's D write to S in iteration i and the
@@ -910,7 +967,26 @@ HAZARD, UNVERIFIED, SAFE = "potential hazard", "unverified", "no hazard found"
 CHANNEL = r"no channel path orders them \[channel\]"
 VERDICTS = {  # id: (model, pair, status, evidence regex in the alias section)
     "ring1": (lambda: RingTmemHandoff(1), "P ~ S", SAFE, ""),
+    # tcgen05.ld completes only at tcgen05.wait::ld: a release without it may let the next MMA
+    # overwrite columns a load still reads.
+    "ring1_unwaited_load": (
+        lambda: RingTmemHandoff(1, waited=False),
+        "P ~ S",
+        UNVERIFIED,
+        r"tcgen05\.ld completes only at .*\[tmem_load\]",
+    ),
+    # One shared handoff stopped only by an unverified completion orders the pair on its own:
+    # another shared channel that cannot complete the accesses must not turn it into a hazard.
+    "ring1_unwaited_load_beside_control": (
+        RingTmemHandoffBesideControl,
+        "P ~ S",
+        UNVERIFIED,
+        r"tcgen05\.ld completes only at .*\[tmem_load\]",
+    ),
     "ring2": (lambda: RingTmemHandoff(2), "P ~ S", HAZARD, CHANNEL),
+    # One handoff fails twice: an unverified store and an MMA read a thread arrival cannot
+    # complete. The hazard must not hide behind the unverified finding.
+    "umma_read_thread_release": (UmmaReadReleasedByThreads, "P ~ S", HAZARD, r"\[commit\]"),
     "loop_carried": (
         LoopCarriedMma,
         "P ~ S",
@@ -965,3 +1041,60 @@ def test_alias_verdicts(case):
     text = alias_section(op)
     assert status(op, pair) == expected, text
     assert re.search(evidence, text), text
+
+
+def _event(kind: str, where: tuple = (), /, **data) -> Event:
+    return Event(kind, data, "toy.py:1", where, ())
+
+
+IF, LOOP = ((7, "if"),), ((7, "loop"),)
+
+
+@pytest.mark.parametrize(
+    "load, store, wait, signal, completed",
+    [
+        ((), None, (), (), False),  # nothing completes the load
+        ((), (), (), (), True),  # a later same-warp store, waited: ld -> st is pipelined
+        ((), IF, (), (), False),  # the store may be skipped
+        ((), LOOP, (), (), False),  # in a loop that may run zero times
+        ((), (), IF, (), False),  # the wait::st may be skipped
+        ((), IF, IF, IF, True),  # the signal runs only where the store and its wait ran
+        (IF, IF, IF, (), True),  # and the load only there
+    ],
+    ids=[
+        "no_store",
+        "store",
+        "store_in_if",
+        "store_in_loop",
+        "wait_in_if",
+        "signal_in_if",
+        "load_in_if",
+    ],
+)
+def test_load_completes_only_through_a_store_on_every_path(load, store, wait, signal, completed):
+    """A tcgen05.ld handed to a later writer completes through a later tcgen05.st of the same
+    warp and its wait::st only if both run whenever the load and the signal do. The wait::st is
+    another channel's fenced release, as managed signals record it: on the close event."""
+    loaded = SimpleNamespace(
+        agent="threads", read=True, write=False, storage=("tmem", "x"), parts=None
+    )
+    writer = SimpleNamespace(agent="umma", read=False, write=True)
+    events = [_event("access", load)]
+    if store is not None:
+        events.append(
+            _event("access", store, write=True, agent="threads", storage=("tmem", "y"), warps=None)
+        )
+    other = Slots(1, Umma, Threads, release_fence="tmem_store")
+    release = SimpleNamespace(chan=other, producer=False, role="r")
+    events += [
+        _event("close", wait, handle=release, signal=True, fenced=True),
+        _event("close", signal),
+    ]
+    role = RoleEvents("r", (0,), False, events, None)
+    seq = list(range(len(events)))
+    found = completion(
+        loaded, writer, role, seq, 0, len(events) - 1, mech="Threads", fence=(), own=False
+    )
+    assert (found is None) == completed, found
+    if not completed:
+        assert (found.severity, found.rule) == (UNVERIFIED, "tmem_load")

@@ -34,11 +34,11 @@ from itertools import combinations
 
 from cutlass import cute
 
-from attn_gym.warpdrive.protocol import ProtocolError, current_trace, fence_skip
+from attn_gym.warpdrive import fences
+from attn_gym.warpdrive.protocol import PTX, ProtocolError, current_trace, fence_skip
 from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 
 MODES = ("warn", "strict", "off")
-PTX = "https://docs.nvidia.com/cuda/parallel-thread-execution/index.html"
 
 
 @dataclass(frozen=True)
@@ -81,6 +81,13 @@ RULES = {
         "another thread or to tcgen05.mma waits (warpdrive's tmem_store fence) before it "
         "signals.",
         f"PTX ISA 9.5 9.7.18.6.2.1.2 and 9.7.18.6.3 "
+        f"({PTX}#tcgen05-memory-consistency-model-inter-thread-sync)",
+    ),
+    "tmem_load": Rule(
+        "tcgen05.ld completes only at tcgen05.wait::ld; a thread handing loaded columns to a "
+        "later writer waits (warpdrive's tmem_load fence) before it signals, or stores from the "
+        "same warp afterwards and waits for that store (ld -> st is pipelined).",
+        f"PTX ISA 9.5 9.7.18.6.2 and 9.7.18.6.3 "
         f"({PTX}#tcgen05-memory-consistency-model-inter-thread-sync)",
     ),
     "complete_tx": Rule(
@@ -365,17 +372,62 @@ def _conflicts(a: Access, b: Access) -> list[tuple]:
 
 # Completion of one access at a signal (the first hop of an ordering edge)
 
+# For each fence kind a completion may need: the rule a missing one breaks, and why.
+_FENCES = {
+    "tmem_store": (
+        "tmem_store",
+        "tcgen05.st completes only at tcgen05.wait::st (a tmem_store fence)",
+    ),
+    "tmem_load": (
+        "tmem_load",
+        (
+            "tcgen05.ld completes only at tcgen05.wait::ld (tmem_load), or at tcgen05.wait::st "
+            "after a later tcgen05.st of every warp that loaded"
+        ),
+    ),
+    "smem_async": (
+        "proxy",
+        (
+            "no fence.proxy.async between a generic access and a later {agent} access (channel "
+            "smem_async fence or fence_async_shared())"
+        ),
+    ),
+}
+
+
+@cache  # asked for every access pair and signal
+def _required(storage: str, mine: tuple, theirs: tuple) -> tuple[str, ...]:
+    """``fences.required`` between accesses given as ``(agent, read, write)``."""
+
+    def modes(agent, read, write):
+        return [fences.Access(agent, w) for w, used in ((False, read), (True, write)) if used]
+
+    return fences.required(storage, modes(*mine), modes(*theirs))
+
+
+def mech_name(mech) -> str:
+    """A signal mechanism's name: ``"Threads"``, ``"Warps"``, ``"Umma"`` or ``"Tma"``."""
+    return getattr(mech, "__name__", type(mech).__name__)
+
+
+def access_warps(parts, role_warps) -> set:
+    """The warps making an access: those of its declared footprint, else ``role_warps``."""
+    return {w for w, _, _ in parts or () if w is not None} or set(role_warps)
+
 
 def _between(role: RoleEvents, seq: list[int], lo: int, hi: int):
-    """Events of ``role`` at positions ``lo < p < hi`` of ``seq`` (event indices)."""
-    return [role.events[seq[p]] for p in range(lo + 1, hi)]
+    """Events of ``role`` at positions ``lo < p < hi`` of ``seq`` (event indices) that run
+    whenever the events at ``lo`` and ``hi`` both do: those outside any branch or loop that
+    encloses neither. A conditional or possibly zero-trip event completes nothing."""
+    ends = [role.events[seq[lo]].where, role.events[seq[hi]].where]
+    events = (role.events[seq[p]] for p in range(lo + 1, hi))
+    return [ev for ev in events if any(w[: len(ev.where)] == ev.where for w in ends)]
 
 
-def _bulk_done(role: RoleEvents, seq: list[int], pos_a: int, pos_e: int) -> bool:
-    """Check whether a bulk wait before ``pos_e`` covers the TMA store's group at ``pos_a``."""
+def _bulk_done(between: list) -> bool:
+    """Whether a bulk wait among ``between`` covers a TMA store issued before them."""
     groups = 0  # commits since the store, which joins the first of these groups
-    for p in range(pos_a + 1, pos_e):
-        ev = role.events[seq[p]]
+    for ev in between:
         if ev.kind == "bulk_commit":
             groups += 1
         elif ev.kind == "bulk_wait" and groups and groups > ev.data["n"]:
@@ -383,77 +435,130 @@ def _bulk_done(role: RoleEvents, seq: list[int], pos_a: int, pos_e: int) -> bool
     return False
 
 
-def _completion(a: Access, seq: list[int], pos_a: int, pos_e: int, other: str) -> Finding | None:
+def _load_waited(a, between: list, signal_fences, role_warps) -> bool:
+    """Whether every warp that made TMEM load ``a`` later stored to TMEM and waited for that
+    store (a ``tmem_store`` fence after it, standalone or run by a managed signal, or the
+    signal's own ``signal_fences``): a same-warp ``ld -> st`` is pipelined, so waiting for the
+    store waits for the load. An access that also writes is its own later store."""
+    stored = access_warps(a.parts, role_warps) if a.write else set()
+    waited: set = set()
+    for ev in between:
+        d = ev.data
+        if ev.kind == "access" and d["write"] and d["agent"] == "threads":
+            if d["storage"][0] == "tmem":
+                stored |= set(d["warps"] or role_warps)
+        elif "tmem_store" in fences.event_fences(ev):
+            waited |= stored
+    if "tmem_store" in signal_fences:
+        waited |= stored
+    return access_warps(a.parts, role_warps) <= waited
+
+
+def completion(
+    a,
+    other,
+    role: RoleEvents,
+    seq,
+    pos_a: int,
+    pos_e: int,
+    *,
+    mech: str,
+    fence,
+    own: bool,
+    signal: str | None = None,
+) -> Finding | None:
+    """Why the signal at ``pos_e`` of ``role``'s executed ``seq`` (event indices) does not
+    complete access ``a`` at ``pos_a`` for a conflicting later access ``other``; None if it does.
+
+    ``a`` and ``other`` have ``agent``, ``read`` and ``write``, and ``a`` also ``storage`` and
+    ``parts``, like ``Access``; a storage kind other than TMEM or SMEM takes the mechanism rules
+    only. The signal has mechanism ``mech`` (described as ``signal``, default ``mech``) and runs
+    ``fence`` first; ``own``: it is the commit of ``a``'s own TMA handle. TMEM accesses need
+    the fences ``fences.RULES`` requires; a generic SMEM access needs ``smem_async`` before any
+    async-proxy access (``RULES["proxy"]``), a wider rule than ``fences.RULES``' two SMEM ones.
+    """
+    signal = signal or mech
+    if a.agent == "tma" and a.write:
+        if own and mech == "Tma":
+            return None
+        return Finding(
+            HAZARD,
+            "a TMA load is published only by the transaction count of the handle whose barrier "
+            f"it uses, not by this {signal} signal",
+            "complete_tx",
+        )
+    if a.agent == "tma":
+        if mech not in THREAD_SIGNALS:
+            return Finding(
+                HAZARD, "nothing waits for the TMA store's source reads", "wait_group_read"
+            )
+        if _bulk_done(_between(role, seq, pos_a, pos_e)):
+            return None
+        return Finding(
+            UNVERIFIED,
+            "no recorded bulk_wait_group(read=True) covers the store before the signal",
+            "wait_group_read",
+        )
+    if a.agent == "umma":
+        if mech == "Umma":
+            return None
+        return Finding(
+            HAZARD,
+            f"tcgen05.mma completes only through tcgen05.commit, not this {signal} signal",
+            "commit",
+        )
+    if mech not in THREAD_SIGNALS:
+        return Finding(
+            HAZARD,
+            f"a {signal} signal does not publish this thread's accesses",
+            "commit" if mech == "Umma" else "complete_tx",
+        )
+    if a.storage[0] == "smem":  # RULES["proxy"]: a generic access before any async-proxy one
+        kinds = ("smem_async",) if other.agent in ("tma", "umma") else ()
+    else:
+        kinds = _required(
+            a.storage[0], (a.agent, a.read, a.write), (other.agent, other.read, other.write)
+        )
+    if not kinds:
+        return None
+    between = _between(role, seq, pos_a, pos_e)
+    # Managed signals record their fences on their close events, not as fence events.
+    ran = set(fence).union(*(fences.event_fences(ev) for ev in between))
+    for kind in kinds:
+        if kind in ran or (kind == "tmem_load" and _load_waited(a, between, fence, role.warps)):
+            continue
+        rule, why = _FENCES[kind]
+        return Finding(UNVERIFIED, why.format(agent=other.agent), rule)
+    return None
+
+
+def _completion(a: Access, seq: list[int], pos_a: int, pos_e: int, other) -> Finding | None:
     """Return the missing completion edge, or None if ``a`` is published by the signal.
 
-    ``pos_a`` indexes the access and ``pos_e`` its candidate close in ``seq``.
-    ``other`` is the conflicting agent that would synchronize with that signal.
+    ``pos_a`` indexes the access and ``pos_e`` its candidate close in ``seq``; ``other`` is the
+    conflicting access that would synchronize with that signal.
     """
     close = a.role.events[seq[pos_e]]
     rec = close.data["handle"]
     chan = rec.chan
     side = "producer" if rec.producer else "consumer"
-    mech = chan.mechanism(side, rec.role)
-    mech_name = getattr(mech, "__name__", type(mech).__name__)
-    fence = chan.fences(side, rec.role) if close.data["fenced"] else ()
+    mech = mech_name(chan.mechanism(side, rec.role))
     where = f"{a.describe()} before {chan.name} {close.site}"
     if not close.data["signal"]:
         return Finding(UNVERIFIED, f"{where}: raw signal (signal=False) is not visible", "channel")
-    if a.agent == "tma" and a.write:
-        if rec is a.handle and rec.producer and mech_name == "Tma":
-            return None
-        return Finding(
-            HAZARD,
-            f"{where}: a TMA load is published only by the transaction count of the handle "
-            f"whose barrier it uses, not by this {mech_name} {side} signal",
-            "complete_tx",
-        )
-    if a.agent == "tma":
-        if mech_name not in THREAD_SIGNALS:
-            return Finding(
-                HAZARD,
-                f"{where}: nothing waits for the TMA store's source reads",
-                "wait_group_read",
-            )
-        if _bulk_done(a.role, seq, pos_a, pos_e):
-            return None
-        return Finding(
-            UNVERIFIED,
-            f"{where}: no recorded bulk_wait_group(read=True) covers the store before the signal",
-            "wait_group_read",
-        )
-    if a.agent == "umma":
-        if mech_name == "Umma":
-            return None
-        return Finding(
-            HAZARD,
-            f"{where}: tcgen05.mma completes only through tcgen05.commit, not this {mech_name} "
-            f"{side} signal",
-            "commit",
-        )
-    if mech_name not in THREAD_SIGNALS:
-        return Finding(
-            HAZARD,
-            f"{where}: a {mech_name} {side} signal does not publish this thread's accesses",
-            "commit" if mech_name == "Umma" else "complete_tx",
-        )
-    if a.storage[0] == "tmem" and a.write and "tmem_store" not in fence:
-        return Finding(
-            UNVERIFIED,
-            f"{where}: tcgen05.st is not waited (channel tmem_store fence) before the signal "
-            f"that hands its columns to a later {other} access",
-            "tmem_store",
-        )
-    if other in ("tma", "umma") and a.storage[0] == "smem":
-        fences = {e.data["kind"] for e in _between(a.role, seq, pos_a, pos_e) if e.kind == "fence"}
-        if "smem_async" not in fence and "smem_async" not in fences:
-            return Finding(
-                UNVERIFIED,
-                f"{where}: no fence.proxy.async between a generic access and a later {other} "
-                "access (channel smem_async fence or fence_async_shared())",
-                "proxy",
-            )
-    return None
+    found = completion(
+        a,
+        other,
+        a.role,
+        seq,
+        pos_a,
+        pos_e,
+        mech=mech,
+        fence=chan.fences(side, rec.role) if close.data["fenced"] else (),
+        own=rec is a.handle and rec.producer,
+        signal=f"{mech} {side}",
+    )
+    return None if found is None else Finding(found.severity, f"{where}: {found.text}", found.rule)
 
 
 # Same-thread ordering inside one handle period
@@ -542,7 +647,9 @@ def _open_before(role: RoleEvents, index: int, rec) -> int:
     return -1
 
 
-def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> Finding | None:
+def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> list[Finding]:
+    """What keeps the shared handoff on ``chan``/``slot`` from ordering ``a`` and ``b``: one
+    finding, or each access's failed completion (empty: ordered)."""
     ha, hb = _handle_on(a, chan, slot), _handle_on(b, chan, slot)
     if a.role is b.role:
         # Same-role handles separate accesses only when the first closes before the second
@@ -557,28 +664,34 @@ def _handoff(a: Access, b: Access, chan, slot, warp_pairs) -> Finding | None:
         if not separated:
             found = _same_period(first, second, warp_pairs)
             if found is not None:
-                return found
+                return [found]
     elif ha.producer == hb.producer and not (chan.exclusive and not ha.producer):
         # Exclusive consumers own separate epochs. Producer reuse orders them once each
         # access completes before its handle closes.
         side = "producers" if ha.producer else "consumers"
-        return Finding(
-            HAZARD,
-            f"{a.describe()} and {b.describe()}: {side} of one {chan.name} epoch are unordered",
-            "channel",
-        )
+        return [
+            Finding(
+                HAZARD,
+                f"{a.describe()} and {b.describe()}: {side} of one {chan.name} epoch are unordered",
+                "channel",
+            )
+        ]
     # Other epochs: each access must complete before its own handle's close signals.
+    failed = []
     for x, hx, other in ((a, ha, b), (b, hb, a)):
         seq = list(range(len(x.role.events)))
         close = _close_after(x.role, x.index, hx)
         if close is None:
-            return Finding(
-                UNVERIFIED, f"{x.describe()}: its {chan.name} handle never closes", "channel"
+            failed.append(
+                Finding(
+                    UNVERIFIED, f"{x.describe()}: its {chan.name} handle never closes", "channel"
+                )
             )
-        found = _completion(x, seq, x.index, close, other.agent)
+            continue
+        found = _completion(x, seq, x.index, close, other)
         if found is not None:
-            return found
-    return None
+            failed.append(found)
+    return failed
 
 
 # Cross-channel happens-before graph
@@ -592,6 +705,37 @@ class _TooLarge(Exception):
     pass
 
 
+@dataclass
+class Region:
+    """A dynamic region of a role's program: its ``where`` key and kind, the site of its first
+    event, and its body of event indices and nested regions in trace order."""
+
+    key: int
+    kind: str
+    site: str
+    body: list
+
+
+def program(role: RoleEvents, keep=None) -> list:
+    """The role's events (``keep``: only these indices, ascending) as a program: event indices
+    and nested ``Region``s in trace order."""
+    root: list = []
+    stack: list = [(None, root)]
+    for i in range(len(role.events)) if keep is None else keep:
+        ev = role.events[i]
+        keys = [k for k, _ in ev.where]
+        depth = 0
+        while depth < len(stack) - 1 and depth < len(keys) and stack[depth + 1][0] == keys[depth]:
+            depth += 1
+        del stack[depth + 1 :]
+        for key, kind in ev.where[depth:]:
+            node = Region(key, kind, ev.site, [])
+            stack[-1][1].append(node)
+            stack.append((key, node.body))
+        stack[-1][1].append(i)
+    return root
+
+
 def _unroll(role: RoleEvents, items: int) -> list[tuple[int, int]]:
     """Return ``(event index, item)`` pairs in program order.
 
@@ -600,19 +744,6 @@ def _unroll(role: RoleEvents, items: int) -> list[tuple[int, int]]:
     (``once="first"``) and in-loop close (``once="last"``) appear only in their loop's first
     and last repetition.
     """
-    root: list = []
-    stack: list = [(None, root)]
-    for i, ev in enumerate(role.events):
-        keys = [k for k, _ in ev.where]
-        depth = 0
-        while depth < len(stack) - 1 and depth < len(keys) and stack[depth + 1][0] == keys[depth]:
-            depth += 1
-        del stack[depth + 1 :]
-        for key, kind in ev.where[depth:]:
-            node = (key, kind, [])
-            stack[-1][1].append(node)
-            stack.append((key, node[2]))
-        stack[-1][1].append(i)
     out: list = []
 
     def emit(children, item, first=True, last=True):
@@ -623,17 +754,17 @@ def _unroll(role: RoleEvents, items: int) -> list[tuple[int, int]]:
                 once = role.events[c].data.get("once")
                 if once is None or (first if once == "first" else last):
                     out.append((c, item))
-            elif c[0] == role.item_key:
+            elif c.key == role.item_key:
                 for it in range(items):
-                    emit(c[2], it, it == 0, it == items - 1)
+                    emit(c.body, it, it == 0, it == items - 1)
             else:
-                repetitions = 2 if c[1] == "loop" else 1
+                repetitions = 2 if c.kind == "loop" else 1
                 for r in range(repetitions):
-                    emit(c[2], item, r == 0, r == repetitions - 1)
+                    emit(c.body, item, r == 0, r == repetitions - 1)
 
     item = -1
-    for c in root:
-        if not isinstance(c, int) and c[0] == role.item_key:
+    for c in program(role):
+        if not isinstance(c, int) and c.key == role.item_key:
             emit([c], item)
             item = items
         else:
@@ -926,14 +1057,15 @@ def _cross_channel(graph: _Graph, a: Access, b: Access) -> Finding | None:
     return first
 
 
-def _reach(graph: _Graph, x: Access, px: int, other: str) -> tuple:
-    """Cache reachability from instance ``px`` of ``x`` for a conflicting ``other`` agent.
+def _reach(graph: _Graph, x: Access, px: int, other: Access) -> tuple:
+    """Cache reachability from instance ``px`` of ``x`` for a conflicting access ``other``
+    (the completion rules read its agent and modes).
 
     Returns ordered targets, completion failures, targets reachable without completion,
     targets reachable with raw signals, and a function for any further epoch guesses
     (``_Graph.guessed``).
     """
-    key = (id(x), px, other)
+    key = (id(x), px, other.agent, other.read, other.write)
     if key not in graph.cache:
         seq = [e for e, _ in graph.seq[id(x.role)]]
         failures: list = []
@@ -968,7 +1100,7 @@ def _graph_order(graph: _Graph, x: Access, px: int, y: Access, py: int) -> tuple
 
     Also return completion failures, a possible raw signal or required epoch guesses.
     """
-    ordered, failures, anyway, raw, guessed = _reach(graph, x, px, y.agent)
+    ordered, failures, anyway, raw, guessed = _reach(graph, x, px, y)
     target = (id(y.role), py)
     if target in ordered:
         return True, []
@@ -1117,17 +1249,24 @@ def _order(a: Access, b: Access, warp_pairs, get_graph) -> Finding | str | None:
 
     One ordering channel shared by both accesses is enough.
     """
-    found = []
+    found = []  # each shared handoff's first failure
+    # The first finding of a shared handoff that only unverified completions stopped: one such
+    # handoff orders every epoch on its own, whatever the other shared channels do.
+    unverified = None
     ring_stage = a.storage[0] == "smem" and (a.slot is None or b.slot is None)
     # A handle around a loop hides loop-carried pairs on static storage, so same-role
     # accesses need the unrolled graph. Ring stages still use their own handles: each handle
     # covers one epoch.
     for ha in _handoff_handles(a) if a.role is not b.role or ring_stage else ():
         if _handle_on(b, ha.chan, ha.slot) is not None:
-            why = _handoff(a, b, ha.chan, ha.slot, warp_pairs)
-            if why is None:
+            failed = _handoff(a, b, ha.chan, ha.slot, warp_pairs)
+            if not failed:
                 return None
-            found.append(why)
+            found.append(failed[0])
+            if unverified is None and all(
+                f.severity != HAZARD and f.rule != "channel" for f in failed
+            ):
+                unverified = failed[0]
     if found and ring_stage:
         return next((f for f in found if f.severity == HAZARD), found[0])
     if ring_stage:
@@ -1138,16 +1277,20 @@ def _order(a: Access, b: Access, warp_pairs, get_graph) -> Finding | str | None:
     if isinstance(graph, str):
         return graph
     try:
-        found = (
+        path = (
             _same_role(graph, a, b, warp_pairs)
             if a.role is b.role
             else _cross_channel(graph, a, b)
         )
     except _TooLarge as exc:
         return f"{a.describe()} and {b.describe()}: {exc}; not modeled"
-    if found is not None and found.rule == EPOCHS:
-        return found.text  # a modeling gap, like an unmodeled cluster: not a finding
-    return found
+    if path is not None and path.rule == EPOCHS:
+        return path.text  # a modeling gap, like an unmodeled cluster: not a finding
+    # A shared handoff orders every epoch once each access completes: if only unverified
+    # completions stopped it, a path the graph misses is not a hazard.
+    if path is not None and path.severity == HAZARD and unverified is not None:
+        return unverified
+    return path
 
 
 def report(rep: AliasReport, mode: str, kernel_name: str):
