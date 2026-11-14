@@ -720,8 +720,14 @@ def test_gdn_wd_split_schedules_reject_stateful_calls(option: str) -> None:
 
 
 def _split_work_items(monkeypatch, gate_pattern: str) -> tuple[tuple, list[int]]:
-    """Run exact and split warpdrive GDN fwd+bwd on one long stream; record split work items."""
+    """Run exact and split warpdrive GDN fwd+bwd on one long stream; record split work items.
+
+    The exact run keeps the uncut table the split cuts: the piece chain this stream would take
+    rounds differently, which elementwise bf16 tolerances on tiny gradients do not absorb."""
     from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as gdn_driver
+
+    for costs in (gdn_driver.CHAIN_COST_FWD, gdn_driver.CHAIN_COST_BWD):
+        monkeypatch.setitem(costs, 128, costs[128]._replace(overhead_tokens=1 << 40))
 
     q, k, value, gate, beta, _state, _ = make_gdn_test_inputs(
         8192, gate_pattern=gate_pattern, seed=337
@@ -754,8 +760,7 @@ def test_gdn_wd_split_cuts_a_forgetting_stream_and_matches_exact(monkeypatch) ->
 
 
 def test_gdn_wd_split_places_no_cuts_when_the_gate_never_forgets(monkeypatch) -> None:
-    """A gate that never forgets is not cut. The exact path runs this long stream as an exact
-    piece chain, so the uncut split result matches it to rounding rather than bitwise."""
+    """A gate that never forgets is not cut, so the split matches the exact uncut table."""
     (exact, split), work_counts = _split_work_items(monkeypatch, "near_zero")
     assert work_counts == [exact[0].shape[2]] * 2
     for actual, expected in zip(split, exact, strict=True):
@@ -896,7 +901,7 @@ def test_gdn_wd_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
     tokens, heads = q.shape[1], value.shape[2]
     if not gdn_driver.ForwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain:
         pytest.skip("this device has too many (sequence, head) tiles per SM to chain")
-    assert gdn_driver.BackwardPlan.build(tokens, 1, heads, q.device).chain
+    assert gdn_driver.BackwardPlan.build(tokens, 1, heads, value.shape[3], q.device).chain
     inputs = (q, k, value, gate, beta, state)
     cotangents = (torch.randn_like(value), torch.randn_like(state))
 
@@ -911,8 +916,8 @@ def test_gdn_wd_exact_chain_matches_uncut_with_state(monkeypatch) -> None:
         return (*output, *torch.autograd.grad(output, leaves, cotangents))
 
     chain = run()
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 1 << 40)
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 1 << 40)
+    for costs in (gdn_driver.CHAIN_COST_FWD, gdn_driver.CHAIN_COST_BWD):
+        monkeypatch.setitem(costs, 128, costs[128]._replace(overhead_tokens=1 << 40))
     uncut = run()
     for actual, expected in zip(chain, uncut, strict=True):
         assert actual.isfinite().all()

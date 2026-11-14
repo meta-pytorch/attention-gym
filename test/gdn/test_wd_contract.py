@@ -156,7 +156,8 @@ def test_gdn_chain_backward_rejects_invalid_plan_buffers(monkeypatch, invalid):
     """The real chain plan reaches the compiler; corrupting one of its buffers fails before
     compiling."""
     monkeypatch.setattr(gdn_chain_backward, "_compile_chain_backward_head", reached_compiler)
-    monkeypatch.setattr(gdn, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    cost = gdn.CHAIN_COST_BWD[128]
+    monkeypatch.setitem(gdn.CHAIN_COST_BWD, 128, cost._replace(overhead_tokens=0))
     build = gdn.build_chain_backward
 
     def corrupt(**kwargs):

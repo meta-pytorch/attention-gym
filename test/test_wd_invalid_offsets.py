@@ -15,7 +15,6 @@ import subprocess
 import sys
 
 import pytest
-import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 
@@ -158,15 +157,11 @@ def _chain_shape(family: str, direction: str) -> tuple[int, int]:
         from attn_gym.linear._delta_rule.warpdrive.drivers import kda as driver
     else:
         from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as driver
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
+    tokens, heads = 4096, 2
     if direction == "forward":
-        heads = num_sm // 3
-        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD * (num_sm // heads)
         assert driver.ForwardPlan.build(tokens, 1, heads, 128, "cuda").chain
     else:
-        heads = num_sm // 2
-        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD * (num_sm // heads)
-        assert driver.BackwardPlan.build(tokens, 1, heads, "cuda").chain
+        assert driver.BackwardPlan.build(tokens, 1, heads, 128, "cuda").chain
     return tokens, heads
 
 

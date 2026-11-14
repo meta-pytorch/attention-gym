@@ -23,13 +23,13 @@ from ..kda_common import B_T
 from ..piece_chain import chain_rows_per_cta
 from ..work_tables import WORK_ITEM_FIELDS
 from .plan import BackwardPlan as _BackwardPlan
+from .plan import ChainCost, aligned, chain_buffers, int32, split_scratch, tma_slots
 from .plan import ForwardPlan as _ForwardPlan
-from .plan import aligned, chain_buffers, int32, split_scratch, tma_slots
 
-# Start with the GDN driver's conservative chain floors; KDA has its own BT16 pieces.
-# These guard against summary overhead, rather than claiming KDA-specific tuning.
-MIN_CHAIN_TOKENS_PER_PIECE_FWD = 8192
-MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
+# See NOTE [Chain plan cost] in plan.py; keyed by head dimension as in GDN. The prep d_v split is
+# strong enough that three forward pieces on a full grid never beat it.
+CHAIN_COST_FWD = {128: ChainCost(piece=1.5, overhead_tokens=2560)}
+CHAIN_COST_BWD = {128: ChainCost(piece=1.0, overhead_tokens=256)}
 PREP_TILE_FRACTION = 0.475
 _GATE_FLAGS = {"log_gate": True}
 
@@ -51,7 +51,7 @@ class ForwardPlan(_ForwardPlan):
             dim_v,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_FWD,
+            chain_cost=CHAIN_COST_FWD[dim_v],
         )
 
 
@@ -96,9 +96,10 @@ def kda_forward(
     plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0, tiles_per_head=1)
-    if paged:
-        # The piece chain has no paged routing; seed and store through the prefill instead.
-        plan = replace(plan, pieces=0)
+    if paged and plan.chain:
+        # The piece chain has no paged routing; seed and store through the prefill instead, with
+        # the unchained plan's own d_v split (and shared prep) rather than a chain plan's tiles.
+        plan = ForwardPlan.uncut(num_seqs, heads_out, dim_v, plan.num_sm)
     o = torch.empty_like(v)
     final_state = None
     if output_final_state:
@@ -225,14 +226,14 @@ def _prep_buffers(
 
 class BackwardPlan(_BackwardPlan):
     @classmethod
-    def build(cls, tokens: int, num_seqs: int, heads_out: int, device) -> BackwardPlan:
+    def build(cls, tokens: int, num_seqs: int, heads_out: int, dim_v: int, device) -> BackwardPlan:
         return cls.for_shape(
             tokens,
             num_seqs,
             heads_out,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_BWD,
+            chain_cost=CHAIN_COST_BWD[dim_v],
         )
 
 
@@ -268,7 +269,7 @@ def kda_backward(
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
+    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs
