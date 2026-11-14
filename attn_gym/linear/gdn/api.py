@@ -164,8 +164,7 @@ def paged_chunk_gdn(
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
         beta: Floating per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
-            Recurrence math remains FP32; BF16 affects persistent storage only. The optional
-            warpdrive backend requires FP32.
+            Recurrence math remains FP32; BF16 affects persistent storage only.
         state_indices: Contiguous int32 slot indices, one per logical sequence. Positive,
             unique indices select slots to advance; non-positive indices produce zero output
             and leave the cache untouched.

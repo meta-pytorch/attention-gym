@@ -21,16 +21,26 @@ pytestmark = pytest.mark.skipif(
 _WARPDRIVE = {"backend": "warpdrive"}
 
 
-def test_warpdrive_paged_matches_gather_scatter() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("io_dtype", [torch.bfloat16, torch.float16])
+def test_warpdrive_paged_matches_gather_scatter(
+    pool_dtype: torch.dtype, io_dtype: torch.dtype
+) -> None:
     """Resumed, fresh, empty, and null routes match ordinary warpdrive execution bitwise."""
-    q, k, value, gate, beta = make_kda_test_inputs(256, heads=2, seed=9)
+    q, k, value, gate, beta = make_kda_test_inputs(
+        256,
+        heads=2,
+        seed=9,
+        dtype=io_dtype,
+        gate_value=-0.01 if io_dtype == torch.float16 else None,
+    )
     cu_seqlens = cumulative_sequence_offsets((65, 0, 0, 0, 127, 64))
     state_indices = torch.tensor([4, 2, 5, 0, 0, 1], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False, True, True, True, False], device="cuda")
     for tensor in (q, k, value, gate, beta):
         tensor[:, 65:192] = torch.nan
 
-    storage, pool = strided_state_pool(6, 2, 128, 128, prefix=0, suffix=32)
+    storage, pool = strided_state_pool(6, 2, 128, 128, prefix=0, suffix=32, dtype=pool_dtype)
     expected_storage = storage.clone()
     expected_pool = expected_storage[:, : pool[0].numel()].view_as(pool)
     initial_state = torch.zeros(6, 2, 128, 128, device="cuda")
@@ -73,11 +83,12 @@ def test_warpdrive_paged_matches_gather_scatter() -> None:
     torch.testing.assert_close(storage, expected_storage, rtol=0, atol=0)
 
 
-def test_warpdrive_paged_dense_batch_resumes_every_slot() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_dense_batch_resumes_every_slot(pool_dtype: torch.dtype) -> None:
     """Dense batches use the same packed routing contract without a seed mask."""
     q, k, value, gate, beta = make_kda_test_inputs(64, batch=3, heads=2, seed=17)
     state_indices = torch.tensor([3, 1, 2], device="cuda", dtype=torch.int32)
-    pool = torch.randn(4, 2, 128, 128, device="cuda")
+    pool = torch.randn(4, 2, 128, 128, device="cuda", dtype=pool_dtype)
     expected_pool = pool.clone()
     packed = tuple(
         tensor.reshape(1, -1, *tensor.shape[2:]) for tensor in (q, k, value, gate, beta)
@@ -85,13 +96,13 @@ def test_warpdrive_paged_dense_batch_resumes_every_slot() -> None:
     cu_seqlens = torch.arange(4, device="cuda", dtype=torch.int32) * 64
     expected_output, final_state = chunk_kda(
         *packed,
-        pool[state_indices.long()].clone(),
+        pool[state_indices.long()].float().clone(),
         cu_seqlens=cu_seqlens,
         output_final_state=True,
         kernel_options=_WARPDRIVE,
     )
     assert final_state is not None
-    expected_pool[state_indices.long()] = final_state
+    expected_pool[state_indices.long()] = final_state.to(pool_dtype)
 
     with torch.no_grad():
         output = paged_chunk_kda(
@@ -102,10 +113,11 @@ def test_warpdrive_paged_dense_batch_resumes_every_slot() -> None:
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0)
 
 
-def test_warpdrive_paged_raw_operator_registration() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_raw_operator_registration(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta = make_kda_test_inputs(96, heads=2, seed=21)
     cu_seqlens = cumulative_sequence_offsets((64, 32))
-    pool = torch.zeros(3, 2, 128, 128, device="cuda")
+    pool = torch.zeros(3, 2, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
     torch.library.opcheck(
         chunk_warpdrive_packed_fwd_paged_op,
@@ -124,12 +136,13 @@ def test_warpdrive_paged_raw_operator_registration() -> None:
     )
 
 
-def test_warpdrive_paged_fullgraph_and_cuda_graph_replay() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_fullgraph_and_cuda_graph_replay(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta = make_kda_test_inputs(128, heads=2, seed=27)
     cu_seqlens = cumulative_sequence_offsets((65, 63))
     state_indices = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
     has_initial_state = torch.tensor([True, False], device="cuda")
-    seed_pool = torch.randn(3, 2, 128, 128, device="cuda") * 0.01
+    seed_pool = torch.randn(3, 2, 128, 128, device="cuda", dtype=pool_dtype) * 0.01
 
     @torch.compile(fullgraph=True)
     def compiled(q, k, value, gate, beta, pool, state_indices, has_initial_state, cu_seqlens):
@@ -217,7 +230,10 @@ def _dense_reference(q, k, value, gate, beta, cu_seqlens, pool, routes, fresh):
     (0, 40),
     ids=("value-split-plan", "uncut-plan"),
 )
-def test_warpdrive_paged_negative_and_zero_routes_never_touch_the_pool(extra_empty: int) -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_negative_and_zero_routes_never_touch_the_pool(
+    pool_dtype: torch.dtype, extra_empty: int
+) -> None:
     """Negative and zero routes emit zeros and never read or write any slot, in both plans.
 
     Slot 0 and the unused slot hold NaN: any read would poison an output or state, any write
@@ -230,7 +246,7 @@ def test_warpdrive_paged_negative_and_zero_routes_never_touch_the_pool(extra_emp
     q, k, value, gate, beta = make_kda_test_inputs(sum(lengths), heads=2, seed=31)
     cu_seqlens = cumulative_sequence_offsets(lengths)
     q[:, 33:103] = torch.nan  # the negative route's tokens
-    pool = torch.randn(6, 2, 128, 128, device="cuda") * 0.1
+    pool = torch.randn(6, 2, 128, 128, device="cuda", dtype=pool_dtype) * 0.1
     pool[0] = torch.nan
     pool[5] = torch.nan
     expected_output, expected_pool = _dense_reference(
@@ -257,7 +273,8 @@ def test_warpdrive_paged_negative_and_zero_routes_never_touch_the_pool(extra_emp
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0, equal_nan=True)
 
 
-def test_warpdrive_paged_empty_routes_past_compaction_capacity() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_empty_routes_past_compaction_capacity(pool_dtype: torch.dtype) -> None:
     """Fresh empties clear and resumed empties persist on the uncompacted fallback table."""
     num_sequences = 4200  # more sequences than the order pass can compact
     lengths = [64, 48] + [0] * (num_sequences - 2)
@@ -268,7 +285,7 @@ def test_warpdrive_paged_empty_routes_past_compaction_capacity() -> None:
     fresh[-1] = True
     q, k, value, gate, beta = make_kda_test_inputs(sum(lengths), heads=1, seed=37)
     cu_seqlens = cumulative_sequence_offsets(lengths)
-    pool = torch.randn(5, 1, 128, 128, device="cuda")
+    pool = torch.randn(5, 1, 128, 128, device="cuda", dtype=pool_dtype)
     pool[0] = torch.nan
     expected_output, expected_pool = _dense_reference(
         q, k, value, gate, beta, cu_seqlens, pool, routes, fresh
@@ -293,7 +310,8 @@ def test_warpdrive_paged_empty_routes_past_compaction_capacity() -> None:
     torch.testing.assert_close(pool, expected_pool, rtol=0, atol=0, equal_nan=True)
 
 
-def test_warpdrive_paged_runs_the_native_driver(monkeypatch) -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_runs_the_native_driver(pool_dtype: torch.dtype, monkeypatch) -> None:
     """Paged calls launch the v1.30 driver in place and reject final-state and split requests."""
     from attn_gym.linear._delta_rule.warpdrive.drivers import kda
     from attn_gym.linear._delta_rule.warpdrive.launchers import forward
@@ -307,7 +325,7 @@ def test_warpdrive_paged_runs_the_native_driver(monkeypatch) -> None:
     monkeypatch.setattr(forward, "kda_forward", spy)
     q, k, value, gate, beta = make_kda_test_inputs(96, heads=2, seed=41)
     cu_seqlens = cumulative_sequence_offsets((64, 32))
-    pool = torch.zeros(3, 2, 128, 128, device="cuda")
+    pool = torch.zeros(3, 2, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.tensor([2, 1], device="cuda", dtype=torch.int32)
     with torch.no_grad():
         paged_chunk_kda(
@@ -332,16 +350,19 @@ def test_warpdrive_paged_runs_the_native_driver(monkeypatch) -> None:
             )
 
 
-def test_warpdrive_paged_writes_every_token_up_to_the_last_interval() -> None:
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+def test_warpdrive_paged_writes_every_token_up_to_the_last_interval(
+    pool_dtype: torch.dtype,
+) -> None:
     """Every token in ``[0, cu_seqlens[-1])`` is written: sequence tokens with their output and
     null-route tokens with zeros. Rows past ``cu_seqlens[-1]`` are unspecified (not written)."""
     q, k, value, gate, beta = make_kda_test_inputs(128, heads=2, seed=3)
     cu_seqlens = torch.tensor([0, 32, 96], device="cuda", dtype=torch.int32)
-    pool = torch.zeros(2, 2, 128, 128, device="cuda")
+    pool = torch.zeros(2, 2, 128, 128, device="cuda", dtype=pool_dtype)
     state_indices = torch.tensor([0, 1], device="cuda", dtype=torch.int32)
     expected, _final = chunk_kda(
         *(t[:, 32:96] for t in (q, k, value, gate, beta)),
-        pool[1:2].clone(),
+        pool[1:2].float().clone(),
         cu_seqlens=torch.tensor([0, 64], device="cuda", dtype=torch.int32),
         output_final_state=True,
         kernel_options=_WARPDRIVE,
