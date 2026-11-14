@@ -73,6 +73,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Barriers,
     Consumer,
@@ -128,7 +129,6 @@ from .ragged import (
 from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_step, smem_desc
 
 B_T = 64
-DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 BOX = 64  # 16-bit elements per 128-byte swizzle row
 BOX_BYTES = B_T * BOX * 2  # one 64 x 64 16-bit box
@@ -180,7 +180,6 @@ def _commit(bars, name: cutlass.Constexpr[str]):
 
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 _STATE_DTYPES = {torch.float32: cutlass.Float32, torch.bfloat16: cutlass.BFloat16}
 
 
@@ -229,8 +228,8 @@ class GdnRecompute(WarpSpecialized):
     """Warpdrive GDN checkpoint-series recompute for fp16/bf16 ``d_k, d_v`` in {64, 128}."""
 
     def __init__(self, dtype_name: str, d_k: int, d_v: int, use_initial_state: bool):
-        if d_k not in DIMS or d_v not in DIMS:
-            raise ValueError(f"the recompute serves d_k, d_v in {DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"the recompute serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         self.dtype_name, self.d_k, self.d_v = dtype_name, d_k, d_v
         self.use_initial_state = use_initial_state
         self.io_dtype = _CUTE_DTYPES[dtype_name]
@@ -1147,14 +1146,14 @@ def gdn_recompute(
     ``GdnRecompute`` with ``enable_trace("globaltimer")``) and its ``trace`` buffer capture a role
     timeline. ``max_ctas`` caps the grid (default: one CTA per SM); with fewer CTAs than rows,
     each CTA claims several items in turn."""
-    if k.dtype not in _IO_DTYPES or v.dtype != k.dtype or checkpoints.dtype != k.dtype:
+    if k.dtype not in IO_DTYPE_NAMES or v.dtype != k.dtype or checkpoints.dtype != k.dtype:
         raise TypeError("k, v and checkpoints must share a 16-bit dtype")
     if state_in is not None and state_in.dtype not in _STATE_DTYPES:
         raise TypeError(f"state_in must be fp32 or bf16, got {state_in.dtype}")
     if scheduler is None:
         scheduler = torch.zeros(2, dtype=torch.int32, device=k.device)
     if op is None:
-        op = GdnRecompute(_IO_DTYPES[k.dtype], k.shape[-1], v.shape[-1], state_in is not None)
+        op = GdnRecompute(IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1], state_in is not None)
     state_name = None if state_in is None else _STATE_DTYPES[state_in.dtype].__name__
     fn = compile_gdn_recompute(op, state_name)
     workspace, sms = op.work.launch_args(k.device)

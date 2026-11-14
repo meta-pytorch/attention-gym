@@ -77,6 +77,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -153,8 +154,6 @@ TINV_STAGES = 3
 A_STAGES = 3
 CG0_STAGES = 2
 TICKET_STAGES = 2
-KEY_DIMS = (64, 128)
-VALUE_DIMS = (64, 128)
 TINV_SOURCES = ("compute", "gmem")
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16, "fp32": cutlass.Float32}
 _NAMES = {cutlass.Float16: "fp16", cutlass.BFloat16: "bf16", cutlass.Float32: "fp32"}
@@ -236,8 +235,8 @@ class GdnPrefill(WarpSpecialized):
         store_final_state: bool,
         paged_state: bool,
     ):
-        if d_k not in KEY_DIMS or d_v not in VALUE_DIMS:
-            raise ValueError(f"GDN prefill serves d_k in {KEY_DIMS}, d_v in {VALUE_DIMS}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"GDN prefill serves d_k, d_v in {HEAD_DIMS}")
         if tiles_per_head not in (1, 2) or (tiles_per_head == 2 and d_v != 64):
             raise ValueError("the d_v split runs two 64-column tiles per head")
         if paged_state and not (use_initial_state and store_final_state):

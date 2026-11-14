@@ -54,6 +54,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Consumer,
     Instance,
@@ -113,7 +114,6 @@ from .ragged import (
 from .work_tables import check_packed_offsets, emit_chunk_rows
 
 B_T = 64
-KEY_DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 K_STAGES = 4
 ACC_STAGES = 4
@@ -122,8 +122,7 @@ TILE_STAGES = 4  # 2 per compute instance; one stage holds both members' tiles
 TILE_ELEMS = B_T * B_T
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16, "fp32": cutlass.Float32}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
-_BETA_DTYPES = {**_IO_DTYPES, torch.float32: "fp32"}
+_BETA_DTYPES = {**IO_DTYPE_NAMES, torch.float32: "fp32"}
 
 
 def tinv_rows(total_tokens: int, num_seqs: int) -> int:
@@ -188,8 +187,8 @@ class GdnTinv(WarpSpecialized):
     Beta may be fp32 or 16-bit; its loads follow the traced tensor's element type."""
 
     def __init__(self, dtype_name: str, d_k: int):
-        if d_k not in KEY_DIMS:
-            raise ValueError(f"the chunk-factor pass serves d_k in {KEY_DIMS}, got {d_k}")
+        if d_k not in HEAD_DIMS:
+            raise ValueError(f"the chunk-factor pass serves d_k in {HEAD_DIMS}, got {d_k}")
         self.dtype_name, self.d_k = dtype_name, d_k
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         self.smem_plan = SmemPlan()
@@ -784,14 +783,14 @@ def gdn_tinv(
 ) -> None:
     """Fill ``tinv``, ``rows`` and ``row_count`` for packed ``k [T, HK, D]`` and ``[T, H]``
     natural-log ``gate`` / ``beta`` (see the module docstring for the layouts)."""
-    if k.dtype not in _IO_DTYPES or tinv.dtype != k.dtype:
+    if k.dtype not in IO_DTYPE_NAMES or tinv.dtype != k.dtype:
         raise TypeError(f"k and tinv must share a 16-bit dtype, got {k.dtype}/{tinv.dtype}")
     if gate.dtype != torch.float32 or beta.dtype not in _BETA_DTYPES:
         raise TypeError(f"gate must be fp32 and beta fp32/16-bit, got {gate.dtype}/{beta.dtype}")
     heads = gate.shape[1]
     if heads % k.shape[1] or tinv.shape[1:] != (heads, B_T, B_T):
         raise ValueError("tinv must be [rows, heads, 64, 64] with heads a multiple of k heads")
-    op = GdnTinv(_IO_DTYPES[k.dtype], k.shape[-1])
+    op = GdnTinv(IO_DTYPE_NAMES[k.dtype], k.shape[-1])
     fn = compile_gdn_tinv(op, _BETA_DTYPES[beta.dtype])
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)

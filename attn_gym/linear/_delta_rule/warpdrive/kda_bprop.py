@@ -90,6 +90,7 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.arch import inline_ptx
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -179,7 +180,6 @@ from .umma import (
     smem_desc,
 )
 
-DIMS = (64, 128)
 LOG2_E = 1.4426950408889634
 DSTATE_DST = 9  # work-item field: the sequence whose d_initial_state the item stores
 RAW_STAGES = 2
@@ -358,8 +358,8 @@ class KdaBprop(WarpSpecialized):
         use_dstate0: bool,
         num_ctas: int,
     ):
-        if d_k not in DIMS or d_v not in DIMS:
-            raise ValueError(f"the KDA bprop serves d_k, d_v in {DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"the KDA bprop serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if io not in ("fp16", "bf16") or gate not in ("fp32", io):
             raise ValueError(f"io must be fp16/bf16 and the gate fp32 or io, got {io}, {gate}")
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v

@@ -67,6 +67,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Consumer,
     LastEntry,
@@ -116,7 +117,6 @@ from .ragged import (
 from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ss, mma_ts, smem_desc
 
 B_T = 64
-STATE_DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 BOX = 64  # 16-bit elements per 128-byte swizzle row
 BOX_BYTES = B_T * BOX * 2  # one 64 x 64 16-bit box
@@ -131,7 +131,6 @@ WORK_ITEM_FIELDS = 10
 SPIN = "spin"
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 
 
 @dataclass(frozen=True)
@@ -179,9 +178,9 @@ class GdnBpropSummary(WarpSpecialized):
     64 or 128 and fp32 summaries."""
 
     def __init__(self, dtype_name: str, d_k: int, d_v: int):
-        if d_k not in STATE_DIMS or d_v not in STATE_DIMS:
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(
-                f"the GDN bprop summary serves d_k, d_v in {STATE_DIMS}, got {d_k}, {d_v}"
+                f"the GDN bprop summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}"
             )
         self.dtype_name, self.d_k, self.d_v = dtype_name, d_k, d_v
         self.io_dtype = _CUTE_DTYPES[dtype_name]
@@ -1052,7 +1051,7 @@ def gdn_bprop_summary(
 ) -> None:
     """Fill ``state_g`` for the work table (see the module docstring for the layouts); ``tinv``
     holds ``gdn_tinv``'s tiles over the same pieces."""
-    if q.dtype not in _IO_DTYPES or {k.dtype, do.dtype, tinv.dtype} != {q.dtype}:
+    if q.dtype not in IO_DTYPE_NAMES or {k.dtype, do.dtype, tinv.dtype} != {q.dtype}:
         raise TypeError(f"q, k, do and tinv must share a 16-bit dtype, got {q.dtype}/{k.dtype}")
     if state_g.dtype != torch.float32:
         raise TypeError("the bprop summaries are fp32")
@@ -1063,7 +1062,7 @@ def gdn_bprop_summary(
         raise ValueError("heads must match dO and be a multiple of the query and key head counts")
     if not state_g.is_contiguous() or state_g.data_ptr() % 16:
         raise ValueError("the bprop summaries must be contiguous and 16-byte aligned")
-    op = GdnBpropSummary(_IO_DTYPES[q.dtype], q.shape[-1], do.shape[-1])
+    op = GdnBpropSummary(IO_DTYPE_NAMES[q.dtype], q.shape[-1], do.shape[-1])
     fn = compile_gdn_bprop_summary(op)
     workspace, sms = op.work.launch_args(q.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), q.device)

@@ -23,6 +23,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.cute.utils import initialized_cuda_device
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.utils import cdiv
 
 from .. import kda_bprop_summary, kda_summary
@@ -220,13 +221,13 @@ def _reverse_summary(
 
 def _validate(tensors: dict[str, torch.Tensor], cu_seqlens: torch.Tensor, bounds) -> None:
     k = tensors["k"]
-    if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] not in (64, 128):
-        raise ValueError("k must have shape [1, T, H, K] with K in {64, 128}")
+    if k.ndim != 4 or k.shape[0] != 1 or k.shape[-1] not in HEAD_DIMS:
+        raise ValueError(f"k must have shape [1, T, H, K] with K in {HEAD_DIMS}")
     for name in ("q", "v", "d_output"):
         if name in tensors and tensors[name].shape[:3] != k.shape[:3]:
             raise ValueError(f"{name} must match k's token and head extents")
-    if "v" in tensors and tensors["v"].shape[-1] not in (64, 128):
-        raise ValueError("v must have V in {64, 128}")
+    if "v" in tensors and tensors["v"].shape[-1] not in HEAD_DIMS:
+        raise ValueError(f"v must have V in {HEAD_DIMS}")
     if tensors["gate"].shape != k.shape or tensors["beta"].shape != k.shape[:3]:
         raise ValueError("gate and beta must match k's token and head extents")
     if k.dtype not in (torch.float16, torch.bfloat16) or any(
