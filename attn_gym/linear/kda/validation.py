@@ -43,9 +43,8 @@ def resolve_kernel_options(
 ) -> ResolvedKernelOptions:
     """Validate chunk backend options and resolve their defaults."""
     options = resolve_chunk_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name=op_name)
+    # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
     schedule = ScheduleRequest(options.pop("schedule"))
-    if schedule is not ScheduleRequest.AUTO and options["backend"] != "fused":
-        raise ValueError("schedule requires kernel_options['backend']='fused'")
     return ResolvedKernelOptions(**options, schedule=schedule)
 
 

@@ -521,8 +521,11 @@ tokens than the capacity they were captured for. The default static grid launche
 capacity chunk, so a replay at 1/16 of capacity still pays for the empty CTAs; the persistent grid
 strides over only the active work. Below roughly a quarter of capacity active, persistent wins
 (measured 0.1-0.7x the static time on GB200); at full capacity it loses (1.1-2.4x). Outputs are
-bitwise identical. Requires the fused backend and, for packed inputs, the TMA output path (Hopper or
-newer).
+bitwise identical. For packed inputs it requires the TMA output path (Hopper or newer). The
+warpdrive backend accepts every `schedule` value and ignores it: its persistent grids follow the SM
+count and always stride over the active work only, so it needs no option for over-captured graphs.
+Exception: stateful KDA training (an entry state or `output_final_state=True`) still runs the
+fused backward with the `auto` schedule.
 
 ### Fast math and precision
 

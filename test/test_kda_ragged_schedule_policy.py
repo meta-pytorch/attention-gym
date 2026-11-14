@@ -70,25 +70,17 @@ def test_heavy_ragged_kernels_stay_static_under_auto(monkeypatch, shape):
         ({"schedule": "static"}, ScheduleRequest.STATIC),
         ({"backend": "fused", "schedule": "persistent"}, ScheduleRequest.PERSISTENT),
         ({"backend": "warpdrive", "schedule": "auto"}, ScheduleRequest.AUTO),
+        # warpdrive accepts and ignores explicit schedules; its grids stride over active work.
+        ({"backend": "warpdrive", "schedule": "static"}, ScheduleRequest.STATIC),
     ],
 )
 def test_kernel_options_resolve_schedule(kernel_options, expected_schedule):
     assert resolve_kernel_options(kernel_options).schedule is expected_schedule
 
 
-@pytest.mark.parametrize(
-    ("kernel_options", "match"),
-    [
-        ({"schedule": "eager"}, "must be 'auto', 'static', or 'persistent'"),
-        (
-            {"backend": "warpdrive", "schedule": "static"},
-            "requires kernel_options\\['backend'\\]='fused'",
-        ),
-    ],
-)
-def test_kernel_options_reject_invalid_schedule(kernel_options, match):
-    with pytest.raises(ValueError, match=match):
-        resolve_kernel_options(kernel_options)
+def test_kernel_options_reject_invalid_schedule():
+    with pytest.raises(ValueError, match="must be 'auto', 'static', or 'persistent'"):
+        resolve_kernel_options({"schedule": "eager"})
 
 
 @pytest.mark.skipif(

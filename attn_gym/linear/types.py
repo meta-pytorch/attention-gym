@@ -80,8 +80,12 @@ class KernelOptions(SplitOptions, total=False):
     """Set ``"persistent"`` for CUDA graphs whose replays can carry far fewer tokens than the
     captured capacity: the default static grid pays one CTA per capacity chunk even when empty,
     while the persistent grid strides over active work only and wins below ~1/4 of capacity
-    active. Outputs are bitwise identical. Fused backend only; Hopper or newer for packed
-    inputs."""
+    active. Outputs are bitwise identical. Hopper or newer for packed inputs. The warpdrive
+    backend accepts and ignores every value: its persistent grids follow the SM count and
+    always stride over the active work only.
+    Exception: stateful KDA training (an entry state or ``output_final_state=True``) still
+    runs the fused backward with the ``auto`` schedule.
+    """
 
 
 class RecurrentKernelOptions(TuningOptions, total=False):
