@@ -119,6 +119,23 @@ def test_kda_bprop_summary_matches_reference(lens, heads, key_heads, d_k, d_v, d
     _assert_close(_run(*args, d_final=d_final), _reference(*args, d_final=d_final), dtype)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16], ids=["fp16", "bf16"])
+@pytest.mark.parametrize("gate_value", [-1.0, -5.25])
+@pytest.mark.parametrize("seeded", [False, True], ids=["zero-exit", "seeded"])
+def test_kda_bprop_summary_model_range_gates(dtype, gate_value, seeded):
+    """Uniform model-range gates: fp16 forms KK and A from tf32 decay operands and dU from the
+    unscaled cotangent and K_restore, whose fp16 factors would under- and overflow."""
+    lens = (70, 33)
+    q, k, gate, beta, do, cu = _inputs(lens, 2, 2, 128, 128, dtype, seed=4)
+    gate = torch.full_like(gate, gate_value)
+    d_final = None
+    if seeded:
+        gen = torch.Generator(device="cuda").manual_seed(8)
+        d_final = 0.1 * torch.randn(len(lens), 2, 128, 128, device="cuda", generator=gen)
+    args = (q, k, gate, beta, do, cu)
+    _assert_close(_run(*args, d_final=d_final), _reference(*args, d_final=d_final), dtype)
+
+
 @pytest.mark.parametrize("seeded", [False, True], ids=["zero-exit", "seeded"])
 def test_kda_bprop_summary_runs_listed_items_in_any_order(seeded):
     """Rows past ``work_count`` never run, an empty sequence writes its exit cotangent, and a
