@@ -133,25 +133,20 @@ def resolve_chunk_kernel_options(
 # NOTE [Default chunk backend]
 # ``backend="auto"`` (the default) runs warpdrive for CUDA inputs on SM100-family GPUs
 # (``runs_sm100_kernels``: SM100, SM103, and SM107 with CuTeDSL 4.8+) when CuTeDSL (the
-# ``[linear]`` extra) is installed, and the fused backend everywhere else. On those GPUs the calls
-# warpdrive does not serve yet run the fused backend, as listed in docs/linear.md
-# ("Chunk backend selection"): replay-backed paged KDA and paged pools without warpdrive's
-# 16-byte alignment. Each caller reports those as ``fused_only``. The choice depends only on the
-# device, options, and layout, never on sizes, so it is fixed for a compiled or captured call.
+# ``[linear]`` extra) is installed, and the fused backend everywhere else. On SM100-family GPUs warpdrive serves
+# every chunk call (docs/linear.md, "Chunk backend selection"). The choice depends only on the
+# device, never on sizes, so it is fixed for a compiled or captured call.
 # Explicit ``"fused"`` and ``"warpdrive"`` are never rerouted.
-def resolve_chunk_backend(
-    backend: str, q: torch.Tensor, *, fused_only: bool = False
-) -> Literal["fused", "warpdrive"]:
+def resolve_chunk_backend(backend: str, q: torch.Tensor) -> Literal["fused", "warpdrive"]:
     """Resolve a requested chunk backend to the one that runs this call.
 
-    See NOTE [Default chunk backend]: ``"auto"`` selects warpdrive on SM100-family GPUs unless
-    ``fused_only`` reports a call warpdrive does not serve yet.
+    See NOTE [Default chunk backend]: ``"auto"`` selects warpdrive on SM100-family GPUs when
+    CuTeDSL is installed.
     """
     if backend != "auto":
         return backend
     warpdrive = (
-        not fused_only
-        and _CUTEDSL_INSTALLED
+        _CUTEDSL_INSTALLED
         and q.is_cuda
         and runs_sm100_kernels(torch.cuda.get_device_capability(q.device))
     )
