@@ -888,7 +888,7 @@ def test_warpdrive_rejects_mismatched_value_and_beta_shapes() -> None:
 
 
 def _strided_beta(beta: torch.Tensor, layout: str) -> torch.Tensor:
-    """A beta view the public contract accepts but the composed stateful backward ABI rejects."""
+    """A beta view the public contract accepts that is not a compact, aligned buffer."""
     if layout == "misaligned":
         storage = torch.empty(beta.numel() + 1, device=beta.device)
         view = storage[1:].view_as(beta)  # 4-byte base offset
@@ -902,11 +902,8 @@ def _strided_beta(beta: torch.Tensor, layout: str) -> torch.Tensor:
 @pytest.mark.parametrize("layout", ["misaligned", "token_strided"])
 @pytest.mark.parametrize("state", ["initial", "final_only"])
 def test_warpdrive_stateful_backward_accepts_forward_beta_layouts(layout: str, state: str) -> None:
-    """Beta layouts the warpdrive forward accepts must also train through the composed backward.
-
-    The fused stateful backward requires a contiguous, 128-byte-aligned beta; the adapter has
-    to compact the saved beta instead of forwarding the caller's view.
-    """
+    """Beta layouts the warpdrive forward accepts must also train through the stateful backward,
+    with the gradients of a compact beta."""
     from attn_gym.linear import chunk_kda
 
     q, k, value, gate, beta, initial_state, cu_seqlens = _make_inputs(requires_grad=False)
@@ -931,20 +928,41 @@ def test_warpdrive_stateful_backward_accepts_forward_beta_layouts(layout: str, s
         torch.testing.assert_close(actual, expected, atol=0, rtol=0)
 
 
+def test_warpdrive_stateful_backward_accepts_an_expanded_state_cotangent() -> None:
+    """``final_state.sum()`` hands the backward a stride-0 cotangent that TMA cannot read; the
+    gradients must equal those of the materialized cotangent."""
+    from attn_gym.linear import chunk_kda
+
+    q, k, value, gate, beta, initial_state, cu_seqlens = _make_inputs(requires_grad=False)
+    leaves = tuple(t.detach().clone().requires_grad_() for t in (q, k, value, gate, beta))
+    leaves += (initial_state.detach().clone().requires_grad_(),)
+    output, final_state = chunk_kda(
+        *leaves,
+        cu_seqlens=cu_seqlens,
+        output_final_state=True,
+        kernel_options={"backend": "warpdrive"},
+    )
+    d_output = torch.randn_like(output)
+    expanded = torch.ones((), device="cuda").expand(final_state.shape)
+    actual = torch.autograd.grad(
+        (output, final_state), leaves, (d_output, expanded), retain_graph=True
+    )
+    expected = torch.autograd.grad((output, final_state), leaves, (d_output, expanded.clone()))
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(
     os.environ.get("ATTN_GYM_RUN_STRESS_TESTS") != "1",
     reason="set ATTN_GYM_RUN_STRESS_TESTS=1 to run repeated-launch stress tests",
 )
-@pytest.mark.parametrize("path", ["composed", "native"])
-def test_warpdrive_repeated_stateful_backward_with_empty_sequences_stress(path: str) -> None:
+def test_warpdrive_repeated_stateful_backward_with_empty_sequences_stress() -> None:
     """500 stateful backward launches over alternating empty sequences must all complete.
 
-    ``composed`` is what public ``chunk_kda`` with an entry state runs (the fused stateful
-    backward); ``native`` drives the warpdrive BT16 stateful backward op directly, where empty work
-    items must not advance the dstate handshake phase.
+    Empty work items of the warpdrive BT16 stateful backward must not advance the dstate
+    handshake phase.
     """
     from attn_gym.linear import chunk_kda
-    from attn_gym.linear.kda.impl.warpdrive_ops import chunk_warpdrive_packed_bwd_with_state_op
 
     lengths = tuple(0 if index % 2 == 0 else 128 for index in range(29))
     q, k, value, gate, beta = make_kda_test_inputs(
@@ -952,35 +970,30 @@ def test_warpdrive_repeated_stateful_backward_with_empty_sequences_stress(path: 
         heads=16,
         seed=421,
         normalize_qk=True,
-        requires_grad=path == "composed",
+        requires_grad=True,
     )
-    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_(path == "composed")
+    state = (torch.randn(29, 16, D, D, device="cuda") / 100).requires_grad_()
     cu_seqlens = cumulative_sequence_offsets(lengths)
     d_output = torch.randn_like(value)
     d_state = torch.randn_like(state)
     for _ in range(500):
-        if path == "native":
-            grads = chunk_warpdrive_packed_bwd_with_state_op(
-                q, k, value, gate, beta, d_output, cu_seqlens, state, d_state, D**-0.5
-            )
-        else:
-            output, final_state = chunk_kda(
-                q,
-                k,
-                value,
-                gate,
-                beta,
-                state,
-                cu_seqlens=cu_seqlens,
-                output_final_state=True,
-                kernel_options={"backend": "warpdrive"},
-            )
-            assert final_state is not None
-            grads = torch.autograd.grad(
-                (output, final_state),
-                (q, k, value, gate, beta, state),
-                (d_output, d_state),
-            )
+        output, final_state = chunk_kda(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            state,
+            cu_seqlens=cu_seqlens,
+            output_final_state=True,
+            kernel_options={"backend": "warpdrive"},
+        )
+        assert final_state is not None
+        grads = torch.autograd.grad(
+            (output, final_state),
+            (q, k, value, gate, beta, state),
+            (d_output, d_state),
+        )
         torch.cuda.synchronize()
     assert all(torch.isfinite(grad).all() for grad in grads)
 
