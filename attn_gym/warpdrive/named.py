@@ -22,6 +22,7 @@ from cutlass._mlir import ir
 from attn_gym.warpdrive.alias import RoleEvents
 from attn_gym.warpdrive.channels import _named_arrive, _named_sync
 from attn_gym.warpdrive.protocol import ProtocolError, current_trace
+from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 from attn_gym.warpdrive.tracing import wait_range
 
 WARP_SIZE = 32
@@ -186,15 +187,20 @@ class _IndexedBarrier:
 
 
 def _sync(name: str, barrier_id, threads: int, aligned: bool):
-    """Arrive and wait; with wait tracing enabled, inside a ``<name>.sync`` range."""
-    with wait_range(current_trace(), f"{name}.sync"):
+    """Arrive and wait; with wait tracing enabled, inside a ``<name>.sync`` range. A tcgen05
+    role fences both sides (``channels.before_sync``/``after_sync``)."""
+    trace = current_trace()
+    before_sync(trace)
+    with wait_range(trace, f"{name}.sync"):
         if aligned:
             cute.arch.barrier(barrier_id=barrier_id, number_of_threads=threads)
         else:
             _named_sync(barrier_id, threads)
+    after_sync(trace)
 
 
 def _arrive(barrier_id, threads: int, aligned: bool):
+    before_sync(current_trace())
     if aligned:
         cute.arch.barrier_arrive(barrier_id=barrier_id, number_of_threads=threads)
     else:

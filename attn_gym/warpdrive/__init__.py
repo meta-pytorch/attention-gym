@@ -66,6 +66,9 @@ skipped synchronization and math. Keep state explicit; raw CuTeDSL remains avail
   ``cutlass.pipeline`` via ``self.barrier_ptr(name)``. ``@role(..., raw=True)`` reserves
   warps and registers but only dispatches the function. Both still count in SMEM, padding,
   init fences and teardown.
+* ``tcgen05_before_thread_sync()``/``tcgen05_after_thread_sync()`` fence raw signals and
+  waits that order tcgen05 operations across threads; managed ones in roles that issue tcgen05
+  operations emit them.
 * ``unchecked(check, reason=...)`` disables one trace-time check at one site.
   ``describe()`` records the reason, line and suppressed checks.
 * Copies using barrier pointers the layer did not supply stay legal and mark TMA checks
@@ -146,6 +149,7 @@ _EXPORTS = {
         "WorkStream",
     ),
     "attn_gym.warpdrive.storage": ("SmemPlan", "StageView"),
+    "attn_gym.warpdrive.thread_sync": ("tcgen05_after_thread_sync", "tcgen05_before_thread_sync"),
     "attn_gym.warpdrive.tmem": ("TmemPlan",),
 }
 _MODULE_OF = {name: module for module, names in _EXPORTS.items() for name in names}
@@ -204,6 +208,8 @@ __all__ = [
     "named_barrier",
     "plan_from_warpdrive",
     "role",
+    "tcgen05_after_thread_sync",
+    "tcgen05_before_thread_sync",
     "unchecked",
 ]
 

@@ -82,6 +82,7 @@ from attn_gym.warpdrive.storage import (
     allocate,
     stage_extent,
 )
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 from attn_gym.warpdrive.tma import TmaReport, clear_multicast_masks
 from attn_gym.warpdrive.tma import check_role as check_tma
 from attn_gym.warpdrive.tmem import TmemPlan, TmemView
@@ -1391,6 +1392,8 @@ class WarpSpecialized(metaclass=_KernelType):
             )
             self._ws_tmem = tmem
             self._ws_tmem_alloc_role = alloc_role
+            self._ws_tmem_alloc_warp = alloc_warp
+            self._ws_tmem_dealloc_bar = dealloc_bar
             if not clustered:  # a cluster allocates after the cluster sync in run_roles
                 # Only the allocator warp executes tcgen05.alloc (checked inside).
                 tmem.allocate(self.tmem_plan.alloc_cols)
@@ -1651,6 +1654,11 @@ class WarpSpecialized(metaclass=_KernelType):
         trace = RoleTrace(
             name, log, ranges, self.trace_waits, instance=instance, instances=len(unit)
         )
+        trace.tcgen05 = self._issues_tcgen05(r)
+        if trace.tcgen05:
+            # Orders the role's first tcgen05 operation after the CTA sync that published the
+            # TMEM base address and barrier initialization (PTX ISA 9.7.18.6.3).
+            tcgen05_after_thread_sync()
         args = self._role_args(unit, instance, ctx, trace)
         # A role looping over a WorkStream gets one range per work item (WorkCursor); any
         # other role gets one over its whole body.
@@ -1720,8 +1728,24 @@ class WarpSpecialized(metaclass=_KernelType):
                 events.events = [_for_instance(ev, j) for ev in events.events]
             self._ws_role_events.append(events)
 
+    def _issues_tcgen05(self, r: RoleInstance) -> bool:
+        """Whether ``r`` issues tcgen05 operations: it takes ``tmem: Tmem`` (tcgen05.ld/st, or
+        MMAs into TMEM) or signals a channel side as ``Umma``. Its managed synchronization then
+        takes the tcgen05 thread-sync fences (``thread_sync.py``)."""
+        if r.uses_tmem:
+            return True
+        for ch in self._ws_chans.values():
+            for side, bound in (("producer", ch.producers), ("consumer", ch.consumers)):
+                if any(ri is r for ri, _ in bound) and ch.mechanism(side, r.role) is Umma:
+                    return True
+        return False
+
     def _tmem_teardown(self, unit: tuple[RoleInstance, ...]):
-        """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp."""
+        """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp.
+
+        Each user thread orders its tcgen05 operations before the rendezvous
+        (``tcgen05.fence::before_thread_sync``), and the allocator warp orders the dealloc after
+        it (``::after_thread_sync``), as PTX requires across threads (ISA 9.7.18.6.3)."""
         r = unit[0]
         # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
         # peer has no leader-only TMEM roles, so its count is smaller).
@@ -1733,12 +1757,25 @@ class WarpSpecialized(metaclass=_KernelType):
         count = rank_value(threads, self.cluster.rank)
         # Roles reach this from different code sites after per-lane mbarrier spins, so use
         # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
+        tcgen05_before_thread_sync()
         _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
         if self._ws_tmem_alloc_role in unit:
-            ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-            # Only the allocator warp frees (checked inside, so a shared body may call it).
-            # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
-            self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
+            self._free_tmem(self._ws_tmem.retrieve_ptr(cutlass.Float32))
+
+    @cute.jit
+    def _free_tmem(self, ptr):
+        """``tcgen05.dealloc`` from the allocator warp (a shared body may reach this from other
+        warps), fenced after the last synchronization: the teardown rendezvous, or in a pair the
+        allocator warps' dealloc mbarrier, which the peer reaches after its own rendezvous."""
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp == self._ws_tmem_alloc_warp:
+            if cutlass.const_expr(self.cluster.pair):
+                bar = self._ws_tmem_dealloc_bar
+                peer = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) ^ 1
+                cute.arch.mbarrier_arrive(bar, peer)
+                cute.arch.mbarrier_wait(bar, 0)
+            tcgen05_after_thread_sync()
+            cute.arch.dealloc_tmem(ptr, self.tmem_plan.alloc_cols, is_two_cta=self.cluster.pair)
 
     def _set_regs(self, regs):
         if regs is None:

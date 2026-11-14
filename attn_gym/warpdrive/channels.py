@@ -85,6 +85,7 @@ from attn_gym.warpdrive.protocol import (
     user_site,
 )
 from attn_gym.warpdrive.storage import SmemBuffer, StageView, project, stage_extent
+from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 from attn_gym.warpdrive.tma import TmaUse, stage_closed
 from attn_gym.warpdrive.tracing import wait_range
 
@@ -1022,6 +1023,7 @@ class Span(Handle):
             bar = end._empty(self.index) if self._is_producer else end._full(self.index)
             with wait_range(end._trace, f"{end._chan.name}.{op}"):
                 _parity_wait(bar, self.phase, end._chan.wait)
+            after_sync(end._trace)
 
         if_generate(i == 0, wait)
 
@@ -1365,8 +1367,12 @@ class _End:
         return Int32(barriers[0]._allocated_id()) + index, barriers[0].threads
 
     def _named_wait(self, barriers, index, op):
+        """``bar.sync`` on a named channel's slot: an arrival and a wait, so in a tcgen05 role
+        it takes both thread-sync fences."""
+        before_sync(self._trace)
         with wait_range(self._trace, f"{self._chan.name}.{op}"):
             _named_sync(*self._named(barriers, index))
+        after_sync(self._trace)
 
     def _named_arrive(self, barriers, index):
         _named_arrive(*self._named(barriers, index))
@@ -1500,6 +1506,7 @@ class _End:
         fence = chan.fences(side, self._role) if fenced else ()
         if chan.named:
             _fence(fence)
+            before_sync(self._trace)
             self._named_arrive(chan.full_barriers if producer else chan.empty_barriers, index)
             return
         self._arrive(
@@ -1515,6 +1522,7 @@ class _End:
         _fence(fence)
         cluster, targets = self._chan.cluster, self.targets
         if mech is Umma:
+            # A tcgen05.commit performs tcgen05.fence::before_thread_sync for its MMAs itself.
             # Stage reuse assumes tcgen05.commit orders MMA SMEM reads before later generic
             # writes. See docs/warpdrive/guarantees.md, Hardware assumptions.
             #
@@ -1535,8 +1543,10 @@ class _End:
                 else:
                     cute.nvgpu.tcgen05.commit(bar)
         elif mech is Threads:
+            before_sync(self._trace)
             self._thread_arrive(bar)
         elif mech is Warps:
+            before_sync(self._trace)
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 self._thread_arrive(bar)
@@ -1778,6 +1788,7 @@ class _End:
             with wait_range(self._trace, f"{chan.name}.{op}"):
                 bar = self._empty(index) if producer else self._full(index)
                 _wait(bar, phase, ready, chan.wait)
+            after_sync(self._trace)
         return index, phase, label
 
 
@@ -1810,6 +1821,7 @@ class ProducerEnd(_End):
         channel one CTA arms each barrier, once, with the bytes of every CTA's copies that
         complete there, as CUTLASS's ``PipelineTmaUmma`` does."""
         scope = self._chan.scope
+        before_sync(self._trace)  # arming is an arrival
         if not scope.pair:
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(full, scope.tx)
@@ -1841,6 +1853,7 @@ class ProducerEnd(_End):
                 for _ in range(n):
                     cute.arch.mbarrier_wait(self._empty(st.index), st.phase)
                     st.advance()
+        after_sync(self._trace)
 
 
 class ConsumerEnd(_End):
@@ -1920,6 +1933,7 @@ class ConsumerEnd(_End):
         self._trace.record(self._chan.name, "peek", label)
         with wait_range(self._trace, f"{self._chan.name}.peek"):
             _parity_wait(self._full(index), phase, self._chan.wait)
+        after_sync(self._trace)
         preview = Preview(self, index, phase, slot)
         self._rec.previews.append(preview)
         self._trace.opened(preview._life)
@@ -2005,9 +2019,6 @@ def advance_state(state: pipeline.PipelineState, count: int | Int32) -> pipeline
     return state
 
 
-# Channels omit tcgen05 thread-sync fences, relying on execution and compiler
-# ordering. Roles can emit nvvm.tcgen05_fence explicitly; see
-# docs/warpdrive/guarantees.md, Hardware assumptions.
 def _wait(bar, phase, ready, mode: str):
     """Blocking parity wait on ``bar``; with a probe's ``ready``, only if the probe failed."""
     if ready is None:
@@ -2109,12 +2120,14 @@ class _TurnScope:
             e._trace.record(e._ts.name, "turn", e._seat)
             with wait_range(e._trace, f"{e._ts.name}.turn"):
                 cute.arch.mbarrier_wait(e._bars + e._seat, e._phase)
+            after_sync(e._trace)
 
     def __exit__(self, exc_type, exc, tb):
         e = self._end
         e._trace.open_turns.discard(e._ts.name)
         if exc_type is None and e._ts.enabled:
             nxt = (e._seat + 1) % len(e._ts.parties)
+            before_sync(e._trace)
             cute.arch.mbarrier_arrive(e._bars + nxt)
             e._phase = e._phase ^ 1
             e._trace.record(e._ts.name, "pass", nxt)
