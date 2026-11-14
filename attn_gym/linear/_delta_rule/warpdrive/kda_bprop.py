@@ -115,6 +115,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
 from .blockwise_inverse import invert_unit_lower_16x16_fragments
 from .contract import tma_divisibility
@@ -226,9 +227,19 @@ TSIG_COUNTS = (1, 1, 1, 1, 1, 1, 1, 128, 128, 128, 1, 128, 128, 128, 32, 128, 12
 def _wait(bar, phase):
     """Hint-less parity wait written as upstream's loop (``while not try_wait``): ptxas places
     the retry out of line, so a satisfied wait falls through instead of taking a branch over a
-    peeled retry (an instruction-fetch stall on this kernel's 16 warps)."""
+    peeled retry (an instruction-fetch stall on this kernel's 16 warps). Then
+    ``tcgen05.fence::after_thread_sync``: the raw ``tsig`` signals hand TMEM between threads."""
     while not cute.arch.mbarrier_try_wait(bar, phase):
         pass
+    tcgen05_after_thread_sync()
+
+
+@cute.jit
+def before_sync_and_arrive(bar):
+    """One thread's arrival on a raw ``tsig`` signal after ``tcgen05.fence::before_thread_sync``,
+    which orders its completed TMEM accesses before the arrival (PTX ISA 9.7.18.6.3)."""
+    tcgen05_before_thread_sync()
+    cute.arch.mbarrier_arrive(bar)
 
 
 @cute.jit
@@ -842,7 +853,7 @@ class KdaBprop(WarpSpecialized):
         stage = dh.index
         if channel_active:
             sts_f32(params.s_scale + 4 * (stage * d_k + channel), exp_g_last)
-        cute.arch.mbarrier_arrive(tsig + SCALE + stage)
+        before_sync_and_arrive(tsig + SCALE + stage)
 
         # ---- raw Q/K: SMEM -> TMEM ring (channel-major, zero past the sequence end) ---------
         qh = qk_raw.acquire()
@@ -927,7 +938,7 @@ class KdaBprop(WarpSpecialized):
             st_shared_v4(params.s_kinv + off, ki)
             st_shared_v4(params.s_kdecay + off, kd)
         cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(tsig + KDI + stage)
+        before_sync_and_arrive(tsig + KDI + stage)
 
         # ---- Q decay = (scale Q) 2^g --------------------------------------------------------------
         scale = params.scale
@@ -1063,7 +1074,7 @@ class KdaBprop(WarpSpecialized):
                 if cutlass.const_expr(self.use_dstate0):
                     self.store_dstate0(params, geo, tmem, tile, batch, head, n_chunks)
                 if n_chunks > 0:
-                    cute.arch.mbarrier_arrive(tsig + DSTATE0)
+                    before_sync_and_arrive(tsig + DSTATE0)
                 base += n_chunks
                 sched, tile = self.next_tile(sched)
             work.advance()
@@ -1100,7 +1111,7 @@ class KdaBprop(WarpSpecialized):
             ]
             tmem_st("32x32b", lane_base + tmem.cols("dstate_in") + i * 8, words)
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + DSTATE_IN)
+        before_sync_and_arrive(tsig + DSTATE_IN)
         for i in cutlass.range_constexpr(self.d_k // 16):
             words = tmem_ld("32x32b", 8, lane_base + tmem.cols("dstate_in") + i * 8, Int32)
             if row_valid:
@@ -1204,7 +1215,7 @@ class KdaBprop(WarpSpecialized):
         if cutlass.const_expr(wide):
             tmem_st("16x128b", hi_lanes + tmem.cols("yin"), [y_hi[i] for i in range(4)])
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + Y_IN)
+        before_sync_and_arrive(tsig + Y_IN)
 
         # ---- dU accumulator -> fp16 MMA operand ----------------------------------------------
         self.sig_wait("du_acc", tsig + DU_ACC, ph)
@@ -1224,7 +1235,7 @@ class KdaBprop(WarpSpecialized):
                 [fp32_to_fp16(du_hi[2 * r], du_hi[2 * r + 1], dtype=io) for r in range(4)],
             )
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + DU_IN)
+        before_sync_and_arrive(tsig + DU_IN)
 
         # ---- U -> sU ---------------------------------------------------------------------------
         self.sig_wait("u_acc", tsig + U_ACC, ph)
@@ -1244,7 +1255,7 @@ class KdaBprop(WarpSpecialized):
                 trans=True,
             )
         cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(tsig + U_SMEM)
+        before_sync_and_arrive(tsig + U_SMEM)
 
         # ---- dY -> sdY -------------------------------------------------------------------------
         self.sig_wait("dy_acc", tsig + DY_ACC, ph)
@@ -1264,7 +1275,7 @@ class KdaBprop(WarpSpecialized):
                 trans=True,
             )
         cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(tsig + DY_SMEM)
+        before_sync_and_arrive(tsig + DY_SMEM)
 
         # ---- beta dY, -beta dY -> TMEM -------------------------------------------------------
         c0 = lds_f32(s_beta + 4 * ((lane & 3) * 2))
@@ -1293,7 +1304,7 @@ class KdaBprop(WarpSpecialized):
                 [fp32_to_fp16(-bdy_hi[2 * r], -bdy_hi[2 * r + 1], dtype=io) for r in range(4)],
             )
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + NBDY_IN)
+        before_sync_and_arrive(tsig + NBDY_IN)
 
         # ---- dbeta v-term: sum_v dY (V - K S) --------------------------------------------------
         token4 = cute.make_rmem_tensor((4,), Float32)
@@ -1378,7 +1389,7 @@ class KdaBprop(WarpSpecialized):
                     [scaled[j] for j in range(32)],
                 )
             cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(tsig + DSTATE_IN)
+            before_sync_and_arrive(tsig + DSTATE_IN)
             for i in cutlass.range(self.d_k // 32, unroll=1):
                 words = tmem_ld("32x32b", 16, lane_base + tmem.cols("dstate_in") + i * 16, Int32)
                 if row_valid:
@@ -1986,7 +1997,7 @@ class KdaBprop(WarpSpecialized):
                         sts_f32(params.s_betam + 4 * row_lo, -bsum_lo)
                         sts_f32(params.s_betam + 4 * row_hi, -bsum_hi)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.mbarrier_arrive(tsig + DBETA_M)
+                    before_sync_and_arrive(tsig + DBETA_M)
                 base += n_chunks
                 sched, tile = self.next_tile(sched)
             work.advance()

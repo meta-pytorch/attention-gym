@@ -101,6 +101,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum, SmemAllocator
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
 from . import umma
 from .blockwise_inverse import (
@@ -675,6 +676,7 @@ class GdnPrefill(WarpSpecialized):
         tmem.access("cg0", write=True, by="umma")
         stage = issued % KQ_STAGES
         cute.arch.mbarrier_wait(self.barrier_ptr("kq") + stage, (issued // KQ_STAGES) % 2)
+        tcgen05_after_thread_sync()
         self.cg0_gemm(params, stage, cg0_col + ch.index * B_T, member)
         ch.commit()
         return cg0, issued + 1
@@ -1020,8 +1022,10 @@ class GdnPrefill(WarpSpecialized):
     @cute.jit
     def publish_tmem(self, name: str):
         """Raw producer signal of a compute1 -> MMA handoff: every thread completes its TMEM
-        stores, then arrives on the channel's full barrier (128 arrivals)."""
+        accesses and orders them before its arrival on the channel's full barrier (128
+        arrivals)."""
         cute.arch.fence_view_async_tmem_store()
+        tcgen05_before_thread_sync()
         cute.arch.mbarrier_arrive(self.barrier_ptr(name))
 
     @cute.jit

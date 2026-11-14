@@ -98,6 +98,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
 from attn_gym.warpdrive.protocol import current_trace
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 from attn_gym.warpdrive.tracing import wait_range
 
 from .contract import tma_divisibility
@@ -162,11 +163,13 @@ def _wait(bars, phases, name: cutlass.Constexpr[str]):
     i = SIG[name]
     with wait_range(current_trace(), f"{name}.wait"):
         cute.arch.mbarrier_wait(bars + i, Int32((phases >> i) & 1))
+    tcgen05_after_thread_sync()  # every signal hands TMEM between threads
     return phases ^ Int32(1 << i)
 
 
 @cute.jit
-def _arrive(bars, name: cutlass.Constexpr[str]):
+def before_sync_and_arrive(bars, name: cutlass.Constexpr[str]):
+    tcgen05_before_thread_sync()
     cute.arch.mbarrier_arrive(bars + SIG[name])
 
 
@@ -742,7 +745,7 @@ class GdnRecompute(WarpSpecialized):
                     words[half * 16 : half * 16 + 16],
                 )
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "y")
+            before_sync_and_arrive(sig, "y")
             # ---- decayed U -> the KV GEMM operand ------------------------------------
             # The decay factors fill the U GEMM's latency (upstream's schedule).
             last = cs[B_T - 1, 0]
@@ -775,7 +778,7 @@ class GdnRecompute(WarpSpecialized):
                     pack.append(fp32_to_fp16(s0, s1, dtype=io))
                 tmem_st("16x128b", ((lane_base + half * 16) << 16) + du_col, pack)
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "du")
+            before_sync_and_arrive(sig, "du")
             # The V release retains its proxy fence before the TMA ring refills this stage.
             vh.release()
         if n_local > 0:
@@ -796,7 +799,7 @@ class GdnRecompute(WarpSpecialized):
             pack = [fp32_to_fp16(vecs[i][2 * j], vecs[i][2 * j + 1], dtype=io) for j in range(16)]
             tmem_st("32x32b", lane0 + state_in_col + i * 16, pack)
         cute.arch.fence_view_async_tmem_store()
-        _arrive(sig, "state_in")
+        before_sync_and_arrive(sig, "state_in")
         if chunk >= it.write_start:
             row, row_valid = self._state_row(me.tid)
             with ckpt.produce() as h:
