@@ -37,7 +37,8 @@ from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 from .. import gdn_prefill, work_tables
-from ..contract import get_dtype
+from ..contract import get_dtype, paged_state_align
+from ..kda_common import state_align_suffix
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -158,11 +159,13 @@ def _compile_warmup_forward(
     d_v,
     tiles_per_head,
     use_int64_offsets,
+    state_align=16,
 ):
     """Compile the warmup or uncut forward launch for one static configuration (dtypes, gate and
     state flags, split-table geometry, d_v split, device target); every extent is symbolic.
     ``use_int64_offsets`` widens the extents for tensors past the int32 ABI (strides are always
-    int64, as upstream traced them)."""
+    int64, as upstream traced them). ``state_align`` is the state rows' byte alignment
+    (``paged_state_align``)."""
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
 
     def tensor(dtype, rank, align):
@@ -194,6 +197,7 @@ def _compile_warmup_forward(
         tiles_per_head=tiles_per_head,
         paged_state=paged_state,
         has_final_indices=has_final_indices,
+        state_align=state_align,
     )
     flags = (
         num_sms,
@@ -214,6 +218,7 @@ def _compile_warmup_forward(
     name = "gdn_warmup_forward_" + "_".join(str(int(flag)) for flag in flags)
     name += "_split_" + ("none" if split is None else "_".join(str(v) for v in split))
     name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
+    name += state_align_suffix(state_align)
     return compile_tvm_ffi(
         warmup_forward_host,
         split,
@@ -230,8 +235,8 @@ def _compile_warmup_forward(
         tensor(beta_dtype, 2, 16),
         tensor(io_dtype, 3, 16),
         make_cu_seqlens_signature(sym_int(), assumed_align=4),
-        tensor(state_dtype, 4, 16) if use_initial_state else None,
-        tensor(state_dtype, 4, 16) if store_final_state else None,
+        tensor(state_dtype, 4, state_align) if use_initial_state else None,
+        tensor(state_dtype, 4, state_align) if store_final_state else None,
         make_counter_signature(sym_int()) if has_seed_indices else None,
         make_compact_signature_tensor(cutlass.Uint8, (sym_int(),), assumed_align=1)
         if has_initial_state
@@ -315,6 +320,7 @@ def build_warmup_forward(
         int(v.shape[2]),
         int(tiles_per_head),
         use_int64_offsets,
+        paged_state_align(state_in) if paged_state else 16,
     )
     return compiled, facts
 

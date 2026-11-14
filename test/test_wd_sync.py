@@ -268,7 +268,8 @@ def _kda_paged(paged_state: int, tiles_per_head: int, state_dtype=FP32) -> tuple
     return (None, 152, *dtypes, 128, 128, tiles_per_head, tiles_per_head > 1, False, paged_state)
 
 
-# (bundle module, _compile_warmup_forward arguments): the paged prefill states.
+# (bundle module, _compile_warmup_forward arguments[, keyword arguments]): the paged prefill
+# states.
 BUNDLES = [
     ("gdn_warmup_forward", _gdn_paged(True, 1)),
     ("gdn_warmup_forward", _gdn_paged(False, 2)),
@@ -280,6 +281,13 @@ BUNDLES = [
     ("kda_warmup_forward", _kda_paged(2, 1, BF16)),
     ("kda_warmup_forward", _kda_paged(1, 2, BF16)),
     ("kda_warmup_forward", _kda_paged(2, 2, BF16)),
+    # Pools with unaligned rows (NOTE [Unaligned state rows]): realigned state row access.
+    ("gdn_warmup_forward", _gdn_paged(True, 1), {"state_align": 4}),
+    ("gdn_warmup_forward", _gdn_paged(False, 2, BF16), {"state_align": 2}),
+    ("kda_warmup_forward", _kda_paged(2, 1), {"state_align": 4}),
+    ("kda_warmup_forward", _kda_paged(2, 1, BF16), {"state_align": 2}),
+    ("kda_warmup_forward", _kda_paged(2, 2), {"state_align": 4}),
+    ("kda_warmup_forward", _kda_paged(1, 2, BF16), {"state_align": 2}),
 ]
 
 
@@ -409,8 +417,9 @@ def _kernel_id(case) -> str:
 
 
 def _bundle_id(case) -> str:
-    module, args = case
-    return "-".join([module, *(getattr(a, "__name__", str(a)) for a in args)])
+    module, args, *kwargs = case
+    keywords = [f"{name}={value}" for name, value in (kwargs[0] if kwargs else {}).items()]
+    return "-".join([module, *(getattr(a, "__name__", str(a)) for a in args), *keywords])
 
 
 def _unaudited(module: str, op) -> list[str]:
@@ -424,9 +433,9 @@ def _unaudited(module: str, op) -> list[str]:
     return out
 
 
-def _check(tmp_path, build, *args):
+def _check(tmp_path, build, *args, **kwargs):
     with capture_ptx(tmp_path) as out:
-        build.__wrapped__(*args)  # uncached: a cached kernel has no PTX
+        build.__wrapped__(*args, **kwargs)  # uncached: a cached kernel has no PTX
     (path,) = out.glob("*.ptx")
     findings = check_tcgen05_sync(read_ptx(path), teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
     assert not findings, "\n".join(f.describe() for f in findings)
@@ -467,6 +476,6 @@ def test_dropped_audited_fence_fails(requires_blackwell, tmp_path):
 
 @pytest.mark.parametrize("case", BUNDLES, ids=_bundle_id)
 def test_bundle_ptx_is_fenced(requires_blackwell, tmp_path, case):
-    module, args = case
+    module, args, *kwargs = case
     mod = importlib.import_module(f"{PACKAGE}.bundles.{module}")
-    _check(tmp_path, mod._compile_warmup_forward, *args)
+    _check(tmp_path, mod._compile_warmup_forward, *args, **(kwargs[0] if kwargs else {}))

@@ -86,8 +86,6 @@ def kda_forward(
     if paged:
         if initial_state is None or output_final_state or split:
             raise ValueError("paged KDA needs a state pool and no final state or split schedule")
-        if initial_state.data_ptr() % 16:
-            raise ValueError("the paged state pool must be 16-byte aligned")
         initial_state = initial_state.detach()
     else:
         initial_state = None if initial_state is None else aligned(initial_state.detach())

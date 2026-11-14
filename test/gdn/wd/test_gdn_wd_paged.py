@@ -119,7 +119,7 @@ def test_warpdrive_paged_dense_batch_without_mask_seeds_every_slot(
 
 
 @pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
-def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride(pool_dtype: torch.dtype) -> None:
+def test_warpdrive_paged_rejects_grad_and_unsupported_pool_dtype(pool_dtype: torch.dtype) -> None:
     q, k, value, gate, beta, _state, cu_seqlens = make_gdn_test_inputs(
         (64,), key_heads=1, value_heads=1, seed=1
     )
@@ -133,21 +133,6 @@ def test_warpdrive_paged_rejects_grad_and_misaligned_slot_stride(pool_dtype: tor
             gate,
             beta,
             pool,
-            state_indices,
-            cu_seqlens=cu_seqlens,
-            kernel_options=_WARPDRIVE,
-        )
-    _storage, misaligned = strided_state_pool(
-        2, 1, 128, 128, prefix=0, suffix=17, dtype=pool_dtype
-    )
-    with torch.no_grad(), pytest.raises(TypeError, match="16-byte aligned"):
-        paged_chunk_gdn(
-            q.detach(),
-            k,
-            value,
-            gate,
-            beta,
-            misaligned,
             state_indices,
             cu_seqlens=cu_seqlens,
             kernel_options=_WARPDRIVE,

@@ -45,13 +45,14 @@ from ..contract import (
     get_dtype,
     memoize_launch_check,
     op_dtype_name,
+    paged_state_align,
     validate_cuda_tensors,
     validate_kda_forward_operands,
     validate_kda_forward_states,
     validate_tensor,
     validate_work_table,
 )
-from ..kda_common import B_T
+from ..kda_common import B_T, state_align_suffix
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -229,11 +230,12 @@ def _compile_warmup_forward(
     use_int64_offsets: bool,
     paged_state: int = 0,
     fastmath: bool = True,
+    state_align: int = 16,
 ):
     """Compile the warmup / uncut forward host for one static config over fake tensors that repeat
     the standalone builds' placeholders; absent tensors have a None dtype. ``paged_state`` is 0
     without paged routing, 1 with per-sequence routes and 2 with routes plus the fresh-slot byte
-    mask."""
+    mask; ``state_align`` is the state rows' byte alignment (``paged_state_align``)."""
     i64 = use_int64_offsets
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
     states = (state_in_dtype is not None, state_out_dtype is not None, paged_state, num_sms)
@@ -242,11 +244,20 @@ def _compile_warmup_forward(
     if prep:
         if d_v // tiles_per_head != kda_prep_prefill.D_V:
             raise ValueError("the KDA prep prefill runs 64-column value tiles")
-        prefill_op = kda_prep_prefill.KdaPrepPrefill(io, d_k, tiles_per_head, *states)
+        prefill_op = kda_prep_prefill.KdaPrepPrefill(
+            io, d_k, tiles_per_head, *states, state_align=state_align
+        )
         prep_op = kda_prep.KdaPrep(io, gate_name, d_k, num_sms, fastmath)
     else:
         prefill_op = kda_prefill.KdaPrefill(
-            io, gate_name, d_k, d_v // tiles_per_head, tiles_per_head, *states, fastmath
+            io,
+            gate_name,
+            d_k,
+            d_v // tiles_per_head,
+            tiles_per_head,
+            *states,
+            fastmath,
+            state_align=state_align,
         )
     if prep:
         prep_signatures = [
@@ -284,7 +295,7 @@ def _compile_warmup_forward(
     name = (
         "kda_warmup_forward_"
         + "_".join(str(int(flag)) for flag in static)
-        + f"_split_{split_tag}_{dtype_names}"
+        + f"_split_{split_tag}_{dtype_names}{state_align_suffix(state_align)}"
         + ("" if fastmath else "_nofm")
     )
     return compile_tvm_ffi(
@@ -307,8 +318,8 @@ def _compile_warmup_forward(
         _dynamic(
             cu_seqlens_dtype, 1, 8 if cu_seqlens_dtype is cutlass.Int64 else 4, i64
         ),  # cu_seqlens
-        _dynamic(state_in_dtype, 4, 16, i64) if state_in_dtype is not None else None,
-        _dynamic(state_out_dtype, 4, 16, i64) if state_out_dtype is not None else None,
+        _dynamic(state_in_dtype, 4, state_align, i64) if state_in_dtype is not None else None,
+        _dynamic(state_out_dtype, 4, state_align, i64) if state_out_dtype is not None else None,
         *(
             make_paged_route_signatures(cute.sym_int(), has_initial_state=paged_state == 2)
             if paged_state
@@ -368,13 +379,16 @@ def _validate_launch(
     if b_t != B_T:
         raise ValueError(f"the KDA forward runs b_t={B_T} chunks, got {b_t}")
     tokens, heads_out, num_seqs = validate_kda_forward_operands(q, k, v, gate, beta, o, cu_seqlens)
+    paged = state_indices is not None
     validate_kda_forward_states(
         q,
         v,
         heads_out,
         num_seqs,
-        state_in=(state_in, state_indices is not None),
-        state_out=(state_out, state_indices is not None),
+        # The prefills realign a paged pool's unaligned rows (NOTE [Unaligned state rows]).
+        align=state_in.element_size() if paged else 16,
+        state_in=(state_in, paged),
+        state_out=(state_out, paged),
     )
     validate_cuda_tensors(
         q,
@@ -397,7 +411,7 @@ def _validate_launch(
         )
     if n_tiles != num_seqs * heads_out * tiles_per_head:
         raise ValueError("n_tiles must equal sequences x output heads x tiles_per_head")
-    if state_indices is not None:
+    if paged:
         validate_tensor(
             "state_indices", state_indices, (num_seqs,), ("int32",), align=4, compact=True
         )
@@ -591,6 +605,7 @@ def build_warmup_forward(
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
     paged_state = 0 if state_indices is None else 1 + (has_initial_state is not None)
+    state_align = 16 if state_indices is None else paged_state_align(state_in)
     use_int64_offsets = requires_int64_abi(*tensors)
     compiled = _compile_warmup_forward.by_args(
         None if facts is None else facts.static,
@@ -608,6 +623,7 @@ def build_warmup_forward(
         use_int64_offsets,
         paged_state,
         bool(fastmath),
+        state_align,
     )
     return compiled, facts
 

@@ -58,9 +58,10 @@ def strided_state_pool(
     whose slots are separated by padding, matching how serving engines carve recurrent state
     out of larger per-slot pages. Keep the storage alive while the view is in use.
 
-    The default ``prefix`` deliberately misaligns the pool base to stress the Triton paths,
-    which tolerate arbitrary element offsets. CuTe backends declare ``assumed_align=16`` on
-    the pool pointer, so their tests must pass ``prefix=0`` to keep the base 16-byte aligned.
+    The default ``prefix`` deliberately misaligns the pool base (and, for BF16, the default
+    ``suffix`` the slot stride) to exercise every backend's unaligned state rows. Pass
+    ``prefix=0`` and a suffix that keeps the slot stride a multiple of 16 bytes for 16-byte
+    aligned rows.
     """
     state_elements = heads * key_dim * value_dim
     storage = torch.randn(num_slots, prefix + state_elements + suffix, device="cuda", dtype=dtype)

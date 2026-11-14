@@ -114,6 +114,7 @@ from .blockwise_inverse import (
     blockwise_32x32_to_64x64,
     invert_diagonal_8x8,
 )
+from .kda_common import load_state_16, state_align_suffix, store_state_32
 from .ptx import (
     cp_async_4b_zfill,
     f16x2_to_f32,
@@ -220,7 +221,8 @@ class GdnPrefill(WarpSpecialized):
     """Shared roles and launch of the two GDN prefill variants (see the module docstring).
 
     ``d_v`` is one tile's value width: ``tiles_per_head`` 2 runs every head as two 64-column
-    tiles (the d_v split)."""
+    tiles (the d_v split). ``state_align`` is the byte alignment of every state row: below 16
+    only for a paged pool with unaligned rows (NOTE [Unaligned state rows] in kda_common)."""
 
     tinv_source = ""
 
@@ -234,6 +236,7 @@ class GdnPrefill(WarpSpecialized):
         use_initial_state: bool,
         store_final_state: bool,
         paged_state: bool,
+        state_align: int = 16,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"GDN prefill serves d_k, d_v in {HEAD_DIMS}")
@@ -245,6 +248,7 @@ class GdnPrefill(WarpSpecialized):
         self.d_k, self.d_v, self.tiles_per_head = d_k, d_v, tiles_per_head
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         self.paged_state = paged_state
+        self.state_align = state_align
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         compute = self.tinv_source == "compute"
         plan = self.smem_plan = SmemPlan()
@@ -322,7 +326,7 @@ class GdnPrefill(WarpSpecialized):
         )
         return (
             f"wd_gdn_prefill_{self.tinv_source}_{self.dtype_name}_dk{self.d_k}_dv{self.d_v}"
-            f"x{self.tiles_per_head}_{flags or 'n'}"
+            f"x{self.tiles_per_head}_{flags or 'n'}{state_align_suffix(self.state_align)}"
         )
 
     def tma_slot_rows(self, heads: int) -> int:
@@ -1046,20 +1050,26 @@ class GdnPrefill(WarpSpecialized):
             base = src_t[row, None, head_o, seq].iterator.toint()
             for i in cutlass.range_constexpr(self.d_k // 32):
                 words = []
-                for gi in cutlass.range_constexpr(32 // vw):
-                    chunk = cute.make_rmem_tensor((vw,), elem)
-                    src = cute.make_tensor(
-                        cute.make_ptr(
-                            elem,
-                            base + (i * 32 + gi * vw) * (elem.width // 8),
-                            cute.AddressSpace.gmem,
-                            assumed_align=16,
-                        ),
-                        cute.make_layout(vw),
-                    )
-                    cute.autovec_copy(src, chunk)
-                    for t in cutlass.range_constexpr(vw):
-                        words.append(chunk[t].to(Float32))
+                if cutlass.const_expr(self.state_align < 16):
+                    for half in cutlass.range_constexpr(2):
+                        words += load_state_16(
+                            base + (i * 32 + half * 16) * (elem.width // 8), elem, self.state_align
+                        )
+                else:
+                    for gi in cutlass.range_constexpr(32 // vw):
+                        chunk = cute.make_rmem_tensor((vw,), elem)
+                        src = cute.make_tensor(
+                            cute.make_ptr(
+                                elem,
+                                base + (i * 32 + gi * vw) * (elem.width // 8),
+                                cute.AddressSpace.gmem,
+                                assumed_align=16,
+                            ),
+                            cute.make_layout(vw),
+                        )
+                        cute.autovec_copy(src, chunk)
+                        for t in cutlass.range_constexpr(vw):
+                            words.append(chunk[t].to(Float32))
                 tmem_st("32x32b", taddr + i * 32, words)
             cute.arch.fence_view_async_tmem_store()
         else:
@@ -1070,14 +1080,18 @@ class GdnPrefill(WarpSpecialized):
 
     @cute.jit
     def store_state(self, params: PrefillParams, row_valid, row, head_o, seq, taddr):
-        """Final S^T row ``row`` from TMEM to ``state_out`` (16-byte vectors)."""
+        """Final S^T row ``row`` from TMEM to ``state_out`` (16-byte vectors, realigned in
+        registers below 16-byte ``state_align``)."""
         dst_t = params.state_out
         out = dst_t.element_type
         vw = 16 // (out.width // 8)
         base = dst_t[row, None, head_o, seq].iterator.toint()
         for i in cutlass.range_constexpr(self.d_k // 32):
             vals = tmem_ld("32x32b", 32, taddr + i * 32)
-            if row_valid:
+            if cutlass.const_expr(self.state_align < 16):
+                if row_valid:
+                    store_state_32(base, i * 32 * (out.width // 8), vals, out, self.state_align)
+            elif row_valid:
                 for gi in cutlass.range_constexpr(32 // vw):
                     frag = cute.make_rmem_tensor((vw,), out)
                     for t in cutlass.range_constexpr(vw):
@@ -2071,6 +2085,7 @@ def bundle_hook(
     tiles_per_head: int = 1,
     paged_state: bool = False,
     has_final_indices: bool = False,
+    state_align: int = 16,
 ) -> tuple[GdnPrefill, int]:
     """``(op, num_sm)`` constexpr for the launch bundles: ``op.launch(..., Int32(num_sm),
     stream)`` inside their ``@cute.jit`` host. Rejects what this kernel does not implement:
@@ -2094,6 +2109,7 @@ def bundle_hook(
         use_initial_state,
         store_final_state,
         paged_state,
+        state_align,
     )
     return op, num_sm
 
