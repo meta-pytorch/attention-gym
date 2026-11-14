@@ -53,6 +53,9 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
+    BEFORE_FENCE_COVERED,
+    BOTH_FENCES_COVERED,
     Barriers,
     Consumer,
     Local,
@@ -320,8 +323,11 @@ class KdaPrepPrefill(WarpSpecialized):
         )
 
     @cute.jit
-    def next_tile(self, sched):
-        with sched.consume() as h:
+    def next_tile(self, sched, skip_fence=None):
+        """The next tile of the item list; ``skip_fence`` as for the consume (its reason is
+        ``AFTER_FENCE_COVERED``/``BEFORE_FENCE_COVERED``)."""
+        reason = BEFORE_FENCE_COVERED if skip_fence == "before" else AFTER_FENCE_COVERED
+        with sched.consume(skip_fence=skip_fence, reason=reason) as h:
             tile = h.data[0]
         return sched, tile
 
@@ -501,9 +507,9 @@ class KdaPrepPrefill(WarpSpecialized):
                         tmem_st("16x256b", state_col, scaled)
                         cute.arch.fence_view_async_tmem_store()
                     warp_arrive(tstate + UIN)  # the left half is decayed (with CG2's Y operand)
-                    rh.release()
+                    rh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
                     cum += 1
-                sched, tile = self.next_tile(sched)
+                sched, tile = self.next_tile(sched, skip_fence="before")
             work.advance()
         return raw, sched, work
 
@@ -540,7 +546,7 @@ class KdaPrepPrefill(WarpSpecialized):
                     batch, params.state_indices, params.has_initial_state
                 )
                 for _ in cutlass.range(write_end - compute_start, unroll=1):
-                    oh = o_smem.acquire()
+                    oh = o_smem.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     oh.access(write=True, by="threads")
                     oa = o_acc.wait()
                     acc = tmem_ld("16x256b", 2, qs_col + oa.index * B_T)
@@ -554,7 +560,7 @@ class KdaPrepPrefill(WarpSpecialized):
                         words.append(fp32_to_fp16(a0, a1, dtype=self.io_dtype))
                     stmatrix(params.s_o + oh.index * (B_T * D_V * 2) + 2 * ov, words, trans=True)
                     oh.commit()
-                    oa.release()
+                    oa.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
                 sched, tile = self.next_tile(sched)
             work.advance()
         return o_acc, o_smem, sched, work
@@ -635,12 +641,12 @@ class KdaPrepPrefill(WarpSpecialized):
                     )
                 if n_local > 0:
                     with self.trace_region("sacc_r.wait"):
-                        spin_wait(
-                            tstate + SACC_R + (n_upd & 3), (n_upd >> 2) & 1
-                        )  # the last update
+                        # The last update; the ODONE wait's fence orders the final state loads.
+                        spin_wait(tstate + SACC_R + (n_upd & 3), (n_upd >> 2) & 1, fence=False)
                     n_upd += 1
                     with self.trace_region("odone.wait"):  # the last O GEMM read the Y operand
-                        spin_wait(tstate + ODONE, (n_upd - 1) & 1)
+                        # Only the final state store accesses TMEM before the next fenced wait.
+                        spin_wait(tstate + ODONE, (n_upd - 1) & 1, fence=self.store_final_state)
                 if cutlass.const_expr(self.store_final_state):
                     self.final_state(
                         params,
@@ -704,7 +710,7 @@ class KdaPrepPrefill(WarpSpecialized):
         tmem_st("16x128b", cols["uin"], y)
         cute.arch.fence_view_async_tmem_store()
         warp_arrive(tstate + UIN)
-        rh.release()
+        rh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return raw, n_ks
 
     @cute.jit
@@ -763,7 +769,7 @@ class KdaPrepPrefill(WarpSpecialized):
         _l, cols, _ov, pack_col, _vd = geo
         io = self.io_dtype
         d_k = self.d_k
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
         rh.access("V", read=True, by="threads")
         rh.access("Diag", read=True, by="threads")
         s_diag = params.s_diag + rh.index * (d_k * 4)
@@ -959,7 +965,7 @@ class KdaPrepPrefill(WarpSpecialized):
                     seeded = compute_start == 0
                 for local in cutlass.range(n_local, unroll=1):
                     have_state = local > 0 or seeded
-                    kh = rec.wait()
+                    kh = rec.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     for name in ("Kdecay", "Qdecay", "T", "A"):
                         kh.access(name, read=True, by="umma")
                     stage = kh.index * stage_bytes
@@ -969,7 +975,7 @@ class KdaPrepPrefill(WarpSpecialized):
                     # and QS under one have_state branch (two made ptxas wrap the QS MMAs in
                     # per-lane ELECT loops). Each descriptor is built next to its GEMM: built
                     # together, they pushed the channel state out of uniform registers.
-                    oh = o_acc.acquire()
+                    oh = o_acc.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     qs = qs_col + oh.index * B_T
                     if have_state:
                         # ---- KS = S k_decay^T: the left half of S lands first --------------

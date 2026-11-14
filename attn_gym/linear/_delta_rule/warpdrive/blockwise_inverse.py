@@ -121,12 +121,20 @@ def blockwise_16x16_to_32x32(
 
 @cute.jit
 def blockwise_32x32_to_64x64(
-    tile, band, lane, barrier, b_t: cutlass.Constexpr[int], dtype: cutlass.Constexpr
+    tile,
+    band,
+    lane,
+    barrier,
+    b_t: cutlass.Constexpr[int],
+    dtype: cutlass.Constexpr,
+    skip_fence=None,
+    reason=None,
 ):
     """Off-diagonal correction of the 64x64 tile (two warps, one 16-row band each).
 
     Both bands read the raw C block before either stores, so they meet on ``barrier`` (a
-    ``NamedBarrier`` over the compute group) first."""
+    ``NamedBarrier`` over the compute group) first; ``skip_fence``/``reason`` pass to that sync
+    (the correction itself issues no tcgen05 operation)."""
     lane_row = lane % 16
     lane_col = (lane // 16) * 8
     row_d_inv = 32 + band * 16 + lane_row
@@ -172,7 +180,7 @@ def blockwise_32x32_to_64x64(
         )
     o_pack = [fp32_to_fp16(o_regs[2 * j], o_regs[2 * j + 1], dtype=dtype) for j in range(8)]
 
-    barrier.sync(aligned=True)
+    barrier.sync(aligned=True, skip_fence=skip_fence, reason=reason)
     stmatrix(_addr(tile, row_d_inv * b_t + swizzle_xor_128b(row_d_inv, lane_col)), o_pack[0:4])
     stmatrix(
         _addr(tile, row_d_inv * b_t + swizzle_xor_128b(row_d_inv, 16 + lane_col)), o_pack[4:8]

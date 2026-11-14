@@ -68,7 +68,8 @@ skipped synchronization and math. Keep state explicit; raw CuTeDSL remains avail
   init fences and teardown.
 * ``tcgen05_before_thread_sync()``/``tcgen05_after_thread_sync()`` fence raw signals and
   waits that order tcgen05 operations across threads; managed ones in roles that issue tcgen05
-  operations emit them.
+  operations emit them. ``skip_fence=..., reason=...`` on a managed wait or signal drops one
+  that another fence provides (``AFTER_FENCE_COVERED`` and the like).
 * ``unchecked(check, reason=...)`` disables one trace-time check at one site.
   ``describe()`` records the reason, line and suppressed checks.
 * Copies using barrier pointers the layer did not supply stay legal and mark TMA checks
@@ -149,12 +150,21 @@ _EXPORTS = {
         "WorkStream",
     ),
     "attn_gym.warpdrive.storage": ("SmemPlan", "StageView"),
-    "attn_gym.warpdrive.thread_sync": ("tcgen05_after_thread_sync", "tcgen05_before_thread_sync"),
+    "attn_gym.warpdrive.thread_sync": (
+        "AFTER_FENCE_COVERED",
+        "BEFORE_FENCE_COVERED",
+        "BOTH_FENCES_COVERED",
+        "tcgen05_after_thread_sync",
+        "tcgen05_before_thread_sync",
+    ),
     "attn_gym.warpdrive.tmem": ("TmemPlan",),
 }
 _MODULE_OF = {name: module for module, names in _EXPORTS.items() for name in names}
 
 __all__ = [
+    "AFTER_FENCE_COVERED",
+    "BEFORE_FENCE_COVERED",
+    "BOTH_FENCES_COVERED",
     "AtomicPersistent",
     "Barriers",
     "BoundWork",

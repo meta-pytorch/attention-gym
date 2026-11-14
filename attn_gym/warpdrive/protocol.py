@@ -48,8 +48,41 @@ class OptOut:
         return f"unchecked {self.check} @ {self.site}: {who}{self.reason!r} -> {what}"
 
 
+# What a managed synchronization's ``skip_fence=`` may name: the tcgen05 thread-sync fence before
+# its arrival, the one after its wait, or both (thread_sync.py).
+FENCE_SKIPS = ("before", "after", "both")
+
+
+@dataclass
+class FenceSkip:
+    """A per-call opt-out of automatic tcgen05 thread-sync work, with its reason, site and the
+    instructions it suppressed. ``skips`` holds ``"before"``/``"after"`` (thread-sync fences).
+    The synchronization itself, completion waits and every check stay."""
+
+    skips: tuple[str, ...]
+    reason: str
+    site: str
+    op: str
+    role: str | None = None
+    suppressed: list = field(default_factory=list)
+
+    def covers(self, kind: str) -> bool:
+        return kind in self.skips
+
+    def suppress(self, kind: str, role: str):
+        self.role = self.role or role
+        self.suppressed.append(kind)
+
+    def describe(self) -> str:
+        """Two lines: what was skipped where, then the reason (kept apart so neither runs long)."""
+        what = ", ".join(sorted(set(self.suppressed))) or "nothing (not a tcgen05 role?)"
+        who = f"{self.role}: " if self.role else ""
+        skips = "+".join(self.skips)
+        return f"skip {skips} @ {self.site} ({self.op}): {who}skipped {what}\n  {self.reason!r}"
+
+
 _ACTIVE: list[OptOut] = []  # innermost last; tracing is single-threaded
-_SEEN: list[OptOut] = []  # every opt-out entered since the last take_opt_outs()
+_SEEN: list[OptOut | FenceSkip] = []  # every opt-out entered since the last take_opt_outs()
 _ROLE: list = []  # the RoleTrace of the role being traced (alias.py's ordering wrappers)
 
 
@@ -89,11 +122,30 @@ def unchecked(check: str, *, reason: str):
         _ACTIVE.remove(opt)
 
 
+def fence_skip(skip_fence: str | None, reason: str | None, op: str, allowed=FENCE_SKIPS):
+    """The ``FenceSkip`` of one managed synchronization's ``skip_fence=..., reason=...``
+    keywords, or None for ``skip_fence=None`` (a reason alone is ignored, so a call can skip
+    conditionally). ``allowed``: the fences ``op`` emits."""
+    if skip_fence is None:
+        return None
+    if skip_fence not in allowed:
+        raise ValueError(f"{op}: skip_fence={skip_fence!r}; one of {allowed}")
+    return _skip(("before", "after") if skip_fence == "both" else (skip_fence,), reason, op)
+
+
+def _skip(skips: tuple[str, ...], reason, op: str) -> FenceSkip:
+    if not isinstance(reason, str) or not reason.strip():
+        raise ValueError(f"{op}: a skip needs a non-empty reason")
+    skip = FenceSkip(skips, reason, user_site(), op)
+    _SEEN.append(skip)
+    return skip
+
+
 def active_opt_out(check: str) -> OptOut | None:
     return next((o for o in reversed(_ACTIVE) if o.check == check), None)
 
 
-def take_opt_outs() -> list[OptOut]:
+def take_opt_outs() -> list[OptOut | FenceSkip]:
     """Opt-outs entered since the last call (the kernel collects them once per trace)."""
     seen = list(_SEEN)
     _SEEN.clear()

@@ -318,14 +318,24 @@ class PersistentGemm(WarpSpecialized):
                 cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
                 cute.arch.fence_view_async_shared()  # st.shared -> TMA store
                 # All epilogue threads reach both syncs convergently, allowing aligned=True.
-                self.epi_sync.sync(aligned=True)
+                # Nothing between them touches TMEM: the first sync's before fence orders this
+                # subtile's loads for both, and the second's after fence orders the next loads.
+                self.epi_sync.sync(
+                    aligned=True,
+                    skip_fence="after",
+                    reason="no tcgen05 op before the next sync, whose after fence covers it",
+                )
                 if warp == 0:
                     cute.copy(params.tma_c, bSG_sC[None, buf], dst[None, i])
                     cute.arch.cp_async_bulk_commit_group()
                     # Buffer `buf` is rewritten c_stages subtiles later; keep at most
                     # c_stages - 1 stores still reading SMEM.
                     cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
-                self.epi_sync.sync(aligned=True)
+                self.epi_sync.sync(
+                    aligned=True,
+                    skip_fence="before",
+                    reason="no tcgen05 op since the previous sync's before fence",
+                )
             if cutlass.const_expr(not self.early_release):
                 a.release()
             if cutlass.const_expr(rotate):

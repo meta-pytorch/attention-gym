@@ -165,6 +165,9 @@ What the layer supplies, checks and leaves to you:
     Raw accessors do not validate pointer bounds or ownership; restoring old `end.state`
     can silently break the protocol.
 
+    `skip_fence=...` drops a redundant `tcgen05` thread-sync fence
+    ([thread-sync](#thread-sync)); it needs a reason and changes no check.
+
     `unchecked(check, reason=...)` accepts exactly `"tma"`, `"fence"` and `"liveness"`.
     Respectively, it excludes copies through barrier pointers obtained inside the block,
     annotated accesses from the fence check, or channel/barrier ops from liveness (making the
@@ -195,7 +198,19 @@ What the layer supplies, checks and leaves to you:
     `tcgen05.dealloc`. Raw waits and signals (`Barriers`, external sides, barrier pointers,
     native named barriers) need `tcgen05_before_thread_sync()`/`tcgen05_after_thread_sync()`
     by hand ([dropping down](dropping-down.md#tcgen05-thread-sync-fences-on-raw-synchronization)).
-    `ptx_check.check_tcgen05_sync` checks every PTX path of a compiled kernel for both.
+    With ptxas on GB300 each fence measured as a stall, needed or not. A fence is redundant
+    where another of its kind already provides its ordering on every path: a before fence
+    orders the thread's earlier `tcgen05` operations before all its later synchronizations,
+    an after fence its later operations after all earlier ones. A managed wait or signal opts
+    out of such a fence with `skip_fence="before"|"after"|"both"` and `reason=...`
+    (`AFTER_FENCE_COVERED`, `BEFORE_FENCE_COVERED`, `BOTH_FENCES_COVERED`); on `acquire`,
+    `wait` or `span` it also covers the handle's closing signal. The synchronization, the
+    channel's declared fences and every check stay. `describe()` lists each skip with its
+    reason, site and the instructions it dropped; the layer does not prove the skip safe.
+    `ptx_check.check_tcgen05_sync` checks every
+    intraprocedural PTX path of a compiled kernel for both fences and the teardown drain; it
+    counts a guarded instruction as possibly skipped, rejects calls, and does not check in-loop
+    TMEM completion between threads.
 
     Historical cost ([PR #883](https://github.com/meta-pytorch/attention-gym/pull/883)): making
     `tcgen05` ordering across managed thread synchronization explicit constrains compiler
