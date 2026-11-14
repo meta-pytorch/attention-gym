@@ -212,9 +212,9 @@ def test_explicit_backends_are_never_rerouted(monkeypatch, dispatched, capabilit
     _run_gdn(kernel_options=fused)
     _run_paged_kda(prefix=1, kernel_options=warpdrive)
     _run_gdn(kernel_options=warpdrive)
-    assert dispatched == ["fused", "fused", "warpdrive", "warpdrive"]
-    with pytest.raises(ValueError, match="paged chunk replay requires"):
-        _run_paged_kda(replay=True, kernel_options=warpdrive)
+    _run_paged_kda(replay=True, kernel_options=fused)
+    _run_paged_kda(replay=True, kernel_options=warpdrive)
+    assert dispatched == ["fused", "fused", "warpdrive", "warpdrive", "fused", "warpdrive"]
 
 
 needs_warpdrive = pytest.mark.skipif(
