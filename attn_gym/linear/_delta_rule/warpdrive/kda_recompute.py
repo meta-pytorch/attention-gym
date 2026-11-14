@@ -212,15 +212,26 @@ class KdaRecomputeParams:
 class KdaRecompute(WarpSpecialized):
     """Warpdrive KDA checkpoint-series recompute for ``io`` fp16/bf16 operands, an fp32 or ``io``
     gate and ``d_k, d_v`` in {64, 128}; the initial state dtype (fp32 or bf16) follows the traced
-    tensor."""
+    tensor.
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
-    def __init__(self, io: str, gate: str, d_k: int, d_v: int, use_initial_state: bool, num_ctas):
+    def __init__(
+        self,
+        io: str,
+        gate: str,
+        d_k: int,
+        d_v: int,
+        use_initial_state: bool,
+        num_ctas,
+        fastmath: bool = True,
+    ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA recompute serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
         self.use_initial_state, self.num_ctas = use_initial_state, num_ctas
+        self.fastmath = fastmath
         # One cg0 body for both instances is 1% faster at d_k = 128 (8x4096 H32: 559 vs 565 us)
         # but 2.5% slower at d_k = 64 (2x8192 H64: 369 vs 360 us).
         self.roles = {"cg0": RoleConfig(CG0_WARPS, regs=CG0_REGS, shared_body=d_k == 128)}
@@ -339,7 +350,8 @@ class KdaRecompute(WarpSpecialized):
 
     def get_name(self) -> str:
         init = "_init" if self.use_initial_state else ""
-        return f"wd_kda_recompute_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}{init}"
+        name = f"wd_kda_recompute_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}{init}"
+        return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
 
@@ -673,7 +685,7 @@ class KdaRecompute(WarpSpecialized):
             g[2 * pair + 1] = p1
             acc = p1
         for row in cutlass.range_constexpr(B_T):
-            g[row] = cute.math.exp2(g[row], fastmath=True)
+            g[row] = cute.math.exp2(g[row], fastmath=self.fastmath)
         ex_stage = c % self.ex_stages  # == rh.index for an fp32 gate
         if cutlass.const_expr(self.gate == "fp32"):
             s_ex = s_gate  # in place over this raw gate stage
@@ -739,8 +751,8 @@ class KdaRecompute(WarpSpecialized):
                 r0 = half * 8 + 2 * p
                 kd0, kd1 = fmul2(raw_k[r0], raw_k[r0 + 1], exp_g[r0], exp_g[r0 + 1])
                 kd_pack.append(fp32_to_fp16(kd0, kd1, dtype=io))
-                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=True)
-                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=True)
+                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=self.fastmath)
+                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=self.fastmath)
                 ki0, ki1 = fmul2(raw_k[r0], raw_k[r0 + 1], inv0, inv1)
                 ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])

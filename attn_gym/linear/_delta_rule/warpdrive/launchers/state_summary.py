@@ -26,16 +26,20 @@ def build_warpdrive_state_summaries(
     cu_seqlens: torch.Tensor,
     *,
     bounds: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Return FP32 ``[N, H, V + K, K]`` maps packed as ``[B; A]`` for subsequences.
 
     Inputs use staged ``[1, T, H, D]`` layout, FP32 gate/beta, and normalized keys. Optional
     contiguous int32 ``bounds[R, 2]`` on k.device select, reorder, or duplicate consecutive
     cu_seqlens pairs. Empty intervals yield ``[0; I]``; zero rows yield no maps. Bounds values
-    stay on device and may change during CUDA Graph replay.
+    stay on device and may change during CUDA Graph replay. ``fastmath=False`` selects the
+    non-flushing gate exponentials.
     """
     validate_available(k)
-    return summary.build_state_summaries(k, value, gate, beta, cu_seqlens, bounds=bounds)
+    return summary.build_state_summaries(
+        k, value, gate, beta, cu_seqlens, bounds=bounds, fastmath=fastmath
+    )
 
 
 def build_warpdrive_state_grad_summaries(
@@ -50,13 +54,14 @@ def build_warpdrive_state_grad_summaries(
     *,
     transpose_forward_transition: bool = False,
     bounds: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Return subsequence FP32 ``[N, H, V + K, K]`` maps packed as ``[C; R]``.
 
     C is the native entry cotangent with zero exit cotangent. R uses an identity exit
     cotangent and zero d_output. ``transpose_forward_transition=True`` instead uses A.T
     from the forward summary: algebraically the adjoint, but not native backward rounding.
-    Inputs and bounds follow :func:`build_warpdrive_state_summaries`.
+    Inputs, bounds and ``fastmath`` follow :func:`build_warpdrive_state_summaries`.
     """
     validate_available(q)
     return summary.build_state_grad_summaries(
@@ -70,6 +75,7 @@ def build_warpdrive_state_grad_summaries(
         scale,
         transpose_forward_transition=transpose_forward_transition,
         bounds=bounds,
+        fastmath=fastmath,
     )
 
 

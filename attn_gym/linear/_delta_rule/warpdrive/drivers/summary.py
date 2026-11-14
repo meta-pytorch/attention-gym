@@ -195,11 +195,22 @@ def _forward_summary(
     state: torch.Tensor,
     transition: torch.Tensor,
     launch: _Launch,
+    *,
+    fastmath: bool,
 ) -> None:
     """Write H into ``state`` and stored-domain M into ``transition`` for every work item."""
     launch.reset()
     kda_summary.kda_summary(
-        k, v, gate, beta, state, transition, launch.work_items, launch.work_count, launch.counters
+        k,
+        v,
+        gate,
+        beta,
+        state,
+        transition,
+        launch.work_items,
+        launch.work_count,
+        launch.counters,
+        fastmath=fastmath,
     )
 
 
@@ -214,6 +225,8 @@ def _reverse_summary(
     d_initial_state: torch.Tensor,
     d_final_state: torch.Tensor | None,
     launch: _Launch,
+    *,
+    fastmath: bool,
 ) -> None:
     """Write the entry cotangent for every work item; ``d_final_state`` None seeds zero."""
     kda_bprop_summary.kda_bprop_summary(
@@ -227,6 +240,7 @@ def _reverse_summary(
         launch.work_count,
         scale=scale,
         d_final_state=d_final_state,
+        fastmath=fastmath,
     )
 
 
@@ -303,6 +317,7 @@ def build_state_summaries(
     cu_seqlens: torch.Tensor,
     *,
     bounds: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Return FP32 ``[R, H, V + K, K]`` maps packed as ``[B; A]`` for whole packed sequences.
 
@@ -311,6 +326,7 @@ def build_state_summaries(
     consecutive ``cu_seqlens`` pairs; without bounds one row per sequence is returned. Empty
     intervals yield ``[0; I]``, nonempty rows that are not a sequence yield NaN, and zero rows
     yield no maps. Bounds values stay on device and may change during CUDA Graph replay.
+    ``fastmath=False`` selects the non-flushing gate exponentials.
     """
     _validate({"k": k, "v": v, "gate": gate, "beta": beta}, cu_seqlens, bounds)
     with initialized_cuda_device(k):
@@ -327,6 +343,7 @@ def build_state_summaries(
                 maps[:, :, :dim_v],
                 maps[:, :, dim_v:],
                 launch,
+                fastmath=fastmath,
             )
         return _summary_rows(maps, cu_seqlens, bounds)
 
@@ -343,14 +360,15 @@ def build_state_grad_summaries(
     *,
     transpose_forward_transition: bool = True,
     bounds: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> torch.Tensor:
     """Return FP32 ``[R, H, V + K, K]`` maps packed as ``[C; R]`` for whole packed sequences.
 
     C is the native entry cotangent under a zero exit cotangent. R is ``A.T`` from the forward
     summary (the exact adjoint of right-multiplication by A) or, with
     ``transpose_forward_transition=False``, a second reverse launch seeded with the identity exit
-    cotangent and zero ``d_output`` (requires ``V == K``). Inputs and bounds follow
-    :func:`build_state_summaries`.
+    cotangent and zero ``d_output`` (requires ``V == K``). Inputs, bounds and ``fastmath``
+    follow :func:`build_state_summaries`.
     """
     _validate(
         {"q": q, "k": k, "v": v, "gate": gate, "beta": beta, "d_output": d_output},
@@ -371,7 +389,9 @@ def build_state_grad_summaries(
             transition = torch.empty(
                 sequences, heads, dim_k, dim_k, dtype=torch.float32, device=q.device
             )
-            _forward_summary(k[0], v[0], gate[0], beta[0], state, transition, forward)
+            _forward_summary(
+                k[0], v[0], gate[0], beta[0], state, transition, forward, fastmath=fastmath
+            )
             maps[:, :, dim_v:].copy_(transition.transpose(-1, -2))
         elif dim_v != dim_k:
             raise ValueError("the identity reverse probe requires V == K")
@@ -387,6 +407,7 @@ def build_state_grad_summaries(
             maps[:, :, :dim_v],
             None,
             launch,
+            fastmath=fastmath,
         )
         if not transpose_forward_transition:
             identity = (
@@ -405,6 +426,7 @@ def build_state_grad_summaries(
                 maps[:, :, dim_v:],
                 identity,
                 launch,
+                fastmath=fastmath,
             )
         return _summary_rows(maps, cu_seqlens, bounds)
 

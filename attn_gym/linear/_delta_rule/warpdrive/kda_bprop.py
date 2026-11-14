@@ -345,7 +345,8 @@ class KdaBprop(WarpSpecialized):
 
     ``use_initial_state``: the item's first chunk has a checkpoint (else chunk 0 starts from
     zero state). ``use_dstate_in`` / ``use_dstate0``: seed dS from ``dstate_in`` / store the
-    final dS to ``dstate0``."""
+    final dS to ``dstate0``.
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
     def __init__(
         self,
@@ -357,6 +358,7 @@ class KdaBprop(WarpSpecialized):
         use_dstate_in: bool,
         use_dstate0: bool,
         num_ctas: int,
+        fastmath: bool = True,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA bprop serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
@@ -365,7 +367,7 @@ class KdaBprop(WarpSpecialized):
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
         self.use_initial_state = use_initial_state
         self.use_dstate_in, self.use_dstate0 = use_dstate_in, use_dstate0
-        self.num_ctas = num_ctas
+        self.num_ctas, self.fastmath = num_ctas, fastmath
         self.first_state_chunk = 0 if use_initial_state else 1
         self.io_dtype = io_t = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
@@ -525,7 +527,8 @@ class KdaBprop(WarpSpecialized):
 
     def get_name(self) -> str:
         flags = f"{int(self.use_initial_state)}{int(self.use_dstate_in)}{int(self.use_dstate0)}"
-        return f"wd_kda_bprop_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}_f{flags}"
+        name = f"wd_kda_bprop_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}_f{flags}"
+        return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
 
@@ -815,8 +818,8 @@ class KdaBprop(WarpSpecialized):
                 g1 = g1 * Float32(LOG2_E) if chunk_start + row1 < seqlen else Float32(0.0)
                 p0, pair_sum = fadd2(prefix, g0, g0, g1)
                 p1 = prefix + pair_sum
-                e0 = cute.math.exp2(p0, fastmath=True)
-                e1 = cute.math.exp2(p1, fastmath=True)
+                e0 = cute.math.exp2(p0, fastmath=self.fastmath)
+                e1 = cute.math.exp2(p1, fastmath=self.fastmath)
                 # exp2(g) goes in place over this raw gate pair, into slots that other lanes of
                 # this warp read (below 32 channel rows, duplicate lanes store equal values to
                 # equal slots): the warp sync orders every lane's reads of the pair first. Later
@@ -852,8 +855,8 @@ class KdaBprop(WarpSpecialized):
                 row1 = row0 + 1
                 p0, pair_sum = fadd2(prefix, graw[row0], graw[row0], graw[row1])
                 p1 = prefix + pair_sum
-                e0 = cute.math.exp2(p0, fastmath=True)
-                e1 = cute.math.exp2(p1, fastmath=True)
+                e0 = cute.math.exp2(p0, fastmath=self.fastmath)
+                e1 = cute.math.exp2(p1, fastmath=self.fastmath)
                 if channel_active:
                     sts_f32(
                         s_ex
@@ -951,8 +954,8 @@ class KdaBprop(WarpSpecialized):
                 r0 = half * 8 + 2 * p
                 kd0, kd1 = fmul2(raw_k[r0], raw_k[r0 + 1], exp_g[r0], exp_g[r0 + 1])
                 kd.append(fp32_to_fp16(kd0, kd1, dtype=io))
-                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=True)
-                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=True)
+                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=self.fastmath)
+                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=self.fastmath)
                 ki0, ki1 = fmul2(raw_k[r0], raw_k[r0 + 1], inv0, inv1)
                 ki.append(fp32_to_fp16(ki0, ki1, dtype=io))
             off = op_stage + 2 * (
@@ -1613,7 +1616,7 @@ class KdaBprop(WarpSpecialized):
             dkr = tmem_ld("32x32b", B_T, lane_base + tmem.cols("dkr"))
             kr = tmem_ld("32x32b", B_T // 2, kraw_col, Int32)
             for t in cutlass.range_constexpr(B_T):
-                dk_hat = cute.math.rcp(eg[t], approx=True, ftz=True) * dkr[t]
+                dk_hat = cute.math.rcp(eg[t], approx=True, ftz=self.fastmath) * dkr[t]
                 dk_n[t] = dk_hat
                 k_v = _half(kr[t // 2], t % 2, io)
                 last_acc[t % 4] = last_acc[t % 4] + k_v * dk_hat
@@ -1632,7 +1635,7 @@ class KdaBprop(WarpSpecialized):
         self.sig_wait("dki", tsig + DKI, n & 1)
         dki = tmem_ld("32x32b", B_T, lane_base + tmem.cols("dki"))
         for t in cutlass.range_constexpr(B_T):
-            dk_n[t] = dk_n[t] + dki[t] * cute.math.rcp(eg[t], approx=True, ftz=True)
+            dk_n[t] = dk_n[t] + dki[t] * cute.math.rcp(eg[t], approx=True, ftz=self.fastmath)
 
         # ---- dK decay part: -2^g term ---------------------------------------------------------------
         dqh = dqk.wait()
@@ -1816,7 +1819,7 @@ class KdaBprop(WarpSpecialized):
                     k_word = w1 if (quad & 1) == 1 else w0
                     for m in cutlass.range_constexpr(2):
                         k = rep * 4 + cs * 2 + m
-                        dk_hat = cute.math.rcp(eg[k], approx=True, ftz=True) * dkr[k]
+                        dk_hat = cute.math.rcp(eg[k], approx=True, ftz=self.fastmath) * dkr[k]
                         dk_f[k] = dk_hat
                         kdot[cs * 2 + m] = kdot[cs * 2 + m] + _half(k_word, m, io) * dk_hat
 
@@ -1830,7 +1833,7 @@ class KdaBprop(WarpSpecialized):
         self.sig_wait("dki", tsig + DKI, n & 1)
         dki = tmem_ld("16x256b", B_T // 8, lane_base + tmem.cols("dki"))
         for k in cutlass.range_constexpr(8):
-            dk_f[k] = dk_f[k] + dki[k] * cute.math.rcp(eg[k], approx=True, ftz=True)
+            dk_f[k] = dk_f[k] + dki[k] * cute.math.rcp(eg[k], approx=True, ftz=self.fastmath)
         dqh = dqk.wait()
         dkd = tmem_ld("16x256b", B_T // 8, lane_base + tmem.cols("dkd"))
         for k in cutlass.range_constexpr(8):

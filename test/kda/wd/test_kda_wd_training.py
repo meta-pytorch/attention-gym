@@ -569,7 +569,7 @@ def test_warpdrive_public_packed_unsplit_local_backward_matches_exact_gradients(
     local_backward_op = backend.chunk_warpdrive_packed_local_bwd_op
 
     def record_local_backward(*args):
-        selected.append(args[-2])
+        selected.append(args[7])  # split
         return local_backward_op(*args)
 
     monkeypatch.setattr(backend, "chunk_warpdrive_packed_local_bwd_op", record_local_backward)
@@ -762,7 +762,7 @@ def test_warpdrive_dense_and_packed_split_share_auto_scheduler(monkeypatch) -> N
     geometries = []
 
     def record_split(*args):
-        selected.append(args[-2])
+        selected.append(args[7])  # split
         return local_backward(*args)
 
     def record_geometry(*args):

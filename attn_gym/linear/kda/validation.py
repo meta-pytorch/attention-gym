@@ -78,25 +78,15 @@ def resolve_kda_backend(
     k: torch.Tensor,
     v: torch.Tensor,
     *,
-    fastmath: bool,
     fused_only: bool = False,
 ) -> Literal["fused", "warpdrive"]:
     """Resolve the backend of one KDA chunk call (NOTE [Default chunk backend]).
 
     ``"auto"`` keeps FP16 kernels on the fused backend, because warpdrive FP16 does not hold
-    model-range gates yet, and ``fastmath=False``, which warpdrive cannot honor yet.
+    model-range gates yet.
     """
-    fused_only = fused_only or not fastmath or kernel_dtype(q, k, v) == torch.float16
+    fused_only = fused_only or kernel_dtype(q, k, v) == torch.float16
     return resolve_chunk_backend(backend, q, fused_only=fused_only)
-
-
-def validate_warpdrive_fastmath(fastmath: bool) -> None:
-    """Reject a precision request that the native warpdrive KDA kernels cannot honor."""
-    if not fastmath:
-        raise ValueError(
-            "warpdrive KDA cannot honor fastmath=False; "
-            "use fastmath=True or the repo-local fused backend"
-        )
 
 
 def validate_kda_inputs(
@@ -147,5 +137,4 @@ __all__ = [
     "resolve_kda_backend",
     "resolve_kernel_options",
     "validate_kda_inputs",
-    "validate_warpdrive_fastmath",
 ]

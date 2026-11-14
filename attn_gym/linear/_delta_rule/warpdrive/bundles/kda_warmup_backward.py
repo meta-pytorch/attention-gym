@@ -173,6 +173,7 @@ def _compile_warmup_backward(
     has_dstate0: bool,
     has_dstate_in: bool,
     use_int64_offsets: bool,
+    fastmath: bool = True,
 ):
     """Compile the warmup / uncut backward host over fake tensors with dynamic extents, int64
     outer strides under ``use_int64_offsets`` and the last mode contiguous."""
@@ -189,9 +190,11 @@ def _compile_warmup_backward(
         )
 
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
-    recompute_op = kda_recompute.KdaRecompute(io, gate_name, d_k, d_v, has_state_in, num_sms)
+    recompute_op = kda_recompute.KdaRecompute(
+        io, gate_name, d_k, d_v, has_state_in, num_sms, fastmath
+    )
     bprop_op = kda_bprop.KdaBprop(
-        io, gate_name, d_k, d_v, use_initial_state, has_dstate_in, has_dstate0, num_sms
+        io, gate_name, d_k, d_v, use_initial_state, has_dstate_in, has_dstate0, num_sms, fastmath
     )
     static = (
         num_sms,
@@ -212,6 +215,7 @@ def _compile_warmup_backward(
         "kda_warmup_backward_"
         + "_".join(str(int(flag)) for flag in static)
         + f"_{dtype_names}_split_{split_tag}"
+        + ("" if fastmath else "_nofm")
     )
     return compile_tvm_ffi(
         warmup_backward_host,
@@ -285,10 +289,12 @@ def build_warmup_backward(
     b_t,
     log_gate,
     scale,
+    fastmath=True,
 ):
     """Compile (persisted per static config) the warmup or uncut backward launch over the buffers
     of one plan; return ``(compiled, facts)`` with ``facts`` the split table's
-    :class:`~work_tables.SplitTableFacts` (None for the uncut table)."""
+    :class:`~work_tables.SplitTableFacts` (None for the uncut table). ``fastmath=False``
+    selects the non-flushing gate exponentials."""
     if not log_gate or b_t != B_T:
         raise ValueError("the warpdrive KDA backward serves 16-token chunks of natural-log gates")
     facts = None
@@ -336,6 +342,7 @@ def build_warmup_backward(
         dstate0 is not None,
         dstate_in is not None,
         requires_int64_abi(*(t for t in tensors if t is not None)),
+        bool(fastmath),
     )
     return compiled, facts
 

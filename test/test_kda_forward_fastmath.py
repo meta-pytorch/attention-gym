@@ -23,7 +23,7 @@ requires_blackwell = pytest.mark.skipif(
 pytestmark = pytest.mark.usefixtures("fused_chunk_default")
 
 
-def test_warpdrive_precision_request_is_rejected_before_cuda_dispatch(monkeypatch):
+def test_warpdrive_accepts_both_precision_requests(monkeypatch):
     warpdrive = importlib.import_module("attn_gym.linear.kda.impl.warpdrive")
 
     def reached_native(_q):
@@ -33,9 +33,7 @@ def test_warpdrive_precision_request_is_rejected_before_cuda_dispatch(monkeypatc
     q = torch.zeros(1, 64, 1, 128, dtype=torch.bfloat16)
     beta = torch.ones(1, 64, 1)
     gate = torch.zeros_like(q, dtype=torch.float32)
-    with pytest.raises(ValueError, match="warpdrive KDA cannot honor fastmath=False"):
-        chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "warpdrive"}, fastmath=False)
-    for kwargs in ({}, {"fastmath": True}):
+    for kwargs in ({}, {"fastmath": True}, {"fastmath": False}):
         with pytest.raises(RuntimeError, match="reached native warpdrive dispatch"):
             chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "warpdrive"}, **kwargs)
 
