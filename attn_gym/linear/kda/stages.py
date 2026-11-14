@@ -32,7 +32,7 @@ Which tokens a device owns and how summaries travel are the caller's decisions;
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -65,6 +65,12 @@ from attn_gym.linear.kda.validation import (
     validate_kda_inputs,
 )
 from attn_gym.linear.types import KernelOptions
+
+if TYPE_CHECKING:
+    from attn_gym.linear._delta_rule.warpdrive.drivers.staged import (
+        BackwardPieces,
+        ForwardPieces,
+    )
 
 
 class ChunkKDASaved(NamedTuple):
@@ -200,14 +206,20 @@ class ChunkKDAWarpdrivePrepared:
 
     warpdrive keeps its WY factors on chip, so each subsequence's ``[B; A]`` map comes from two
     runs of warpdrive's state-only pass over it (from a zero entry state for ``B``, from the
-    identity with the value term disabled for ``A``). The backward handle is
-    :class:`ChunkKDAWarpdriveBackward`.
+    identity with the value term disabled for ``A``). When the summaries split, ``prepare``
+    summarizes every piece once and ``run`` starts all pieces from their maps instead of running
+    the public op's plan. Its bits then follow the piece length, and its maps are those of
+    ``prepare``'s inputs, which must not change before the handle's last use (NOTE [Staged piece
+    plans]). The backward handle is :class:`ChunkKDAWarpdriveBackward`.
     """
 
     saved: ChunkKDAWarpdriveSaved
     metadata: RaggedChunkMetadata
     scale: float
     fastmath: bool
+    # Set when the summaries split: ``run`` starts every piece at once from their maps (NOTE
+    # [Staged piece plans] in ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
+    pieces: ForwardPieces | None = None
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -216,12 +228,15 @@ class ChunkKDAWarpdrivePrepared:
         16-token-chunk rounding, which differs from the fused maps and from an unsharded warpdrive
         pass.
         """
-        # Lazy import keeps the optional warpdrive backend out of the fused import path.
+        # Lazy imports keep the optional warpdrive backend out of the fused import path.
+        from attn_gym.linear._delta_rule.warpdrive.drivers import staged
         from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
             build_warpdrive_state_summaries,
         )
 
         saved = self.saved
+        if self.pieces is not None:
+            return staged.gather(self.pieces, saved.cu_seqlens, bounds)
         return build_warpdrive_state_summaries(
             saved.k,
             saved.v,
@@ -238,8 +253,21 @@ class ChunkKDAWarpdrivePrepared:
         *,
         output_final_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Run the with-state kernel from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
+        """Finish the local forward from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
         saved = self.saved
+        if self.pieces is not None:
+            from attn_gym.linear._delta_rule.warpdrive.drivers import staged
+
+            output, final_state = staged.forward_from_pieces(
+                *(t[0] for t in (saved.q, saved.k, saved.v, saved.gate, saved.beta)),
+                saved.cu_seqlens,
+                self.pieces,
+                scale=self.scale,
+                initial_state=_normalize_warpdrive_state(initial_state),
+                output_final_state=output_final_state,
+                fastmath=self.fastmath,
+            )
+            return output.unsqueeze(0), final_state
         if initial_state is None:
             initial_state = zero_state(saved.q, saved.v, self.metadata)
         else:
@@ -316,7 +344,10 @@ def chunk_kda_prepare(
         saved = ChunkKDAWarpdriveSaved(
             q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets
         )
-        return ChunkKDAWarpdrivePrepared(saved, metadata, scale, fastmath)
+        from attn_gym.linear._delta_rule.warpdrive.drivers import staged
+
+        pieces = staged.forward_pieces(k[0], v[0], gate[0], beta[0], cu_seqlens, fastmath=fastmath)
+        return ChunkKDAWarpdrivePrepared(saved, metadata, scale, fastmath, pieces)
     factors = _prepare_chunk_kda_fwd(
         q,
         k,
@@ -416,7 +447,9 @@ class ChunkKDAWarpdriveBackward:
 
     Each subsequence's ``[C; R]`` map is the entry cotangent of warpdrive's backward run with a
     zero exit cotangent (``C``) and the forward transition transposed (``R``, the exact adjoint; a
-    natively probed adjoint would round differently). Nothing is consumed, so ``run`` and
+    natively probed adjoint would round differently). When the summaries split, the handle
+    holds the pieces' reverse maps and checkpoints, computed by ``prepare_backward``, and
+    ``run`` finishes from them (NOTE [Staged piece plans]). Nothing is consumed, so ``run`` and
     ``state_grad_summaries`` may be called in either order.
     """
 
@@ -425,17 +458,23 @@ class ChunkKDAWarpdriveBackward:
     initial_state: torch.Tensor | None
     scale: float
     fastmath: bool
+    # Set when the summaries split: the maps and checkpoints ``run`` finishes from (NOTE
+    # [Staged piece plans] in ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
+    pieces: BackwardPieces | None = None
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
 
         Rows follow NOTE [Summary ranges are subsequences].
         """
+        from attn_gym.linear._delta_rule.warpdrive.drivers import staged
         from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
             build_warpdrive_state_grad_summaries,
         )
 
         saved = self.saved
+        if self.pieces is not None:
+            return staged.gather(self.pieces, saved.cu_seqlens, bounds)
         return build_warpdrive_state_grad_summaries(
             saved.q,
             saved.k,
@@ -469,6 +508,19 @@ class ChunkKDAWarpdriveBackward:
         saved = self.saved
         d_final_state = _normalize_warpdrive_state(d_final_state)
         operands = (saved.q, saved.k, saved.v, saved.gate, saved.beta, self.d_output)
+        if self.pieces is not None:
+            from attn_gym.linear._delta_rule.warpdrive.drivers import staged
+
+            *grads, d_initial_state = staged.backward_from_pieces(
+                *(t[0] for t in operands),
+                saved.cu_seqlens,
+                self.pieces,
+                scale=self.scale,
+                d_final_state=d_final_state,
+                d_initial_state=self.initial_state is not None,
+                fastmath=self.fastmath,
+            )
+            return (*(grad.unsqueeze(0) for grad in grads), d_initial_state)
         if self.initial_state is None:
             grads = chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
                 *operands, saved.cu_seqlens, d_final_state, self.scale, self.fastmath
@@ -510,9 +562,17 @@ def chunk_kda_prepare_backward(
     scale = float(scale)
     options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare_backward")
     if isinstance(saved, ChunkKDAWarpdriveSaved):
-        return ChunkKDAWarpdriveBackward(
-            saved, d_output, _normalize_warpdrive_state(initial_state), scale, fastmath
+        from attn_gym.linear._delta_rule.warpdrive.drivers import staged
+
+        initial_state = _normalize_warpdrive_state(initial_state)
+        pieces = staged.backward_pieces(
+            *(t[0] for t in (saved.q, saved.k, saved.v, saved.gate, saved.beta, d_output)),
+            saved.cu_seqlens,
+            scale=scale,
+            initial_state=initial_state,
+            fastmath=fastmath,
         )
+        return ChunkKDAWarpdriveBackward(saved, d_output, initial_state, scale, fastmath, pieces)
     metadata = None
     if saved.cu_seqlens is not None:
         assert saved.chunk_offsets is not None
