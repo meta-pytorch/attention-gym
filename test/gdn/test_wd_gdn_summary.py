@@ -47,8 +47,9 @@ def _work_table(cu, heads, order, capacity, chunk_ranges=None):
     return table, torch.tensor([len(order)], dtype=torch.int32, device="cuda")
 
 
-def _run(k, v, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None):
-    from attn_gym.linear._delta_rule.warpdrive import gdn_summary, gdn_tinv
+def _summary_operands(k, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None):
+    """``gdn_tinv``'s tiles and a work table over every (piece, head) of ``cu``."""
+    from attn_gym.linear._delta_rule.warpdrive import gdn_tinv
 
     pieces, heads = cu.numel() - 1, gate.shape[1]
     rows = gdn_tinv.tinv_rows(int(cu[-1]), pieces)
@@ -57,7 +58,14 @@ def _run(k, v, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None):
     row_count = torch.empty(1, dtype=torch.int32, device="cuda")
     gdn_tinv.gdn_tinv(k, gate, beta, cu, tinv, row_table, row_count)
     order = range(pieces * heads) if order is None else order
-    table, count = _work_table(cu, heads, order, len(order) + extra_rows, chunk_ranges)
+    return tinv, *_work_table(cu, heads, order, len(order) + extra_rows, chunk_ranges)
+
+
+def _run(k, v, gate, beta, cu, order=None, extra_rows=0, chunk_ranges=None):
+    from attn_gym.linear._delta_rule.warpdrive import gdn_summary
+
+    pieces, heads = cu.numel() - 1, gate.shape[1]
+    tinv, table, count = _summary_operands(k, gate, beta, cu, order, extra_rows, chunk_ranges)
     d_k, d_v = k.shape[2], v.shape[2]
     state_h = torch.full((pieces, heads, d_v, d_k), float("nan"), device="cuda")
     state_m = torch.full((pieces, heads, d_k, d_k), float("nan"), device="cuda")
@@ -134,6 +142,31 @@ def test_gdn_summary_runs_listed_items_in_any_order():
     _assert_close(state_m, ref_m, torch.bfloat16, "M")
 
 
+def test_gdn_summary_writes_into_views_of_a_packed_map():
+    """The states may be the two halves of one packed ``[H; M]`` buffer, with the same bits as
+    separate outputs; a misaligned, broadcast or self-overlapping view is rejected before launch."""
+    from attn_gym.linear._delta_rule.warpdrive import gdn_summary
+
+    lens, heads = (70, 130), 2
+    k, v, gate, beta, cu = _inputs(lens, heads, 1, 128, 128, torch.bfloat16, seed=4)
+    pieces = len(lens)
+    tinv, table, count = _summary_operands(k, gate, beta, cu)
+    expected = _run(k, v, gate, beta, cu)
+    packed = torch.full((pieces, heads, 256, 128), float("nan"), device="cuda")
+    gdn_summary.gdn_summary(k, v, gate, tinv, packed[:, :, :128], packed[:, :, 128:], table, count)
+    for got, want in zip(packed.split(128, dim=2), expected, strict=True):
+        assert torch.equal(got, want)
+    wide = torch.empty(pieces, heads, 128, 256, device="cuda")
+    broadcast = torch.empty(1, heads, 128, 128, device="cuda").expand(pieces, -1, -1, -1)
+    # Aligned, d_k-divisible strides whose heads share rows.
+    overlapping = torch.empty(pieces * heads * 128 * 128, device="cuda").as_strided(
+        (pieces, heads, 128, 128), (heads * 128 * 128, 128, 128, 1)
+    )
+    for bad in (wide[..., 4:132], broadcast, overlapping):
+        with pytest.raises(ValueError, match="summary states"):
+            gdn_summary.gdn_summary(k, v, gate, tinv, bad, expected[1], table, count)
+
+
 def test_gdn_summary_runs_chunk_ranges_of_split_tables():
     """A split-K row runs chunks ``[begin, end)``: both chains start from zero past chunk 0 (no
     identity seed, so M stays zero), and only a row reaching its piece's last chunk stores."""
@@ -170,6 +203,6 @@ def test_gdn_summary_reuses_one_compile_across_runtime_shapes():
     gdn_summary.compile_gdn_summary.cache_clear()
     for lens, heads, key_heads in shapes:
         _run(*_inputs(lens, heads, key_heads, 128, 128, torch.bfloat16), extra_rows=heads)
-    info = gdn_summary.compile_gdn_summary.cache_info()
+    info = gdn_summary.compile_gdn_summary.cache_info()  # one specialization, looked up per launch
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(shapes), info

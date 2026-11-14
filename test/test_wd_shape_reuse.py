@@ -88,10 +88,10 @@ def test_one_compile_per_direction_serves_every_shape_class(monkeypatch, family:
     )
     compile_fns = (forward._compile_warmup_forward, backward._compile_warmup_backward)
     if family == "gdn":
-        # GDN launches its gradient kernel outside the warmup bundle, through two cache layers.
+        # GDN launches its gradient kernel outside the warmup bundle.
         from attn_gym.linear._delta_rule.warpdrive import gdn_bprop
 
-        compile_fns += (gdn_bprop._compiled, gdn_bprop.compile_gdn_bprop)
+        compile_fns += (gdn_bprop.compile_gdn_bprop,)
     for compile_fn in compile_fns:
         compile_fn.cache_clear()  # count keys from zero; entries reload from disk
 

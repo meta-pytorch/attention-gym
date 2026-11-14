@@ -2378,12 +2378,11 @@ def compile_gdn_bprop(
     )
 
 
-@functools.lru_cache
-def _compiled(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0, *dtypes):
-    """``(op, compiled)`` per static configuration: the per-call ``jit_cache`` key of a
-    warpdrive op costs ~150 us of host time, which the uncut driver would pay per backward."""
-    op = GdnBprop(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0)
-    return op, compile_gdn_bprop(op, *dtypes)
+@functools.cache
+def _op(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0) -> GdnBprop:
+    """One op per static configuration. Launches look its build up with ``by_static_key``
+    (the hot-path lookup), which still honours ``cache_clear()`` and the compile target."""
+    return GdnBprop(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0)
 
 
 def _dtype_name(tensor, names):
@@ -2438,7 +2437,11 @@ def gdn_bprop(
     )
     if op is None:
         flags = (use_initial_state, dstate_in is not None, dstate0 is not None)
-        op, fn = _compiled(IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags, *dtypes)
+        config = (IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags)
+        op = _op(*config)
+        fn = compile_gdn_bprop.by_static_key(
+            (config, dtypes), lambda: compile_gdn_bprop(op, *dtypes)
+        )
     else:
         fn = compile_gdn_bprop(op, *dtypes)
     workspace, sms = op.work.launch_args(q.device)

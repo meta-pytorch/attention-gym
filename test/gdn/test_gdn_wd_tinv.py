@@ -100,6 +100,6 @@ def test_gdn_tinv_reuses_one_compile_across_runtime_shapes():
     gdn_tinv.compile_gdn_tinv.cache_clear()
     for lens, heads, key_heads in shapes:
         _run(*_inputs(lens, heads, key_heads, 128, torch.bfloat16, torch.float32), lens, heads)
-    info = gdn_tinv.compile_gdn_tinv.cache_info()
+    info = gdn_tinv.compile_gdn_tinv.cache_info()  # one specialization, looked up per launch
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(shapes), info
