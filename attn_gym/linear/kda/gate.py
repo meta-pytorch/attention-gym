@@ -40,9 +40,8 @@ def bound_gate(
         fastmath: Allow approximate gating exponentials (default ``True``). ``False`` selects
             non-fast forward and backward math. Reference execution uses normal PyTorch math
             for either value; ``chunk_kda`` has its own flag.
-        impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses private CuTeDSL
-            kernels and requires CUDA capability 9.0 or newer, ``D=128``, and FP16, BF16,
-            or FP32 logits.
+        impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses private kernels (see
+            ``gate_transform``) and requires FP16, BF16, or FP32 logits.
     """
     if raw_gate.ndim != 4:
         raise ValueError(f"raw_gate must have shape [B, T, H, D], got {tuple(raw_gate.shape)}")
