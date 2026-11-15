@@ -499,6 +499,8 @@ def chunk_kda_prepare_backward(
         d_output = normalize_compact_tensor(d_output.to(saved.v.dtype))
     scale = float(scale)
     options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare_backward")
+    if options.split_backward or options.split_forward:
+        raise ValueError("split schedules are not supported by chunk_kda_prepare_backward")
     if isinstance(saved, ChunkKDAWarpdriveSaved):
         validate_warpdrive_fastmath(fastmath)
         return ChunkKDAWarpdriveBackward(

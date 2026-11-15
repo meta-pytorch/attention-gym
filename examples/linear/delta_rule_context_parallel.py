@@ -16,9 +16,9 @@ Add ``--variant gdn``, ``--partition zigzag``, or ``--compute-dtype float16`` to
 ``--partition documents`` assigns whole documents to ranks (``document_aligned_fragments``): no
 document crosses ranks, so the delta-rule op exchanges no state and its result is bitwise
 independent of the CP degree (``test/test_context_parallel_distributed.py``, table ``documents``).
-``--core-backend warpdrive`` selects the KDA warpdrive backend (SM100 family). ``--cuda-graph``
-checks a changed-input replay; ``--profile`` writes a merged native Perfetto trace.
-``--no-validate`` skips the unsharded reference at scales where it does not fit. Batch
+``--core-backend warpdrive`` runs each rank's local KDA or GDN pass on warpdrive (SM100 family).
+``--cuda-graph`` checks a changed-input replay; ``--profile`` writes a merged native Perfetto
+trace. ``--no-validate`` skips the unsharded reference at scales where it does not fit. Batch
 construction, loss/backward, and capture are shown in ``delta_rule_training.py`` and imported here.
 Numerical assertions, trace export, and benchmark reporting live in ``attn_gym.testing``.
 """
@@ -147,9 +147,6 @@ class ContextParallelDeltaRuleAttention(DeltaRuleAttention):
 
     def __init__(self, *args, group: dist.ProcessGroup, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        # Fail at construction rather than at the first distributed forward.
-        if self.variant == "gdn" and (self.kernel_options or {}).keys() - {"autotune"}:
-            raise ValueError("context_parallel_gdn takes only the autotune kernel option")
         self.cp_group = group
 
     def forward(
@@ -263,7 +260,7 @@ def main(
         typer.Option(
             "--core-backend",
             "--kda-backend",
-            help="Local KDA chunk kernels: fused or warpdrive (SM100).",
+            help="Local KDA/GDN chunk kernels: fused or warpdrive (SM100).",
         ),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
@@ -353,8 +350,7 @@ def main(
             "compute_dtype": getattr(torch, compute_dtype.value),
             "device": device,
         }
-        # The reference keeps the repo-local core; only each rank's local KDA pass may use
-        # warpdrive.
+        # The reference keeps the repo-local core; only each rank's local pass may use warpdrive.
         make_model = partial(
             ContextParallelDeltaRuleAttention,
             **model_options,
