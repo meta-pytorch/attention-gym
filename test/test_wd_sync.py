@@ -203,20 +203,38 @@ KERNELS = [
     ("kda_summary", "KdaSummary", ("fp16", "fp16", 128, 128, 152), ("fp32",)),
     ("kda_summary", "KdaSummary", ("fp16", "fp32", 64, 128, 152), ("fp32",)),
 ]
+KERNELS += [
+    ("gdn_prefill", "GdnPrefillCompute", ("bf16", "bf16", 128, 128, 1, True, True, False), ()),
+    ("gdn_prefill", "GdnPrefillCompute", ("bf16", "bf16", 128, 64, 2, True, True, False), ()),
+    (
+        "kda_prefill",
+        "KdaPrefill",
+        ("bf16", "fp32", 128, 128, 1, True, True, 2, 152),
+        ("fp32", "bf16"),
+    ),
+    (
+        "kda_prefill",
+        "KdaPrefill",
+        ("bf16", "fp32", 128, 64, 2, True, True, 2, 152),
+        ("fp32", "bf16"),
+    ),
+    ("kda_prep_prefill", "KdaPrepPrefill", ("bf16", 128, 2, True, True, 1, 152), ("bf16",)),
+    ("kda_prep_prefill", "KdaPrepPrefill", ("bf16", 128, 2, True, True, 2, 152), ("bf16",)),
+]
 BF16, FP32, I32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
 
 
-def _gdn_paged(has_initial_state: bool, tiles_per_head: int) -> tuple:
-    """``gdn_warmup_forward._compile_warmup_forward`` arguments: bf16, fp32 states in and out,
-    seed indices, a paged state, natural-log gates, d 128."""
+def _gdn_paged(has_initial_state: bool, tiles_per_head: int, state_dtype=FP32) -> tuple:
+    """``gdn_warmup_forward._compile_warmup_forward`` arguments: BF16 inputs,
+    selectable state dtype, seed indices, paged state, natural-log gates, d 128."""
     states = (True, True, True, False, True, has_initial_state, False, True)
-    return (BF16, FP32, FP32, FP32, None, 152, *states, 128, 128, tiles_per_head, False)
+    return (BF16, state_dtype, FP32, FP32, None, 152, *states, 128, 128, tiles_per_head, False)
 
 
-def _kda_paged(paged_state: int, tiles_per_head: int) -> tuple:
-    """``kda_warmup_forward._compile_warmup_forward`` arguments: bf16, fp32 states in and out,
-    d 128; the d_v split runs the prep prefill."""
-    dtypes = (BF16, FP32, FP32, I32, FP32, FP32)
+def _kda_paged(paged_state: int, tiles_per_head: int, state_dtype=FP32) -> tuple:
+    """``kda_warmup_forward._compile_warmup_forward`` arguments: BF16 inputs,
+    selectable input/output state dtype, d 128; the d_v split runs the prep prefill."""
+    dtypes = (BF16, FP32, FP32, I32, state_dtype, state_dtype)
     return (None, 152, *dtypes, 128, 128, tiles_per_head, tiles_per_head > 1, False, paged_state)
 
 
@@ -227,6 +245,11 @@ BUNDLES = [
     ("kda_warmup_forward", _kda_paged(2, 1)),
     ("kda_warmup_forward", _kda_paged(1, 2)),
     ("kda_warmup_forward", _kda_paged(2, 2)),
+    ("gdn_warmup_forward", _gdn_paged(True, 1, BF16)),
+    ("gdn_warmup_forward", _gdn_paged(False, 2, BF16)),
+    ("kda_warmup_forward", _kda_paged(2, 1, BF16)),
+    ("kda_warmup_forward", _kda_paged(1, 2, BF16)),
+    ("kda_warmup_forward", _kda_paged(2, 2, BF16)),
 ]
 
 

@@ -185,8 +185,6 @@ def _packed_fwd_paged_cuda(
     cu_seqlens,
     scale,
 ):
-    if state_cache.dtype != torch.float32:
-        raise TypeError("the warpdrive KDA state pool must use float32")
     template = value
     # The pool is advanced in place, so it is validated rather than copied.
     q, k, value, gate, beta, cu_seqlens = _normalize_operands(q, k, value, gate, beta, cu_seqlens)
