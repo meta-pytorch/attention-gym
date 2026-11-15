@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_gym._backends.cute.utils import layout_overlaps, tensor_supports_contiguous_dim
+from attn_gym._backends.cute.utils import tensor_supports_contiguous_dim
 from attn_gym.warpdrive.cache import make_fake_strided_tensor
 
 
@@ -57,30 +57,3 @@ def test_make_fake_strided_tensor_all_dynamic(use_int64_strides):
     assert fake._assumed_align == 2
     assert all(stride.width == (64 if use_int64_strides else 32) for stride in fake.stride)
     assert all(stride.divisibility == 1 for stride in fake.stride)
-
-
-@pytest.mark.parametrize(
-    ("shape", "strides", "overlaps"),
-    [
-        ((2, 3), (3, 1), False),  # contiguous
-        ((4, 5), (0, 1), True),  # an expanded dimension
-        ((3, 4), (2, 1), True),  # rows step less than they span
-        ((2, 3), (1, 2), False),  # column-major
-        ((1, 4), (0, 1), False),  # size-1 dimensions never step
-        ((0, 4), (0, 1), False),  # empty
-        ((), (), False),
-        # Sufficient, not necessary: injective (0, 2, 4, 3, 5, 7) but nested-reach fails.
-        ((3, 2), (2, 3), True),
-    ],
-)
-def test_layout_overlaps(shape, strides, overlaps):
-    assert layout_overlaps(shape, strides) is overlaps
-
-
-def test_views_into_a_packed_map_do_not_overlap():
-    """Either half of a packed [C; R] map, and a head slice of it, writes each element once."""
-    packed = torch.empty(5, 3, 128 + 64, 64)
-    for view in (packed[:, :, :128], packed[:, :, 128:], packed[:, 1:, 128:]):
-        assert not layout_overlaps(view.shape, view.stride())
-    broadcast = packed[:, :1].expand(5, 3, -1, -1)
-    assert layout_overlaps(broadcast.shape, broadcast.stride())

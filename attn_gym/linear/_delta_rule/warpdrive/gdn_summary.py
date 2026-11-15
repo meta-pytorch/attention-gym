@@ -55,7 +55,7 @@ from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.arch import inline_ptx
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym._backends.cute.utils import layout_overlaps
+from attn_gym._backends.layout import layout_overlaps
 from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Consumer,
