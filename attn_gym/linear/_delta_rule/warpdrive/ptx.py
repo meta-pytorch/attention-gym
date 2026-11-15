@@ -236,6 +236,34 @@ def _mma_sync(
 
 
 @cute.jit
+def tf32_lo(x):
+    """``x - tf32(x)`` (exact in fp32) for 3xTF32 products: the tf32 mma reads only the top 19
+    bits of an fp32 operand, so ``x`` itself is the high part and this the low part."""
+    return inline_ptx(
+        "{ .reg .b32 xb; .reg .f32 h; mov.b32 xb, $1; and.b32 xb, xb, 0xffffe000; "
+        "mov.b32 h, xb; sub.f32 $0, $1, h; }",
+        write_only_types=[cutlass.Float32],
+        read_only_args=[x],
+    )
+
+
+@cute.jit
+def mma_tf32(acc, a, b):
+    """``acc[4] + A[16, 8] @ B[8, 8]`` (m16n8k8 tf32 mma.sync) of fp32 fragments ``a[4]`` and
+    ``b[2]`` (read as tf32); returns the four fp32 outputs."""
+    return list(
+        inline_ptx(
+            "{ .reg .b32 a<4>, b<2>; mov.b32 a0, $4; mov.b32 a1, $5; mov.b32 a2, $6; "
+            "mov.b32 a3, $7; mov.b32 b0, $8; mov.b32 b1, $9; "
+            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 {$0,$1,$2,$3}, "
+            "{a0,a1,a2,a3}, {b0,b1}, {$10,$11,$12,$13}; }",
+            write_only_types=[cutlass.Float32] * 4,
+            read_only_args=[*a, *b, *acc],
+        )
+    )
+
+
+@cute.jit
 def mma_step(
     acc,
     a_frag,

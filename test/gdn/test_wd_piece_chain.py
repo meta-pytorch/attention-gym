@@ -20,6 +20,7 @@ from test_wd_work_tables import (
 )
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from attn_gym.testing.kda import relative_rms_error
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -245,6 +246,9 @@ def run_state_chain(main_rows, h, m, seed_state, indices, transpose, rows=None):
 
 
 # (lens, pieces, heads, dim_v, dim_k)
+# Relative RMS against the FP64 reference: 4x the worst measured (5.0e-7, the 3xTF32 tensor-core
+# walk; 1.0e-7 on FMA); a single-pass TF32 product would sit near 1e-3.
+STATE_CHAIN_RMS_BUDGET = 2e-6
 STATE_CASES = [
     ([32768], 4, 2, 128, 128),
     ([20000, 0, 3000, 70, 9000], 3, 3, 64, 128),
@@ -270,7 +274,78 @@ def test_state_chain_matches_fp64(
     for rows in {r for r in (dim_v // 16, dim_v // 8) if r >= pc().CHAIN_WARPS}:
         x = run_state_chain(main_rows, h, m, seed_state, indices, transpose, rows)
         torch.testing.assert_close(x[filled].double(), ref[filled], atol=1e-4, rtol=1e-4)
+        assert relative_rms_error(x[filled], ref[filled]) < STATE_CHAIN_RMS_BUDGET
         assert torch.isnan(x[~filled]).all()
+
+
+@pytest.mark.parametrize(("lens", "pieces", "heads", "dim_v", "dim_k"), STATE_CASES)
+@pytest.mark.parametrize(
+    ("seed_dtype", "routed"),
+    [(None, False), (torch.float32, False), (torch.bfloat16, True)],
+)
+def test_paired_state_chains_match_fp64(lens, pieces, heads, dim_v, dim_k, seed_dtype, routed):
+    """One launch running the forward chain of ``h`` and the transposed chain of ``g`` over the
+    same ``m`` (the backward's pair) matches both references, on both row-block widths."""
+    main_rows, h, m, seed_state, indices = state_case(
+        lens, pieces, heads, dim_v, dim_k, seed_dtype, routed
+    )
+    _, g, _, dseed, _ = state_case(lens, pieces, heads, dim_v, dim_k, seed_dtype, routed, seed=1)
+    ref = state_chain_reference(main_rows, h, m, seed_state, indices, False)
+    ref_t = state_chain_reference(main_rows, g, m, dseed, indices, True)
+    filled = ~torch.isnan(ref[:, 0, 0, 0])
+    for rows in {r for r in (dim_v // 16, dim_v // 8) if r >= pc().CHAIN_WARPS}:
+        x, dx = torch.full_like(h, float("nan")), torch.full_like(g, float("nan"))
+        pc().state_chain(
+            h,
+            m,
+            x,
+            main_rows,
+            seed=seed_state,
+            seed_indices=indices,
+            rows=rows,
+            reverse=(g, dx, dseed),
+        )
+        for out, expected in ((x, ref), (dx, ref_t)):
+            torch.testing.assert_close(
+                out[filled].double(), expected[filled], atol=1e-4, rtol=1e-4
+            )
+            assert relative_rms_error(out[filled], expected[filled]) < STATE_CHAIN_RMS_BUDGET
+            assert torch.isnan(out[~filled]).all()
+
+
+@pytest.mark.parametrize("paired", [False, True], ids=["forward", "paired"])
+def test_state_chain_reads_a_padded_bf16_seed(paired):
+    """BF16 seeds padded to row stride 132, which the compile signature allows (strides divisible
+    by four elements) but which starts odd rows 8 bytes off a 16-byte boundary, give bitwise the
+    result of compact seeds on the tensor-core walk at K = 128 (8-column row segments)."""
+    lens, pieces, heads, dim_v, dim_k = [4096, 4096], 6, 2, 128, 128
+    main_rows, h, m, seed_state, indices = state_case(
+        lens, pieces, heads, dim_v, dim_k, torch.bfloat16, True
+    )
+    _, g, _, dseed, _ = state_case(lens, pieces, heads, dim_v, dim_k, torch.bfloat16, True, seed=1)
+
+    def padded(state):
+        rows = torch.full((*state.shape[:-1], dim_k + 4), float("nan"), dtype=state.dtype)
+        view = rows.to(state.device)[..., :dim_k]
+        assert view.stride(-2) == dim_k + 4 and view.data_ptr() % 16 == 0
+        return view.copy_(state)
+
+    def run(seed, reverse_seed):
+        x, dx = torch.full_like(h, float("nan")), torch.full_like(g, float("nan"))
+        pc().state_chain(
+            h,
+            m,
+            x,
+            main_rows,
+            seed=seed,
+            seed_indices=indices,
+            rows=16,
+            reverse=(g, dx, reverse_seed) if paired else None,
+        )
+        return x, dx
+
+    for got, want in zip(run(padded(seed_state), padded(dseed)), run(seed_state, dseed)):
+        torch.testing.assert_close(got, want, atol=0, rtol=0, equal_nan=True)
 
 
 def test_state_chain_reuses_one_compile_across_runtime_shapes():
