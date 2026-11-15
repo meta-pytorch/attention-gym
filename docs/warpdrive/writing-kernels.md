@@ -202,6 +202,53 @@ Run the [repository testing tiers](https://github.com/meta-pytorch/attention-gym
 tuning stages, warps, registers, layouts or schedules. Hold workload and numerical checks
 fixed across measurements. More stages or fewer instructions alone do not establish speed.
 
+## Kernels without warp specialization
+
+A kernel whose warps all run the same loop still uses warpdrive: declare one role over every
+warp and no channels. The layer then supplies the constructor-keyed compile, `describe()`, the
+work stream and SMEM declared in `smem_plan`; it adds no producer or consumer you don't need.
+[`StateChain`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/linear/_delta_rule/warpdrive/piece_chain.py)
+is the reference: four (or eight) warps walk a recurrence with `cp.async` staging and
+`mma.sync` math, all raw. The skeleton:
+
+```python
+class Walk(WarpSpecialized):
+    def __init__(self, k: int, stages: int):
+        self.k, self.stages = k, stages
+        self.smem_plan = SmemPlan()
+        self.smem_plan.buffer("M", Float32, align=128)
+        self.work = WorkStream(schedule=OneShot(grid="3d"), ready=PdlWait())
+
+    @role(warps=range(4), raw=True)
+    @cute.jit
+    def walk(self, params: WalkParams, me: Local):
+        _, (seq, head, block) = self.work.single_item()  # one item per CTA
+        ...  # raw cp.async into params.sM, cute.arch.barrier(), mma.sync; me.tid indexes
+
+    @cute.kernel
+    def kernel(self, ..., bound):
+        self.begin_roles(work=bound, layouts={"M": cute.make_layout((self.k * self.k, self.stages))})
+        self.run_roles(WalkParams(..., sM=self.buffer("M")))
+```
+
+- **One role, all warps.** `@role(warps=range(n))`, or set `self.roles` in the constructor when
+  the warp count depends on a constructor argument. Index threads with `me.tid`.
+- **The work item.** A raw role reads its single item with `self.work.single_item()`; a managed
+  role loops `while work.valid:` over a `WorkCursor`. `PdlWait()` readiness places the
+  `griddepcontrol.wait` of a programmatic dependent launch before the first decode.
+- **Declared SMEM.** Declare buffers in `smem_plan`, give their layouts (stage mode outermost) to
+  `begin_roles`, and pass `self.buffer(name)` to the role. These buffers belong to no channel:
+  `describe()` lists them, but no warpdrive check covers raw accesses to them. State the
+  ordering that protects each one (which `cp.async` group, which barrier) in the kernel's
+  docstring.
+- **Raw operations stay raw.** Unsupported copies, math and synchronization run unchanged inside
+  the role; wrapping them proves nothing about their lifetimes.
+- **Launch.** `self.launch_config(bound)` gives grid and block; pass `use_pdl=True` to `.launch(...)`
+  when the kernel is a dependent launch. `run_roles` adds one CTA barrier at entry.
+
+Check the port as any other: bitwise against the raw kernel where the math is unchanged, and
+matched before/after timing.
+
 ## Where to go next
 
 - [Persistent GEMM](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/persistent_gemm.py): multiple items, pairs and multicast.
