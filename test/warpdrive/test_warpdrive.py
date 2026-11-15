@@ -411,7 +411,7 @@ def test_register_budget_branches_are_warpgroup_uniform(monkeypatch, traced_comp
         tracing, "iket", SimpleNamespace(range_push=push, range_pop=iket.range_pop)
     )
     compile_toy.cache_clear()  # trace even if another test compiled the same key
-    compile_toy(HoleToy().enable_iket(waits=False))
+    compile_toy(HoleToy().with_settings(trace_backend="iket", trace_waits=False))
     assert [e for e in events if isinstance(e, int)] == [56, 232, 56]
     regs_of = {"prod": 56, "cons": 232, "idle": 56}
     current, seen = None, set()
@@ -805,11 +805,12 @@ def test_persistent_gemm_wrapper_keys_roles_by_content(requires_blackwell):
     from attn_gym.warpdrive.examples import persistent_gemm as pg
 
     load, mma = RoleConfig(4, regs=48), RoleConfig(5, regs=48)
-    before = len(pg._OPS)
     check_gemm(persistent_gemm, 256, 256, 64, roles={"load": load, "mma": mma})
-    assert len(pg._OPS) == before + 1
+    before = pg.compile_persistent_gemm.cache_info()
     check_gemm(persistent_gemm, 256, 256, 64, roles={"mma": mma, "load": load})
-    assert len(pg._OPS) == before + 1
+    after = pg.compile_persistent_gemm.cache_info()
+    assert (after.misses, after.currsize) == (before.misses, before.currsize)
+    assert after.hits == before.hits + 1
 
 
 def test_persistent_gemm_config_reaches_names_and_keys():

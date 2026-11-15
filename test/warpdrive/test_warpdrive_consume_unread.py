@@ -129,8 +129,7 @@ def test_consume_unread_drops_only_its_own_fence(requires_blackwell, tmp_path):
 
 
 def test_consume_unread_is_traced_as_a_wait_and_release():
-    op = Skipper("unread")
-    op.trace_protocol = True
+    op = Skipper("unread", trace_protocol=True)
     compile_skipper.__wrapped__(op)
     ops = [(chan, op_name) for chan, op_name, *_ in op._ws_log.ops["skipper"]]
     assert ops == [("ch", "wait"), ("ch", "release")] * 2

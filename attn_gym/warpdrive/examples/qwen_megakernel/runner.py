@@ -209,7 +209,10 @@ class QwenMegakernel:
         self.table = build_table(op, self.max_ctas, ops).to(device)
         rows_per_cta = -(-self.table.shape[0] // self.max_ctas)
         events = max(TRACE_EVENTS, TRACE_EVENTS_PER_ROW * rows_per_cta)
-        op.enable_trace(trace, waits=waits, events_per_role=events)
+        self.op = op = op.with_settings(
+            trace_backend=trace, trace_waits=waits, trace_events_per_role=events
+        )
+        self.workspace, self.max_ctas = op.work.launch_args(device)  # the traced kernel's stream
         self.wqkv = torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1).reshape(
             -1, op.hidden
         )

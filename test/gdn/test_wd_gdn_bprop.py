@@ -186,14 +186,12 @@ def test_gdn_bprop_reuses_one_compile_across_runtime_shapes():
 
     shapes = [((100,), 1, 2, None), ((1, 64, 65), 2, 6, 3), ((7,) * 33 + (640,), 4, 4, 16)]
     gdn_bprop.compile_gdn_bprop.cache_clear()
-    gdn_bprop._compiled.cache_clear()
     for lens, key_heads, heads, num_sm in shapes:
         q, k, v, gate, beta, _, cu = make_gdn_test_inputs(
             lens, key_heads=key_heads, value_heads=heads, dtype=torch.bfloat16
         )
         q, k, v, gate, beta = (x[0] for x in (q, k, v, gate, beta))
         _wd_backward(q, k, v, gate, beta, torch.randn_like(v), cu, lens, None, None, 0.1, num_sm)
-    assert gdn_bprop.compile_gdn_bprop.cache_info().currsize == 1
-    info = gdn_bprop._compiled.cache_info()  # the wrapper's per-configuration entry
+    info = gdn_bprop.compile_gdn_bprop.cache_info()  # one specialization, looked up per launch
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(shapes), info

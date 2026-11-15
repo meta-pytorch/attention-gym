@@ -502,13 +502,6 @@ def compile_persistent_gemm(op: PersistentGemm):
     )
 
 
-_OPS: dict = {}
-
-
-def _frozen_roles(roles):
-    return None if roles is None else tuple(sorted(roles.items()))
-
-
 def persistent_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -536,14 +529,10 @@ def persistent_gemm(
         return out.zero_()
     if tile_n is None:
         tile_n = default_tile_n(cluster or SingleCta())
-    frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in config.items()}
-    key = (schedule, mapping, cluster, tile_n, *sorted(frozen.items()))
-    op = _OPS.get(key)
-    if op is None:
-        op = _OPS[key] = PersistentGemm(
-            schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n, **config
-        )
-    fn = compile_persistent_gemm.by_static_key(key, lambda: compile_persistent_gemm(op))
+    op = PersistentGemm.get_or_build(
+        schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n, **config
+    )
+    fn = compile_persistent_gemm(op)
     workspace, sms = op.work.launch_args(a.device)
     fn(a, b, out, workspace, max_ctas or sms)
     return out

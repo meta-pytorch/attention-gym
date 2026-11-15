@@ -790,7 +790,7 @@ def gdn_tinv(
     heads = gate.shape[1]
     if heads % k.shape[1] or tinv.shape[1:] != (heads, B_T, B_T):
         raise ValueError("tinv must be [rows, heads, 64, 64] with heads a multiple of k heads")
-    op = GdnTinv(IO_DTYPE_NAMES[k.dtype], k.shape[-1])
+    op = GdnTinv.get_or_build(IO_DTYPE_NAMES[k.dtype], k.shape[-1])
     fn = compile_gdn_tinv(op, _BETA_DTYPES[beta.dtype])
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)

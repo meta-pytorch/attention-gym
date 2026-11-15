@@ -88,16 +88,14 @@ def test_alias_warning_restores_from_disk(tmp_path, monkeypatch):
 
 def test_alias_strict_off_and_unannotated():
     compile_quietly(AliasRing(), compile_alias_ring)
-    strict = AliasRing()
-    strict.alias_check = "strict"
+    strict = AliasRing(alias_check="strict")
     raises_protocol(r"alias diagnostic \(strict\)", lambda: compile_alias_ring(strict))
 
     unannotated = AliasRing(annotated=False)
     _, alias = compile_quietly(unannotated, compile_alias_ring)
     assert alias == []
 
-    off = AliasRing()
-    off.alias_check = "off"
+    off = AliasRing(alias_check="off")
     _, alias = compile_quietly(off, compile_alias_ring)
     assert alias == [] and "Alias diagnostic" not in off.describe()
     assert off.checks().aliases == {}
@@ -344,8 +342,7 @@ def test_qk_overwriting_p_before_pv_is_a_potential_hazard(fa4, tmp_path, monkeyp
 
 def test_strict_mode_raises_and_off_or_unannotated_opts_out(fa4):
     fa4.compile_quietly(fa4.QkBeforePv())  # a cached "warn" build must not satisfy a "strict" one
-    strict = fa4.QkBeforePv()
-    strict.alias_check = "strict"
+    strict = fa4.QkBeforePv(alias_check="strict")
     raises_protocol(r"alias diagnostic \(strict\)", lambda: fa4.compile_fa4_fwd(strict))
 
     unannotated = fa4.QkBeforePv(annotated=False)
@@ -355,8 +352,7 @@ def test_strict_mode_raises_and_off_or_unannotated_opts_out(fa4):
         unannotated
     )
 
-    off = fa4.QkBeforePv()
-    off.alias_check = "off"
+    off = fa4.QkBeforePv(alias_check="off")
     _, alias = fa4.compile_quietly(off)
     assert alias == [] and "Alias diagnostic" not in off.describe()
     assert off.checks().aliases == {}

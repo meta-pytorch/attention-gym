@@ -90,7 +90,9 @@ def test_disabled_emits_no_iket_ops(monkeypatch, traced_compiles):
 
 
 def test_gemm_range_names_match_plan(iket_recorder):
-    op = _compile_gemm(PersistentGemm(schedule=StaticPersistent()).enable_iket())
+    op = _compile_gemm(
+        PersistentGemm(schedule=StaticPersistent()).with_settings(trace_backend="iket")
+    )
     plan = plan_from_warpdrive(op)
     names = set(iket_recorder.pushed)
     assert set(plan.roles) == set(plan.regions) == {"epilogue", "load", "mma"}
@@ -145,7 +147,9 @@ def test_pair_plan_per_cta_and_roles_only(tmp_path, iket_recorder):
     """Per-CTA plans of a roles-only pair capture, and the leader's joins a synthetic capture
     end to end."""
     op = _compile_gemm(
-        PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()).enable_iket(waits=False)
+        PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair()).with_settings(
+            trace_backend="iket", trace_waits=False
+        )
     )
     names = set(iket_recorder.pushed)
     assert names == {"epilogue", "load", "mma", "work.scheduler"}  # waits=False: no waits
@@ -285,9 +289,9 @@ def test_globaltimer_ranges_decode_and_join_the_plan(requires_blackwell, tmp_pat
     A disk-loaded kernel must decode using range names restored from its cached trace.
     """
     compile_traced_ring.cache_clear()
-    compile_traced_ring(RingRoles().enable_trace("globaltimer"))
+    compile_traced_ring(RingRoles().with_settings(trace_backend="globaltimer"))
     hits = compile_traced_ring.cache_info().hits
-    op = RingRoles().enable_trace("globaltimer")
+    op = RingRoles().with_settings(trace_backend="globaltimer")
     session = _run_traced(op, CTAS, trace_path=tmp_path / "ring.pftrace")
     assert compile_traced_ring.cache_info().hits == hits + 1
     ranges = session.ranges
@@ -334,12 +338,14 @@ def test_globaltimer_short_buffer_and_capacity(requires_blackwell):
 
     Raw roles without cursors record one range over their whole body.
     """
-    session = _run_traced(TracedRing().enable_trace("globaltimer", waits=False), CTAS - 1)
+    session = _run_traced(
+        TracedRing().with_settings(trace_backend="globaltimer", trace_waits=False), CTAS - 1
+    )
     assert {e.cta for e in session.ranges} == {(cta,) for cta in range(CTAS - 1)}
     assert not {e.name for e in session.ranges} & {"ring.acquire", "ring.wait"}
     idle = [(e.cta, e.warp, e.payload) for e in session.ranges if e.name == "idle"]
     assert sorted(idle) == [((cta,), 3, None) for cta in range(CTAS - 1)]
-    op = TracedRing().enable_trace("globaltimer", events_per_role=2)
+    op = TracedRing().with_settings(trace_backend="globaltimer", trace_events_per_role=2)
     with pytest.warns(UserWarning, match="filled their 2 records"):
         session = _run_traced(op, CTAS)
     assert max(Counter((e.cta, e.warp) for e in session.ranges).values()) == 2
@@ -369,7 +375,7 @@ def test_ranges_must_nest(traced_compiles, backend):
     """Closing a work item's range while a region inside it is open is rejected at trace time
     (both backends pair a pop with the latest push)."""
     with pytest.raises(ProtocolError, match="ranges must nest"):
-        compile_traced_ring.__wrapped__(AdvanceInRegion().enable_trace(backend))
+        compile_traced_ring.__wrapped__(AdvanceInRegion().with_settings(trace_backend=backend))
 
 
 def test_globaltimer_needs_a_buffer_and_a_role():
@@ -380,23 +386,30 @@ def test_globaltimer_needs_a_buffer_and_a_role():
             self.run_roles(SimpleNamespace(out=out))
 
     with pytest.raises(ProtocolError, match="trace_buffer"):
-        compile_traced_ring.__wrapped__(NoBuffer().enable_trace("globaltimer"))
+        compile_traced_ring.__wrapped__(NoBuffer().with_settings(trace_backend="globaltimer"))
     with pytest.raises(ProtocolError, match="outside a role"):
-        compile_traced_ring.__wrapped__(RegionOutsideRoles().enable_trace("globaltimer"))
-    compile_traced_ring.__wrapped__(RegionOutsideRoles().enable_iket())  # IKET may: no error
-    op = TracedRing().enable_trace("globaltimer")
+        compile_traced_ring.__wrapped__(
+            RegionOutsideRoles().with_settings(trace_backend="globaltimer")
+        )
+    compile_traced_ring.__wrapped__(
+        RegionOutsideRoles().with_settings(trace_backend="iket")
+    )  # IKET may: no error
+    op = TracedRing().with_settings(trace_backend="globaltimer")
     with pytest.raises(ProtocolError, match="compiled kernel"):
         trace_session(op, CTAS)
-    with pytest.raises(ValueError, match="trace backend"):
-        op.enable_trace("nvtx")
+    with pytest.raises(ValueError, match="trace_backend must be"):
+        op.with_settings(trace_backend="nvtx")
     assert op.trace_key() == "_gtimer"
-    assert op.enable_trace("globaltimer", waits=False).trace_key() == "_gtimerroles"
+    assert (
+        op.with_settings(trace_backend="globaltimer", trace_waits=False).trace_key()
+        == "_gtimerroles"
+    )
 
 
 def test_iket_region_payload(iket_recorder):
     """With IKET, a trace_region payload becomes the range's payload; layer ranges carry none."""
     compile_traced_ring.cache_clear()
-    compile_traced_ring.__wrapped__(TracedRing().enable_iket())
+    compile_traced_ring.__wrapped__(TracedRing().with_settings(trace_backend="iket"))
     pushed = dict(zip(iket_recorder.pushed, iket_recorder.payloads))
     assert pushed == {
         "prod": False,

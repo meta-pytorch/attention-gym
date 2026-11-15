@@ -330,7 +330,7 @@ def gemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> t
         return out
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         return out.zero_()
-    compile_gemm.by_static_key("default", lambda: compile_gemm(Gemm()))(a, b, out)
+    compile_gemm(Gemm.get_or_build())(a, b, out)
     return out
 
 

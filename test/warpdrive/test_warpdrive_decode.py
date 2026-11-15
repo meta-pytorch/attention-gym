@@ -276,9 +276,10 @@ def test_named_channels_need_free_ids_and_one_cta():
         return a
 
     op = probe_kernel(
-        {"a": lambda: Ring(1, Threads, Threads, sync="named")}, {"lead": lead, "both": both}
+        {"a": lambda: Ring(1, Threads, Threads, sync="named")},
+        {"lead": lead, "both": both},
+        cluster=CtaPair(),
     )
-    op.cluster = CtaPair()
     _raises_protocol("named barriers are per CTA", op.describe)
 
     @role(warps=[range(1, 2), range(2, 3)])
@@ -289,8 +290,8 @@ def test_named_channels_need_free_ids_and_one_cta():
     op = probe_kernel(
         {"a": lambda: Ring(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)},
         {"lead": lead, "pair_cons": pair_cons},
+        cluster=CtaPair(),
     )
-    op.cluster = CtaPair()
     _raises_protocol("round-robin sides are CTA-local", op.describe)
 
 

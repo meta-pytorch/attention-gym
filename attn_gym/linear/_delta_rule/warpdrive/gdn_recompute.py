@@ -1143,7 +1143,7 @@ def gdn_recompute(
     """Fill ``checkpoints`` for packed ``k [T, HK, DK]``, ``v [T, HV, DV]``, fp32 natural-log
     ``gate [T, H]``, ``gdn_tinv`` tiles and an int32 work table ``items`` (see the module
     docstring). ``scheduler`` (int32, zeroed) is allocated when omitted. ``op`` (a
-    ``GdnRecompute`` with ``enable_trace("globaltimer")``) and its ``trace`` buffer capture a role
+    ``GdnRecompute`` built with ``trace_backend="globaltimer"``) and its ``trace`` buffer capture a role
     timeline. ``max_ctas`` caps the grid (default: one CTA per SM); with fewer CTAs than rows,
     each CTA claims several items in turn."""
     if k.dtype not in IO_DTYPE_NAMES or v.dtype != k.dtype or checkpoints.dtype != k.dtype:

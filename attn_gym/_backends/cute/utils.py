@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import operator
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from functools import cache, lru_cache
 from typing import Any, NamedTuple
 
 import torch
+
+from attn_gym._backends.triton.utils import storage_cosize
 
 TMA_ALIGNMENT_BYTES = 16
 _CUTE_DTYPES = {
@@ -72,6 +74,24 @@ def requires_int64_abi(*tensors: torch.Tensor | None) -> bool:
         cosize = 1 + sum(map(operator.mul, tensor.shape, strides)) - sum(strides)
         if tensor.numel() and cosize > 2**31:
             return True
+    return False
+
+
+def layout_overlaps(shape: Sequence[int], strides: Sequence[int]) -> bool:
+    """Whether two indices of a nonnegative-strided layout address one element.
+
+    Ordered by stride, a layout is injective when each dimension of size > 1 steps past the
+    ``storage_cosize`` of the dimensions inside it. This is sufficient, not necessary: an
+    interleaving such as strides ``(2, 3)`` over sizes ``(3, 2)`` is injective but reported as
+    overlapping. Writes through views of one buffer need no more than this.
+    """
+    inner_shape: list[int] = []
+    inner_strides: list[int] = []
+    for stride, size in sorted(zip(strides, shape)):
+        if size > 1 and stride < storage_cosize(inner_shape, inner_strides):
+            return True
+        inner_shape.append(size)
+        inner_strides.append(stride)
     return False
 
 

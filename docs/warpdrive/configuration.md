@@ -163,8 +163,8 @@ work stream and cluster. It does not autotune them.
 Static algorithm choices belong in constructor arguments. A fixed module constant can
 express an instruction or algorithm constraint: editing tracked source invalidates the
 cache, but mutating a Python global does not select a specialization. Create a new kernel
-instance instead of changing its declarations. The [compile-key contract](roles.md#compile-keys)
-lists the few settings that may change after construction and when they become frozen.
+instance instead of changing its declarations: a kernel is fixed once its constructor returns
+(see the [compile-key contract](roles.md#compile-keys)).
 
 ### Placement and registers
 

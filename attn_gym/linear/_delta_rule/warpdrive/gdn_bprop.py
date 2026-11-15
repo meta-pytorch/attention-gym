@@ -58,7 +58,6 @@ chain (noted at the declaration). A managed round trip there would add a wait to
 critical path (see ``gdn_recompute``).
 """
 
-import functools
 from dataclasses import dataclass
 
 import cutlass
@@ -2378,14 +2377,6 @@ def compile_gdn_bprop(
     )
 
 
-@functools.lru_cache
-def _compiled(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0, *dtypes):
-    """``(op, compiled)`` per static configuration: the per-call ``jit_cache`` key of a
-    warpdrive op costs ~150 us of host time, which the uncut driver would pay per backward."""
-    op = GdnBprop(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0)
-    return op, compile_gdn_bprop(op, *dtypes)
-
-
 def _dtype_name(tensor, names):
     return None if tensor is None else names[tensor.dtype]
 
@@ -2420,7 +2411,7 @@ def gdn_bprop(
     ``dstate0`` for packed ``q``/``k``/``v``/``do`` ``[T, H, D]``, a natural-log ``gate [T, H]``,
     fp32 ``beta``, ``gdn_recompute`` checkpoints and an int32 work table (see the module
     docstring). ``scheduler`` (int32, zeroed) is allocated when omitted; ``num_sm`` defaults to
-    the device's SM count. ``op`` (a ``GdnBprop`` with ``enable_trace("globaltimer")``) and its
+    the device's SM count. ``op`` (a ``GdnBprop`` built with ``trace_backend="globaltimer"``) and its
     ``trace`` buffer capture a role timeline. ``tma_slots`` (``ragged.new_tma_slots``, at
     least ``op.tma_slot_rows(heads)`` rows) is allocated when omitted."""
     if q.dtype not in IO_DTYPE_NAMES or any(t.dtype != q.dtype for t in (k, v, do, checkpoints)):
@@ -2438,9 +2429,8 @@ def gdn_bprop(
     )
     if op is None:
         flags = (use_initial_state, dstate_in is not None, dstate0 is not None)
-        op, fn = _compiled(IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags, *dtypes)
-    else:
-        fn = compile_gdn_bprop(op, *dtypes)
+        op = GdnBprop.get_or_build(IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags)
+    fn = compile_gdn_bprop(op, *dtypes)
     workspace, sms = op.work.launch_args(q.device)
     if tma_slots is None:
         tma_slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), q.device)

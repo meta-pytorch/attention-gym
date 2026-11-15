@@ -15,7 +15,7 @@ __all__ = ["WAIT_OPS", "MeasuredCapture", "MeasuredRegion", "join"]
 
 # A range named ``<x>.<op>`` with one of these ops, nested in a plan region's range on the same
 # warp, is a blocking wait inside that region. warpdrive records these for channel, turnstile
-# and named-barrier waits under ``enable_trace(waits=True)``.
+# and named-barrier waits under ``trace_waits=True``.
 WAIT_OPS = frozenset({"acquire", "wait", "peek", "tail", "turn", "sync"})
 
 

@@ -408,8 +408,7 @@ def test_kernel_ptx_and_reports(requires_blackwell, tmp_path, case):
     hazard raises) the trace leaves no alias finding and only allowlisted fence entries."""
     module, cls, args, compile_args = case
     mod = importlib.import_module(f"{PACKAGE}.{module}")
-    op = getattr(mod, cls)(*args)
-    op.alias_check = "strict"
+    op = getattr(mod, cls)(*args, alias_check="strict")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # the reports are asserted below
         _check(tmp_path, getattr(mod, COMPILE[module]), op, *compile_args)
@@ -425,9 +424,8 @@ def test_dropped_audited_fence_fails(requires_blackwell, tmp_path):
     allowlist must reject it."""
     from attn_gym.linear._delta_rule.warpdrive.kda_bprop import KdaBprop, compile_kda_bprop
 
-    op = KdaBprop("bf16", "fp32", 128, 128, True, True, True, 152)
-    op.qk_raw.release_fence = ()
-    op.alias_check = "strict"
+    op = KdaBprop("bf16", "fp32", 128, 128, True, True, True, 152, alias_check="strict")
+    op.qk_raw.release_fence = ()  # in place, on the built channel: the audit must catch it
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         _check(tmp_path, compile_kda_bprop, op, "fp32")

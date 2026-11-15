@@ -92,10 +92,6 @@ def test_grouped_gemm_shapes_and_routings_reuse_one_compile(requires_blackwell):
     assert after.currsize == before.currsize, "a shape or offset change compiled another kernel"
     assert after.misses == before.misses
     assert after.hits == before.hits + len(SIZE_CASES) - 1  # one launch each
-    # The wrapper's launch cache also keys on the configuration, not the shapes.
-    ops = len(gg._OPS)
-    _check([64, 64], 64, 64)
-    assert len(gg._OPS) == ops
 
 
 def _skewed_sizes(groups: int, total: int, seed: int = 0) -> list[int]:

@@ -54,6 +54,32 @@ choices to the kernel constructor rather than assigning attributes afterwards.
 `compile_tvm_ffi` accepts fake tensors, not real `torch.Tensor` inputs. Use
 `make_fake_compact_tensor` for compact layouts or `make_fake_strided_tensor` for explicit strides.
 
+### Launch from a hot path
+
+A launch path calls the compile function with its kernel on every call; no separate key or
+dictionary of kernels is needed:
+
+```python
+def gemm(a, b, out, ab_stages=4):
+    compile_gemm(Gemm.get_or_build(ab_stages=ab_stages))(a, b, out)
+```
+
+- `Kernel.get_or_build(*args, **kwargs)` returns the kernel for that constructor call, built on
+  the first request (about 1 µs afterwards). Kernels are immutable, so reusing one is safe. Its
+  work stream's scheduler workspace is shared too: concurrent launches of a broadcast schedule on
+  different streams need kernels of their own (`Kernel(...)`).
+- `compile_fn(op)` remembers the build it served on `op`, so the next call with that kernel
+  costs about 0.6 µs on a GB300 host. The key is derived from the call, never written by hand;
+  `cache_clear()`, a fork or a new compile target retire every entry.
+- A memo hit restores no trace record: the instance already holds the record its first call
+  restored or traced, so `describe()` and the reports are unaffected.
+
+Keep the objects a kernel's settings hold (cluster, schedules, maps,
+readiness) immutable, as warpdrive's own frozen dataclasses are.
+
+Any `jit_cache` argument can opt in: a first argument with a `__cute_memo__` dict attribute,
+which the object replaces whenever anything its key reads changes.
+
 ### Launch on a different stream
 
 The compiled function uses the current PyTorch stream **at launch time**, not the stream that
@@ -216,8 +242,9 @@ Use `compile_fn.cache_clear()` to reset the in-process entries and counters betw
 
 ### Reuse a caller-supplied key
 
-If a launch path already has a small static key, it can avoid reconstructing and hashing the
-full compile arguments on each lookup:
+Kernel launches use the [hot-path pattern](#launch-from-a-hot-path). When the compile arguments
+are not a kernel instance (tensor signature specs, configuration tuples) and building them
+costs more than a key, a launch path can look the build up under a small static key instead:
 
 - `compile_fn.by_static_key(key, call)` uses your key. On a miss, it invokes the zero-argument
   `call`, which must call the decorated compile function. Your key must fully determine that
