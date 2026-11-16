@@ -10,8 +10,6 @@ from typing import Any, NamedTuple
 
 import torch
 
-from attn_gym._backends.triton.utils import storage_cosize
-
 TMA_ALIGNMENT_BYTES = 16
 _CUTE_DTYPES = {
     torch.float16: ("Float16", "fp16"),
@@ -85,6 +83,8 @@ def layout_overlaps(shape: Sequence[int], strides: Sequence[int]) -> bool:
     interleaving such as strides ``(2, 3)`` over sizes ``(3, 2)`` is injective but reported as
     overlapping. Writes through views of one buffer need no more than this.
     """
+    from attn_gym._backends.triton.utils import storage_cosize
+
     inner_shape: list[int] = []
     inner_strides: list[int] = []
     for stride, size in sorted(zip(strides, shape)):
