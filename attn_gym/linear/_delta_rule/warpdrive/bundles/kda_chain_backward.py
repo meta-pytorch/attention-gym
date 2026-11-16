@@ -25,9 +25,9 @@
 # cadence the drivers never compile are gone.
 
 """One compiled launch for the KDA chain backward at ``--opt-level 2``, the level of every KDA
-module: the chain tables and the forward state chain (``piece_chain``), the fused H and M
-summary (``kda_summary``), the G summary (``kda_bprop_summary``), the reverse state
-chain, the seeded series recompute (``kda_recompute``) and the bprop (``kda_bprop``)."""
+module: the chain tables (``piece_chain``), the fused H and M summary (``kda_summary``), the G
+summary (``kda_bprop_summary``), the forward and reverse state chains in one launch, the seeded
+series recompute (``kda_recompute``) and the bprop (``kda_bprop``)."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -124,21 +124,6 @@ def chain_backward_host(
         tma_slots,
         stream,
     )
-    piece_chain.launch_state_chain(
-        dim_v,
-        dim_k,
-        chain_rows,
-        False,
-        heads_out,
-        num_seqs,
-        state_h,
-        state_m,
-        state_x,
-        seed,
-        main_rows,
-        None,
-        stream,
-    )
     bwd_summary_op.launch(
         q,
         k,
@@ -157,16 +142,17 @@ def chain_backward_host(
         dim_v,
         dim_k,
         chain_rows,
-        True,
+        False,
         heads_out,
         num_seqs,
-        state_g,
+        state_h,
         state_m,
-        state_dx_end,
-        dseed,
+        state_x,
+        seed,
         main_rows,
         None,
         stream,
+        reverse=(state_g, state_dx_end, dseed),
     )
     series_op.launch(
         k,
@@ -458,7 +444,7 @@ def run_chain_backward(
     num_seqs,
     scale,
 ) -> None:
-    """Replay the chain backward: one crossing into the DSL for its seven launches. The plan
+    """Replay the chain backward: one crossing into the DSL for its six launches. The plan
     validated the contract at build, so nothing here raises."""
     compiled(
         int(pieces),

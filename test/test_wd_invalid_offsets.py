@@ -15,13 +15,14 @@ import subprocess
 import sys
 
 import pytest
-import torch
+
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive GDN/KDA kernels require SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive GDN/KDA kernels require an SM100-family GPU",
 )
 
 # Runs the raw registered forward or backward op once with valid offsets, then with ``offsets``.
@@ -156,15 +157,11 @@ def _chain_shape(family: str, direction: str) -> tuple[int, int]:
         from attn_gym.linear._delta_rule.warpdrive.drivers import kda as driver
     else:
         from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as driver
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
+    tokens, heads = 4096, 2
     if direction == "forward":
-        heads = num_sm // 3
-        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD * (num_sm // heads)
         assert driver.ForwardPlan.build(tokens, 1, heads, 128, "cuda").chain
     else:
-        heads = num_sm // 2
-        tokens = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD * (num_sm // heads)
-        assert driver.BackwardPlan.build(tokens, 1, heads, "cuda").chain
+        assert driver.BackwardPlan.build(tokens, 1, heads, 128, "cuda").chain
     return tokens, heads
 
 

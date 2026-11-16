@@ -276,9 +276,10 @@ def test_named_channels_need_free_ids_and_one_cta():
         return a
 
     op = probe_kernel(
-        {"a": lambda: Ring(1, Threads, Threads, sync="named")}, {"lead": lead, "both": both}
+        {"a": lambda: Ring(1, Threads, Threads, sync="named")},
+        {"lead": lead, "both": both},
+        cluster=CtaPair(),
     )
-    op.cluster = CtaPair()
     _raises_protocol("named barriers are per CTA", op.describe)
 
     @role(warps=[range(1, 2), range(2, 3)])
@@ -289,8 +290,8 @@ def test_named_channels_need_free_ids_and_one_cta():
     op = probe_kernel(
         {"a": lambda: Ring(2, Threads, Threads, consumer_sharing=Sharing.ROUND_ROBIN)},
         {"lead": lead, "pair_cons": pair_cons},
+        cluster=CtaPair(),
     )
-    op.cluster = CtaPair()
     _raises_protocol("round-robin sides are CTA-local", op.describe)
 
 
@@ -584,6 +585,9 @@ def test_decode_matches_fa4_partials_bitwise(
     Per-sequence lengths use split counts from FA4's prepare kernel, then FA4's combine.
     """
     interface = pytest.importorskip("flash_attn.cute.interface")
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        # FA4's SwapAB selector accepts only device_arch 100/103.
+        pytest.skip("FA4's SwapAB decode kernel runs only on SM100 and SM103")
     monkeypatch.setenv("FLASH_ATTENTION_SM100_BACKEND", "swapab")
     torch.manual_seed(0)
     h, hkv = 8, 1

@@ -11,12 +11,13 @@ from test_delta_affine_summary import (
     state_summary_reference,
 )
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.cute import affine_summary_fwd as forward
 from attn_gym.linear._delta_rule.cute import affine_summary_rev as reverse
 from attn_gym.warpdrive.cache import detect_compile_target, get_compile_target, set_compile_target
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    not cuda_runs_sm100_kernels(),
     reason="native affine summaries require Blackwell",
 )
 

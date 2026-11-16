@@ -6,15 +6,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.cute.utils import requires_int64_abi
 from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.sparse.indexer.impl import cute as impl
 from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
 
-CUTE_SUPPORTED = torch.cuda.is_available() and torch.cuda.get_device_capability() in (
-    (10, 0),
-    (10, 3),
-)
+CUTE_SUPPORTED = cuda_runs_sm100_kernels()
 
 
 @pytest.mark.parametrize("batch", [1, 3, 64])
@@ -32,7 +30,7 @@ def test_score_workspace_bound(batch, tokens):
 def radix_impl():
     """Load the optional backend only on compatible hardware."""
     if not CUTE_SUPPORTED:
-        pytest.skip("SM100 or SM103 required for the CuTe radix port")
+        pytest.skip("SM100-family GPU required for the CuTe radix port")
     pytest.importorskip("cutlass.cute")
     return impl
 

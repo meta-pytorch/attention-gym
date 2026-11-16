@@ -9,6 +9,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
     chunk_kda_bwd_wy_dqkg,
@@ -21,8 +22,8 @@ from attn_gym.testing.kda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the fused CuTe WY backward requires CUDA capability 10.0 or 10.3",
+    not cuda_runs_sm100_kernels(),
+    reason="the fused CuTe WY backward requires an SM100-family GPU",
 )
 
 

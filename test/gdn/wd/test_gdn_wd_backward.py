@@ -10,6 +10,7 @@ import torch
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn
 from attn_gym.linear._delta_rule.warpdrive.launchers.gdn_backward import (
     chunk_gdn_bwd_warpdrive_packed,
@@ -20,8 +21,8 @@ from attn_gym.testing.gdn import GatePattern
 from attn_gym.testing.kda import assert_matches_low_precision_reference
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive GDN path requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive GDN path requires an SM100-family GPU",
 )
 
 BackwardStateMode = Literal["none", "initial", "cotangent"]
@@ -317,11 +318,12 @@ def test_gdn_wd_chain_backward_mixed_small_beta_matches_reference(monkeypatch) -
     """The piece-chain backward runs its own bprop launch; dBeta must stay exact there too."""
     from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as gdn_driver
 
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    cost = gdn_driver.CHAIN_COST_BWD[128]
+    monkeypatch.setitem(gdn_driver.CHAIN_COST_BWD, 128, cost._replace(overhead_tokens=0))
     inputs = make_gdn_test_inputs(
         (2048,), key_heads=1, value_heads=2, dtype=torch.bfloat16, seed=163
     )
-    assert gdn_driver.BackwardPlan.build(2048, 1, 2, inputs[0].device).pieces > 1
+    assert gdn_driver.BackwardPlan.build(2048, 1, 2, 128, inputs[0].device).pieces > 1
     beta = inputs[4]
     beta[:, ::4] = 0.0
     beta[:, 1::4] = 1e-12

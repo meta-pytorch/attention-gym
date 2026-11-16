@@ -7,15 +7,23 @@ import torch
 
 pytest.importorskip("cutlass.cute")  # the bench module imports the megakernel
 
-from attn_gym.warpdrive.examples.bench_qwen_megakernel import (
+import torch.nn.functional as F
+
+from attn_gym.warpdrive.examples.qwen_megakernel import ref as ref_module
+from attn_gym.warpdrive.examples.qwen_megakernel.bench import (
     decode_step_fast,
+    decode_step_fast_batch,
     prepare_fast_weights,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
+    QwenConfig,
     compare_logits,
     decode_step_ref,
     load_qwen3_weights,
     make_decode_state,
+    prompt_tokens,
+    random_weights,
+    rope_cos_sin,
     validate_against_hf,
 )
 
@@ -61,9 +69,184 @@ def test_decode_matches_hf_and_writes_only_current_cache_position(checkpoint: Pa
         assert torch.isnan(cache[:, :, pos + 1]).all()
 
 
+def test_moe_decode_matches_hf(tmp_path: Path) -> None:
+    """A small random Qwen3-MoE, saved by HF and read back by load_qwen3_weights (per-expert
+    tensors, router, untied head, transformers 5 config names): prefill and decode logits agree
+    with Qwen3MoeForCausalLM to bf16 noise."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    torch.manual_seed(0)
+    config = transformers.Qwen3MoeConfig(
+        hidden_size=512, num_hidden_layers=3, num_attention_heads=8, num_key_value_heads=2,
+        head_dim=128, intermediate_size=1024, moe_intermediate_size=256, num_experts=16,
+        num_experts_per_tok=4, norm_topk_prob=True, vocab_size=2048, tie_word_embeddings=False,
+    )  # fmt: skip
+    model = transformers.Qwen3MoeForCausalLM(config).to(torch.bfloat16).cuda().eval()
+    model.save_pretrained(tmp_path)
+    weights = load_qwen3_weights(str(tmp_path))
+    assert weights.config.num_experts == 16 and weights.router.shape == (3, 16, 512)
+    assert weights.gate.shape == (3, 16, 256, 512) and weights.down.shape == (3, 16, 512, 256)
+    ctx = 40
+    with torch.no_grad():
+        output = model(prompt_tokens(weights, ctx, 0)[None], use_cache=True, logits_to_keep=1)
+        caches, token, pos = make_decode_state(weights, ctx, ctx + 4, seed=0)
+        assert token == output.logits[0, -1].argmax()
+        for step in range(3):
+            ours = decode_step_ref(weights, token, pos + step, *caches)
+            output = model(token.reshape(1, 1), past_key_values=output.past_key_values)
+            theirs = output.logits[0, -1].float()
+            torch.testing.assert_close(ours, theirs, atol=0.05, rtol=0.02)
+            assert ours.argmax() == theirs.argmax()
+            token = theirs.argmax()
+
+
+def test_yarn_decode_matches_hf(tmp_path: Path) -> None:
+    """A small random Qwen3 with YaRN RoPE (transformers 5's rope_parameters), saved by HF and
+    read back by load_qwen3_weights: cos and sin match Qwen3RotaryEmbedding, and decode logits
+    past the original context match Qwen3ForCausalLM. The legacy rope_scaling spelling parses
+    to the same scaling."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    transformers = pytest.importorskip("transformers")
+    pytest.importorskip("safetensors")
+    torch.manual_seed(0)
+    yarn = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 64}
+    config = transformers.Qwen3Config(
+        hidden_size=512, num_hidden_layers=2, num_attention_heads=8, num_key_value_heads=2,
+        head_dim=128, intermediate_size=1024, vocab_size=2048, max_position_embeddings=256,
+        rope_parameters={"rope_theta": 1e6, **yarn},
+    )  # fmt: skip
+    model = transformers.Qwen3ForCausalLM(config).to(torch.bfloat16).cuda().eval()
+    # .to() rounds the rotary inv_freq buffer to bf16; from_pretrained(dtype=bf16) keeps fp32.
+    rotary = transformers.models.qwen3.modeling_qwen3.Qwen3RotaryEmbedding(config)
+    model.model.rotary_emb = rotary.cuda()
+    model.save_pretrained(tmp_path)
+    weights = load_qwen3_weights(str(tmp_path))
+    scaling = weights.config.rope_scaling
+    assert (scaling.factor, scaling.original_max_position) == (4.0, 64)
+    legacy = {**config.to_dict(), "rope_scaling": yarn, "rope_theta": 1e6}
+    del legacy["rope_parameters"]
+    assert QwenConfig.from_hf(legacy).rope_scaling == scaling
+
+    positions = torch.arange(256, device="cuda")
+    x = torch.zeros(1, 256, 128, device="cuda")
+    hf_cos, hf_sin = model.model.rotary_emb(x, positions[None])
+    cos, sin = rope_cos_sin(weights.config, positions.float())
+    torch.testing.assert_close(cos, hf_cos[0], atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(sin, hf_sin[0], atol=1e-6, rtol=1e-6)
+
+    ctx = 150  # past the 64-token original context
+    with torch.no_grad():
+        output = model(prompt_tokens(weights, ctx, 0)[None], use_cache=True, logits_to_keep=1)
+        caches, token, pos = make_decode_state(weights, ctx, ctx + 4, seed=0)
+        assert token == output.logits[0, -1].argmax()
+        for step in range(3):
+            ours = decode_step_ref(weights, token, pos + step, *caches)
+            output = model(token.reshape(1, 1), past_key_values=output.past_key_values)
+            theirs = output.logits[0, -1].float()
+            torch.testing.assert_close(ours, theirs, atol=0.05, rtol=0.02)
+            token = theirs.argmax()
+
+
+def test_rope_scaling_parsing() -> None:
+    """Configs without scaling, with transformers 5's rope_type "default", or with the legacy
+    "type" key parse; other scaling types are rejected rather than silently ignored."""
+    transformers = pytest.importorskip("transformers")
+    base = transformers.Qwen3Config().to_dict()
+    base.pop("rope_parameters", None)
+    base["rope_theta"] = 1e6
+    assert QwenConfig.from_hf({**base, "rope_scaling": None}).rope_scaling is None
+    default = {"rope_type": "default", "rope_theta": 1e6}
+    assert QwenConfig.from_hf({**base, "rope_parameters": default}).rope_scaling is None
+    legacy = {"type": "yarn", "factor": 2.0, "original_max_position_embeddings": 1024}
+    scaling = QwenConfig.from_hf({**base, "rope_scaling": legacy}).rope_scaling
+    assert (scaling.factor, scaling.original_max_position) == (2.0, 1024)
+    default_factor = {"rope_type": "yarn", "original_max_position_embeddings": 1024}
+    config = {**base, "max_position_embeddings": 4096, "rope_scaling": default_factor}
+    assert QwenConfig.from_hf(config).rope_scaling.factor == 4.0
+    with pytest.raises(ValueError, match="only YaRN"):
+        QwenConfig.from_hf({**base, "rope_scaling": {"rope_type": "linear", "factor": 2.0}})
+
+
 def test_error_budget_rejects_wrong_token_and_nonfinite_logits() -> None:
     high = torch.tensor([1.0, 2.0, 3.0])
     bf16 = torch.tensor([1.01, 2.02, 3.01])
     assert compare_logits(bf16, bf16, high)["passed"]
     assert not compare_logits(high.flip(0), bf16, high)["passed"]
     assert not compare_logits(torch.full_like(high, float("nan")), bf16, high)["passed"]
+
+
+def test_compare_logits_accepts_either_token_of_a_near_tie():
+    """Eager and the test pick different tokens 0.01 apart in the oracle (well within eager's
+    error): the gate passes. A token the oracle scores far below eager's fails."""
+    high = torch.tensor([8.0, 7.99, 2.0, 1.0], dtype=torch.float64)
+    eager = torch.tensor([7.97, 8.0, 2.05, 0.95])
+    test = torch.tensor([8.01, 7.98, 2.0, 1.04])
+    metrics = compare_logits(test, eager, high)
+    assert not metrics["argmax_match"] and metrics["argmax_ok"] and metrics["passed"], metrics
+    wrong = torch.tensor([7.9, 7.95, 8.05, 1.0])
+    assert not compare_logits(wrong, eager, high)["argmax_ok"]
+
+
+def router_rank_gap(weights, token, pos, caches) -> float:
+    """The reference's smallest gap between its 8th and 9th router logits over the layers."""
+    recorded, original = [], ref_module.mlp
+
+    def spy(config, w, x, forced=None):
+        recorded.append(F.linear(x, w["router"]).float()[0])
+        return original(config, w, x, forced)
+
+    ref_module.mlp = spy
+    try:
+        decode_step_ref(weights, token, pos, *[c.clone() for c in caches])
+    finally:
+        ref_module.mlp = original
+    k = weights.config.experts_per_token
+    return min((r.sort(descending=True).values[k - 1] - r.sort(descending=True).values[k]).item()
+               for r in recorded)  # fmt: skip
+
+
+@pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+def test_batched_baseline_matches_the_reference_per_sequence(moe):
+    """decode_step_fast_batch: 5 sequences at different positions, each within the bf16 budget
+    of its own reference step, with only its cache row pos written. A MoE sequence may route
+    differently only at a near-tie of the reference's 8th and 9th router logits (the batched
+    router GEMM rounds differently from the reference's single-row one)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    config = QwenConfig(
+        hidden_size=1024, num_layers=2, num_q_heads=32 if moe else 16,
+        num_kv_heads=4 if moe else 8, intermediate_size=1024 if moe else 3072, vocab_size=4096,
+        **({"num_experts": 128, "experts_per_token": 8, "moe_intermediate_size": 256} if moe else {}),
+    )  # fmt: skip
+    weights = random_weights(config)
+    batch, max_len = 5, 512
+    states = [make_decode_state(weights, 60 + 37 * b, max_len, seed=b) for b in range(batch)]
+    k = torch.stack([s[0][0] for s in states])
+    v = torch.stack([s[0][1] for s in states])
+    for b, (_, _, pos) in enumerate(states):  # masked SDPA reads the unused rows: zero them
+        k[b][:, :, pos:] = 0
+        v[b][:, :, pos:] = 0
+    tokens = torch.stack([s[1].reshape(()) for s in states])
+    positions = torch.tensor([s[2] for s in states], device="cuda")
+    ours_k, ours_v = k.clone(), v.clone()
+    layers = range(config.num_layers)
+    logits = decode_step_fast_batch(
+        prepare_fast_weights(weights, max_len), tokens, positions,
+        tuple(ours_k[:, layer] for layer in layers), tuple(ours_v[:, layer] for layer in layers),
+    )  # fmt: skip
+    for b, (_, _, pos) in enumerate(states):
+        caches = (k[b], v[b])
+        theirs = decode_step_ref(weights, tokens[b], pos, *[c.clone() for c in caches])
+        high = decode_step_ref(
+            weights, tokens[b], pos, *[c.clone() for c in caches], dtype=torch.float32
+        )
+        metrics = compare_logits(logits[b], theirs, high)
+        if not metrics["passed"] and moe:
+            assert router_rank_gap(weights, tokens[b], pos, caches) <= 2**-6, (b, metrics)
+        else:
+            assert metrics["passed"], (b, metrics)
+        assert torch.equal(ours_k[b][:, :, :pos], k[b][:, :, :pos])
+        assert torch.equal(ours_k[b][:, :, pos + 1 :], k[b][:, :, pos + 1 :])

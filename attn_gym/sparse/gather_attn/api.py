@@ -416,7 +416,7 @@ def gather_attn(
 
         sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to
             reuse sparse_kv as the values. Separate values and 1 < kv_heads < num_heads
-            run on Impl.REFERENCE, or on the Triton backend with SM100 or SM103,
+            run on Impl.REFERENCE, or on the Triton backend with an SM100-family GPU,
             bfloat16 inputs, head_dim <= 256 and divisible by 16, unit inner strides,
             and sliding_window_size <= 2048; other inputs raise. The CuTe backend
             requires shared values and one KV head. Passing the key tensor objects

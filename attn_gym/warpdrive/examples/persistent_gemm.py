@@ -233,6 +233,7 @@ class PersistentGemm(WarpSpecialized):
     ):
         tiled_mma = params.tiled_mma
         tCtAcc = cute.make_tensor(tmem.ptr("acc"), params.acc_layout)
+        tmem.skip_teardown_drain(reason="the MMA warp issues no tcgen05.ld or tcgen05.st")
         ab = ab.views(A=params.tCrA, B=params.tCrB)
         while work.valid:
             with acc.produce() as a:
@@ -318,14 +319,24 @@ class PersistentGemm(WarpSpecialized):
                 cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
                 cute.arch.fence_view_async_shared()  # st.shared -> TMA store
                 # All epilogue threads reach both syncs convergently, allowing aligned=True.
-                self.epi_sync.sync(aligned=True)
+                # Nothing between them touches TMEM: the first sync's before fence orders this
+                # subtile's loads for both, and the second's after fence orders the next loads.
+                self.epi_sync.sync(
+                    aligned=True,
+                    skip_fence="after",
+                    reason="no tcgen05 op before the next sync, whose after fence covers it",
+                )
                 if warp == 0:
                     cute.copy(params.tma_c, bSG_sC[None, buf], dst[None, i])
                     cute.arch.cp_async_bulk_commit_group()
                     # Buffer `buf` is rewritten c_stages subtiles later; keep at most
                     # c_stages - 1 stores still reading SMEM.
                     cute.arch.cp_async_bulk_wait_group(self.c_stages - 1, read=True)
-                self.epi_sync.sync(aligned=True)
+                self.epi_sync.sync(
+                    aligned=True,
+                    skip_fence="before",
+                    reason="no tcgen05 op since the previous sync's before fence",
+                )
             if cutlass.const_expr(not self.early_release):
                 a.release()
             if cutlass.const_expr(rotate):
@@ -491,13 +502,6 @@ def compile_persistent_gemm(op: PersistentGemm):
     )
 
 
-_OPS: dict = {}
-
-
-def _frozen_roles(roles):
-    return None if roles is None else tuple(sorted(roles.items()))
-
-
 def persistent_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -525,14 +529,10 @@ def persistent_gemm(
         return out.zero_()
     if tile_n is None:
         tile_n = default_tile_n(cluster or SingleCta())
-    frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in config.items()}
-    key = (schedule, mapping, cluster, tile_n, *sorted(frozen.items()))
-    op = _OPS.get(key)
-    if op is None:
-        op = _OPS[key] = PersistentGemm(
-            schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n, **config
-        )
-    fn = compile_persistent_gemm.by_static_key(key, lambda: compile_persistent_gemm(op))
+    op = PersistentGemm.get_or_build(
+        schedule=schedule, mapping=mapping, cluster=cluster, tile_n=tile_n, **config
+    )
+    fn = compile_persistent_gemm(op)
     workspace, sms = op.work.launch_args(a.device)
     fn(a, b, out, workspace, max_ctas or sms)
     return out

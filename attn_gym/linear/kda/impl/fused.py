@@ -28,6 +28,7 @@ from attn_gym.linear.kda.ops import (
     chunk_replay_prepare_op,
     chunk_replay_state_gather_op,
 )
+from attn_gym.linear.kda.validation import cast_to_kernel_dtypes
 from attn_gym.linear.types import ReplayState
 
 _HEAD_DIM = 128
@@ -217,14 +218,8 @@ def chunk_forward(
     _validate_fused_constraints(q, v)
     output_dtype = q.dtype
     output_shape = q.shape
-    kernel_dtype = (
-        q.dtype
-        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
-        else torch.bfloat16
-    )
-    q, k, v = (tensor.to(kernel_dtype) for tensor in (q, k, v))
-    gate = gate.float()
-    beta = beta.float().contiguous()
+    q, k, v, gate, beta = cast_to_kernel_dtypes(q, k, v, gate, beta)
+    beta = beta.contiguous()
     batch, tokens = output_shape[:2]
     metadata = (
         prepare_ragged_chunk_metadata(cu_seqlens, tokens, _CHUNK_SIZE)

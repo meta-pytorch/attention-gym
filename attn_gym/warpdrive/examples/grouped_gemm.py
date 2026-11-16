@@ -65,7 +65,6 @@ from attn_gym.warpdrive.examples.persistent_gemm import (
     EPI_TILE_NS,
     MAX_C_STAGES,
     TILE_K,
-    _frozen_roles,
 )
 from attn_gym.warpdrive.examples.tma_tiles import tma_partition_tiles
 
@@ -598,9 +597,6 @@ def check_grouped_gemm_args(
     return out
 
 
-_OPS: dict = {}
-
-
 def grouped_gemm(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -627,12 +623,8 @@ def grouped_gemm(
     if a.shape[1] == 0:  # no K tiles: the MMA would publish an unwritten accumulator
         covered = torch.arange(out.shape[0], device=out.device) < offsets[-1:]
         return out.masked_fill_(covered[:, None], 0)
-    frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in config.items()}
-    key = (schedule, cluster, *sorted(frozen.items()))
-    op = _OPS.get(key)
-    if op is None:
-        op = _OPS[key] = GroupedGemm(schedule=schedule, cluster=cluster, **config)
-    fn = compile_grouped_gemm.by_static_key(key, lambda: compile_grouped_gemm(op))
+    op = GroupedGemm.get_or_build(schedule=schedule, cluster=cluster, **config)
+    fn = compile_grouped_gemm(op)
     workspace, sms = op.work.launch_args(a.device)
     fn(a, b, out, offsets, workspace, max_ctas or sms)
     return out

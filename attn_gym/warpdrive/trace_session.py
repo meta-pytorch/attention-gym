@@ -24,7 +24,7 @@ from attn_gym.warpdrive.protocol import ProtocolError
 def trace_session(
     kernel, num_ctas: int, *, trace_path: str | Path | None = None, device=None
 ) -> AbstractContextManager[ProfileSession]:
-    """Capture one launch of a compiled kernel with ``enable_trace("globaltimer")``.
+    """Capture one launch of a compiled kernel with ``trace_backend="globaltimer"``.
 
     Pass ``session.prof.tensor`` to ``run_roles(..., trace_buffer=...)``. ``num_ctas``
     sizes the capture. After exit, ``session.ranges`` contains names, ``cta=(CTA,)``,
@@ -35,7 +35,7 @@ def trace_session(
     """
     if kernel.trace_backend != "globaltimer":
         raise ProtocolError(
-            f"trace_session needs enable_trace('globaltimer'), not {kernel.trace_backend!r}"
+            f"trace_session needs trace_backend='globaltimer', not {kernel.trace_backend!r}"
         )
     if not kernel._ws_traced:
         raise ProtocolError(
@@ -44,9 +44,18 @@ def trace_session(
     return capture(kernel, num_ctas, trace_path, device)
 
 
+def _roles(kernel) -> list:
+    """The kernel's role instances. A build restored from the compile cache carries its trace
+    record but collects its roles only on demand; plain stand-ins (tests) carry them as is."""
+    collect = getattr(kernel, "_collect", None)
+    if collect is not None:
+        collect()
+    return kernel._ws_roles
+
+
 @contextmanager
 def capture(kernel, num_ctas: int, trace_path, device) -> Iterator[ProfileSession]:
-    roles = kernel._ws_roles
+    roles = _roles(kernel)
     capacity = kernel.trace_events_per_role
     with profile_session(
         max_events_per_unit=len(roles) * capacity,
@@ -61,7 +70,7 @@ def capture(kernel, num_ctas: int, trace_path, device) -> Iterator[ProfileSessio
     if full:
         warnings.warn(
             f"warpdrive trace: role(s) {full} filled their {capacity} records in some CTA; "
-            "later ranges were dropped (raise enable_trace(events_per_role=...))",
+            "later ranges were dropped (raise trace_events_per_role)",
             stacklevel=3,
         )
     if trace_path is not None:
@@ -73,7 +82,7 @@ def write_trace(path: str | Path, kernel, ranges: list[Range], **options) -> Pat
 
     ``options`` (``name``, ``args``, ``flows``) pass through to ``write_ranges``.
     """
-    lanes = {r.first_warp: r.name for r in kernel._ws_roles}
+    lanes = {r.first_warp: r.name for r in _roles(kernel)}
     return write_ranges(
         path,
         ranges,
@@ -95,7 +104,7 @@ def work_item_spans(ranges: list[Range], role: str) -> list[list]:
     items = sorted(work_item_ranges(ranges, role).items())
     if not items:
         raise ValueError(
-            f"no {role} work-item ranges: trace a launch with enable_trace('globaltimer')"
+            f"no {role} work-item ranges: trace a launch with trace_backend='globaltimer'"
         )
     t0 = min(item.start_ns for _, item in items)
     return [
@@ -111,7 +120,7 @@ def role_tracks(ranges: list[Range], kernel, origin_ns: int) -> list[list]:
     ``n`` deep inside them, such as ``trace_region``s, on ``"<role> +n"``; a range with its
     enclosing range's span nests inside it, the role's own range outermost. Ranges recorded by no
     role's first warp (compact records) are skipped."""
-    roles = {r.first_warp: r for r in kernel._ws_roles}
+    roles = {r.first_warp: r for r in _roles(kernel)}
     by_warp: dict[tuple[int, int], list[Range]] = defaultdict(list)
     for item in ranges:
         if item.warp in roles:

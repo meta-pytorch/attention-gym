@@ -90,7 +90,11 @@ from cutlass import Float32, Int32, cute
 from cutlass.cute.arch import inline_ptx
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
+    BEFORE_FENCE_COVERED,
+    BOTH_FENCES_COVERED,
     Barriers,
     Consumer,
     Local,
@@ -115,6 +119,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
 from .blockwise_inverse import invert_unit_lower_16x16_fragments
 from .contract import tma_divisibility
@@ -175,7 +180,6 @@ from .umma import (
     smem_desc,
 )
 
-DIMS = (64, 128)
 LOG2_E = 1.4426950408889634
 DSTATE_DST = 9  # work-item field: the sequence whose d_initial_state the item stores
 RAW_STAGES = 2
@@ -223,12 +227,32 @@ TSIG_COUNTS = (1, 1, 1, 1, 1, 1, 1, 128, 128, 128, 1, 128, 128, 128, 32, 128, 12
 
 
 @cute.jit
-def _wait(bar, phase):
+def _wait(bar, phase, fence: cutlass.Constexpr[bool] = True):
     """Hint-less parity wait written as upstream's loop (``while not try_wait``): ptxas places
     the retry out of line, so a satisfied wait falls through instead of taking a branch over a
-    peeled retry (an instruction-fetch stall on this kernel's 16 warps)."""
+    peeled retry (an instruction-fetch stall on this kernel's 16 warps). Then
+    ``tcgen05.fence::after_thread_sync``: the raw ``tsig`` signals hand TMEM between threads;
+    ``fence=False`` omits it where a later wait's fence precedes the caller's next tcgen05
+    operation (``AFTER_FENCE_COVERED``)."""
     while not cute.arch.mbarrier_try_wait(bar, phase):
         pass
+    if cutlass.const_expr(fence):
+        tcgen05_after_thread_sync()
+
+
+@cute.jit
+def before_sync_and_arrive(bar):
+    """One thread's arrival on a raw ``tsig`` signal after ``tcgen05.fence::before_thread_sync``,
+    which orders its completed TMEM accesses before the arrival (PTX ISA 9.7.18.6.3)."""
+    tcgen05_before_thread_sync()
+    arrive(bar)
+
+
+@cute.jit
+def arrive(bar):
+    """One thread's arrival on a raw ``tsig`` signal without a fence: only where an earlier
+    before fence already follows its TMEM accesses (``BEFORE_FENCE_COVERED``)."""
+    cute.arch.mbarrier_arrive(bar)
 
 
 @cute.jit
@@ -334,8 +358,8 @@ class KdaBprop(WarpSpecialized):
         use_dstate0: bool,
         num_ctas: int,
     ):
-        if d_k not in DIMS or d_v not in DIMS:
-            raise ValueError(f"the KDA bprop serves d_k, d_v in {DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"the KDA bprop serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if io not in ("fp16", "bf16") or gate not in ("fp32", io):
             raise ValueError(f"io must be fp16/bf16 and the gate fp32 or io, got {io}, {gate}")
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
@@ -522,8 +546,11 @@ class KdaBprop(WarpSpecialized):
         )
 
     @cute.jit
-    def next_tile(self, sched):
-        with sched.consume() as h:
+    def next_tile(self, sched, skip_fence=None):
+        """The next tile of the item list; ``skip_fence`` as for the consume (its reason is
+        ``AFTER_FENCE_COVERED``/``BEFORE_FENCE_COVERED``)."""
+        reason = BEFORE_FENCE_COVERED if skip_fence == "before" else AFTER_FENCE_COVERED
+        with sched.consume(skip_fence=skip_fence, reason=reason) as h:
             tile = h.data[0]
         return sched, tile
 
@@ -535,10 +562,13 @@ class KdaBprop(WarpSpecialized):
         return cutlass.Boolean(rev > 0)
 
     @cute.jit
-    def sig_wait(self, name: cutlass.Constexpr[str], bar, phase):
-        """A raw (``tsig`` or unbound channel) wait, as a named trace range when tracing."""
+    def sig_wait(
+        self, name: cutlass.Constexpr[str], bar, phase, fence: cutlass.Constexpr[bool] = True
+    ):
+        """A raw (``tsig`` or unbound channel) wait, as a named trace range when tracing
+        (``fence`` as for ``_wait``)."""
         with self.trace_region(name + ".wait"):
-            _wait(bar, phase)
+            _wait(bar, phase, fence)
 
     @cute.jit
     def lane_base(self, tmem, warp):
@@ -703,7 +733,9 @@ class KdaBprop(WarpSpecialized):
                     # ---- beta (warp 0): one chunk's scalars, zero past the sequence end --------
                     if warp == 0:
                         bstage = n & (BETA_STAGES - 1)
-                        self.sig_wait("beta_empty", beta_empty + bstage, ((n >> 2) + 1) & 1)
+                        self.sig_wait(
+                            "beta_empty", beta_empty + bstage, ((n >> 2) + 1) & 1, fence=False
+                        )
                         if lane < B_T:
                             token = chunk_start + lane
                             value = Float32(0.0)
@@ -730,7 +762,7 @@ class KdaBprop(WarpSpecialized):
                         tmem,
                     )
                 base += n_chunks
-                sched, tile = self.next_tile(sched)
+                sched, tile = self.next_tile(sched, skip_fence="before")
             work.advance()
         return raw, state, decay, qk_raw, state_in, sched, work
 
@@ -759,7 +791,7 @@ class KdaBprop(WarpSpecialized):
         dk_halves = d_k // 64
         channel_rows = d_k // 4
         valid = seqlen - chunk_start
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         s_q = params.s_q + rh.index * (d_k * B_T * 2)
         s_k = params.s_k + rh.index * (d_k * B_T * 2)
         s_ex = params.s_g + rh.index * (d_k * B_T * 4)  # fp32 exchange over the raw gate stage
@@ -813,7 +845,8 @@ class KdaBprop(WarpSpecialized):
                     self.gate_dtype,
                 )
                 graw[row] = g * Float32(LOG2_E) if chunk_start + row < seqlen else Float32(0.0)
-            self.cg0_sync.sync(aligned=True)  # every raw gate is read before the exchange stores
+            # Every raw gate is read before the exchange stores.
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             for pair in cutlass.range_constexpr(B_T // 2):
                 row0 = pair * 2
                 row1 = row0 + 1
@@ -838,11 +871,11 @@ class KdaBprop(WarpSpecialized):
                 exp_g_last = e1
 
         # ---- the decay stage: 2^g_last first (cg1's dS decay) --------------------------------
-        dh = decay.acquire()
+        dh = decay.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         stage = dh.index
         if channel_active:
             sts_f32(params.s_scale + 4 * (stage * d_k + channel), exp_g_last)
-        cute.arch.mbarrier_arrive(tsig + SCALE + stage)
+        arrive(tsig + SCALE + stage)
 
         # ---- raw Q/K: SMEM -> TMEM ring (channel-major, zero past the sequence end) ---------
         qh = qk_raw.acquire()
@@ -867,7 +900,8 @@ class KdaBprop(WarpSpecialized):
         tmem_st("32x32b", lane_base + tmem.cols("qraw") + qslot, [q_words[i] for i in range(8)])
         tmem_st("32x32b", lane_base + tmem.cols("kraw") + qslot, [k_words[i] for i in range(8)])
         qh.commit()
-        self.cg0_sync.sync(aligned=True)  # every exp2 exchange store lands before its reads
+        # Every exp2 exchange store lands before its reads.
+        self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
 
         # ---- raw Q/K rows, exp2(g) of the row -------------------------------------------------
         decay_row = warp * (B_T // 4) + (lane >> 3)
@@ -906,7 +940,7 @@ class KdaBprop(WarpSpecialized):
                     + swz128(decay_row ^ f_seg, f_dim - f_seg * 32, 4)
                 )
                 exp_g += lds_v4_f32(s_ex + 4 * idx)
-        rh.release()
+        rh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- K decay = K 2^g, K inv = K 2^-g ----------------------------------------------------
         op_stage = stage * (d_k * B_T * 2)
@@ -927,7 +961,7 @@ class KdaBprop(WarpSpecialized):
             st_shared_v4(params.s_kinv + off, ki)
             st_shared_v4(params.s_kdecay + off, kd)
         cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(tsig + KDI + stage)
+        arrive(tsig + KDI + stage)
 
         # ---- Q decay = (scale Q) 2^g --------------------------------------------------------------
         scale = params.scale
@@ -942,10 +976,10 @@ class KdaBprop(WarpSpecialized):
                 half * (B_T * 64) + decay_row * 64 + swz128(decay_row, lane_in_row * 8)
             )
             st_shared_v4(params.s_qdecay + off, qd)
-        dh.commit()
+        dh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- state copy: SMEM -> TMEM f16 (k lanes x v columns) ------------------------------
-        sih = state_in.acquire()
+        sih = state_in.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         if chunk >= self.first_state_chunk:
             sth = state.wait()
             ldm_row = ((lane >> 4) << 3) + (lane & 7)
@@ -973,7 +1007,7 @@ class KdaBprop(WarpSpecialized):
                     tmem_st("16x128b", state_col + (16 << 16) + blk * 8, frag_hi)
             cute.arch.fence_view_async_tmem_store()
             sth.release()
-        sih.commit()
+        sih.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return raw, state, decay, qk_raw, state_in
 
     # ---- compute group 1 (warps 4-7): dS seed/capture, value-side TMEM operands, dbeta -----
@@ -1063,7 +1097,7 @@ class KdaBprop(WarpSpecialized):
                 if cutlass.const_expr(self.use_dstate0):
                     self.store_dstate0(params, geo, tmem, tile, batch, head, n_chunks)
                 if n_chunks > 0:
-                    cute.arch.mbarrier_arrive(tsig + DSTATE0)
+                    before_sync_and_arrive(tsig + DSTATE0)
                 base += n_chunks
                 sched, tile = self.next_tile(sched)
             work.advance()
@@ -1074,7 +1108,7 @@ class KdaBprop(WarpSpecialized):
         """dS of the item's last chunk: ``dstate_in[batch, head] 2^g_last`` (zero for a split
         item's warmup), as the fp32 accumulator, its fp16 MMA operand and the SMEM tile."""
         _l, _t, _w, lane_base, _lo, _hi, value_dim, row_valid = geo
-        dh = dstate.acquire()
+        dh = dstate.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         stage = n & 1
         self.sig_wait("scale", tsig + SCALE + stage, (n >> 1) & 1)
         s_scale = params.s_scale + stage * (self.d_k * 4)
@@ -1100,7 +1134,7 @@ class KdaBprop(WarpSpecialized):
             ]
             tmem_st("32x32b", lane_base + tmem.cols("dstate_in") + i * 8, words)
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + DSTATE_IN)
+        before_sync_and_arrive(tsig + DSTATE_IN)
         for i in cutlass.range_constexpr(self.d_k // 16):
             words = tmem_ld("32x32b", 8, lane_base + tmem.cols("dstate_in") + i * 8, Int32)
             if row_valid:
@@ -1146,7 +1180,7 @@ class KdaBprop(WarpSpecialized):
         valid = seqlen - chunk_start
 
         # ---- Y = beta (V - K S) ---------------------------------------------------------------
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         s_v = params.s_v + rh.index * (self.d_v * B_T * 2)
         v_lo = ldmatrix(s_v + 2 * ov_lo, 4, trans=True)
         v_hi = [Int32(0)] * 4
@@ -1204,7 +1238,7 @@ class KdaBprop(WarpSpecialized):
         if cutlass.const_expr(wide):
             tmem_st("16x128b", hi_lanes + tmem.cols("yin"), [y_hi[i] for i in range(4)])
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + Y_IN)
+        before_sync_and_arrive(tsig + Y_IN)
 
         # ---- dU accumulator -> fp16 MMA operand ----------------------------------------------
         self.sig_wait("du_acc", tsig + DU_ACC, ph)
@@ -1224,7 +1258,7 @@ class KdaBprop(WarpSpecialized):
                 [fp32_to_fp16(du_hi[2 * r], du_hi[2 * r + 1], dtype=io) for r in range(4)],
             )
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + DU_IN)
+        before_sync_and_arrive(tsig + DU_IN)
 
         # ---- U -> sU ---------------------------------------------------------------------------
         self.sig_wait("u_acc", tsig + U_ACC, ph)
@@ -1244,7 +1278,7 @@ class KdaBprop(WarpSpecialized):
                 trans=True,
             )
         cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(tsig + U_SMEM)
+        before_sync_and_arrive(tsig + U_SMEM)
 
         # ---- dY -> sdY -------------------------------------------------------------------------
         self.sig_wait("dy_acc", tsig + DY_ACC, ph)
@@ -1264,14 +1298,14 @@ class KdaBprop(WarpSpecialized):
                 trans=True,
             )
         cute.arch.fence_view_async_shared()
-        cute.arch.mbarrier_arrive(tsig + DY_SMEM)
+        before_sync_and_arrive(tsig + DY_SMEM)
 
         # ---- beta dY, -beta dY -> TMEM -------------------------------------------------------
         c0 = lds_f32(s_beta + 4 * ((lane & 3) * 2))
         c1 = lds_f32(s_beta + 4 * ((lane & 3) * 2 + 1))
         c8 = lds_f32(s_beta + 4 * ((lane & 3) * 2 + 8))
         c9 = lds_f32(s_beta + 4 * ((lane & 3) * 2 + 9))
-        bh.release()
+        bh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         bdy_lo = cute.make_rmem_tensor((8,), Float32)
         bdy_hi = cute.make_rmem_tensor((8,), Float32)
         for e2 in cutlass.range_constexpr(4):
@@ -1293,7 +1327,7 @@ class KdaBprop(WarpSpecialized):
                 [fp32_to_fp16(-bdy_hi[2 * r], -bdy_hi[2 * r + 1], dtype=io) for r in range(4)],
             )
         cute.arch.fence_view_async_tmem_store()
-        cute.arch.mbarrier_arrive(tsig + NBDY_IN)
+        before_sync_and_arrive(tsig + NBDY_IN)
 
         # ---- dbeta v-term: sum_v dY (V - K S) --------------------------------------------------
         token4 = cute.make_rmem_tensor((4,), Float32)
@@ -1313,7 +1347,7 @@ class KdaBprop(WarpSpecialized):
             token4[slot + 1] = hi
 
         # ---- dV = beta dY -> staging ---------------------------------------------------------------
-        vh = dv.acquire()
+        vh = dv.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         s_dv = params.s_dv + vh.index * (B_T * self.d_v * 2)
         stmatrix(
             s_dv + 2 * ov_lo,
@@ -1326,11 +1360,11 @@ class KdaBprop(WarpSpecialized):
                 [fp32_to_fp16(bdy_hi[2 * r], bdy_hi[2 * r + 1], dtype=io) for r in range(4)],
                 trans=True,
             )
-        vh.commit()
+        vh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- dbeta = v-term + M-term ----------------------------------------------------------------
-        self.cg1_sync.sync(aligned=True)
-        self.sig_wait("dbeta_m", tsig + DBETA_M, ph)
+        self.cg1_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
+        self.sig_wait("dbeta_m", tsig + DBETA_M, ph, fence=False)
         for off in cutlass.range_constexpr(3):
             for s in cutlass.range_constexpr(4):
                 token4[s] = token4[s] + shfl_bfly(token4[s], 4 << off)
@@ -1340,7 +1374,7 @@ class KdaBprop(WarpSpecialized):
                     params.s_red + 4 * (warp * B_T + (lane & 3) * 2 + (s % 2) + 8 * (s // 2)),
                     token4[s],
                 )
-        self.cg1_sync.sync(aligned=True)
+        self.cg1_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
         if tid < B_T:
             acc = Float32(0.0)
             for w in cutlass.range_constexpr(4):
@@ -1348,12 +1382,14 @@ class KdaBprop(WarpSpecialized):
             db = acc + lds_f32(params.s_betam + 4 * tid)
             if tid < valid and chunk < write_end:
                 params.dbeta[start + chunk_start + tid, head] = db.to(params.dbeta.element_type)
-        self.cg1_sync.sync(aligned=True)
+        self.cg1_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
 
         # ---- dS for the next chunk: 2^g_last(next) dS, its fp16 operand and SMEM tile -------
-        self.sig_wait("dstate_acc", tsig + DSTATE_ACC, ph)
+        # Fenced only for the dS store after the last chunk (``store_dstate0``) without the
+        # scale wait of a capture.
+        self.sig_wait("dstate_acc", tsig + DSTATE_ACC, ph, fence=self.use_dstate0)
         if capture:
-            dsh = dstate.acquire()
+            dsh = dstate.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             nxt = n + 1
             stage = nxt & 1
             self.sig_wait("scale", tsig + SCALE + stage, (nxt >> 1) & 1)
@@ -1378,7 +1414,7 @@ class KdaBprop(WarpSpecialized):
                     [scaled[j] for j in range(32)],
                 )
             cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(tsig + DSTATE_IN)
+            before_sync_and_arrive(tsig + DSTATE_IN)
             for i in cutlass.range(self.d_k // 32, unroll=1):
                 words = tmem_ld("32x32b", 16, lane_base + tmem.cols("dstate_in") + i * 16, Int32)
                 if row_valid:
@@ -1513,10 +1549,11 @@ class KdaBprop(WarpSpecialized):
         f16_seg = channel >> 6
         f16_dim = channel - f16_seg * 64
         stage = n & 1
-        self.sig_wait("kdi", tsig + KDI + stage, (n >> 1) & 1)  # the exchange is complete
+        # The exchange is complete.
+        self.sig_wait("kdi", tsig + KDI + stage, (n >> 1) & 1, fence=False)
 
         # ---- per-channel 2^g of every token ---------------------------------------------------
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         s_ex = params.s_g + rh.index * (self.d_k * B_T * 4)
         eg = cute.make_rmem_tensor((B_T,), Float32)
         for t in cutlass.range_constexpr(B_T):
@@ -1524,13 +1561,13 @@ class KdaBprop(WarpSpecialized):
                 s_ex + 4 * (f32_seg * (B_T * 32) + t * 32 + swz128(t ^ f32_seg, f32_dim, 4))
             )
         rh.release()
-        qh = qk_raw.wait()
+        qh = qk_raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         qraw_col = lane_base + tmem.cols("qraw") + qh.index * (B_T // 2)
         kraw_col = lane_base + tmem.cols("kraw") + qh.index * (B_T // 2)
 
         # ---- dGate last: sum_v dS[v, c] S[c, v] ------------------------------------------------
         dgate_last = Float32(0.0)
-        sih = state_in.wait()
+        sih = state_in.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         if has_dstate:
             dsh = dstate.wait()
             for trip in cutlass.range(d_v // 32, unroll=1):
@@ -1558,7 +1595,7 @@ class KdaBprop(WarpSpecialized):
                 part_a, part_b = fadd2(pa0, pb0, pa1, pb1)
                 dgate_last = dgate_last + (part_a + part_b)
             dsh.release()
-        sih.release()
+        sih.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         dq_n = cute.make_rmem_tensor((B_T,), Float32)
         dk_n = cute.make_rmem_tensor((B_T,), Float32)
@@ -1610,7 +1647,7 @@ class KdaBprop(WarpSpecialized):
         diag = cute.make_rmem_tensor((B_T,), Float32)
         for t in cutlass.range_constexpr(B_T):
             diag[t] = lds_f32(params.s_diag + 4 * (ddh.index * B_T + t)) * scale
-        ddh.release()
+        ddh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- dGate finalize --------------------------------------------------------------------------
         qf = tmem_ld("32x32b", B_T // 2, qraw_col, Int32)
@@ -1625,14 +1662,14 @@ class KdaBprop(WarpSpecialized):
         qh.release()
 
         # ---- stage dQ / dK ---------------------------------------------------------------------------
-        qsh = dq.acquire()
-        ksh = dk.acquire()
+        qsh = dq.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
+        ksh = dk.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         for t in cutlass.range_constexpr(B_T):
             out = 2 * (f16_seg * (B_T * 64) + t * 64 + swz128(t, f16_dim))
             _sts_16(params.s_dq + out, dq_n[t], io)
             _sts_16(params.s_dk + out, dk_n[t], io)
-        qsh.commit()
-        ksh.commit()
+        qsh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+        ksh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- dGate: last-chunk state term, reverse cumsum, staging -------------------------------
         if has_dstate:  # noqa: SIM102 (upstream nests the dynamic tests)
@@ -1643,7 +1680,7 @@ class KdaBprop(WarpSpecialized):
             t = B_T - 1 - rt
             suffix = suffix + dg[t]
             dg[t] = suffix
-        gh = dgate.acquire()
+        gh = dgate.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         for t in cutlass.range_constexpr(B_T):
             if cutlass.const_expr(self.gate == "fp32"):
                 sts_f32(
@@ -1656,7 +1693,7 @@ class KdaBprop(WarpSpecialized):
                     dg[t],
                     self.gate_dtype,
                 )
-        gh.commit()
+        gh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return raw, qk_raw, state_in, dstate, dqk, da_diag, dq, dk, dgate, n_dkr
 
     @cute.jit
@@ -1694,9 +1731,10 @@ class KdaBprop(WarpSpecialized):
         ch_lo = warp * 16 + (lane >> 2)
         channels = (ch_lo, ch_lo + 8)
         stage = n & 1
-        self.sig_wait("kdi", tsig + KDI + stage, (n >> 1) & 1)  # the exchange is complete
+        # The exchange is complete.
+        self.sig_wait("kdi", tsig + KDI + stage, (n >> 1) & 1, fence=False)
 
-        rh = raw.wait()
+        rh = raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         s_ex = params.s_g + rh.index * (self.d_k * B_T * 4)
         eg = cute.make_rmem_tensor((8,), Float32)
         for cs in cutlass.range_constexpr(2):
@@ -1709,7 +1747,7 @@ class KdaBprop(WarpSpecialized):
                         s_ex + 4 * (seg * (B_T * 32) + token * 32 + swz128(token ^ seg, dim, 4))
                     )
         rh.release()
-        qh = qk_raw.wait()
+        qh = qk_raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         qraw_col = lane_base + tmem.cols("qraw") + qh.index * (B_T // 2)
         kraw_col = lane_base + tmem.cols("kraw") + qh.index * (B_T // 2)
 
@@ -1717,7 +1755,7 @@ class KdaBprop(WarpSpecialized):
         last_frag = cute.make_rmem_tensor((2,), Float32)
         for cs in cutlass.range_constexpr(2):
             last_frag[cs] = Float32(0.0)
-        sih = state_in.wait()
+        sih = state_in.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         if has_dstate:
             dsh = dstate.wait()
             svec = tmem_ld(
@@ -1753,7 +1791,7 @@ class KdaBprop(WarpSpecialized):
                 part = part + shfl_bfly(part, 2)
                 last_frag[cs] = part
             dsh.release()
-        sih.release()
+        sih.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         dq_f = cute.make_rmem_tensor((8,), Float32)
         dk_f = cute.make_rmem_tensor((8,), Float32)
@@ -1807,7 +1845,7 @@ class KdaBprop(WarpSpecialized):
             for m in cutlass.range_constexpr(2):
                 token = quad * 2 + (rep * 8 + m)
                 diag[rep * 2 + m] = lds_f32(params.s_diag + 4 * (ddh.index * B_T + token)) * scale
-        ddh.release()
+        ddh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- dGate finalize --------------------------------------------------------------------------
         qf = tmem_ld("16x256b", B_T // 16, qraw_col, Int32)
@@ -1837,8 +1875,8 @@ class KdaBprop(WarpSpecialized):
         qh.release()
 
         # ---- stage dQ / dK ---------------------------------------------------------------------------
-        qsh = dq.acquire()
-        ksh = dk.acquire()
+        qsh = dq.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
+        ksh = dk.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         for cs in cutlass.range_constexpr(2):
             for rep in cutlass.range_constexpr(2):
                 for m in cutlass.range_constexpr(2):
@@ -1847,8 +1885,8 @@ class KdaBprop(WarpSpecialized):
                     out = 2 * (token * 64 + swz128(token, channels[cs]))
                     _sts_16(params.s_dq + out, dq_f[k], io)
                     _sts_16(params.s_dk + out, dk_f[k], io)
-        qsh.commit()
-        ksh.commit()
+        qsh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+        ksh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- dGate: last-chunk state term, reverse cumsum over the quad, staging -----------------
         if has_dstate:  # noqa: SIM102 (upstream nests the dynamic tests)
@@ -1878,7 +1916,7 @@ class KdaBprop(WarpSpecialized):
             head = dg[cs * 2 + 1] + higher[0]
             dg[cs * 2 + 1] = head + block_total[1]
             dg[cs * 2] = (dg[cs * 2] + head) + block_total[1]
-        gh = dgate.acquire()
+        gh = dgate.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         for cs in cutlass.range_constexpr(2):
             for rep in cutlass.range_constexpr(2):
                 for m in cutlass.range_constexpr(2):
@@ -1898,7 +1936,7 @@ class KdaBprop(WarpSpecialized):
                             dg[k],
                             self.gate_dtype,
                         )
-        gh.commit()
+        gh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return raw, qk_raw, state_in, dstate, dqk, da_diag, dq, dk, dgate, n_dkr
 
     # ---- register MMA (warp 12): KK, T, dM, the dbeta M-term ------------------------------
@@ -1936,7 +1974,7 @@ class KdaBprop(WarpSpecialized):
                     stage = n & 1
                     th = tinv.acquire()
                     # ---- KK = K decay K inv^T ------------------------------------------------------
-                    self.sig_wait("kdi", tsig + KDI + stage, (n >> 1) & 1)
+                    self.sig_wait("kdi", tsig + KDI + stage, (n >> 1) & 1, fence=False)
                     op = stage * (self.d_k * B_T * 2)
                     kk = _mma_tile(params.s_kdecay + op, params.s_kinv + op, frag, self.d_k, io)
                     # ---- L = beta strict(KK), T = (I + L)^-1 ---------------------------------------
@@ -1986,7 +2024,7 @@ class KdaBprop(WarpSpecialized):
                         sts_f32(params.s_betam + 4 * row_lo, -bsum_lo)
                         sts_f32(params.s_betam + 4 * row_hi, -bsum_hi)
                     cute.arch.fence_view_async_shared()
-                    cute.arch.mbarrier_arrive(tsig + DBETA_M)
+                    before_sync_and_arrive(tsig + DBETA_M)
                 base += n_chunks
                 sched, tile = self.next_tile(sched)
             work.advance()
@@ -2237,7 +2275,7 @@ class KdaBprop(WarpSpecialized):
                     d_int = d_int0 + stage * inter_seg
 
                     # ---- K S = state(S) @ K decay^T --------------------------------------------
-                    self.sig_wait("kdi", tsig + KDI + stage, sphase)
+                    self.sig_wait("kdi", tsig + KDI + stage, sphase, fence=False)
                     if chunk >= self.first_state_chunk:
                         sh = state.wait()
                         mma_ss_op(
@@ -2252,8 +2290,8 @@ class KdaBprop(WarpSpecialized):
                         sh.release()
 
                     # ---- dQ inter = state(T) @ dO^T ---------------------------------------------
-                    qh = dqk.acquire()
-                    sih = state_in.wait()
+                    qh = dqk.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
+                    sih = state_in.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     self.sig_wait(
                         "do_full", do_full + stage, sphase
                     )  # dO landed (see ``self.do``)
@@ -2290,7 +2328,7 @@ class KdaBprop(WarpSpecialized):
                     mma_ss_op(self.g_do_qd, d_do_t, d_qd_t, col["dstate"], has_dstate, elect)
 
                     # ---- U = Y(T) @ T^-1, dY = dU(T) @ T^-T ---------------------------------------
-                    th = tinv.wait()
+                    th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     self.sig_wait("y_in", tsig + Y_IN, n & 1)
                     mma_ts_all_op(self.g_t, col["yin"], d_int + slot, col["u"], False, elect)
                     umma_commit(tsig + U_ACC, elect)
@@ -2302,7 +2340,7 @@ class KdaBprop(WarpSpecialized):
                     th.release()
 
                     # ---- dK restore part = dS(S) @ U^T ------------------------------------------
-                    self.sig_wait("u_smem", tsig + U_SMEM, n & 1)
+                    self.sig_wait("u_smem", tsig + U_SMEM, n & 1, fence=False)
                     if has_dstate:
                         dsh = dstate.wait()
                         mma_ss_op(
@@ -2358,7 +2396,7 @@ class KdaBprop(WarpSpecialized):
                     mh.release()
                     dh.release()
                 if n_chunks > 0:  # cg1 stored this item's dS before the next item rewrites it
-                    self.sig_wait("dstate0", tsig + DSTATE0, n_items & 1)
+                    self.sig_wait("dstate0", tsig + DSTATE0, n_items & 1, fence=False)
                     n_items += 1
                 base += n_chunks
                 sched, tile = self.next_tile(sched)

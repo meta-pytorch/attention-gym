@@ -146,11 +146,12 @@ def collect_pair(
 
 
 def collect_roles(roles, declarations=None):
-    cls = type("DeclarationProbe", (WarpSpecialized,), roles)
-    op = cls()
-    for name, value in (declarations or {}).items():
-        setattr(op, name, value)
-    return op.describe()
+    def init(self):
+        for name, value in (declarations or {}).items():
+            setattr(self, name, value)
+
+    cls = type("DeclarationProbe", (WarpSpecialized,), {**roles, "__init__": init})
+    return cls().describe()
 
 
 def collect_one(*params, raw=False, **declarations):

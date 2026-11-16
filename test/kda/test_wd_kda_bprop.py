@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
@@ -14,8 +15,8 @@ from attn_gym.testing.kda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive KDA bprop requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive KDA bprop requires an SM100-family GPU",
 )
 
 B_T = 16

@@ -7,6 +7,7 @@ import torch
 
 pytest.importorskip("cutlass")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     RaggedChunkMetadata,
     prepare_ragged_chunk_metadata,
@@ -20,8 +21,8 @@ from attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd import (
 from attn_gym.testing import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTe delta-H backward stage requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTe delta-H backward stage requires an SM100-family GPU",
 )
 
 

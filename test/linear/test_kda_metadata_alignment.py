@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_kda
 from attn_gym.testing.kda import clone_kda_inputs, make_kda_test_inputs
 
@@ -21,8 +22,8 @@ def test_stateful_backward_accepts_sliced_cu_seqlens(
 ):
     if backend == "warpdrive":
         pytest.importorskip("cutlass.experimental")
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            pytest.skip("the cuDNN backend requires SM100/SM103")
+        if not cuda_runs_sm100_kernels():
+            pytest.skip("the cuDNN backend requires an SM100-family GPU")
 
     inputs = make_kda_test_inputs(100, heads=2, seed=0, requires_grad=True)
     state = (torch.randn(2, 2, 128, 128, device="cuda") / 8).requires_grad_()

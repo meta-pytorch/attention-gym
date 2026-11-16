@@ -21,6 +21,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.cute import normalize_compact_tensor
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda.constants import LOG2_E
@@ -30,8 +31,8 @@ from attn_gym.testing.kda import cumulative_sequence_offsets
 from attn_gym.warpdrive.cache import detect_compile_target, get_compile_target, set_compile_target
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="KDA intra engine requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="KDA intra engine requires an SM100-family GPU",
 )
 
 BT, BC, D = 64, 16, 128

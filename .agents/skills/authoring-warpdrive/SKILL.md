@@ -66,9 +66,18 @@ Follow the guide's lifecycle, prologue and launch sections. In particular:
   [compile cache](../../../docs/warpdrive/cache.md) explains keys). Put static choices in the
   constructor so they reach the cache key, validate runtime alignment/compactness before relying on them, and keep scheduler
   workspaces disjoint across concurrent launches.
+- Launch with `compile_fn(Kernel.get_or_build(...))` on every call
+  ([hot path](../../../docs/warpdrive/cache.md#launch-from-a-hot-path)); do not hand-build keys,
+  keep dictionaries of kernels, or cache the compiled function yourself.
 - For raw synchronization, overrides or opt-outs, explain the exact ordering supplied instead.
   Never suppress a check just to obtain a successful compile. Inspect unverified TMA/alias
   sites rather than interpreting silence as proof.
+- Raw waits and signals in a TMEM or MMA role need the tcgen05 thread-sync fences that managed
+  ones emit ([dropping down](../../../docs/warpdrive/dropping-down.md#tcgen05-thread-sync-fences-on-raw-synchronization));
+  run `ptx_check.check_tcgen05_sync` on the kernel's PTX to find a missing one. Drop a
+  redundant managed fence only with `skip_fence=..., reason=...`
+  ([skip a fence](../../../docs/warpdrive/dropping-down.md#skip-a-redundant-thread-sync-fence)),
+  and rerun that check over every configuration the skip depends on.
 
 ## Validate and hand back
 

@@ -1329,10 +1329,6 @@ def compile_decode(op: SwapABDecode):
     )
 
 
-def _frozen_roles(roles):
-    return None if roles is None else tuple(sorted(roles.items()))
-
-
 def tile_hq_for(num_heads: int, num_heads_kv: int) -> int:
     """Return the next power of two covering the GQA group."""
     return 1 << (num_heads // num_heads_kv - 1).bit_length()
@@ -1393,19 +1389,11 @@ def decode_partials(
     if type(shared_kv) is not bool:
         raise ValueError(f"shared_kv must be a bool, got {shared_kv!r}")
     kernel_class = SharedKVDecode if shared_kv else SwapABDecode
-    frozen = {k: _frozen_roles(v) if k == "roles" else v for k, v in options.items()}
-    key = (
-        tile_hq_for(heads, heads_kv),
-        kv_stages,
-        per_sequence,
-        shared_kv,
-        *sorted(frozen.items()),
+    op = kernel_class.get_or_build(
+        tile_hq_for(heads, heads_kv), kv_stages, per_sequence, **options
     )
-    op = _OPS.get(key)
-    if op is None:
-        op = _OPS[key] = kernel_class(key[0], kv_stages, per_sequence, **options)
     scale = softmax_scale if softmax_scale is not None else head_dim**-0.5
-    compile_decode.by_static_key(key, lambda: compile_decode(op))(
+    compile_decode(op)(
         q[:, 0],
         k,
         v,
@@ -1458,6 +1446,3 @@ def fa4_decode(
         num_splits_dynamic_ptr=splits_per_seq,
     )
     return out, lse
-
-
-_OPS: dict = {}

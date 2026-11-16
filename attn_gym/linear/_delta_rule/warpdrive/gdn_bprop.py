@@ -58,7 +58,6 @@ chain (noted at the declaration). A managed round trip there would add a wait to
 critical path (see ``gdn_recompute``).
 """
 
-import functools
 from dataclasses import dataclass
 
 import cutlass
@@ -68,7 +67,11 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
+    BEFORE_FENCE_COVERED,
+    BOTH_FENCES_COVERED,
     Barriers,
     Consumer,
     Local,
@@ -95,6 +98,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
 from attn_gym.warpdrive.protocol import current_trace
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 from attn_gym.warpdrive.tracing import wait_range
 
 from .blockwise_inverse import (
@@ -139,7 +143,6 @@ from .ragged import (
 from .umma import SWIZZLE_128B, MmaDesc, instr_desc, mma_ss, mma_ts, smem_desc
 
 B_T = 64
-DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 BOX = 64  # 16-bit elements per 128-byte swizzle row
 BOX_BYTES = B_T * BOX * 2  # one 64 x 64 16-bit box
@@ -154,7 +157,6 @@ WORK_ITEM_FIELDS = 10
 WORK_ITEM_DSTATE_DST = 9
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 _SCALAR_DTYPES = {
     torch.float32: "Float32",
     torch.bfloat16: "BFloat16",
@@ -250,17 +252,29 @@ class Item:
         return self.compute_end - self.write_start
 
 
-def _wait(bars, phases, name: str):
+def _wait(bars, phases, name: str, fence: bool = True):
     """Wait for raw signal ``name`` at this role's parity; returns the flipped parity mask. A
-    ``<name>.wait`` range when the kernel traces waits."""
+    ``<name>.wait`` range when the kernel traces waits. ``fence=False`` omits the after fence
+    where a later one precedes the role's next tcgen05 op (``AFTER_FENCE_COVERED``)."""
     i = SIG[name]
     with wait_range(current_trace(), f"{name}.wait"):
         cute.arch.mbarrier_wait(bars + i, Int32((phases >> i) & 1))
+    if fence:
+        tcgen05_after_thread_sync()  # every signal hands TMEM between threads
     return phases ^ Int64(1 << i)
 
 
 @cute.jit
-def _arrive(bars, name: cutlass.Constexpr[str]):
+def before_sync_and_arrive(bars, name: cutlass.Constexpr[str]):
+    """``tcgen05.fence::before_thread_sync``, then arrive on raw signal ``name``."""
+    tcgen05_before_thread_sync()
+    arrive(bars, name)
+
+
+@cute.jit
+def arrive(bars, name: cutlass.Constexpr[str]):
+    """Arrive on raw signal ``name`` without a fence: only where an earlier before fence
+    already follows the role's last tcgen05 op (``BEFORE_FENCE_COVERED``)."""
     cute.arch.mbarrier_arrive(bars + SIG[name])
 
 
@@ -332,8 +346,8 @@ class GdnBprop(WarpSpecialized):
         """``column_fold_delay`` is a test hook: the ``clock64`` cycles cg0's warp 1 idles
         before it reads the dGate column partials, so a test can order those reads after warp
         0's next sKK write (see cg0's column fold). Production builds keep 0."""
-        if d not in DIMS:
-            raise ValueError(f"the bprop serves d_k = d_v in {DIMS}, got {d}")
+        if d not in HEAD_DIMS:
+            raise ValueError(f"the bprop serves d_k = d_v in {HEAD_DIMS}, got {d}")
         self.dtype_name, self.d = dtype_name, d
         self.use_initial_state = use_initial_state
         self.use_dstate_in = use_dstate_in
@@ -464,8 +478,10 @@ class GdnBprop(WarpSpecialized):
         return buf.iterator.toint()
 
     @cute.jit
-    def _next_row(self, sched):
-        with sched.consume() as h:
+    def _next_row(self, sched, skip_fence=None):
+        """The next work-table row; ``skip_fence="before"`` drops the release's before fence
+        (``BEFORE_FENCE_COVERED``)."""
+        with sched.consume(skip_fence=skip_fence, reason=BEFORE_FENCE_COVERED) as h:
             row = h.data[0]
         return row, sched
 
@@ -796,14 +812,15 @@ class GdnBprop(WarpSpecialized):
                 _commit(sig, "a_acc_full")
             # ---- KS = state @ K^T -> acc_a (needs cg0's KK read) ------------------------------
             if has_state:
-                state.peek()  # the state stage this chunk reads; the wait below owns it
+                # The state stage this chunk reads; the wait below owns it.
+                state.peek(skip_fence="after", reason=AFTER_FENCE_COVERED)
                 ph = _wait(sig, ph, "kk_free")
                 mma_ss(d["ks"], sdesc("State", 16), desc_k, acc_a, False)
                 if elect_sync():
                     _commit(sig, "ks_full")
             # ---- dV inter = dS_in(T) @ K^T -> dvdk ---------------------------------------------
             if have_dstate:
-                ph = _wait(sig, ph, "dstate_in_full")
+                ph = _wait(sig, ph, "dstate_in_full", fence=False)
             ph = _wait(sig, ph, "dk_total_free")
             if have_dstate:
                 mma_ts(d["ks"], dsin_col, desc_k, dvdk_col, False)
@@ -811,7 +828,7 @@ class GdnBprop(WarpSpecialized):
                     _commit(sig, "du_scale_full")
                     _commit(sig, "dstate_in_free")
             # ---- dQ inter = state^T @ dO -> dq accumulator --------------------------------------
-            doh = do.wait()
+            doh = do.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             if has_state:
                 ph = _wait(sig, ph, "dq_total_free")
                 mma_ss(d["state_t"], sdesc("State", lbo_s), sdesc("dO", 16), dsin_col, False)
@@ -826,12 +843,12 @@ class GdnBprop(WarpSpecialized):
                 _commit(sig, "du_total_full")
             ah.release()  # A read; cg0 writes dA over it after the dA GEMM (da_acc_full)
             # ---- dS Q term += dO'(T) @ Q -------------------------------------------------------
-            ph = _wait(sig, ph, "do_prime_full")
+            ph = _wait(sig, ph, "do_prime_full", fence=False)
             ph = _wait(sig, ph, "dstate_scaled")
             mma_ts(d["dstate"], do_prime_col, sdesc("Q", lbo_t), dstate_col, have_dstate)
             # ---- U^T = Y(T) @ (T Beta)^T -> acc_b ------------------------------------------------
-            th = tinv.wait()
-            ph = _wait(sig, ph, "y_full")
+            th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
+            ph = _wait(sig, ph, "y_full", fence=False)
             vh = v.wait()  # cg1 observed V before publishing Y: this passes at once
             mma_ts(d["u"], y_col, sdesc("Tinv", 16), acc_b, False)
             if elect_sync():
@@ -869,7 +886,7 @@ class GdnBprop(WarpSpecialized):
                 _commit(sig, "dstate_full")
             # ---- dK attn += Q^T @ dA -> dvdk ------------------------------------------------------
             if have_dstate:
-                ph = _wait(sig, ph, "dk_scale_free")
+                ph = _wait(sig, ph, "dk_scale_free", fence=False)
             dah = a.wait()  # dA (cg0's da_ready)
             mma_ss(d["k_t_t"], sdesc("Q", lbo_t), sdesc("A", lbo_sq), dvdk_col, have_dstate)
             if elect_sync():
@@ -885,7 +902,7 @@ class GdnBprop(WarpSpecialized):
                 _commit(sig, "dq_total_full")
             dah.release()
             # ---- dK state path = state^T @ dV^T -> the inputs region ------------------------------
-            dvh = dv.wait()
+            dvh = dv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             if has_state:
                 sh = state.wait()  # owns the stage peeked for KS
                 mma_ss(d["state_t"], sdesc("State", lbo_s), sdesc("dV", 16), inputs, False)
@@ -894,7 +911,7 @@ class GdnBprop(WarpSpecialized):
                 sh.release()
             dvh.release()  # upstream's sdv_done
             # ---- dK dM-terms += K^T @ dM^T + K^T @ dM -> dvdk ---------------------------------------
-            mh = dm.wait()
+            mh = dm.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             ph = _wait(sig, ph, "dk_attn_free")
             mma_ss(d["k_t_t"], desc_kt, sdesc("Dm", lbo_sq), dvdk_col, True)
             mma_ss(d["k_t"], desc_kt, sdesc("Dm", 16), dvdk_col, True)
@@ -933,7 +950,7 @@ class GdnBprop(WarpSpecialized):
                 gate, beta, state, a, tinv, dm, ph = self.cg0_item(
                     params, Item(params, row), gate, beta, state, a, tinv, dm, sig, ph, tmem, me
                 )
-                row, sched = self._next_row(sched)
+                row, sched = self._next_row(sched, skip_fence="before")
             work.advance()
         return gate, beta, state, a, tinv, dm, sched, work
 
@@ -993,7 +1010,7 @@ class GdnBprop(WarpSpecialized):
             n_valid = it.batch_end - it.batch_start - (it.compute_end - 1 - i) * B_T
             partial = n_valid < B_T
             # ---- T-pairwise decay ----------------------------------------------------------
-            gh = gate.wait()
+            gh = gate.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             gs = gh.index
             row_cumsums = [s_cumsum[warp * 16 + lane // 4 + r * 8, gs] for r in range(2)]
             col_cumsums = [
@@ -1014,7 +1031,7 @@ class GdnBprop(WarpSpecialized):
                 )
                 decay_t_strict.append(mask_zero if chunk_row == chunk_col else decay_t[kv])
             cumprod_total = s_cumprod[B_T - 1, gs]
-            bh = beta.wait()
+            bh = beta.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             bs = bh.index
             g_beta = [
                 s_beta[warp * 16 + lane // 4 + ((kv // 2) % 2) * 8, bs] for kv in range(n_vals)
@@ -1044,7 +1061,7 @@ class GdnBprop(WarpSpecialized):
             # before the signal that lets the MMA rewrite it, and before teardown frees TMEM.
             cute.arch.fence_view_async_tmem_load()
             if has_state:
-                _arrive(sig, "kk_free")
+                before_sync_and_arrive(sig, "kk_free")
             # ---- A epilogue: A = QK * decay * scale -> sA ----------------------------------
             ph = _wait(sig, ph, "a_acc_full")
             a_vec = tmem_ld("16x256b", 8, acc_b)
@@ -1055,23 +1072,32 @@ class GdnBprop(WarpSpecialized):
                 a_pack.append(fp32_to_fp16(v0, v1, dtype=io))
             if partial:
                 a_pack = self._mask_rows(a_pack, warp, lane, n_valid)
-            ah = a.acquire()
+            ah = a.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             self._store_frags(a_base, store_row, store_col, a_pack)
             cute.arch.fence_view_async_tmem_load()
             ah.commit()
             # ---- blockwise inverse in place in sDm: T = (I + M_kk)^-1 ----------------------
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             if warp < 2:
                 invert_diagonal_8x8(dm_tile, tid // 8, tid, B_T, io)
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             blockwise_8x8_to_16x16(dm_tile, warp * 16, lane, B_T, io)
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             if warp < 2:
                 blockwise_16x16_to_32x32(dm_tile, warp * 32, lane, B_T, io)
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             if warp < 2:
-                blockwise_32x32_to_64x64(dm_tile, warp, lane, self.inv_sync, B_T, io)
-            self.cg0_sync.sync(aligned=True)
+                blockwise_32x32_to_64x64(
+                    dm_tile,
+                    warp,
+                    lane,
+                    self.inv_sync,
+                    B_T,
+                    io,
+                    skip_fence="both",
+                    reason=BOTH_FENCES_COVERED,
+                )
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             # ---- U GEMM operand: T[i, j] * Beta[j] -> sTinv ----------------------------------
             beta_col = [
                 s_beta[(lane % 4) * 2 + ((kv // 4) * 8 + kv % 2), bs] for kv in range(n_vals)
@@ -1082,20 +1108,20 @@ class GdnBprop(WarpSpecialized):
                 lo, hi = f16x2_to_f32(tinv_frags[j], dtype=io)
                 s0, s1 = fmul2(lo, hi, beta_col[2 * j], beta_col[2 * j + 1])
                 tinv_pack.append(fp32_to_fp16(s0, s1, dtype=io))
-            th = tinv.acquire()
+            th = tinv.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             self._store_frags(tinv_base, store_row, store_col, tinv_pack)
-            th.commit()
+            th.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             # ---- dGate last-state term: cumprod_total * <state, dS> --------------------------
             have_dstate = i + dstate_in0 >= 1
             if have_dstate:
-                ph = _wait(sig, ph, "dstate_smem_full")
+                ph = _wait(sig, ph, "dstate_smem_full", fence=False)
             hdh_last_w = acc_zero
             if has_state:
-                sh = state.wait()
+                sh = state.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
                 if have_dstate:
                     hdh_last_w = cumprod_total * self._state_dot(tid)
                 sh.release()
-            _arrive(sig, "state_dot_done")
+            arrive(sig, "state_dot_done")
             # ---- dA epilogue -> sA (A's reader, dU intra, completed before da_acc_full) ------
             ph = _wait(sig, ph, "da_acc_full")
             da_vec = tmem_ld("16x256b", 8, acc_b)
@@ -1108,7 +1134,7 @@ class GdnBprop(WarpSpecialized):
                 da_pack.append(fp32_to_fp16(v0, v1, dtype=io))
             if partial:
                 da_pack = self._mask_rows(da_pack, warp, lane, n_valid)
-            dah = a.acquire()
+            dah = a.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             self._store_frags(a_base, store_row, store_col, da_pack)
             cute.arch.fence_view_async_tmem_load()
             dah.commit()
@@ -1142,7 +1168,7 @@ class GdnBprop(WarpSpecialized):
                 v0 = Float32(0.0) - p0
                 v1 = Float32(0.0) - p1
                 dm_pack.append(fp32_to_fp16(v0, v1, dtype=io))
-            mh = dm.acquire()
+            mh = dm.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             self._store_frags(dm_base, store_row, store_col, dm_pack)
             cute.arch.fence_view_async_tmem_load()
             mh.commit()
@@ -1172,7 +1198,7 @@ class GdnBprop(WarpSpecialized):
                 for rp in cutlass.range_constexpr(2):
                     row_part[rp] += shfl_bfly(row_part[rp], off)
             # ---- dGate column fold (sKK is cg0's scratch once every thread read L) ----------
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             col_lo, col_hi = warp_reduce_scatter_sum_16(col_part, lane)
             tok0 = (lane // 4) * 8 + (lane % 4) * 2
             skk[warp * 64 + tok0] = col_lo
@@ -1181,7 +1207,7 @@ class GdnBprop(WarpSpecialized):
                 for rp in cutlass.range_constexpr(2):
                     crow = warp * 16 + lane // 4 + rp * 8
                     s_cumsum[crow, gs] = acc_zero - row_part[rp] * dm_row_beta[rp]
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             if cutlass.const_expr(self.column_fold_delay > 0):  # noqa: SIM102 (static)
                 if warp == 1:
                     t0 = cute.arch.clock64()
@@ -1190,12 +1216,12 @@ class GdnBprop(WarpSpecialized):
             if tid < 64:
                 col_sum = skk[tid] + skk[64 + tid] + skk[128 + tid] + skk[192 + tid]
                 s_cumsum[tid, gs] = s_cumsum[tid, gs] + col_sum
-            _arrive(sig, "dgate_cg0")
-            gh.release()
+            arrive(sig, "dgate_cg0")
+            gh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             # Warp 0's next L store covers sKK's scratch: it waits for warp 1's partial reads.
-            self.cg0_sync.sync(aligned=True)
+            self.cg0_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             # ---- dBeta M-term ----------------------------------------------------------------
-            ph = _wait(sig, ph, "dbeta_cg1")
+            ph = _wait(sig, ph, "dbeta_cg1", fence=False)
             if lane % 4 == 0:
                 for rp in cutlass.range_constexpr(2):
                     crow = warp * 16 + lane // 4 + rp * 8
@@ -1204,7 +1230,7 @@ class GdnBprop(WarpSpecialized):
                     else:
                         db = s_beta[crow, bs] - row_part[rp]
                     s_beta[crow, bs] = db
-            bh.release()
+            bh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return gate, beta, state, a, tinv, dm, ph
 
     @cute.jit
@@ -1403,9 +1429,9 @@ class GdnBprop(WarpSpecialized):
                 have_dstate = rev > 0
             has_state = chunk >= self.first_state_chunk
             n_valid = it.batch_end - it.batch_start - chunk * B_T
-            gh = gate.wait()
+            gh = gate.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             gs = gh.index
-            bh = beta.wait()
+            bh = beta.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             bs = bh.index
             cumprod_fp32 = [
                 s_cumprod[(lane % 4) * 2 + g * 8 + b, gs] for g in range(8) for b in range(2)
@@ -1431,9 +1457,9 @@ class GdnBprop(WarpSpecialized):
                             scaled += [h0, h1]
                         tmem_st("32x32b", lane0 + dstate_col + i * 32, scaled)
                 cute.arch.fence_view_async_tmem_store()
-                _arrive(sig, "dstate_scaled")
+                before_sync_and_arrive(sig, "dstate_scaled")
             # ---- V and dO fragments ------------------------------------------------------
-            vh = v.wait()
+            vh = v.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             v_frag = self._load_tile_frags(v_base, offs)
             doh = do.wait()
             do_frag = self._load_tile_frags(do_base, offs)
@@ -1457,7 +1483,7 @@ class GdnBprop(WarpSpecialized):
                 for half in cutlass.range_constexpr(halves):
                     tmem_st("16x128b", self._rows(lane_base, half, y_col), v_frag[half])
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "y_full")
+            before_sync_and_arrive(sig, "y_full")
             # ---- dV inter *= 2^(g_63 - g) in place ------------------------------------------
             if have_dstate:
                 last_cumsum = s_cumsum[B_T - 1, gs]
@@ -1484,7 +1510,7 @@ class GdnBprop(WarpSpecialized):
                         scaled += [s0, s1]
                     tmem_st("16x256b", self._rows(lane_base, half, dvdk_col), scaled)
                 cute.arch.fence_view_async_tmem_store()
-                _arrive(sig, "du_scale_free")
+                before_sync_and_arrive(sig, "du_scale_free")
             # ---- dO' = dO * cumprod * scale -> TMEM (cg2 read the last state path) -----------
             ph = _wait(sig, ph, "cg2_chunk")
             for half in cutlass.range_constexpr(halves):
@@ -1498,7 +1524,7 @@ class GdnBprop(WarpSpecialized):
                     do_pack = _mask_words(do_pack, _token_masks(lane, n_valid))
                 tmem_st("16x128b", self._rows(lane_base, half, do_prime_col), do_pack)
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "do_prime_full")
+            before_sync_and_arrive(sig, "do_prime_full")
             # ---- dU -> fp16 TMEM --------------------------------------------------------------
             ph = _wait(sig, ph, "du_total_full")
             for half in cutlass.range_constexpr(halves):
@@ -1506,7 +1532,7 @@ class GdnBprop(WarpSpecialized):
                 du_pack = [fp32_to_fp16(du[2 * j], du[2 * j + 1], dtype=io) for j in range(16)]
                 tmem_st("16x128b", self._rows(lane_base, half, du_col), du_pack)
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "du_in_full")
+            before_sync_and_arrive(sig, "du_in_full")
             # ---- dQ inter *= cumprod * scale in place ---------------------------------------
             if has_state:
                 ph = _wait(sig, ph, "dq_scale_full")
@@ -1526,19 +1552,19 @@ class GdnBprop(WarpSpecialized):
                         scaled += [s0, s1]
                     tmem_st("16x256b", self._rows(lane_base, half, dsin_col), scaled)
                 cute.arch.fence_view_async_tmem_store()
-                _arrive(sig, "dq_scale_free")
+                before_sync_and_arrive(sig, "dq_scale_free")
             # ---- U -> sV (over V) --------------------------------------------------------------
             ph = _wait(sig, ph, "u_acc_full")
             u_regs = []
             for half in cutlass.range_constexpr(halves):
                 u_regs.append(tmem_ld("16x256b", 8, self._rows(lane_base, half, u_col)))
-            uh = u.acquire()
+            uh = u.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             self._store_tile(v_base, offs, u_regs)
             uh.commit()
             # The u commit's fence (every thread) ordered this group's V/dO reads before the
             # async proxy; the releases need no fence of their own (release_fence=()).
-            vh.release()
-            doh.release()
+            vh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+            doh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             # ---- Z -> sdQ (the dM core operand) -------------------------------------------------
             ph = _wait(sig, ph, "z_acc_full")
             z_regs = []
@@ -1550,7 +1576,7 @@ class GdnBprop(WarpSpecialized):
                 s_beta[(lane % 4) * 2 + g * 8 + b, bs] for g in range(8) for b in range(2)
             ]
             beta_vals = [beta_fp32[(kv // 4) * 2 + (kv % 2)] for kv in range(n_vals)]
-            dqh = dq.acquire()
+            dqh = dq.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             zh = z.acquire()
             if cutlass.const_expr(io is cutlass.Float16):
                 # FP16 range floor: beta-free Z can exceed 65504 where Beta*Z cannot, so FP16
@@ -1579,11 +1605,11 @@ class GdnBprop(WarpSpecialized):
                     dyp_pack.append(fp32_to_fp16(n0, n1, dtype=io))
                 tmem_st("16x128b", self._rows(lane_base, half, du_col), dyp_pack)
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "dyp_full")
+            before_sync_and_arrive(sig, "dyp_full")
             # ---- dV = Beta Z -> sdV (the dV output and dK's state-path operand) ----------------
-            dvh = dv.acquire()
+            dvh = dv.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             self._store_tile(dv_base, offs, z_regs, beta_vals)
-            dvh.commit()
+            dvh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             dkh = dk.acquire()  # sdK is this group's scratch until the dQ dot
             # ---- dBeta V-term rowsum(Z * Y); dGate state term Beta * rowsum(Z * 2^g KS) ------
             gsum = Float32(0.0)
@@ -1596,7 +1622,7 @@ class GdnBprop(WarpSpecialized):
                 sdk[v_term_off + warp * 64 + tok0 + 1] = py_hi
                 sdk[v_term_off + 256 + warp * 64 + tok0] = pg_lo
                 sdk[v_term_off + 256 + warp * 64 + tok0 + 1] = pg_hi
-                self.cg1_sync.sync(aligned=True)
+                self.cg1_sync.sync(aligned=True, skip_fence="after", reason=AFTER_FENCE_COVERED)
                 if tid < 64:
                     ysum = (
                         sdk[v_term_off + tid]
@@ -1614,7 +1640,7 @@ class GdnBprop(WarpSpecialized):
             else:
                 sdk[v_term_off + warp * 64 + tok0] = py_lo
                 sdk[v_term_off + warp * 64 + tok0 + 1] = py_hi
-                self.cg1_sync.sync(aligned=True)
+                self.cg1_sync.sync(aligned=True, skip_fence="after", reason=AFTER_FENCE_COVERED)
                 if tid < 64:
                     ysum = (
                         sdk[v_term_off + tid]
@@ -1623,11 +1649,11 @@ class GdnBprop(WarpSpecialized):
                         + sdk[v_term_off + 192 + tid]
                     )
                     s_beta[tid, bs] = ysum
-            bh.release()
-            _arrive(sig, "dbeta_cg1")
-            self.cg1_sync.sync(aligned=True)
+            bh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+            arrive(sig, "dbeta_cg1")
+            self.cg1_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             # ---- Q fragments (upstream also stored them to the Y TMEM slot, never read) -------
-            qh = q.wait()
+            qh = q.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
             q_frag = self._load_tile_frags(q_base, offs)
             # Release Q right away (with its own proxy fence), as upstream does: the next
             # chunk's Q load, and so its QK GEMM, waits for this release.
@@ -1639,9 +1665,9 @@ class GdnBprop(WarpSpecialized):
             for half in cutlass.range_constexpr(halves):
                 dq_regs.append(tmem_ld("16x256b", 8, self._rows(lane_base, half, dsin_col)))
             cute.arch.fence_view_async_tmem_load()
-            _arrive(sig, "dq_total_free")
+            before_sync_and_arrive(sig, "dq_total_free")
             self._store_tile(dq_base, offs, dq_regs)
-            dqh.commit()
+            dqh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             # ---- dGate Q part: rowsum(dQ * Q) ----------------------------------------------------
             part_q = [None] * 16
             for half in cutlass.range_constexpr(halves):
@@ -1670,8 +1696,8 @@ class GdnBprop(WarpSpecialized):
             pq_hi = pq_hi if tok0 + 1 < n_valid else Float32(0.0)
             sdk[part_q_off + warp * 64 + tok0] = pq_lo
             sdk[part_q_off + warp * 64 + tok0 + 1] = pq_hi
-            self.cg1_sync.sync(aligned=True)
-            ph = _wait(sig, ph, "dgate_cg0")
+            self.cg1_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
+            ph = _wait(sig, ph, "dgate_cg0", fence=False)
             if tid < 64:
                 pq_sum = (
                     sdk[part_q_off + tid]
@@ -1684,8 +1710,8 @@ class GdnBprop(WarpSpecialized):
             # for the TMA store) after dgate_cg1, so cg1's arrival needs no proxy fence.
             cute.arch.mbarrier_arrive(dkh.full_barrier)
             dkh.commit(signal=False)
-            gh.release()
-            _arrive(sig, "dgate_cg1")
+            gh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+            arrive(sig, "dgate_cg1")
         return gate, beta, q, v, do, u, z, dq, dk, dv, ph
 
     @cute.jit
@@ -1855,13 +1881,13 @@ class GdnBprop(WarpSpecialized):
                     ]
                     tmem_st("32x32b", lane0 + dsin_col + i * 8, pack)
                 cute.arch.fence_view_async_tmem_store()
-                _arrive(sig, "dstate_in_full")
+                before_sync_and_arrive(sig, "dstate_in_full")
                 self._dstate_to_smem(lane0, dstate_col, state_row, row_valid)
-                _arrive(sig, "dstate_smem_full")
+                before_sync_and_arrive(sig, "dstate_smem_full")
         for rev in cutlass.range(n, unroll=1):
             chunk = it.compute_end - 1 - rev
             # ---- latch the chunk's decay 2^(g_63 - g) ------------------------------------------
-            gh = gate.wait()
+            gh = gate.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             gs = gh.index
             last_cumsum = s_cumsum[B_T - 1, gs]
             decay_fp32 = [
@@ -1872,9 +1898,9 @@ class GdnBprop(WarpSpecialized):
                 for i in range(16)
             ]
             decay = [decay_fp32[(kv // 4) * 2 + (kv % 2)] for kv in range(n_vals)]
-            _arrive(sig, "cg2_chunk")
+            before_sync_and_arrive(sig, "cg2_chunk")
             # The MMA warp waited for this K stage before the dK GEMMs this group waits for.
-            kh = k.wait()
+            kh = k.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
             k_stage = k_base + kh.index * self.tile_bytes
             # ---- dK inter *= decay in place; <K, dK inter> for dGate -------------------------
             k_dot = Float32(0.0)
@@ -1896,7 +1922,7 @@ class GdnBprop(WarpSpecialized):
                 else:
                     k_part = self._scale_dk_inter(lane_base, dvdk_col, k_stage, offs, decay)
                 cute.arch.fence_view_async_tmem_store()
-                _arrive(sig, "dk_scale_free")
+                before_sync_and_arrive(sig, "dk_scale_free")
                 k_dot = k_part
                 for off in [1, 2, 4, 8, 16]:
                     k_dot += shfl_bfly(k_dot, off)
@@ -1906,8 +1932,8 @@ class GdnBprop(WarpSpecialized):
             for half in cutlass.range_constexpr(d // 64):
                 dks.append(tmem_ld("16x256b", 8, self._rows(lane_base, half, dvdk_col)))
             cute.arch.fence_view_async_tmem_load()
-            _arrive(sig, "dk_attn_free")
-            dkh = dk.acquire()
+            before_sync_and_arrive(sig, "dk_attn_free")
+            dkh = dk.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
             # ---- dGate K part: rowsum(dK attn * K) ---------------------------------------------
             part_k = [acc_zero] * 16
             for half in cutlass.range_constexpr(d // 64):
@@ -1930,7 +1956,7 @@ class GdnBprop(WarpSpecialized):
                                 part_k[p],
                                 part_k[p + 1],
                             )
-            kh.release()
+            kh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             pk_lo, pk_hi = warp_reduce_scatter_sum_16(part_k, lane)
             # Tokens past the sequence end load zero K rows; their partials are also zeroed
             # explicitly.
@@ -1939,21 +1965,21 @@ class GdnBprop(WarpSpecialized):
             pk_hi = pk_hi if tok0 + 1 < n_valid else acc_zero
             sdk[warp * 64 + tok0] = pk_lo
             sdk[warp * 64 + tok0 + 1] = pk_hi - k_dot if lane == 31 else pk_hi
-            ph = _wait(sig, ph, "dq_total_free")  # dQ left the dstate_in columns
+            ph = _wait(sig, ph, "dq_total_free", fence=False)  # dQ left the dstate_in columns
             # ---- the next chunk's dS: fp16 operand, then sDstate --------------------------------
             if chunk >= it.write_start + 1:
-                ph = _wait(sig, ph, "dstate_full")
+                ph = _wait(sig, ph, "dstate_full", fence=False)
                 ph = _wait(sig, ph, "dstate_in_free")
                 for i in cutlass.range_constexpr(d // 32):
                     vec = tmem_ld("32x32b", 32, lane0 + dstate_col + i * 32)
                     pack = [fp32_to_fp16(vec[2 * j], vec[2 * j + 1], dtype=io) for j in range(16)]
                     tmem_st("32x32b", lane0 + dsin_col + i * 16, pack)
                 cute.arch.fence_view_async_tmem_store()
-                _arrive(sig, "dstate_in_full")
+                before_sync_and_arrive(sig, "dstate_in_full")
             if chunk >= it.write_start + 1:
                 ph = _wait(sig, ph, "state_dot_done")
                 self._dstate_to_smem(lane0, dstate_col, state_row, row_valid)
-                _arrive(sig, "dstate_smem_full")
+                before_sync_and_arrive(sig, "dstate_smem_full")
             else:
                 # cg0's last-chunk arrival goes unwaited; flipping the parity counts it. Its
                 # sDstate read still precedes this group's next write (the next item's seed or
@@ -1963,12 +1989,12 @@ class GdnBprop(WarpSpecialized):
                 # first for the dstate_smem_full this group arrives after that wait.
                 ph = ph ^ Int64(1 << SIG["state_dot_done"])
             # ---- dGate fold ----------------------------------------------------------------------
-            ph = _wait(sig, ph, "dgate_cg1")
-            self.cg2_sync.sync(aligned=True)
+            ph = _wait(sig, ph, "dgate_cg1", fence=False)
+            self.cg2_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             if tid < 64:
                 dgate_sum = sdk[tid] + sdk[64 + tid] + sdk[128 + tid] + sdk[192 + tid]
                 s_cumsum[tid, gs] = s_cumsum[tid, gs] - dgate_sum
-            self.cg2_sync.sync(aligned=True)
+            self.cg2_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
             # ---- dK = dM-terms total - cumprod * (dV S^T) -> sdK --------------------------------
             if chunk >= self.first_state_chunk:
                 cumprod_neg = [
@@ -1976,14 +2002,14 @@ class GdnBprop(WarpSpecialized):
                     for i in range(16)
                 ]
                 cumprod_neg_vals = [cumprod_neg[(kv // 4) * 2 + (kv % 2)] for kv in range(n_vals)]
-                ph = _wait(sig, ph, "spath_full")
+                ph = _wait(sig, ph, "spath_full", fence=False)
                 ph = _wait(sig, ph, "dk_total_full")
                 for half in cutlass.range_constexpr(d // 64):
                     sp = tmem_ld("16x256b", 8, self._rows(lane_base, half, spath_col))
                     dmr = tmem_ld("16x256b", 8, self._rows(lane_base, half, dvdk_col))
                     cute.arch.fence_view_async_tmem_load()
                     if cutlass.const_expr(half == d // 64 - 1):
-                        _arrive(sig, "dk_total_free")
+                        before_sync_and_arrive(sig, "dk_total_free")
                     for block in cutlass.range_constexpr(4):
                         dk_row = []
                         for j in cutlass.range_constexpr(4):
@@ -2003,7 +2029,7 @@ class GdnBprop(WarpSpecialized):
                     dmr = tmem_ld("16x256b", 8, self._rows(lane_base, half, dvdk_col))
                     cute.arch.fence_view_async_tmem_load()
                     if cutlass.const_expr(half == d // 64 - 1):
-                        _arrive(sig, "dk_total_free")
+                        before_sync_and_arrive(sig, "dk_total_free")
                     for block in cutlass.range_constexpr(4):
                         dk_pack = [
                             fp32_to_fp16(
@@ -2012,11 +2038,12 @@ class GdnBprop(WarpSpecialized):
                             for j in range(4)
                         ]
                         stmatrix(dk_base + offs[half][block] * 2, dk_pack, trans=True)
-            dkh.commit()
-            gh.release()
+            dkh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+            gh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         # ---- the item's final dS: d_initial_state, and hand the accumulator back -------------
         if n > 0:
-            ph = _wait(sig, ph, "dstate_full")
+            # Only the d_initial_state store loads TMEM before the next fenced wait.
+            ph = _wait(sig, ph, "dstate_full", fence=self.use_dstate0)
             if cutlass.const_expr(self.use_dstate0):
                 dst = params.items[item_row, WORK_ITEM_DSTATE_DST]
                 if dst >= 0:
@@ -2029,7 +2056,7 @@ class GdnBprop(WarpSpecialized):
                     # Before dstate_scaled lets the MMA rewrite dS, or teardown frees TMEM.
                     cute.arch.fence_view_async_tmem_load()
             if cutlass.const_expr(not self.use_dstate_in):
-                _arrive(sig, "dstate_scaled")
+                before_sync_and_arrive(sig, "dstate_scaled")
         else:
             if cutlass.const_expr(self.use_dstate0):
                 dst = params.items[item_row, WORK_ITEM_DSTATE_DST]
@@ -2350,14 +2377,6 @@ def compile_gdn_bprop(
     )
 
 
-@functools.lru_cache
-def _compiled(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0, *dtypes):
-    """``(op, compiled)`` per static configuration: the per-call ``jit_cache`` key of a
-    warpdrive op costs ~150 us of host time, which the uncut driver would pay per backward."""
-    op = GdnBprop(dtype_name, d, use_initial_state, use_dstate_in, use_dstate0)
-    return op, compile_gdn_bprop(op, *dtypes)
-
-
 def _dtype_name(tensor, names):
     return None if tensor is None else names[tensor.dtype]
 
@@ -2392,10 +2411,10 @@ def gdn_bprop(
     ``dstate0`` for packed ``q``/``k``/``v``/``do`` ``[T, H, D]``, a natural-log ``gate [T, H]``,
     fp32 ``beta``, ``gdn_recompute`` checkpoints and an int32 work table (see the module
     docstring). ``scheduler`` (int32, zeroed) is allocated when omitted; ``num_sm`` defaults to
-    the device's SM count. ``op`` (a ``GdnBprop`` with ``enable_trace("globaltimer")``) and its
+    the device's SM count. ``op`` (a ``GdnBprop`` built with ``trace_backend="globaltimer"``) and its
     ``trace`` buffer capture a role timeline. ``tma_slots`` (``ragged.new_tma_slots``, at
     least ``op.tma_slot_rows(heads)`` rows) is allocated when omitted."""
-    if q.dtype not in _IO_DTYPES or any(t.dtype != q.dtype for t in (k, v, do, checkpoints)):
+    if q.dtype not in IO_DTYPE_NAMES or any(t.dtype != q.dtype for t in (k, v, do, checkpoints)):
         raise TypeError("q, k, v, do and checkpoints must share a 16-bit dtype")
     if beta.dtype != torch.float32 or dgate.dtype != torch.float32 or dbeta.dtype != torch.float32:
         raise TypeError("beta, dgate and dbeta must be fp32")
@@ -2410,9 +2429,8 @@ def gdn_bprop(
     )
     if op is None:
         flags = (use_initial_state, dstate_in is not None, dstate0 is not None)
-        op, fn = _compiled(_IO_DTYPES[q.dtype], q.shape[-1], *flags, *dtypes)
-    else:
-        fn = compile_gdn_bprop(op, *dtypes)
+        op = GdnBprop.get_or_build(IO_DTYPE_NAMES[q.dtype], q.shape[-1], *flags)
+    fn = compile_gdn_bprop(op, *dtypes)
     workspace, sms = op.work.launch_args(q.device)
     if tma_slots is None:
         tma_slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), q.device)

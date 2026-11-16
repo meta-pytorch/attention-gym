@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
+from attn_gym._backends import arch
 from attn_gym.sparse.gather_attn import Impl, RopePair, api, gather_attn
 from attn_gym.sparse.gather_attn.api import _select_backend
 from attn_gym.sparse.gather_attn.impl import cute
@@ -33,9 +34,10 @@ def cuda_inputs():
         }
 
 
-@pytest.fixture(params=[(10, 0), (10, 3)], ids=["sm100", "sm103"])
+@pytest.fixture(params=[(10, 0), (10, 3), (10, 7)], ids=["sm100", "sm103", "sm107"])
 def fa4_available(monkeypatch, request):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: request.param)
+    monkeypatch.setattr(arch, "cutedsl_targets_rubin", lambda: True)
     available = Mock(return_value=True)
     monkeypatch.setattr(cute, "_fa4_available", available)
     return available
@@ -61,12 +63,14 @@ def test_default_prefers_cute(cuda_inputs, fa4_available, heads, rope_dim):
         (128, 512, torch.bfloat16, 128, (10, 0)),
         (128, 512, torch.bfloat16, 1, (9, 0)),
         (128, 512, torch.bfloat16, 1, (12, 0)),
+        (128, 512, torch.bfloat16, 1, (10, 7)),  # with a CuTeDSL that cannot target SM107
     ],
 )
 def test_unsupported_metadata_uses_triton(
     monkeypatch, fa4_available, heads, head_dim, dtype, kv_heads, capability
 ):
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: capability)
+    monkeypatch.setattr(arch, "cutedsl_targets_rubin", lambda: False)
     with FakeTensorMode():
         query = torch.empty(1, heads, 8, head_dim, device="cuda", dtype=dtype)
     assert _select_backend(query, None, kv_heads == 1, num_keys=6) == "triton"

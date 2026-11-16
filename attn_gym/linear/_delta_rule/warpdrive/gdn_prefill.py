@@ -7,7 +7,7 @@
 # clips the O stores), and the checkpoint, linear-gate, 16-bit-beta and final-index paths are
 # gone.
 
-"""Chunked scalar-gate GDN prefill (forward) for SM100/SM103.
+"""Chunked scalar-gate GDN prefill (forward) for the SM100 family.
 
 Per chunk ``c`` (64 tokens) of a work item, with ``g`` the in-chunk cumulative log2 gate::
 
@@ -77,7 +77,11 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
+    AFTER_FENCE_COVERED,
+    BEFORE_FENCE_COVERED,
+    BOTH_FENCES_COVERED,
     Consumer,
     Local,
     NamedBarrier,
@@ -101,6 +105,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum, SmemAllocator
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
 from . import umma
 from .blockwise_inverse import (
@@ -149,8 +154,6 @@ TINV_STAGES = 3
 A_STAGES = 3
 CG0_STAGES = 2
 TICKET_STAGES = 2
-KEY_DIMS = (64, 128)
-VALUE_DIMS = (64, 128)
 TINV_SOURCES = ("compute", "gmem")
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16, "fp32": cutlass.Float32}
 _NAMES = {cutlass.Float16: "fp16", cutlass.BFloat16: "bf16", cutlass.Float32: "fp32"}
@@ -232,8 +235,8 @@ class GdnPrefill(WarpSpecialized):
         store_final_state: bool,
         paged_state: bool,
     ):
-        if d_k not in KEY_DIMS or d_v not in VALUE_DIMS:
-            raise ValueError(f"GDN prefill serves d_k in {KEY_DIMS}, d_v in {VALUE_DIMS}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"GDN prefill serves d_k, d_v in {HEAD_DIMS}")
         if tiles_per_head not in (1, 2) or (tiles_per_head == 2 and d_v != 64):
             raise ValueError("the d_v split runs two 64-column tiles per head")
         if paged_state and not (use_initial_state and store_final_state):
@@ -354,9 +357,12 @@ class GdnPrefill(WarpSpecialized):
         return head_o, v_offset
 
     @cute.jit
-    def next_tile(self, ticket):
-        """Read the next item the load warp published; returns ``(tile, ticket)``."""
-        with ticket.consume() as th:
+    def next_tile(self, ticket, skip_fence=None):
+        """Read the next item the load warp published; returns ``(tile, ticket)``.
+        ``skip_fence`` as for the consume (its reason is ``AFTER_FENCE_COVERED`` or
+        ``BEFORE_FENCE_COVERED``)."""
+        reason = BEFORE_FENCE_COVERED if skip_fence == "before" else AFTER_FENCE_COVERED
+        with ticket.consume(skip_fence=skip_fence, reason=reason) as th:
             tile = th.data[0]
         return tile, ticket
 
@@ -671,10 +677,12 @@ class GdnPrefill(WarpSpecialized):
         the same KQ stage. kq's consumer side is raw: this waits for the TMA fill, and the KV
         GEMM of that chunk releases the stage (protocol §7 items 1-2: one release covers every
         read of the stage, as MMAs complete in order). Returns ``(cg0, issued + 1)``."""
-        ch = cg0.acquire()
+        # The raw kq wait below fences the GEMM.
+        ch = cg0.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         tmem.access("cg0", write=True, by="umma")
         stage = issued % KQ_STAGES
         cute.arch.mbarrier_wait(self.barrier_ptr("kq") + stage, (issued // KQ_STAGES) % 2)
+        tcgen05_after_thread_sync()
         self.cg0_gemm(params, stage, cg0_col + ch.index * B_T, member)
         ch.commit()
         return cg0, issued + 1
@@ -774,7 +782,7 @@ class GdnPrefill(WarpSpecialized):
                         # compute1 restages S only after this chunk's KV GEMM (§7 item 7).
                         sh.release(signal=False)
                     # U^T = Y^T Tinv^T into cg1: compute1 published Y after reading KS (§7 4).
-                    th = tinv.wait()
+                    th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     th.access(read=True, by="umma")
                     desc_tinv = umma.desc_opaque(
                         umma.smem_desc(
@@ -798,7 +806,7 @@ class GdnPrefill(WarpSpecialized):
                     if member == 0 and local + 2 < n_local:
                         cg0, issued = self.lookahead(params, cg0, issued, cg0_col, 0, tmem)
                     # O^T (+)= U^T A^T on the rescaled QS^T.
-                    ah = a.wait()
+                    ah = a.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     ah.access(read=True, by="umma")
                     desc_a = umma.desc_opaque(
                         umma.smem_desc(
@@ -809,7 +817,7 @@ class GdnPrefill(WarpSpecialized):
                         )
                     )
                     if cutlass.const_expr(have_state):
-                        qh = qs_scaled.wait()
+                        qh = qs_scaled.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
                     ui = slot0.wait()
                     tmem.access("slot0", read=True, by="umma")
                     tmem.access("qs", read=True, write=True, by="umma")
@@ -984,7 +992,9 @@ class GdnPrefill(WarpSpecialized):
                     )
                 # The last KV GEMM's state: the final state. The next item's KV GEMMs follow
                 # this item's last loads in compute1's order (§7 items 5-7).
-                sh = state.wait()
+                # Without a final state store no TMEM load follows before the next fenced wait.
+                skip = None if self.store_final_state else "after"
+                sh = state.wait(skip_fence=skip, reason=AFTER_FENCE_COVERED)
                 tmem.access("state", read=True)
                 if cutlass.const_expr(self.store_final_state):
                     store_final = state_active
@@ -1020,8 +1030,10 @@ class GdnPrefill(WarpSpecialized):
     @cute.jit
     def publish_tmem(self, name: str):
         """Raw producer signal of a compute1 -> MMA handoff: every thread completes its TMEM
-        stores, then arrives on the channel's full barrier (128 arrivals)."""
+        accesses and orders them before its arrival on the channel's full barrier (128
+        arrivals)."""
         cute.arch.fence_view_async_tmem_store()
+        tcgen05_before_thread_sync()
         cute.arch.mbarrier_arrive(self.barrier_ptr(name))
 
     @cute.jit
@@ -1080,9 +1092,6 @@ class GdnPrefill(WarpSpecialized):
                         cute.make_layout(vw),
                     )
                     cute.autovec_copy(frag, dst)
-        # The CTA's last item has no later TMEM store to order these loads before teardown
-        # frees TMEM.
-        cute.arch.fence_view_async_tmem_load()
 
     @cute.jit
     def empty_state(
@@ -1156,7 +1165,9 @@ class GdnPrefill(WarpSpecialized):
         v_o_col = o_col_base + (tid // 8 % 2) * 8
         sG = params.sGate
 
-        gh = gate.wait()
+        # Only a state restage without its own fenced state wait reads TMEM next.
+        skip = None if valid_state and not wait_state else "after"
+        gh = gate.wait(skip_fence=skip, reason=AFTER_FENCE_COVERED)
         g_idx = gh.index
         cumprod_total = sG[B_T - 1, 1, g_idx]
         # ---- state restage (fp16 S for KS/QS) and rescale S *= exp2(g[63]) --------------
@@ -1229,7 +1240,10 @@ class GdnPrefill(WarpSpecialized):
         gh.release()
 
         # ---- Y = V - fp16(KS * exp2(g)) ------------------------------------------------------
-        vh = v.wait()
+        # With a state, the restage's wait fenced the TMEM accesses that follow.
+        skip = "both" if valid_state else "before"
+        reason = BOTH_FENCES_COVERED if valid_state else BEFORE_FENCE_COVERED
+        vh = v.wait(skip_fence=skip, reason=reason)
         v_stage = params.sV.iterator.toint() + vh.index * (B_T * self.d_v * 2)
         v_frag = []
         for half in cutlass.range_constexpr(dv_halves):
@@ -1325,7 +1339,7 @@ class GdnPrefill(WarpSpecialized):
         if cutlass.const_expr(self.paged_state):
             # Null-route padding may hold NaNs: select, never multiply, to emit zeros.
             o_regs = [[x if state_active else Float32(0.0) for x in regs] for regs in o_regs]
-        ob = o.acquire()
+        ob = o.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         o_stage = params.sO.iterator.toint()
         for half in cutlass.range_constexpr(dv_halves):
             for block in cutlass.range_constexpr(4):
@@ -1721,7 +1735,7 @@ class GdnPrefillCompute(GdnPrefill):
                     gate, beta, cg0, tinv, a = self.cg0_pair(
                         params, False, gate, beta, cg0, tinv, a, tmem, me
                     )
-                tile, ticket = self.next_tile(ticket)
+                tile, ticket = self.next_tile(ticket, skip_fence="before")
             work.advance()
         return gate, beta, cg0, tinv, a, ticket, work
 
@@ -1763,20 +1777,20 @@ class GdnPrefillCompute(GdnPrefill):
             half_row_base + lane // 4 + 24,
         )
 
-        g0 = gate.wait()
+        g0 = gate.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
         g_idx0 = g0.index
         g_idx1 = g_idx0
         if cutlass.const_expr(have_m1):
-            g1 = gate.wait()
+            g1 = gate.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
             g_idx1 = g1.index
         kk_g = g_idx1 if pair_half == 1 else g_idx0
         a_g = g_idx0 if pair_half == 1 else g_idx1
         decay_kk = decay_tile(sG, kk_g, rows, lane, mask_zero)
-        b0 = beta.wait()
+        b0 = beta.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
         b_idx0 = b0.index
         b_idx1 = b_idx0
         if cutlass.const_expr(have_m1):
-            b1 = beta.wait()
+            b1 = beta.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
             b_idx1 = b1.index
         kk_b = b_idx1 if pair_half == 1 else b_idx0
         kk_beta = [sB[r, kk_b] for r in rows]
@@ -1785,9 +1799,9 @@ class GdnPrefillCompute(GdnPrefill):
         # Half 0 starts on member 0's accumulator while member 1's GEMM still runs; half 1
         # waits for member 1's (the MMA warp issues them in that order).
         tinv_base = params.sTinv.iterator.toint()
-        c0 = cg0.wait()
+        c0 = cg0.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
         tmem.access("cg0", read=True)
-        t0 = tinv.acquire()
+        t0 = tinv.acquire(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         t0.access(write=True, by="threads")
         t0.access(read=True, by="threads")
         t_addr0 = tinv_base + t0.index * TILE_BYTES
@@ -1796,8 +1810,8 @@ class GdnPrefillCompute(GdnPrefill):
         c_idx1 = c0.index
         t_addr1 = t_addr0
         if cutlass.const_expr(have_m1):
-            c1 = cg0.wait()
-            t1 = tinv.acquire()
+            c1 = cg0.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
+            t1 = tinv.acquire(skip_fence="before", reason=BEFORE_FENCE_COVERED)
             t1.access(write=True, by="threads")
             t1.access(read=True, by="threads")
             c_idx1 = c1.index
@@ -1811,19 +1825,28 @@ class GdnPrefillCompute(GdnPrefill):
         do_inv = have_m1 or warp < 2
         ti = self._flat(inv_tile)
         barrier = self.inverse
-        barrier.sync(aligned=True)
+        barrier.sync(aligned=True, skip_fence="after", reason=AFTER_FENCE_COVERED)
         if do_inv:
             invert_diagonal_8x8(ti, (inverse_local_warp * 32 + lane) // 8, tid, B_T, dtype)
-        barrier.sync(aligned=True)
+        barrier.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
         blockwise_8x8_to_16x16(self._flat(t_addr0), warp * 16, lane, B_T, dtype)
         if cutlass.const_expr(have_m1):
             blockwise_8x8_to_16x16(self._flat(t_addr1), warp * 16, lane, B_T, dtype)
-        barrier.sync(aligned=True)
+        barrier.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
         if do_inv:
             blockwise_16x16_to_32x32(ti, inverse_local_warp * 32, lane, B_T, dtype)
-        barrier.sync(aligned=True)
-        blockwise_32x32_to_64x64(ti, inverse_local_warp, lane, barrier, B_T, dtype)
-        barrier.sync(aligned=True)
+        barrier.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
+        blockwise_32x32_to_64x64(
+            ti,
+            inverse_local_warp,
+            lane,
+            barrier,
+            B_T,
+            dtype,
+            skip_fence="both",
+            reason=BOTH_FENCES_COVERED,
+        )
+        barrier.sync(aligned=True, skip_fence="before", reason=BEFORE_FENCE_COVERED)
 
         # ---- beta column scaling: Tinv[i, j] *= beta[j], member by member -------------
         self.scale_columns(sB, b_idx0, t_addr0, store_row, store_col, lane)
@@ -1843,14 +1866,14 @@ class GdnPrefillCompute(GdnPrefill):
         a_hi = tmem_ld("16x256b", 8, cg0_col + a_acc * B_T + lane_hi)
         c0.release()  # tcgen05.wait::ld first
         if cutlass.const_expr(have_m1):
-            c1.release()
-        a0 = a.acquire()
+            c1.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
+        a0 = a.acquire(skip_fence="both", reason=BOTH_FENCES_COVERED)
         a0.access(write=True, by="threads")
         a_base = params.sA.iterator.toint()
         a_addr0 = a_base + a0.index * TILE_BYTES
         a_addr1 = a_addr0
         if cutlass.const_expr(have_m1):
-            a1 = a.acquire()
+            a1 = a.acquire(skip_fence="both", reason=BOTH_FENCES_COVERED)
             a1.access(write=True, by="threads")
             a_addr1 = a_base + a1.index * TILE_BYTES
         my_a = a_addr0 if pair_half == 1 else a_addr1
@@ -1984,7 +2007,7 @@ class GdnPrefillGmem(GdnPrefill):
                     gate, cg0, a = self.a_pair(params, True, gate, cg0, a, tmem, me)
                 if n_local - n_pairs * 2 == 1:
                     gate, cg0, a = self.a_pair(params, False, gate, cg0, a, tmem, me)
-                tile, ticket = self.next_tile(ticket)
+                tile, ticket = self.next_tile(ticket, skip_fence="before")
             work.advance()
         return gate, cg0, a, ticket, work
 
@@ -2002,10 +2025,10 @@ class GdnPrefillGmem(GdnPrefill):
         mask_zero = opaque_f32_zero()
         lane_lo = (32 * (me.tmem_row // 32)) << 16
         cg0_col = tmem.ptr("cg0").toint()
-        g0 = gate.wait()
+        g0 = gate.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
         g_idx = [g0.index]
         if cutlass.const_expr(have_m1):
-            g1 = gate.wait()
+            g1 = gate.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
             g_idx.append(g1.index)
         factors = [params.scale for _ in range(16)]
         for member in cutlass.range_constexpr(2 if have_m1 else 1):
@@ -2013,7 +2036,7 @@ class GdnPrefillGmem(GdnPrefill):
             ch = cg0.wait()
             vals = tmem_ld("16x256b", 8, cg0_col + ch.index * B_T + lane_lo)
             ch.release()  # tcgen05.wait::ld first
-            ah = a.acquire()
+            ah = a.acquire(skip_fence="both", reason=BOTH_FENCES_COVERED)
             ah.access(write=True, by="threads")
             store_scaled(
                 params.sA.iterator.toint() + ah.index * TILE_BYTES,

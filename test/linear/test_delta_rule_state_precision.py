@@ -14,6 +14,7 @@ import math
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, chunk_kda, recurrent_gdn
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
@@ -32,12 +33,12 @@ def _warpdrive_available() -> bool:
         import cutlass.cute  # noqa: F401
     except ImportError:
         return False
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+    return cuda_runs_sm100_kernels()
 
 
 _WARPDRIVE_SKIP = pytest.mark.skipif(
     not _warpdrive_available(),
-    reason="the warpdrive backend requires CuTeDSL on SM100/SM103",
+    reason="the warpdrive backend requires CuTeDSL on an SM100-family GPU",
 )
 # Documented limitations: only the contract assertions may fail, and they must keep failing.
 _FP16_STATE_RANGE = pytest.mark.xfail(

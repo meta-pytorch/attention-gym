@@ -7,6 +7,8 @@ compilation and Triton's host TMA descriptors behind one fake-tensor contract.
 import torch
 from torch import Tensor
 
+from attn_gym._backends.arch import runs_sm100_kernels
+
 torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
@@ -32,7 +34,7 @@ def _indexer_cuda(
     """
     if backend == "auto":
         capability = torch.cuda.get_device_capability(q.device)
-        backend = "cute" if capability in ((10, 0), (10, 3)) else "triton"
+        backend = "cute" if runs_sm100_kernels(capability) else "triton"
     match backend:
         case "cute":
             from .impl.cute import launch

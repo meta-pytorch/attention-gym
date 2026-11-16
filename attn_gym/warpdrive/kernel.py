@@ -16,11 +16,12 @@ from types import SimpleNamespace
 
 import cutlass
 from cutlass import Int32, Uint32, cute, pipeline
-from cutlass._mlir.dialects import llvm
+from cutlass._mlir.dialects import llvm, nvvm
 
 from attn_gym.warpdrive import alias, fences, liveness, named, ownership, tracing
 from attn_gym.warpdrive.alias import RoleEvents
 from attn_gym.warpdrive.cache._key import canonical_key, module_source_digest
+from attn_gym.warpdrive.cache.jit import fast_key
 from attn_gym.warpdrive.channels import (
     SIDES,
     Barriers,
@@ -82,6 +83,7 @@ from attn_gym.warpdrive.storage import (
     allocate,
     stage_extent,
 )
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 from attn_gym.warpdrive.tma import TmaReport, clear_multicast_masks
 from attn_gym.warpdrive.tma import check_role as check_tma
 from attn_gym.warpdrive.tmem import TmemPlan, TmemView
@@ -430,10 +432,11 @@ def role(
 # --------------------------------------------------------------------------- #
 
 
-# Keyed settings that may change after construction. Collection freezes the cluster (it fixes
-# the channel scopes), the work streams (the scheduler roles) and trace_protocol (the protocol
-# log); the rest are read at trace time.
-_HOST_SETTINGS = (
+# Settings every kernel's constructor accepts as keywords, unless its __init__ declares the
+# name itself (FA4 and the GEMMs take cluster=). Like every other attribute they are fixed once
+# construction returns; with_settings() builds a kernel with different ones.
+SETTINGS = (
+    "cluster",
     "alias_check",
     "liveness_check",
     "trace_protocol",
@@ -441,7 +444,6 @@ _HOST_SETTINGS = (
     "trace_waits",
     "trace_events_per_role",
 )
-_COLLECTED_SETTINGS = ("cluster", "trace_protocol")
 # Trace results for describe(), pipeline plans and trace-time warnings.
 # __cute_trace_record__ and __cute_restore_trace__ save and restore exactly these attributes;
 # _reset_trace gives each its empty value.
@@ -459,27 +461,43 @@ _TRACE_RESULTS = (
 )
 
 
+# Kernel.get_or_build(): one instance per class and constructor call.
+_BUILT: dict = {}
+
+
 @functools.cache
 def _init_signature(cls) -> inspect.Signature:
     return inspect.signature(cls.__init__)
 
 
 def _rebuild(cls, args, kwargs, settings):
-    kernel = cls(*args, **kwargs)
-    for name, value in settings.items():
-        setattr(kernel, name, value)
-    return kernel
+    return cls(*args, **kwargs, **settings)
+
+
+def _check_settings(settings: dict) -> None:
+    backend = settings.get("trace_backend")
+    if backend is not None and backend not in tracing.BACKENDS:
+        raise ValueError(
+            f"trace_backend must be one of {tracing.BACKENDS} or None, got {backend!r}"
+        )
+    events = settings.get("trace_events_per_role", 1024)
+    if type(events) is not int or events < 1:
+        raise ValueError(f"trace_events_per_role must be a positive int, got {events!r}")
 
 
 class _KernelType(type):
-    """Metaclass that records the constructor call.
+    """Metaclass that records the constructor call and then freezes the kernel.
 
-    Everything any ``__init__`` of the call assigns belongs to the constructor. The arguments
-    are deep-copied before the call runs; that copy becomes the kernel's cache key and is
-    replayed on unpickling, so a later in-place change to an argument affects neither.
+    Everything any ``__init__`` of the call assigns belongs to the constructor, and so do the
+    ``SETTINGS`` keywords, which the base applies after ``__init__``. The arguments are
+    deep-copied before the call runs; that copy becomes the kernel's cache key and is replayed
+    on unpickling, so a later in-place change to an argument affects neither.
     """
 
     def __call__(cls, *args, **kwargs):
+        params = _init_signature(cls).parameters
+        settings = {k: kwargs.pop(k) for k in SETTINGS if k in kwargs and k not in params}
+        _check_settings(settings)
         try:
             init = copy.deepcopy((args, kwargs))
         except Exception as error:  # noqa: BLE001 (raised by __cute_cache_key__ and pickling)
@@ -488,6 +506,8 @@ class _KernelType(type):
                 f"no cache key and cannot be pickled ({error})"
             )
         kernel = super().__call__(*args, **kwargs)
+        for name, value in settings.items():
+            setattr(kernel, name, value)
         if isinstance(init, TypeError):
             frozen = init
         else:
@@ -498,7 +518,9 @@ class _KernelType(type):
             except TypeError as error:
                 frozen = error
         object.__setattr__(kernel, "_ws_init_key", frozen)
-        object.__setattr__(kernel, "_ws_init", init)
+        # The builds jit_cache served this instance, valid for its life: nothing keyed changes.
+        object.__setattr__(kernel, "__cute_memo__", {})
+        object.__setattr__(kernel, "_ws_init", init)  # constructed: public attributes are fixed
         return kernel
 
 
@@ -529,7 +551,11 @@ class WarpSpecialized(metaclass=_KernelType):
     alias_check: str = "warn"
     liveness_check: str = "strict"
     trace_protocol: bool = False
-    # Ranges named after roles and channels (tracing.py), set with enable_trace().
+    # Ranges named after roles and channels (tracing.py): "iket" records IKET ranges for
+    # run-iket; "globaltimer" writes profiler records into the buffer passed to
+    # run_roles(..., trace_buffer=...), decoded by trace_session.trace_session. trace_waits=False
+    # keeps only the role, work-item and trace_region ranges (wait ranges are costly, role ranges
+    # nearly free); globaltimer ranges past trace_events_per_role are dropped.
     trace_backend: str | None = None  # "iket", "globaltimer", or None: no ranges
     trace_waits: bool = True  # also a range around every blocking channel wait
     trace_events_per_role: int = 1024  # globaltimer: records per role instance and CTA
@@ -538,34 +564,76 @@ class WarpSpecialized(metaclass=_KernelType):
     _ws_traced: bool = False  # trace results are present, from tracing or a cached build
 
     def __reduce__(self):
-        """Pickle as the constructor call plus what the cache key lets change after it: the
-        host settings, the cluster and the work streams. A fresh compiler process rebuilds the
-        kernel from that. Any other attribute assigned after construction makes the key raise,
-        so none are kept."""
+        """Pickle as the constructor call, settings included; a fresh compiler process rebuilds
+        the kernel from that. Nothing else can differ: the kernel is fixed once constructed."""
         if isinstance(self._ws_init, TypeError):
             raise self._ws_init
-        state = vars(self)
-        settings = {k: state[k] for k in (*_HOST_SETTINGS, "cluster") if k in state}
-        # A stream refers back to its owner; ship its declaration and let setattr re-own it.
-        settings |= {k: replace(v) for k, v in state.items() if isinstance(v, WorkStream)}
-        return _rebuild, (type(self), *self._ws_init, settings)
+        return _rebuild, (type(self), *self._ws_init, self._settings())
 
     def __setattr__(self, name, value):
-        state = vars(self)
-        collected_setting = isinstance(value, WorkStream) or name in _COLLECTED_SETTINGS
-        if collected_setting and self._ws_roles is not None:
-            raise ProtocolError(
-                f"{type(self).__name__}.{name} cannot change after collection (describe, "
-                "compile-cache lookup, or tracing derived the channels from it); construct a "
-                "new kernel"
-            )
+        if not name.startswith("_") or isinstance(value, WorkStream):
+            self._check_constructing(name)
         if isinstance(value, WorkStream):
             value.owner = self  # the stream's work unit follows this kernel's cluster
         super().__setattr__(name, value)  # a read-only property raises before anything is kept
-        if "_ws_init" in state and not (  # assigned after construction
-            collected_setting or name.startswith("_") or name in _HOST_SETTINGS
-        ):
-            state.setdefault("_ws_late", set()).add(name)  # not keyed: see __cute_cache_key__
+
+    def _check_constructing(self, name: str) -> None:
+        """Raise once construction has returned: the constructor call is the compile key."""
+        if "_ws_init" in vars(self):
+            raise ProtocolError(
+                f"{type(self).__name__}.{name} cannot change after construction: the "
+                "constructor call is the kernel's compile key. Pass it to the constructor (the "
+                f"settings {', '.join(SETTINGS)} are keywords of every kernel) or use "
+                "with_settings()"
+            )
+
+    def _settings(self) -> dict:
+        """The settings given as keywords, not through the subclass's own parameters."""
+        params = _init_signature(type(self)).parameters
+        state = vars(self)
+        return {k: state[k] for k in SETTINGS if k in state and k not in params}
+
+    def with_settings(self, **changes):
+        """A new kernel from this one's constructor call with ``changes`` applied, each a
+        setting (``SETTINGS``) or a constructor parameter by name::
+
+            traced = op.with_settings(trace_backend="globaltimer", trace_waits=False)
+        """
+        if isinstance(self._ws_init, TypeError):
+            raise self._ws_init
+        cls = type(self)
+        signature = _init_signature(cls)
+        call = signature.bind(None, *self._ws_init[0], **self._ws_init[1])
+        settings = self._settings()
+        for name, value in changes.items():
+            if name in signature.parameters and name != "self":
+                call.arguments[name] = value
+            elif name in SETTINGS:
+                settings[name] = value
+            else:
+                raise TypeError(f"{cls.__name__} has no setting or parameter {name!r}")
+        return cls(*call.args[1:], **call.kwargs, **settings)
+
+    @classmethod
+    def get_or_build(cls, *args, **kwargs):
+        """The kernel for this constructor call, built on the first request and then reused.
+
+        The launch pattern: ``compile_fn(Kernel.get_or_build(...))`` costs two dictionary
+        lookups per call, keyed by the call itself rather than a hand-written key. Kernels are
+        immutable, so reusing one is safe. Its work stream's scheduler workspace is shared too:
+        concurrent launches of a broadcast schedule on different streams need instances of
+        their own (``Kernel(...)``).
+        """
+        key = (
+            cls,
+            fast_key((args, tuple(sorted(kwargs.items())))) if kwargs else fast_key(args),
+        )
+        if key[1] is None:
+            key = (cls, canonical_key((args, kwargs)))
+        kernel = _BUILT.get(key)
+        if kernel is None:
+            kernel = _BUILT.setdefault(key, cls(*args, **kwargs))
+        return kernel
 
     # ---- host-side analysis ------------------------------------------------ #
 
@@ -732,7 +800,13 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_named_bars = named_bars
         self._ws_streams = streams
         self._ws_fetch_keys = fetch_keys
+        # A cached build may have restored its trace record before anything collected: keep it.
+        restored = {n: getattr(self, n) for n in _TRACE_RESULTS} if self._ws_traced else None
         self._reset_trace()
+        if restored is not None:
+            for name, value in restored.items():
+                setattr(self, name, value)
+            self._ws_traced = True
 
     def _reset_trace(self):
         """Clear trace state so a failed retrace cannot expose an earlier trace's reports.
@@ -1068,40 +1142,54 @@ class WarpSpecialized(metaclass=_KernelType):
 
         * the constructor call: bound arguments with defaults filled in, copied before
           ``__init__`` runs, so a later in-place change to a list argument does not change it;
-        * what may change after construction: the cluster, each work stream, and the host
-          settings (trace backend and options, ``trace_protocol``, ``alias_check``; a "warn"
-          build must not satisfy a "strict" one);
+        * the settings: the cluster, each work stream, and the host settings (trace backend
+          and options, ``trace_protocol``, ``alias_check``; a "warn" build must not satisfy a
+          "strict" one);
         * the resolved role placement and budgets;
         * the source of every module defining the kernel's, cluster's and streams' classes, so
           editing a kernel the compile function does not import (a test's subclass)
           recompiles it.
 
-        Raises ``TypeError`` for any other public attribute assigned after construction: set it
-        in ``__init__``. In-place changes to objects the constructor built (``op.ab.n = 4``) are
-        not keyed; don't make them.
+        The kernel is fixed once constructed, so this is too. In-place changes to objects the
+        constructor built (``op.ab.n = 4``) are not keyed; don't make them.
         """
-        late = vars(self).get("_ws_late")
-        if late:
-            raise TypeError(
-                f"{type(self).__name__}: {sorted(late)} assigned after construction, but a "
-                "cached compile keys the constructor call. Pass the value to the constructor or "
-                "set it in __init__ (a subclass works); only cluster, work streams, alias_check, "
-                "liveness_check, trace_protocol and the trace settings may change after "
-                "construction"
-            )
-        if isinstance(self._ws_init_key, TypeError):
-            raise self._ws_init_key
-        streams = [v for v in vars(self).values() if isinstance(v, WorkStream)]
+        streams = self._streams()
         parts = [self, self.cluster]
         parts += [part for s in streams for part in (s.schedule, s.mapping, s.ready)]
         modules = sorted({c.__module__ for part in parts for c in type(part).__mro__})
+        return (
+            *self._call_key(streams),
+            self.role_config_key(),
+            tuple((m, module_source_digest(m)) for m in modules),
+        )
+
+    def __cute_runtime_key__(self) -> tuple:
+        """This kernel's in-process lookup key: ``__cute_cache_key__`` without the parts a class
+        fixes for the whole process. The collected role placement is a pure function of the
+        constructor call and the class, and the module sources cannot change under a running
+        process, so ``jit_cache`` finds a build it already holds without collecting the roles
+        (about 0.3-0.8 ms per launch for a fresh instance). The disk key keeps both. The kernel
+        is immutable, so the key is computed once."""
+        key = vars(self).get("_ws_runtime_key")
+        if key is None:
+            init, *settings = self._call_key(self._streams())
+            key = (init, canonical_key(tuple(settings)))  # the constructor key is canonical
+            self._ws_runtime_key = key
+        return key
+
+    def _streams(self) -> list:
+        """The work streams, once the constructor call is known to have a key."""
+        if isinstance(self._ws_init_key, TypeError):
+            raise self._ws_init_key
+        return [v for v in vars(self).values() if isinstance(v, WorkStream)]
+
+    def _call_key(self, streams: list) -> tuple:
+        """The constructor call and the settings it fixed."""
         return (
             self._ws_init_key,
             self.cluster,
             tuple((s.schedule, s.mapping, s.ready, s.scheduler_warp) for s in streams),
             (self.alias_check, self.liveness_check, self.trace_protocol, self._trace_settings()),
-            self.role_config_key(),
-            tuple((m, module_source_digest(m)) for m in modules),
         )
 
     def __cute_trace_record__(self) -> dict:
@@ -1120,8 +1208,9 @@ class WarpSpecialized(metaclass=_KernelType):
     def __cute_restore_trace__(self, record: dict) -> None:
         """Load a cached build's trace record, so ``describe()`` and the warnings match a cold
         compile. An instance that traced, or already took a record, keeps its own. Restored
-        SMEM entries have no tensors: ``buffer()`` works only while tracing."""
-        self._collect()
+        SMEM entries have no tensors: ``buffer()`` works only while tracing. The record holds
+        everything ``describe()`` and the reports read, so restoring collects no roles: the
+        cached-launch path stays cheap for a fresh instance (``describe()`` collects on demand)."""
         if record is None or self._ws_traced:
             return
         record = pickle.loads(pickle.dumps(record))  # this instance's own copies
@@ -1134,32 +1223,6 @@ class WarpSpecialized(metaclass=_KernelType):
         self._ws_traced = True
         self._report_trace()
 
-    def enable_trace(
-        self, backend: str | None, *, waits: bool = True, events_per_role: int = 1024
-    ):
-        """Emit ranges named after roles and channels in the next compile.
-
-        ``backend``: ``"iket"`` records IKET ranges for ``run-iket``; ``"globaltimer"`` writes
-        profiler records into the buffer passed to ``run_roles(..., trace_buffer=...)``,
-        decoded by ``trace_session.trace_session``; ``None`` emits no ranges and no IR.
-        ``waits=False`` keeps only the role, work-item and ``trace_region`` ranges: wait ranges
-        are costly, role ranges nearly free.
-        ``events_per_role``: globaltimer records per role instance and CTA; later ranges are
-        dropped.
-
-        ``__cute_cache_key__`` keys the settings that change code; ``trace_key()`` names the
-        backend for kernel names.
-        """
-        if backend is not None and backend not in tracing.BACKENDS:
-            raise ValueError(
-                f"trace backend must be one of {tracing.BACKENDS} or None, got {backend!r}"
-            )
-        if type(events_per_role) is not int or events_per_role < 1:
-            raise ValueError(f"events_per_role must be a positive int, got {events_per_role!r}")
-        self.trace_backend, self.trace_waits = backend, waits
-        self.trace_events_per_role = events_per_role
-        return self
-
     def _trace_settings(self) -> tuple:
         """The trace settings that change the generated code (the compile key's part)."""
         if self.trace_backend is None:
@@ -1167,10 +1230,6 @@ class WarpSpecialized(metaclass=_KernelType):
         if self.trace_backend == "iket":
             return ("iket", self.trace_waits)
         return (self.trace_backend, self.trace_waits, self.trace_events_per_role)
-
-    def enable_iket(self, enabled: bool = True, *, waits: bool = True):
-        """``enable_trace("iket", waits=waits)``, or ``enable_trace(None)`` when not enabled."""
-        return self.enable_trace("iket" if enabled else None, waits=waits)
 
     def trace_key(self) -> str:
         """Kernel-name suffix: ``_iket``, ``_iketroles``, ``_gtimer`` or ``_gtimerroles`` (empty
@@ -1391,6 +1450,8 @@ class WarpSpecialized(metaclass=_KernelType):
             )
             self._ws_tmem = tmem
             self._ws_tmem_alloc_role = alloc_role
+            self._ws_tmem_alloc_warp = alloc_warp
+            self._ws_tmem_dealloc_bar = dealloc_bar
             if not clustered:  # a cluster allocates after the cluster sync in run_roles
                 # Only the allocator warp executes tcgen05.alloc (checked inside).
                 tmem.allocate(self.tmem_plan.alloc_cols)
@@ -1536,7 +1597,7 @@ class WarpSpecialized(metaclass=_KernelType):
             return IketTrace()
         if buffer is None:
             raise ProtocolError(
-                "enable_trace('globaltimer') records into a profile buffer: pass "
+                "trace_backend='globaltimer' records into a profile buffer: pass "
                 "run_roles(params, trace_buffer=...) (see trace_session.py)"
             )
         trace = tracing.GlobaltimerTrace(
@@ -1651,6 +1712,11 @@ class WarpSpecialized(metaclass=_KernelType):
         trace = RoleTrace(
             name, log, ranges, self.trace_waits, instance=instance, instances=len(unit)
         )
+        trace.tcgen05 = self._issues_tcgen05(r)
+        if trace.tcgen05:
+            # Orders the role's first tcgen05 operation after the CTA sync that published the
+            # TMEM base address and barrier initialization (PTX ISA 9.7.18.6.3).
+            tcgen05_after_thread_sync()
         args = self._role_args(unit, instance, ctx, trace)
         # A role looping over a WorkStream gets one range per work item (WorkCursor); any
         # other role gets one over its whole body.
@@ -1684,7 +1750,7 @@ class WarpSpecialized(metaclass=_KernelType):
             raise ProtocolError(f"{name}: trace ranges {ranges.names} left open at role exit")
         self._record_role(unit, instance, trace)
         if r.uses_tmem:
-            self._tmem_teardown(unit)
+            self._tmem_teardown(unit, trace)
 
     def _record_role(self, unit: tuple[RoleInstance, ...], instance, trace: RoleTrace):
         """Check a traced role body and keep its results, under each instance it ran as, for
@@ -1720,8 +1786,26 @@ class WarpSpecialized(metaclass=_KernelType):
                 events.events = [_for_instance(ev, j) for ev in events.events]
             self._ws_role_events.append(events)
 
-    def _tmem_teardown(self, unit: tuple[RoleInstance, ...]):
-        """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp."""
+    def _issues_tcgen05(self, r: RoleInstance) -> bool:
+        """Whether ``r`` issues tcgen05 operations: it takes ``tmem: Tmem`` (tcgen05.ld/st, or
+        MMAs into TMEM) or signals a channel side as ``Umma``. Its managed synchronization then
+        takes the tcgen05 thread-sync fences (``thread_sync.py``)."""
+        if r.uses_tmem:
+            return True
+        for ch in self._ws_chans.values():
+            for side, bound in (("producer", ch.producers), ("consumer", ch.consumers)):
+                if any(ri is r for ri, _ in bound) and ch.mechanism(side, r.role) is Umma:
+                    return True
+        return False
+
+    def _tmem_teardown(self, unit: tuple[RoleInstance, ...], trace: RoleTrace):
+        """At role exit, wait for the CTA's other TMEM users, then free from the allocator warp.
+
+        Each user thread completes its TMEM loads and stores (``tcgen05.wait::ld``/``::st``,
+        unless the role skipped them with ``TmemView.skip_teardown_drain``) and orders them
+        before the rendezvous (``tcgen05.fence::before_thread_sync``); the allocator warp orders
+        the dealloc after it (``::after_thread_sync``), as PTX requires across threads (ISA
+        9.7.18.6.3)."""
         r = unit[0]
         # Every TMEM user of this CTA finishes before the allocator warp frees it (a pair's
         # peer has no leader-only TMEM roles, so its count is smaller).
@@ -1731,14 +1815,39 @@ class WarpSpecialized(metaclass=_KernelType):
             for c in self.cluster.ctas(r.cta)
         }
         count = rank_value(threads, self.cluster.rank)
+        # Complete this thread's TMEM loads and stores: tcgen05.ld/st are asynchronous, and
+        # neither a register dependency on loaded values nor the rendezvous below completes them
+        # (PTX ISA 9.7.18.6.4.5). MMAs and copies complete through their commits, which their
+        # consumers waited for. Then order them before the rendezvous and so the dealloc.
+        # NOTE: tcgen05.wait blocks until the executing thread's own earlier loads (stores)
+        # complete, so every TMEM user waits here: the allocator warp cannot complete them after
+        # the rendezvous. A role whose every path already completed its accesses of a kind (or
+        # issues none) may skip that wait: the before fence below still orders those completed
+        # accesses before the rendezvous, and the allocator's after fence orders the dealloc
+        # after it (ISA 9.7.18.6.3). Keeping it is not free: ptxas takes a .sync.aligned wait as
+        # a convergence point and may regenerate the roles dispatched after this one.
+        _teardown_drain(trace)
+        tcgen05_before_thread_sync()
         # Roles reach this from different code sites after per-lane mbarrier spins, so use
         # the unaligned form (compute-sanitizer synccheck flags the aligned bar.sync).
         _named_sync(TMEM_TEARDOWN_BARRIER_ID, count)
         if self._ws_tmem_alloc_role in unit:
-            ptr = self._ws_tmem.retrieve_ptr(cutlass.Float32)
-            # Only the allocator warp frees (checked inside, so a shared body may call it).
-            # Pair: the allocator warps of both CTAs meet on the dealloc mbarrier first.
-            self._ws_tmem.free(ptr, self.tmem_plan.alloc_cols)
+            self._free_tmem(self._ws_tmem.retrieve_ptr(cutlass.Float32))
+
+    @cute.jit
+    def _free_tmem(self, ptr):
+        """``tcgen05.dealloc`` from the allocator warp (a shared body may reach this from other
+        warps), fenced after the last synchronization: the teardown rendezvous, or in a pair the
+        allocator warps' dealloc mbarrier, which the peer reaches after its own rendezvous."""
+        warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp == self._ws_tmem_alloc_warp:
+            if cutlass.const_expr(self.cluster.pair):
+                bar = self._ws_tmem_dealloc_bar
+                peer = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster()) ^ 1
+                cute.arch.mbarrier_arrive(bar, peer)
+                cute.arch.mbarrier_wait(bar, 0)
+            tcgen05_after_thread_sync()
+            cute.arch.dealloc_tmem(ptr, self.tmem_plan.alloc_cols, is_two_cta=self.cluster.pair)
 
     def _set_regs(self, regs):
         if regs is None:
@@ -2068,6 +2177,20 @@ def _runs(warps: list[int]) -> list[range]:
         else:
             runs.append(range(w, w + 1))
     return runs
+
+
+def _teardown_drain(trace: RoleTrace):
+    """The role's ``tcgen05.wait::ld`` and ``::st`` at the TMEM teardown, except those it
+    skipped (``TmemView.skip_teardown_drain``)."""
+    skip = trace.teardown_skip
+    for kind, wait in (
+        ("wait::ld", nvvm.Tcgen05WaitKind.LOAD),
+        ("wait::st", nvvm.Tcgen05WaitKind.STORE),
+    ):
+        if skip is not None and skip.covers(kind):
+            skip.suppress(kind, trace.role_name)
+        else:
+            nvvm.tcgen05_wait(kind=wait)
 
 
 def _in_warpgroups(warp_idx, groups: tuple[int, ...]):

@@ -7,6 +7,8 @@ import itertools
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
+
 
 @pytest.mark.parametrize(
     ("head_dim", "chunk_size", "subchunk_size", "message"),
@@ -73,8 +75,8 @@ def test_ragged_fake_tensors_reject_legacy_boolean_schedule():
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA inter-solve requires an SM100 or SM103 GPU",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTeDSL KDA inter-solve requires an SM100-family GPU",
 )
 def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
     pytest.importorskip("cutlass")
@@ -119,8 +121,8 @@ def test_inter_solve_reuses_compiled_specializations(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA inter-solve requires an SM100 or SM103 GPU",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTeDSL KDA inter-solve requires an SM100-family GPU",
 )
 def test_persistent_inter_solve_compile_counts(tmp_path, monkeypatch):
     """K3b's persistent chunk-worker cap is a launch argument: varying it with the capacity, the
@@ -178,8 +180,8 @@ def test_persistent_inter_solve_compile_counts(tmp_path, monkeypatch):
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA inter-solve requires an SM100 or SM103 GPU",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTeDSL KDA inter-solve requires an SM100-family GPU",
 )
 @pytest.mark.parametrize("request_name", ["STATIC", "PERSISTENT"])
 def test_ragged_inter_solve_forced_int64_matches_default(monkeypatch, request_name):
@@ -230,8 +232,8 @@ def test_ragged_inter_solve_forced_int64_matches_default(monkeypatch, request_na
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA inter-solve requires an SM100 or SM103 GPU",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTeDSL KDA inter-solve requires an SM100-family GPU",
 )
 def test_dense_inter_solve_without_chunks_launches_nothing():
     """Zero dense chunks return empty outputs without compiling or launching: a one-item grid of

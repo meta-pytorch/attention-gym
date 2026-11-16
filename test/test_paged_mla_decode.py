@@ -8,6 +8,7 @@ import torch
 from torch._dynamo.testing import CompileCounterWithBackend
 
 from attn_gym._backends import tune as tune_module
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.tune import run_tunable
 from attn_gym.mla import AuxRequest, Impl, paged_mla_decode
 from attn_gym.mla.impl import cute, fa3
@@ -18,12 +19,11 @@ from attn_gym.testing.kda import (
 )
 
 CAPABILITY = torch.cuda.get_device_capability() if torch.cuda.is_available() else None
-FUSED_CAPABLE = CAPABILITY in cute.SUPPORTED_CAPABILITIES + fa3.SUPPORTED_CAPABILITIES
-FUSED_MODULE = (
-    "flash_attn.cute" if CAPABILITY in cute.SUPPORTED_CAPABILITIES else "flash_attn_interface"
-)
+CUTE_CAPABLE = cuda_runs_sm100_kernels()
+FUSED_CAPABLE = CUTE_CAPABLE or CAPABILITY in fa3.SUPPORTED_CAPABILITIES
+FUSED_MODULE = "flash_attn.cute" if CUTE_CAPABLE else "flash_attn_interface"
 requires_fused = pytest.mark.skipif(
-    not FUSED_CAPABLE, reason="Fused absorbed MLA requires SM90 (FA3) or SM100/SM103 (FA4)"
+    not FUSED_CAPABLE, reason="Fused absorbed MLA requires SM90 (FA3) or the SM100 family (FA4)"
 )
 
 
@@ -364,7 +364,8 @@ def test_fused_fullgraph_compile_reuses_one_graph():
 
 
 @pytest.mark.skipif(
-    CAPABILITY not in cute.SUPPORTED_CAPABILITIES, reason="Autotuning requires SM100/SM103 (FA4)"
+    not CUTE_CAPABLE,
+    reason="Autotuning requires an SM100-family GPU (FA4)",
 )
 @pytest.mark.parametrize(
     "num_heads, query_lengths",
@@ -460,7 +461,8 @@ def test_autotune_matches_reference_and_reuses_winner(
 
 
 @pytest.mark.skipif(
-    CAPABILITY not in cute.SUPPORTED_CAPABILITIES, reason="Autotuning requires SM100/SM103 (FA4)"
+    not CUTE_CAPABLE,
+    reason="Autotuning requires an SM100-family GPU (FA4)",
 )
 @pytest.mark.parametrize(
     "num_heads, query_lengths",

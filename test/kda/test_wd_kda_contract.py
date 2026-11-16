@@ -110,7 +110,8 @@ def test_kda_chain_forward_rejects_invalid_plan_buffers(monkeypatch, invalid):
     """The real chain plan reaches the compiler; corrupting one of its buffers fails before
     compiling."""
     monkeypatch.setattr(kda_chain_forward, "_compile_chain_forward", reached_compiler)
-    monkeypatch.setattr(kda, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 0)
+    cost = kda.CHAIN_COST_FWD[128]
+    monkeypatch.setitem(kda.CHAIN_COST_FWD, 128, cost._replace(overhead_tokens=0))
     build = kda.build_chain_forward
 
     def corrupt(**kwargs):

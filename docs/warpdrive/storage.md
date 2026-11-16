@@ -126,7 +126,7 @@ Annotate overlapping accesses so the alias diagnostic can compare their lifetime
 ordering. See [alias checks](guarantees.md#aliases) for what a result establishes.
 
 ```python
-op.alias_check = "warn"  # default; set before compiling
+op = MyKernel(alias_check="warn")  # the default; "strict" raises, "off" skips
 compile_kernel(op)  # your kernel's compile helper
 print(op.describe())
 ```

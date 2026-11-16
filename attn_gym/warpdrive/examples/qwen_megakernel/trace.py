@@ -28,9 +28,12 @@ from attn_gym.warpdrive.examples.qwen_megakernel import (
     DOWN,
     GATEUP,
     LMHEAD,
+    NORM,
     OP_NAMES,
     OPROJ,
     QKV,
+    REDUCE,
+    ROUTER,
     QwenDecodeMegakernel,
     row_groups,
 )
@@ -40,7 +43,13 @@ from attn_gym.warpdrive.trace_session import work_item_ranges, write_trace
 
 # The instruction kind each phase waits for; QKV and the LM head wait for the previous layer's
 # down.
-PRODUCER = {QKV: DOWN, ATTN: QKV, OPROJ: ATTN, GATEUP: OPROJ, DOWN: GATEUP, LMHEAD: DOWN}
+PRODUCER = {
+    QKV: DOWN, ATTN: QKV, OPROJ: ATTN, ROUTER: OPROJ, GATEUP: OPROJ, DOWN: GATEUP, LMHEAD: DOWN,
+    REDUCE: DOWN,
+}  # fmt: skip
+MOE_PRODUCER = {**PRODUCER, GATEUP: ROUTER}  # a MoE table's expert rows wait for the router
+# Batched MoE: REDUCE rows publish the residual QKV and the LM head read.
+MOE_BATCH_PRODUCER = {**MOE_PRODUCER, QKV: REDUCE, LMHEAD: REDUCE}
 
 
 @contextmanager
@@ -110,32 +119,55 @@ def input_edges(
 
 
 def phase_spans(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
-    """Mean us per layer, by instruction kind, from the producer phase's last row done to this
-    phase's last row done. QKV counts from layer 1, whose producer is the previous layer's
-    down."""
+    """Mean us per layer, by phase, from the producer phase's last row done to this phase's last
+    row done. QKV counts from layer 1, whose producer is the previous layer's down; a MoE
+    table's GATEUP counts from its ROUTER. A streaming table's NORM rows are two phases,
+    NORM_IN (QKV's and the LM head's inputs) and NORM_POST (gate/up's), and QKV, the LM head
+    and dense gate/up count from them."""
     rows = table.tolist()
-    last: dict[tuple[int, int], int] = {}
+    kinds = {row[0] for row in rows}
+    producers = PRODUCER
+    if ROUTER in kinds:
+        producers = MOE_PRODUCER
+    if REDUCE in kinds:
+        producers = MOE_BATCH_PRODUCER
+    # Phase name -> (producer phase, its layer offset).
+    after = {
+        OP_NAMES[op]: (OP_NAMES[producer], -1 if op in (QKV, LMHEAD) else 0)
+        for op, producer in producers.items()
+    }
+    if NORM in kinds:
+        after["NORM_IN"] = after["QKV"]
+        after["QKV"] = after["LMHEAD"] = ("NORM_IN", 0)
+        after["NORM_POST"] = ("OPROJ", 0)
+        if ROUTER not in kinds:
+            after["GATEUP"] = ("NORM_POST", 0)
+    last: dict[tuple[str, int], int] = {}
     for row, item in work_item_ranges(ranges, "compute").items():
-        key = tuple(rows[row][:2])  # (op, layer); the LM head's layer is the layer count
-        last[key] = max(last.get(key, 0), item.end_ns)
+        op, layer, a = rows[row][:3]  # the LM head's layer is the layer count
+        name = ("NORM_IN", "NORM_POST")[a] if op == NORM else OP_NAMES[op]
+        last[name, layer] = max(last.get((name, layer), 0), item.end_ns)
     spans: dict[str, list[int]] = {}
-    for (op, layer), end in last.items():
-        producer_layer = layer - 1 if op in (QKV, LMHEAD) else layer
-        producer = last.get((PRODUCER[op], producer_layer))
-        if producer is not None:
-            spans.setdefault(OP_NAMES[op], []).append(end - producer)
+    for (name, layer), end in last.items():
+        producer, offset = after[name]
+        start = last.get((producer, layer + offset))
+        if start is not None:
+            spans.setdefault(name, []).append(end - start)
     return {name: sum(v) / len(v) / 1e3 for name, v in spans.items()}
 
 
 def input_waits(ranges: list[Range], table: torch.Tensor) -> dict[str, float]:
     """Median us, by instruction kind, from a row's start to its inputs ready (the end of its
-    first ``poll``). Rows that reuse the previous row's GEMV input poll nothing and are not
-    counted."""
+    first ``poll``; a REDUCE row's ``reduce.poll``). Rows that reuse the previous row's GEMV input
+    poll nothing and are not counted."""
     rows = table.tolist()
     starts = {row: item.start_ns for row, item in work_item_ranges(ranges, "compute").items()}
     ready: dict[int, float] = {}
     for item in ranges:
-        if item.name == "poll" and item.payload is not None:
+        if item.payload is None:
+            continue
+        reduce_row = 0 <= item.payload < len(rows) and rows[item.payload][0] == REDUCE
+        if item.name == "poll" or (item.name == "reduce.poll" and reduce_row):
             ready[item.payload] = min(ready.get(item.payload, math.inf), item.end_ns)
     waits: dict[str, list[int]] = {}
     for row, end in ready.items():

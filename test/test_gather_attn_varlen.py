@@ -5,6 +5,7 @@ from functools import wraps
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.sparse.gather_attn import AuxRequest, gather_attn
 
 
@@ -15,8 +16,8 @@ def _device(backend):
         pytest.skip("CUDA required")
     if backend == "cute":
         pytest.importorskip("flash_attn.cute.interface")
-        if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-            pytest.skip("FA4 gather requires SM100/SM103")
+        if not cuda_runs_sm100_kernels():
+            pytest.skip("FA4 gather requires an SM100-family GPU")
     return "cuda"
 
 

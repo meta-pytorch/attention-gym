@@ -34,7 +34,7 @@ def chunk_gdn_bwd_warpdrive_packed(
 ]:
     """Run checkpoint recompute followed by scalar-GDN backward.
 
-    Long sequences on few (sequence, head) tiles run as an exact piece chain. ``split`` enables
+    Few (sequence, head) tiles run as an exact piece chain when it pays. ``split`` enables
     the approximate forgetting-horizon work table instead and requires a no-state call.
     """
     if split and (initial_state is not None or d_final_state is not None):

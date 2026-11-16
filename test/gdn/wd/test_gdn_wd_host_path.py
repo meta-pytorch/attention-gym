@@ -8,16 +8,18 @@ import collections
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn
 from attn_gym.linear._delta_rule.warpdrive import contract
 from attn_gym.linear._delta_rule.warpdrive.bundles import gdn_warmup_backward
 from attn_gym.linear._delta_rule.warpdrive.drivers import gdn as gdn_driver
 from attn_gym.testing import make_gdn_test_inputs
+from attn_gym.warpdrive import WarpSpecialized
 from attn_gym.warpdrive.cache import jit as cute_cache
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive backend requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive backend requires an SM100-family GPU",
 )
 
 _WARPDRIVE = {"backend": "warpdrive"}
@@ -49,7 +51,7 @@ def test_warm_gdn_call_validates_once_and_skips_full_cache_key(monkeypatch):
     calls = collections.Counter()
     _count(monkeypatch, calls, contract, "validate_gdn_bwd_operands")
     # jit_cache's full argument-key builds, the path a warm launch must skip.
-    _count(monkeypatch, calls, cute_cache, "_fast_key")
+    _count(monkeypatch, calls, WarpSpecialized, "__cute_runtime_key__")
     _count(monkeypatch, calls, cute_cache, "_make_runtime_key")
 
     _gdn_step(lengths)
@@ -63,14 +65,14 @@ def test_warm_gdn_call_validates_once_and_skips_full_cache_key(monkeypatch):
 def test_gdn_chain_changing_shapes_matches_default(monkeypatch):
     """The chain launches are keyed without the batch shape; a later shape must still get its
     own plan, piece geometry and validation instead of a replay of the previous one."""
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_FWD", 0)
-    monkeypatch.setattr(gdn_driver, "MIN_CHAIN_TOKENS_PER_PIECE_BWD", 0)
+    for costs in (gdn_driver.CHAIN_COST_FWD, gdn_driver.CHAIN_COST_BWD):
+        monkeypatch.setitem(costs, 128, costs[128]._replace(overhead_tokens=0))
     device = torch.device("cuda")
     # 8, then 4 pieces per sequence, then the first shape again.
     for lengths in ((2048,), (900, 1148), (2048,)):
         tokens = sum(lengths)
         assert gdn_driver.ForwardPlan.build(tokens, len(lengths), 2, 128, device).chain
-        assert gdn_driver.BackwardPlan.build(tokens, len(lengths), 2, device).chain
+        assert gdn_driver.BackwardPlan.build(tokens, len(lengths), 2, 128, device).chain
         actual = _gdn_step(lengths)
         expected = _gdn_step(lengths, kernel_options=None)
         for got, want in zip(actual, expected, strict=True):

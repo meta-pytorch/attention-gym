@@ -128,13 +128,17 @@ def clone_kda_inputs(
     inputs: Sequence[torch.Tensor],
     *,
     dtype: torch.dtype | None = None,
+    requires_grad: bool | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Clone KDA inputs into independent autograd leaves, optionally changing precision."""
+    """Clone inputs into independent autograd leaves.
+
+    Preserve each input's dtype and requires_grad unless overridden.
+    """
     return tuple(
         value.detach()
         .to(dtype=value.dtype if dtype is None else dtype)
         .clone()
-        .requires_grad_(value.requires_grad)
+        .requires_grad_(value.requires_grad if requires_grad is None else requires_grad)
         for value in inputs
     )
 
@@ -256,6 +260,17 @@ def assert_relative_rms_within(
         f"{name}: relative RMS error {relative_error:.3e} exceeds {limit:.3e} "
         f"({relative_error / torch.finfo(source_dtype).eps:.2f} {source_dtype} eps)"
     )
+
+
+def assert_matches_fused(actual: torch.Tensor, fused: torch.Tensor, name: str) -> None:
+    """Assert matching dtypes and BF16-based error bounds against the fused reference.
+
+    Allow pointwise error up to two BF16 eps times the reference's maximum magnitude
+    and relative RMS error up to 1%, regardless of the tensors' dtype.
+    """
+    assert actual.dtype == fused.dtype, name
+    assert_matches_low_precision_reference(actual, fused, fused, name)
+    assert_relative_rms_within(actual, fused, name, max_eps=1e-2 / torch.finfo(torch.bfloat16).eps)
 
 
 def bwd_daqk_reference(
@@ -461,6 +476,7 @@ def bwd_wy_dqkg_reference(
 
 
 __all__ = [
+    "assert_matches_fused",
     "assert_matches_low_precision_reference",
     "assert_relative_rms_within",
     "assert_rms_matches_low_precision_reference",

@@ -43,10 +43,30 @@ def resolve_kernel_options(
 ) -> ResolvedKernelOptions:
     """Validate chunk backend options and resolve their defaults."""
     options = resolve_chunk_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name=op_name)
+    # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
     schedule = ScheduleRequest(options.pop("schedule"))
-    if schedule is not ScheduleRequest.AUTO and options["backend"] != "fused":
-        raise ValueError("schedule requires kernel_options['backend']='fused'")
     return ResolvedKernelOptions(**options, schedule=schedule)
+
+
+def cast_to_kernel_dtypes(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor
+) -> tuple[torch.Tensor, ...]:
+    """Cast chunk operands to the dtypes the KDA chunk kernels compute in.
+
+    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16. Gate and beta
+    run in FP32. Callers return the output in the original ``q.dtype``. Each cast is an autograd
+    op, so gradients come back in the caller's dtypes.
+    """
+    kernel_dtype = (
+        q.dtype
+        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
+        else torch.bfloat16
+    )
+    return (
+        *(tensor.to(kernel_dtype) for tensor in (q, k, v)),
+        gate.float(),
+        beta.float(),
+    )
 
 
 def validate_warpdrive_fastmath(fastmath: bool) -> None:
@@ -101,6 +121,7 @@ def validate_kda_inputs(
 
 __all__ = [
     "SUPPORTED_INPUT_DTYPES",
+    "cast_to_kernel_dtypes",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_warpdrive_fastmath",

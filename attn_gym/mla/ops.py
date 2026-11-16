@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym._backends.arch import SM100_KERNELS_REQUIREMENT, runs_sm100_kernels
+
 from .impl import cute, fa3
 
 # Two fixed-arity ops instead of an optional LSE output.
@@ -44,7 +46,7 @@ def _decode_cuda(
     args = (q_latent, q_rope, latent_cache, rope_cache, block_table, cu_seqlens_q, seqused_k)
     options = {"max_seqlen_q": max_seqlen_q, "scale": scale, "return_lse": return_lse}
     capability = torch.cuda.get_device_capability(q_latent.device)
-    if capability in cute.SUPPORTED_CAPABILITIES:
+    if runs_sm100_kernels(capability):
         # Autotuning allocates and captures graphs on the current device.
         with torch.cuda.device(q_latent.device):
             return cute.paged_mla_decode(
@@ -55,7 +57,7 @@ def _decode_cuda(
         return fa3.paged_mla_decode(*args, **options)
     raise ValueError(
         "The fused paged_mla_decode requires SM90 (FlashAttention-3) or "
-        f"SM100/SM103 (FlashAttention-4), got SM{capability[0]}{capability[1]}."
+        f"{SM100_KERNELS_REQUIREMENT} (FlashAttention-4), got SM{capability[0]}{capability[1]}."
     )
 
 

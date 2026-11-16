@@ -17,7 +17,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from attn_gym.warpdrive.examples import qwen_megakernel_trace
 from attn_gym.warpdrive.examples.bench_support import (
     CudaBenchmarkStats,
     benchmark_cuda_graph_stats,
@@ -25,7 +24,8 @@ from attn_gym.warpdrive.examples.bench_support import (
     settle,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenWeights,
     compare_logits,
     decode_step_ref,
@@ -33,7 +33,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
     make_decode_state,
     rms_norm,
     rope,
-    rope_angles,
+    rope_cos_sin,
 )
 
 
@@ -56,13 +56,13 @@ def prepare_fast_weights(
     weights: QwenWeights, max_len: int, gemm_rows: int = 16
 ) -> FastQwenWeights:
     positions = torch.arange(max_len, device=weights.embed.device)
-    angles = rope_angles(weights.config, positions.float())
+    cos, sin = rope_cos_sin(weights.config, positions.float())
     return FastQwenWeights(
         weights,
         torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1),
-        torch.cat((weights.gate, weights.up), dim=1),
-        angles.cos().to(torch.bfloat16),
-        angles.sin().to(torch.bfloat16),
+        torch.cat((weights.gate, weights.up), dim=-2),  # MoE: per expert
+        cos.to(torch.bfloat16),
+        sin.to(torch.bfloat16),
         positions,
         gemm_rows,
     )
@@ -72,6 +72,23 @@ def baseline_linear(x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.T
     # Duplicating the row makes cuBLAS pick a tensor-core GEMM over its slow single-row GEMV;
     # only the first output row is used.
     return F.linear(x.expand(rows, -1).contiguous(), weight)[:1]
+
+
+def moe_mlp_fast(config, packed: FastQwenWeights, layer: int, norm: torch.Tensor) -> torch.Tensor:
+    """One token's routed MLP as batched matmuls over the top-k experts' gathered weights
+    (compile- and CUDA-graph-friendly; the gather copies those experts' weights)."""
+    weights = packed.weights
+    probs = F.softmax(F.linear(norm, weights.router[layer]), dim=-1, dtype=torch.float32)
+    weight, expert = probs.topk(config.experts_per_token, dim=-1)
+    if config.norm_topk_prob:
+        weight = weight / weight.sum(dim=-1, keepdim=True)
+    weight = weight.to(norm.dtype)[0]
+    expert = expert[0]
+    k = config.experts_per_token
+    gate_up = torch.bmm(packed.gate_up[layer][expert], norm.expand(k, -1)[..., None])[..., 0]
+    gate, up = gate_up.chunk(2, dim=-1)
+    y = torch.bmm(weights.down[layer][expert], (F.silu(gate) * up)[..., None])[..., 0]
+    return (y * weight[:, None]).sum(dim=0, keepdim=True)
 
 
 @torch.no_grad()
@@ -112,10 +129,94 @@ def decode_step_fast(
         ).reshape(1, q_heads * head_dim)
         x = x + baseline_linear(attention, weights.o_proj[layer], packed.gemm_rows)
         norm = rms_norm(x, weights.post_ln[layer], config.rms_eps)
-        gate, up = baseline_linear(norm, packed.gate_up[layer], packed.gemm_rows).chunk(2, dim=-1)
-        x = x + baseline_linear(F.silu(gate) * up, weights.down[layer], packed.gemm_rows)
+        if config.is_moe:
+            x = x + moe_mlp_fast(config, packed, layer, norm)
+        else:
+            gate_up = baseline_linear(norm, packed.gate_up[layer], packed.gemm_rows)
+            gate, up = gate_up.chunk(2, dim=-1)
+            x = x + baseline_linear(F.silu(gate) * up, weights.down[layer], packed.gemm_rows)
     x = rms_norm(x, weights.final_norm, config.rms_eps)
     return baseline_linear(x, weights.lm_head, packed.gemm_rows).reshape(-1).float()
+
+
+def batch_linear(x: torch.Tensor, weight: torch.Tensor, rows: int) -> torch.Tensor:
+    """F.linear of a (B, K) batch; below ``rows`` the batch is zero-padded to ``rows`` so cuBLAS
+    picks a tensor-core GEMM (as ``baseline_linear`` does for one row)."""
+    if x.shape[0] >= rows:
+        return F.linear(x, weight)
+    return F.linear(F.pad(x, (0, 0, 0, rows - x.shape[0])), weight)[: x.shape[0]]
+
+
+def moe_mlp_batch(config, packed: FastQwenWeights, layer: int, norm: torch.Tensor) -> torch.Tensor:
+    """A batch's routed MLP with grouped GEMMs: the (token, expert) pairs sorted by expert, one
+    F.grouped_mm over every expert for gate/up and one for down, then the outputs unsorted and
+    summed over each token's k experts in rank order (deterministic: no atomics). Shapes stay
+    static (no host sync), so it compiles and graph-captures."""
+    weights = packed.weights
+    k, experts = config.experts_per_token, config.num_experts
+    probs = F.softmax(F.linear(norm, weights.router[layer]), dim=-1, dtype=torch.float32)
+    # Ties go to the lower expert, as in the reference's stable sort (topk leaves them unordered).
+    weight, expert = (t[:, :k] for t in probs.sort(dim=-1, descending=True, stable=True))
+    if config.norm_topk_prob:
+        weight = weight / weight.sum(dim=-1, keepdim=True)
+    weight = weight.to(norm.dtype)
+    flat = expert.reshape(-1)
+    order = flat.argsort(stable=True)
+    counts = torch.zeros(experts, dtype=torch.int32, device=norm.device)
+    counts.scatter_add_(0, flat.int(), torch.ones_like(flat, dtype=torch.int32))
+    offs = counts.cumsum(0, dtype=torch.int32)
+    tokens = order // k
+    x = norm[tokens]  # (batch * k, hidden), grouped by expert
+    gate_up = F.grouped_mm(x, packed.gate_up[layer].transpose(-2, -1), offs=offs)
+    gate, up = gate_up.chunk(2, dim=-1)
+    y = F.grouped_mm(F.silu(gate) * up, weights.down[layer].transpose(-2, -1), offs=offs)
+    unsorted = torch.empty_like(y)
+    unsorted[order] = y  # back to (token, rank) order
+    return (unsorted.view(-1, k, y.shape[-1]) * weight[..., None]).sum(dim=1)
+
+
+@torch.no_grad()
+def decode_step_fast_batch(
+    packed: FastQwenWeights,
+    tokens: torch.Tensor,
+    positions: torch.Tensor,
+    k_cache: tuple[torch.Tensor, ...],
+    v_cache: tuple[torch.Tensor, ...],
+) -> torch.Tensor:
+    """``decode_step_fast`` for a batch: sequence b decodes ``tokens[b]`` at ``positions[b]``
+    (a device tensor) into its own cache. Caches are per-layer (batch, kv heads, max_len, head
+    dim) views. Weights are read once for the batch; attention is SDPA over each sequence's
+    cache with a length mask, so sequences may sit at different positions. Cache rows past a
+    sequence's position must be finite (zeroed caches): masked scores are zero, but 0 * NaN is not."""
+    weights, config = packed.weights, packed.weights.config
+    batch, rows = tokens.shape[0], packed.gemm_rows
+    q_heads, kv_heads, head_dim = config.num_q_heads, config.num_kv_heads, config.head_dim
+    max_len = k_cache[0].shape[2]
+    x = F.embedding(tokens, weights.embed)
+    cos, sin = packed.cos[positions][:, None], packed.sin[positions][:, None]  # (batch, 1, hd)
+    seq = torch.arange(batch, device=tokens.device)
+    mask = (packed.positions[None, :max_len] <= positions[:, None])[:, None, None]
+    for layer in range(config.num_layers):
+        norm = rms_norm(x, weights.input_ln[layer], config.rms_eps)
+        qkv = batch_linear(norm, packed.qkv[layer], rows)
+        q, k, v = qkv.split((q_heads * head_dim, kv_heads * head_dim, kv_heads * head_dim), -1)
+        q = rms_norm(q.reshape(batch, q_heads, head_dim), weights.q_norm[layer], config.rms_eps)
+        k = rms_norm(k.reshape(batch, kv_heads, head_dim), weights.k_norm[layer], config.rms_eps)
+        q, k = rope(q, cos, sin), rope(k, cos, sin)
+        k_cache[layer][seq, :, positions] = k
+        v_cache[layer][seq, :, positions] = v.reshape(batch, kv_heads, head_dim)
+        attention = F.scaled_dot_product_attention(
+            q[:, :, None], k_cache[layer], v_cache[layer], attn_mask=mask, enable_gqa=True
+        ).reshape(batch, q_heads * head_dim)
+        x = x + batch_linear(attention, weights.o_proj[layer], rows)
+        norm = rms_norm(x, weights.post_ln[layer], config.rms_eps)
+        if config.is_moe:
+            x = x + moe_mlp_batch(config, packed, layer, norm)
+        else:
+            gate, up = batch_linear(norm, packed.gate_up[layer], rows).chunk(2, dim=-1)
+            x = x + batch_linear(F.silu(gate) * up, weights.down[layer], rows)
+    x = rms_norm(x, weights.final_norm, config.rms_eps)
+    return batch_linear(x, weights.lm_head, rows).float()
 
 
 @torch.no_grad()
@@ -203,8 +304,16 @@ def time_step(
 
 
 def bytes_per_step(weights: QwenWeights, ctx_len: int) -> int:
-    weight_bytes = sum(t.numel() * t.element_size() for t in weights.tensors().values())
+    """Logical bytes one decode step must read: every weight once (a MoE layer only its
+    top-k experts), the populated KV cache and the new KV row, and the fp32 logits."""
     config = weights.config
+    tensors = weights.tensors()
+    weight_bytes = sum(t.numel() * t.element_size() for t in tensors.values())
+    if config.is_moe:
+        experts = sum(
+            tensors[n].numel() * tensors[n].element_size() for n in ("gate", "up", "down")
+        )
+        weight_bytes -= experts * (1 - config.experts_per_token / config.num_experts)
     kv_bytes = 2 * config.num_layers * config.num_kv_heads * config.head_dim * (ctx_len + 2) * 2
     return weight_bytes + kv_bytes + config.vocab_size * 4
 
@@ -224,18 +333,20 @@ def measure_hbm_rooflines(buffer_gb: float = 2.0, iters: int = 100) -> dict[str,
 
 
 @torch.no_grad()
-def trace_megakernel(weights, max_len: int, token, pos: int, caches, path: Path) -> dict:
-    """One warmed megakernel step traced with globaltimer (``qwen_megakernel_trace``): per-layer
+def trace_megakernel(
+    weights, max_len: int, token, pos: int, caches, path: Path, engine: str = "cuda_core"
+) -> dict:
+    """One warmed megakernel step traced with globaltimer (``trace``): per-layer
     phase spans and median input waits in us, and the Perfetto trace at ``path``."""
-    runner = QwenMegakernel(weights, max_len, trace="globaltimer")
+    runner = QwenMegakernel(weights, max_len, trace="globaltimer", engine=engine)
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
     path.parent.mkdir(parents=True, exist_ok=True)
-    with qwen_megakernel_trace.trace_session(runner, trace_path=str(path)) as session:
+    with mk_trace.trace_session(runner, trace_path=str(path)) as session:
         runner.launch(*caches)
     return {
         "trace": str(path),
-        "phase_span_us": qwen_megakernel_trace.phase_spans(session.ranges, runner.table),
-        "input_wait_us": qwen_megakernel_trace.input_waits(session.ranges, runner.table),
+        "phase_span_us": mk_trace.phase_spans(session.ranges, runner.table),
+        "input_wait_us": mk_trace.input_waits(session.ranges, runner.table),
     }
 
 
@@ -269,6 +380,12 @@ def main() -> None:
     parser.add_argument(
         "--skip-megakernel", action="store_true", help="skip the warpdrive decode megakernel"
     )
+    parser.add_argument(
+        "--engine",
+        choices=("cuda_core", "tcgen05"),
+        default="cuda_core",
+        help="the megakernel's GEMV engine",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
         "--trace-dir",
@@ -283,7 +400,7 @@ def main() -> None:
         "metadata": provenance(
             {
                 "bench": Path(__file__),
-                "reference": Path(__file__).with_name("qwen_megakernel_ref.py"),
+                "reference": Path(__file__).with_name("ref.py"),
                 "megakernel": Path(__file__).with_name("qwen_megakernel.py"),
             },
             vars(args),
@@ -311,17 +428,19 @@ def main() -> None:
         report.setdefault("correctness", {})[str(ctx_len)] = {"reference": error, "fast": metrics}
         print(f"ctx={ctx_len} fast_correctness={json.dumps(metrics)}", flush=True)
         check_budget("fast", metrics)
-        variants = [
-            ("eager", eager, False),
-            ("eager_graph", eager, True),
-            ("fast_graph", fast, True),
-        ]
+        variants = [("eager", eager, False), ("fast_graph", fast, True)]
+        if not weights.config.is_moe:  # the MoE reference syncs to loop over its experts
+            variants.insert(1, ("eager_graph", eager, True))
         if args.profile:
             profiles = report.setdefault("profiles", {}).setdefault(str(ctx_len), {})
-            profiles["reference"] = profile_step(eager)
-            print(
-                f"ctx={ctx_len} reference_profile={json.dumps(profiles['reference'])}", flush=True
-            )
+            if weights.config.is_moe:  # profile_step captures a graph; the reference cannot
+                print(f"ctx={ctx_len} reference_profile skipped: the MoE reference syncs")
+            else:
+                profiles["reference"] = profile_step(eager)
+                print(
+                    f"ctx={ctx_len} reference_profile={json.dumps(profiles['reference'])}",
+                    flush=True,
+                )
         if not args.skip_compile:
             compiled = torch.compile(decode_step_fast, mode=args.compile_mode, fullgraph=True)
             compiled_step = partial(compiled, packed, token, pos, *layer_caches)
@@ -340,7 +459,7 @@ def main() -> None:
             profiles["fast"] = profile_step(fast if args.skip_compile else compiled_step)
             print(f"ctx={ctx_len} fast_profile={json.dumps(profiles['fast'])}", flush=True)
         if not args.skip_megakernel:
-            runner = QwenMegakernel(weights, max_len)
+            runner = QwenMegakernel(weights, max_len, engine=args.engine)
             for cache in caches:
                 cache[:, :, pos].fill_(float("nan"))
             metrics = compare_logits(runner(weights, token, pos, *caches), reference, high)
@@ -361,6 +480,7 @@ def main() -> None:
                     pos,
                     caches,
                     args.trace_dir / f"qwen_megakernel_ctx{ctx_len}.pftrace",
+                    args.engine,
                 )
                 print(
                     f"ctx={ctx_len} megakernel_trace={json.dumps(report['traces'][str(ctx_len)])}",

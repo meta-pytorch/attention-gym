@@ -302,10 +302,10 @@ values raise `ProtocolError` at collection. `describe()` shows the resolved budg
 **Placement does not repartition tensors.** Update partitions when moving work.
 [`Local`](#index-the-role-not-the-hardware) indices follow the role; hardware IDs do not.
 
-**Collection freezes declarations.** The first `describe()`, trace or compile-cache lookup
-collects the kernel. Construct a new instance to change it; mutation or recollection is
-unsupported. Assigning `self.roles` after construction also makes the compile key raise:
-the constructor no longer describes the kernel.
+**A kernel is fixed once constructed.** Declare roles, channels and work streams in
+`__init__`; assigning any public attribute (`roles` included) or work-stream field afterwards
+raises `ProtocolError`, because the constructor call is the compile key. Construct a new
+instance, or use `op.with_settings(...)`, to change it.
 
 ## Compile keys
 
@@ -323,26 +323,30 @@ def compile_kernel(op: MyKernel):
 
 - The constructor call, with defaults filled in and its arguments copied/frozen for the key.
 - Cluster and each work stream's schedule, mapping, readiness and scheduler warp.
-- The trace settings that change the code (`enable_trace`'s backend, and its `waits` and
-  `events_per_role` where they apply), `trace_protocol`, `alias_check`, `liveness_check`, and
-  resolved roles.
+- The settings: `cluster`, the trace settings that change the code (`trace_backend`, and
+  `trace_waits` and `trace_events_per_role` where they apply), `trace_protocol`, `alias_check`,
+  `liveness_check`, and the resolved roles.
 - Source of the modules defining the kernel, cluster and stream-component classes, including
   their base classes.
 
 Thus `Gemm()` and `Gemm(ab_stages=3)` share an entry. A different role budget does not.
+Launch with `compile_kernel(MyKernel.get_or_build(...))`: one kernel per constructor call and
+a lookup memoized on it, so a warm launch costs about a microsecond of host time (see
+[launching from a hot path](cache.md#launch-from-a-hot-path)).
 Editing a kernel subclass in your own source file recompiles it, even when the compile helper
 does not import that file.
 
-Put static algorithm choices in constructor arguments. Mutation rules are deliberately
-narrow:
+Every compile-time choice is a constructor argument. The settings every kernel shares
+(`SETTINGS`: `cluster`, `alias_check`, `liveness_check`, `trace_protocol`, `trace_backend`,
+`trace_waits`, `trace_events_per_role`) are keywords of every constructor unless its `__init__`
+declares the name itself:
 
 | Change | Contract |
 |---|---|
-| `op.tile_n = 128` after construction | Key raises `TypeError`; pass it to the constructor |
-| Reassign cluster, work stream or `trace_protocol` before collection | Allowed and keyed |
-| Reassign those after collection | Raises `ProtocolError`; channels already depend on them |
-| Change trace settings (`enable_trace`), `alias_check` or `liveness_check` | Allowed and keyed |
-| Mutate a constructed object, e.g. `op.ab.n = 4` | Not tracked; do not do it |
+| `MyKernel(..., cluster=CtaPair(), trace_backend="iket")` | Keyed with the constructor call |
+| `op.with_settings(alias_check="strict", tile_n=128)` | A new kernel from the same call with those changes |
+| `op.tile_n = 128`, `op.cluster = ...`, `op.work.schedule = ...` after construction | Raises `ProtocolError` |
+| Mutate a constructed object in place, e.g. `op.ab.n = 4` | Not tracked; do not do it |
 
 A cache hit skips tracing. `jit_cache` [restores](cache.md#cached-builds-were-never-traced)
 check reports, opt-outs and warnings for `describe()`. Protocol logs need a fresh trace;

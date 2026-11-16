@@ -511,7 +511,10 @@ def chunk_forward(
     output_final_state: bool,
     autotune: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Route dense inputs and invoke the fused scalar chunk forward operator."""
+    """Route dense inputs and invoke the fused scalar chunk forward operator.
+
+    Gate, beta, and the entry state arrive in FP32 (``chunk_gdn`` casts them).
+    """
     _validate_fused_chunk_qkv(q, k, v)
     output_shape = v.shape
     batch, tokens = q.shape[:2]
@@ -527,10 +530,6 @@ def chunk_forward(
         if cu_seqlens is not None
         else None
     )
-    gate = gate.float()
-    beta = beta.float()
-    if initial_state is not None:
-        initial_state = initial_state.float()
     chunk_offsets = None if metadata is None else metadata.chunk_offsets
     capacity = 0 if metadata is None else metadata.capacity
     result = _ChunkGDN.apply(
@@ -567,7 +566,10 @@ def paged_chunk_forward(
     scale: float,
     autotune: bool,
 ) -> torch.Tensor:
-    """Normalize inputs and advance selected state-cache slots with chunk GDN."""
+    """Normalize inputs and advance selected state-cache slots with chunk GDN.
+
+    Gate and beta arrive in FP32 (``paged_chunk_gdn`` casts them).
+    """
     _validate_fused_chunk_qkv(q, k, v)
     require_inference_only(
         (q, k, v, gate, beta, state_cache),
@@ -579,8 +581,6 @@ def paged_chunk_forward(
         cu_seqlens, q, k, v, gate, beta = pack_dense_batch(q, k, v, gate, beta)
 
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, q.shape[1], 64)
-    gate = gate.float()
-    beta = beta.float()
     cumulative_gate = _plain_gate_scan_op(
         gate.unsqueeze(-1), metadata.cu_seqlens, metadata.chunk_offsets, False
     ).squeeze(-1)

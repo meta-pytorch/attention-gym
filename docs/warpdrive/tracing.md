@@ -132,12 +132,13 @@ fails before producing it.
 ```python
 from attn_gym.warpdrive import StaticPersistent
 
-op = PersistentGemm(schedule=StaticPersistent()).enable_trace("iket", waits=False)
+op = PersistentGemm(schedule=StaticPersistent(), trace_backend="iket", trace_waits=False)
 fn = compile_persistent_gemm(op)
 ```
 
-Enable tracing before compiling. Start with `"iket"` (`enable_iket()` is shorthand) and
-`waits=False` to limit instrumentation overhead. The layer adds named ranges for you;
+Tracing is a constructor setting (`op.with_settings(trace_backend=...)` derives a traced kernel
+from an existing one). Start with `"iket"` and `trace_waits=False` to limit instrumentation
+overhead. The layer adds named ranges for you;
 the [profiler quick start](profiler.md#quick-start) shows a complete capture.
 
 - Roles taking `WorkCursor`: one range per work item, ending at `advance()`.
@@ -228,7 +229,7 @@ def kernel(self, ..., trace: cute.Tensor, bound):
 from attn_gym.warpdrive.profiler import summarize_by_tag
 from attn_gym.warpdrive.trace_session import trace_session
 
-op = MyKernel().enable_trace("globaltimer", waits=False)
+op = MyKernel(trace_backend="globaltimer", trace_waits=False)
 fn = compile_my_kernel(op)  # compile first: the range names come from the trace
 with trace_session(op, num_ctas, trace_path="kernel.pftrace") as session:
     fn(..., session.prof.tensor, ...)
@@ -444,7 +445,7 @@ Two examples use it:
 python -m attn_gym.warpdrive.examples.schedule_views OUTDIR --ctas 152
 # the Qwen megakernel's instruction table under its latency model; --timeline overlays a
 # trace="globaltimer" capture with per-role tracks (overlay() in the module docstring writes it)
-python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html --model Qwen/Qwen3-32B --ctas 152
+python -m attn_gym.warpdrive.examples.qwen_megakernel.viz OUT.html --model Qwen/Qwen3-32B --ctas 152
 ```
 
 ![The Qwen megakernel's predicted timeline with its critical path](images/qwen_megakernel_schedule.png)
@@ -454,8 +455,7 @@ python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html --model Qwen/
 ## Trace the protocol
 
 ```python
-op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair())
-op.trace_protocol = True  # before the first describe() or compile
+op = PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair(), trace_protocol=True)
 compile_persistent_gemm(op)
 print(op.describe())
 ```

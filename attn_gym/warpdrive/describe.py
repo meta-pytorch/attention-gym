@@ -13,6 +13,7 @@ from typing import Literal
 
 from attn_gym.warpdrive.channels import SIDES, Threads, Tma, Umma, Warps
 from attn_gym.warpdrive.fences import FenceStatus
+from attn_gym.warpdrive.protocol import FenceSkip, OptOut
 from attn_gym.warpdrive.scheduling import _tile_grid, scheduler_role
 
 WIDTH = 100  # wrap channel flows past this many columns
@@ -538,9 +539,22 @@ def _fences(kernel) -> str:
 
 
 def _opt_outs(kernel) -> str:
-    if not kernel._ws_opt_outs:
-        return ""
-    return "\n".join(["Unchecked opt-outs", *(f"  {o.describe()}" for o in kernel._ws_opt_outs)])
+    checks = [o for o in kernel._ws_opt_outs if isinstance(o, OptOut)]
+    # One line per skip site: a call traced several times (an unrolled loop, a shared helper)
+    # registers a skip each time.
+    skips: dict = {}
+    for o in kernel._ws_opt_outs:
+        if isinstance(o, FenceSkip):
+            key = (o.skips, o.reason, o.site, o.op, o.role)
+            merged = skips.setdefault(key, FenceSkip(*key))
+            merged.suppressed += o.suppressed
+    sections = []
+    if checks:
+        sections.append("\n".join(["Unchecked opt-outs", *(f"  {o.describe()}" for o in checks)]))
+    if skips:
+        lines = (f"  {line}" for o in skips.values() for line in o.describe().splitlines())
+        sections.append("\n".join(["Skipped thread-sync work", *lines]))
+    return "\n\n".join(sections)
 
 
 def _protocol(kernel) -> str:

@@ -8,6 +8,8 @@ import pytest
 import torch
 from torch._dynamo.testing import CompileCounterWithBackend
 
+from attn_gym._backends import arch
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.sparse import Impl
 from attn_gym.sparse.indexer import lightning_indexer, ops
 from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
@@ -18,10 +20,10 @@ def require_backend(backend: str | None = None) -> str:
     if torch.version.hip or not torch.cuda.is_available():
         pytest.skip("NVIDIA CUDA required")
     capability = torch.cuda.get_device_capability()
-    selected = backend or ("cute" if capability in ((10, 0), (10, 3)) else "triton")
+    selected = backend or ("cute" if runs_sm100_kernels(capability) else "triton")
     if selected == "cute":
-        if capability not in ((10, 0), (10, 3)):
-            pytest.skip("SM100 or SM103 required for CuTe")
+        if not runs_sm100_kernels(capability):
+            pytest.skip("SM100-family GPU required for CuTe")
         pytest.importorskip("cutlass.cute")
     else:
         if capability[0] < 9:
@@ -36,6 +38,7 @@ def require_backend(backend: str | None = None) -> str:
         ((9, 0), "auto", "triton"),
         ((10, 0), "auto", "cute"),
         ((10, 3), "auto", "cute"),
+        ((10, 7), "auto", "cute"),
         ((12, 0), "auto", "triton"),
         ((10, 0), "triton", "triton"),
         ((10, 3), "triton", "triton"),
@@ -63,6 +66,7 @@ def test_backend_dispatch_uses_input_device(
     other = Mock(side_effect=AssertionError("the nonselected backend ran"))
     device_capability = Mock(return_value=capability)
     monkeypatch.setattr(torch.cuda, "get_device_capability", device_capability)
+    monkeypatch.setattr(arch, "cutedsl_targets_rubin", lambda: True)
     monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: deterministic)
     for name in ("cute", "triton"):
         monkeypatch.setitem(

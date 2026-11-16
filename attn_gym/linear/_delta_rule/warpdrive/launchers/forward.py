@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import torch
 
+from attn_gym._backends.arch import SM100_KERNELS_REQUIREMENT, runs_sm100_kernels
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.paged_state import PagedState
@@ -21,8 +22,8 @@ def validate_available(q: torch.Tensor) -> None:
     if not q.is_cuda:
         raise ValueError("the warpdrive KDA backend requires CUDA tensors")
     properties = get_device_properties(q.device)
-    if (properties.major, properties.minor) not in ((10, 0), (10, 3)):
-        raise ValueError("the warpdrive KDA backend requires SM100 or SM103")
+    if not runs_sm100_kernels((properties.major, properties.minor)):
+        raise ValueError(f"the warpdrive KDA backend requires {SM100_KERNELS_REQUIREMENT}")
 
 
 def run_forward_on_current_device(

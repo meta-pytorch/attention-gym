@@ -31,6 +31,8 @@ def pack_dense_batch(
     """
     batch, tokens = tensors[0].shape[:2]
     cu_seqlens = torch.arange(batch + 1, dtype=torch.int32, device=tensors[0].device) * tokens
+    if batch == 1:  # already one packed row: skip a host-side view per tensor
+        return cu_seqlens, *tensors
     return cu_seqlens, *(
         tensor.reshape(1, batch * tokens, *tensor.shape[2:]) for tensor in tensors
     )
@@ -63,8 +65,7 @@ def prepare_span(
     A dense span with a partial tail chunk runs as one packed sequence; ``torch.arange`` keeps that
     launch capture-safe.
     """
-    if q.shape[0] != 1:
-        raise ValueError("staged primitives require B=1; pack sequences with cu_seqlens")
+    q, k, v, beta, scale = normalize_span(q, k, v, beta, scale=scale)
     tokens = q.shape[1]
     if cu_seqlens is None and tokens % CHUNK_SIZE:
         cu_seqlens = torch.arange(2, dtype=torch.int32, device=q.device) * tokens
@@ -73,17 +74,32 @@ def prepare_span(
         if cu_seqlens is None
         else prepare_ragged_chunk_metadata(cu_seqlens, tokens, CHUNK_SIZE)
     )
-    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     return PreparedSpan(
         q,
         k,
         v,
-        normalize_compact_tensor(beta.float()),
+        beta,
         metadata,
         None if metadata is None else metadata.cu_seqlens,
         None if metadata is None else metadata.chunk_offsets,
-        resolve_scale(scale, q.shape[-1]),
+        scale,
     )
+
+
+def normalize_span(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    beta: torch.Tensor,
+    *,
+    scale: float | None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]:
+    """``prepare_span``'s operand normalization without the chunk schedule, for a backend that
+    builds its own: ``(q, k, v, beta, scale)`` with FP32 compact ``beta``."""
+    if q.shape[0] != 1:
+        raise ValueError("staged primitives require B=1; pack sequences with cu_seqlens")
+    q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
+    return q, k, v, normalize_compact_tensor(beta.float()), resolve_scale(scale, q.shape[-1])
 
 
 def zero_state(

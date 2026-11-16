@@ -15,12 +15,13 @@ import math
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="KDA intra engine requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="KDA intra engine requires an SM100-family GPU",
 )
 
 D, BT = 128, 64

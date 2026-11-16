@@ -34,10 +34,10 @@ from cutlass.cute.tensor import TensorSSA
 from cutlass.cute.typing import BFloat16, Float16, Float32, Int32
 from cutlass.cutlass_dsl import dsl_user_op
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute.utils import cute_dtype, get_device_properties, requires_int64_abi
 from attn_gym._backends.tune import run_tunable
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
-from attn_gym.linear.kda.constants import is_sm100_kda_capability
 from attn_gym.linear.kda.fwd.cute.chunk_scheduler_cute import (
     load_ragged_chunk_count,
     load_ragged_chunk_work,
@@ -256,11 +256,11 @@ def umma_arrive(mbar_ptr: cute.Pointer):
 
 
 def require_blackwell_target() -> None:
-    """Reject compilation targets that cannot execute this SM100/SM103 kernel."""
+    """Reject compilation targets that cannot execute this SM100-family kernel."""
     target = get_compile_target()
-    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
+    if target.device_type != "cuda" or not runs_sm100_kernels(target.effective_capability):
         raise RuntimeError(
-            f"chunk_kda_bwd_wy_dqkg_fused requires Blackwell (SM100/SM103), got target={target}"
+            f"chunk_kda_bwd_wy_dqkg_fused requires an SM100-family GPU, got target={target}"
         )
 
 

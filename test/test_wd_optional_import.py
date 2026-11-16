@@ -10,7 +10,8 @@ import subprocess
 import sys
 
 import pytest
-import torch
+
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 
 
 def test_linear_import_does_not_load_warpdrive_kernel_dependencies() -> None:
@@ -53,7 +54,8 @@ def recording(driver, name):
 
 
 for driver in (gdn, kda):
-    driver.MIN_CHAIN_TOKENS_PER_PIECE_FWD = driver.MIN_CHAIN_TOKENS_PER_PIECE_BWD = 0
+    for costs in (driver.CHAIN_COST_FWD, driver.CHAIN_COST_BWD):
+        costs.update({dim: cost._replace(overhead_tokens=0) for dim, cost in costs.items()})
     for name in (
         "build_warmup_forward",
         "build_chain_forward",
@@ -65,7 +67,10 @@ warpdrive = {"backend": "warpdrive"}
 lengths = (3000, 0, 2000)
 cu = cumulative_sequence_offsets(lengths)
 tokens = sum(lengths)
-for heads in (1, 17, 32):  # chained; d_v split forward; uncut
+# A plan's scheme follows the one-wave geometry num_sm // (3 sequences * heads): pick heads from
+# the SM count so every scheme is reached on any GPU.
+num_sm = torch.cuda.get_device_properties(0).multi_processor_count
+for heads in (1, num_sm // 7, num_sm // 5):  # chained; d_v split forward; uncut
     q, k, v, gate, beta, state, _ = make_gdn_test_inputs(
         lengths, key_heads=heads, value_heads=heads, seed=5
     )
@@ -99,8 +104,8 @@ assert not [name for name in sys.modules if name.startswith("cutlass.experimenta
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive backend requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive backend requires an SM100-family GPU",
 )
 def test_warpdrive_driver_paths_build_every_bundle_without_cutlass_experimental() -> None:
     """Every warpdrive driver path (uncut, d_v split, chain, split tables, summaries) builds its

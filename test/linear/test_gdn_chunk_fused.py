@@ -149,7 +149,7 @@ def force_portable_backward(monkeypatch) -> None:
     monkeypatch.setattr(
         chunk_impl,
         "get_device_properties",
-        lambda device: SimpleNamespace(major=9),
+        lambda device: SimpleNamespace(major=9, minor=0),
     )
 
 

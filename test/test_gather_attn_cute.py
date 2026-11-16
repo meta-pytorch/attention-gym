@@ -1,8 +1,8 @@
 """
-Tests for the CuTe DSL (SM100/SM103) backend of gather attention.
+Tests for the CuTe DSL (SM100 family) backend of gather attention.
 
 Validates forward and backward precision against an FP64 eager baseline.
-CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 or SM103.
+CuTe constraints: head_dim=512, 1 <= nheads <= 128, share_kv=True, dtype=bfloat16, SM100 family.
 Fewer than 128 heads require FA4's sparse-MLA head-padding support.
 
 Compiled training and CUDA graph replay are covered in test_gather_attn_cute_compile.py.
@@ -14,16 +14,16 @@ import math
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.sparse.gather_attn import AuxRequest, Impl, gather_attn
-from attn_gym.sparse.gather_attn.impl.cute import SUPPORTED_CAPABILITIES
 from attn_gym.testing.kda import assert_relative_rms_within
 
 
 def _skip_no_sm100():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for CuTe backend")
-    if torch.cuda.get_device_capability() not in SUPPORTED_CAPABILITIES:
-        pytest.skip("SM100 or SM103 required for CuTe backend")
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("SM100-family GPU required for CuTe backend")
 
 
 def skip_unsupported_cute_sink(sink_dtype: torch.dtype | None) -> None:

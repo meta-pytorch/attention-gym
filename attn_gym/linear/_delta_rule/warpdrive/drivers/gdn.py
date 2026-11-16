@@ -3,8 +3,8 @@
 """Torch drivers for the warpdrive scalar-GDN kernels (derived from cudnn-frontend v1.30).
 
 Ported from cudnn-frontend's GDN engine plans: the forward runs ``uncut`` (one work item
-per sequence and value head), the d_v split, or the exact piece ``chain`` for long sequences on
-few tiles. Workspace regions are ordinary Torch allocations.
+per sequence and value head), the d_v split, or the exact piece ``chain`` when few tiles leave
+SMs idle. Workspace regions are ordinary Torch allocations.
 """
 
 from __future__ import annotations
@@ -24,17 +24,23 @@ from ..contract import STATE_DTYPES, validate_state_series
 from ..piece_chain import chain_rows_per_cta
 from ..work_tables import WORK_ITEM_FIELDS
 from .plan import BackwardPlan as _BackwardPlan
+from .plan import ChainCost, aligned, chain_buffers, int32, split_scratch, tma_slots
 from .plan import ForwardPlan as _ForwardPlan
-from .plan import aligned, chain_buffers, int32, split_scratch, tma_slots
 
 B_T = gdn_prefill.B_T
-# Shorter chain pieces cost more in summaries than they save. cudnn-frontend v1.30 chains any
-# sequence whose heads fill at most a third of the SMs; on GB200 at 48 heads, D=128 the forward
-# d_v split beats the chain up to ~5.5k tokens per piece (1x16384: 370 vs 393 us) and the chain
-# wins at ~13.6k (1x40960: 848 vs 901 us). The backward has no d_v split, and its chain already
-# wins at ~2.7k tokens per piece (1x8192: 705 vs 928 us) but loses at 1k (1x2048: 279 vs 258).
-MIN_CHAIN_TOKENS_PER_PIECE_FWD = 8192
-MIN_CHAIN_TOKENS_PER_PIECE_BWD = 2048
+# See NOTE [Chain plan cost] in plan.py; keyed by head dimension. With 48 heads (three pieces on a
+# full grid) the D=128 forward chain beats the d_v split only past ~5-6k tokens per piece; on GB200
+# it lost at 1x16384 (393 vs 370 us) and won at 1x40960 (848 vs 901 us). D=64 has no d_v split
+# and a quarter of the summary state, so its chain pays off on shorter pieces: 1x4096 H2 forward
+# 45 vs 100 us uncut, backward 1x1024 H16 70 vs 96 us.
+CHAIN_COST_FWD = {
+    64: ChainCost(piece=1.125, overhead_tokens=768),
+    128: ChainCost(piece=1.25, overhead_tokens=1664),
+}
+CHAIN_COST_BWD = {
+    64: ChainCost(piece=0.125, overhead_tokens=576),
+    128: ChainCost(piece=1.0, overhead_tokens=512),
+}
 # Natural-log gate with no in-kernel gate or beta activation.
 _GATE_FLAGS = {"log_gate": True}
 
@@ -56,7 +62,7 @@ class ForwardPlan(_ForwardPlan):
             dim_v,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_FWD,
+            chain_cost=CHAIN_COST_FWD[dim_v],
         )
 
 
@@ -105,9 +111,10 @@ def gdn_forward(
     if split:
         # The approximate forgetting-horizon split replaces the exact schemes.
         plan = replace(plan, pieces=0, tiles_per_head=1)
-    if paged:
-        # The chain seeds pieces through the state chain, which has no route predicates.
-        plan = replace(plan, pieces=0)
+    if paged and plan.chain:
+        # The chain seeds pieces through the state chain, which has no route predicates: take the
+        # unchained plan with its own d_v split instead of a chain plan without its pieces.
+        plan = ForwardPlan.uncut(num_seqs, heads_out, dim_v, plan.num_sm)
     o = torch.empty(tokens, heads_out, dim_v, dtype=q.dtype, device=device)
     final_state = None
     if output_final_state:
@@ -222,14 +229,14 @@ def _tinv_buffers(tokens: int, num_pieces: int, heads_out: int, dtype, device) -
 
 class BackwardPlan(_BackwardPlan):
     @classmethod
-    def build(cls, tokens: int, num_seqs: int, heads_out: int, device) -> BackwardPlan:
+    def build(cls, tokens: int, num_seqs: int, heads_out: int, dim_v: int, device) -> BackwardPlan:
         return cls.for_shape(
             tokens,
             num_seqs,
             heads_out,
             device,
             b_t=B_T,
-            min_chain_tokens_per_piece=MIN_CHAIN_TOKENS_PER_PIECE_BWD,
+            chain_cost=CHAIN_COST_BWD[dim_v],
         )
 
 
@@ -262,7 +269,7 @@ def gdn_backward(
     heads_out = gate.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, device)
+    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs

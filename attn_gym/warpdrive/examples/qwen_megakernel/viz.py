@@ -1,7 +1,7 @@
 """The Qwen3 megakernel's static schedule, drawn per CTA (``schedule_html``).
 
 ``build_table`` assigns the step's instructions to CTAs by list schedule over a latency model
-(``list_schedule``: ``ROW_COST`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
+(``list_schedule``: ``row_costs`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
 them out ``[slot][cta]`` for ``StaticPersistent`` (``assign_static``). The page shows each
 CTA's rows coloured by op and shaded by layer, their predicted start and end, the rows that
 gate them (the last row of each producer group) and the predicted critical path. CTA rows
@@ -12,7 +12,7 @@ come from ``WorkStream.assignment``, so they are the rows the kernel runs.
 "tracks": [[cta, track, name, table_row, start, end], ...]}``, times from any common origin;
 ``ctas`` and ``splits`` are optional and checked against the drawn table. ``tracks`` (optional)
 are every recorded range by role, drawn under a CTA when it is clicked. ``overlay`` builds the
-file from a ``trace="globaltimer"`` launch (``qwen_megakernel_trace``)::
+file from a ``trace="globaltimer"`` launch (``trace``)::
 
     runner = QwenMegakernel(weights, max_len, trace="globaltimer")
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
@@ -22,8 +22,9 @@ file from a ``trace="globaltimer"`` launch (``qwen_megakernel_trace``)::
 
 Draw it::
 
-    python -m attn_gym.warpdrive.examples.qwen_megakernel_viz OUT.html \\
-        [--model Qwen/Qwen3-32B] [--ctas 152] [--splits 16] [--timeline capture.json]
+    python -m attn_gym.warpdrive.examples.qwen_megakernel.viz OUT.html \\
+        [--model Qwen/Qwen3-32B] [--ctas 152] [--splits 16] [--timeline capture.json] \
+        [--engine tcgen05 [--batch 16] [--stream-inputs]]
 """
 
 import argparse
@@ -31,7 +32,7 @@ import json
 from pathlib import Path
 
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import QwenConfig
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 from attn_gym.warpdrive.profiler import Range
 from attn_gym.warpdrive.schedule_html import Item, Track, schedule_html
 from attn_gym.warpdrive.trace_session import role_tracks, work_item_ranges, work_item_spans
@@ -47,17 +48,23 @@ def critical_path(pred: list[mk.RowSpan]) -> list[int]:
     return path[::-1]
 
 
-def _label(words, deps, table_row: int) -> str:
+def _label(words, deps, table_row: int, rows: int) -> str:
     kind, layer, a, b = words
     match kind:
         case mk.QKV:
-            what = f"QKV layer {layer} · rows {a * mk.ROWS}-{a * mk.ROWS + mk.ROWS - 1}"
+            what = f"QKV layer {layer} · rows {a * rows}-{a * rows + rows - 1}"
         case mk.ATTN:
             what = f"ATTN layer {layer} · kv head {a}, split {b}"
         case mk.OPROJ | mk.DOWN:
-            what = f"{mk.OP_NAMES[kind]} layer {layer} · rows {a * mk.ROWS}.. · k split {b}"
+            what = f"{mk.OP_NAMES[kind]} layer {layer} · rows {a * rows}.. · k split {b}"
+        case mk.ROUTER:
+            what = f"ROUTER layer {layer} · experts {a * rows}-{a * rows + rows - 1}"
         case mk.GATEUP:
             what = f"GATEUP layer {layer} · tile {a}"
+        case mk.NORM:
+            what = f"NORM layer {layer} · {('ln_in', 'ln_post')[a]} · token {b}"
+        case mk.REDUCE:
+            what = f"REDUCE layer {layer} · columns {a * rows}-{a * rows + rows - 1}"
         case _:
             what = f"LMHEAD · row tiles {a}-{a + b - 1}"
     waits = ", ".join(" ".join(map(str, d)) for d in deps) or "nothing"
@@ -70,12 +77,15 @@ def megakernel_view(
     measured: dict | None = None,
     model: QwenConfig = mk.QWEN3_0_6B,
     name: str = "Qwen3-0.6B",
+    engine: str = "cuda_core",
+    batch: int = 1,
+    stream_inputs: bool = False,
 ) -> str:
-    op = mk.QwenDecodeMegakernel(splits=splits, model=model)
+    op = mk.kernel_class(engine, stream_inputs)(splits=splits, model=model, batch=batch)
     splits = op.splits
     rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
-    cost = mk.row_cost(op)
-    pred = mk.list_schedule(rows, ctas, cost)
+    cost = mk.row_cost(op, ctas)
+    pred = mk.list_schedule(op, rows, ctas)
     by_cta: list[list[int]] = [[] for _ in range(ctas)]
     for i, p in enumerate(pred):
         by_cta[p.cta].append(i)
@@ -90,7 +100,7 @@ def megakernel_view(
             table_row[t], table_cta[t] = i, cta
     items = [
         Item(
-            _label(words, deps, t),
+            _label(words, deps, t, op.rows),
             mk.OP_NAMES[words[0]],
             shade=words[1] / (op.layers - 1) if words[0] != mk.LMHEAD else 0.0,
             start=pred[i].start,
@@ -115,7 +125,8 @@ def megakernel_view(
     path = critical_path(pred)
     return schedule_html(
         f"{name} decode step",
-        f"{len(rows):,} work items · {ctas} CTAs · {splits} KV splits",
+        f"{len(rows):,} work items · {ctas} CTAs · {splits} KV splits · batch {batch} · "
+        f"{engine}{' · streamed inputs' if stream_inputs else ''}",
         items,
         by_cta,
         critical=path,
@@ -129,7 +140,8 @@ def megakernel_view(
             ),
             "Predicted cost per item (us): "
             + ", ".join(f"{mk.OP_NAMES[k]} {c:.1f}" for k, c in cost.items())
-            + f", plus {mk.DEPENDENCY_LATENCY:g} us per dependency.",
+            + f", plus {mk.DEPENDENCY_LATENCY:g} us per dependency; a batch-one GEMV row "
+            f"reusing its CTA's input costs its weight stages plus {mk.REUSED_INPUT:g} us.",
         ],
     )
 
@@ -187,10 +199,16 @@ def main():
         "--model", default="Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory (its config)"
     )
     parser.add_argument("--timeline", type=Path, help="measured spans (see the docstring)")
+    parser.add_argument("--engine", choices=("cuda_core", "tcgen05"), default="cuda_core")
+    parser.add_argument("--batch", type=int, default=1, help="sequences per step (tcgen05)")
+    parser.add_argument(
+        "--stream-inputs", action="store_true", help="streamed GEMV inputs (tcgen05)"
+    )
     args = parser.parse_args()
     model = load_config(args.model)
+    kernel = mk.kernel_class(args.engine, args.stream_inputs)
     if args.splits is None:
-        args.splits = mk.QwenDecodeMegakernel(model=model).splits
+        args.splits = kernel(model=model, batch=args.batch).splits
     measured = json.loads(args.timeline.read_text()) if args.timeline else None
     for key in ("ctas", "splits"):  # the capture must be of the drawn table
         if measured and measured.get(key, getattr(args, key)) != getattr(args, key):
@@ -198,7 +216,17 @@ def main():
                 f"the capture ran with {key} = {measured[key]}; pass --{key} {measured[key]}"
             )
     name = Path(args.model).name
-    args.out.write_text(megakernel_view(args.ctas, args.splits, measured, model, name))
+    view = megakernel_view(
+        args.ctas,
+        args.splits,
+        measured,
+        model,
+        name,
+        args.engine,
+        args.batch,
+        args.stream_inputs,
+    )
+    args.out.write_text(view)
     print(args.out)
 
 

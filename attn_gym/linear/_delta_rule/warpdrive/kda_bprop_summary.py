@@ -68,6 +68,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.warpdrive import (
     Consumer,
     LastEntry,
@@ -139,7 +140,6 @@ from .umma import (
     smem_desc,
 )
 
-DIMS = (64, 128)
 LOG2_E = 1.4426950408889634
 RAW_STAGES = 2
 BETA_STAGES = 4
@@ -201,8 +201,10 @@ class KdaBpropSummary(WarpSpecialized):
     from ``d_final_state`` instead of zero."""
 
     def __init__(self, io: str, d_k: int, d_v: int, seeded: bool):
-        if d_k not in DIMS or d_v not in DIMS:
-            raise ValueError(f"the KDA bprop summary serves d_k, d_v in {DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(
+                f"the KDA bprop summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}"
+            )
         self.io, self.d_k, self.d_v, self.seeded = io, d_k, d_v, seeded
         self.io_dtype = io_t = _CUTE_DTYPES[io]
         plan = self.smem_plan = SmemPlan()

@@ -279,7 +279,9 @@ def test_dropped_helper_cursor_rejected(requires_blackwell):
 
 @pytest.mark.parametrize("iket", [False, True])
 def test_cursor_return_required_independently_of_tracing(requires_blackwell, iket):
-    op = ReturnedCursor(StaticPersistent(), missing=True).enable_iket(iket)
+    op = ReturnedCursor(StaticPersistent(), missing=True).with_settings(
+        trace_backend="iket" if iket else None
+    )
     with pytest.raises(Exception, match="return all warpdrive state arguments; missing work"):
         compile_cursor(op)
 
@@ -318,4 +320,4 @@ def test_no_python_profiler_needed(requires_blackwell, monkeypatch, traced_compi
     compile_cursor.cache_clear()
     monkeypatch.setattr(sys, "setprofile", forbidden)
     compile_producer(ReturnedProducer())
-    compile_cursor(ReturnedCursor(StaticPersistent()).enable_iket())
+    compile_cursor(ReturnedCursor(StaticPersistent()).with_settings(trace_backend="iket"))

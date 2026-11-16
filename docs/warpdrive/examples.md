@@ -15,7 +15,7 @@ PyTorch or FA4 feature.
 | Study attention backward and overlapping lifetimes | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
-| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
+| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -223,7 +223,7 @@ out, lse = fa4_fwd(
 128 scores -> four 32-column hardware maxima -> existing software row-max updater
 ```
 
-- SM103 only; an SM100 target raises `ValueError`. Default is false, retaining the software path.
+- SM103-family targets only (SM103 and SM107); an SM100 target raises `ValueError`. Default is false, retaining the software path.
 - Rescale threshold, exponentials, BF16 P conversion and row sums are unchanged, including
   fast-exp2's flush-to-zero rescale behavior.
 - Tests compare O/LSE bitwise: ragged Q, nonuniform scales, repeated launches, persistent
@@ -464,7 +464,7 @@ the shape determines whether that reuse helps.
 
 ```python
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
-from attn_gym.warpdrive.examples.qwen_megakernel_ref import (
+from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     load_qwen3_weights,
     make_decode_state,
 )
@@ -491,10 +491,10 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 
 | Input | Contract |
 |---|---|
-| Model | Dense Qwen3: 0.6B, 1.7B, 8B, 14B and 32B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
+| Model | Qwen3 0.6B, 1.7B, 8B, 14B and 32B, and Qwen3-MoE 30B-A3B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
 | Caches | Contiguous bf16 `(layers, kv_heads, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
 | GPU | SM100 family; one CTA per SM, cooperative launch |
-| Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models |
+| Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models across GPUs (235B-A22B) |
 
 The table above shows 0.6B's counts. Larger models change only the counts: an attention row
 serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj split covers a
@@ -502,7 +502,7 @@ quarter of the q heads, the residual polls run 8 elements per thread at a time, 
 as many 16 KB stages as fit (11 for 32B), and the default KV split count targets about 128
 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
 
-Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `bench_qwen_megakernel`;
+Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `qwen_megakernel.bench`;
 "roofline" is the logical bytes per step at the measured 6.2 TB/s read bandwidth, so above
 100% means L2 hits):
 
@@ -513,6 +513,86 @@ Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `bench_qwen_megake
 | 8B | 1024 / 8192 | 3858 / 4011 | 2949 / 3368 | 1.31x / 1.19x | 90% / 84% |
 | 14B | 1024 / 8192 | 5918 / 6106 | 4760 / 5634 | 1.24x / 1.08x | 101% / 88% |
 | 32B | 1024 / 8192 | 12849 / 13101 | 10650 / 12035 | 1.21x / 1.09x | 99% / 91% |
+| 30B-A3B (MoE) | 1024 / 8192 | 4650 / 4818 | 2202 / 2768 | 2.11x / 1.74x | 50% / 44% |
+
+A MoE model adds a router phase after o_proj (128 logits from 4 tiles) and routes the MLP:
+the gate/up and down GEMVs keep the dense layout over `experts_per_token x moe_intermediate_size`
+activation columns, with slot s's weight rows taken from its routed expert. Each consumer computes
+the top-k itself from the logits (k rounds of a warp max over packed (logit, index) keys; ties go
+to the lower expert), the load warp for expert addresses and one compute warp for the routing
+weights, which gate/up folds into its output. The torch.compile baseline gathers the top-k
+experts' weights for batched matmuls. Its floor counts only the routed experts' bytes, and it
+stays latency-bound like the small dense models: one more dependent phase per layer, routing on
+the critical path, and expert weights that cannot stream before the router finishes.
+
+**Tensor-core engine.** ``QwenMegakernel(..., engine="tcgen05")`` swaps the GEMV engine
+(``TcGen05Gemv``, ``QwenDecodeMegakernelTc``): an MMA warp accumulates each 128-row weight tile
+against the input with tcgen05 swap-AB MMAs (M = 128 weight rows, N = 16 token columns) into
+TMEM, and the compute warps run the same epilogues. Each 16 KB stage is one 128 x 64 SW128
+operand, so a stage is four MMAs; the input stays the contiguous vector the CUDA-core engine
+reads, viewed through a B layout whose core matrices overlap, so batch one needs no zero
+padding. At batch one it is not faster (GB200, ctx 1024, us): 0.6B 465 vs 637, 8B 2959 vs 3048,
+32B 10629 vs 11294, 30B-A3B 2199 vs 2496. The 128-row items give the latency-bound phases fewer
+CTAs (30B-A3B's router is one item). It is the base for batched decoding, where the CUDA-core
+GEMV's work grows with every token.
+
+**Batched decoding.** ``QwenMegakernel(..., engine="tcgen05", batch=B)`` decodes B sequences (dense
+models, B <= 64) per launch through ``decode(tokens, positions, k_cache, v_cache)``, each sequence
+with its own position and cache. The weights stream once for all B: the MMA's N columns are the
+tokens, and every activation carries a token axis. Attention rows are per (sequence, kv head,
+split), with the split count divided by B. Each warp builds whole tokens' GEMV inputs, and
+o_proj's last split publishes the post-attention residual so gate/up rows read one word per
+element. A sequence's logits do not depend on the rest of the batch (bit-identical in batches
+of 8 and 3). The inputs stay in shared memory (B x hidden x 2 bytes), which bounds Qwen3-8B
+at B = 16. GB200, all sequences at one context, tokens per second
+(``qwen_megakernel.bench_batch``):
+
+| model, ctx | CUDA cores, B=1 | B=1 | B=4 | B=16 | B=32 | B=64 |
+|---|---:|---:|---:|---:|---:|---:|
+| 0.6B, 256 | 1993 | 1422 | 5312 | 12251 | 15010 | 13568 |
+| 0.6B, 1024 | 2049 | 1600 | 4860 | 10146 | 11963 | 10991 |
+| 8B, 256 | 323 | 332 | 1095 | 2721 | | |
+| 8B, 1024 | 339 | 330 | 1041 | 2438 | | |
+
+Beyond B = 32 the input buffer leaves 0.6B five ring stages, and at ctx 1024 the batch's KV
+reads (about 270 MB per layer at B = 64) bound attention.
+
+**Batched MoE.** Qwen3-30B-A3B batches too (B <= 32, its inputs' shared-memory bound). The router
+row computes every token's logits, takes each token's top 8 and publishes per-expert token lists
+(count, token and rank, routing weight) plus the normalized MLP input. Each expert has four
+gate/up and four down rows (a quarter of its tiles each) whose MMA columns are its tokens:
+gate/up gathers their inputs and writes each token's activation slot times its routing weight,
+down writes per-(token, rank) outputs, and REDUCE rows sum a token's eight into the next
+residual. Rows of experts no token chose skip after one poll. A sequence's results do not
+depend on which tokens share its experts (bit-identical in batches of 8 and 3). GB200, tokens
+per second at ctx 256 / 1024: B=1 410 / 407 (the batch-one kernel), B=2 442 / 446, B=4 834 /
+817, B=8 1401 / 1326, B=16 1925 / 1771, B=32 2279 / 2052. At small batches most of the 1024
+expert rows per layer only skip; a device-built list of active experts would remove them.
+
+**Streamed inputs.** `QwenMegakernel(..., engine="tcgen05", batch=B, stream_inputs=True)`
+(`QwenDecodeMegakernelTcStream`) keeps GEMV inputs in global memory and stages chunks in
+shared memory, leaving room for the weight ring. With resident inputs, batches above 16
+on 8B and 14B, or 8 on 32B, no longer fit. NORM rows, one per token, normalize QKV and
+LM-head inputs into a shared bf16 buffer. For dense models, they also normalize gate/up
+inputs, and gate/up epilogues write their activations into that buffer. NORM rows publish
+an epoch flag per token; gate/up publishes one per 64-column chunk. A dedicated warp polls
+these flags and bulk-copies chunks into the activation ring read by the MMAs. For dense
+models with equal KV split counts, each sequence's results are bit-identical to the
+tcgen05 kernel at batch one. o_proj, the MoE router and expert rows still build inputs in
+per-CTA scratch. The table compares megakernel throughput (the faster of resident and
+streamed inputs) with `torch.compile` + CUDA graph, in tokens per second on GB300 at
+ctx 1024. Each cell is megakernel / compiled:
+
+| model | B=16 | B=32 | B=64 |
+|---|---:|---:|---:|
+| 1.7B | | 10598 / 5020 | 11282 / 5875 |
+| 8B | 2946 / 2342 | 4325 / 3301 | 5256 / 4166 |
+| 14B | 1767 / 1764 | 2502 / 2581 | 2999 / 3464 |
+| 32B | 845 / 934 | 1244 / 1439 | 1452 / 2055 |
+
+In these measurements, resident inputs are faster at B = 8 and below; NORM rows add a
+dependency hop per phase. Attention on CUDA cores is the largest remaining cost on 14B
+and 32B.
 
 The megakernel removes launch and dependency latency, so its lead shrinks as weight bytes
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
@@ -521,15 +601,23 @@ which varies about 5x across prompts on the deep models.
 <details markdown="1">
 <summary>How the megakernel runs the model</summary>
 
+- **Code.** The `qwen_megakernel` package: `core.py` holds the base kernel and the CUDA-core engine,
+  `tc.py` the tcgen05 engine and streamed inputs, `schedule.py` the host's instruction
+  table and CTA assignment, and `runner.py` the `QwenMegakernel` runner. One prologue builds every GEMV input: a group of
+  `8 // min(batch, 8)` warps per token, so batch one uses all eight warps per token and a batch
+  of eight or more one warp each.
 - **Schedule.** `InstructionTable` is a `WorkMap` over the int32 table. `list_schedule`
-  assigns rows to CTAs with a row-latency model and `assign_static` lays the table out
+  assigns rows to CTAs with an engine-specific row-latency model (`row_cost`, fitted to
+  traced work items across batch sizes), placing each row on the CTA that finishes it first (at
+  batch one a row costs less on a CTA whose previous GEMV row wrote the same input: it skips the
+  prologue), and `assign_static` lays the table out
   `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
   `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
   resident (the reason for `cooperative=True`) the earliest unfinished row can always run.
 - **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
   and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
   prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
-  on CUDA cores; weights and KV carry an L2 evict-first hint.
+  on CUDA cores (or tcgen05 MMAs from a tenth warp, above); weights and KV carry an L2 evict-first hint.
 - **Dependencies between CTAs** are raw code: every activation is a 64-bit word
   `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
   (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL
@@ -557,7 +645,7 @@ gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 600s \
   .venv/bin/python -m pytest test/warpdrive/test_warpdrive_qwen_megakernel.py \
   test/warpdrive/test_warpdrive_qwen_megakernel_ref.py
 gpu-run --timeout 600 auto -- timeout --signal=TERM --kill-after=5s 2400s \
-  .venv/bin/python -m attn_gym.warpdrive.examples.bench_qwen_megakernel \
+  .venv/bin/python -m attn_gym.warpdrive.examples.qwen_megakernel.bench \
   --output agent_space/qwen_megakernel.json
 ```
 
@@ -569,10 +657,10 @@ ctx 1024/4096/8192 (`--contexts`).
 (payload: the table row) and the compute role's `trace_region`s, also with the row as payload:
 `poll` (waiting for the row's inputs; it ends when they are ready), `stream` (a GEMV tile's
 weight stages), `attn.blocks` (an attention row's KV blocks) and `reduce.poll` (the last down
-split fetching the other partials). `qwen_megakernel_trace` decodes one launch:
+split fetching the other partials). `qwen_megakernel.trace` decodes one launch:
 
 ```python
-from attn_gym.warpdrive.examples import qwen_megakernel_trace as mkt
+from attn_gym.warpdrive.examples.qwen_megakernel import trace as mkt
 
 runner = QwenMegakernel(weights, max_len=1088, trace="globaltimer")
 runner(weights, token, pos, *caches)  # compile and warm up
@@ -585,7 +673,7 @@ mkt.input_waits(session.ranges, runner.table)  # median row start -> inputs read
 The trace has one process per SM and one track per role; work items are named after their
 instruction (`QKV`, `load QKV`, ...) with `layer`, `a` and `b` in their args, and an arrow runs
 from each input group's last-finishing producer row to the row waiting for it, across SMs
-(`write_step_trace`). `bench_qwen_megakernel --trace-dir DIR` writes one trace per context and
+(`write_step_trace`). `qwen_megakernel.bench --trace-dir DIR` writes one trace per context and
 reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
 [Tracing](tracing.md#iket)), and `waits=True` adds the layer's wait ranges with either backend.
 Disabled, both emit no instructions.

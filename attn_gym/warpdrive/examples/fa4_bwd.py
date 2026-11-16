@@ -109,6 +109,7 @@ from attn_gym.warpdrive import (
     bulk_wait_group,
     fence_async_shared,
     role,
+    tcgen05_before_thread_sync,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
@@ -797,8 +798,11 @@ class FlashAttentionBackward(WarpSpecialized):
 
         Match ``Warps`` counting: finish every lane, then arrive once per warp on rank 0's
         full barrier. Rank 0 is the only target because the kernel runs on one CTA pair.
-        No fence is needed here: make_ds fenced sdS, and the caller waits for its S loads.
+        make_ds fenced sdS, and the caller completed its S loads, but the MMA role's dQ
+        overwrites the tail of S: PTX orders this role's tcgen05.ld of S before that write
+        only with ``tcgen05.fence::before_thread_sync`` ahead of the arrival (ISA 9.7.18.6.3).
         """
+        tcgen05_before_thread_sync()
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             cute.arch.mbarrier_arrive(ds.full_barrier(0), peer_cta_rank_in_cluster=Int32(0))
@@ -1482,21 +1486,12 @@ def compile_fa4_bwd(op: FlashAttentionBackward):
     )
 
 
-_OPS: dict = {}
-
-
-def _op(causal, roles, dq_stages, cluster) -> tuple:
+def _op(causal, roles, dq_stages, cluster):
     pair = is_pair(cluster)
     dq_stages = check_dq_stages(dq_stages, pair)  # normalized: one compile key per kernel
-    key = (causal, None if roles is None else tuple(sorted(roles.items())), dq_stages, pair)
-    op = _OPS.get(key)
-    if op is None:
-        if pair:
-            op = FlashAttentionBackward2Cta(causal, roles)
-        else:
-            op = FlashAttentionBackward(causal, roles, dq_stages)
-        _OPS[key] = op
-    return op, key
+    if pair:
+        return FlashAttentionBackward2Cta.get_or_build(causal, roles)
+    return FlashAttentionBackward.get_or_build(causal, roles, dq_stages)
 
 
 def check_dq_stages(dq_stages, pair: bool) -> int:
@@ -1540,8 +1535,8 @@ def fa4_bwd_main(
 
     This runs only the main kernel. Keyword options are the same as ``fa4_bwd``.
     """
-    op, key = _op(causal, roles, dq_stages, cluster)
-    fn = compile_fa4_bwd.by_static_key(key, lambda: compile_fa4_bwd(op))
+    op = _op(causal, roles, dq_stages, cluster)
+    fn = compile_fa4_bwd(op)
     workspace, sms = op.work.launch_args(q.device)
     fn(q, k, v, dout, lse_log2, dpsum, dq_accum, dk, dv, softmax_scale, workspace, sms)
 

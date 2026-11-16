@@ -225,8 +225,7 @@ def paged_chunk_kda(
             conversion are internal, matching :func:`chunk_kda`.
         beta: Per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
-            Recurrence math remains FP32; BF16 affects persistent storage only. The optional
-            warpdrive backend requires FP32.
+            Recurrence math remains FP32; BF16 affects persistent storage only.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence.
             Positive, unique indices select cache slots to read and advance;
             non-positive indices produce zero output and leave the cache untouched.
@@ -240,7 +239,7 @@ def paged_chunk_kda(
         kernel_options: Backend-specific options. ``{"backend": "warpdrive"}`` selects
             the optional warpdrive backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
-            applies to the fused backend as in ``chunk_kda``. ``"autotune"`` (default
+            applies as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the repo-local fused kernels;
             warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.

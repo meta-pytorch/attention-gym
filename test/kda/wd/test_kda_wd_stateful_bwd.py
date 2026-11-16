@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 
 import pytest
 import torch
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from attn_gym.linear import chunk_kda
 from attn_gym.linear.kda.impl.warpdrive_ops import (
     chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
     chunk_warpdrive_packed_bwd_with_state_op,
@@ -30,8 +33,8 @@ from attn_gym.testing.kda import (
 )
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive KDA path requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive KDA path requires an SM100-family GPU",
 )
 
 D = 128
@@ -39,6 +42,19 @@ SCALE = D**-0.5
 OPCHECK_UTILITIES = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
 MILD_GATE = 0.05  # Decay per token in [e^-0.05, 1): the entry state still matters 4096 tokens in.
 GRADIENT_NAMES = ("dq", "dk", "dv", "dgate", "dbeta", "d_initial_state")
+
+
+@pytest.fixture(params=[0, 4], ids=["uncut", "chain"])
+def backward_pieces(request, monkeypatch) -> int:
+    """Pin the backward plan: one work item per sequence and head, or a four-piece chain whose
+    piece boundaries carry the state cotangent through the reverse state chain."""
+    from attn_gym.linear._delta_rule.warpdrive.drivers import kda
+
+    build = kda.BackwardPlan.build
+    monkeypatch.setattr(
+        kda.BackwardPlan, "build", lambda *args: replace(build(*args), pieces=request.param)
+    )
+    return request.param
 
 
 def _make_inputs(
@@ -264,7 +280,9 @@ def test_staged_warpdrive_backward_is_the_native_op() -> None:
     )
 
 
-def test_stateful_backward_matches_fp64_reference_including_d_initial_state() -> None:
+def test_stateful_backward_matches_fp64_reference_including_d_initial_state(
+    backward_pieces: int,
+) -> None:
     """All six gradients, including the entry-state cotangent, sit within the reference budget."""
     lengths = [100, 156]
     q, k, value, gate, beta, initial_state, d_output, d_final_state = _make_inputs(
@@ -298,3 +316,95 @@ def test_stateful_backward_matches_fp64_reference_including_d_initial_state() ->
         assert_matches_low_precision_reference(actual_grad, high_grad, low_grad, name)
     # The entry state must actually reach the gradient: a dead state makes the check vacuous.
     assert high[5].abs().max() > 1e-3
+
+
+def _public_gradients(inputs, entry_state, offsets, loss: str, *, compile_fn=None):
+    """The five input gradients of a public call that returns its final state."""
+    leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+
+    def step(*operands):
+        return chunk_kda(
+            *operands,
+            entry_state,
+            cu_seqlens=offsets,
+            output_final_state=True,
+            kernel_options={"backend": "warpdrive"},
+        )
+
+    output, final_state = (compile_fn(step) if compile_fn else step)(*leaves)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    d_output = torch.randn(output.shape, device="cuda", generator=generator).to(output.dtype)
+    d_final = torch.randn(final_state.shape, device="cuda", generator=generator)
+    outs = {"output": (output,), "final": (final_state,), "both": (output, final_state)}[loss]
+    cots = {"output": (d_output,), "final": (d_final,), "both": (d_output, d_final)}[loss]
+    return _grads(outs, leaves, cots), cots
+
+
+def _grads(outs, leaves, cotangents):
+    """Gradients of every leaf; one the outputs do not depend on (q of the final state) is zero."""
+    grads = torch.autograd.grad(outs, leaves, cotangents, allow_unused=True)
+    return tuple(
+        torch.zeros_like(leaf) if grad is None else grad
+        for grad, leaf in zip(grads, leaves, strict=True)
+    )
+
+
+@pytest.mark.parametrize("loss", ["output", "final", "both"])
+def test_final_state_without_entry_state_trains_like_a_zero_entry_state(loss: str) -> None:
+    """With no entry state, the exit cotangent still reaches every input: the gradients equal a
+    zero-entry-state call's and sit within the FP64/FP32 reference budget, eager and compiled."""
+    lengths = [100, 156]
+    q, k, value, gate, beta, *_ = _make_inputs(lengths, heads=1, gate_scale=MILD_GATE, seed=7)
+    inputs, offsets = (q, k, value, gate, beta), cumulative_sequence_offsets(lengths)
+    zeros = torch.zeros(len(lengths), 1, D, D, device="cuda")
+
+    actual, cotangents = _public_gradients(inputs, None, offsets, loss)
+    with_zeros, _ = _public_gradients(inputs, zeros, offsets, loss)
+    compiled, _ = _public_gradients(
+        inputs, None, offsets, loss, compile_fn=lambda fn: torch.compile(fn, fullgraph=True)
+    )
+    _assert_gradients_equal(actual, compiled)
+    for name, got, want in zip(GRADIENT_NAMES, actual, with_zeros, strict=False):
+        torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-6, msg=name)
+
+    references = []
+    for precision in (torch.float64, torch.float32):
+        leaves = tuple(tensor.detach().to(precision).requires_grad_() for tensor in inputs)
+        output, final_state = kda_reference(
+            *leaves, cu_seqlens=offsets, scale=SCALE, output_final_state=True
+        )
+        outs = {"output": (output,), "final": (final_state,), "both": (output, final_state)}[loss]
+        references.append(_grads(outs, leaves, tuple(c.to(precision) for c in cotangents)))
+    for name, got, high, low in zip(GRADIENT_NAMES, actual, *references, strict=False):
+        assert_matches_low_precision_reference(got, high, low, name)
+
+
+def test_public_stateful_backward_carries_a_tiny_cotangent_in_fp32(backward_pieces: int) -> None:
+    """A ``2^-25`` exit cotangent reaches ``d_initial_state`` at FP32 precision in every plan.
+
+    Zero Q/K/V reduce the backward to the per-channel decay ``dS_entry = dS_exit exp(sum gate)``,
+    so rounding the carried cotangent to BF16 at any chunk, piece or work-item boundary would
+    show as a relative error near ``2^-9``. The FP32 eager oracle drifts by about 1e-5 over these
+    256 tokens; the closed form does not.
+    """
+    shape = (1, 256, 1, D)
+    q, k, value = (torch.zeros(shape, device="cuda", dtype=torch.bfloat16) for _ in range(3))
+    gate = torch.linspace(-0.02, -0.002, D, device="cuda").expand(shape).contiguous()
+    beta = torch.full(shape[:-1], 0.5, device="cuda")
+    state = torch.ones(1, 1, D, D, device="cuda", requires_grad=True)
+    _, final_state = chunk_kda(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        state,
+        output_final_state=True,
+        kernel_options={"backend": "warpdrive"},
+    )
+    d_exit = 2.0**-25
+    (actual,) = torch.autograd.grad(final_state, state, torch.full_like(state, d_exit))
+
+    decay = gate.double().sum(dim=1).exp()  # [1, 1, K], broadcast over the value rows
+    expected = (d_exit * decay).expand(actual.shape).float()
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=0.0)

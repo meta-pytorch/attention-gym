@@ -203,8 +203,7 @@ def test_binding_rejects(kwargs, match):
 
 
 def test_cross_cta_placement_is_rejected():
-    op = JointRing(roles={"mma": RoleConfig(5, cta="leader")})
-    op.cluster = CtaPair()
+    op = JointRing(roles={"mma": RoleConfig(5, cta="leader")}, cluster=CtaPair())
     with pytest.raises(ProtocolError, match="CTA-local only"):
         op.describe()
 

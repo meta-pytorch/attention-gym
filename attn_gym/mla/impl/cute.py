@@ -1,4 +1,4 @@
-"""CuTe DSL (SM100/SM103) backend for paged MLA decode.
+"""CuTe DSL (SM100 family) backend for paged MLA decode.
 
 Delegates to FlashAttention-4's absorbed MLA path (``qv``): FA4 sums
 ``q_rope @ rope^T`` and ``q_latent @ latent^T`` into one score accumulator and uses the
@@ -17,7 +17,7 @@ contexts re-tune.
 Constraints
 -----------
 - latent_dim = 512, rope_dim = 64, at most 128 heads
-- dtype = bfloat16, SM100 or SM103 (compute capability 10.0 or 10.3)
+- dtype = bfloat16, SM100 family (compute capability 10.0, 10.3, or 10.7)
 """
 
 from __future__ import annotations
@@ -34,8 +34,6 @@ import torch
 
 from attn_gym._backends.tune import run_tunable
 from attn_gym.warpdrive.cache._key import source_fingerprint
-
-SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
 
 
 def _validate_inputs(q_latent: torch.Tensor, q_rope: torch.Tensor) -> None:
@@ -287,4 +285,4 @@ def paged_mla_decode(
     )[0]
 
 
-__all__ = ["SUPPORTED_CAPABILITIES", "PagedMLADecodeFA4", "paged_mla_decode"]
+__all__ = ["PagedMLADecodeFA4", "paged_mla_decode"]

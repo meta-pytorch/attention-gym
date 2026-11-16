@@ -196,10 +196,14 @@ def test_override_instantiates_a_single_warp_default():
 
 
 def test_resolved_placement_drives_pair_scope():
-    op = ConfiguredCopy({"load": replace(LOAD, cta="leader")})
-    op.cluster = CtaPair()
-    # Pair payloads aren't yet supported: use the same graph as a pure handoff.
-    op.data = Ring(2, Threads, Threads)
+    class PairHandoff(ConfiguredCopy):
+        def __init__(self, roles):
+            super().__init__(roles)
+            self.cluster = CtaPair()
+            # Pair payloads aren't yet supported: use the same graph as a pure handoff.
+            self.data = Ring(2, Threads, Threads)
+
+    op = PairHandoff({"load": replace(LOAD, cta="leader")})
     op.describe()
     assert op.data.scope.full_counts == {0: [32, 32], 1: [32, 32]}
     assert op.data.scope.empty_counts == {0: [256, 256], 1: [1, 1]}
@@ -285,10 +289,8 @@ def test_cache_key_is_the_constructor_call():
     assert compile_marker(ConfiguredCopy({"load": LOAD, "consume": CONSUME})) is not first
     assert len(built) == 4
     assert compile_marker.cache_info() == CacheInfo(hits=1, misses=4, currsize=4)
-    op = ConfiguredCopy()
-    op.roles = {"load": LOAD}  # after construction: not part of the constructor call
-    with pytest.raises(TypeError, match="assigned after construction"):
-        op.__cute_cache_key__()
+    with pytest.raises(ProtocolError, match="roles cannot change after construction"):
+        ConfiguredCopy().roles = {"load": LOAD}  # it would not be part of the constructor call
 
 
 @dataclass(frozen=True)

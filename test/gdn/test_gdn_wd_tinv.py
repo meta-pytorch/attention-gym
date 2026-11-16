@@ -8,9 +8,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
+
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the warpdrive GDN T pass requires SM100 or SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the warpdrive GDN T pass requires an SM100-family GPU",
 )
 
 B_T = 64
@@ -98,6 +100,6 @@ def test_gdn_tinv_reuses_one_compile_across_runtime_shapes():
     gdn_tinv.compile_gdn_tinv.cache_clear()
     for lens, heads, key_heads in shapes:
         _run(*_inputs(lens, heads, key_heads, 128, torch.bfloat16, torch.float32), lens, heads)
-    info = gdn_tinv.compile_gdn_tinv.cache_info()
+    info = gdn_tinv.compile_gdn_tinv.cache_info()  # one specialization, looked up per launch
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(shapes), info

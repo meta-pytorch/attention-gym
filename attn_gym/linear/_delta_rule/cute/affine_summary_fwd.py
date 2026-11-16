@@ -89,9 +89,9 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from cutlass.cute.typing import Float32, Int32
 from torch._subclasses.fake_tensor import FakeTensor
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.linear._delta_rule.constants import is_sm100_kda_capability
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive import (
@@ -956,8 +956,8 @@ def _compile_affine_summary(
 ):
     """Compile one dtype/head-count specialization from fake tensors."""
     target = get_compile_target()
-    if target.device_type != "cuda" or not is_sm100_kda_capability(target.effective_capability):
-        raise ValueError(f"affine_summary_fwd requires an SM100/SM103 target; got {target}")
+    if target.device_type != "cuda" or not runs_sm100_kernels(target.effective_capability):
+        raise ValueError(f"affine_summary_fwd requires an SM100-family target; got {target}")
     sym_int = cute.sym_int64 if use_int64_offsets else cute.sym_int
     tokens = sym_int()
 
@@ -1107,7 +1107,7 @@ def build_state_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_fwd requires CUDA capability 8.0+, got {capability}")
-    portable = not is_sm100_kda_capability(capability)
+    portable = not runs_sm100_kernels(capability)
     sm_count = properties.multi_processor_count
     if portable:
         if capability[0] in (10, 12):

@@ -683,9 +683,10 @@ def test_grouped_owners_with_rendezvous(requires_blackwell, stages, group):
 
 class AliasModel(WarpSpecialized):
     """``prod`` writes TMEM S (threads) and publishes it on ``kv``; ``a`` reads P (an alias in
-    S) inside its kv handle, then signals ``back`` (a -> prod), which orders the read before
-    prod's next write. Only ``kv`` orders the write before the read: through an exclusive ring
-    the diagnostic cannot match epochs, so the pair is unverified; joined, it is checked."""
+    S) inside its kv handle, then waits for the load and signals ``back`` (a -> prod), which
+    orders the read before prod's next write. Only ``kv`` orders the write before the read:
+    through an exclusive ring the diagnostic cannot match epochs, so the pair is unverified;
+    joined, it is checked."""
 
     def __init__(self, mode: str):
         self.mode = mode
@@ -698,7 +699,7 @@ class AliasModel(WarpSpecialized):
             consumer_sharing=Sharing(mode),
             commit_fence="tmem_store",
         )
-        self.back = Ring(1, Threads, Threads)
+        self.back = Ring(1, Threads, Threads, commit_fence="tmem_load")
         self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
 
     @role(warps=0)

@@ -19,8 +19,8 @@ import torch
 import triton
 import triton.language as tl
 
+from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.triton import utils as triton_utils
-from attn_gym.linear.kda.constants import is_sm100_kda_capability
 
 IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
 
@@ -29,7 +29,7 @@ IS_GATHER_SUPPORTED = hasattr(triton.language, "gather")
 def is_sm100_kda_target(device: torch.device) -> bool:
     """Return whether a physical device should use the SM100-specific KDA route."""
     properties = torch.cuda.get_device_properties(device)
-    return is_sm100_kda_capability((properties.major, properties.minor))
+    return runs_sm100_kernels((properties.major, properties.minor))
 
 
 def _uses_pre_ampere_triton_target() -> bool:

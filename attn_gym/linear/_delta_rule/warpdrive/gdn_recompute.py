@@ -73,6 +73,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync
 
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.warpdrive import (
     Barriers,
     Consumer,
@@ -98,6 +99,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
 from attn_gym.warpdrive.protocol import current_trace
+from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 from attn_gym.warpdrive.tracing import wait_range
 
 from .contract import tma_divisibility
@@ -127,7 +129,6 @@ from .ragged import (
 from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_step, smem_desc
 
 B_T = 64
-DIMS = (64, 128)
 RCP_LN2 = 1.4426950408889634  # 1 / ln 2: natural-log gates -> the kernel's log2 domain
 BOX = 64  # 16-bit elements per 128-byte swizzle row
 BOX_BYTES = B_T * BOX * 2  # one 64 x 64 16-bit box
@@ -162,11 +163,13 @@ def _wait(bars, phases, name: cutlass.Constexpr[str]):
     i = SIG[name]
     with wait_range(current_trace(), f"{name}.wait"):
         cute.arch.mbarrier_wait(bars + i, Int32((phases >> i) & 1))
+    tcgen05_after_thread_sync()  # every signal hands TMEM between threads
     return phases ^ Int32(1 << i)
 
 
 @cute.jit
-def _arrive(bars, name: cutlass.Constexpr[str]):
+def before_sync_and_arrive(bars, name: cutlass.Constexpr[str]):
+    tcgen05_before_thread_sync()
     cute.arch.mbarrier_arrive(bars + SIG[name])
 
 
@@ -177,7 +180,6 @@ def _commit(bars, name: cutlass.Constexpr[str]):
 
 
 _CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16}
-_IO_DTYPES = {torch.float16: "fp16", torch.bfloat16: "bf16"}
 _STATE_DTYPES = {torch.float32: cutlass.Float32, torch.bfloat16: cutlass.BFloat16}
 
 
@@ -226,8 +228,8 @@ class GdnRecompute(WarpSpecialized):
     """Warpdrive GDN checkpoint-series recompute for fp16/bf16 ``d_k, d_v`` in {64, 128}."""
 
     def __init__(self, dtype_name: str, d_k: int, d_v: int, use_initial_state: bool):
-        if d_k not in DIMS or d_v not in DIMS:
-            raise ValueError(f"the recompute serves d_k, d_v in {DIMS}, got {d_k}, {d_v}")
+        if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
+            raise ValueError(f"the recompute serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         self.dtype_name, self.d_k, self.d_v = dtype_name, d_k, d_v
         self.use_initial_state = use_initial_state
         self.io_dtype = _CUTE_DTYPES[dtype_name]
@@ -742,7 +744,7 @@ class GdnRecompute(WarpSpecialized):
                     words[half * 16 : half * 16 + 16],
                 )
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "y")
+            before_sync_and_arrive(sig, "y")
             # ---- decayed U -> the KV GEMM operand ------------------------------------
             # The decay factors fill the U GEMM's latency (upstream's schedule).
             last = cs[B_T - 1, 0]
@@ -775,7 +777,7 @@ class GdnRecompute(WarpSpecialized):
                     pack.append(fp32_to_fp16(s0, s1, dtype=io))
                 tmem_st("16x128b", ((lane_base + half * 16) << 16) + du_col, pack)
             cute.arch.fence_view_async_tmem_store()
-            _arrive(sig, "du")
+            before_sync_and_arrive(sig, "du")
             # The V release retains its proxy fence before the TMA ring refills this stage.
             vh.release()
         if n_local > 0:
@@ -796,7 +798,7 @@ class GdnRecompute(WarpSpecialized):
             pack = [fp32_to_fp16(vecs[i][2 * j], vecs[i][2 * j + 1], dtype=io) for j in range(16)]
             tmem_st("32x32b", lane0 + state_in_col + i * 16, pack)
         cute.arch.fence_view_async_tmem_store()
-        _arrive(sig, "state_in")
+        before_sync_and_arrive(sig, "state_in")
         if chunk >= it.write_start:
             row, row_valid = self._state_row(me.tid)
             with ckpt.produce() as h:
@@ -1141,17 +1143,17 @@ def gdn_recompute(
     """Fill ``checkpoints`` for packed ``k [T, HK, DK]``, ``v [T, HV, DV]``, fp32 natural-log
     ``gate [T, H]``, ``gdn_tinv`` tiles and an int32 work table ``items`` (see the module
     docstring). ``scheduler`` (int32, zeroed) is allocated when omitted. ``op`` (a
-    ``GdnRecompute`` with ``enable_trace("globaltimer")``) and its ``trace`` buffer capture a role
+    ``GdnRecompute`` built with ``trace_backend="globaltimer"``) and its ``trace`` buffer capture a role
     timeline. ``max_ctas`` caps the grid (default: one CTA per SM); with fewer CTAs than rows,
     each CTA claims several items in turn."""
-    if k.dtype not in _IO_DTYPES or v.dtype != k.dtype or checkpoints.dtype != k.dtype:
+    if k.dtype not in IO_DTYPE_NAMES or v.dtype != k.dtype or checkpoints.dtype != k.dtype:
         raise TypeError("k, v and checkpoints must share a 16-bit dtype")
     if state_in is not None and state_in.dtype not in _STATE_DTYPES:
         raise TypeError(f"state_in must be fp32 or bf16, got {state_in.dtype}")
     if scheduler is None:
         scheduler = torch.zeros(2, dtype=torch.int32, device=k.device)
     if op is None:
-        op = GdnRecompute(_IO_DTYPES[k.dtype], k.shape[-1], v.shape[-1], state_in is not None)
+        op = GdnRecompute(IO_DTYPE_NAMES[k.dtype], k.shape[-1], v.shape[-1], state_in is not None)
     state_name = None if state_in is None else _STATE_DTYPES[state_in.dtype].__name__
     fn = compile_gdn_recompute(op, state_name)
     workspace, sms = op.work.launch_args(k.device)

@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym._backends import tune as tune_module
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref, naive_chunk_kda
 
@@ -46,8 +47,8 @@ from attn_gym.testing import strided_state_pool
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
-    reason="the CuTeDSL KDA forward pipeline requires SM100/SM103",
+    not cuda_runs_sm100_kernels(),
+    reason="the CuTeDSL KDA forward pipeline requires an SM100-family GPU",
 )
 
 _DEFAULT_SCALE = 128**-0.5

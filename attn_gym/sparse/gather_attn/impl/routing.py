@@ -29,7 +29,7 @@ def require_grouped_schedule(
     major, minor = torch.cuda.get_device_capability(query.device)
     violation = None
     if major != 10:
-        violation = f"SM100 or SM103, got SM{major}{minor}"
+        violation = f"an SM100-family GPU, got SM{major}{minor}"
     elif query.dtype != torch.bfloat16:
         violation = f"bfloat16 inputs, got {query.dtype}"
     elif any(tensor.stride(-1) != 1 for tensor in kv_tensors):
