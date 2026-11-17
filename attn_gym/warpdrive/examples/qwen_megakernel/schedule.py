@@ -3,6 +3,7 @@ dependency groups, the row-cost model and the static list-schedule assignment to
 
 import collections
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -29,6 +30,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ROUTER,
     WORDS,
     QwenDecodeMegakernel,
+    SmPersistent,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.tc import QwenDecodeMegakernelTc
 
@@ -206,17 +208,60 @@ def instruction_rows(op: QwenDecodeMegakernel, ops: tuple[int, ...] = ALL_OPS) -
     return rows
 
 
-def build_table(
-    op: QwenDecodeMegakernel, ctas: int, ops: tuple[int, ...] = ALL_OPS
-) -> torch.Tensor:
-    """The ``instruction_rows`` table: in dependency order for the atomic schedule, assigned
-    to ``ctas`` CTAs for the static one."""
+class StepTables(NamedTuple):
+    """A step's instruction tables, one per launch (each layer, then the LM head), and
+    ``cta_of[launch][blockIdx]``: the ``list_schedule`` CTA whose rows that launch's CTA runs
+    (the identity for the atomic and SM-keyed schedules)."""
+
+    tables: list[torch.Tensor]
+    cta_of: list[list[int]]
+
+
+def build_tables(
+    op: QwenDecodeMegakernel,
+    ctas: int,
+    ops: tuple[int, ...] = ALL_OPS,
+    placement: "Placement | None" = None,
+) -> StepTables:
+    """One table per launch (``op.launches``), from one schedule of the whole step. A row runs in
+    its layer's launch; the LM head's layer word is ``op.layers``, the last launch.
+
+    The static schedules assign every row to a CTA (``list_schedule``, over ``placement`` if
+    given). A launch's table is each CTA's rows of that launch, laid out ``[slot][cta]``
+    (``layout_static``), with the CTAs ordered by their first row's predicted start (SM-keyed
+    tables keep the SM order). Each CTA's rows stay in dependency order, so with every CTA of a
+    launch resident the earliest unfinished row always has its producers finished (they are in
+    this launch or an earlier one): no deadlock. The atomic schedule keeps each launch's rows in
+    dependency order. A row's last word is its index in the concatenated tables (trace payloads
+    and ``runner.table``)."""
     rows = instruction_rows(op, ops)
-    if isinstance(op.work.schedule, StaticPersistent):
-        table = assign_static(op, rows, ctas)
+    per_launch = [[] for _ in range(op.launches)]
+    cta_of = [list(range(ctas)) for _ in range(op.launches)]
+    if isinstance(op.work.schedule, (StaticPersistent, SmPersistent)):
+        spans = list_schedule(op, rows, ctas, placement)
+        # (start, words) per launch and CTA, in each CTA's dependency order.
+        parts = [[[] for _ in range(ctas)] for _ in range(op.launches)]
+        for (words, _, _), span in zip(rows, spans):
+            parts[words[1]][span.cta].append((span.start, words))
+        for launch, part in enumerate(parts):
+            if not isinstance(op.work.schedule, SmPersistent):
+                # A launch's CTAs take SMs in blockIdx order as the previous launch's CTAs exit,
+                # so give the lowest blockIdx to the CTA whose first row is due first.
+                first = [items[0][0] if items else math.inf for items in part]
+                cta_of[launch] = sorted(range(ctas), key=first.__getitem__)
+            per_launch[launch] = layout_static([[w for _, w in part[c]] for c in cta_of[launch]])
     else:
-        table = [words for words, _, _ in rows]
-    return torch.tensor([words + [i] for i, words in enumerate(table)], dtype=torch.int32)
+        for words, _, _ in rows:
+            per_launch[words[1]].append(words)
+    tables, first = [], 0
+    for words in per_launch:
+        if not words:  # an ops subset can leave a launch nothing to run
+            words = layout_static([[] for _ in range(ctas)])
+        tables.append(
+            torch.tensor([w + [first + i] for i, w in enumerate(words)], dtype=torch.int32)
+        )
+        first += len(words)
+    return StepTables(tables, cta_of)
 
 
 def row_groups(
@@ -274,12 +319,27 @@ class RowSpan(NamedTuple):
     after: int | None  # the row that set its start: its latest gate, or its CTA's previous row
 
 
-def list_schedule(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[RowSpan]:
+class Placement(NamedTuple):
+    """Memory-side constraints: ``row_side(words)`` selects a row's side, or None for any side.
+    ``cta_side[c]`` gives CTA slot c's side; under ``SmPersistent``, slots are SMs."""
+
+    row_side: Callable[[list[int]], int | None]
+    cta_side: tuple[int, ...]
+
+
+def list_schedule(
+    op: QwenDecodeMegakernel, rows: list[Row], ctas: int, placement: Placement | None = None
+) -> list[RowSpan]:
     """Greedy list schedule of dependency-ordered rows onto ``ctas`` CTAs under ``op``'s
     ``row_costs``: each row goes to the CTA that finishes it first, starting once every producer
     group it waits for has finished plus ``DEPENDENCY_LATENCY``. A row costs less on the CTA whose
-    previous GEMV row wrote the same input (``input_key``)."""
+    previous GEMV row wrote the same input (``input_key``). With a ``placement``, a row with a
+    side runs on a CTA of that side."""
     cost, reused = row_costs(op, ctas)
+    slots = range(ctas)
+    by_side = {}
+    if placement is not None:
+        by_side = {s: [c for c in slots if placement.cta_side[c] == s] for s in (0, 1)}
     last: dict[tuple, int] = {}  # producer group -> its last-finishing row so far
     tail: list[int | None] = [None] * ctas  # each CTA's previous row
     free = [0.0] * ctas  # when each CTA's previous row ends
@@ -296,7 +356,9 @@ def list_schedule(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[
             else cost[words[0]]
             for c in range(ctas)
         ]
-        cta = min(range(ctas), key=lambda c: (max(free[c], ready) + costs[c], c))
+        side = placement.row_side(words) if placement is not None else None
+        candidates = by_side[side] if side is not None else slots
+        cta = min(candidates, key=lambda c: (max(free[c], ready) + costs[c], c))
         start = max(free[cta], ready)
         after = gate if gate is not None and ready >= free[cta] else tail[cta]
         spans.append(RowSpan(cta, start, start + costs[cta], gates, after))
@@ -308,19 +370,13 @@ def list_schedule(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[
     return spans
 
 
-def assign_static(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[list[int]]:
-    """``list_schedule``'s per-CTA row lists laid out ``[slot][cta]`` for ``StaticPersistent``
-    (CTA b runs rows b, b + ctas, ...); short lists are padded with dropped rows.
-
-    Each list keeps the dependency order, so with every CTA resident the earliest unfinished
-    row always has its producers finished: no deadlock."""
-    lists: list[list[list[int]]] = [[] for _ in range(ctas)]
-    for (words, _, _), span in zip(rows, list_schedule(op, rows, ctas)):
-        lists[span.cta].append(words)
-    slots = max(len(rows) for rows in lists)
+def layout_static(lists: list[list[list[int]]]) -> list[list[int]]:
+    """Per-CTA row lists laid out ``[slot][cta]`` for ``StaticPersistent`` (CTA b runs rows b,
+    b + ctas, ...); short lists are padded with dropped rows."""
+    slots = max(1, max(len(rows) for rows in lists))
     padding = [-1] * (WORDS - 1)
     return [
         lists[cta][slot] if slot < len(lists[cta]) else padding
         for slot in range(slots)
-        for cta in range(ctas)
+        for cta in range(len(lists))
     ]

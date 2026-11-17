@@ -1,18 +1,19 @@
 """The Qwen3 megakernel's static schedule, drawn per CTA (``schedule_html``).
 
-``build_table`` assigns the step's instructions to CTAs by list schedule over a latency model
+``build_tables`` assigns the step's instructions to CTAs by list schedule over a latency model
 (``list_schedule``: ``row_costs`` per row, ``DEPENDENCY_LATENCY`` per producer group) and lays
-them out ``[slot][cta]`` for ``StaticPersistent`` (``assign_static``). The page shows each
-CTA's rows coloured by op and shaded by layer, their predicted start and end, the rows that
-gate them (the last row of each producer group) and the predicted critical path. CTA rows
-come from ``WorkStream.assignment``, so they are the rows the kernel runs.
+each launch's table out ``[slot][cta]`` for ``StaticPersistent`` (``layout_static``). The page shows
+each schedule CTA's rows coloured by op and shaded by layer, their predicted start and end, the
+rows that gate them (the last row of each producer group) and the predicted critical path. A
+schedule CTA's rows run on one CTA of each launch (``cta_of``); they are checked against
+``WorkStream.assignment`` of every launch's table, so they are the rows the kernel runs.
 
 ``--timeline`` overlays a capture: a JSON file
 ``{"unit": "us", "ctas": 152, "splits": 16, "spans": [[table_row, cta, start, end], ...],
 "tracks": [[cta, track, name, table_row, start, end], ...]}``, times from any common origin;
 ``ctas`` and ``splits`` are optional and checked against the drawn table. ``tracks`` (optional)
 are every recorded range by role, drawn under a CTA when it is clicked. ``overlay`` builds the
-file from a ``trace="globaltimer"`` launch (``trace``)::
+file from a ``trace="globaltimer"`` step (``trace``)::
 
     runner = QwenMegakernel(weights, max_len, trace="globaltimer")
     runner(weights, token, pos, *caches)  # compile, warm, and set the step's token and position
@@ -83,21 +84,32 @@ def megakernel_view(
 ) -> str:
     op = mk.kernel_class(engine, stream_inputs)(splits=splits, model=model, batch=batch)
     splits = op.splits
-    rows, table = mk.instruction_rows(op), mk.build_table(op, ctas)
+    rows, (tables, cta_of) = mk.instruction_rows(op), mk.build_tables(op, ctas)
     cost = mk.row_cost(op, ctas)
     pred = mk.list_schedule(op, rows, ctas)
     by_cta: list[list[int]] = [[] for _ in range(ctas)]
     for i, p in enumerate(pred):
         by_cta[p.cta].append(i)
-    # The kernel's view: StaticPersistent over the [slot][cta] table, padding rows dropped.
-    host = table.tolist()
-    assigned = op.work.assignment(table, max_ctas=ctas, decode=lambda t: (host[t][0] >= 0, t))
-    table_row, table_cta = {}, {}
-    for cta, items in enumerate(assigned):
-        assert len(items) == len(by_cta[cta]), "build_table disagrees with list_schedule"
-        for (t, _), i in zip(items, by_cta[cta]):
-            assert host[t][:4] == rows[i][0], "build_table disagrees with list_schedule"
-            table_row[t], table_cta[t] = i, cta
+    # The kernel's view: each launch's StaticPersistent table, padding rows dropped. A launch's
+    # CTA b runs list_schedule CTA cta_of[launch][b]'s rows of that launch, in that CTA's order.
+    # Rows are unique by their words.
+    host = [words for part in tables for words in part.tolist()]  # the joined tables
+    index = {tuple(words): i for i, (words, _, _) in enumerate(rows)}
+    table_row = {}  # row of the joined tables -> its instruction_rows index
+    base = 0
+    for launch, part in enumerate(tables):
+        assignment = op.work.assignment(
+            part, max_ctas=ctas, decode=lambda t, base=base: (host[base + t][0] >= 0, base + t)
+        )
+        base += part.shape[0]
+        for cta, launch_items in enumerate(assignment):
+            order = [index[tuple(host[t][:4])] for _, t in launch_items]
+            assert all(pred[i].cta == cta_of[launch][cta] for i in order), (
+                "build_tables disagrees with list_schedule"
+            )
+            assert order == sorted(order), "a CTA's rows left dependency order"
+            table_row.update((t, i) for (_, t), i in zip(launch_items, order))
+    assert len(table_row) == len(rows), "build_tables disagrees with list_schedule"
     items = [
         Item(
             _label(words, deps, t, op.rows),
@@ -115,10 +127,11 @@ def megakernel_view(
         # A capture of another table (atomic schedule, an ops subset) would land on the wrong
         # rows. Reject spans whose CTA disagrees with this table's assignment.
         for t, cta, _, _ in measured["spans"]:
-            if table_cta.get(t) != cta:
+            planned = pred[table_row[t]].cta if t in table_row else None
+            if planned != cta:
                 raise ValueError(
                     f"measured table row {t} ran on CTA {cta}, but this table runs it on "
-                    f"{table_cta.get(t)}: the capture is not of this static table"
+                    f"{planned}: the capture is not of this static table"
                 )
         spans = {table_row[t]: (cta, s, e) for t, cta, s, e in measured["spans"]}
         tracks = measured_tracks(measured.get("tracks", ()), table_row, host)
@@ -165,7 +178,7 @@ def measured_tracks(
 
 
 def overlay(ranges: list[Range], runner: mk.QwenMegakernel) -> dict:
-    """The ``--timeline`` JSON of one traced launch, in us from the earliest compute start: each
+    """The ``--timeline`` JSON of one traced step, in us from the earliest compute start: each
     table row's compute work item on its CTA, every range on its role's track, and the table's
     CTA and split counts."""
     spans = work_item_spans(ranges, "compute")

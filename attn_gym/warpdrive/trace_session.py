@@ -121,10 +121,11 @@ def role_tracks(ranges: list[Range], kernel, origin_ns: int) -> list[list]:
     enclosing range's span nests inside it, the role's own range outermost. Ranges recorded by no
     role's first warp (compact records) are skipped."""
     roles = {r.first_warp: r for r in _roles(kernel)}
-    by_warp: dict[tuple[int, int], list[Range]] = defaultdict(list)
+    # Ranges nest per recording unit (the whole cta tuple); rows name the CTA by cta[0].
+    by_warp: dict[tuple[tuple[int, ...], int], list[Range]] = defaultdict(list)
     for item in ranges:
         if item.warp in roles:
-            by_warp[item.cta[0], item.warp].append(item)
+            by_warp[item.cta, item.warp].append(item)
     rows = []
     for (cta, warp), items in sorted(by_warp.items()):
         role = roles[warp]
@@ -138,7 +139,7 @@ def role_tracks(ranges: list[Range], kernel, origin_ns: int) -> list[list]:
             track = f"{role.name} +{len(open_ends)}" if open_ends else outer
             open_ends.append(item.end_ns)
             start, end = (item.start_ns - origin_ns) / 1e3, (item.end_ns - origin_ns) / 1e3
-            rows.append([cta, track, item.name, item.payload, start, end])
+            rows.append([cta[0], track, item.name, item.payload, start, end])
     return rows
 
 

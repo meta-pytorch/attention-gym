@@ -35,6 +35,7 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
+from attn_gym.warpdrive.scheduling import IndexSchedule
 
 # Every size but the head dimension comes from the model (QwenDecodeMegakernel, check_model).
 QWEN3_0_6B = QwenConfig()
@@ -75,9 +76,10 @@ EVICT_FIRST = 0x12F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EV
 WORDS = 5  # op, layer, a, b, table row
 OP_NAMES = ("QKV", "ATTN", "OPROJ", "GATEUP", "DOWN", "LMHEAD", "ROUTER", "REDUCE", "NORM")
 SHARED_CHUNK = 64  # activation columns per epoch flag: one tcgen05 gate/up tile
-# Globaltimer records per role and CTA: at least TRACE_EVENTS (0.6B: a CTA runs ~140 rows),
-# else TRACE_EVENTS_PER_ROW per row of the CTA's share (a row records its work item and regions).
-TRACE_EVENTS, TRACE_EVENTS_PER_ROW = 2048, 8
+# Globaltimer records per role, launch and CTA: at least TRACE_EVENTS (headroom for the atomic
+# schedule's uneven claims; a static 0.6B launch gives a CTA ~5 rows), else TRACE_EVENTS_PER_ROW
+# per row of the launch CTA's share (a row records its work item and regions).
+TRACE_EVENTS, TRACE_EVENTS_PER_ROW = 256, 8
 WEIGHT_ATOMS = 6  # wqkv, wo, wgu, wd, LM head, router; the KV caches' atoms follow
 
 
@@ -148,6 +150,22 @@ class ScratchLayout:
 
 
 @dataclass(frozen=True)
+class SmPersistent(IndexSchedule):
+    """SM-keyed persistent schedule: SM s runs table rows s, s + grid, ...
+
+    This lets the host place rows on chosen SMs, for example by memory side. Requires a grid
+    covering every SM, shared memory limiting residency to one CTA per SM, and an exit wait
+    until all CTAs of the launch have arrived (the kernel's arrival counter).
+    """
+
+    def first_index(self, problem):
+        return cute.arch.smid()
+
+    def next_index(self, index, problem):
+        return index + problem.units()
+
+
+@dataclass(frozen=True)
 class InstructionTable(WorkMap):
     """Row ``index`` of an int32 ``(rows, WORDS)`` table. A negative op marks a padding row,
     dropped for every role."""
@@ -197,7 +215,7 @@ class MegakernelParams:
     act_flags: cute.Tensor
     exp: cute.Tensor  # batched MoE SMEM: the routing of a layer, then an expert row's tokens
     logits: cute.Tensor  # (vocab,) fp32
-    state: cute.Tensor  # int32 [epoch of the previous launch, CTAs finished]
+    state: cute.Tensor  # int32 (state_words,): step epoch, then per-launch CTA counts
     step: cute.Tensor  # int32 [token, pos]
     embed: cute.Tensor  # (vocab, hidden) bf16
     ln_in: cute.Tensor  # (layers, hidden) bf16
@@ -210,6 +228,7 @@ class MegakernelParams:
     v_cache: cute.Tensor
     xscratch: cute.Tensor  # (ctas, x_slot) bf16 per-CTA GEMV inputs (QwenDecodeMegakernelTcStream)
     xshared: cute.Tensor  # (shared_size,) bf16 inputs all CTAs read (QwenDecodeMegakernelTcStream)
+    launch: Int32  # this launch's index in the step: its layer, or ``layers`` for the LM head
 
 
 # The argument tensors in argument order: MegakernelParams fields, and the trace buffer.
@@ -478,7 +497,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
         ``roles``: placement by role name over the ``@role`` defaults.
         ``model``: the Qwen3 shape (default Qwen3-0.6B); see ``check_model``.
         ``batch``: sequences decoded per launch, one token each (up to the engine's
-        ``max_batch``; dense models only)."""
+        ``max_batch``; dense models only).
+
+        A step runs as ``launches`` programmatic-dependent launches of this kernel: one per
+        layer, then the LM head, each over that slice of the table."""
         check_model(model)
         if not 1 <= batch <= self.max_batch:
             raise ValueError(
@@ -515,8 +537,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.x_width = max(self.hidden, self.inter // DOWN_SPLITS, self.heads_per_split * HEAD_DIM)
         if self.moe_batched:  # an expert down row's input is one expert's activation slot
             self.x_width = max(self.x_width, self.expert_inter)
-        if schedule not in ("static", "atomic"):
-            raise ValueError(f"schedule must be 'static' or 'atomic', got {schedule!r}")
+        if schedule not in ("static", "atomic", "sm"):
+            raise ValueError(f"schedule must be 'static', 'atomic' or 'sm', got {schedule!r}")
         # The GEMV (ROWS_PER_WARP rows per warp), prologue (token_warps per token) and attention
         # (8 positions per warp per block) tilings fix the compute role's size.
         compute = (roles or {}).get("compute")
@@ -538,6 +560,9 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if not 2 <= stages <= fit:
             raise ValueError(f"stages must be in [2, {fit}] for this model, got {stages}")
         self.stages = stages
+        self.keyed_by_sm = schedule == "sm"
+        if schedule == "sm" and 2 * (self.fixed_smem_bytes() + stages * STAGE_BYTES) <= SMEM_BYTES:
+            raise ValueError("the 'sm' schedule needs one CTA per SM: use more stages")
         self.scratch_layout = ScratchLayout(model, splits, batch, self.streams_inputs)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
@@ -556,8 +581,23 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.engine = CudaCoreGemv()
         self.work = WorkStream(
             mapping=InstructionTable(),
-            schedule=StaticPersistent() if schedule == "static" else AtomicPersistent(stages=1),
+            schedule={
+                "static": StaticPersistent(),
+                "atomic": AtomicPersistent(stages=1),
+                "sm": SmPersistent(),
+            }[schedule],
         )
+
+    @property
+    def launches(self) -> int:
+        """Launches per step: one per layer, then the LM head."""
+        return self.layers + 1
+
+    @property
+    def state_words(self) -> int:
+        """Number of int32 state words: one epoch, one completion counter per launch, and,
+        for the SM-keyed schedule, one arrival counter per launch."""
+        return 1 + self.launches * (2 if self.keyed_by_sm else 1)
 
     def weight_consumers(self):
         """The weight ring's consumer mechanism (the engine may add an MMA warp)."""
@@ -839,6 +879,14 @@ class QwenDecodeMegakernel(WarpSpecialized):
         tid, warp, lane = me.tid, me.warp, me.lane
         ctas = cute.arch.grid_dim()[0]
         epoch = p.state[0] + 1
+        # SM-keyed slots require an exit wait until all CTAs of this launch have arrived;
+        # otherwise another CTA of this launch could reuse the same SM slot.
+        # State word 1 + launches + l counts launch l's arrivals.
+        keyed = self.keyed_by_sm
+        arrived = p.state.iterator + 1 + self.launches + p.launch
+        if cutlass.const_expr(keyed):
+            if tid == 0:
+                cute.arch.atomic_add(arrived, Int32(1), sem="relaxed", scope="gpu")
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
@@ -891,14 +939,25 @@ class QwenDecodeMegakernel(WarpSpecialized):
                     groups = COMPUTE_THREADS // self.rows
                     self.reduce_residual(p, op, layer, col, tid // self.rows, groups, epoch, row)
             work.advance()
-        # Every CTA has read the epoch by the time it finishes; the last one advances it.
+        # Every CTA has read the epoch by the time it finishes. Launches overlap, so each counts
+        # its own CTAs; the last CTA of the step's last launch advances the epoch.
         if tid == 0:
+            if cutlass.const_expr(keyed):
+                seen = Int32(0)
+                while seen < ctas:
+                    seen = cute.arch.load(arrived, Int32, sem="relaxed", scope="gpu")
             finished = cute.arch.atomic_add(
-                p.state.iterator + 1, Int32(1), sem="acq_rel", scope="gpu"
+                p.state.iterator + 1 + p.launch, Int32(1), sem="acq_rel", scope="gpu"
             )
             if finished == ctas - 1:
-                p.state[1] = Int32(0)
-                p.state[0] = epoch
+                # The counters are the only untagged state shared across launches. The last CTA
+                # resets them for the next step's launch of this layer, which starts a whole step
+                # later; gpu-scope atomics keep the reset ordered with that launch's counting.
+                cute.arch.atomic_exch(p.state.iterator + 1 + p.launch, Int32(0), scope="gpu")
+                if cutlass.const_expr(keyed):
+                    cute.arch.atomic_exch(arrived, Int32(0), scope="gpu")
+                if p.launch == self.launches - 1:
+                    p.state[0] = epoch
         return chans, work
 
     # ------------------------------------------------------------ compute helpers
@@ -1763,7 +1822,13 @@ class QwenDecodeMegakernel(WarpSpecialized):
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(self, tma, gtensors, scratch, tensors, bound, engine_args):
+    def kernel(self, tma, gtensors, scratch, tensors, bound, engine_args, launch):
+        # Only the step's first launch waits, for the epoch the previous step's last launch
+        # wrote. Every launch triggers its dependent at the start; later launches poll tagged
+        # activations instead of waiting for their predecessors to complete.
+        if launch == 0:
+            cute.arch.griddepcontrol_wait()
+        cute.arch.griddepcontrol_launch_dependents()
         x_stride = self.x_stride
         layouts = {
             "W": self.weight_stage_layout(),
@@ -1801,6 +1866,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             exp=self.buffer("EXP") if self.moe_batched else self.buffer("ROUTE"),
             **tagged_views(scratch, self.scratch_layout),
             **tensors,
+            launch=launch,
         )
         self.run_roles(self.make_params(fields, engine_args), trace_buffer=trace_buffer)
 
@@ -1850,6 +1916,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         table: cute.Tensor,
         workspace: cute.Tensor,
         max_ctas: Int32,
+        launch: Int32,
         stream: cuda.CUstream,
     ):
         weights = (wqkv, wo, wgu, wd, lm_head, router)
@@ -1874,8 +1941,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
             xshared,
         )
         self.kernel.set_name_prefix(self.get_name())
-        self.kernel(tma, gtensors, scratch, tensors, bound, engine_args).launch(
-            **self.launch_config(bound), stream=stream, cooperative=True
+        self.kernel(tma, gtensors, scratch, tensors, bound, engine_args, launch).launch(
+            **self.launch_config(bound), stream=stream, use_pdl=True
         )
 
 
@@ -1946,7 +2013,7 @@ def compile_megakernel(op: QwenDecodeMegakernel):
         make_fake_compact_tensor(bf16, (cache_rows, HEAD_DIM)),
         make_fake_compact_tensor(Int64, (op.scratch_layout.size,)),
         make_fake_compact_tensor(Float32, (op.batch, vocab)),
-        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
+        make_fake_compact_tensor(Int32, (op.state_words,), assumed_align=4),
         make_fake_compact_tensor(Int32, (op.batch, 2), assumed_align=4),
         make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer; globaltimer only
         make_fake_compact_tensor(bf16, (layers, hidden)),
@@ -1960,6 +2027,7 @@ def compile_megakernel(op: QwenDecodeMegakernel):
         make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),
         make_fake_compact_tensor(Int32, (cute.sym_int(),)),
         Int32(1),
+        Int32(0),
         name=op.get_name(),
     )
 

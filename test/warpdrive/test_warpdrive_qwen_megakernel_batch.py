@@ -131,7 +131,7 @@ def test_batch_steps_atomic_schedule(stream_inputs):
             ours_k[b][:, :, pos] = theirs_k[b][:, :, pos]
             ours_v[b][:, :, pos] = theirs_v[b][:, :, pos]
         tokens = logits.argmax(-1)
-    assert runner.state.tolist() == [3, 0]
+    assert runner.state[0].item() == 3 and not runner.state[1:].any()
 
 
 @pytest.mark.xdist_group("qwen-large-checkpoints")
