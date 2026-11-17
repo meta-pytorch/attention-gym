@@ -50,9 +50,10 @@ pytestmark = [
 CU_SEQLENS = (0, 40, 232, 384)
 HEADS, HEAD_DIM = 2, 128
 # The unsharded op and its context-parallel binding, per backend (the default runs warpdrive on
-# SM100-family GPUs).
-FUSED = {"backend": "fused"}
-WARPDRIVE = {"backend": "warpdrive"}
+# SM100-family GPUs). Configs are pinned: the bitwise checks compare calls of different lengths,
+# whose tuning keys differ, so timing noise could pick different winners and change bits.
+FUSED = {"backend": "fused", "autotune": False}
+WARPDRIVE = {"backend": "warpdrive", "autotune": False}
 OPS = {
     f"{name}{suffix}": (
         partial(chunk, kernel_options=options),
