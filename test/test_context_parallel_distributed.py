@@ -49,15 +49,18 @@ pytestmark = [
 
 CU_SEQLENS = (0, 40, 232, 384)
 HEADS, HEAD_DIM = 2, 128
-# The unsharded op and its context-parallel binding.
-WARPDRIVE = {"backend": "warpdrive"}
+# The unsharded op and its context-parallel binding. Configs are pinned: the bitwise checks compare
+# calls of different lengths, whose tuning keys differ, so timing noise could pick different winners
+# and change bits.
+PINNED = {"autotune": False}
+WARPDRIVE = {"backend": "warpdrive", "autotune": False}
 OPS = {
-    "kda": (chunk_kda, context_parallel_kda),
-    "gdn": (chunk_gdn, context_parallel_gdn),
-    "gdn-warpdrive": (
-        partial(chunk_gdn, kernel_options=WARPDRIVE),
-        partial(context_parallel_gdn, kernel_options=WARPDRIVE),
-    ),
+    name: (partial(chunk, kernel_options=options), partial(cp, kernel_options=options))
+    for name, chunk, cp, options in (
+        ("kda", chunk_kda, context_parallel_kda, PINNED),
+        ("gdn", chunk_gdn, context_parallel_gdn, PINNED),
+        ("gdn-warpdrive", chunk_gdn, context_parallel_gdn, WARPDRIVE),
+    )
 }
 requires_warpdrive = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -528,8 +531,8 @@ def test_one_captured_graph_replays_across_document_layouts(op_name, fragmented)
     _spawn(_replay_main, (op_name, fragmented))
 
 
-# The recipe saves the links for every backend; the kernel_options below would drop a bound one.
-@pytest.mark.parametrize("op_name", ["kda", "gdn"])
+# The recipe saves the links for every backend.
+@op_param
 def test_backward_detects_fold_link_mutation(op_name):
     with _process_group(0, 1, _free_port()) as device:
         plan = ContextParallelPlan.from_fragments((0, 192), [[(0, 64), (64, 128), (128, 192)]], 0)
@@ -541,7 +544,6 @@ def test_backward_detects_fold_link_mutation(op_name):
             *inputs,
             routing=routing,
             group=dist.group.WORLD,
-            kernel_options={"autotune": False},
         )
         routing.successor_links.add_(0)
         with pytest.raises(RuntimeError, match="modified by an inplace operation"):
