@@ -275,34 +275,28 @@ deterministic mode between a compiled forward and its backward.
 
 ## Paged sparse decode
 
-`paged_sparse_decode` is the serving-side counterpart: decode queries attend to indexer-selected
-entries of a paged KV cache plus an optional causal window, in one softmax with an optional
-attention sink. Indices stay **logical** (positions within each request, `-1` padded); the
-kernel translates them through the block table itself, so no expanded token list or physical
-slot list is built per step.
+`paged_sparse_decode` runs decode attention directly on paged KV caches. Its fused kernel
+translates sequence-local block ids into physical pages and slots, without allocating an
+expanded entry list or physical-address list per step. See the
+[API reference below](#attn_gym.sparse.paged_decode.paged_sparse_decode) for the full key-set,
+query-position, shared/separate window, and attention-sink contracts.
 
 ```python
 from attn_gym.sparse import PagedKV, paged_sparse_decode
 
 kv = PagedKV(key_cache, value_cache, block_table)
-# key_cache/value_cache: [num_pages, page_size, kv_heads, head_dim]; block_table: int32
+# K/V feature widths may differ; block_table maps logical pages to physical page ids.
 out = paged_sparse_decode(
     query,              # [tokens, heads, head_dim]
     kv,
     indices,            # int32 [tokens, topk] logical block ids
     cu_seqlens_q,       # int32 [num_sequences + 1]
-    seqused_k,          # int32 [num_sequences], keys including the current queries
+    seqused_k,          # int32 [num_sequences], key counts within the window source
     max_seqlen_q=1,
-    topk_length=topk_length,  # optional int32 [tokens]: valid prefix of each row
+    topk_length=topk_length,  # optional int32 [tokens]: prefix lengths to read
     index_block_size=4,
 )
 ```
-
-Each index selects `index_block_size` consecutive entries. The window holds the last
-`window_size` positions of `window_kv` (a separate cache) or, by default, of `kv` itself. With
-a shared source the window start rounds down to a block boundary and selections inside the
-window are skipped, so each key is attended once and the incomplete block holding the query
-(which an indexer over complete blocks cannot select) is always included.
 
 | Model | Mapping |
 |---|---|
@@ -312,29 +306,30 @@ window are skipped, so each key is attended once and the incomplete block holdin
 
 ### Implementations
 
-- `impl="reference"` builds each row's key set explicitly on CPU or CUDA; it is the
-  correctness oracle and supports every shape.
-- `impl="fused"` (default) runs a Triton split-K kernel and an LSE merge on CUDA, under
-  `torch.compile(fullgraph=True, dynamic=True)` and CUDA graph capture. Batch, sequence count,
-  split count, sparse capacity, and page-table extents are runtime values. For up to 3
-  (row, KV head) pairs, tile widths are
-  bucketed to 16/32/64 keys as the sparse budget grows, targeting 128 tiles. Larger grids use
-  64-key tiles split by a wave-occupancy model of the GPU's SMs (32 keys for wider head
-  dimensions). For fixed head dimensions and sparse budget, changing batches compile at most
-  three tile configurations: small grids use four or eight warps. Larger grids use two warps
-  for QSA, and eight for wide heads or large head groups to avoid register spills.
-  Small grids over a shared cache use one tile per split for budgets of at most 256 tiles,
-  including the incomplete final block. Larger budgets keep a loop. Splits store unnormalized
-  accumulators and softmax statistics so normalization happens once in the merge. It needs
-  fp16/bf16 inputs, power-of-two head dims of at least 16, and at most 16K elements of
-  `group x head_dim` per KV head (for example 16 x 256 or 32 x 512). Quantized caches (FP8/FP4
-  DeepSeek formats) are not supported yet; DeepSeek V3.2's 576-wide latent needs the reference
-  path.
+- `impl="reference"` materializes each row's key sets on CPU or CUDA as a correctness oracle.
+  It accepts head dimensions outside the fused kernel's restrictions below.
+- `impl="fused"` (default) runs a Triton producer and, when splitting, a merge kernel on CUDA.
+  It supports `torch.compile(fullgraph=True, dynamic=True)` and CUDA graph capture. Batch,
+  sequence count, split count, sparse capacity, and block-table widths are runtime values.
+  Tile width and warp count depend on the number of (row, KV head) pairs, head dimensions,
+  and sparse budget. With fixed head dimensions and sparse budget, varying batch size uses
+  at most three producer tile configurations. In `attn_gym/sparse/paged_decode/impl/triton.py`,
+  `_tile_config` documents the measured tile heuristics and `_choose_splits` and the launcher
+  document split selection.
+
+  Each split stores an unnormalized weighted-value sum, exponential sum, and maximum. The
+  merge rescales these to a common maximum and normalizes once; a single split writes the
+  result directly. The kernel needs FP16/BF16 inputs, power-of-two head dimensions of at
+  least 16, and at most 16K elements in `padded_group * max(head_dim, head_dim_v)` per KV head.
+  Here `padded_group` is the number of query heads per KV head, rounded up to a power of two
+  of at least 16 (for example 64 x 256 or 32 x 512). Quantized caches (FP8/FP4 DeepSeek
+  formats) are not supported yet; DeepSeek V3.2's 576-wide latent needs the reference path.
 
 The fused backend accepts caches with a contiguous feature dimension and arbitrary outer strides,
-including layouts whose relative offsets require int64 addressing. Sparse capacities within the
-same tile bucket reuse the producer kernel; the merge specializes on a power-of-two split bucket.
-Out-of-range positive block ids are ignored before block-to-token multiplication.
+including layouts whose relative offsets require int64 addressing. With other compile-time
+choices fixed, sparse capacities within the same tile and offset-width classes reuse the producer
+kernel; the merge specializes on a power-of-two split bucket. Oversized positive block ids are
+masked out before block-to-entry multiplication can overflow.
 
 On B200 with Qwen3.8-Flash-Next QSA shapes (24/2 heads per rank at TP1, 6/1 at TP4, BF16,
 head dim 256, four-token index blocks, page 64, context 32,771), cold-cache batch-1 timings are:
@@ -352,14 +347,14 @@ perform within 2% of each other; this is about 63% of advertised B200 bandwidth 
 separately measured 6.95 TB/s streaming-read ceiling. Timings depend on the cache state and
 whether the context ends on a complete index block.
 
-The benchmark supports `--cold` to evict K/V from L2 before each call while keeping routing
-metadata warm, and `--json <path>` to save results. Cold timings use GPU timestamps from the
-first attention kernel's start to the last kernel's end, including the split/merge dependency
-gap. Warm timings use repeated calls within a CUDA graph. Both alternate implementations.
-The vLLM comparison excludes its index-expansion kernel.
+The benchmark supports `--cold` to evict K/V from L2 before each call, then warm Q and routing
+metadata, and `--json <path>` to save results. Cold timings use GPU timestamps from the first
+attention kernel's start to the last kernel's end, including split/merge dependencies even when
+kernel lifetimes overlap. Warm timings use repeated calls within a CUDA graph. Both alternate
+implementations to reduce ordering bias.
 
 `SOL us` is a bandwidth-only speed-of-light estimate: logical K/V bytes per query and KV head,
-plus Q/O and selected indices, divided by peak HBM bandwidth (8 TB/s by default on B200;
+plus Q/O and selected block ids, divided by peak HBM bandwidth (8 TB/s by default on B200;
 override with `--peak-bandwidth-tbps`). It excludes launch latency, intermediate buffers,
 and repeated metadata traffic. `--measured-bandwidth-tbps` adds a ceiling based on a separately
 measured streaming read. Warm-cache results and reuse across multiple queries can exceed an

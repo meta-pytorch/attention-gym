@@ -1,4 +1,4 @@
-"""Paged sparse decode over selected cache entries and an optional causal window."""
+"""Decode attention over logical selections in paged KV caches and a causal window."""
 
 from attn_gym.types import AuxRequest, Impl
 

@@ -8,22 +8,23 @@ from torch import Tensor
 
 from attn_gym.types import AuxRequest, Impl, resolve_impl
 
-from . import ops  # noqa: F401  # registers the attn_gym::paged_sparse_decode ops
 from .impl import reference
+from .ops import decode_op, decode_with_lse_op
 
 
 @dataclass(frozen=True, slots=True)
 class PagedKV:
-    """A paged key/value source addressed by logical position through a block table.
+    """Key/value cache whose sequence-local entries map to physical pages and slots.
 
     Attributes:
         key_cache: Keys ``[num_pages, page_size, kv_heads, head_dim]``.
         value_cache: Values ``[num_pages, page_size, kv_heads, head_dim_v]``. Latent (MLA)
             caches whose values are a prefix of each key pass a view such as
             ``key_cache[..., :head_dim_v]``; nothing is copied.
-        block_table: int32 ``[num_sequences, max_pages]``; row ``s`` lists sequence ``s``'s
-            pages, so logical entry ``e`` lives at page ``block_table[s, e // page_size]``,
-            slot ``e % page_size``.
+        block_table: int32 ``[num_sequences, max_pages]`` physical page ids. Logical entry
+            ``e`` of sequence ``s`` lives at page ``block_table[s, e // page_size]``,
+            slot ``e % page_size``. These page ids are distinct from the block ids in
+            ``paged_sparse_decode``'s ``indices``.
     """
 
     key_cache: Tensor
@@ -33,7 +34,7 @@ class PagedKV:
 
 @dataclass(frozen=True, slots=True)
 class PagedSparseDecodeAux:
-    """Auxiliary outputs returned by paged_sparse_decode when requested.
+    """Optional softmax statistics from :func:`paged_sparse_decode`.
 
     Attributes:
         lse: Natural-log log-sum-exp of the scaled logits, including the attention sink,
@@ -43,8 +44,25 @@ class PagedSparseDecodeAux:
     lse: Tensor | None = None
 
 
+def _tensors(kv: PagedKV | None) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
+    return (None,) * 3 if kv is None else (kv.key_cache, kv.value_cache, kv.block_table)
+
+
+def _check_operand(name: str, tensor: Tensor, device: torch.device, field: str = "") -> None:
+    # Validation runs on every decode call, so callers read query.device once and the full
+    # name is formatted only on failure.
+    if tensor.device != device:
+        raise ValueError(
+            f"{name}{field} must be on the same device as query, got {tensor.device} and {device}."
+        )
+    # A last dimension of size 0 or 1 is never strided over, so its stride is irrelevant.
+    if tensor.stride(-1) != 1 and tensor.shape[-1] > 1:
+        raise ValueError(f"{name}{field} must have a contiguous last dimension.")
+    if tensor.requires_grad:
+        raise ValueError(f"{name}{field} requires grad, but paged_sparse_decode is forward-only.")
+
+
 def _validate_source(name: str, kv: PagedKV, query: Tensor, num_sequences: int) -> None:
-    """Check one paged source's tensor metadata against the query."""
     key_cache, value_cache, block_table = kv.key_cache, kv.value_cache, kv.block_table
     if key_cache.ndim != 4 or value_cache.ndim != 4:
         raise ValueError(
@@ -76,27 +94,15 @@ def _validate_source(name: str, kv: PagedKV, query: Tensor, num_sequences: int) 
         )
     if block_table.dtype != torch.int32:
         raise TypeError(f"{name}.block_table must be int32, got {block_table.dtype}.")
-    for field, tensor in (
-        ("key_cache", key_cache),
-        ("value_cache", value_cache),
-        ("block_table", block_table),
-    ):
-        if field != "block_table" and tensor.dtype != query.dtype:
+    device = query.device
+    for field, tensor in ((".key_cache", key_cache), (".value_cache", value_cache)):
+        if tensor.dtype != query.dtype:
             raise ValueError(
-                f"{name}.{field} must have the same dtype as query, got {tensor.dtype} and "
+                f"{name}{field} must have the same dtype as query, got {tensor.dtype} and "
                 f"{query.dtype}."
             )
-        if tensor.device != query.device:
-            raise ValueError(
-                f"{name}.{field} must be on the same device as query, got {tensor.device} and "
-                f"{query.device}."
-            )
-        if tensor.stride(-1) != 1:
-            raise ValueError(f"{name}.{field} must have a contiguous last dimension.")
-        if tensor.requires_grad:
-            raise ValueError(
-                f"{name}.{field} requires grad, but paged_sparse_decode is forward-only."
-            )
+        _check_operand(name, tensor, device, field)
+    _check_operand(name, block_table, device, ".block_table")
 
 
 def _validate_inputs(
@@ -112,7 +118,7 @@ def _validate_inputs(
     index_block_size: int,
     window_size: int,
 ) -> None:
-    """Validate tensor metadata without reading values."""
+    """Validate metadata only: reading tensor contents would synchronize CUDA execution."""
     if type(max_seqlen_q) is not int or max_seqlen_q < 1:
         raise ValueError(f"max_seqlen_q must be a positive Python int, got {max_seqlen_q!r}.")
     if type(index_block_size) is not int or index_block_size < 1:
@@ -127,10 +133,8 @@ def _validate_inputs(
         )
     if not query.is_floating_point():
         raise TypeError(f"query must have a floating-point dtype, got {query.dtype}.")
-    if query.stride(-1) != 1:
-        raise ValueError("query must have a contiguous last dimension.")
-    if query.requires_grad:
-        raise ValueError("query requires grad, but paged_sparse_decode is forward-only.")
+    device = query.device
+    _check_operand("query", query, device)
 
     if seqused_k.ndim != 1:
         raise ValueError(
@@ -165,15 +169,7 @@ def _validate_inputs(
     for name, tensor in metadata:
         if tensor.dtype != torch.int32:
             raise TypeError(f"{name} must be int32, got {tensor.dtype}.")
-        if tensor.device != query.device:
-            raise ValueError(
-                f"{name} must be on the same device as query, got {tensor.device} and "
-                f"{query.device}."
-            )
-        if name != "indices" and not tensor.is_contiguous():
-            raise ValueError(f"{name} must be contiguous.")
-    if indices.shape[1] > 0 and indices.stride(1) != 1:
-        raise ValueError("indices must have a contiguous last dimension.")
+        _check_operand(name, tensor, device)
 
     if attention_sink is not None:
         if attention_sink.shape != (query.shape[1],):
@@ -185,14 +181,7 @@ def _validate_inputs(
             raise TypeError(
                 f"attention_sink must use the query dtype or float32, got {attention_sink.dtype}."
             )
-        if attention_sink.device != query.device:
-            raise ValueError("attention_sink must be on the same device as query.")
-        if attention_sink.requires_grad:
-            raise ValueError(
-                "attention_sink requires grad, but paged_sparse_decode is forward-only."
-            )
-        if not attention_sink.is_contiguous():
-            raise ValueError("attention_sink must be contiguous.")
+        _check_operand("attention_sink", attention_sink, device)
 
 
 @overload
@@ -254,53 +243,52 @@ def paged_sparse_decode(
 ) -> Tensor | tuple[Tensor, PagedSparseDecodeAux]:
     """Attend decode queries to selected entries of a paged cache plus a causal window.
 
-    Each query row attends, in one softmax, to the union of two key sets:
+    Each query row attends to two key sets in one softmax:
 
-    - **Sparse set:** each entry of ``indices[t, :topk_length[t]]`` is a logical block id
-      ``b`` that selects the ``index_block_size`` consecutive entries
-      ``b * index_block_size, ...`` of ``kv``. ``-1`` (any negative value) is padding.
-      Repeated selections keep their multiplicity.
-    - **Window set:** the positions ``window_start .. p`` of the window source, where ``p`` is
-      the query's position and ``window_start = max(p + 1 - window_size, 0)``.
+    - **Sparse set:** each block id ``b`` in ``indices[t, :topk_length[t]]`` selects the
+      ``index_block_size`` consecutive logical entries starting at ``b * index_block_size``
+      in ``kv``. Negative block ids are padding. Repeated selections retain their multiplicity.
+    - **Window set:** positions ``window_start`` through ``p`` (inclusive) of the window
+      source, where ``p`` is the query position and
+      ``window_start = max(p + 1 - window_size, 0)`` before shared-source alignment.
 
-    The window source is ``window_kv`` when given (for example a separate sliding-window cache
-    next to a compressed sparse cache), otherwise ``kv`` itself. With a shared source the
-    window start is rounded down to a multiple of ``index_block_size`` and selected entries
-    at or after it are skipped, so every key is attended once and the incomplete block holding
-    the query, which an indexer over complete blocks cannot select, is always included.
+    The window source is ``window_kv`` when supplied, otherwise ``kv``:
 
-    The queries of each sequence are its last tokens: query ``i`` of a sequence with ``n``
-    queries and ``k`` keys sits at position ``k - n + i``. Rows past ``cu_seqlens_q[-1]``
-    produce undefined output. A row with no keys returns zeros.
+    - **Shared source:** round ``window_start`` down to a multiple of ``index_block_size``
+      and discard sparse entries at or after that boundary. This removes sparse/window
+      overlap, not duplicate sparse selections. The window includes the causal part of the
+      query's incomplete block even when ``window_size=0``; an indexer selecting only complete
+      blocks cannot supply that part.
+    - **Separate sources:** do not align the window start or filter sparse entries by query
+      position. The caller (usually the indexer) is responsible for sparse causality.
+      Sparse and window entries contribute separately, even if the sources alias.
 
-    Model mappings:
-
-    - Qwen QSA: ``index_block_size=4`` with the indexer's compressed-block ids,
-      ``window_size=0``, separate ``key_cache`` / ``value_cache``, grouped KV heads.
-    - DeepSeek V3.2 DSA: ``index_block_size=1`` token ids into the latent cache, values as
-      ``key_cache[..., :512]``.
-    - DeepSeek V4 / V4.1: compressed-entry ids into ``kv``, the raw sliding-window cache as
-      ``window_kv`` with ``window_size=128``, plus ``attention_sink``.
+    A sequence's queries are its last tokens: query ``i`` (zero-based) of a sequence with
+    ``n`` queries and ``k = seqused_k[s]`` keys has position ``p = k - n + i`` in the window
+    source. Negative positions have no keys, including sparse keys. Rows at or beyond
+    ``cu_seqlens_q[-1]`` produce undefined output. A row with no keys returns zeros; its LSE
+    is the sink logit if supplied, otherwise ``-inf``.
 
     Forward-only: inputs must not require grad, and the output carries no autograd history.
 
     Args:
-        query: Queries ``[tokens, heads, head_dim]``.
+        query: Queries ``[tokens, heads, head_dim]``. Each KV head serves a consecutive group
+            of ``heads // kv_heads`` query heads; ``heads`` must be divisible by ``kv_heads``.
         kv: Paged source that ``indices`` address. See :class:`PagedKV`.
-        indices: int32 ``[tokens, topk]`` logical block ids with a contiguous last dimension.
-            With a separate ``window_kv`` they are not bounded by the query position: causality
-            of the sparse set is the caller's (indexer's) contract.
+        indices: int32 ``[tokens, topk]`` sequence-local block ids with a contiguous last
+            dimension.
         cu_seqlens_q: Contiguous int32 ``[num_sequences + 1]`` packed query offsets.
-        seqused_k: Contiguous int32 ``[num_sequences]`` key count per sequence in the window
-            source, including the current queries; it fixes each query's position.
+        seqused_k: Contiguous int32 ``[num_sequences]`` key count per sequence within the
+            window source, including the current queries; it determines their positions.
         max_seqlen_q: Host-side upper bound on any sequence's query count, such as
             ``1 + num_speculative_tokens``. Queries past it produce undefined output.
-        topk_length: Optional contiguous int32 ``[tokens]``; only the first
-            ``topk_length[t]`` indices of row ``t`` are read, which lets the kernel skip the
-            padding of short rows. Defaults to all ``topk`` columns.
-        index_block_size: Consecutive entries selected by one index.
-        window_size: Number of trailing positions in the window set; 0 disables it, except
-            for the incomplete block of a shared source described above.
+        topk_length: Optional contiguous int32 ``[tokens]`` prefix lengths, clamped to
+            ``[0, topk]``. Only this prefix of each row is read, so short rows can skip trailing
+            padding. Defaults to all ``topk`` columns.
+        index_block_size: Number of consecutive logical entries selected by one block id.
+        window_size: Requested number of trailing positions in the window set, before
+            shared-source alignment. Zero disables the window except for the incomplete block
+            of a shared source described above.
         window_kv: Optional separate paged source for the window set, with the same KV heads
             and head dims as ``kv``.
         attention_sink: Optional per-head logit ``[heads]`` (query dtype or float32) that adds
@@ -335,41 +323,43 @@ def paged_sparse_decode(
     if not scale > 0:
         raise ValueError(f"scale must be greater than 0, got {scale}.")
 
-    window = (
-        (None, None, None)
-        if window_kv is None
-        else (
-            window_kv.key_cache,
-            window_kv.value_cache,
-            window_kv.block_table,
-        )
-    )
-    args = (
-        query,
-        kv.key_cache,
-        kv.value_cache,
-        kv.block_table,
-        indices,
-        cu_seqlens_q,
-        seqused_k,
-        topk_length,
-        *window,
-        attention_sink,
-    )
     return_lse = return_aux is not None and return_aux.lse
     with torch.no_grad():
         if selected_impl is Impl.REFERENCE:
             out, lse = reference.paged_sparse_decode(
-                *args, index_block_size=index_block_size, window_size=window_size, scale=scale
+                query,
+                kv,
+                indices,
+                cu_seqlens_q,
+                seqused_k,
+                topk_length,
+                window_kv,
+                attention_sink,
+                index_block_size=index_block_size,
+                window_size=window_size,
+                scale=scale,
             )
         else:
             if not query.is_cuda:
                 raise ValueError("The fused paged_sparse_decode requires CUDA tensors.")
-            options = (max_seqlen_q, index_block_size, window_size, scale)
+            args = (
+                query,
+                *_tensors(kv),
+                indices,
+                cu_seqlens_q,
+                seqused_k,
+                topk_length,
+                *_tensors(window_kv),
+                attention_sink,
+                max_seqlen_q,
+                index_block_size,
+                window_size,
+                scale,
+            )
             if return_lse:
-                out, lse = torch.ops.attn_gym.paged_sparse_decode_with_lse.default(*args, *options)
+                out, lse = decode_with_lse_op(*args)
             else:
-                out, lse = torch.ops.attn_gym.paged_sparse_decode.default(*args, *options), None
+                out, lse = decode_op(*args), None
 
     if return_aux is None:
         return out
