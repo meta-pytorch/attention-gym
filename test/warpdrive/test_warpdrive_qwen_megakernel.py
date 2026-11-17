@@ -27,7 +27,7 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     rope,
 )
 from attn_gym.warpdrive.profiler import Range
-from attn_gym.warpdrive.trace_session import work_item_ranges
+from attn_gym.warpdrive.trace_session import _roles, work_item_ranges
 
 MAX_LEN = 256
 
@@ -114,7 +114,7 @@ def test_single_instruction(weights, op, engine):
     runner.step_info.copy_(torch.tensor([token, pos], dtype=torch.int32))
     runner.launch(*caches)
     torch.cuda.synchronize()
-    assert runner.state.tolist() == [1, 0], "the last CTA advances the epoch"
+    assert runner.state[0].item() == 1 and not runner.state[1:].any(), "one epoch per step"
 
     w, eps = weights, 1e-6
     for layer in range(config.num_layers):
@@ -267,7 +267,93 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
         for cache, source in zip((*ours, *theirs), (*oracle, *oracle)):
             cache[:, :, pos + step] = source[:, :, pos + step].bfloat16()  # same inputs next step
     assert sum(errors) <= 2 * sum(ref_errors), (errors, ref_errors)
-    assert runner.state.tolist() == [6, 0]  # one epoch per launch
+    assert runner.state[0].item() == 6 and not runner.state[1:].any()  # one epoch per step
+
+
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+@pytest.mark.parametrize("schedule, locality", [("atomic", False), ("sm", False), ("sm", True)])
+def test_schedules_and_placement_match_the_static_schedule(schedule, locality, engine):
+    """Atomic and SM-keyed schedules, with optional memory-side placement, match the default
+    static schedule bit for bit, logits and new K/V rows, across repeated steps. The epoch
+    advances once per step."""
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("the megakernel requires an SM100-family GPU")
+    if locality:
+        from attn_gym.warpdrive.examples.qwen_megakernel.locality import sm_sides
+
+        try:
+            sm_sides(torch.cuda.current_device())
+        except RuntimeError as error:
+            if "locality domains" not in str(error):
+                raise
+            pytest.skip(f"needs two memory locality domains: {error}")
+    config = QwenConfig(
+        hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
+        intermediate_size=3072, vocab_size=4096,
+    )  # fmt: skip
+    weights = random_weights(config)
+    caches, token, pos = make_decode_state(weights, 130, MAX_LEN, seed=5)
+    ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
+    runner = mk.QwenMegakernel(
+        weights, MAX_LEN, engine=engine, schedule=schedule, locality=locality
+    )
+    reference = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    assert len(runner.tables) == config.num_layers + 1  # a launch per layer, then the LM head
+    for step in range(3):
+        logits = runner(weights, token, pos + step, *ours)
+        expected = reference(weights, token, pos + step, *theirs)
+        assert torch.equal(logits, expected)
+        token = expected.argmax()
+    for mine, other in zip(ours, theirs):
+        assert torch.equal(mine[:, :, : pos + 3], other[:, :, : pos + 3])
+    assert runner.state[0].item() == 3 and not runner.state[1:].any()
+
+
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_cuda_graph_of_steps_matches_eager(engine):
+    """A CUDA graph of several steps (as ``chat.py`` captures: position and token advanced on the
+    device) replays to the same tokens, logits, K/V rows and step state as eager steps."""
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("the megakernel requires an SM100-family GPU")
+    config = QwenConfig(
+        hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
+        intermediate_size=3072, vocab_size=4096,
+    )  # fmt: skip
+    weights = random_weights(config)
+    caches, token, pos = make_decode_state(weights, 120, MAX_LEN, seed=7)
+    steps, replays = 4, 2
+
+    def decode(runner, caches, out):
+        for i in range(steps):
+            runner.step_info[1].add_(1)
+            runner.launch(*caches)
+            runner.step_info[0].copy_(runner.logits.argmax())
+            out[i].copy_(runner.step_info[0])
+
+    def start(runner):
+        runner.step_info[0] = token
+        runner.step_info[1] = pos - 1
+
+    eager = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    graphed = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
+    graphed(weights, token, pos, *[c.clone() for c in caches])  # compile and warm
+    out = torch.zeros(steps, device="cuda", dtype=torch.long)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        decode(graphed, ours, out)
+    start(graphed)
+    start(eager)
+    expected = torch.zeros_like(out)
+    for _ in range(replays):
+        graph.replay()
+        decode(eager, theirs, expected)
+        assert torch.equal(out, expected)
+        assert torch.equal(graphed.logits, eager.logits)
+    end = pos + steps * replays
+    for mine, other in zip(ours, theirs):
+        assert torch.equal(mine[:, :, :end], other[:, :, :end])
+    assert graphed.state[0].item() == 1 + steps * replays and not graphed.state[1:].any()
 
 
 @pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
@@ -338,26 +424,41 @@ def test_moved_roles_match_defaults(weights_0_6b, engine):
         assert torch.equal(mine[:, :, : pos + 1], other[:, :, : pos + 1])
 
 
-def test_globaltimer_trace(weights_0_6b, tmp_path):
-    """Tracing preserves logits and records every table row's load and compute ranges.
+@pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
+def test_globaltimer_trace(weights_0_6b, tmp_path, engine):
+    """Tracing preserves logits and records every table row's load and compute ranges, across
+    all of a step's launches.
 
-    Ranges carry row IDs, each phase has a span, and the trace links rows across CTAs.
+    Every role's work items carry distinct table rows, each row's CTA is the one the schedule
+    gave it, each phase has a span, and the trace links rows across CTAs.
     """
     caches, token, pos = make_decode_state(weights_0_6b, 100, MAX_LEN, seed=0)
     ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
-    runner = mk.QwenMegakernel(weights_0_6b, MAX_LEN, trace="globaltimer")
+    runner = mk.QwenMegakernel(weights_0_6b, MAX_LEN, trace="globaltimer", engine=engine)
     with mk_trace.trace_session(runner, trace_path=str(tmp_path / "step.pftrace")) as session:
         logits = runner(weights_0_6b, token, pos, *ours)
-    expected = mk.QwenMegakernel(weights_0_6b, MAX_LEN)(weights_0_6b, token, pos, *theirs)
-    assert torch.equal(logits, expected)
-    rows = [r for r, words in enumerate(runner.table.tolist()) if words[0] >= 0]
+    reference = mk.QwenMegakernel(weights_0_6b, MAX_LEN, engine=engine)
+    assert torch.equal(logits, reference(weights_0_6b, token, pos, *theirs))
+    table = runner.table.tolist()
+    rows = [r for r, words in enumerate(table) if words[0] >= 0]
     for role in ("compute", "load"):
         ranges = [e for e in session.ranges if e.name == role]
         assert sorted(e.payload for e in ranges) == rows
+    for role in _roles(runner.op):  # e.g. tcgen05's mma and xload: one item per row at most
+        payloads = [
+            e.payload for e in session.ranges if e.name == role.name and e.payload is not None
+        ]
+        assert len(payloads) == len(set(payloads)) and set(payloads) <= set(rows), role.name
+    op, ctas = runner.op, runner.max_ctas
+    planned = {
+        tuple(words): span.cta
+        for (words, _, _), span in zip(
+            mk.instruction_rows(op),
+            mk.list_schedule(op, mk.instruction_rows(op), ctas),
+        )
+    }
     computed = work_item_ranges(session.ranges, "compute")
-    cta = {row: e.cta[0] for row, e in computed.items()}
-    ctas = runner.max_ctas
-    assert all(cta[row] == row % ctas for row in rows)  # the static [slot][cta] layout
+    assert all(computed[row].cta[0] == planned[tuple(table[row][:4])] for row in rows)
     spans = mk_trace.phase_spans(session.ranges, runner.table)
     ops = {mk.OP_NAMES[op] for op in runner.table[:, 0].tolist() if op >= 0}
     assert set(spans) == ops and all(v > 0 for v in spans.values())

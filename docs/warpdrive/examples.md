@@ -15,7 +15,7 @@ PyTorch or FA4 feature.
 | Study attention backward and overlapping lifetimes | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
-| Run a whole Qwen3 decode step in one launch | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
+| Run a whole Qwen3 decode step as one persistent launch per layer | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -475,8 +475,10 @@ runner = QwenMegakernel(weights, max_len=1088)  # one compile serves every max_l
 logits = runner(weights, token, pos, *caches)  # decode_step_ref's contract: writes K/V at pos
 ```
 
-One persistent launch runs a whole batch-one decode step. The host lowers the step into a
-table of 20.3k instructions and assigns them to CTAs ahead of time:
+A batch-one decode step runs as one persistent launch per layer, then one for the LM head:
+a megakernel whose launch boundaries are the layer boundaries ([why](#why-one-launch-per-layer)).
+The host lowers the step into a table of 20.3k instructions, assigns them to CTAs ahead of time
+and splits the table by layer:
 
 ```text
 for layer in 28 layers:
@@ -493,7 +495,7 @@ LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logi
 |---|---|
 | Model | Qwen3 0.6B, 1.7B, 8B, 14B and 32B, and Qwen3-MoE 30B-A3B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
 | Caches | Contiguous bf16 `(layers, kv_heads, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
-| GPU | SM100 family; one CTA per SM, cooperative launch |
+| GPU | SM100 family; one CTA per SM, a programmatic-dependent launch per layer |
 | Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models across GPUs (235B-A22B) |
 
 The table above shows 0.6B's counts. Larger models change only the counts: an attention row
@@ -501,6 +503,9 @@ serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj spli
 quarter of the q heads, the residual polls run 8 elements per thread at a time, the ring keeps
 as many 16 KB stages as fit (11 for 32B), and the default KV split count targets about 128
 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
+
+The GB200 and GB300 tables in this section were measured with the earlier single cooperative
+launch of the whole step.
 
 Median us per step on a GB200 (CUDA-graph replay, 2026-11-11; `qwen_megakernel.bench`;
 "roofline" is the logical bytes per step at the measured 6.2 TB/s read bandwidth, so above
@@ -598,6 +603,39 @@ The megakernel removes launch and dependency latency, so its lead shrinks as wei
 dominate the step. Its one-step error against fp32 stays within the spread of eager bf16's,
 which varies about 5x across prompts on the deep models.
 
+### Why one launch per layer
+
+A decode step is a chain of short dependent phases. Two considerations determine where to put
+launch boundaries:
+
+- **A kernel boundary requires materializing any live on-chip state.** Registers, shared
+  memory and tensor memory belong to a CTA and die with it, so a value that one op leaves on
+  chip for the next must be written out and read back if a launch boundary falls between
+  them. Activations that already cross CTAs through global memory pay nothing extra.
+- **A programmatic-dependent launch hands off like an in-kernel dependency.** Each launch
+  calls `griddepcontrol.launch_dependents` at its start, so the next launch's CTAs take SMs as
+  this launch's CTAs exit, and its consumers poll the same epoch-tagged words they would poll
+  inside one kernel. Only a step's first launch calls `griddepcontrol.wait`, to read the
+  epoch the previous step's last launch wrote; later launches do not wait for their
+  predecessors to complete. The added cost per boundary is a launch hop of under a
+  microsecond, against several to tens of microseconds per layer.
+
+The layer boundary is where both hold: the residual sum after the MLP is an all-to-all (every
+CTA's next QKV row needs the whole hidden vector, built from every down partial), so nothing
+local is live there, and every layer is long enough to hide the launch hop. Inside a layer the
+phases are short and point to point (QKV to attention to o_proj to the MLP), and the rows and
+weights a CTA keeps for the next item, and any placement of rows on chosen SMs, need one
+persistent CTA per SM; those stay inside a launch.
+
+What a layer boundary still costs: each launch's CTAs start fresh, so an SM's prologue and its
+prefetch of the next layer's weights wait until its previous CTA exits. Against one cooperative
+launch of the whole step, most configurations we measured ran as fast or faster; the worst lost
+several percent of a step, where a layer's first phase waited on that fresh start. The host
+enqueues a step's launches faster than the GPU runs them, so eager steps time within a few
+percent of CUDA-graph replay. In return each launch has its own table, which keeps tables small
+and traces per layer, needs no cooperative launch, and leaves room for launches that differ per
+layer (hybrid models whose attention layers want another kernel configuration).
+
 <details markdown="1">
 <summary>How the megakernel runs the model</summary>
 
@@ -610,18 +648,26 @@ which varies about 5x across prompts on the deep models.
   assigns rows to CTAs with an engine-specific row-latency model (`row_cost`, fitted to
   traced work items across batch sizes), placing each row on the CTA that finishes it first (at
   batch one a row costs less on a CTA whose previous GEMV row wrote the same input: it skips the
-  prologue), and `assign_static` lays the table out
+  prologue), and `layout_static` lays each launch's table out
   `[slot][cta]` for `StaticPersistent`; `schedule="atomic"` claims rows in dependency order with
-  `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA
-  resident (the reason for `cooperative=True`) the earliest unfinished row can always run.
+  `AtomicPersistent` instead. Each CTA's rows stay in dependency order, so with every CTA of a
+  launch resident the earliest unfinished row can always run. `build_tables` schedules the
+  whole step once and splits each CTA's rows by layer into that layer's launch, ordering a
+  launch's CTAs by their first row's predicted start; the atomic schedule gives each launch its
+  own claim counter.
+  `locality=True` (GPUs with two memory locality domains) copies the weights into memory whose
+  2 MiB pages alternate between the domains, keys rows by SM (`schedule="sm"`) and schedules each
+  GEMV row only on SMs of its weights' domain (`schedule.Placement`); it helps rows that stream
+  weights at bandwidth and can unbalance rows that do not.
 - **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
   and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
   prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
   on CUDA cores (or tcgen05 MMAs from a tenth warp, above); weights and KV carry an L2 evict-first hint.
 - **Dependencies between CTAs** are raw code: every activation is a 64-bit word
-  `(fp32 value, launch epoch)` published with one relaxed store, and consumers spin on relaxed
+  `(fp32 value, step epoch)` published with one relaxed store, and consumers spin on relaxed
   (mostly 16- and 32-byte vector) loads until each word carries the current epoch (NCCL's LL
-  protocol). The last CTA to finish advances the epoch. Consumers sum their Split-K partials,
+  protocol), within a launch or across one. The last CTA of the step's last launch advances
+  the epoch. Consumers sum their Split-K partials,
   except down's: its last split (last because its GATEUP rows run in a second wave) fetches the other
   partials and publishes the finished residual, so QKV and the LM head read one word per
   element instead of five.
@@ -657,7 +703,9 @@ ctx 1024/4096/8192 (`--contexts`).
 (payload: the table row) and the compute role's `trace_region`s, also with the row as payload:
 `poll` (waiting for the row's inputs; it ends when they are ready), `stream` (a GEMV tile's
 weight stages), `attn.blocks` (an attention row's KV blocks) and `reduce.poll` (the last down
-split fetching the other partials). `qwen_megakernel.trace` decodes one launch:
+split fetching the other partials). `qwen_megakernel.trace` decodes all launches of one step.
+Each launch records into its own buffer; ranges use launch-local CTA indices, and work-item
+payloads index `runner.table`:
 
 ```python
 from attn_gym.warpdrive.examples.qwen_megakernel import trace as mkt
@@ -670,9 +718,9 @@ mkt.phase_spans(session.ranges, runner.table)  # {"QKV": us, "ATTN": us, ...} pe
 mkt.input_waits(session.ranges, runner.table)  # median row start -> inputs ready, us
 ```
 
-The trace has one process per SM and one track per role; work items are named after their
+The trace has one process per schedule CTA and one track per role; work items are named after their
 instruction (`QKV`, `load QKV`, ...) with `layer`, `a` and `b` in their args, and an arrow runs
-from each input group's last-finishing producer row to the row waiting for it, across SMs
+from each input group's last-finishing producer row to the row waiting for it, across CTAs
 (`write_step_trace`). `qwen_megakernel.bench --trace-dir DIR` writes one trace per context and
 reports both views. `trace="iket"` emits the same ranges for `run-iket` (as in
 [Tracing](tracing.md#iket)), and `waits=True` adds the layer's wait ranges with either backend.
@@ -681,10 +729,14 @@ Disabled, both emit no instructions.
 <details markdown="1">
 <summary>Implementation pitfalls and current limits</summary>
 
-- **Co-residency.** A static schedule over spinning CTAs needs every CTA resident;
-  `launch_args()`'s SM-count cap is only a capacity estimate. Launch with `cooperative=True`
-  (CUDA-graph capture keeps the attribute). When another job shares the GPU, steps can slow
-  down several times or stall; `schedule="atomic"` does not need co-residency.
+- **Co-residency.** A static schedule over spinning CTAs needs every CTA of a launch resident
+  eventually. A launch starts only after every CTA of the previous one has started, and those
+  never wait on later launches, so the step cannot deadlock on its own. A concurrent kernel that
+  holds SMs while it spins (another static runner on another stream, an MPS peer) can deadlock
+  it, which the cooperative launch used to reject at launch; `schedule="atomic"` does not need
+  co-residency. `schedule="sm"` keys rows by SM (`SmPersistent`). Each CTA waits at exit until all
+  CTAs of its launch have arrived; otherwise another CTA of that launch could reuse the same SM
+  slot.
 - **Materialize tensors before `run_roles`.** Argument tensors materialized lazily inside a
   role, dicts of tensors in params and Python loops in the kernel prologue fail with "operand
   does not dominate this use" at an unrelated line. Keep params flat.

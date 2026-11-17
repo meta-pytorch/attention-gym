@@ -6,13 +6,14 @@ for the row's inputs), ``stream`` (a GEMV tile's weight stages), ``attn.blocks``
 row's KV blocks) and ``reduce.poll`` (the last down split fetching the other partials)::
 
     with trace_session(runner, trace_path="step.pftrace") as session:
-        runner(weights, token, pos, *caches)  # one launch
+        runner(weights, token, pos, *caches)  # one step
     phase_spans(session.ranges, runner.table)  # {"QKV": 1.9, ...} us per layer
 
-The Perfetto trace has one process per CTA and one thread per role. Work items are named after
-their instruction (``QKV``, ``load QKV``, ...) with ``layer``/``a``/``b`` as args, and an arrow
-runs from each input group's last-finishing producer row to the row that waited for it. Host
-only; the kernel module does not import this.
+The Perfetto trace has one process per CTA of the schedule (``runner.cta_of``; the launches
+running its rows overlap where one layer's CTA starts before the last one's exits) and one
+thread per role. Work items are named after their instruction (``QKV``, ``load QKV``, ...) with
+``layer``/``a``/``b`` as args, and an arrow runs from each input group's last-finishing producer
+row to the row that waited for it. Host only; the kernel module does not import this.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import math
 import statistics
 from contextlib import contextmanager
+from dataclasses import replace
 
 import torch
 
@@ -38,8 +40,8 @@ from attn_gym.warpdrive.examples.qwen_megakernel import (
     row_groups,
 )
 from attn_gym.warpdrive.profiler import Range
+from attn_gym.warpdrive.trace_session import _roles, work_item_ranges, write_trace
 from attn_gym.warpdrive.trace_session import trace_session as kernel_session
-from attn_gym.warpdrive.trace_session import work_item_ranges, write_trace
 
 # The instruction kind each phase waits for; QKV and the LM head wait for the previous layer's
 # down.
@@ -54,15 +56,35 @@ MOE_BATCH_PRODUCER = {**MOE_PRODUCER, QKV: REDUCE, LMHEAD: REDUCE}
 
 @contextmanager
 def trace_session(runner, *, trace_path=None, device=None):
-    """``trace_session.trace_session`` for one launch of a ``trace="globaltimer"`` runner: inside
-    the block the runner records into the session's buffer. ``trace_path``: also write the
-    Perfetto trace (``write_step_trace``)."""
-    with kernel_session(runner.op, runner.max_ctas, device=device) as session:
-        previous, runner.trace_buffer = runner.trace_buffer, session.prof.tensor
+    """``trace_session.trace_session`` for one step (its launches) of a ``trace="globaltimer"``
+    runner: inside the block the runner records into the session's buffer. ``trace_path``: also
+    write the Perfetto trace (``write_step_trace``)."""
+    # One profile unit per (launch, CTA): each launch records into its slice of the session
+    # buffer.
+    ctas, launches = runner.max_ctas, runner.op.launches
+    with kernel_session(runner.op, ctas * launches, device=device) as session:
+        runner.trace_buffers = list(session.prof.tensor.view(launches, -1))
         try:
             yield session
         finally:
-            runner.trace_buffer = previous
+            runner.trace_buffers = None
+    # A range's CTA becomes the list_schedule CTA whose rows its launch's CTA ran (the schedule
+    # view's lanes), with the launch kept as cta[1] so each launch's CTA nests its own ranges.
+    # Work-item payloads (indices into their launch's table) become joined-table rows;
+    # trace-region payloads already are.
+    starts = [0]
+    for table in runner.tables[:-1]:
+        starts.append(starts[-1] + table.shape[0])
+    work_roles = {role.name for role in _roles(runner.op)}
+
+    def joined(item: Range) -> Range:
+        launch, cta = divmod(item.cta[0], ctas)
+        payload = item.payload
+        if payload is not None and item.name in work_roles:
+            payload += starts[launch]
+        return replace(item, cta=(runner.cta_of[launch][cta], launch), payload=payload)
+
+    session.ranges = [joined(item) for item in session.ranges]
     if trace_path is not None:
         write_step_trace(trace_path, runner, session.ranges)
 

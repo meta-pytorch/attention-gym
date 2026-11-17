@@ -1,4 +1,5 @@
-"""Qwen3 decode step as one persistent warpdrive kernel (a "megakernel").
+"""Qwen3 decode step as one persistent warpdrive launch per layer, then one for the LM head.
+See docs/warpdrive/examples.md for why the launch boundaries sit at layers.
 
 The code spans the modules of this package (see its ``__init__``). Kernels compile from ``core``'s
 imports plus their own module, so host-side edits recompile nothing.
@@ -20,18 +21,22 @@ An attention row serves two q heads of one kv head (one when the GQA group is od
 models run several rows per kv head and split; o_proj splits a quarter of the q heads each.
 
 By default the host also assigns rows to CTAs (``list_schedule``, over a latency model) and
-lays the table out ``[slot][cta]`` for ``StaticPersistent`` (``assign_static``); the atomic
-schedule claims rows in dependency order instead. Each CTA's rows stay in dependency order, so
-with every CTA resident (one per SM, guaranteed by the cooperative launch) the earliest
-unfinished row can always run.
+lays each launch's table out ``[slot][cta]`` for ``StaticPersistent`` (``build_tables``); the
+atomic schedule claims rows in dependency order instead. Each CTA's rows stay in dependency order, so
+with every CTA resident (one per SM) the earliest unfinished row can always run.
+
+Each layer, and then the LM head, is its own launch of the same kernel over that layer's slice
+of the table. Launches are programmatic-dependent: each lets its successor start at once, so the
+next layer's CTAs take SMs as this layer's CTAs exit and start streaming weights, and activations
+cross the launch boundary as the same tagged words.
 
 Cross-CTA dependencies use no counters. Each activation is published as one 64-bit word
-``(fp32 value, launch epoch)`` with a relaxed store; a consumer spins on relaxed loads until
+``(fp32 value, step epoch)`` with a relaxed store; a consumer spins on relaxed loads until
 every word it needs carries the current epoch (NCCL's LL protocol). The word is single-copy
-atomic, so a matching tag means the value is this launch's. One write and one read
+atomic, so a matching tag means the value is this step's. One write and one read
 propagation per dependency, no fences, no separate flag (streamed inputs add per-token and
-per-chunk flags for their bf16 buffers). The last CTA to finish advances the epoch for the next
-launch.
+per-chunk flags for their bf16 buffers). The last CTA of the step's last launch advances the
+epoch for the next step.
 
 Roles of one CTA (9 warps; 10 with the atomic schedule's scheduler warp)::
 
@@ -87,16 +92,17 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     compile_megakernel,
     packed_mlp_shapes,
 )
+from attn_gym.warpdrive.examples.qwen_megakernel.locality import byte_side, sm_sides, striped_copy
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig, rope_cos_sin
 from attn_gym.warpdrive.examples.qwen_megakernel.schedule import (
     CONTEXT,
     DEPENDENCY_LATENCY,
     REUSED_INPUT,
     ROW_COST_MODELS,
+    Placement,
     RowCostModel,
     RowSpan,
-    assign_static,
-    build_table,
+    build_tables,
     instruction_rows,
     list_schedule,
     row_cost,
@@ -139,8 +145,7 @@ __all__ = [
     "QwenMegakernel",
     "RowCostModel",
     "RowSpan",
-    "assign_static",
-    "build_table",
+    "build_tables",
     "check_model",
     "check_tc_model",
     "compile_megakernel",
@@ -186,33 +191,36 @@ class QwenMegakernel:
         waits: bool = False,
         engine: str = "cuda_core",
         stream_inputs: bool = False,
+        locality: bool = False,
         **config,
     ):
         """``ops``: keep only these instruction kinds (tests). ``trace``: compile with ranges for
         the work items and ``trace_region``s, recorded by ``"globaltimer"``
-        (``trace.trace_session`` decodes a launch) or ``"iket"`` (``run-iket``);
+        (``trace.trace_session`` decodes all launches of a step) or ``"iket"`` (``run-iket``);
         ``waits`` adds the layer's wait ranges. ``engine``: the GEMV engine, ``"cuda_core"`` or
         ``"tcgen05"`` (``QwenDecodeMegakernelTc``). ``stream_inputs`` (tcgen05): stream GEMV
         inputs from global memory through an activation ring (``QwenDecodeMegakernelTcStream``).
         QKV and LM-head inputs, plus dense MLP inputs, are shared across CTAs; other inputs
-        use per-CTA scratch. See that class for the dataflow. ``config``: ``QwenDecodeMegakernel``
-        constructor arguments; the model shape comes from ``weights.config``."""
+        use per-CTA scratch. See that class for the dataflow. ``locality``: place the weights
+        on known memory sides (``locality.striped_copy``) and run each GEMV row on an SM of its
+        weights' side; it needs the ``"sm"`` schedule (CTA slots are SMs) and two locality
+        domains. ``config``: ``QwenDecodeMegakernel`` constructor arguments; the model shape
+        comes from ``weights.config``."""
         kernel = kernel_class(engine, stream_inputs)
         if max_len % BLOCK:
             raise ValueError(f"max_len must be a multiple of {BLOCK}, got {max_len}")
         device = weights.embed.device
         self.max_len = max_len
+        if locality:
+            if weights.config.is_moe:
+                raise ValueError("locality places dense GEMV rows only: not for MoE models")
+            config.setdefault("schedule", "sm")
+            if config["schedule"] != "sm":
+                raise ValueError("locality needs the 'sm' schedule")
         # The kernel reads RoPE from ``self.rope``: its scaling stays out of the compile key.
         model = dataclasses.replace(weights.config, rope_scaling=None)
         self.op = op = kernel(model=model, **config)
-        self.workspace, self.max_ctas = op.work.launch_args(device)
-        self.table = build_table(op, self.max_ctas, ops).to(device)
-        rows_per_cta = -(-self.table.shape[0] // self.max_ctas)
-        events = max(TRACE_EVENTS, TRACE_EVENTS_PER_ROW * rows_per_cta)
-        self.op = op = op.with_settings(
-            trace_backend=trace, trace_waits=waits, trace_events_per_role=events
-        )
-        self.workspace, self.max_ctas = op.work.launch_args(device)  # the traced kernel's stream
+        self.max_ctas = op.work.launch_args(device)[1]
         self.wqkv = torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1).reshape(
             -1, op.hidden
         )
@@ -226,6 +234,31 @@ class QwenMegakernel:
         else:  # a stub tile for the unused router atom
             shape = packed_mlp_shapes(op)[2]
             self.router = torch.zeros(shape, device=device, dtype=torch.bfloat16)
+        self.lm_head = weights.lm_head
+        placement = None
+        if locality:
+            sides = sm_sides(device.index)
+            if len(sides) != self.max_ctas:
+                raise ValueError(
+                    f"locality needs one CTA per SM: {len(sides)} SMs, {self.max_ctas} CTAs"
+                )
+            self.wqkv, self.wo, self.wgu, self.wd, self.lm_head = (
+                striped_copy(t) for t in (self.wqkv, self.wo, self.wgu, self.wd, self.lm_head)
+            )
+            placement = Placement(self.row_side, sides)
+        tables, self.cta_of = build_tables(op, self.max_ctas, ops, placement)
+        self.tables = [table.to(device) for table in tables]  # one per launch
+        self.table = torch.cat(self.tables)  # every row, as trace payloads index them
+        # Trace capacity per (launch, CTA): a launch's CTA runs at most its table's slot count of
+        # rows under a static schedule.
+        rows_per_cta = -(-max(t.shape[0] for t in tables) // self.max_ctas)
+        events = max(TRACE_EVENTS, TRACE_EVENTS_PER_ROW * rows_per_cta)
+        self.op = op = op.with_settings(
+            trace_backend=trace, trace_waits=waits, trace_events_per_role=events
+        )
+        workspace = op.work.launch_args(device)[0]  # the traced kernel's stream
+        # Launches overlap: each gets its own schedule workspace (the atomic schedule's counter).
+        self.workspaces = [torch.zeros_like(workspace) for _ in range(op.launches)]
         self.weights = weights
         self.rope = rope_table(weights.config, max_len, device)
         self.scratch = torch.zeros(op.scratch_layout.size, device=device, dtype=torch.int64)
@@ -233,7 +266,7 @@ class QwenMegakernel:
         # (batch, vocab); ``logits`` is token 0's row at batch one, the whole tensor otherwise.
         self.all_logits = torch.zeros(op.batch, op.vocab, device=device)
         self.logits = self.all_logits[0] if op.batch == 1 else self.all_logits
-        self.state = torch.zeros(2, device=device, dtype=torch.int32)
+        self.state = torch.zeros(op.state_words, device=device, dtype=torch.int32)
         # (batch, 2) [token, pos]; ``step_info`` is token 0's ``(2,)`` row at batch one, as before.
         self.all_steps = torch.zeros(op.batch, 2, device=device, dtype=torch.int32)
         self.step_info = self.all_steps[0] if op.batch == 1 else self.all_steps
@@ -243,7 +276,49 @@ class QwenMegakernel:
         self.xshared = torch.zeros(op.shared_size, device=device, dtype=torch.bfloat16)
         # Placeholder; trace_session swaps in the real globaltimer buffer for a traced launch.
         self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
+        self.trace_buffers: list[torch.Tensor] | None = None  # per launch, inside trace_session
         self.fn = compile_megakernel(self.op)
+
+    def row_side(self, words: list[int]) -> int | None:
+        """The memory side most of a GEMV row's weight bytes live on (striped weights; see
+        ``locality``), or None for rows that stream no weights (attention reads the KV cache)."""
+        op = self.op
+        kind, layer, a, b = words
+        rows, tile_k = op.rows, op.tile_k
+        if kind == QKV:
+            weight, tile, k0, k_tiles = (
+                self.wqkv,
+                layer * (op.qkv_rows // rows) + a,
+                0,
+                op.hidden_k_tiles,
+            )
+        elif kind == OPROJ:
+            k_tiles = op.oproj_k_tiles
+            weight, tile, k0 = self.wo, layer * (op.hidden // rows) + a, b * k_tiles
+        elif kind == GATEUP:
+            weight, tile, k0, k_tiles = (
+                self.wgu,
+                layer * (2 * op.inter // rows) + a,
+                0,
+                op.hidden_k_tiles,
+            )
+        elif kind == DOWN:
+            k_tiles = op.down_k_tiles
+            weight, tile, k0 = self.wd, layer * (op.hidden // rows) + a, b * k_tiles
+        elif kind == LMHEAD:
+            weight, tile, k0, k_tiles = self.lm_head, a, 0, op.hidden_k_tiles
+            rows *= b  # b row tiles from tile a
+        else:
+            return None
+        row_bytes = weight.shape[1] * weight.element_size()
+        start = tile * op.rows * row_bytes + k0 * tile_k * weight.element_size()
+        span = k_tiles * tile_k * weight.element_size()
+        counts = [0, 0]
+        for r in range(rows):
+            first = start + r * row_bytes
+            for edge in (first, first + span - 1):
+                counts[byte_side(edge)] += 1
+        return int(counts[1] > counts[0])
 
     def tagged(self, name: str) -> torch.Tensor:
         """The int64 words of a tagged buffer, shaped as ``ScratchLayout.shapes``."""
@@ -288,13 +363,21 @@ class QwenMegakernel:
             if cache.device != self.logits.device or cache.data_ptr() % 16:
                 raise ValueError("caches must be 16-byte aligned on the kernel's device (TMA)")
         w = self.weights
+        # A traced step gives each launch its own profile buffer (trace.trace_session).
+        traces = self.trace_buffers or [self.trace_buffer] * self.op.launches
+        for launch, (table, workspace, trace) in enumerate(
+            zip(self.tables, self.workspaces, traces)
+        ):
+            self._launch_layer(w, k_cache, v_cache, launch, table, workspace, trace)
+
+    def _launch_layer(self, w, k_cache, v_cache, launch, table, workspace, trace):
         self.fn(
             self.wqkv,
             self.wo,
             self.wgu,
             self.wd,
             w.embed,
-            w.lm_head,
+            self.lm_head,
             self.router,
             k_cache.view(-1, HEAD_DIM),
             v_cache.view(-1, HEAD_DIM),
@@ -302,7 +385,7 @@ class QwenMegakernel:
             self.all_logits,
             self.state,
             self.all_steps,
-            self.trace_buffer,
+            trace,
             w.input_ln,
             w.post_ln,
             w.q_norm,
@@ -311,9 +394,10 @@ class QwenMegakernel:
             self.rope,
             self.xscratch,
             self.xshared,
-            self.table,
-            self.workspace,
+            table,
+            workspace,
             self.max_ctas,
+            launch,
         )
 
     def __call__(self, weights, token, pos: int, k_cache, v_cache) -> torch.Tensor:
