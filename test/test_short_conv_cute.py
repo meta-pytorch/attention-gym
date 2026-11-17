@@ -692,9 +692,12 @@ def test_short_conv_tma_backward_matches_batched_reference(
     expected = _reference(x, weight)
     actual_gradients = torch.autograd.grad(actual, (x, weight), grad_output)
     expected_gradients = torch.autograd.grad(expected, (x, weight), grad_output)
+    # The fallbacks pack two channels per thread like the TMA defaults: CuTeDSL 4.9 lowers
+    # two-lane FP32 math to non-contracting ``.rn.f32x2`` instructions while scalar math still
+    # contracts into FMAs, so another packing width rounds the SiLU derivative differently.
     match dtype:
         case torch.float16 | torch.bfloat16:
-            fallback_input = ShortConvConfig(128, 1, 28)
+            fallback_input = ShortConvConfig(128, 2, 28)
             fallback_weight = ShortConvConfig(128, 4, 128)
         case torch.float32:
             fallback_input = ShortConvConfig(128, 2, 12)
@@ -725,8 +728,8 @@ def test_short_conv_tma_backward_matches_batched_reference(
         rtol=tolerance,
         atol=weight_atol,
     )
-    # dx keeps the same per-token reduction tree. dw changes partial boundaries and therefore
-    # follows the dtype tolerance rather than a bitwise contract.
+    # dx keeps the same per-token reduction tree and packing. dw changes partial boundaries and
+    # therefore follows the dtype tolerance rather than a bitwise contract.
     assert torch.equal(actual_gradients[0], fallback_gradients[0])
     torch.testing.assert_close(
         actual_gradients[1],
