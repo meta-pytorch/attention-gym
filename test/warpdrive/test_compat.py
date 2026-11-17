@@ -2,17 +2,24 @@
 
 import importlib.metadata
 import importlib.util
+import math
 import sys
 import types
 import warnings
+from types import SimpleNamespace
 
 import pytest
+import torch
 from packaging.specifiers import InvalidSpecifier
 from packaging.version import Version
 
 pytest.importorskip("cutlass")
 
-from attn_gym.warpdrive import compat
+from cuda.bindings import driver as cuda
+from cutlass import Int32, cute
+
+from attn_gym.warpdrive import Local, WarpSpecialized, compat, role
+from attn_gym.warpdrive.cache import compile_tvm_ffi, make_fake_compact_tensor
 
 
 @pytest.mark.parametrize(
@@ -91,6 +98,9 @@ def test_import_selects_only_available_api(monkeypatch, installed: str):
         monkeypatch.setattr(cute, "FastDivmodDivisor", divisor, raising=False)
     if modern:
         monkeypatch.setattr(cute.arch, "store_async_dsmem", store, raising=False)
+    divmod_flip = Version(installed) >= Version("4.9.0.dev1")
+    if divmod_flip:
+        monkeypatch.setattr(cute, "DivmodSemantics", lambda mode: ("divmod", mode), raising=False)
 
     spec = importlib.util.spec_from_file_location("compat_under_test", compat.__file__)
     selected = importlib.util.module_from_spec(spec)
@@ -100,6 +110,7 @@ def test_import_selects_only_available_api(monkeypatch, installed: str):
     assert (selected.mbarrier_arrive is arrive) == (Version(installed) >= Version("4.7"))
     assert (selected.store_async_dsmem is store) == modern
     assert selected.NATIVE_MULTI_ADVANCE == modern
+    assert selected.COMPILE_OPTIONS == ((("divmod", "legacy"),) if divmod_flip else ())
     assert selected.SmemAllocator is smem
     assert selected.TmemAllocator is tmem
     assert selected.LayoutEnum is layout
@@ -140,3 +151,36 @@ def test_import_rejects_cutedsl_below_the_floor(monkeypatch):
     spec = importlib.util.spec_from_file_location("compat_floor_probe", compat.__file__)
     with pytest.raises(ImportError, match=r"nvidia-cutlass-dsl>=4\.6\.2, found 4\.6\.1.*elect"):
         spec.loader.exec_module(importlib.util.module_from_spec(spec))
+
+
+class SignedDivmod(WarpSpecialized):
+    """One thread writes ``a % b`` and ``a // b`` of runtime operands."""
+
+    @role(warps=0, raw=True)
+    @cute.jit
+    def compute(self, ctx, me: Local):
+        if me.tid == 0:
+            ctx.out[0] = ctx.a % ctx.b
+            ctx.out[1] = ctx.a // ctx.b
+
+    @cute.kernel
+    def kernel(self, out: cute.Tensor, a: Int32, b: Int32):
+        self.begin_roles()
+        self.run_roles(SimpleNamespace(out=out, a=a, b=b))
+
+    @cute.jit
+    def __call__(self, out: cute.Tensor, a: Int32, b: Int32, stream: cuda.CUstream):
+        self.kernel(out, a, b).launch(**self.launch_config(grid=(1, 1, 1)), stream=stream)
+
+
+def test_signed_remainder_keeps_c_semantics_without_migration_warning(requires_blackwell, capfd):
+    """CuTeDSL 4.9 warns that signed ``%`` will take the divisor's sign; compiles pin the C
+    remainder (the dividend's sign) on every version, beside the floored ``//``."""
+    capfd.readouterr()
+    fake = make_fake_compact_tensor(Int32, (2,), assumed_align=4)
+    compiled = compile_tvm_ffi(SignedDivmod(), fake, Int32(0), Int32(1), name="signed_divmod")
+    assert "DivmodMigration" not in capfd.readouterr().err
+    out = torch.empty(2, dtype=torch.int32, device="cuda")
+    for a, b in [(-7, 3), (7, -3), (-7, -3), (7, 3), (-6, 3)]:
+        compiled(out, a, b)
+        assert out.tolist() == [int(math.fmod(a, b)), a // b], (a, b)
