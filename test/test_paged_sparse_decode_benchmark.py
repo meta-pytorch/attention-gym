@@ -1,4 +1,4 @@
-"""Selection packing for the native vLLM benchmark comparison."""
+"""vLLM benchmark packing must keep incomplete-block entries inside the valid prefix."""
 
 import torch
 
@@ -16,8 +16,8 @@ def test_vllm_operands_compacts_partial_blocks_after_valid_selections():
 
     packed, token_to_req = vllm_operands(inputs)
 
-    # The first request has only an open block. The second has two query rows
-    # with different sparse budgets and causal tails.
+    # Empty and partially filled sparse prefixes must not strand incomplete-block entries
+    # after padding. The second sequence's two queries need different causal tails.
     expected = [
         [0, 1, 2],
         [4, 5, 6, 7, 12, 13],

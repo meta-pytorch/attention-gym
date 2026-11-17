@@ -1,7 +1,7 @@
-"""Private operators for the fused paged sparse decode.
+"""Opaque CUDA operators keep Triton launch setup out of ``torch.compile`` tracing.
 
-Schemas and fakes register at import, so ``torch.compile`` traces each launch as one opaque op
-and the Triton kernels see real tensors.
+Schemas and fake implementations register at import time. Tracing uses output metadata only;
+execution passes real tensors to the Triton launcher, which chooses the grid and scratch sizes.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ _SCHEMA_ARGS = (
     " Tensor? window_value_cache, Tensor? window_block_table, Tensor? attention_sink,"
     " SymInt max_seqlen_q, int index_block_size, int window_size, float scale)"
 )
-# Two fixed-arity ops instead of an optional LSE output.
+# Separate schemas let tracing know the output structure without an optional Tensor result.
 torch.library.define("attn_gym::paged_sparse_decode", _SCHEMA_ARGS + " -> Tensor")
 torch.library.define(
     "attn_gym::paged_sparse_decode_with_lse", _SCHEMA_ARGS + " -> (Tensor, Tensor)"
@@ -24,15 +24,7 @@ torch.library.define(
 def _decode_cuda(*args, return_lse: bool):
     from .impl import triton
 
-    *tensors, max_seqlen_q, index_block_size, window_size, scale = args
-    return triton.paged_sparse_decode(
-        *tensors,
-        max_seqlen_q=max_seqlen_q,
-        index_block_size=index_block_size,
-        window_size=window_size,
-        scale=scale,
-        return_lse=return_lse,
-    )
+    return triton.paged_sparse_decode(*args, return_lse=return_lse)
 
 
 torch.library.impl(
@@ -47,19 +39,15 @@ torch.library.impl(
 )
 
 
-def _output_like(query: torch.Tensor, value_cache: torch.Tensor) -> torch.Tensor:
-    return query.new_empty(query.shape[0], query.shape[1], value_cache.shape[-1])
-
-
 @torch.library.register_fake("attn_gym::paged_sparse_decode")
 def _decode_fake(query, key_cache, value_cache, *args) -> torch.Tensor:
-    del key_cache, args
-    return _output_like(query, value_cache)
+    return query.new_empty(*query.shape[:2], value_cache.shape[-1])
 
 
 @torch.library.register_fake("attn_gym::paged_sparse_decode_with_lse")
-def _decode_with_lse_fake(
-    query, key_cache, value_cache, *args
-) -> tuple[torch.Tensor, torch.Tensor]:
-    del key_cache, args
-    return _output_like(query, value_cache), query.new_empty(query.shape[:2], dtype=torch.float32)
+def _decode_with_lse_fake(query, *args) -> tuple[torch.Tensor, torch.Tensor]:
+    return _decode_fake(query, *args), query.new_empty(query.shape[:2], dtype=torch.float32)
+
+
+decode_op = torch.ops.attn_gym.paged_sparse_decode.default
+decode_with_lse_op = torch.ops.attn_gym.paged_sparse_decode_with_lse.default

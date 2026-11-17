@@ -1,12 +1,14 @@
-"""Input factories for paged sparse decode tests and benchmarks."""
+"""Reproducible paged-decode inputs shared by correctness tests and benchmarks."""
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
 
 import torch
 
 from attn_gym.sparse.paged_decode import PagedKV
+from attn_gym.testing.kda import cumulative_sequence_offsets
 
 
 def _paged_source(
@@ -20,14 +22,18 @@ def _paged_source(
     device: torch.device | str,
     generator: torch.Generator,
 ) -> PagedKV:
-    """Scatter each sequence over randomly permuted pages, with one spare page per row."""
+    """Use permuted physical pages so logical entry offsets cannot double as cache offsets.
+
+    Every block-table row fits the longest sequence plus one spare page, so shorter sequences
+    have more unused capacity. That padding must not affect visible-key counts.
+    """
     pages_per_sequence = max(-(-length // page_size) for length in seqlens) + 1
     num_pages = len(seqlens) * pages_per_sequence + 3
     block_table = torch.randperm(num_pages, generator=generator)[
         : len(seqlens) * pages_per_sequence
     ]
     width = head_dim if latent_values else head_dim + head_dim_v
-    # One [pages, page, heads, K | V] allocation, the layout serving engines use.
+    # Views exercise non-contiguous outer strides; latent values also alias the key prefix.
     cache = torch.randn(num_pages, page_size, kv_heads, width, generator=generator).to(
         device, dtype
     )
@@ -59,42 +65,32 @@ def make_paged_sparse_decode_inputs(
     device: torch.device | str = "cuda",
     seed: int = 0,
 ) -> dict[str, Any]:
-    """Build keyword arguments for ``paged_sparse_decode``.
+    """Build deterministic, causal keyword arguments for ``paged_sparse_decode``.
 
-    Indices select random distinct complete blocks visible to each query. With
-    ``compress_ratio == 1`` the sparse and window keys share one source (QSA); otherwise ``kv``
-    holds one compressed entry per ``compress_ratio`` tokens and the window reads a separate raw
-    cache paged by ``window_page_size`` (DeepSeek V4). ``topk_length=False`` scatters the
-    selections across the row instead of compacting them in front.
+    ``seqlens`` counts raw keys, including the queries. Selected block ids are distinct and
+    refer only to complete blocks visible to the query. With ``compress_ratio > 1``, ``kv``
+    represents one entry per complete group of raw tokens and the window uses a separate raw
+    source with ``window_page_size``. Otherwise both key sets share one source.
+
+    Caches contain random values, not actual compressed tokens. ``latent_values=True`` makes
+    values a key-prefix view. With ``topk_length=False``, valid selections are scattered among
+    negative padding instead of packed into a prefix, exercising the full-row read path.
     """
     generator = torch.Generator().manual_seed(seed)
     head_dim_v = head_dim_v or head_dim
     separate_window = compress_ratio > 1
-    sparse_lengths = [length // compress_ratio for length in seqlens]
-    kv = _paged_source(
-        [max(length, 1) for length in sparse_lengths],
-        page_size,
-        kv_heads,
-        head_dim,
-        head_dim_v,
-        latent_values,
-        dtype,
-        device,
-        generator,
+    source = partial(
+        _paged_source,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        latent_values=latent_values,
+        dtype=dtype,
+        device=device,
+        generator=generator,
     )
-    window_kv = None
-    if separate_window:
-        window_kv = _paged_source(
-            seqlens,
-            window_page_size or page_size,
-            kv_heads,
-            head_dim,
-            head_dim_v,
-            latent_values,
-            dtype,
-            device,
-            generator,
-        )
+    kv = source([max(length // compress_ratio, 1) for length in seqlens], page_size)
+    window_kv = source(seqlens, window_page_size or page_size) if separate_window else None
 
     rows = sum(query_lens)
     indices = torch.full((rows, topk), -1, dtype=torch.int32)
@@ -106,7 +102,7 @@ def make_paged_sparse_decode_inputs(
             if separate_window:
                 visible = (position + 1) // compress_ratio // index_block_size
             else:
-                # Only complete blocks that end before the window are selectable.
+                # Exclude the aligned window's entries so these mimic complete-block indexer ids.
                 window_start = max(position + 1 - window_size, 0)
                 visible = window_start // index_block_size
             count = min(max(visible, 0), topk)
@@ -124,7 +120,7 @@ def make_paged_sparse_decode_inputs(
         "query": torch.randn(rows, heads, head_dim, generator=generator).to(device, dtype),
         "kv": kv,
         "indices": indices.to(device),
-        "cu_seqlens_q": torch.tensor([0, *query_lens]).cumsum(0).to(device, torch.int32),
+        "cu_seqlens_q": cumulative_sequence_offsets(query_lens, device=device),
         "seqused_k": torch.tensor(seqlens, dtype=torch.int32, device=device),
         "max_seqlen_q": max(query_lens, default=1),
         "topk_length": lengths.to(device) if topk_length else None,

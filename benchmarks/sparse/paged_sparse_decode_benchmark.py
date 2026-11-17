@@ -1,16 +1,16 @@
 """Benchmark paged_sparse_decode on Qwen QSA decode shapes, optionally against vLLM's kernel.
 
-Each batch captures a CUDA graph per implementation and alternates their replays. ``--cold``
-evicts K/V from L2 before each call and warms the routing metadata, as an indexer would. With
-``--vllm-root``, vLLM's native QSA
-Triton kernel (``vllm/models/qwen4_exp/nvidia/ops/qsa.py``) runs in this process on the same
-caches, given the expanded token indices it consumes; the time of vLLM's separate expansion
-kernel is excluded, which favors vLLM.
+Each batch size uses one CUDA graph per implementation, with alternating replays to reduce
+ordering bias. ``--cold`` evicts K/V from L2 before each call, then warms Q and routing metadata
+to approximate a preceding indexer. With ``--vllm-root``, vLLM's native QSA Triton kernel
+(``vllm/models/qwen4_exp/nvidia/ops/qsa.py``) runs on the same caches with pre-expanded logical
+entry indices. Excluding vLLM's separate expansion kernel favors vLLM.
 
 The bandwidth speed-of-light (SOL) floor counts logical K/V reads per query and KV head,
-Q/O, and selected indices. It excludes intermediate traffic and launch latency. Warm-cache
-results can exceed an HBM roofline; use ``--cold`` for that comparison. The B200's advertised
-8 TB/s is the default peak there; pass measured bandwidth explicitly for a practical ceiling.
+Q/O, and selected block ids. It excludes intermediate traffic, repeated metadata reads, and
+launch latency. Cache reuse can exceed this HBM estimate; use ``--cold`` to reduce that effect.
+B200's advertised 8 TB/s is the default peak there; pass measured bandwidth for a practical
+ceiling.
 
 Usage:
     python benchmarks/sparse/paged_sparse_decode_benchmark.py
@@ -26,19 +26,23 @@ import sys
 import types
 from collections.abc import Callable
 from functools import partial
+from itertools import groupby
 from pathlib import Path
 from statistics import median
 
 import torch
 import triton
 import triton.language as tl
+from torch.profiler import ProfilerActivity, profile
 
 from attn_gym.sparse import paged_sparse_decode
 from attn_gym.testing.paged_decode import make_paged_sparse_decode_inputs
 
+COLD_REPEATS = 8
+
 
 def load_vllm_qsa(root: str) -> Callable[..., torch.Tensor]:
-    """Import vLLM's QSA kernel module, stubbing the two vLLM helpers it imports."""
+    """Load native QSA without importing the vLLM runtime; restore stubbed modules afterward."""
     stubs = {
         "vllm": {},
         "vllm.triton_utils": {"HAS_TRITON": True, "tl": tl, "triton": triton},
@@ -69,68 +73,91 @@ def load_vllm_qsa(root: str) -> Callable[..., torch.Tensor]:
     return module.qsa_sparse_paged_attention
 
 
-def vllm_operands(inputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
-    """Expand block ids to vLLM's packed token buffer: tokens, the open block, a count column."""
-    block = inputs["index_block_size"]
-    query_lens = inputs["cu_seqlens_q"].diff()
+def query_positions(inputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return sequence ids and window-source positions, assuming queries are the last tokens."""
+    cu_seqlens_q = inputs["cu_seqlens_q"]
     token_to_req = torch.repeat_interleave(
-        torch.arange(len(query_lens), device=query_lens.device, dtype=torch.int32), query_lens
+        torch.arange(len(cu_seqlens_q) - 1, device=cu_seqlens_q.device, dtype=torch.int32),
+        cu_seqlens_q.diff(),
     )
-    rows = inputs["indices"].shape[0]
-    first_row = inputs["cu_seqlens_q"][token_to_req.long()]
-    positions = (
-        inputs["seqused_k"][token_to_req.long()]
-        - query_lens[token_to_req.long()]
-        + torch.arange(rows, device=first_row.device)
-        - first_row
-    )
-    selected = inputs["indices"]
-    tokens = (selected[:, :, None] * block + torch.arange(block, device=selected.device)).flatten(
-        1
-    )
-    tokens = torch.where(selected.repeat_interleave(block, dim=1) >= 0, tokens, -1)
+    requests = token_to_req.long()
+    rows = torch.arange(len(token_to_req), device=cu_seqlens_q.device)
+    return token_to_req, inputs["seqused_k"][requests] - (cu_seqlens_q[1:][requests] - rows)
+
+
+def vllm_operands(inputs: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack this benchmark's shared-source, size-zero-window inputs for native vLLM QSA.
+
+    Input selections must form the prefix described by ``topk_length``. Each output row holds
+    expanded entries, the query's incomplete-block entries, padding, and a final valid count.
+    """
+    block = inputs["index_block_size"]
+    token_to_req, positions = query_positions(inputs)
+    selected = inputs["indices"][:, :, None]
+    offsets = torch.arange(block, device=selected.device)
+    tokens = torch.where(selected >= 0, selected * block + offsets, -1).flatten(1)
     tail_start = (positions + 1) // block * block
-    tail = tail_start[:, None] + torch.arange(block - 1, device=selected.device)
+    tail = tail_start[:, None] + offsets[:-1]
     tail = torch.where(tail <= positions[:, None], tail, -1)
     counts = inputs["topk_length"] * block + (positions + 1 - tail_start)
     packed = torch.cat((tokens, torch.full_like(tail, -1), counts[:, None]), dim=1).to(torch.int32)
-    # vLLM stops after the valid-count tile. Keep the open block next to the valid
-    # selections, including when a short context does not fill the sparse budget.
-    tail_columns = inputs["topk_length"][:, None] * block + torch.arange(
-        block - 1, device=selected.device
-    )
+    # The count describes a prefix: incomplete-block entries must precede padding when a
+    # short context leaves part of the sparse budget unused.
+    tail_columns = inputs["topk_length"][:, None] * block + offsets[:-1]
     packed.scatter_(1, tail_columns.long(), tail.to(torch.int32))
     return packed, token_to_req
 
 
-def replay_times(functions: list[Callable[[], object]], replays: int, rounds: int) -> list[float]:
-    """Median microseconds per call over alternating CUDA graph replays."""
-    graphs = []
-    for function in functions:
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
+def capture(
+    function: Callable[[], object], repeats: int, before: Callable[[], object] | None = None
+) -> torch.cuda.CUDAGraph:
+    """Keep compilation and host launches outside replay timing by capturing warmed calls.
+
+    ``before`` runs inside the graph before every call, allowing per-call cache eviction.
+    """
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        function()
+        function()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(repeats):
+            if before is not None:
+                before()
             function()
-            function()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for _ in range(replays):
-                function()
-        graphs.append(graph)
-    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-    samples = [[] for _ in functions]
+    return graph
+
+
+def alternating_medians(
+    graphs: list[torch.cuda.CUDAGraph],
+    rounds: int,
+    sample: Callable[[torch.cuda.CUDAGraph], list[float]],
+) -> list[float]:
+    """Reduce replay-order bias by rotating the first graph; return each graph's sample median."""
+    samples = [[] for _ in graphs]
     for round_index in range(rounds):
         for i in range(len(graphs)):
             index = (i + round_index) % len(graphs)
-            graph, timings = graphs[index], samples[index]
-            graph.replay()
-            start.record()
-            graph.replay()
-            end.record()
-            torch.cuda.synchronize()
-            timings.append(start.elapsed_time(end) * 1000 / replays)
+            samples[index].extend(sample(graphs[index]))
     return [median(timings) for timings in samples]
+
+
+def replay_times(functions: list[Callable[[], object]], replays: int, rounds: int) -> list[float]:
+    """Return median microseconds per call, amortizing event timing over a warm graph replay."""
+    graphs = [capture(function, replays) for function in functions]
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+
+    def sample(graph: torch.cuda.CUDAGraph) -> list[float]:
+        graph.replay()
+        start.record()
+        graph.replay()
+        end.record()
+        torch.cuda.synchronize()
+        return [start.elapsed_time(end) * 1000 / replays]
+
+    return alternating_medians(graphs, rounds, sample)
 
 
 def cold_replay_times(
@@ -138,77 +165,54 @@ def cold_replay_times(
     metadata: list[torch.Tensor],
     rounds: int,
 ) -> list[float]:
-    """Median GPU span from first kernel start to last kernel end, excluding cache eviction.
+    """Return median attention spans in microseconds, excluding cache eviction and warmup reads.
 
-    Each captured invocation follows a 512 MiB read and metadata reads. CUPTI timestamps avoid
-    subtracting two large timings to recover a microsecond-scale attention duration. The span
-    includes the dependency gap between split and merge kernels, including overlapping PDL.
+    Each invocation follows a 512 MiB eviction read, then Q and routing-metadata reads. CUPTI
+    timestamps avoid subtracting two large timings to recover microsecond-scale attention
+    latency. First kernel start to last kernel end includes split/merge dependencies even when
+    programmatic dependent launch (PDL) overlaps their lifetimes.
     """
-    from torch.profiler import ProfilerActivity, profile
-
     flush = torch.empty(1 << 27, device="cuda", dtype=torch.float32)
     flush_out = torch.empty(1 << 10, device="cuda", dtype=torch.float32)
-    graphs = []
-    repeats = 8
-    for function in functions:
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            function()
-            function()
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            for _ in range(repeats):
-                torch.sum(flush.view(1 << 10, -1), dim=1, out=flush_out)
-                for tensor in metadata:
-                    tensor.sum()
-                function()
-        graphs.append(graph)
 
-    samples = [[] for _ in functions]
-    for round_index in range(rounds):
-        for i in range(len(graphs)):
-            index = (i + round_index) % len(graphs)
-            with profile(activities=[ProfilerActivity.CUDA]) as prof:
-                graphs[index].replay()
-                torch.cuda.synchronize()
-            kernels = sorted(
-                (e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA),
-                key=lambda e: e.time_range.start,
-            )
-            spans = []
-            span = None
-            for event in kernels:
-                # The only native PyTorch kernels in these graphs are the harness's reads.
-                if event.name.startswith(("void at::native::", "Memset")):
-                    if span is not None:
-                        spans.append(span[1] - span[0])
-                    span = None
-                elif span is None:
-                    span = [event.time_range.start, event.time_range.end]
-                else:
-                    span[1] = max(span[1], event.time_range.end)
-            if span is not None:
-                spans.append(span[1] - span[0])
-            if len(spans) != repeats:
-                raise RuntimeError(f"Expected {repeats} attention spans, found {len(spans)}.")
-            samples[index].extend(spans)
-    return [median(timings) for timings in samples]
+    def evict() -> None:
+        torch.sum(flush.view(1 << 10, -1), dim=1, out=flush_out)
+        for tensor in metadata:
+            tensor.sum()
+
+    def is_harness(event) -> bool:
+        # Only eviction/warmup uses native PyTorch kernels here; attention kernels are Triton.
+        return event.name.startswith(("void at::native::", "Memset"))
+
+    def sample(graph: torch.cuda.CUDAGraph) -> list[float]:
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            graph.replay()
+            torch.cuda.synchronize()
+        kernels = sorted(
+            (e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA),
+            key=lambda e: e.time_range.start,
+        )
+        spans = []
+        for harness, group in groupby(kernels, key=is_harness):
+            if not harness:
+                run = list(group)
+                spans.append(max(e.time_range.end for e in run) - run[0].time_range.start)
+        if len(spans) != COLD_REPEATS:
+            raise RuntimeError(f"Expected {COLD_REPEATS} attention spans, found {len(spans)}.")
+        return spans
+
+    graphs = [capture(function, COLD_REPEATS, before=evict) for function in functions]
+    return alternating_medians(graphs, rounds, sample)
 
 
 def logical_bytes(inputs: dict) -> int:
-    """Per-query logical traffic, including the causal tail of an incomplete index block."""
+    """Total logical bytes per decode call for this benchmark's equal-width K/V inputs.
+
+    Count every query's selected entries and incomplete-block tail without discounting reuse.
+    """
     query = inputs["query"]
     kv = inputs["kv"]
-    _, token_to_req = vllm_operands(inputs)
-    query_lens = inputs["cu_seqlens_q"].diff()
-    positions = (
-        inputs["seqused_k"][token_to_req.long()]
-        - query_lens[token_to_req.long()]
-        + torch.arange(query.shape[0], device=query.device)
-        - inputs["cu_seqlens_q"][token_to_req.long()]
-    )
+    _, positions = query_positions(inputs)
     block = inputs["index_block_size"]
     selected = int(inputs["topk_length"].sum())
     keys = selected * block + int(((positions + 1) % block).sum())
@@ -233,7 +237,12 @@ def main() -> None:
     parser.add_argument("--block-topk", type=int, default=512, help="Selected index blocks")
     parser.add_argument("--index-block-size", type=int, default=4)
     parser.add_argument("--vllm-root", help="vLLM checkout providing the native QSA kernel")
-    parser.add_argument("--replays", type=int, default=50)
+    parser.add_argument(
+        "--replays",
+        type=int,
+        default=50,
+        help=f"Calls per warm graph; ignored with --cold, which captures {COLD_REPEATS}",
+    )
     parser.add_argument("--rounds", type=int, default=9)
     parser.add_argument("--cold", action="store_true", help="Cold K/V, warm routing metadata")
     parser.add_argument("--peak-bandwidth-tbps", type=float, help="Advertised HBM bandwidth")

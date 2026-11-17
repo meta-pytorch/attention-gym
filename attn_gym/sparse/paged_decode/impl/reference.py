@@ -1,55 +1,54 @@
-"""Torch-only paged sparse decode reference implementation."""
+"""Eager PyTorch oracle that materializes each query's sparse and window entries."""
 
 from __future__ import annotations
+
+from typing import TYPE_CHECKING
 
 import torch
 from torch import Tensor
 
+if TYPE_CHECKING:
+    from ..api import PagedKV
 
-def _gather_rows(cache: Tensor, block_table_row: Tensor, positions: Tensor) -> Tensor:
-    """Read ``cache`` rows ``[n, kv_heads, dim]`` at logical ``positions`` of one sequence."""
-    page_size = cache.shape[1]
-    pages = block_table_row[positions // page_size].long()
-    return cache[pages, positions % page_size]
+
+def _rows(source: PagedKV, sequence: int, positions: Tensor) -> tuple[Tensor, Tensor]:
+    """Map sequence-local entries to physical pages and slots; retain order and duplicates."""
+    page_size = source.key_cache.shape[1]
+    pages = source.block_table[sequence, positions // page_size].long()
+    slots = positions % page_size
+    return source.key_cache[pages, slots], source.value_cache[pages, slots]
 
 
 def paged_sparse_decode(
     query: Tensor,
-    key_cache: Tensor,
-    value_cache: Tensor,
-    block_table: Tensor,
+    kv: PagedKV,
     indices: Tensor,
     cu_seqlens_q: Tensor,
     seqused_k: Tensor,
     topk_length: Tensor | None,
-    window_key_cache: Tensor | None,
-    window_value_cache: Tensor | None,
-    window_block_table: Tensor | None,
+    window_kv: PagedKV | None,
     attention_sink: Tensor | None,
     *,
     index_block_size: int,
     window_size: int,
     scale: float,
 ) -> tuple[Tensor, Tensor]:
-    """Build each query row's key set explicitly and attend in at least float32.
+    """Evaluate the API's key sets in float32, or float64 for float64 inputs.
 
-    Rows with no keys return zero output; their LSE is the sink logit, or ``-inf``.
+    Host reads and explicit gathers favor inspectable semantics over capture or performance.
     """
     compute_dtype = torch.promote_types(query.dtype, torch.float32)
     num_tokens, num_heads, _ = query.shape
-    kv_heads = key_cache.shape[2]
-    group = num_heads // kv_heads
-    shared_window = window_key_cache is None
-    if shared_window:
-        window_key_cache, window_value_cache = key_cache, value_cache
-        window_block_table = block_table
-    out = query.new_zeros(num_tokens, num_heads, value_cache.shape[-1])
+    group = num_heads // kv.key_cache.shape[2]
+    shared_window = window_kv is None
+    window_source = kv if shared_window else window_kv
+    out = query.new_zeros(num_tokens, num_heads, kv.value_cache.shape[-1])
     lse = torch.full(
-        (num_tokens, num_heads), float("-inf"), dtype=compute_dtype, device=query.device
+        (num_tokens, num_heads), float("-inf"), dtype=torch.float32, device=query.device
     )
     sink = None if attention_sink is None else attention_sink.to(compute_dtype)
-    sparse_capacity = block_table.shape[1] * key_cache.shape[1]
-    window_capacity = window_block_table.shape[1] * window_key_cache.shape[1]
+    sparse_capacity = kv.block_table.shape[1] * kv.key_cache.shape[1]
+    window_capacity = window_source.block_table.shape[1] * window_source.key_cache.shape[1]
     block_offsets = torch.arange(index_block_size, device=query.device)
     offsets = cu_seqlens_q.tolist()
     lengths = None if topk_length is None else topk_length.tolist()
@@ -59,7 +58,7 @@ def paged_sparse_decode(
         for row in range(start, end):
             position = num_keys - (end - row)
             if position < 0:
-                # More queries than keys: the row has no keys, not even sparse ones.
+                # Queries before position zero must not attend to sparse entries either.
                 window_start = window_end = width = 0
             else:
                 width = indices.shape[1] if lengths is None else lengths[row]
@@ -72,23 +71,16 @@ def paged_sparse_decode(
             blocks = indices[row, :width].long()
             blocks = blocks[blocks >= 0]
             entries = (blocks[:, None] * index_block_size + block_offsets).flatten()
-            # A shared source attends each key once: the window owns positions from its start.
-            limit = window_start if shared_window else sparse_capacity
-            entries = entries[entries < min(limit, sparse_capacity)]
+            # A shared source excludes sparse entries at or after the window start to avoid
+            # overlap. Duplicate selections before it retain their multiplicity.
+            limit = min(window_start, sparse_capacity) if shared_window else sparse_capacity
+            entries = entries[entries < limit]
 
-            keys, values = (
-                torch.cat(
-                    (
-                        _gather_rows(cache, block_table[sequence], entries),
-                        _gather_rows(window_cache, window_block_table[sequence], window_positions),
-                    )
-                ).to(compute_dtype)
-                for cache, window_cache in (
-                    (key_cache, window_key_cache),
-                    (value_cache, window_value_cache),
-                )
-            )
-            # [keys, kv_heads, dim] -> one key set per query head.
+            sparse_keys, sparse_values = _rows(kv, sequence, entries)
+            window_keys, window_values = _rows(window_source, sequence, window_positions)
+            keys = torch.cat((sparse_keys, window_keys)).to(compute_dtype)
+            values = torch.cat((sparse_values, window_values)).to(compute_dtype)
+            # Consecutive query heads in a group share the same KV head.
             keys = keys.repeat_interleave(group, dim=1)
             values = values.repeat_interleave(group, dim=1)
             logits = torch.einsum("hd,nhd->hn", query[row].to(compute_dtype), keys) * scale
@@ -100,4 +92,4 @@ def paged_sparse_decode(
             probabilities = torch.exp(logits - row_lse[:, None])[:, : keys.shape[0]]
             out[row] = torch.einsum("hn,nhd->hd", probabilities, values).to(out.dtype)
             lse[row] = row_lse
-    return out, lse.float()
+    return out, lse
