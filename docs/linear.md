@@ -65,6 +65,13 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
   direct paged-cache prefill on SM100-family GPUs (SM100, SM103, and SM107 with CuTeDSL 4.8+).
 - An inference-only fused recurrent implementation on CUDA, including mutable paged state caches
   shaped `[num_slots, H, V, K]` selected by `state_indices`.
+- Mid-sequence state checkpoints for paged prefill: `paged_chunk_gdn`, paged `recurrent_gdn`, and
+  `paged_chunk_kda` take `checkpoint_indices` and `checkpoint_lens`, and also store each
+  sequence's state after its first `checkpoint_lens` tokens into another pool slot, bitwise equal
+  to the state a call ending there would leave. Serving engines use them to snapshot a prefix's
+  state for their prefix cache without a second pass (for example SGLang's `extra_buffer` radix
+  cache, which keeps overlap scheduling). Chunk kernels store at 64-token boundaries; the
+  recurrent scan, and `paged_chunk_kda` with replay state, at any token count.
 - Autograd for the reference and fused chunk implementations, including initial-state gradients.
 - Q/K/V share one dtype. FP16 and BF16 inputs use FP32 recurrence math and state while returning
   output in the Q dtype.

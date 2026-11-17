@@ -53,8 +53,8 @@ torch.library.define(
     "attn_gym::gdn_chunk_fwd_packed_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
-    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune) "
-    "-> Tensor",
+    "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune, "
+    "Tensor? checkpoint_indices=None, Tensor? checkpoint_lens=None) -> Tensor",
 )
 _RECURRENT_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state, "
@@ -66,7 +66,8 @@ torch.library.define(
     "attn_gym::gdn_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale, "
-    "bool batch_invariant) -> Tensor",
+    "bool batch_invariant, Tensor? checkpoint_indices=None, Tensor? checkpoint_lens=None) "
+    "-> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_recurrent_decode",
@@ -230,7 +231,10 @@ def _chunk_fwd_packed_paged_fake(
     capacity: int,
     scale: float,
     autotune: bool,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    del checkpoint_indices, checkpoint_lens
     return torch.empty(v.shape, dtype=q.dtype, device=v.device)
 
 
@@ -345,9 +349,11 @@ def _recurrent_fwd_paged_fake(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     batch_invariant: bool,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
-    del batch_invariant
+    del batch_invariant, checkpoint_indices, checkpoint_lens
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -565,6 +571,8 @@ def paged_chunk_forward(
     has_initial_state: torch.Tensor | None,
     scale: float,
     autotune: bool,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Normalize inputs and advance selected state-cache slots with chunk GDN.
 
@@ -598,6 +606,8 @@ def paged_chunk_forward(
         metadata.capacity,
         scale,
         autotune,
+        checkpoint_indices,
+        checkpoint_lens,
     )
     return output.reshape(output_shape)
 
@@ -617,6 +627,8 @@ def recurrent_forward(
     has_initial_state: torch.Tensor | None,
     autotune: bool,
     batch_invariant: bool,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize inputs and invoke the fused recurrent GDN operator."""
     if q.shape[-1] > 256:
@@ -647,6 +659,8 @@ def recurrent_forward(
             cu_seqlens,
             scale,
             batch_invariant,
+            checkpoint_indices,
+            checkpoint_lens,
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()

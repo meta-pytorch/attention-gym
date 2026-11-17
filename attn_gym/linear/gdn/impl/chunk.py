@@ -328,6 +328,8 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     capacity: int,
     scale: float,
     autotune: bool,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run packed scalar GDN while advancing selected cache slots in place.
 
@@ -372,6 +374,8 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         has_initial_state=has_initial_state,
         output_final_state=False,
         metadata=metadata,
+        checkpoint_indices=checkpoint_indices,
+        checkpoint_lens=checkpoint_lens,
     )
     assert final_state is None
     return chunk_gdn_fwd_output_packed(

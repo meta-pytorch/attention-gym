@@ -10,6 +10,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     resolve_decode_out,
     resolve_scale,
+    validate_checkpoints,
     validate_decode_inputs,
     validate_paged_state,
 )
@@ -152,6 +153,8 @@ def paged_chunk_gdn(
     has_initial_state: torch.Tensor | None = None,
     scale: float | None = None,
     kernel_options: KernelOptions | None = None,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk GDN while advancing a paged state cache in place.
 
@@ -183,6 +186,16 @@ def paged_chunk_gdn(
             ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
             The recurrence that advances ``state_cache`` and the warpdrive backend always use
             fixed configurations.
+        checkpoint_indices: Optional contiguous int32 slot indices, one per logical sequence.
+            A positive entry also stores the sequence's state after its first
+            ``checkpoint_lens`` tokens into that ``state_cache`` slot, bitwise equal to the
+            state a call ending there would leave; non-positive entries store nothing.
+            Serving engines use it to snapshot a prefix's state mid-prefill (for example
+            SGLang's ``extra_buffer`` prefix cache). The slot must not be any sequence's
+            ``state_indices`` entry. Not supported by the warpdrive backend.
+        checkpoint_lens: Contiguous int32 token counts, one per logical sequence, required
+            with ``checkpoint_indices``. Each must be a positive multiple of 64 within the
+            sequence's complete 64-token chunks; other values store nothing.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -203,7 +216,10 @@ def paged_chunk_gdn(
     )
     scale = resolve_scale(scale, q.shape[-1])
     gate, beta, _ = cast_to_kernel_dtypes(gate, beta, None)
+    validate_checkpoints(q, cu_seqlens, state_indices, checkpoint_indices, checkpoint_lens)
     if options["backend"] == "warpdrive":
+        if checkpoint_indices is not None:
+            raise ValueError("the warpdrive backend does not support checkpoints")
         return warpdrive_paged_chunk_forward(
             q,
             k,
@@ -228,6 +244,8 @@ def paged_chunk_gdn(
         has_initial_state=has_initial_state,
         scale=scale,
         autotune=should_autotune(options["autotune"]),
+        checkpoint_indices=checkpoint_indices,
+        checkpoint_lens=checkpoint_lens,
     )
 
 
@@ -246,6 +264,8 @@ def recurrent_gdn(
     has_initial_state: torch.Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
     kernel_options: RecurrentKernelOptions | None = None,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent gated delta rule attention for decoding and inference prefill.
 
@@ -288,6 +308,13 @@ def recurrent_gdn(
             autotune cache states. That config still follows the batch shape:
             ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
             the batch.
+        checkpoint_indices: Optional contiguous int32 slots, one per logical sequence, with
+            ``state_indices`` only. A positive entry also stores the sequence's state after
+            its first ``checkpoint_lens`` tokens into that pool slot, bitwise equal to the
+            state a call ending there would leave; non-positive entries store nothing. The
+            slot must not be any sequence's ``state_indices`` entry.
+        checkpoint_lens: Contiguous int32 token counts, one per logical sequence, required
+            with ``checkpoint_indices``. Values outside ``[1, length]`` store nothing.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -315,6 +342,7 @@ def recurrent_gdn(
             raise ValueError("state_indices requires impl='fused'")
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
+    validate_checkpoints(q, cu_seqlens, state_indices, checkpoint_indices, checkpoint_lens)
 
     scale = q.shape[-1] ** -0.5 if scale is None else scale
     if selected_impl is Impl.FUSED:
@@ -332,6 +360,8 @@ def recurrent_gdn(
             has_initial_state=has_initial_state,
             autotune=should_autotune(options["autotune"]),
             batch_invariant=options["batch_invariant"],
+            checkpoint_indices=checkpoint_indices,
+            checkpoint_lens=checkpoint_lens,
         )
 
     return reference_delta_rule(

@@ -269,6 +269,85 @@ def chunk_forward(
     return output.reshape(output_shape).to(output_dtype), state
 
 
+def _store_replay_checkpoint_tails(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_cache: torch.Tensor,
+    replay_state: ReplayState,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    checkpoint_indices: torch.Tensor,
+    checkpoint_lens: torch.Tensor,
+) -> torch.Tensor:
+    """Store the replay part of each replay-prefill checkpoint, before the call
+    advances the slots; return the prefix-pass checkpoint lengths.
+
+    A checkpoint after ``checkpoint_lens`` new tokens is the logical state there: the
+    state at the last complete chunk before it, which the prefix pass stores, plus the
+    tokens after that chunk as the checkpoint slot's replay state. Those tokens are the
+    slot's replayed tokens followed by the new ones. A checkpoint before the prefix
+    pass's first chunk boundary keeps the slot's starting state.
+    """
+    replay_caches, replay_count = replay_state[:-1], replay_state[-1]
+    count_rows = replay_count.reshape(replay_count.shape[0], -1)
+    slots = state_indices.clamp(min=0).long()
+    replayed = count_rows[slots, 0]
+    if has_initial_state is not None:
+        replayed = torch.where(has_initial_state, replayed, 0)
+    active = checkpoint_indices > 0
+    # Entries without a checkpoint may hold any length.
+    total = torch.where(active, checkpoint_lens, 0) + replayed
+    boundary = total.div(_CHUNK_SIZE, rounding_mode="floor") * _CHUNK_SIZE
+    tail = total - boundary
+    checkpoint_rows = checkpoint_indices.clamp(min=0).long()
+
+    # The tail's tokens, at logical offsets [boundary, total) from the prefix pass start.
+    token = torch.arange(_CHUNK_SIZE, device=q.device)
+    offsets = boundary[:, None] + token
+    stored = active[:, None] & (token < tail[:, None])
+    from_replay = offsets < replayed[:, None]
+    num_tokens = q.shape[0] * q.shape[1]
+    input_rows = (cu_seqlens[:-1, None] + offsets - replayed[:, None]).clamp(0, num_tokens - 1)
+    replay_rows = offsets.clamp(max=_CHUNK_SIZE - 1)
+    sources = (
+        q.to(torch.bfloat16),
+        k.to(torch.bfloat16),
+        v.to(torch.bfloat16),
+        gate.float(),
+        beta.float(),
+    )
+    for source, cache in zip(sources, replay_caches, strict=True):
+        tokens = source.reshape(num_tokens, *source.shape[2:]).to(cache.dtype)
+        trailing = (1,) * (tokens.ndim - 1)
+        value = torch.where(
+            from_replay.view(*from_replay.shape, *trailing),
+            cache[slots[:, None], replay_rows],
+            tokens[input_rows],
+        )
+        cache[checkpoint_rows] = torch.where(
+            stored.view(*stored.shape, *trailing), value, cache[checkpoint_rows]
+        )
+    count_rows[checkpoint_rows, 0] = torch.where(
+        active, tail.to(count_rows.dtype), count_rows[checkpoint_rows, 0]
+    )
+
+    # Before the first chunk boundary, the checkpoint is the slot's starting state.
+    starting_state = state_cache[slots]
+    if has_initial_state is not None:
+        starting_state = torch.where(has_initial_state.view(-1, 1, 1, 1), starting_state, 0).to(
+            state_cache.dtype
+        )
+    keep_start = (active & (boundary == 0)).view(-1, 1, 1, 1)
+    state_cache[checkpoint_rows] = torch.where(
+        keep_start, starting_state, state_cache[checkpoint_rows]
+    )
+    return boundary.to(torch.int32)
+
+
 def paged_chunk_forward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -283,6 +362,8 @@ def paged_chunk_forward(
     autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     replay_state: ReplayState | None = None,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run paged chunk prefill or replay-backed decode."""
     _validate_fused_constraints(q, v)
@@ -304,10 +385,14 @@ def paged_chunk_forward(
             has_initial_state=has_initial_state,
             autotune=autotune,
             schedule=schedule,
+            checkpoint_indices=checkpoint_indices,
+            checkpoint_lens=checkpoint_lens,
         )
 
     replay_q, replay_k, replay_v, replay_gate, replay_beta, replay_count = replay_state
     if cu_seqlens is None and q.shape[1] == 1:
+        if checkpoint_indices is not None:
+            raise ValueError("replay-backed decode does not support checkpoints")
         (
             active_q,
             active_k,
@@ -361,6 +446,22 @@ def paged_chunk_forward(
 
     if cu_seqlens is None:
         cu_seqlens = torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device) * q.shape[1]
+    prefix_checkpoint_lens = None
+    if checkpoint_indices is not None:
+        prefix_checkpoint_lens = _store_replay_checkpoint_tails(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            cu_seqlens,
+            state_cache,
+            replay_state,
+            state_indices,
+            has_initial_state,
+            checkpoint_indices,
+            checkpoint_lens,
+        )
     (
         prefix_q,
         prefix_k,
@@ -404,6 +505,8 @@ def paged_chunk_forward(
         has_initial_state=has_initial_state,
         autotune=autotune,
         schedule=schedule,
+        checkpoint_indices=checkpoint_indices,
+        checkpoint_lens=prefix_checkpoint_lens,
     )
     tail_output, _ = chunk_forward(
         tail_q,
@@ -452,6 +555,8 @@ def _paged_chunk_state_forward(
     has_initial_state: torch.Tensor | None,
     autotune: bool,
     schedule: ScheduleRequest,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the original paged state-only chunk path."""
     output_dtype = q.dtype
@@ -483,6 +588,8 @@ def _paged_chunk_state_forward(
         metadata.chunk_offsets,
         autotune,
         schedule.value,
+        checkpoint_indices,
+        checkpoint_lens,
     )
     return output.reshape(output_shape).to(output_dtype)
 

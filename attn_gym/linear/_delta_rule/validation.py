@@ -242,12 +242,44 @@ def validate_paged_state(
     )
 
 
+def validate_checkpoints(
+    q: torch.Tensor,
+    cu_seqlens: torch.Tensor | None,
+    state_indices: torch.Tensor | None,
+    checkpoint_indices: torch.Tensor | None,
+    checkpoint_lens: torch.Tensor | None,
+) -> None:
+    """Validate the paged mid-sequence state snapshot tensors (one int32 per sequence).
+
+    Their values (slots, token counts) are device data, so they stay unchecked here.
+    """
+    if (checkpoint_indices is None) != (checkpoint_lens is None):
+        raise ValueError("checkpoint_indices and checkpoint_lens must be passed together")
+    if checkpoint_indices is None:
+        return
+    if state_indices is None:
+        raise ValueError("checkpoint_indices requires a paged state pool (state_indices)")
+    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
+    for name, tensor in (
+        ("checkpoint_indices", checkpoint_indices),
+        ("checkpoint_lens", checkpoint_lens),
+    ):
+        if (
+            tensor.shape != (num_sequences,)
+            or tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tensor.device != q.device
+        ):
+            raise ValueError(f"{name} must be contiguous int32 with shape ({num_sequences},)")
+
+
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
     "require_inference_only",
     "resolve_chunk_kernel_options",
     "resolve_decode_out",
     "resolve_scale",
+    "validate_checkpoints",
     "validate_decode_inputs",
     "validate_delta_rule_inputs",
     "validate_has_initial_state",

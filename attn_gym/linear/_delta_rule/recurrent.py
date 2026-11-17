@@ -177,6 +177,8 @@ def _recurrent_delta_rule_fwd_kernel(
     cu_seqlens,
     state_indices,
     has_initial_state,
+    checkpoint_indices,
+    checkpoint_lens,
     scale,
     T,
     N,
@@ -195,8 +197,12 @@ def _recurrent_delta_rule_fwd_kernel(
     SCALAR_GATE: tl.constexpr,
     PREFETCH: tl.constexpr,
     BATCH_INVARIANT: tl.constexpr,
+    USE_CHECKPOINTS: tl.constexpr = False,
 ):
     """Scan one sequence/head/value tile while retaining the FP32 state in registers.
+
+    With ``USE_CHECKPOINTS``, a sequence whose ``checkpoint_indices`` entry is positive also
+    stores its state after its first ``checkpoint_lens`` tokens into that pool slot.
 
     Programs are indexed by value head. With multi-value attention (MVA, ``HK < H``) each
     block of ``H // HK`` consecutive value heads reads one shared q/k head, while gates,
@@ -246,6 +252,15 @@ def _recurrent_delta_rule_fwd_kernel(
     else:
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 
+    if USE_CHECKPOINTS:
+        checkpoint_row = tl.load(checkpoint_indices + i_n)
+        # The token count before the snapshot; 0 (no snapshot) never matches.
+        checkpoint_len = tl.where(checkpoint_row > 0, tl.load(checkpoint_lens + i_n), 0)
+        p_checkpoint = ptr_offset(
+            (checkpoint_row.to(tl.int64), i_h, o_v[None, :], o_k[:, None]),
+            (state_batch_stride, V * K, K, 1),
+        )
+
     # Load key-indexed operands as [BK, BV] tiles in the state's layout; broadcasting [BK]
     # vectors costs a layout conversion per operand per token.
     o_k_tile = tl.broadcast_to(o_k[:, None], (BK, BV))
@@ -294,6 +309,8 @@ def _recurrent_delta_rule_fwd_kernel(
             b_state += b_k * b_delta[None, :]
             b_o = tl.sum(b_q * b_state, 0)
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
+        if USE_CHECKPOINTS:
+            tl.store(h0 + p_checkpoint, b_state, mask=m_kv & (i_t + 1 == checkpoint_len))
 
     if STORE_FINAL_STATE:
         tl.store(ht + p_state, b_state, mask=m_kv)
@@ -367,6 +384,8 @@ def launch_recurrent_delta_rule_fwd(
     gate_kind: GateKind,
     store_final_state: bool,
     state_indices: torch.Tensor | None = None,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     autotune: bool,
     batch_invariant: bool,
@@ -395,6 +414,11 @@ def launch_recurrent_delta_rule_fwd(
         state_indices: Optional per-sequence slot indices enabling paged mode. Active
             sequences must select distinct, positive, in-bounds slots; nonpositive entries
             are padding that produce zero output and leave the pool untouched.
+        checkpoint_indices: Optional per-sequence pool slots, paged mode only. A positive
+            entry also stores the sequence's state after its first ``checkpoint_lens``
+            tokens into that slot.
+        checkpoint_lens: Per-sequence token counts, required with ``checkpoint_indices``;
+            values outside ``[1, length]`` store nothing.
         has_initial_state: Optional per-sequence booleans qualifying paged slots. Pool
             allocators hand out slots without zeroing them, so a False entry marks garbage
             contents: the scan starts from zero and overwrites the slot, including for empty
@@ -419,6 +443,8 @@ def launch_recurrent_delta_rule_fwd(
     assert beta.shape == v.shape[:-1]
     assert all(tensor.is_contiguous() for tensor in (q, k, v, gate, beta))
     assert has_initial_state is None or state_indices is not None
+    assert (checkpoint_indices is None) == (checkpoint_lens is None)
+    assert checkpoint_indices is None or state_indices is not None
 
     batch, tokens, key_heads, key_dim = q.shape
     heads, value_dim = v.shape[2], v.shape[-1]
@@ -459,6 +485,8 @@ def launch_recurrent_delta_rule_fwd(
         cu_seqlens,
         state_indices,
         has_initial_state,
+        checkpoint_indices,
+        checkpoint_lens,
     )
     options: dict[str, Any] = {
         "scale": scale,
@@ -478,6 +506,7 @@ def launch_recurrent_delta_rule_fwd(
         "SCALAR_GATE": gate_kind is GateKind.SCALAR,
         "PREFETCH": prefetch,
         "BATCH_INVARIANT": batch_invariant,
+        "USE_CHECKPOINTS": checkpoint_indices is not None,
     }
     if batch_invariant:
         # Disable FMA fusion to avoid layout-dependent rounding.

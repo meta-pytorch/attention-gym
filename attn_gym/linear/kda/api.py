@@ -26,6 +26,7 @@ from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
     resolve_scale,
+    validate_checkpoints,
     validate_decode_inputs,
     validate_paged_state,
 )
@@ -211,6 +212,8 @@ def paged_chunk_kda(
     has_initial_state: torch.Tensor | None = None,
     kernel_options: KernelOptions | None = None,
     replay_state: ReplayState | None = None,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk KDA while advancing a paged state cache in place.
 
@@ -261,6 +264,20 @@ def paged_chunk_kda(
             intermediates. CUDA graph users such as vLLM must budget this workspace for every
             captured bucket. Graph replay may change packed offsets, slot routing, initialization
             flags, and replay counts while tensor shapes remain fixed to that bucket.
+        checkpoint_indices: Optional contiguous int32 slot indices, one per logical sequence.
+            A positive entry also stores the sequence's state after its first
+            ``checkpoint_lens`` tokens into that ``state_cache`` slot, bitwise equal to the
+            state a call ending there would leave; non-positive entries store nothing.
+            Serving engines use it to snapshot a prefix's state mid-prefill (for example
+            SGLang's ``extra_buffer`` prefix cache). The slot must not be any sequence's
+            ``state_indices`` entry. With ``replay_state``, the slot also receives the
+            snapshot's replay state (its tokens after the last complete chunk and their
+            count); replay-backed decode does not support checkpoints. Not supported by
+            the warpdrive backend.
+        checkpoint_lens: Contiguous int32 token counts, one per logical sequence, required
+            with ``checkpoint_indices``. Without ``replay_state``, a snapshot is stored only
+            at a positive multiple of 64 tokens within the sequence's complete 64-token
+            chunks; with it, at any count in ``[1, length]``.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -326,7 +343,10 @@ def paged_chunk_kda(
         if num_slots > 1 and replay_state.count.stride(0) == 0:
             raise ValueError("replay_state count tensor slots must not overlap")
         # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
+    validate_checkpoints(q, cu_seqlens, state_indices, checkpoint_indices, checkpoint_lens)
     if options.backend == "warpdrive":
+        if checkpoint_indices is not None:
+            raise ValueError("the warpdrive backend does not support checkpoints")
         return _warpdrive_paged_chunk_forward(
             q,
             k,
@@ -352,6 +372,8 @@ def paged_chunk_kda(
         autotune=should_autotune(options.autotune),
         schedule=options.schedule,
         replay_state=replay_state,
+        checkpoint_indices=checkpoint_indices,
+        checkpoint_lens=checkpoint_lens,
     )
 
 

@@ -160,6 +160,8 @@ def _finish_chunk_kda_fwd(
     autotune: bool,
     schedule: ScheduleRequest,
     fastmath: bool = False,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply an initial state and compose token outputs from prepared local factors."""
     with profiler_range("kda/triton/inter_chunk_state"):
@@ -175,6 +177,8 @@ def _finish_chunk_kda_fwd(
             output_final_state=output_final_state,
             metadata=metadata,
             fastmath=fastmath,
+            checkpoint_indices=checkpoint_indices,
+            checkpoint_lens=checkpoint_lens,
         )
     with profiler_range("kda/triton/output_composition"):
         output = chunk_gla_fwd_o_gk(
@@ -209,6 +213,8 @@ def _chunk_kda_fwd(
     autotune: bool,
     schedule: ScheduleRequest,
     fastmath: bool = False,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor, torch.Tensor]:
     """Run the optimized KDA core using an already selected chunk schedule."""
     factors = _prepare_chunk_kda_fwd(
@@ -236,6 +242,8 @@ def _chunk_kda_fwd(
         autotune=autotune,
         schedule=schedule,
         fastmath=fastmath,
+        checkpoint_indices=checkpoint_indices,
+        checkpoint_lens=checkpoint_lens,
     )
     return output, final_state, factors.aqk, factors.akk
 
@@ -442,6 +450,8 @@ def _chunk_kda_fwd_ragged_paged_cuda(
     chunk_offsets: torch.Tensor,
     autotune: bool,
     schedule: str,
+    checkpoint_indices: torch.Tensor | None = None,
+    checkpoint_lens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_paged_private_abi(
@@ -471,6 +481,8 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         autotune=autotune,
         schedule=ScheduleRequest(schedule),
         fastmath=True,
+        checkpoint_indices=checkpoint_indices,
+        checkpoint_lens=checkpoint_lens,
     )
     return output
 
