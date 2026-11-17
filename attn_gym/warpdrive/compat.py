@@ -43,6 +43,15 @@ def _remote(ptr: cute.Pointer, rank: ir.Value, loc, ip) -> ir.Value:
     return nvvm.mapa(dsmem, ptr.to_llvm_ptr(loc=loc, ip=ip), rank, loc=loc, ip=ip)
 
 
+# CuTeDSL 4.9 warns (DivmodMigration) that signed-integer `%` will switch from C remainder (the
+# sign of the dividend) to Python modulo (the sign of the divisor); `//` already floors. Every
+# compile_tvm_ffi compile pins the C remainder, which the kernels were written against, so the
+# flip cannot change generated code. Earlier versions have only that behavior and no option.
+if cutedsl_version_matches(">=4.9.0.dev1"):
+    COMPILE_OPTIONS = (cute.DivmodSemantics("legacy"),)
+else:
+    COMPILE_OPTIONS = ()
+
 # CuTeDSL 4.8's PipelineState.advance(count) takes a count; older versions advance one epoch.
 NATIVE_MULTI_ADVANCE = cutedsl_version_matches(">=4.8")
 
@@ -141,6 +150,7 @@ else:
 
 
 __all__ = [
+    "COMPILE_OPTIONS",
     "CUTEDSL_VERSION",
     "MIN_CUTEDSL_VERSION",
     "NATIVE_MULTI_ADVANCE",
