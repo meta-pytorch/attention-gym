@@ -133,6 +133,7 @@ def test_compile_tvm_ffi_enforces_the_compile_contract():
 
 def test_compile_tvm_ffi_adds_fake_stream_and_typed_option(monkeypatch):
     cute = pytest.importorskip("cutlass.cute")
+    from attn_gym.warpdrive.compat import COMPILE_OPTIONS
 
     fake_stream = object()
     fake_tensor = object()
@@ -165,7 +166,7 @@ def test_compile_tvm_ffi_adds_fake_stream_and_typed_option(monkeypatch):
 
     assert compile_tvm_ffi(entrypoint, fake_tensor) == "compiled"
     assert observed == {
-        "option": cute.EnableTVMFFI,
+        "option": (cute.EnableTVMFFI, *COMPILE_OPTIONS),
         "entrypoint": entrypoint,
         "args": (fake_tensor, fake_stream),
         "kwargs": {},
@@ -173,8 +174,8 @@ def test_compile_tvm_ffi_adds_fake_stream_and_typed_option(monkeypatch):
     }
 
     compile_tvm_ffi(entrypoint, fake_tensor, opt_level=2)
-    first, level = observed["option"]
-    assert first is cute.EnableTVMFFI and isinstance(level, cute.OptLevel)
+    *options, level = observed["option"]
+    assert options == [cute.EnableTVMFFI, *COMPILE_OPTIONS] and isinstance(level, cute.OptLevel)
 
 
 FIRST_NAN = struct.unpack("!d", bytes.fromhex("7ff8000000000001"))[0]

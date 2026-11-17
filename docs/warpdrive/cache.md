@@ -278,6 +278,12 @@ code, outside kernels and launch hot paths.
 For example, use `attn_gym.warpdrive.advance_state(state, n)` to advance a raw `PipelineState`
 by several epochs. Calling `state.advance(n)` directly requires CuTeDSL 4.8.
 
+CuTeDSL 4.9 plans to switch `%` on signed integers from C remainder (the sign of the dividend)
+to Python modulo (the sign of the divisor); `//` already floors in every version.
+`compile_tvm_ffi` pins the C remainder on 4.9 and later (`compat.COMPILE_OPTIONS`), so kernels
+keep their generated code and compile without the `DivmodMigration` warning. Write index math
+whose operands stay non-negative, where both semantics agree.
+
 The cache key includes the CuTeDSL version, so different versions can safely share a disk
 cache. For independent environment runs, give each environment its own `WARPDRIVE_CACHE_DIR`
 and `CUTE_DSL_CACHE_DIR` anyway.

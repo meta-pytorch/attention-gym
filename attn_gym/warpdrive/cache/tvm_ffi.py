@@ -103,7 +103,8 @@ def compile_tvm_ffi(
 
     Pass ``name=``, or expose ``get_name()`` on the entrypoint (class entrypoints do).
     ``opt_level`` is the CuTeDSL optimization level (``None`` is the compiler default). It
-    changes the generated code, so a caller that needs a specific level must pass it.
+    changes the generated code, so a caller that needs a specific level must pass it. Every
+    compile also passes ``compat.COMPILE_OPTIONS``, which pins C semantics for signed ``%``.
     """
     if name is None:
         get_name = getattr(entrypoint, "get_name", None)
@@ -120,14 +121,16 @@ def compile_tvm_ffi(
 
     from cutlass import cute
 
+    from attn_gym.warpdrive.compat import COMPILE_OPTIONS
+
     # A class entrypoint's jit wrapper is its `__call__`.
     jit_wrapper = entrypoint if hasattr(entrypoint, "set_name_prefix") else entrypoint.__call__
     jit_wrapper.set_name_prefix(name)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    if opt_level is None:
-        compile_fn = cute.compile[cute.EnableTVMFFI]
-    else:
-        compile_fn = cute.compile[cute.EnableTVMFFI, cute.OptLevel(opt_level)]
+    options = (cute.EnableTVMFFI, *COMPILE_OPTIONS)
+    if opt_level is not None:
+        options += (cute.OptLevel(opt_level),)
+    compile_fn = cute.compile[options]
     return compile_fn(
         entrypoint,
         *compile_args,
