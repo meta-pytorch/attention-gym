@@ -19,7 +19,7 @@ self.acc = Ring(1, Umma, Threads)
 You (your agent) still choose the tiles, layouts, warps and register budgets. warpdrive handles the barrier
 counts and phases, role dispatch and TMEM allocation/free. The individual warps bodies are ordinary CuTeDSL.
 
-Requires `nvidia-cutlass-dsl` 4.6.2 or newer (tested on 4.6, 4.7 and 4.8).
+Requires `nvidia-cutlass-dsl` 4.6.2 through 4.8 (tested on 4.6, 4.7 and 4.8; 4.9 is not supported yet).
 
 **Start with [Write a kernel](../../docs/warpdrive/writing-kernels.md):** run the complete GEMM, define a work
 item, connect the roles, and validate the handoffs. The [safety contract](../../docs/warpdrive/guarantees.md) explains
