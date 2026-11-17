@@ -9,6 +9,7 @@ from .gather_attn import (
     gather_attn,
 )
 from .indexer import IndexerKernelOptions, lightning_indexer
+from .paged_decode import PagedKV, PagedSparseDecodeAux, paged_sparse_decode
 
 __all__ = [
     "AuxRequest",
@@ -16,7 +17,10 @@ __all__ = [
     "GatherAttnKernelOptions",
     "Impl",
     "IndexerKernelOptions",
+    "PagedKV",
+    "PagedSparseDecodeAux",
     "RopePair",
     "gather_attn",
     "lightning_indexer",
+    "paged_sparse_decode",
 ]
