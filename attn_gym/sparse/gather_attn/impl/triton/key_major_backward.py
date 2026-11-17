@@ -11,9 +11,7 @@ import torch
 import triton
 import triton.language as tl
 
-from attn_gym._backends.triton.utils import ptr_offset
-
-from .primitives import offset_strides
+from attn_gym._backends.triton.utils import offset_strides, ptr_offset
 
 
 @triton.jit

@@ -8,7 +8,12 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.tune import TritonTuner, tuning_key
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    can_use_tma,
+    offset_strides,
+    ptr_offset,
+    requires_int64_offsets,
+)
 
 from ..routing import uses_grouped_schedule
 from .dense_backward import BWD_DQ_DENSE, BWD_DSPARSE_KV_DENSE, document_key_tiles
@@ -22,7 +27,6 @@ from .primitives import (
     dense_tile_shape,
     load_bhsd,
     load_document_bounds,
-    offset_strides,
     optional_strides,
     plan_dense_tiles,
     prune_wide_backward_configs,

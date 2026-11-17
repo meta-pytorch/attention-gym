@@ -6,7 +6,12 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from attn_gym._backends.triton.tune import TritonTuner, tuning_key
-from attn_gym._backends.triton.utils import can_use_tma, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    can_use_tma,
+    offset_strides,
+    ptr_offset,
+    requires_int64_offsets,
+)
 
 from ..routing import require_grouped_schedule, uses_grouped_schedule
 from .primitives import (
@@ -20,7 +25,6 @@ from .primitives import (
     in_dense_tile,
     load_bhsd,
     load_document_bounds,
-    offset_strides,
     online_softmax_update,
     optional_strides,
     plan_dense_tiles,

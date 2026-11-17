@@ -9,13 +9,12 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.triton.tune import TritonTuner, tuning_key
-from attn_gym._backends.triton.utils import ptr_offset
+from attn_gym._backends.triton.utils import offset_strides, ptr_offset
 
 from .primitives import (
     head_block_heads,
     in_dense_tile,
     load_document_bounds,
-    offset_strides,
     prune_wide_backward_configs,
 )
 

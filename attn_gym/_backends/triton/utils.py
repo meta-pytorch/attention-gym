@@ -41,6 +41,15 @@ def exp2(x, FASTMATH: tl.constexpr = True):
 
 
 @triton.jit
+def offset_strides(strides, USE_INT64_OFFSETS: tl.constexpr):
+    """Select address width before multiplying runtime strides and indices."""
+    result = ()
+    for axis in tl.static_range(len(strides)):
+        result += (tl.cast(strides[axis], tl.int64 if USE_INT64_OFFSETS else tl.int32),)
+    return result
+
+
+@triton.jit
 def ptr_offset(indices, strides):
     """Compute a broadcasted linear offset from index and stride tuples.
 
