@@ -702,12 +702,18 @@ def test_chunk_kda_single_sequence_metadata_matches_dense_path():
     torch.manual_seed(17)
     dense_inputs = _inputs(tokens=128, heads=2, initial_state=True)
     explicit_inputs = _clone_inputs(dense_inputs)
+    # Pinned: the dense and ragged lowerings have different tuning keys, so timing noise could
+    # pick different backward tiles for each and change gradient bits.
+    pinned = {"autotune": False}
 
-    dense_output, dense_state = chunk_kda(*dense_inputs, output_final_state=True)
+    dense_output, dense_state = chunk_kda(
+        *dense_inputs, output_final_state=True, kernel_options=pinned
+    )
     explicit_output, explicit_state = chunk_kda(
         *explicit_inputs,
         cu_seqlens=torch.tensor([0, 128], device="cuda", dtype=torch.int32),
         output_final_state=True,
+        kernel_options=pinned,
     )
     assert dense_state is not None and explicit_state is not None
     torch.testing.assert_close(explicit_output, dense_output, rtol=0, atol=0)
