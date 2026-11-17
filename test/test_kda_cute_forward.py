@@ -977,8 +977,9 @@ def test_chunk_kda_op_registration(dtype):
     torch.library.opcheck(chunk_fwd_with_state_op, args, rtol=2e-2, atol=2e-3)
 
 
+@pytest.mark.parametrize("checkpoints", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_chunk_kda_paged_op_registration(state_dtype: torch.dtype):
+def test_chunk_kda_paged_op_registration(state_dtype: torch.dtype, checkpoints: bool):
     """Validate the mutating paged schema, fake tensor, and AOT behavior."""
     torch.manual_seed(37)
     q, k, v, cumulative_gate, beta = (tensor.detach() for tensor in _inputs(tokens=128, heads=2))
@@ -1003,6 +1004,14 @@ def test_chunk_kda_paged_op_registration(state_dtype: torch.dtype):
             metadata.chunk_offsets,
             True,
             "auto",
+            *(
+                (
+                    torch.tensor([3, 0], device="cuda", dtype=torch.int32),
+                    torch.tensor([64, 0], device="cuda", dtype=torch.int32),
+                )
+                if checkpoints
+                else ()
+            ),
         ),
         rtol=2e-2,
         atol=2e-3,

@@ -274,8 +274,9 @@ def test_fused_recurrent_packed_paged_empty_sequences():
     torch.testing.assert_close(state_cache[preserved], original_cache[preserved])
 
 
+@pytest.mark.parametrize("checkpoints", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_fused_recurrent_paged_registration(state_dtype: torch.dtype):
+def test_fused_recurrent_paged_registration(state_dtype: torch.dtype, checkpoints: bool):
     q, k, v, gate, beta, _state = make_inputs(batch=1, tokens=3)
     state_cache = torch.randn(
         3, q.shape[2], v.shape[-1], q.shape[-1], device="cuda", dtype=state_dtype
@@ -296,6 +297,14 @@ def test_fused_recurrent_paged_registration(state_dtype: torch.dtype):
             None,
             q.shape[-1] ** -0.5,
             False,
+            *(
+                (
+                    torch.tensor([1], device="cuda", dtype=torch.int32),
+                    torch.tensor([2], device="cuda", dtype=torch.int32),
+                )
+                if checkpoints
+                else ()
+            ),
         ),
     )
 

@@ -423,8 +423,9 @@ def test_paged_chunk_rejects_unsupported_qkv_dtype(dtype: torch.dtype):
         )
 
 
+@pytest.mark.parametrize("checkpoints", [False, True])
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
-def test_paged_chunk_raw_operator_registration(state_dtype: torch.dtype):
+def test_paged_chunk_raw_operator_registration(state_dtype: torch.dtype, checkpoints: bool):
     """Validate mutation, fake output layout, and dynamic AOT dispatch."""
     q, k, v, gate, beta, _state = make_inputs(tokens=128, key_heads=1, value_heads=2)
     v = token_strided_like(v)
@@ -453,6 +454,14 @@ def test_paged_chunk_raw_operator_registration(state_dtype: torch.dtype):
             metadata.capacity,
             128**-0.5,
             True,
+            *(
+                (
+                    torch.tensor([2, 0], device="cuda", dtype=torch.int32),
+                    torch.tensor([64, 0], device="cuda", dtype=torch.int32),
+                )
+                if checkpoints
+                else ()
+            ),
         ),
     )
 
