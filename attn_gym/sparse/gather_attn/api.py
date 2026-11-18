@@ -391,14 +391,14 @@ def gather_attn(
             CuTe backward recomputes attention probabilities; False saves them in forward
             instead (BF16, tokens x heads x keys, with backend padding). Triton always
             recomputes and ignores this option. Deterministic mode selects Triton
-            automatically, but nonempty paired RoPE has no strict deterministic backward
-            there. "autotune" (default True): Triton kernels benchmark candidate
-            configurations on first use and reuse the cached winner. Candidates differ in
+            automatically, including paired RoPE backward. "autotune" (default True):
+            Triton kernels benchmark candidate configurations on first use and reuse the
+            cached winner. Candidates differ in
             floating-point order; False, or deterministic mode, launches each kernel's
             pinned configuration instead. CuTe has one schedule and ignores this option.
             Explicit backend requests are honored; execution failures are never
             retried on another backend. Impl.REFERENCE validates the options
-            and ignores them. Bare and zero-width paired shared-KV Triton backward, and
+            and ignores them. Shared-KV Triton backward, including paired RoPE, and
             the grouped schedule's sparse dK/dV for sparse selections over small heads,
             accumulate with nondeterministic atomics unless deterministic algorithms
             are enabled.

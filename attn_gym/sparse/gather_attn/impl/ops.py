@@ -148,8 +148,8 @@ def _gather_attn_fwd_cuda(
                 autotune=should_autotune(autotune),
             )
             if needs_backward:
-                # Only full-width backward uses the reverse map, including when determinism
-                # is enabled after forward. The grouped backward builds its own key-major map.
+                # Save the full-width reverse map even if determinism is enabled after forward.
+                # Paired and grouped backward build their own maps when needed.
                 needs_map = (query_rope is None or query_rope.shape[-1] == 0) and not (
                     uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None)
                 )
