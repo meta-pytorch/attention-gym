@@ -895,6 +895,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 t, split = self.attn_token(b)
                 pos = p.step[t, 1]
                 blk0, blk1 = self.split_blocks(pos, split)
+                # The last split always runs: it takes the new token (and has blocks for pos > 0).
                 if (blk0 == blk1) & (split != self.splits - 1):
                     self.publish_empty_partial(p, layer, a, split, t, epoch, tid)
                 else:
@@ -1038,11 +1039,25 @@ class QwenDecodeMegakernel(WarpSpecialized):
         return t, b - t * self.splits
 
     @cute.jit
-    def split_blocks(self, pos, split):
-        """KV blocks ``[blk0, blk1)`` of positions ``[0, pos)`` that ``split`` reads."""
+    def split_layout(self, pos):
+        """``(blocks, per, empty)``: the KV blocks of positions ``[0, pos)``, the most one split
+        reads (at least 1), and the splits before the first that reads any (``split_blocks``)."""
         blocks, per = self.kv_blocks(pos)
-        blk0 = split * per
-        blk1 = cutlass.min(blk0 + per, blocks)
+        per = cutlass.max(per, 1)
+        return blocks, per, self.splits - (blocks + per - 1) // per
+
+    @cute.jit
+    def split_blocks(self, pos, split):
+        """KV blocks ``[blk0, blk1)`` of positions ``[0, pos)`` that ``split`` reads: ``per`` blocks
+        each from the start, shifted to later splits by the splits that would otherwise be left
+        empty at the end. For pos > 0 the last split (which also takes the new token) then reads
+        the final, remainder chunk, and the empty splits are the first ones. Left at the end, an
+        empty last split's compute warps waited about 6 us in the lane merge after its empty
+        block loop, in more than half the layers (Rubin, cuda_core, 0.6B at ctx 128; bisected
+        with barriers, cause not identified)."""
+        blocks, per, empty = self.split_layout(pos)
+        blk0 = cutlass.max((split - empty) * per, 0)
+        blk1 = cutlass.min((split - empty + 1) * per, blocks)
         return blk0, cutlass.max(blk1, blk0)
 
     @property
@@ -1540,10 +1555,10 @@ class QwenDecodeMegakernel(WarpSpecialized):
     @cute.jit
     def publish_empty_partial(self, p: MegakernelParams, layer, group, split, t, epoch, tid):
         """An attention row whose split has no KV blocks at this position (short contexts leave
-        most splits empty) and does not hold the new token (the last split): its partial is empty,
-        m = -1e30 and l = 0 (zero weight in o_proj's merge) and O = 0, published at once without
-        waiting for QKV. Such a split never appends the new K/V row: that is the split whose
-        block holds pos, or the last split when pos starts a new block."""
+        the first splits empty; ``split_blocks``) and does not hold the new token (the last split):
+        its partial is empty, m = -1e30 and l = 0 (zero weight in o_proj's merge) and O = 0,
+        published at once without waiting for QKV. For pos > 0 the last split, which appends the
+        new K/V row, always has blocks."""
         heads = self.per_row
         if tid < heads * HEAD_DIM:
             hq = tid // HEAD_DIM
@@ -1677,13 +1692,17 @@ class QwenDecodeMegakernel(WarpSpecialized):
                             for hq in cutlass.range_constexpr(heads):
                                 for e in cutlass.range_constexpr(16):
                                     o[hq, e] = o[hq, e] + pr[hq, i] * vv[e]
-        # Append the new K/V row at pos. Only the split whose KV block holds pos TMA-loads that
-        # row (masked above), and it stores after its own loads completed, so no async-proxy
-        # read races the generic store. When pos starts a new block, no split reads it.
-        blocks, per = self.kv_blocks(pos)
-        writer = cutlass.select_(pos // BLOCK < blocks, pos // BLOCK // per, self.splits - 1)
-        # Of the kv head's groups, the first writes. The others read the block too but mask
-        # pos (K scores select -inf, V is skipped), so the racing store's value never matters.
+        # Append the new K/V row at pos. pos is in the final block, which only last-split rows
+        # TMA-load, or starts a new block no row reads. Of the kv head's groups, the first one's
+        # last-split row stores, after its own loads completed. The other groups' last-split rows
+        # may read the block concurrently but mask pos (K scores select -inf, V is skipped), so
+        # the racing store's value never matters.
+        # The writer is the last split, but naming it ``split == splits - 1`` (the ``last`` test
+        # below) measured 2% slower on 8B steps at ctx 1024 (code generation): derive it from pos.
+        blocks, per, empty = self.split_layout(pos)
+        writer = cutlass.select_(
+            pos // BLOCK < blocks, pos // BLOCK // per + empty, self.splits - 1
+        )
         if (split == writer) & (group * heads % self.group_size == 0):
             if tid < 8:  # warp 0, lane group 0
                 row = ((t * self.layers + layer) * self.kv_heads + kvh) * max_len + pos

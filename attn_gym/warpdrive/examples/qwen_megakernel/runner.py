@@ -52,8 +52,8 @@ consumer, down's by its last split); attention scores round like the eager matmu
 softmax merges flash-decoding partials in fp32.
 
 Every per-step intermediate has its own per-layer buffer, so a launch has no write-after-read
-hazards. The new K/V row at ``pos`` is written by the one attention row whose TMA-loaded block
-holds it (masked), after those loads completed.
+hazards. The new K/V row at ``pos`` is written by the last KV split of the kv head's first
+attention row group, after its own loads of the final block (which mask it) completed.
 
 The step is latency-bound: about 140 dependent phases, each paying input propagation plus its
 row's latency (docs/warpdrive/examples.md). ``QwenMegakernel(trace="globaltimer")``
