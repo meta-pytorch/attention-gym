@@ -8,6 +8,7 @@ from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_backend,
     resolve_chunk_kernel_options,
     resolve_decode_out,
     resolve_scale,
@@ -76,19 +77,18 @@ def chunk_gdn(
             unspecified.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         output_final_state: Return the final recurrent state with the output.
-        impl: ``"fused"`` (default) uses the repo-local scalar chunk pipeline on CUDA
-            capability 8.0+ with FP16/BF16 QKV and equal ``K = V`` of 64 or 128;
-            ``"reference"`` uses eager PyTorch.
-        kernel_options: Backend-specific options for fused execution. The repo-local path is the
-            default; ``{"backend": "warpdrive"}`` selects the optional warpdrive backend.
-            ``split_forward`` and ``split_backward`` opt into its approximate
-            forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
-            for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
-            (default ``True``) benchmarks candidate configurations of the Triton fused
-            kernels; winners are cached and reused. When ``False``, and always under
-            ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
-            fixed configurations, so bits repeat across processes and winner-cache states on
-            one GPU model and software stack. The warpdrive backend always uses its fixed schedule.
+        impl: ``"fused"`` (default) uses the optimized chunk kernels that
+            ``kernel_options["backend"]`` selects, on CUDA capability 8.0+ with FP16/BF16 QKV
+            and equal ``K = V`` of 64 or 128; ``"reference"`` uses eager PyTorch.
+        kernel_options: ``"backend": "auto"`` (default) uses warpdrive on supported SM100-family
+            GPUs with CuTeDSL installed, and Triton elsewhere. Select ``"fused"`` or
+            ``"warpdrive"`` to require that backend (see "Chunk backend selection" in
+            ``docs/linear.md``). With an explicit warpdrive backend,
+            ``split_forward`` and ``split_backward`` enable approximate forgetting-horizon
+            schedules for calls without an initial or returned state (see
+            :class:`attn_gym.linear.types.SplitOptions`). Triton benchmarks candidate
+            configurations by default; ``"autotune": False`` or deterministic algorithms pin the
+            forward and backward configurations. Warpdrive selects a plan without benchmarking.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -99,7 +99,7 @@ def chunk_gdn(
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
         gate, beta, initial_state = cast_to_kernel_dtypes(gate, beta, initial_state)
-        if options["backend"] == "warpdrive":
+        if resolve_chunk_backend(options["backend"], q) == "warpdrive":
             return warpdrive_chunk_forward(
                 q,
                 k,
@@ -179,18 +179,15 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend. Split schedules
-            are not supported. ``"autotune"`` (default ``True``) benchmarks candidate
-            configurations of the Triton factor and output kernels. When ``False``, and
-            always under ``torch.use_deterministic_algorithms(True)``, they launch fixed
-            configurations. The recurrence that advances ``state_cache`` and the warpdrive
-            backend always use fixed configurations.
+        kernel_options: Backend selection follows ``chunk_gdn``. Paged execution does not support
+            split schedules. Set ``"autotune": False`` or enable deterministic algorithms to pin
+            the Triton factor and output kernels. The recurrence that advances
+            ``state_cache`` never tunes; neither does warpdrive.
 
         state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
             state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
-            semantics.
-            Requires the fused backend.
+            semantics. Runs on the fused backend: ``"auto"`` selects it, and ``"warpdrive"``
+            raises.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -210,11 +207,14 @@ def paged_chunk_gdn(
         has_initial_state,
     )
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    if state_checkpoints is not None and options["backend"] != "fused":
+    backend = resolve_chunk_backend(
+        options["backend"], q, fused_only=state_checkpoints is not None
+    )
+    if state_checkpoints is not None and backend != "fused":
         raise ValueError("state_checkpoints requires the fused backend")
     scale = resolve_scale(scale, q.shape[-1])
     gate, beta, _ = cast_to_kernel_dtypes(gate, beta, None)
-    if options["backend"] == "warpdrive":
+    if backend == "warpdrive":
         return warpdrive_paged_chunk_forward(
             q,
             k,

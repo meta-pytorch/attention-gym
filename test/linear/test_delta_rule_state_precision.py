@@ -57,7 +57,7 @@ _FP32_CARRY_RTOL = 1e-5
 _FAMILIES = ("gdn", "kda")
 _DTYPES = (pytest.param(torch.bfloat16, id="bf16"), pytest.param(torch.float16, id="fp16"))
 _BACKENDS = (
-    pytest.param(None, id="fused"),
+    pytest.param({"backend": "fused"}, id="fused"),
     pytest.param({"backend": "warpdrive"}, id="warpdrive", marks=_WARPDRIVE_SKIP),
 )
 

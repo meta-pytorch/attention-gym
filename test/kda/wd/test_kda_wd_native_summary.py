@@ -455,7 +455,7 @@ def test_native_reverse_matches_fp64(dtype: torch.dtype, gate_value: float) -> N
         for transpose in (False, True)
     ]
     prepared = chunk_kda_prepare(
-        *inputs, cu_seqlens=cu, scale=scale, kernel_options={"autotune": False}
+        *inputs, cu_seqlens=cu, scale=scale, kernel_options={"backend": "fused", "autotune": False}
     )
     backward = chunk_kda_prepare_backward(
         prepared.saved, do, None, scale=scale, kernel_options={"autotune": False}

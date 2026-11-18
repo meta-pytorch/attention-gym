@@ -20,6 +20,11 @@ GATE_LOWER_BOUND_SAFETY_MARGIN = 1e-3
 MAX_GATE_LOWER_BOUND_MAGNITUDE = (
     FP32_EXPONENT_BUDGET / (GATE_SPAN_STEPS * LOG2_E) - GATE_LOWER_BOUND_SAFETY_MARGIN
 )
+# Empirical warpdrive training limit for a uniform per-token gate, not a finiteness guarantee;
+# narrower than Triton's MAX_GATE_LOWER_BOUND_MAGNITUDE. Near this limit gradients lose accuracy
+# before the inverse chunk decay overflows. bound_gate's default floor of -5 fits both.
+# See the KDA gate contract in docs/linear.md.
+WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE = 5.25
 
 
 __all__ = [
@@ -29,4 +34,5 @@ __all__ = [
     "LN2",
     "LOG2_E",
     "MAX_GATE_LOWER_BOUND_MAGNITUDE",
+    "WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE",
 ]

@@ -102,7 +102,7 @@ def test_reference_api_imports_without_optional_kernel_dependencies():
                 compiled = torch.compile(paged_chunk_kda, backend=counter, fullgraph=True)
                 output = compiled(
                     q, q, q, gate, beta, state, indices,
-                    replay_state=replay, kernel_options={"autotune": False},
+                    replay_state=replay, kernel_options={"backend": "fused", "autotune": False},
                 )
                 if counter.frame_count != 1:
                     raise RuntimeError("paged KDA must trace as one graph")
@@ -172,7 +172,7 @@ def test_chunk_kda_cold_public_fullgraph_compile():
         beta = torch.rand(shape[:3], device='cuda')
 
         compiled = torch.compile(chunk_kda, fullgraph=True)
-        compiled(q, k, v, gate, beta, kernel_options={"autotune": False})
+        compiled(q, k, v, gate, beta, kernel_options={"backend": "fused", "autotune": False})
         torch.cuda.synchronize()
         """
     )

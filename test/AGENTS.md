@@ -25,8 +25,9 @@ either metric alone can hide a different class of regression.
 The repo advertises portable fallbacks (Triton, reference) next to optional fast paths
 (CuTeDSL warpdrive on sm100). A test must not assume the fast path is selected just because the
 shape qualifies: gate fast-path-only tests with a module-level capability marker (see
-`requires_warpdrive` in `test/test_delta_rule_stages.py`) so the portable route is tested on
-machines without the optional dependency.
+`requires_warpdrive` in `test/test_delta_rule_stages.py`). Use `fused_chunk_default` when testing
+Triton kernels, even on SM100-family GPUs. Test backend selection separately in
+`test/test_linear_default_backend.py`, including the case where CuTeDSL is not installed.
 
 Extreme-input tests must compare values, including every gradient, against the reference, not
 only `isfinite`. Overflow-safe rewrites (`max(z, 0) + log1p(exp(-|z|))`) and cancellation-prone

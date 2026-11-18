@@ -130,6 +130,16 @@ def release_cuda_memory() -> Iterator[None]:
 
 
 @pytest.fixture
+def fused_chunk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep chunk tests that omit the backend on Triton, even when auto would select warpdrive."""
+    from attn_gym.linear import types
+
+    for spec in (types.SPLIT_OPTION_SPEC, types.KERNEL_OPTION_SPEC):
+        accepted, _ = spec["backend"]
+        monkeypatch.setitem(spec, "backend", (accepted, "fused"))
+
+
+@pytest.fixture
 def traced_compiles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep this test's compiles out of the jit_cache disk cache (``CUTE_DSL_NO_CACHE``).
 
