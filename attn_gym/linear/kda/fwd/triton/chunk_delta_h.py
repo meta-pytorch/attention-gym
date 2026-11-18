@@ -38,7 +38,11 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_sequence_work,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
-from attn_gym.linear._delta_rule.validation import validate_state_checkpoints
+from attn_gym.linear._delta_rule.validation import (
+    state_checkpoint_op_args,
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints,
+)
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
@@ -56,9 +60,7 @@ def _run_chunk_delta_h_sequence(
     gk_desc,
     h0,
     ht,
-    checkpoint_states,
-    cu_checkpoint_offsets,
-    CHECKPOINT_EVERY_CHUNKS,
+    checkpoints,
     state_indices,
     has_initial_state,
     cu_seqlens,
@@ -83,7 +85,6 @@ def _run_chunk_delta_h_sequence(
     NUM_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    STORE_CHECKPOINTS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
@@ -161,11 +162,12 @@ def _run_chunk_delta_h_sequence(
             tl.float32,
         )
 
-    if STORE_CHECKPOINTS:
-        checkpoint_row = tl.load(cu_checkpoint_offsets + i_n)
+    if checkpoints is not None:
+        checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n)
         if USE_INT64_OFFSETS:
             checkpoint_row = checkpoint_row.to(tl.int64)
-        next_checkpoint_chunk = CHECKPOINT_EVERY_CHUNKS
+        checkpoint_chunks = checkpoints.every_n_tokens // BT
+        next_checkpoint_chunk = checkpoint_chunks
 
     for i_t in tl.range(0, NT_full, warp_specialize=WARP_SPECIALIZE, num_stages=NUM_STAGES):
         chunk = boh + i_t
@@ -190,16 +192,16 @@ def _run_chunk_delta_h_sequence(
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
-        if STORE_CHECKPOINTS:  # noqa: SIM102 - keep optional counters inside their constexpr guard
+        if checkpoints is not None:  # noqa: SIM102 - optional counters need their constexpr guard
             # Store the post-chunk FP32 accumulator, not the rounded chunk-entry tape.
             if i_t + 1 == next_checkpoint_chunk:
                 p_checkpoint = ptr_offset(
                     (checkpoint_row, i_h, o_v[None, :], o_k[:, None]),
                     (H * V * K, V * K, K, 1),
                 )
-                tl.store(checkpoint_states + p_checkpoint, b_h)
+                tl.store(checkpoints.states + p_checkpoint, b_h)
                 checkpoint_row += 1
-                next_checkpoint_chunk += CHECKPOINT_EVERY_CHUNKS
+                next_checkpoint_chunk += checkpoint_chunks
 
     if NT_full < NT:
         # Peeled partial tail chunk: masked pointers keep the loads and the
@@ -249,7 +251,7 @@ def _run_chunk_delta_h_sequence(
         )
 
 
-@triton.jit(do_not_specialize=["T", "CHECKPOINT_EVERY_CHUNKS"])
+@triton.jit(do_not_specialize=["T"])
 def chunk_delta_h_kernel(
     k_desc,
     w_desc,
@@ -259,9 +261,7 @@ def chunk_delta_h_kernel(
     gk_desc,
     h0,
     ht,
-    checkpoint_states,
-    cu_checkpoint_offsets,
-    CHECKPOINT_EVERY_CHUNKS,
+    checkpoints,
     state_indices,
     has_initial_state,
     cu_seqlens,
@@ -290,7 +290,6 @@ def chunk_delta_h_kernel(
     NUM_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    STORE_CHECKPOINTS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
@@ -308,9 +307,7 @@ def chunk_delta_h_kernel(
         gk_desc,
         h0,
         ht,
-        checkpoint_states,
-        cu_checkpoint_offsets,
-        CHECKPOINT_EVERY_CHUNKS,
+        checkpoints,
         state_indices,
         has_initial_state,
         cu_seqlens,
@@ -335,7 +332,6 @@ def chunk_delta_h_kernel(
         NUM_STAGES,
         USE_INITIAL_STATE,
         STORE_FINAL_STATE,
-        STORE_CHECKPOINTS,
         IS_VARLEN,
         USE_STATE_INDICES,
         USE_HAS_INITIAL_STATE,
@@ -345,7 +341,7 @@ def chunk_delta_h_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["T", "NUM_SEQUENCES", "CHECKPOINT_EVERY_CHUNKS"])
+@triton.jit(do_not_specialize=["T", "NUM_SEQUENCES"])
 def chunk_delta_h_persistent_kernel(
     k_desc,
     w_desc,
@@ -355,9 +351,7 @@ def chunk_delta_h_persistent_kernel(
     gk_desc,
     h0,
     ht,
-    checkpoint_states,
-    cu_checkpoint_offsets,
-    CHECKPOINT_EVERY_CHUNKS,
+    checkpoints,
     state_indices,
     has_initial_state,
     cu_seqlens,
@@ -386,7 +380,6 @@ def chunk_delta_h_persistent_kernel(
     NUM_STAGES: tl.constexpr,
     USE_INITIAL_STATE: tl.constexpr,
     STORE_FINAL_STATE: tl.constexpr,
-    STORE_CHECKPOINTS: tl.constexpr,
     USE_STATE_INDICES: tl.constexpr,
     USE_HAS_INITIAL_STATE: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
@@ -411,9 +404,7 @@ def chunk_delta_h_persistent_kernel(
             gk_desc,
             h0,
             ht,
-            checkpoint_states,
-            cu_checkpoint_offsets,
-            CHECKPOINT_EVERY_CHUNKS,
+            checkpoints,
             state_indices,
             has_initial_state,
             cu_seqlens,
@@ -438,7 +429,6 @@ def chunk_delta_h_persistent_kernel(
             NUM_STAGES,
             USE_INITIAL_STATE,
             STORE_FINAL_STATE,
-            STORE_CHECKPOINTS,
             True,
             USE_STATE_INDICES,
             USE_HAS_INITIAL_STATE,
@@ -497,20 +487,10 @@ def _delta_h_launch(
     final_state: torch.Tensor | None,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = True,
-    checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate outputs and launch the recurrence; runs eagerly inside the op."""
-    if checkpoint_states is not None:
-        if cu_checkpoint_offsets is None:
-            raise ValueError("checkpoint_states requires cu_checkpoint_offsets")
-        validate_state_checkpoints(
-            StateCheckpoints(checkpoint_states, cu_checkpoint_offsets, checkpoint_interval),
-            k,
-            u,
-            cu_seqlens,
-        )
+    validate_state_checkpoints(state_checkpoints, k, u, cu_seqlens)
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
@@ -558,9 +538,7 @@ def _delta_h_launch(
         *descriptors,
         initial_state,
         final_state,
-        checkpoint_states,
-        cu_checkpoint_offsets,
-        checkpoint_interval // _CHUNK_SIZE,
+        state_checkpoints,
         state_indices,
         has_initial_state,
         cu_seqlens,
@@ -586,11 +564,18 @@ def _delta_h_launch(
         "NUM_STAGES": 3 if use_warp_specialization else 2,
         "USE_INITIAL_STATE": initial_state is not None,
         "STORE_FINAL_STATE": final_state is not None,
-        "STORE_CHECKPOINTS": checkpoint_states is not None,
         "USE_STATE_INDICES": state_indices is not None,
         "USE_HAS_INITIAL_STATE": has_initial_state is not None,
         "USE_INT64_OFFSETS": requires_int64_offsets(
-            k, w, u, gk, v_new, h, initial_state, final_state, checkpoint_states
+            k,
+            w,
+            u,
+            gk,
+            v_new,
+            h,
+            initial_state,
+            final_state,
+            None if state_checkpoints is None else state_checkpoints.states,
         ),
         "SCALAR_GATE": scalar_gate,
         "FASTMATH": fastmath,
@@ -724,9 +709,9 @@ def _delta_h_paged_cuda(
         capacity,
         state_cache,
         fastmath=fastmath,
-        checkpoint_states=checkpoint_states,
-        cu_checkpoint_offsets=cu_checkpoint_offsets,
-        checkpoint_interval=checkpoint_interval,
+        state_checkpoints=state_checkpoints_from_op_args(
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+        ),
     )
 
 
@@ -873,7 +858,7 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets,
             chunks,
             fastmath,
-            *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
+            *state_checkpoint_op_args(state_checkpoints),
         )
         return h, v_new, None
     if output_final_state:

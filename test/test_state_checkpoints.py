@@ -402,7 +402,7 @@ def test_cudnn_rejects_checkpoints_before_backend_dispatch(rule: Rule) -> None:
 @torch.no_grad()
 def test_checkpoint_intervals_and_shapes_reuse_recurrence(rule: Rule, cuda: None, triton_compiles):
     paged, _ = operations(rule)
-    # Interval in chunks crosses Triton's ==1 / divisible-by-16 / other classes.
+    # Token intervals are multiples of 64, so one variant serves every interval below 2**31.
     for sequences, length, interval, spare in (
         (1, 65, 64, 0),
         (16, 1025, 1024, 16),

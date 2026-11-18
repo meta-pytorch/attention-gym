@@ -11,7 +11,7 @@ from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
 from attn_gym.linear._lazy import register_lazy_cuda_impls
 from attn_gym.linear.types import StateCheckpoints
 
@@ -609,7 +609,7 @@ def paged_chunk_forward(
         metadata.capacity,
         scale,
         autotune,
-        *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
+        *state_checkpoint_op_args(state_checkpoints),
     )
     return output.reshape(output_shape)
 
@@ -660,7 +660,7 @@ def recurrent_forward(
             cu_seqlens,
             scale,
             batch_invariant,
-            *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
+            *state_checkpoint_op_args(state_checkpoints),
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()

@@ -21,7 +21,10 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
-from attn_gym.linear._delta_rule.validation import validate_state_checkpoints_metadata
+from attn_gym.linear._delta_rule.validation import (
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints_metadata,
+)
 from attn_gym.linear.types import StateCheckpoints
 
 # Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as
@@ -30,9 +33,14 @@ _CHUNK_SIZE = tl.constexpr(DEFAULT_CHUNK_SIZE)
 
 
 def _int64_offset_heuristic(*tensor_names: str):
+    def tensors(value):
+        if isinstance(value, StateCheckpoints):
+            return value.states, value.cu_checkpoint_offsets
+        return (value,)
+
     return {
         "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            *(args[name] for name in tensor_names)
+            *(tensor for name in tensor_names for tensor in tensors(args[name]))
         )
     }
 
@@ -532,11 +540,10 @@ def _gather_state_kernel(
         "active_counts",
         "state_cache",
         "replay_count",
-        "checkpoint_states",
-        "cu_checkpoint_offsets",
+        "checkpoints",
     )
 )
-@triton.jit(do_not_specialize=["checkpoint_interval"])
+@triton.jit
 def _commit_state_kernel(
     final_state,
     state_indices,
@@ -544,9 +551,7 @@ def _commit_state_kernel(
     active_counts,
     state_cache,
     replay_count,
-    checkpoint_states,
-    cu_checkpoint_offsets,
-    checkpoint_interval,
+    checkpoints,
     final_stride_b: tl.constexpr,
     state_stride_s: tl.constexpr,
     count_stride_s: tl.constexpr,
@@ -554,7 +559,6 @@ def _commit_state_kernel(
     chunk_size: tl.constexpr,
     num_elements,
     use_has_initial_state: tl.constexpr,
-    use_checkpoints: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
@@ -581,16 +585,16 @@ def _commit_state_kernel(
         boundary_state,
         mask=active & (completes_chunk | fresh_slot),
     )
-    if use_checkpoints:
+    if checkpoints is not None:
         # A single new token can cross only the first 64-token checkpoint.
-        checkpoint_mask = active & completes_chunk & (checkpoint_interval == chunk_size)
+        checkpoint_mask = active & completes_chunk & (checkpoints.every_n_tokens == chunk_size)
         checkpoint_index = tl.load(
-            cu_checkpoint_offsets + active_index, mask=checkpoint_mask, other=0
+            checkpoints.cu_checkpoint_offsets + active_index, mask=checkpoint_mask, other=0
         )
         if USE_INT64_OFFSETS:
             checkpoint_index = checkpoint_index.to(tl.int64)
         tl.store(
-            checkpoint_states + checkpoint_index * state_size + state_offset,
+            checkpoints.states + checkpoint_index * state_size + state_offset,
             boundary_state,
             mask=checkpoint_mask,
         )
@@ -711,11 +715,12 @@ def commit_paged_chunk_replay(
     checkpoint_interval: int = 0,
 ) -> None:
     """Commit completed boundaries, their optional snapshots, and active replay counts."""
-    if checkpoint_states is not None:
-        if cu_checkpoint_offsets is None:
-            raise ValueError("checkpoint_states requires cu_checkpoint_offsets")
+    checkpoints = state_checkpoints_from_op_args(
+        checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+    )
+    if checkpoints is not None:
         validate_state_checkpoints_metadata(
-            StateCheckpoints(checkpoint_states, cu_checkpoint_offsets, checkpoint_interval),
+            checkpoints,
             num_sequences=final_state.shape[0],
             state_shape=final_state.shape[1:],
             device=final_state.device,
@@ -731,9 +736,7 @@ def commit_paged_chunk_replay(
         active_counts,
         state_cache,
         replay_count,
-        checkpoint_states,
-        cu_checkpoint_offsets,
-        checkpoint_interval,
+        checkpoints,
         final_stride_b=final_state.stride(0),
         state_stride_s=state_cache.stride(0),
         count_stride_s=replay_count.stride(0),
@@ -741,7 +744,6 @@ def commit_paged_chunk_replay(
         chunk_size=_CHUNK_SIZE,
         num_elements=num_elements,
         use_has_initial_state=has_initial_state is not None,
-        use_checkpoints=checkpoint_states is not None,
         BLOCK=block,
     )
 

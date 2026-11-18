@@ -13,7 +13,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
 )
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -355,7 +355,7 @@ def paged_chunk_forward(
             active_counts,
             state_cache,
             replay_count,
-            *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
+            *state_checkpoint_op_args(state_checkpoints),
         )
         token_indices = active_counts.to(torch.int64).reshape(-1, 1, 1, 1)
         return output.gather(1, token_indices.expand(-1, 1, output.shape[2], output.shape[3])).to(
@@ -488,7 +488,7 @@ def _paged_chunk_state_forward(
         metadata.chunk_offsets,
         autotune,
         schedule.value,
-        *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
+        *state_checkpoint_op_args(state_checkpoints),
     )
     return output.reshape(output_shape).to(output_dtype)
 

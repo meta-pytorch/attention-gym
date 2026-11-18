@@ -295,12 +295,37 @@ def validate_state_checkpoints_metadata(
     )
 
 
+def state_checkpoint_op_args(
+    checkpoints: StateCheckpoints | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+    """Flatten optional snapshots into the trailing arguments of a custom-op schema."""
+    return (None, None, 0) if checkpoints is None else checkpoints
+
+
+def state_checkpoints_from_op_args(
+    states: torch.Tensor | None, offsets: torch.Tensor | None, every_n_tokens: int
+) -> StateCheckpoints | None:
+    """Rebuild the snapshots a custom-op schema received as flattened arguments.
+
+    Triton kernels take the result as one tuple argument. Triton specializes its interval only
+    on equality to 1, divisibility by 16, and int32 range, so every positive multiple of 64
+    below ``2**31`` shares one compiled variant.
+    """
+    if states is None:
+        return None
+    if offsets is None:
+        raise ValueError("checkpoint_states requires cu_checkpoint_offsets")
+    return StateCheckpoints(states, offsets, every_n_tokens)
+
+
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
     "require_inference_only",
     "resolve_chunk_kernel_options",
     "resolve_decode_out",
     "resolve_scale",
+    "state_checkpoint_op_args",
+    "state_checkpoints_from_op_args",
     "validate_decode_inputs",
     "validate_delta_rule_inputs",
     "validate_has_initial_state",

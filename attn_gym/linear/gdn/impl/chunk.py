@@ -17,7 +17,10 @@ from attn_gym._backends.triton.utils import requires_int64_offsets
 from attn_gym.linear._delta_rule.span import zero_state
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.triton.group_sum import group_sum
-from attn_gym.linear._delta_rule.validation import validate_paged_state
+from attn_gym.linear._delta_rule.validation import (
+    state_checkpoints_from_op_args,
+    validate_paged_state,
+)
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
     chunk_gdn_bwd_intra_dense,
@@ -49,7 +52,6 @@ from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused import (
 )
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_daqk import chunk_kda_bwd_daqk
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from attn_gym.linear.types import StateCheckpoints
 
 
 def validate_supported_device(q: torch.Tensor) -> None:
@@ -376,10 +378,8 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         has_initial_state=has_initial_state,
         output_final_state=False,
         metadata=metadata,
-        state_checkpoints=(
-            StateCheckpoints(checkpoint_states, cu_checkpoint_offsets, checkpoint_interval)
-            if checkpoint_states is not None
-            else None
+        state_checkpoints=state_checkpoints_from_op_args(
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
         ),
     )
     assert final_state is None
