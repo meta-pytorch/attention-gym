@@ -87,9 +87,9 @@ class BackendOptions(TuningOptions, total=False):
 
     backend: Literal["auto", "fused", "warpdrive", "cudnn"]
     """Choose the optimized chunk backend. With CuTeDSL installed, ``"auto"`` prefers warpdrive on
-    SM100 and SM103, and on SM107 with CuTeDSL 4.8+. Native FP16 KDA and paged checkpoint writes
-    use Triton. Set ``"warpdrive"`` or ``"fused"`` (Triton) to require that backend;
-    ``"cudnn"``, warpdrive's former name, is an alias of ``"warpdrive"``.
+    SM100 and SM103, and on SM107 with CuTeDSL 4.8+. Paged checkpoint writes use Triton.
+    Set ``"warpdrive"`` or ``"fused"`` (Triton) to require that backend; ``"cudnn"``,
+    warpdrive's former name, is an alias of ``"warpdrive"``.
     See "Chunk backend selection" in ``docs/linear.md``."""
 
 

@@ -24,11 +24,9 @@ including paged, staged and context-parallel calls, choose the kernels with
 - `"warpdrive"` selects the CuTeDSL kernels. Install the `[linear]` extra; unsupported calls raise
   rather than switching to Triton. `"cudnn"`, the backend's former name, is an alias.
 
-Two cases still select Triton on SM100-family GPUs:
-
-- KDA with all-FP16 Q/K/V. An explicit `"warpdrive"` can run FP16 KDA.
-- Paged calls that write [state checkpoints](#paged-state-checkpoints-gdn-and-kda). Warpdrive
-  cannot write checkpoints; requesting it explicitly raises.
+FP16 KDA follows the same rule as BF16. Paged calls that write
+[state checkpoints](#paged-state-checkpoints-gdn-and-kda) are the exception: `"auto"` uses
+Triton, and an explicit `"warpdrive"` raises because warpdrive cannot write checkpoints.
 
 Selection does not depend on batch size or sequence lengths. A staged backward uses the backend
 saved by its forward. Select `"warpdrive"` explicitly to use `split_forward`, `split_backward`,
@@ -41,8 +39,8 @@ Switching from Triton to warpdrive changes more than speed:
   across backends. On captured BF16 KDA inputs, default warpdrive had lower output and gradient
   errors against FP64 than Triton did; [Operand precision](#operand-precision) compares all
   three choices. Pass `{"backend": "fused"}` to keep using Triton.
-- **KDA gate range.** For BF16 kernels (including FP32 or mixed Q/K/V cast to BF16), the
-  recommended training floor is about `-5.25` on warpdrive and `-5.914` on Triton. The default
+- **KDA gate range.** The recommended training floor for both FP16 and BF16 is about `-5.25` on
+  warpdrive and `-5.914` on Triton. The default
   `bound_gate` floor of `-5` fits both ([KDA gate contract](#kimi-delta-attention)).
 - **Determinism.** warpdrive neither autotunes nor needs a tuning warm-up, and repeats its bits
   run to run, but its plan follows the packed shape and the SM count, so a sequence's bits can
@@ -51,8 +49,10 @@ Switching from Triton to warpdrive changes more than speed:
   ([Document-aligned fragments](#document-aligned-fragments-cp-invariant-bits)).
 - **Speed.** On GB300, the default was faster than Triton on every measured BF16 GDN and KDA
   prefill and training shape below; small single-sequence calls gain least. For BF16 KDA operand
-  choices, see [Operand precision](#operand-precision). Other shapes and GPU models can give
-  different results.
+  choices, see [Operand precision](#operand-precision). Across ten FP16 KDA shapes, the geometric
+  mean speedups over the faster of pinned and autotuned Triton were 2.6× forward and 1.5×
+  forward + backward. At 1 × 2048 tokens and eight heads, forward + backward was 2–4% slower.
+  Other shapes and GPU models can give different results.
 
 **Default versus Triton.** GB300, PR #907 on main 278c4f60, PyTorch `2.16.0.dev20261113+cu134`,
 CuTeDSL 4.8.1, BF16 Q/K/V, head width 128. Each cell is warm CUDA Graph replay in µs, Triton

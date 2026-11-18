@@ -26,6 +26,7 @@ from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     require_inference_only,
+    resolve_chunk_backend,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -45,7 +46,6 @@ from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forwar
 from attn_gym.linear.kda.validation import (
     kernel_dtype,
     resolve_intra_chunk_dtypes,
-    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
     validate_replay_state,
@@ -143,10 +143,10 @@ def chunk_kda(
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
             See :class:`attn_gym.linear.types.KernelOptions`. With ``"backend": "auto"`` (default),
-            BF16 kernels use warpdrive on supported SM100-family GPUs with CuTeDSL installed;
-            other calls use Triton (see "Chunk backend selection" in ``docs/linear.md``).
-            ``"autotune"`` (default ``True``) tunes Triton configurations.
-            Warpdrive chooses a plan without benchmarking.
+            both FP16 and BF16 use warpdrive on supported SM100-family GPUs with CuTeDSL
+            installed; other devices use Triton (see "Chunk backend selection" in
+            ``docs/linear.md``). ``"autotune"`` (default ``True``) tunes Triton
+            configurations. Warpdrive chooses a plan without benchmarking.
             ``"intra_chunk_dtypes"`` sets warpdrive operand precision in forward and backward.
             BF16 kernels accept ``"tf32+bf16"`` (TF32 decay, BF16 solve; default), ``"tf32"``
             or ``"bf16"``. FP16 kernels default to ``"tf32+fp16"`` and accept no other value.
@@ -176,7 +176,7 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if resolve_kda_backend(options.backend, q, k, v) == "warpdrive":
+        if resolve_chunk_backend(options.backend, q) == "warpdrive":
             return _warpdrive_chunk_forward(
                 q,
                 k,
@@ -321,9 +321,7 @@ def paged_chunk_kda(
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    backend = resolve_kda_backend(
-        options.backend, q, k, v, fused_only=state_checkpoints is not None
-    )
+    backend = resolve_chunk_backend(options.backend, q, fused_only=state_checkpoints is not None)
     if state_checkpoints is not None and backend != "fused":
         raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:

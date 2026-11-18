@@ -47,6 +47,7 @@ from attn_gym.linear._delta_rule.span import (
     zero_state,
 )
 from attn_gym.linear._delta_rule.summaries import build_state_grad_summaries, build_state_summaries
+from attn_gym.linear._delta_rule.validation import resolve_chunk_backend
 from attn_gym.linear.kda.impl.chunk import (
     ChunkKDABwdPrepared,
     ChunkKDAFactors,
@@ -67,7 +68,6 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
 from attn_gym.linear.kda.validation import (
     kernel_dtype,
     resolve_intra_chunk_dtypes,
-    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
 )
@@ -348,7 +348,7 @@ def chunk_kda_prepare(
         raise TypeError(
             "chunk_kda_prepare requires q, k, and v to share dtype float16 or bfloat16"
         )
-    backend = resolve_kda_backend(backend, q, k, v)
+    backend = resolve_chunk_backend(backend, q)
     if backend == "warpdrive":
         validate_warpdrive_available(q)
         if cu_seqlens is None:
