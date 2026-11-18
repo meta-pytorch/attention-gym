@@ -30,13 +30,12 @@ On SM100-family GPUs, `"auto"` runs these calls on the fused backend:
 
 | Call | Reason |
 | --- | --- |
-| KDA whose kernels run in FP16 (Q, K, and V all FP16) | not switched to warpdrive yet; an explicit `"warpdrive"` runs it there |
 | `paged_chunk_gdn`/`paged_chunk_kda` with `state_checkpoints` | warpdrive kernels do not write [checkpoints](#paged-state-checkpoints-gdn-and-kda); an explicit `"warpdrive"` raises |
 
-The choice depends only on the device, dtypes and whether checkpoints are requested, never on
-sizes, so a compiled graph or captured CUDA Graph keeps one backend. A staged backward handle
-follows its forward tape. `split_forward` and `split_backward` still require an explicit
-`"warpdrive"`. Explicit `"fused"` and `"warpdrive"` are never rerouted.
+The choice depends only on the device and whether checkpoints are requested, never on sizes, so a
+compiled graph or captured CUDA Graph keeps one backend. A staged backward handle follows its
+forward tape. `split_forward` and `split_backward` still require an explicit `"warpdrive"`.
+Explicit `"fused"` and `"warpdrive"` are never rerouted.
 
 What changes when the default runs warpdrive (it was the fused backend before), as measured on
 GB300 (SM103); there are no SM107 (Rubin) performance numbers yet:
@@ -54,10 +53,9 @@ GB300 (SM103); there are no SM107 (Rubin) performance numbers yet:
   hybrid on 3.1B tokens, the loss matched fused within run-to-run noise at 8.6-8.9% more
   tokens/s per GPU ([Operand precision](#operand-precision)). Pass `{"backend": "fused"}` to keep
   the previous bits.
-- **KDA gate range.** BF16 KDA (and FP32 or mixed Q/K/V, which run in BF16) narrows from about
-  `[-5.914, 0]` to about `[-5.25, 0]` per token (`WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`); the
-  default `bound_gate` bound of `-5` is inside both
-  ([KDA gate contract](#kimi-delta-attention)).
+- **KDA gate range.** KDA narrows from about `[-5.914, 0]` to about `[-5.25, 0]` per token
+  (`WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`); the default `bound_gate` bound of `-5` is inside
+  both ([KDA gate contract](#kimi-delta-attention)).
 - **Determinism.** warpdrive neither autotunes nor needs a tuning warm-up, and repeats its bits
   run to run, but its plan follows the packed shape and the SM count, so a sequence's bits can
   depend on the rest of the batch ([Determinism](determinism.md#warpdrive-chunk-kernels)).
@@ -66,7 +64,11 @@ GB300 (SM103); there are no SM107 (Rubin) performance numbers yet:
 - **Speed.** On GB300, warpdrive was faster than the fused backend on every measured GDN and KDA
   training and prefill shape (geomean 2.1-3.9x) except one-sequence 2048-token, 8-head KDA
   forward+backward, which is at parity in CUDA Graph replay (0.99-1.05x) and 5-7% slower in
-  summed kernel time.
+  summed kernel time. FP16 KDA follows the same pattern: against the faster of pinned and
+  autotuned fused FP16 over ten shapes, warpdrive's forward was 1.2-4.8x faster (geomean 2.6x).
+  Its forward+backward was 1.2-2.4x faster except for one sequence of 2048 tokens and 8 heads,
+  2-4% slower in CUDA Graph replay; the forward+backward geomean, including that exception,
+  was 1.5x.
 
 ## Gated Delta Rule
 
@@ -554,7 +556,7 @@ conversion because recurrence consumes one token decay at a time. This keeps chu
 of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The Triton fused
 backend requires approximately `[-5.914, 0]` (`MAX_GATE_LOWER_BOUND_MAGNITUDE`). warpdrive, the
-default on SM100-family GPUs for BF16, FP32, and mixed Q/K/V, requires about `[-5.25, 0]`
+default on SM100-family GPUs, requires about `[-5.25, 0]`
 (`WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE`), for the reasons below. Every aligned 16-token
 per-channel sum must exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
 results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). That bound keeps the

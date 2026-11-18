@@ -26,6 +26,7 @@ from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     require_inference_only,
+    resolve_chunk_backend,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -44,7 +45,6 @@ from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import (
     resolve_intra_chunk_dtypes,
-    resolve_kda_backend,
     resolve_kernel_options,
     validate_kda_inputs,
     validate_replay_state,
@@ -106,8 +106,7 @@ def chunk_kda(
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
-            are internal. Calls that run warpdrive (the default for BF16 kernels on
-            SM100-family GPUs) require
+            are internal. Calls that run warpdrive (the default on SM100-family GPUs) require
             about ``[-5.25, 0]`` (``WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE``): gradient
             error grows quickly past a uniform gate of about ``-5.25``, and with
             ``fastmath=True`` results stop being finite once an aligned 16-token per-channel sum
@@ -153,9 +152,9 @@ def chunk_kda(
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
             See :class:`attn_gym.linear.types.KernelOptions`. ``"backend"`` defaults to
-            ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed,
-            except for FP16 kernels, and the Triton ``"fused"`` backend elsewhere ("Chunk backend
-            selection" in ``docs/linear.md``).
+            ``"auto"``: warpdrive on SM100-family GPUs with the ``[linear]`` extra installed, and
+            the Triton ``"fused"`` backend elsewhere ("Chunk backend selection" in
+            ``docs/linear.md``).
             ``"autotune"`` (default ``True``) benchmarks candidate fused-kernel
             configurations; warpdrive accepts the option but uses its fixed schedule.
             ``"intra_chunk_dtypes"`` (default ``"tf32+bf16"``) selects warpdrive's intra-chunk
@@ -186,7 +185,7 @@ def chunk_kda(
     )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if resolve_kda_backend(options.backend, q, k, v) == "warpdrive":
+        if resolve_chunk_backend(options.backend, q) == "warpdrive":
             return _warpdrive_chunk_forward(
                 q,
                 k,
@@ -332,9 +331,7 @@ def paged_chunk_kda(
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    backend = resolve_kda_backend(
-        options.backend, q, k, v, fused_only=state_checkpoints is not None
-    )
+    backend = resolve_chunk_backend(options.backend, q, fused_only=state_checkpoints is not None)
     if state_checkpoints is not None and backend != "fused":
         raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
