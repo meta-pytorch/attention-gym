@@ -71,6 +71,7 @@ from attn_gym.linear._delta_rule.cute.affine_summary_fwd import (
     tmem_tile_reader,
     zero_tail_tokens,
 )
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive import (
@@ -1130,7 +1131,7 @@ def build_state_grad_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_rev requires CUDA capability 8.0+, got {capability}")
-    portable = not runs_sm100_kernels(capability)
+    portable = not uses_legacy_cute(qg.device)
     if fastmath is None:
         fastmath = portable
     if portable:
