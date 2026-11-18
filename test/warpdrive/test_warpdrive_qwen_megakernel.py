@@ -271,22 +271,11 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
 
 
 @pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
-@pytest.mark.parametrize("schedule, locality", [("atomic", False), ("sm", False), ("sm", True)])
-def test_schedules_and_placement_match_the_static_schedule(schedule, locality, engine):
-    """Atomic and SM-keyed schedules, with optional memory-side placement, match the default
-    static schedule bit for bit, logits and new K/V rows, across repeated steps. The epoch
-    advances once per step."""
+def test_atomic_schedule_matches_the_static_schedule(engine):
+    """The atomic schedule's per-layer launches match the default static schedule bit for bit,
+    logits and new K/V rows, across repeated steps. The epoch advances once per step."""
     if not cuda_runs_sm100_kernels():
         pytest.skip("the megakernel requires an SM100-family GPU")
-    if locality:
-        from attn_gym.warpdrive.examples.qwen_megakernel.locality import sm_sides
-
-        try:
-            sm_sides(torch.cuda.current_device())
-        except RuntimeError as error:
-            if "locality domains" not in str(error):
-                raise
-            pytest.skip(f"needs two memory locality domains: {error}")
     config = QwenConfig(
         hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
         intermediate_size=3072, vocab_size=4096,
@@ -294,9 +283,7 @@ def test_schedules_and_placement_match_the_static_schedule(schedule, locality, e
     weights = random_weights(config)
     caches, token, pos = make_decode_state(weights, 130, MAX_LEN, seed=5)
     ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
-    runner = mk.QwenMegakernel(
-        weights, MAX_LEN, engine=engine, schedule=schedule, locality=locality
-    )
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine, schedule="atomic")
     reference = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
     assert len(runner.tables) == config.num_layers + 1  # a launch per layer, then the LM head
     for step in range(3):

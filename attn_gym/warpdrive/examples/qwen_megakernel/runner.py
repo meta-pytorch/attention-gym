@@ -92,14 +92,12 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     compile_megakernel,
     packed_mlp_shapes,
 )
-from attn_gym.warpdrive.examples.qwen_megakernel.locality import byte_side, sm_sides, striped_copy
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig, rope_cos_sin
 from attn_gym.warpdrive.examples.qwen_megakernel.schedule import (
     CONTEXT,
     DEPENDENCY_LATENCY,
     REUSED_INPUT,
     ROW_COST_MODELS,
-    Placement,
     RowCostModel,
     RowSpan,
     build_tables,
@@ -191,7 +189,6 @@ class QwenMegakernel:
         waits: bool = False,
         engine: str = "cuda_core",
         stream_inputs: bool = False,
-        locality: bool = False,
         **config,
     ):
         """``ops``: keep only these instruction kinds (tests). ``trace``: compile with ranges for
@@ -201,22 +198,13 @@ class QwenMegakernel:
         ``"tcgen05"`` (``QwenDecodeMegakernelTc``). ``stream_inputs`` (tcgen05): stream GEMV
         inputs from global memory through an activation ring (``QwenDecodeMegakernelTcStream``).
         QKV and LM-head inputs, plus dense MLP inputs, are shared across CTAs; other inputs
-        use per-CTA scratch. See that class for the dataflow. ``locality``: place the weights
-        on known memory sides (``locality.striped_copy``) and run each GEMV row on an SM of its
-        weights' side; it needs the ``"sm"`` schedule (CTA slots are SMs) and two locality
-        domains. ``config``: ``QwenDecodeMegakernel`` constructor arguments; the model shape
-        comes from ``weights.config``."""
+        use per-CTA scratch. See that class for the dataflow. ``config``: ``QwenDecodeMegakernel``
+        constructor arguments; the model shape comes from ``weights.config``."""
         kernel = kernel_class(engine, stream_inputs)
         if max_len % BLOCK:
             raise ValueError(f"max_len must be a multiple of {BLOCK}, got {max_len}")
         device = weights.embed.device
         self.max_len = max_len
-        if locality:
-            if weights.config.is_moe:
-                raise ValueError("locality places dense GEMV rows only: not for MoE models")
-            config.setdefault("schedule", "sm")
-            if config["schedule"] != "sm":
-                raise ValueError("locality needs the 'sm' schedule")
         # The kernel reads RoPE from ``self.rope``: its scaling stays out of the compile key.
         model = dataclasses.replace(weights.config, rope_scaling=None)
         self.op = op = kernel(model=model, **config)
@@ -234,19 +222,7 @@ class QwenMegakernel:
         else:  # a stub tile for the unused router atom
             shape = packed_mlp_shapes(op)[2]
             self.router = torch.zeros(shape, device=device, dtype=torch.bfloat16)
-        self.lm_head = weights.lm_head
-        placement = None
-        if locality:
-            sides = sm_sides(device.index)
-            if len(sides) != self.max_ctas:
-                raise ValueError(
-                    f"locality needs one CTA per SM: {len(sides)} SMs, {self.max_ctas} CTAs"
-                )
-            self.wqkv, self.wo, self.wgu, self.wd, self.lm_head = (
-                striped_copy(t) for t in (self.wqkv, self.wo, self.wgu, self.wd, self.lm_head)
-            )
-            placement = Placement(self.row_side, sides)
-        tables, self.cta_of = build_tables(op, self.max_ctas, ops, placement)
+        tables, self.cta_of = build_tables(op, self.max_ctas, ops)
         self.tables = [table.to(device) for table in tables]  # one per launch
         self.table = torch.cat(self.tables)  # every row, as trace payloads index them
         # Trace capacity per (launch, CTA): a launch's CTA runs at most its table's slot count of
@@ -278,47 +254,6 @@ class QwenMegakernel:
         self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
         self.trace_buffers: list[torch.Tensor] | None = None  # per launch, inside trace_session
         self.fn = compile_megakernel(self.op)
-
-    def row_side(self, words: list[int]) -> int | None:
-        """The memory side most of a GEMV row's weight bytes live on (striped weights; see
-        ``locality``), or None for rows that stream no weights (attention reads the KV cache)."""
-        op = self.op
-        kind, layer, a, b = words
-        rows, tile_k = op.rows, op.tile_k
-        if kind == QKV:
-            weight, tile, k0, k_tiles = (
-                self.wqkv,
-                layer * (op.qkv_rows // rows) + a,
-                0,
-                op.hidden_k_tiles,
-            )
-        elif kind == OPROJ:
-            k_tiles = op.oproj_k_tiles
-            weight, tile, k0 = self.wo, layer * (op.hidden // rows) + a, b * k_tiles
-        elif kind == GATEUP:
-            weight, tile, k0, k_tiles = (
-                self.wgu,
-                layer * (2 * op.inter // rows) + a,
-                0,
-                op.hidden_k_tiles,
-            )
-        elif kind == DOWN:
-            k_tiles = op.down_k_tiles
-            weight, tile, k0 = self.wd, layer * (op.hidden // rows) + a, b * k_tiles
-        elif kind == LMHEAD:
-            weight, tile, k0, k_tiles = self.lm_head, a, 0, op.hidden_k_tiles
-            rows *= b  # b row tiles from tile a
-        else:
-            return None
-        row_bytes = weight.shape[1] * weight.element_size()
-        start = tile * op.rows * row_bytes + k0 * tile_k * weight.element_size()
-        span = k_tiles * tile_k * weight.element_size()
-        counts = [0, 0]
-        for r in range(rows):
-            first = start + r * row_bytes
-            for edge in (first, first + span - 1):
-                counts[byte_side(edge)] += 1
-        return int(counts[1] > counts[0])
 
     def tagged(self, name: str) -> torch.Tensor:
         """The int64 words of a tagged buffer, shaped as ``ScratchLayout.shapes``."""
@@ -377,7 +312,7 @@ class QwenMegakernel:
             self.wgu,
             self.wd,
             w.embed,
-            self.lm_head,
+            w.lm_head,
             self.router,
             k_cache.view(-1, HEAD_DIM),
             v_cache.view(-1, HEAD_DIM),
