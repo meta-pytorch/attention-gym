@@ -10,7 +10,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from attn_gym.linear import (
-    ReplayState,
     StateCheckpoints,
     chunk_gdn,
     chunk_kda,
@@ -397,25 +396,6 @@ def test_cudnn_rejects_checkpoints_before_backend_dispatch(rule: Rule) -> None:
                 cu_seqlens=cu_seqlens,
                 state_checkpoints=saved,
                 kernel_options={"backend": "cudnn"},
-            )
-
-
-def test_kda_replay_rejects_checkpoints() -> None:
-    with FakeTensorMode():
-        args, cu_seqlens, saved = checkpoint_metadata_inputs("kda")
-        replay = ReplayState(
-            *(
-                torch.empty((5, *shape), dtype=dtype, device="cuda")
-                for shape, dtype in ReplayState.slot_layout(2, 128)
-            )
-        )
-        with pytest.raises(ValueError, match="checkpoint"):
-            paged_chunk_kda(
-                *args,
-                cu_seqlens=cu_seqlens,
-                state_checkpoints=saved,
-                replay_state=replay,
-                kernel_options=options("kda"),
             )
 
 

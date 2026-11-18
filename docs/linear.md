@@ -165,12 +165,13 @@ elementwise kernels run per decode step.
 
 ::: attn_gym.linear.recurrent_gdn_decode
 
-### Prefill state checkpoints (GDN and KDA)
+### Paged state checkpoints (GDN and KDA)
 
 Both `paged_chunk_gdn` and `paged_chunk_kda` accept `state_checkpoints=StateCheckpoints(...)`
 to write periodic FP32 snapshots into caller-owned storage while still advancing the ordinary
-state cache. The output remains a single tensor. Checkpointing requires the repo-local fused
-backend and is not supported together with KDA `replay_state`.
+state cache. Paged `recurrent_gdn` (with `state_indices`) accepts the same argument, including
+under `kernel_options={"batch_invariant": True}`. Checkpointing requires the repo-local fused
+backend and does not change the operations' return types.
 
 ```python
 from attn_gym.linear import StateCheckpoints, paged_chunk_gdn
@@ -189,7 +190,7 @@ output = paged_chunk_gdn(
 # paged_chunk_kda accepts the same state_checkpoints argument.
 ```
 
-Boundaries are measured from each sequence's start **in this call**, not from its absolute
+Without KDA replay, boundaries are measured from each sequence's start **in this call**, not from its absolute
 prefix-cache position. The interval must be a positive multiple of 64. Snapshots contain the
 state **after** that many tokens, including a final state exactly on an interval; incomplete
 intervals do not produce a snapshot. Each snapshot is written directly from the FP32 recurrence
@@ -197,10 +198,26 @@ accumulator in public `[H, V, K]` order, not copied from the lower-precision int
 chunk-entry tape. Snapshots are not rounded to the persistent cache dtype.
 
 For CUDA graphs, allocate a fixed-capacity `states` buffer and update the offsets on device
-between replays. Counts must equal `sequence_length // every_n_tokens` for every sequence,
-including null routes, and the terminal offset must fit the buffer. Null-route rows and unused
-capacity are left untouched. These offset values and the absence of aliasing with inputs are
+between replays. Without KDA replay, counts must equal `sequence_length // every_n_tokens`
+for every active sequence, and the terminal offset must fit the buffer. Offsets must be
+nondecreasing; null routes may reserve unused rows, which are left untouched along with spare
+capacity. These offset values and the absence of aliasing with inputs are
 caller responsibilities; validation checks tensor metadata without synchronizing with the host.
+
+With KDA `replay_state`, checkpoint intervals start at the beginning of each slot's unfinished
+chunk, **before** the new input. Counts are `(replayed_tokens + sequence_length) // every_n_tokens`,
+where `replayed_tokens` is the slot's pre-call replay count, or zero for a fresh slot. For example,
+19 replayed tokens plus 100 new tokens produce one interval-64 checkpoint, after 45 new tokens;
+the other 55 tokens belong to the unfinished chunk. The checkpoint is FP32 state after the
+completed chunk, not the state after all 100 new tokens.
+
+A caller restoring a prefix that ends inside the next chunk must copy the tokens after the
+checkpoint and their count into the destination slot's replay buffers as well. Attention Gym
+continues to advance the source slot's replay state normally; `state_checkpoints` does not
+snapshot replay-token buffers. The same contract applies to the one-token replay path: 63
+replayed tokens plus one new token produce an interval-64 checkpoint. The interval origin is
+recomputed for each call, so intervals longer than 64 never complete during one-token replay
+decode.
 
 ::: attn_gym.linear.StateCheckpoints
 

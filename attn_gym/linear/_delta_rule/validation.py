@@ -249,9 +249,25 @@ def validate_state_checkpoints(
     v: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> None:
-    """Check snapshot metadata without reading device-resident offsets."""
+    """Check snapshot metadata against token-major operands without reading device values."""
     if checkpoints is None:
         return
+    validate_state_checkpoints_metadata(
+        checkpoints,
+        num_sequences=q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1,
+        state_shape=(v.shape[2], v.shape[-1], q.shape[-1]),
+        device=q.device,
+    )
+
+
+def validate_state_checkpoints_metadata(
+    checkpoints: StateCheckpoints,
+    *,
+    num_sequences: int,
+    state_shape: tuple[int, int, int],
+    device: torch.device,
+) -> None:
+    """Validate caller-owned snapshots, including commits that have no token operands."""
     if not isinstance(checkpoints, StateCheckpoints):
         raise TypeError("state_checkpoints must be a StateCheckpoints instance")
     states, offsets, interval = checkpoints
@@ -259,20 +275,19 @@ def validate_state_checkpoints(
         raise TypeError("state_checkpoints.every_n_tokens must be an int")
     if interval <= 0 or interval % 64:
         raise ValueError("state_checkpoints.every_n_tokens must be a positive multiple of 64")
-    if states.ndim != 4 or states.shape[1:] != (v.shape[2], v.shape[-1], q.shape[-1]):
+    if states.ndim != 4 or states.shape[1:] != state_shape:
         raise ValueError("state_checkpoints.states must have shape [capacity, H, V, K]")
     if states.dtype != torch.float32:
         raise TypeError("state_checkpoints.states must use float32")
     if not states.is_contiguous():
         raise ValueError("state_checkpoints.states must be contiguous")
-    num_sequences = q.shape[0] if cu_seqlens is None else cu_seqlens.shape[0] - 1
     if offsets.shape != (num_sequences + 1,):
         raise ValueError("state_checkpoints.cu_checkpoint_offsets must have shape [N + 1]")
     if offsets.dtype != torch.int32:
         raise TypeError("state_checkpoints.cu_checkpoint_offsets must use int32")
     if not offsets.is_contiguous():
         raise ValueError("state_checkpoints.cu_checkpoint_offsets must be contiguous")
-    if states.device != q.device or offsets.device != q.device:
+    if states.device != device or offsets.device != device:
         raise ValueError("state_checkpoints tensors must be on the input device")
     require_inference_only(
         (states,),
@@ -292,4 +307,5 @@ __all__ = [
     "validate_packed_offsets_tensor",
     "validate_paged_state",
     "validate_state_checkpoints",
+    "validate_state_checkpoints_metadata",
 ]

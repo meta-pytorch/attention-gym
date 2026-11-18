@@ -257,6 +257,7 @@ def recurrent_gdn(
     has_initial_state: torch.Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
     kernel_options: RecurrentKernelOptions | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Apply recurrent gated delta rule attention for decoding and inference prefill.
 
@@ -299,6 +300,10 @@ def recurrent_gdn(
             autotune cache states. That config still follows the batch shape:
             ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
             the batch.
+        state_checkpoints: Optional caller-owned periodic FP32 snapshots, written directly
+            from the recurrent accumulator before any pool-storage conversion. Requires
+            ``state_indices`` and ``impl="fused"``. Boundaries are relative to this call;
+            see :class:`attn_gym.linear.StateCheckpoints` for layout and boundary semantics.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -307,6 +312,8 @@ def recurrent_gdn(
     options = validate_kernel_options(
         kernel_options, RECURRENT_OPTION_SPEC, op_name="recurrent_gdn"
     )
+    if state_checkpoints is not None and state_indices is None:
+        raise ValueError("state_checkpoints requires state_indices for paged recurrent_gdn")
     validate_gdn_inputs(
         q,
         k,
@@ -326,6 +333,7 @@ def recurrent_gdn(
             raise ValueError("state_indices requires impl='fused'")
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
+    validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
 
     scale = q.shape[-1] ** -0.5 if scale is None else scale
     if selected_impl is Impl.FUSED:
@@ -343,6 +351,7 @@ def recurrent_gdn(
             has_initial_state=has_initial_state,
             autotune=should_autotune(options["autotune"]),
             batch_invariant=options["batch_invariant"],
+            state_checkpoints=state_checkpoints,
         )
 
     return reference_delta_rule(

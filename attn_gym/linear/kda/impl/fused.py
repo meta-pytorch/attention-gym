@@ -355,6 +355,7 @@ def paged_chunk_forward(
             active_counts,
             state_cache,
             replay_count,
+            *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
         )
         token_indices = active_counts.to(torch.int64).reshape(-1, 1, 1, 1)
         return output.gather(1, token_indices.expand(-1, 1, output.shape[2], output.shape[3])).to(
@@ -406,6 +407,7 @@ def paged_chunk_forward(
         has_initial_state=has_initial_state,
         autotune=autotune,
         schedule=schedule,
+        state_checkpoints=state_checkpoints,
     )
     tail_output, _ = chunk_forward(
         tail_q,

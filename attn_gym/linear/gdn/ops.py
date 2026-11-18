@@ -69,7 +69,8 @@ torch.library.define(
     "attn_gym::gdn_recurrent_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale, "
-    "bool batch_invariant) -> Tensor",
+    "bool batch_invariant, Tensor(b!)? checkpoint_states=None, "
+    "Tensor? cu_checkpoint_offsets=None, int checkpoint_interval=0) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_recurrent_decode",
@@ -351,9 +352,12 @@ def _recurrent_fwd_paged_fake(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     batch_invariant: bool,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> torch.Tensor:
     del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
-    del batch_invariant
+    del batch_invariant, checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -625,6 +629,7 @@ def recurrent_forward(
     has_initial_state: torch.Tensor | None,
     autotune: bool,
     batch_invariant: bool,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Normalize inputs and invoke the fused recurrent GDN operator."""
     if q.shape[-1] > 256:
@@ -655,6 +660,7 @@ def recurrent_forward(
             cu_seqlens,
             scale,
             batch_invariant,
+            *(state_checkpoints if state_checkpoints is not None else (None, None, 0)),
         ), None
     if initial_state is not None:
         initial_state = initial_state.contiguous()

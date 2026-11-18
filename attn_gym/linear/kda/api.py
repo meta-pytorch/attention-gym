@@ -269,7 +269,11 @@ def paged_chunk_kda(
 
         state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
             :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
-            Requires the fused backend and cannot be combined with ``replay_state``.
+            Requires the fused backend. With ``replay_state``, intervals start at the beginning
+            of each slot's unfinished chunk, counting replayed tokens before new input tokens.
+            A false ``has_initial_state`` entry counts no replayed tokens. Snapshots contain only
+            complete-chunk states; callers must separately preserve any replay tail needed to
+            restore a checkpoint.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -297,11 +301,8 @@ def paged_chunk_kda(
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    if state_checkpoints is not None:
-        if options.backend != "fused":
-            raise ValueError("state_checkpoints requires the fused backend")
-        if replay_state is not None:
-            raise ValueError("state_checkpoints does not support replay_state")
+    if state_checkpoints is not None and options.backend != "fused":
+        raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
         if options.backend != "fused":
