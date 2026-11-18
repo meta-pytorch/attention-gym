@@ -624,8 +624,8 @@ The layer boundary is where both hold: the residual sum after the MLP is an all-
 CTA's next QKV row needs the whole hidden vector, built from every down partial), so nothing
 local is live there, and every layer is long enough to hide the launch hop. Inside a layer the
 phases are short and point to point (QKV to attention to o_proj to the MLP), and the rows and
-weights a CTA keeps for the next item, and any placement of rows on chosen SMs, need one
-persistent CTA per SM; those stay inside a launch.
+weights a CTA keeps for the next item need one persistent CTA per SM; those stay inside a
+launch.
 
 What a layer boundary still costs: each launch's CTAs start fresh, so an SM's prologue and its
 prefetch of the next layer's weights wait until its previous CTA exits. Against one cooperative
@@ -655,10 +655,6 @@ layer (hybrid models whose attention layers want another kernel configuration).
   whole step once and splits each CTA's rows by layer into that layer's launch, ordering a
   launch's CTAs by their first row's predicted start; the atomic schedule gives each launch its
   own claim counter.
-  `locality=True` (GPUs with two memory locality domains) copies the weights into memory whose
-  2 MiB pages alternate between the domains, keys rows by SM (`schedule="sm"`) and schedules each
-  GEMV row only on SMs of its weights' domain (`schedule.Placement`); it helps rows that stream
-  weights at bandwidth and can unbalance rows that do not.
 - **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
   and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
   prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
@@ -734,9 +730,7 @@ Disabled, both emit no instructions.
   never wait on later launches, so the step cannot deadlock on its own. A concurrent kernel that
   holds SMs while it spins (another static runner on another stream, an MPS peer) can deadlock
   it, which the cooperative launch used to reject at launch; `schedule="atomic"` does not need
-  co-residency. `schedule="sm"` keys rows by SM (`SmPersistent`). Each CTA waits at exit until all
-  CTAs of its launch have arrived; otherwise another CTA of that launch could reuse the same SM
-  slot.
+  co-residency.
 - **Materialize tensors before `run_roles`.** Argument tensors materialized lazily inside a
   role, dicts of tensors in params and Python loops in the kernel prologue fail with "operand
   does not dominate this use" at an unrelated line. Keep params flat.
