@@ -15,7 +15,7 @@ instructions, one row per work item (0.6B counts)::
         OPROJ   32 x 4      32 rows x 512-column slice of Wo (split K)        -> o partials
         GATEUP  192         16 gate + 16 up rows x RMSNorm(h + o)             -> SiLU(g) * u
         DOWN    32 x 4      32 rows x 768-column slice of Wd (split K)        -> down partials
-    LMHEAD  594         8 x 32 rows of the LM head x final RMSNorm            -> logits
+    LMHEAD  4748        32 rows of the LM head x final RMSNorm                -> logits
 
 An attention row serves two q heads of one kv head (one when the GQA group is odd), so larger
 models run several rows per kv head and split; o_proj splits a quarter of the q heads each.
