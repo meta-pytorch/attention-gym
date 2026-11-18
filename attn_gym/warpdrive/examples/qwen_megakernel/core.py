@@ -47,7 +47,7 @@ LOG2E = 1.4426950408889634
 ROWS, TILE_K, BLOCK = 32, 256, 64
 STAGE_BYTES = ROWS * TILE_K * 2
 O_SPLITS, DOWN_SPLITS = 4, 4  # split-K of o_proj (a quarter of the q heads each) and down
-LM_TILES = 8  # row tiles per LM-head item
+LM_TILES = 8  # row tiles per LM-head item (batched or claimed; see schedule.lm_tiles)
 MAX_STAGES = 12
 # Default KV splits. GB200, CUDA-graph medians in us at ctx 1024 / 8192, splits 4, 8, 16:
 # 8B (16 attention row groups) 2916 / 3759, 2937 / 3347, 3033 / 3417; 14B (40 groups)

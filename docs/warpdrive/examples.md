@@ -477,7 +477,7 @@ logits = runner(weights, token, pos, *caches)  # decode_step_ref's contract: wri
 
 A batch-one decode step runs as one persistent launch per layer, then one for the LM head:
 a megakernel whose launch boundaries are the layer boundaries ([why](#why-one-launch-per-layer)).
-The host lowers the step into a table of 20.3k instructions, assigns them to CTAs ahead of time
+The host lowers the step into a table of 24.5k instructions, assigns them to CTAs ahead of time
 and splits the table by layer:
 
 ```text
@@ -488,7 +488,7 @@ for layer in 28 layers:
     GATEUP  192         16 gate + 16 up rows x RMSNorm(h + o)             -> SiLU(g) * u
     DOWN    32 x 4      32 rows x 768-column slice of Wd (split K)        -> down partials;
                         the last split also sums them into the residual
-LMHEAD  594         8 x 32 rows of the tied embedding x final RMSNorm    -> logits
+LMHEAD  4748        32 rows of the tied embedding x final RMSNorm         -> logits
 ```
 
 | Input | Contract |

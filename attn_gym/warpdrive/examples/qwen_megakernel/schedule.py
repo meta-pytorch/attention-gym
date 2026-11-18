@@ -89,7 +89,7 @@ def weight_stages(op: QwenDecodeMegakernel) -> dict[int, int]:
         OPROJ: op.oproj_k_tiles,
         GATEUP: k,
         DOWN: op.down_k_tiles,
-        LMHEAD: LM_TILES * k,
+        LMHEAD: lm_tiles(op) * k,
         ROUTER: k,
         REDUCE: 0,
         NORM: 0,
@@ -203,9 +203,19 @@ def instruction_rows(op: QwenDecodeMegakernel, ops: tuple[int, ...] = ALL_OPS) -
     if op.streams_inputs:
         for t in range(op.batch):
             add(NORM, op.layers, 0, t)
-    for t in range(0, lm_rows, LM_TILES):
-        add(LMHEAD, op.layers, t, min(LM_TILES, lm_rows - t))
+    tiles = lm_tiles(op)
+    for t in range(0, lm_rows, tiles):
+        add(LMHEAD, op.layers, t, min(tiles, lm_rows - t))
     return rows
+
+
+def lm_tiles(op: QwenDecodeMegakernel) -> int:
+    """Row tiles per LM-head item. A batch-one static table takes one: its CTAs share the LM
+    head evenly (Qwen3-0.6B: 594 eight-tile items left the last third on 170 of 212 SMs) and
+    reuse their input, so the extra items skip the prologue. Batched rows pay per-item input
+    handshakes and claimed rows a claim each, so they keep ``LM_TILES``."""
+    static = isinstance(op.work.schedule, (StaticPersistent, SmPersistent))
+    return 1 if op.batch == 1 and static else LM_TILES
 
 
 class StepTables(NamedTuple):
