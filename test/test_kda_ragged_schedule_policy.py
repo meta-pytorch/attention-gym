@@ -25,6 +25,9 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 from attn_gym.linear.kda.validation import resolve_kernel_options
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = pytest.mark.usefixtures("fused_chunk_default")
+
 SM100_SM_COUNT = 152
 CHUNK_SIZE = 64
 # Output composition flattens (head, 64-wide value tile) pairs; recompute flattens heads.

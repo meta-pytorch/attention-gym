@@ -18,7 +18,11 @@ from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA gate ops require CUDA")
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA gate ops require CUDA"),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])

@@ -33,10 +33,14 @@ from attn_gym.linear.kda.ops import (
 )
 from attn_gym.testing import strided_state_pool
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="fused chunk KDA requires CUDA capability 8.0 or newer",
-)
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="fused chunk KDA requires CUDA capability 8.0 or newer",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 _DEFAULT_SCALE = 128**-0.5
 

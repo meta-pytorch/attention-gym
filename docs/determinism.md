@@ -137,8 +137,10 @@ not across GPU architectures.
 
 ## KDA determinism
 
-The KDA operations contain no atomics, so every kernel is bitwise-deterministic
-given a fixed configuration. The guarantees, strongest first:
+The Triton fused KDA kernels contain no atomics, so every kernel is bitwise-deterministic
+given a fixed configuration. The warpdrive kernels, the default chunk backend on SM100-family GPUs,
+follow their own rules ([warpdrive chunk kernels](#warpdrive-chunk-kernels)). The guarantees of
+the fused kernels, strongest first:
 
 - **Same selected configurations, run to run: bitwise.** Repeating a call
   that resolves to the same kernel configurations — across runs and processes —
@@ -173,7 +175,7 @@ given a fixed configuration. The guarantees, strongest first:
   `state_grad_summaries` split into pieces whose length follows the packed stream's shape, so
   its bits change with the other sequences. The option scans every sequence uncut in both
   directions. It does not cover the handles' `run`, whose plan still follows the stream's
-  shape; the fused stages reject it.
+  shape; like the split schedules, it requires an explicit `"backend": "warpdrive"`.
 - **CUDA-graph replay: bitwise** by construction, and the intended serving mode
   for decode.
 - **Across lowerings: never bitwise.** Dense versus packed, chunked versus
@@ -184,6 +186,35 @@ given a fixed configuration. The guarantees, strongest first:
   compile with different schedules.
 
 The reference implementations compute in FP32 even inside an autocast region.
+
+## warpdrive chunk kernels
+
+On SM100-family GPUs, `chunk_kda`, `chunk_gdn`, their paged, staged and context-parallel forms run
+the warpdrive kernels by default ([Chunk backend selection](linear.md#chunk-backend-selection)).
+Pass `kernel_options={"backend": "fused"}` to get the fused guarantees above instead.
+
+- **Run to run: bitwise.** warpdrive does not autotune, so `{"autotune": False}` and
+  `torch.use_deterministic_algorithms(True)` change nothing and no tuning warm-up is needed.
+  Its atomics only claim work items and append rows to its work tables; repeating a call with
+  the same inputs and shapes reproduces the output, final-state and gradient bits
+  (`test/test_linear_default_backend.py`).
+- **Across batch compositions: not bitwise.** The plan (forward and backward piece chains, the
+  KDA value split and its prep pass, the piece length of the staged and context-parallel
+  summaries) follows the packed shape and the SM count, so a sequence's bits can change with
+  the other sequences packed beside it, and between GPU models with different SM counts. When
+  the summaries split, the staged `run` reuses their pieces, so its bits follow that piece
+  length too and differ from the public op's on the same stream.
+  [Document-aligned fragments](linear.md#document-aligned-fragments-cp-invariant-bits) gives
+  measured examples.
+- **Across `intra_chunk_dtypes` values: not bitwise.** The default `"tf32+bf16"` changes the
+  BF16 bits of earlier releases; `kernel_options={"intra_chunk_dtypes": "bf16"}` reproduces them
+  ([Operand precision](linear.md#operand-precision)). FP16 inputs have one value and unchanged
+  bits.
+- **Against the fused backend: never bitwise.** KDA chunks at 16 tokens on warpdrive and at 64
+  on the fused kernels; GDN chunks at 64 on both but with different kernels.
+- **CUDA-graph replay: bitwise** for the same inputs. A graph captured at a larger capacity
+  keeps the plan of its captured shape, so its replays need not match an eager call at the
+  replayed size bit for bit.
 
 
 ## References

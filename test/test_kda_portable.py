@@ -1,7 +1,7 @@
 """Portable Triton KDA forward, backward, and compiler integration tests.
 
 Every test runs the fused chunk backend, which is the portable Triton pipeline on every
-architecture.
+architecture; SM100-family GPUs would otherwise default to warpdrive.
 """
 
 from __future__ import annotations
@@ -32,10 +32,14 @@ from attn_gym.testing.kda import (
     strided_state_pool,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="the portable KDA route requires CUDA capability 8.0 or newer",
-)
+# These tests cover the fused kernels, which SM100-family GPUs run only when asked for.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="the portable KDA route requires CUDA capability 8.0 or newer",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 
 @pytest.fixture(autouse=True)
