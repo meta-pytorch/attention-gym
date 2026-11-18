@@ -206,8 +206,8 @@ also use FP32. Local and sparse pools must have the same KV head count: one shar
 
 | Input form | CuTe (FA4 sparse MLA) | Triton |
 |---|---|---|
-| Bare tensors | SM100-family GPU, BF16, one shared KV head, `1 <= H <= 128`, `D = 512`; no additional window-size bound in the adapter | Generic CUDA path for FP16/BF16/FP32, shared or per-head KV; no fixed `H`, `D`, or `W` eligibility bounds in the generic launcher. A specialized BF16 shared-KV schedule uses the same GPU, `H`, `D`, `W`, and latent-stride constraints as nonempty pairs below, without rotary requirements. |
-| Nonempty `(latent, rope)` pairs (`R > 0`) | Same CuTe constraints as bare, with `R = 64` | Compute capability major >= 8 (Ampere or newer, including Hopper and SM120), BF16, one shared KV head, `16 <= H <= 128`, `D` in `{16, 32, ..., 128, 512}`, `R` in `{16, 32, 64, 128}`, `0 <= W <= 2048`; shared-schedule stride requirements below must hold. No generic paired path. |
+| Bare tensors | SM100-family GPU, BF16, one shared KV head, `1 <= H <= 128`, `D = 512`; no additional window-size bound in the adapter | Generic CUDA path for FP16/BF16/FP32, shared or per-head KV; no fixed `H`, `D`, or `W` eligibility bounds in the generic launcher. A specialized BF16 shared-KV schedule requires `16 <= H <= 128` and the same GPU, `D`, `W`, and latent-stride constraints as nonempty pairs below, without rotary requirements. |
+| Nonempty `(latent, rope)` pairs (`R > 0`) | Same CuTe constraints as bare, with `R = 64` | Compute capability major >= 8 (Ampere or newer, including Hopper and SM120), BF16, one shared KV head, `1 <= H <= 128`, `D` in `{16, 32, ..., 128, 512}`, `R` in `{16, 32, 64, 128}`, `0 <= W <= 2048`; shared-schedule stride requirements below must hold. Head tiles are padded to at least 16 rows. No generic paired path. |
 | Zero-width pairs (`R = 0`) | Same eligibility as bare tensors | Same eligibility as bare tensors; rotary operands are omitted from the kernels and their gradients have empty feature dimensions. |
 
 Zero-width pairs retain paired-form validation and require explicit `scale`; they do not gain
@@ -220,9 +220,10 @@ positive width can launch.
 **Layouts and dependency constraints:**
 
 - The Triton shared schedule requires query latent feature stride 1, sparse latent KV feature
-  stride 1, and, when `W > 0`, local latent KV feature stride 1. KV head strides must be zero;
-  the public API expands shape-one shared KV to zero-head-stride views. Rotary KV must also
-  have zero head stride, but need not have unit feature stride. Required query layouts are
+  stride 1, and, when `W > 0`, local latent KV feature stride 1. For multiple query heads,
+  KV head strides must be zero; the public API expands shape-one shared KV to zero-head-stride
+  views. A singleton head may retain its ordinary stride. The same head-stride rule applies to
+  rotary KV, which need not have unit feature stride. Required query layouts are
   normalized by the launch path. Without a window, local operands are not read and do not
   restrict this schedule. These rules also govern the specialized bare-tensor schedule, except
   for the rotary requirements.
