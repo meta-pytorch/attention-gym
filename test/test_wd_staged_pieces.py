@@ -48,6 +48,8 @@ class Variant(NamedTuple):
 
 
 WARPDRIVE = {"backend": "warpdrive"}
+# chunk_kda_prepare's BF16 default, which direct summary-builder calls must repeat.
+KDA_PRECISION = {"intra_chunk_dtypes": "tf32+bf16"}
 KDA = Variant(
     partial(chunk_kda_prepare, kernel_options=WARPDRIVE), chunk_kda_prepare_backward, True, HEADS
 )
@@ -59,6 +61,16 @@ VARIANTS = [
     pytest.param(GDN, id="gdn"),
     pytest.param(GDN._replace(key_heads=1), id="gdn-gqa"),
 ]
+
+
+def _summary_builders(variant: Variant):
+    """The variant's forward and reverse summary builders, at its prepare's default options."""
+    if variant.channel_gate:
+        return (
+            partial(native_summary.build_state_summaries, **KDA_PRECISION),
+            partial(native_summary.build_state_grad_summaries, **KDA_PRECISION),
+        )
+    return native_summary.build_gdn_state_summaries, native_summary.build_gdn_state_grad_summaries
 
 
 def _operands(variant: Variant, seed: int = 0, dtype: torch.dtype = torch.bfloat16):
@@ -183,12 +195,7 @@ def test_staged_pieces_ignore_call_order_and_bounds(variant):
         torch.testing.assert_close(got, want, atol=0, rtol=0)
     saved = prepared.saved
     q, k, v, gate, beta = (saved.q, saved.k, saved.v, saved.gate, saved.beta)
-    if variant.channel_gate:
-        forward = native_summary.build_state_summaries
-        reverse = native_summary.build_state_grad_summaries
-    else:
-        forward = native_summary.build_gdn_state_summaries
-        reverse = native_summary.build_gdn_state_grad_summaries
+    forward, reverse = _summary_builders(variant)
     expected = (
         forward(k, v, gate, beta, cu_seqlens, bounds=every),
         reverse(q, k, v, gate, beta, grads.d_output, cu_seqlens, SCALE, bounds=every),
@@ -377,11 +384,7 @@ def test_staged_seed_cotangent_is_the_adjoint_of_the_forward_prefix(variant):
     grads = variant.prepare_backward(prepared.saved, d_output, initial_state, scale=SCALE)
     d_initial_state = grads.run(None)[-1]
     saved = prepared.saved
-    reverse = (
-        native_summary.build_state_grad_summaries
-        if variant.channel_gate
-        else native_summary.build_gdn_state_grad_summaries
-    )
+    _, reverse = _summary_builders(variant)
     alone = torch.tensor([0, start, tokens], dtype=torch.int32, device="cuda")
     entry_cotangent = reverse(
         saved.q, saved.k, saved.v, saved.gate, saved.beta, grads.d_output, alone, SCALE,

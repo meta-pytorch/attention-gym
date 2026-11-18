@@ -27,6 +27,7 @@ pytest.importorskip("cutlass.cute")
 
 import cutlass
 
+from attn_gym.linear._delta_rule.warpdrive.kda_common import OperandDtypes
 from attn_gym.warpdrive.fences import FENCE_KINDS
 from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
 from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
@@ -47,6 +48,11 @@ COMPILE = {
     "kda_recompute": "compile_kda_recompute",
     "kda_summary": "compile_kda_summary",
 }
+# Audit forward and backward at each supported (decay, solve) operand precision.
+TF32_FP16 = {"precision": OperandDtypes("tf32", "fp16")}
+TF32 = {"precision": OperandDtypes("tf32", "tf32")}
+TF32_BF16 = {"precision": OperandDtypes("tf32", "bf16")}
+BF16_OPERANDS = {"precision": OperandDtypes("bf16", "bf16")}
 # (module, kernel class, constructor arguments, compile-function arguments after the op)
 KERNELS = [
     (
@@ -199,205 +205,305 @@ KERNELS = [
     ("kda_bprop_summary", "KdaBpropSummary", ("fp16", 64, 64, True), {}),
     ("kda_bprop_summary", "KdaBpropSummary", ("fp16", 128, 128, True), {}),
     ("kda_bprop_summary", "KdaBpropSummary", ("bf16", 128, 128, True, False), {}),
+    *[
+        (
+            "kda_bprop",
+            "KdaBprop",
+            ("bf16", "fp32", 128, 128, seeded, seeded, seeded, 152),
+            {"beta_dtype": "fp32", **precision},
+        )
+        for precision in (TF32_BF16, TF32)
+        for seeded in (False, True)
+    ],
+    *[
+        ("kda_bprop_summary", "KdaBpropSummary", ("bf16", 128, 128, True), precision)
+        for precision in (TF32_BF16, TF32)
+    ],
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "bf16", 128, 64, 2, True, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, False, False, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": None},
+        {"beta_dtype": "fp32", "state_dtype": None, **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, False, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, False, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 0, 148),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 2, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 64, 2, False, False, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": None},
+        {"beta_dtype": "fp32", "state_dtype": None, **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 64, 2, True, False, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 64, 2, True, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 64, 64, 1, True, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("fp16", "fp32", 128, 128, 1, False, False, 0, 4),
-        {"beta_dtype": "fp32", "state_dtype": None},
+        {"beta_dtype": "fp32", "state_dtype": None, **TF32_FP16},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("fp16", "fp32", 128, 64, 2, True, True, 0, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32_FP16},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 0, 152, False),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
-    ("kda_prep", "KdaPrep", ("bf16", "bf16", 128, 152), {"beta_dtype": "bf16"}),
-    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 148), {"beta_dtype": "fp32"}),
-    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32"}),
-    ("kda_prep", "KdaPrep", ("bf16", "fp32", 64, 152), {"beta_dtype": "fp32"}),
-    ("kda_prep", "KdaPrep", ("fp16", "fp16", 128, 152), {"beta_dtype": "fp16"}),
-    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152, False), {"beta_dtype": "fp32"}),
+    ("kda_prep", "KdaPrep", ("bf16", "bf16", 128, 152), {"beta_dtype": "bf16", **TF32}),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 148), {"beta_dtype": "fp32", **TF32}),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32", **TF32}),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 64, 152), {"beta_dtype": "fp32", **TF32}),
+    ("kda_prep", "KdaPrep", ("fp16", "fp16", 128, 152), {"beta_dtype": "fp16", **TF32_FP16}),
+    (
+        "kda_prep",
+        "KdaPrep",
+        ("bf16", "fp32", 128, 152, False),
+        {"beta_dtype": "fp32", **TF32},
+    ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, False, False, 0, 152),
-        {"state_dtype": None},
+        {"state_dtype": None, "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, False, True, 0, 152),
-        {"state_dtype": "fp32"},
+        {"state_dtype": "fp32", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, False, 0, 152),
-        {"state_dtype": "fp32"},
+        {"state_dtype": "fp32", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, True, 0, 1),
-        {"state_dtype": "fp32"},
+        {"state_dtype": "fp32", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, True, 0, 152),
-        {"state_dtype": "fp32"},
+        {"state_dtype": "fp32", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, True, 1, 152),
-        {"state_dtype": "fp32"},
+        {"state_dtype": "fp32", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, True, 2, 152),
-        {"state_dtype": "fp32"},
+        {"state_dtype": "fp32", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 64, 2, True, True, 0, 152),
-        {"state_dtype": "bf16"},
+        {"state_dtype": "bf16", "solve_dtype": "tf32"},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "bf16", 128, 64, True, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "bf16", 64, 64, True, 152),
-        {"beta_dtype": "fp32", "state_dtype": "bf16"},
+        {"beta_dtype": "fp32", "state_dtype": "bf16", **TF32},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "fp32", 128, 128, False, 152),
-        {"beta_dtype": "fp32", "state_dtype": None},
+        {"beta_dtype": "fp32", "state_dtype": None, **TF32},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "fp32", 128, 128, True, 148),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "fp32", 128, 128, True, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("fp16", "fp32", 128, 128, False, 4),
-        {"beta_dtype": "fp32", "state_dtype": None},
+        {"beta_dtype": "fp32", "state_dtype": None, **TF32_FP16},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("fp16", "fp32", 64, 128, False, 152),
-        {"beta_dtype": "fp32", "state_dtype": None},
+        {"beta_dtype": "fp32", "state_dtype": None, **TF32_FP16},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("fp16", "fp32", 128, 128, True, 152),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32_FP16},
     ),
     (
         "kda_recompute",
         "KdaRecompute",
         ("bf16", "fp32", 128, 128, True, 152, False),
-        {"beta_dtype": "fp32", "state_dtype": "fp32"},
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32},
     ),
-    ("kda_summary", "KdaSummary", ("bf16", "bf16", 128, 64, 152), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("bf16", "fp32", 128, 128, 148), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("bf16", "fp32", 128, 128, 152), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("bf16", "fp32", 64, 64, 152), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("fp16", "fp16", 128, 128, 152), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("fp16", "fp32", 64, 128, 152), {"beta_dtype": "fp32"}),
-    ("kda_summary", "KdaSummary", ("bf16", "fp32", 128, 128, 152, False), {"beta_dtype": "fp32"}),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "bf16", 128, 64, 152),
+        {"beta_dtype": "fp32", **TF32},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 128, 128, 148),
+        {"beta_dtype": "fp32", **TF32},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 128, 128, 152),
+        {"beta_dtype": "fp32", **TF32},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 64, 64, 152),
+        {"beta_dtype": "fp32", **TF32},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("fp16", "fp16", 128, 128, 152),
+        {"beta_dtype": "fp32", **TF32_FP16},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("fp16", "fp32", 64, 128, 152),
+        {"beta_dtype": "fp32", **TF32_FP16},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 128, 128, 152, False),
+        {"beta_dtype": "fp32", **TF32},
+    ),
+    # The kernels under intra_chunk_dtypes="bf16".
+    (
+        "kda_recompute",
+        "KdaRecompute",
+        ("bf16", "fp32", 128, 128, True, 152),
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **BF16_OPERANDS},
+    ),
+    (
+        "kda_prefill",
+        "KdaPrefill",
+        ("bf16", "fp32", 128, 128, 1, True, True, 0, 152),
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **BF16_OPERANDS},
+    ),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32", **BF16_OPERANDS}),
+    (
+        "kda_prep_prefill",
+        "KdaPrepPrefill",
+        ("bf16", 128, 2, True, True, 0, 152),
+        {"state_dtype": "fp32", "solve_dtype": "bf16"},
+    ),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 128, 128, 152),
+        {"beta_dtype": "fp32", **BF16_OPERANDS},
+    ),
+    # The kernels under "tf32+bf16" (the prep prefill's BF16 solve operands are covered above).
+    (
+        "kda_recompute",
+        "KdaRecompute",
+        ("bf16", "fp32", 128, 128, True, 152),
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32_BF16},
+    ),
+    (
+        "kda_prefill",
+        "KdaPrefill",
+        ("bf16", "fp32", 128, 128, 1, True, True, 0, 152),
+        {"beta_dtype": "fp32", "state_dtype": "fp32", **TF32_BF16},
+    ),
+    ("kda_prep", "KdaPrep", ("bf16", "fp32", 128, 152), {"beta_dtype": "fp32", **TF32_BF16}),
+    (
+        "kda_summary",
+        "KdaSummary",
+        ("bf16", "fp32", 128, 128, 152),
+        {"beta_dtype": "fp32", **TF32_BF16},
+    ),
 ]
 KERNELS += [
     ("gdn_prefill", "GdnPrefillCompute", ("bf16", "bf16", 128, 128, 1, True, True, False), {}),
@@ -406,25 +512,25 @@ KERNELS += [
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 128, 1, True, True, 2, 152),
-        {"beta_dtype": "fp32", "state_dtype": "bf16"},
+        {"beta_dtype": "fp32", "state_dtype": "bf16", **TF32},
     ),
     (
         "kda_prefill",
         "KdaPrefill",
         ("bf16", "fp32", 128, 64, 2, True, True, 2, 152),
-        {"beta_dtype": "fp32", "state_dtype": "bf16"},
+        {"beta_dtype": "fp32", "state_dtype": "bf16", **TF32},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, True, 1, 152),
-        {"state_dtype": "bf16"},
+        {"state_dtype": "bf16", "solve_dtype": "tf32"},
     ),
     (
         "kda_prep_prefill",
         "KdaPrepPrefill",
         ("bf16", 128, 2, True, True, 2, 152),
-        {"state_dtype": "bf16"},
+        {"state_dtype": "bf16", "solve_dtype": "tf32"},
     ),
 ]
 BF16, FP32, I32 = cutlass.BFloat16, cutlass.Float32, cutlass.Int32
@@ -441,7 +547,18 @@ def _kda_paged(paged_state: int, tiles_per_head: int, state_dtype=FP32) -> tuple
     """``kda_warmup_forward._compile_warmup_forward`` arguments: BF16 inputs,
     selectable input/output state dtype, d 128; the d_v split runs the prep prefill."""
     dtypes = (BF16, FP32, FP32, I32, state_dtype, state_dtype)
-    return (None, 152, *dtypes, 128, 128, tiles_per_head, tiles_per_head > 1, False, paged_state)
+    return (
+        None,
+        152,
+        *dtypes,
+        128,
+        128,
+        tiles_per_head,
+        tiles_per_head > 1,
+        False,
+        OperandDtypes("tf32", "tf32"),  # TF32 solve operands (NOTE [KDA operand precision])
+        paged_state,
+    )
 
 
 # (bundle module, _compile_warmup_forward arguments[, keyword arguments]): the paged prefill
@@ -545,12 +662,14 @@ FENCE_UNVERIFIED = {
         _GENERIC_TO_UMMA + " (Krestore); the epilogue reads only Qdecay"
     ),
     ("kda_recompute", "kk commit_fence smem_async"): (
-        _GENERIC_TO_UMMA + " (Kdecay); under fp16 the regmma consumer reads only the tf32 tiles "
-        "(Kdecay32, Kinv), which the check reports as a missing Kdecay access"
+        _GENERIC_TO_UMMA
+        + " (Kdecay); with tf32 decay products the regmma consumer reads only the "
+        "tf32 tiles (Kdecay32, Kinv), which the check reports as a missing Kdecay access"
     ),
     ("kda_summary", "kk commit_fence smem_async"): (
-        _GENERIC_TO_UMMA + " (Kdecay); under fp16 the regmma consumer reads only the tf32 tiles "
-        "(Kdecay32, Kinv), which the check reports as a missing Kdecay access"
+        _GENERIC_TO_UMMA
+        + " (Kdecay); with tf32 decay products the regmma consumer reads only the "
+        "tf32 tiles (Kdecay32, Kinv), which the check reports as a missing Kdecay access"
     ),
     ("kda_prep", "raw release_fence smem_async"): (
         "warp 0 refills the stage by TMA after the empty wait (external producer); consumers "
@@ -596,14 +715,19 @@ FENCE_UNVERIFIED = {
 
 
 def _kernel_id(case) -> str:
-    module, cls, args, _ = case
-    return "-".join([module, cls, *map(str, args)])
+    module, cls, args, kwargs = case
+    precision = kwargs.get("precision") or [kwargs[k] for k in ("solve_dtype",) if k in kwargs]
+    return "-".join([module, cls, *map(str, args), *precision])
 
 
 def _bundle_id(case) -> str:
     module, args, *kwargs = case
     keywords = [f"{name}={value}" for name, value in (kwargs[0] if kwargs else {}).items()]
-    return "-".join([module, *(getattr(a, "__name__", str(a)) for a in args), *keywords])
+    # Keep both dtype names in the test ID so a failed precision variant is easy to rerun.
+    groups = (
+        a if isinstance(a, OperandDtypes) else (getattr(a, "__name__", str(a)),) for a in args
+    )
+    return "-".join([module, *(name for group in groups for name in group), *keywords])
 
 
 def _unaudited(module: str, op) -> list[str]:

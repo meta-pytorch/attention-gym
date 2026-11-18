@@ -8,6 +8,8 @@
 """Helpers shared by the warpdrive KDA kernels: raw TMEM-handoff barrier ops, swizzled SMEM
 offsets, the upstream pointer loads and stores, the dtype maps and the work-item row layout."""
 
+from typing import NamedTuple
+
 import cutlass
 import torch
 from cutlass import Float32, Int32, Int64, cute
@@ -16,6 +18,7 @@ from cutlass.cute.nvgpu import tcgen05
 
 from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
+from .blockwise_inverse import invert_unit_lower_16x16_fragments, invert_unit_lower_16x16_tf32
 from .ptx import (
     elect_sync,
     f16x2_to_f32,
@@ -25,12 +28,23 @@ from .ptx import (
     mma_step,
     mma_step_tf32,
     st_shared_v4,
+    stmatrix,
     tf32_round,
+    tmem_st,
 )
 from .ragged import RaggedTma, ragged_load
+from .umma import (
+    SWIZZLE_32B,
+    MmaDesc,
+    desc_opaque,
+    instr_desc,
+    mma_ts_op,
+    mma_ts_tf32_op,
+    smem_desc,
+    tf32_k_major_desc,
+)
 
 B_T = 16
-A_WORDS = B_T * B_T // 2  # int32 words of one A record (a 32-byte swizzled 16 x 16 b16 image)
 CUTE_DTYPES = {"fp16": cutlass.Float16, "bf16": cutlass.BFloat16, "fp32": cutlass.Float32}
 TORCH_NAMES = {torch.float16: "fp16", torch.bfloat16: "bf16", torch.float32: "fp32"}
 # Work-item row (bounds in chunks): batch, head x value tile, write_start, write_end,
@@ -355,13 +369,14 @@ def store_state_32(tile, vals, align: cutlass.Constexpr[int] = 16):
 
 
 @cute.jit
-def beta_residual(v_word, beta0, beta1, ks0, ks1, dtype: cutlass.Constexpr, with_state):
-    """``beta * (v - ks)`` for one packed V pair in fp32; only the final pack rounds."""
+def beta_residual(
+    v_word, beta0, beta1, ks0, ks1, dtype: cutlass.Constexpr, with_state: cutlass.Constexpr
+):
+    """``beta * (v - ks)`` for one packed V pair, in fp32."""
     v0, v1 = f16x2_to_f32(v_word, dtype=dtype)
     if cutlass.const_expr(with_state):
         v0, v1 = cute.arch.add_packed_f32x2((v0, v1), (-ks0, -ks1))
-    y0, y1 = fmul2(beta0, beta1, v0, v1)
-    return fp32_to_fp16(y0, y1, dtype=dtype)
+    return fmul2(beta0, beta1, v0, v1)
 
 
 @cute.jit
@@ -458,16 +473,220 @@ def gate_offset(row, dim, d_k: cutlass.Constexpr[int]):
     return 4 * cute.crd2idx((row, dim ^ ((dim >> 5) << 2)), gate_tile(d_k))
 
 
-# ---- TF32 decay operands (fp16 io) -------------------------------------------------------
+# ---- Operand precision options -----------------------------------------------------------
+# NOTE [KDA operand precision]
+# Each chunk builds two triangular matrices from decayed queries and keys: the strictly lower
+# update matrix L = diag(beta) strict_lower(K_decay @ K_inv.T) and the causal attention matrix
+# A = lower(Q_decay @ K_inv.T). ``decay_dtype`` controls the operands of these two products.
+# ``solve_dtype`` controls the inverse of T = I + L and the operands of U = inv(T) @ Y and
+# A @ U, where Y is the gated value residual. Both choices apply to forward, checkpoint
+# recomputation, summaries and backward. Legacy BF16 and FP16 backward keep their older scale
+# placement (see ``kda_bprop``). State products use the Q/K/V kernel dtype (``io``);
+# all of these matrix products accumulate in FP32.
+#
+# TF32 decay also widens the pairwise dQ/dK products. In state gradients it pairs K_restore
+# with unscaled dS rather than rounding dS after decay. TF32 solve rounds dU to TF32 for dY
+# and keeps TF32 U as a BF16 high part plus a residual for dA/dM. With a BF16 solve, beta*dM
+# must round to BF16 before the TF32 pairwise multiply to match the rounded solve contribution.
+#
+# With a TF32 solve, each operand rounds independently to 10 fraction bits with FP32 exponent
+# range. No token borrows a scale from later tokens. The inverse uses m16n8k8 TF32 mma.sync;
+# the solve uses K-major shared-memory tiles for inv(T) and A, and tensor memory for Y and U.
+# Shared prep writes A @ inv(T) @ diag(beta) to global memory in that same K-major layout.
+
+
+class OperandDtypes(NamedTuple):
+    """Kernel dtype names of the intra-chunk matmul operands (NOTE [KDA operand precision])."""
+
+    decay_dtype: str  # "tf32" or the io dtype
+    solve_dtype: str  # "tf32" or the io dtype
+
+
+# ``intra_chunk_dtypes`` value -> its operand dtypes under bf16 io.
+INTRA_CHUNK_DTYPES = {
+    "tf32": OperandDtypes("tf32", "tf32"),
+    "tf32+bf16": OperandDtypes("tf32", "bf16"),
+    "bf16": OperandDtypes("bf16", "bf16"),
+}
+FP16_INTRA_CHUNK_DTYPES = "tf32+fp16"
+FP16_OPERAND_DTYPES = OperandDtypes("tf32", "fp16")
+
+
+def operand_dtypes(io: str, intra_chunk_dtypes: str) -> OperandDtypes:
+    """Map a validated option to its kernel dtypes. FP16 kernels also accept the old raw-op
+    default (``"bf16"``) so serialized calls still select TF32 decay and FP16 solve operands.
+    """
+    if io == "fp16" and intra_chunk_dtypes == FP16_INTRA_CHUNK_DTYPES:
+        return FP16_OPERAND_DTYPES
+    if intra_chunk_dtypes not in INTRA_CHUNK_DTYPES:
+        raise ValueError(
+            f"intra_chunk_dtypes must be one of {tuple(INTRA_CHUNK_DTYPES)}, "
+            f"got {intra_chunk_dtypes!r}"
+        )
+    if io == "fp16":
+        return FP16_OPERAND_DTYPES
+    return INTRA_CHUNK_DTYPES[intra_chunk_dtypes]
+
+
+def check_operand_dtypes(io: str, dtypes: OperandDtypes) -> None:
+    """Validate a kernel's resolved operand dtypes (``operand_dtypes``)."""
+    decay_dtype, solve_dtype = dtypes
+    if decay_dtype not in ("tf32", io) or (io == "fp16" and decay_dtype != "tf32"):
+        raise ValueError(f"decay_dtype must be tf32 (or bf16 for bf16 io), got {decay_dtype}")
+    if solve_dtype not in ("tf32", io) or (io == "fp16" and solve_dtype != io):
+        raise ValueError(f"solve_dtype must be tf32 (bf16 io) or the io dtype, got {solve_dtype}")
+
+
+def solve_suffix(io: str, solve_dtype: str) -> str:
+    """Distinguish TF32 solve kernels without renaming the original 16-bit kernels."""
+    return "_ictf32" if solve_dtype == "tf32" else ""
+
+
+def precision_suffix(io: str, dtypes: OperandDtypes) -> str:
+    """Kernel-name tag of non-io operand dtypes under bf16 io; empty for fp16 io."""
+    decay = "_kktf32" if io != "fp16" and dtypes.decay_dtype == "tf32" else ""
+    return decay + solve_suffix(io, dtypes.solve_dtype)
+
+
+def row_halves(two: bool) -> tuple[int, ...]:
+    """TMEM address offsets of a fragment's 16-lane halves: ``(0, 16 << 16)`` when ``two``."""
+    return (0, 16 << 16) if two else (0,)
+
+
+@cute.jit
+def pack_fragment(vals, dtype: cutlass.Constexpr):
+    """Pack eight FP32 values into four 32-bit words, two 16-bit operands per word."""
+    return [fp32_to_fp16(vals[2 * r], vals[2 * r + 1], dtype=dtype) for r in range(4)]
+
+
+@cute.jit
+def store_tf32_rows(rows):
+    """Store the fp32 fragments of ``rows`` (``(TMEM address, 16x256b x2 fragment)`` pairs),
+    rounded to tf32, as a ``.kind::tf32`` TMEM operand (one column per token). The caller
+    completes the stores (``tcgen05.wait::st``)."""
+    for addr, vals in rows:
+        tmem_st("16x256b", addr, [tf32_round(vals[i]) for i in range(8)])
+
+
+def tf32_k_major_tile():
+    """Map (n, k) to a 32-bit word in the 16 x 16 TF32 B tile. Each unswizzled core matrix
+    has eight rows of four words; ``tf32_k_major_desc`` describes that layout to the MMA."""
+    return cute.make_layout(((8, 2), (4, 4)), stride=((4, 128), (1, 32)))
+
+
+TF32_TILE_BYTES = B_T * B_T * 4
+
+
+@cute.jit
+def store_tf32_k_major(base, acc, lane, transpose: cutlass.Constexpr[bool] = False):
+    """Round an m16n16 mma.sync accumulator fragment to tf32 and store it K-major."""
+    for p in cutlass.range_constexpr(4):
+        n = lane // 4 + (8 if p % 2 else 0)
+        k = (p // 2) * 8 + 2 * (lane % 4)
+        if cutlass.const_expr(transpose):
+            for j in cutlass.range_constexpr(2):
+                addr = base + 4 * cute.crd2idx((k + j, n), tf32_k_major_tile())
+                inline_ptx(
+                    "st.shared.b32 [$0], $1;", read_only_args=[addr, tf32_round(acc[2 * p + j])]
+                )
+        else:
+            addr = base + 4 * cute.crd2idx((n, k), tf32_k_major_tile())
+            sts_v2_b32(addr, tf32_round(acc[2 * p]), tf32_round(acc[2 * p + 1]))
+
+
+@cute.jit
+def sts_v2_b32(addr, lo, hi):
+    inline_ptx("st.shared.v2.b32 [$0], {$1, $2};", read_only_args=[Int32(addr), lo, hi])
+
+
+def solve_type(dtypes: OperandDtypes):
+    """CuTe dtype of the solve operands of ``dtypes`` (Float32 for tf32)."""
+    return CUTE_DTYPES["fp32" if dtypes.solve_dtype == "tf32" else dtypes.solve_dtype]
+
+
+def solve_mma_desc(m: int, dtype) -> MmaDesc:
+    """Describe an [m, 16] by [16, 16] multiply: two K=8 steps for TF32, one K=16 otherwise."""
+    width = dtype.width // 8
+    return MmaDesc(
+        M=m,
+        N=B_T,
+        K=B_T,
+        bpe_a=width,
+        bpe_b=width,
+        tile_k_hw=8 if dtype is Float32 else 16,
+        idesc=instr_desc(Float32, dtype, dtype, m=m, n=B_T),
+    )
+
+
+def a_record_words(dtypes: OperandDtypes) -> int:
+    """Number of int32 words in a prep record holding one 16 x 16 attention tile."""
+    return solve_tile_bytes(solve_type(dtypes)) // 4
+
+
+def solve_tile_bytes(dtype) -> int:
+    """Bytes of one 16 x 16 T^-1 or A tile of solve dtype ``dtype``."""
+    return TF32_TILE_BYTES if dtype is Float32 else B_T * B_T * 2
+
+
+@cute.jit
+def store_solve_operand(rows, dtype: cutlass.Constexpr):
+    """Round each (TMEM address, FP32 fragment) pair to the solve dtype and store it as a TMEM
+    A operand. The caller waits for the stores before publishing the operand."""
+    if cutlass.const_expr(dtype is Float32):
+        store_tf32_rows(rows)
+    else:
+        for addr, vals in rows:
+            tmem_st("16x128b", addr, pack_fragment(vals, dtype))
+
+
+@cute.jit
+def store_solve_tile(base, acc, lane, idx, dtype: cutlass.Constexpr):
+    """Store a 16 x 16 fp32 mma.sync accumulator fragment (T^-1 or A) as the solve MMA's B tile
+    at shared address ``base``: K-major tf32 (``store_tf32_k_major``), or 16-bit through
+    ``stmatrix`` at the lane's 32-byte swizzled element offset ``idx``."""
+    if cutlass.const_expr(dtype is Float32):
+        store_tf32_k_major(base, acc, lane)
+    else:
+        stmatrix(
+            base + 2 * idx,
+            [fp32_to_fp16(acc[2 * i], acc[2 * i + 1], dtype=dtype) for i in range(4)],
+        )
+
+
+@cute.jit
+def invert_solve(l_regs, lane, dtype: cutlass.Constexpr):
+    """``(I + L)^-1`` of a strictly lower 16 x 16 fp32 fragment with ``dtype`` operands."""
+    if cutlass.const_expr(dtype is Float32):
+        return invert_unit_lower_16x16_tf32([l_regs[i] for i in range(8)], lane)
+    return invert_unit_lower_16x16_fragments(l_regs, lane, dtype)
+
+
+@cute.jit
+def solve_tile_desc(addr, dtype: cutlass.Constexpr):
+    """Shared-memory descriptor of the solve B tile at ``addr`` (``store_solve_tile``)."""
+    if cutlass.const_expr(dtype is Float32):
+        return desc_opaque(tf32_k_major_desc(addr))
+    return desc_opaque(smem_desc(addr, 16, 256, SWIZZLE_32B))
+
+
+@cute.jit
+def solve_mma(desc: cutlass.Constexpr, tmem_a, desc_b, tmem_d, accumulate, issue):
+    """Multiply the TMEM operand by the shared-memory solve tile, optionally adding to D."""
+    if cutlass.const_expr(desc.bpe_a == 4):
+        mma_ts_tf32_op(desc.idesc, tmem_a, desc_b, tmem_d, accumulate, issue)
+    else:
+        mma_ts_op(desc, tmem_a, desc_b, tmem_d, 0, accumulate, issue)
+
+
+# ---- TF32 decay operands -----------------------------------------------------------------
 # NOTE [TF32 decay operands]
 # With g the per-channel prefix log2 decay of a 16-token chunk, the in-chunk products are
 # A[i, j] = (Q[i] * 2^g[i]) . (K[j] * 2^-g[j]) for j <= i, and KK[i, j], which uses K[i] in place
 # of Q[i]. On the diagonal the decay cancels exactly in the math, but staging the operands in
 # fp16 can turn one into zero and the other into infinity before they multiply: their ratio spans
-# the whole 16-token gate sum (about 2^121 at the gate bound). That is why the fp16 kernels form
-# these operands (Q_decay or K_decay, and K_inv) in fp32 and round them to tf32 for m16n8k8 tf32
-# mma.sync (and, in the backward, tcgen05 ``.kind::tf32``): they need the exponent range, not
-# accumulator precision.
+# the whole 16-token gate sum. FP16 kernels therefore form both operands in FP32 and round
+# to TF32. BF16 kernels use the same path when TF32 decay is selected: here the benefit is
+# more fraction bits, not a wider exponent range. Accumulation is FP32 in either case.
 #
 # The operands are fp32 ``[16, d_k]`` tiles in one of two layouts (``tf32_tile``), which both the
 # row stores (``sts_tf32x8``) and the fragment loads (``tf32_fragment_offsets``) index by

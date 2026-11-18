@@ -18,47 +18,52 @@ from attn_gym.linear._delta_rule.paged_state import PagedState
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
-# and exported programs that reference them still load.
+# and exported programs that reference them still load. Append the precision argument so old
+# positional calls still bind. Its schema default, "bf16", selects the original kernels for
+# either Q/K/V dtype; native FP16 always runs the fixed TF32-decay, FP16-solve variant.
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "
-    "bool split, float scale, bool fastmath=True) -> Tensor",
+    'bool split, float scale, bool fastmath=True, str intra_chunk_dtypes="bf16") '
+    "-> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_with_initial_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
-    "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True) -> Tensor",
+    "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True, "
+    'str intra_chunk_dtypes="bf16") -> Tensor',
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
     "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True, "
-    "bool nonempty=False) -> (Tensor, Tensor)",
+    'bool nonempty=False, str intra_chunk_dtypes="bf16") -> (Tensor, Tensor)',
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
-    "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale) -> Tensor",
+    "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale, "
+    'str intra_chunk_dtypes="bf16") -> Tensor',
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_local_bwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
-    "Tensor cu_seqlens, bool split, float scale, bool fastmath=True) "
-    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+    "Tensor cu_seqlens, bool split, float scale, bool fastmath=True, "
+    'str intra_chunk_dtypes="bf16") -> (Tensor, Tensor, Tensor, Tensor, Tensor)',
 )
 # Fixed-arity pair over one launcher: only the with-state backward returns the entry cotangent.
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_bwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
     "Tensor cu_seqlens, Tensor initial_state, Tensor? d_final_state, float scale, "
-    "bool fastmath=True) "
+    'bool fastmath=True, str intra_chunk_dtypes="bf16") '
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_bwd_with_exit_cotangent",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
-    "Tensor cu_seqlens, Tensor? d_final_state, float scale, bool fastmath=True) "
-    "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
+    "Tensor cu_seqlens, Tensor? d_final_state, float scale, bool fastmath=True, "
+    'str intra_chunk_dtypes="bf16") -> (Tensor, Tensor, Tensor, Tensor, Tensor)',
 )
 
 
@@ -116,8 +121,19 @@ def _restore_layout(
 
 
 # The dispatcher drops trailing arguments left at their schema default, so every Python impl and
-# fake repeats ``fastmath=True``.
-def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale, fastmath=True):
+# fake repeats ``fastmath=True`` and ``intra_chunk_dtypes="bf16"``.
+def _packed_fwd_cuda(
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    cu_seqlens,
+    split,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
+):
     template = value
     q, k, value, gate, beta, cu_seqlens = _normalize_operands(q, k, value, gate, beta, cu_seqlens)
     output, _ = _backend(q).run_forward(
@@ -132,12 +148,22 @@ def _packed_fwd_cuda(q, k, value, gate, beta, cu_seqlens, split, scale, fastmath
         output_final_state=False,
         split=split,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
     return _restore_layout(output, value, template)
 
 
 def _packed_fwd_with_initial_state_cuda(
-    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    initial_state,
+    cu_seqlens,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     template = value
     q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
@@ -154,12 +180,23 @@ def _packed_fwd_with_initial_state_cuda(
         scale=scale,
         output_final_state=False,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
     return _restore_layout(output, value, template)
 
 
 def _packed_fwd_with_state_cuda(
-    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True, nonempty=False
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    initial_state,
+    cu_seqlens,
+    scale,
+    fastmath=True,
+    nonempty=False,
+    intra_chunk_dtypes="bf16",
 ):
     template, state_template = value, initial_state
     q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
@@ -176,6 +213,7 @@ def _packed_fwd_with_state_cuda(
         scale=scale,
         output_final_state=True,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,
     )
     assert final_state is not None
@@ -196,6 +234,7 @@ def _packed_fwd_paged_cuda(
     has_initial_state,
     cu_seqlens,
     scale,
+    intra_chunk_dtypes="bf16",
 ):
     template = value
     # The pool is advanced in place, so it is validated rather than copied.
@@ -223,6 +262,7 @@ def _packed_fwd_paged_cuda(
         paged_state,
         scale=scale,
         output_final_state=False,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
     return _restore_layout(output, value, template)
 
@@ -240,6 +280,7 @@ def _packed_bwd_cuda(
     scale,
     split,
     fastmath,
+    intra_chunk_dtypes,
 ):
     from attn_gym.linear._delta_rule.warpdrive.launchers.backward import (
         chunk_delta_rule_bwd_warpdrive_packed,
@@ -258,6 +299,7 @@ def _packed_bwd_cuda(
         initial_state=initial_state,
         d_final_state=d_final_state,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
     return (
         *(
@@ -269,10 +311,32 @@ def _packed_bwd_cuda(
 
 
 def _packed_local_bwd_cuda(
-    q, k, value, gate, beta, d_output, cu_seqlens, split, scale, fastmath=True
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    d_output,
+    cu_seqlens,
+    split,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     return _packed_bwd_cuda(
-        q, k, value, gate, beta, d_output, cu_seqlens, None, None, scale, split, fastmath
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        d_output,
+        cu_seqlens,
+        None,
+        None,
+        scale,
+        split,
+        fastmath,
+        intra_chunk_dtypes,
     )[:5]
 
 
@@ -288,6 +352,7 @@ def _packed_bwd_with_state_cuda(
     d_final_state,
     scale,
     fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     return _packed_bwd_cuda(
         q,
@@ -302,14 +367,37 @@ def _packed_bwd_with_state_cuda(
         scale,
         False,
         fastmath,
+        intra_chunk_dtypes,
     )
 
 
 def _packed_bwd_with_exit_cotangent_cuda(
-    q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, scale, fastmath=True
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    d_output,
+    cu_seqlens,
+    d_final_state,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     return _packed_bwd_cuda(
-        q, k, value, gate, beta, d_output, cu_seqlens, None, d_final_state, scale, False, fastmath
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        d_output,
+        cu_seqlens,
+        None,
+        d_final_state,
+        scale,
+        False,
+        fastmath,
+        intra_chunk_dtypes,
     )[:5]
 
 
@@ -335,24 +423,54 @@ torch.library.impl(
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd")
-def _packed_fwd_fake(q, k, value, gate, beta, cu_seqlens, split, scale, fastmath=True):
-    del q, k, gate, beta, cu_seqlens, split, scale, fastmath
+def _packed_fwd_fake(
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    cu_seqlens,
+    split,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
+):
+    del q, k, gate, beta, cu_seqlens, split, scale, intra_chunk_dtypes, fastmath
     return _empty_like_token_operand(value)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_with_initial_state")
 def _packed_fwd_with_initial_state_fake(
-    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    initial_state,
+    cu_seqlens,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
-    del q, k, gate, beta, initial_state, cu_seqlens, scale, fastmath
+    del q, k, gate, beta, initial_state, cu_seqlens, scale, intra_chunk_dtypes, fastmath
     return _empty_like_token_operand(value)
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_with_state")
 def _packed_fwd_with_state_fake(
-    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True, nonempty=False
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    initial_state,
+    cu_seqlens,
+    scale,
+    fastmath=True,
+    nonempty=False,
+    intra_chunk_dtypes="bf16",
 ):
-    del q, k, gate, beta, cu_seqlens, scale, fastmath, nonempty
+    del q, k, gate, beta, cu_seqlens, scale, intra_chunk_dtypes, fastmath, nonempty
     return _empty_like_token_operand(value), torch.empty_like(initial_state)
 
 
@@ -368,6 +486,7 @@ def _packed_fwd_paged_fake(
     has_initial_state,
     cu_seqlens,
     scale,
+    intra_chunk_dtypes="bf16",
 ):
     return _empty_like_token_operand(value)
 
@@ -379,7 +498,17 @@ def _token_gradients_fake(q, k, value, gate, beta):
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_local_bwd")
 def _packed_local_bwd_fake(
-    q, k, value, gate, beta, d_output, cu_seqlens, split, scale, fastmath=True
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    d_output,
+    cu_seqlens,
+    split,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     return _token_gradients_fake(q, k, value, gate, beta)
 
@@ -397,6 +526,7 @@ def _packed_bwd_with_state_fake(
     d_final_state,
     scale,
     fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     # The launcher allocates a compact FP32 cotangent whatever the entry state's outer strides.
     return (
@@ -407,7 +537,17 @@ def _packed_bwd_with_state_fake(
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_bwd_with_exit_cotangent")
 def _packed_bwd_with_exit_cotangent_fake(
-    q, k, value, gate, beta, d_output, cu_seqlens, d_final_state, scale, fastmath=True
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    d_output,
+    cu_seqlens,
+    d_final_state,
+    scale,
+    fastmath=True,
+    intra_chunk_dtypes="bf16",
 ):
     return _token_gradients_fake(q, k, value, gate, beta)
 

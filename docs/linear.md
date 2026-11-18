@@ -87,7 +87,8 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
     cotangents within the FP16 normal range, for example through loss scaling, or use BF16 when
     state magnitudes can leave it. Use L2-normalized Q/K with FP16, as the training example does:
     unnormalized Q/K or unusually large V can likewise push attention, solve, and value
-    intermediates outside the FP16 range between FP32-accumulating GEMMs.
+    intermediates outside the FP16 range between FP32-accumulating GEMMs. BF16 KDA on warpdrive
+    does not have this FP16 range limit (see [Operand precision](#operand-precision)).
 
 The Triton fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and equal `K = V` of 64 or 128, but has no cuDNN runtime dependency. Kernels contract raw QK/KK
@@ -344,7 +345,8 @@ poison their reductions.
     Use L2-normalized Q/K with FP16, as the training example does, and keep states and state
     cotangents within the FP16 normal range. See "What the fused paths keep in FP32" in the
     Gated Delta Rule section for the boundary between the FP32 carry and the Q/K/V-dtype staging
-    that this shares with GDN.
+    that this shares with GDN. BF16 on warpdrive keeps BF16 range under every
+    `intra_chunk_dtypes` value ([Operand precision](#operand-precision)).
 
 A captured graph with sequence capacity `N` keeps `cu_seqlens.shape == (N + 1,)`. If a
 replay has `M <= N` nonempty sequences and `L <= T` active tokens, repeat the terminal
@@ -486,38 +488,25 @@ of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The Triton fused
 backend requires approximately `[-5.914, 0]`. warpdrive BF16 instead requires every aligned
 16-token per-channel sum to exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
-results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). That bound keeps the
-forward finite; gradients need more margin. The
-backward stages `Q_decay = scale * q * exp(in-chunk cumulative decay)` as a BF16 MMA operand,
-which flushes to zero once `scale * |q| * exp(16-token sum)` falls below about `2^-126`, and dv,
-dgate and dbeta then lose precision. Measured as relative RMS error against FP64 (one BF16
-sequence of `T=512`, `H=2`, normalized q/k, default scale), a constant per-token gate of `-5.0`
-gave 0.4-0.7% on dv, dgate and dbeta, comparable to the fused backend; `-5.3` gave 0.7-2% and
-`-5.45` 6-20%. About `-5.25` is therefore an empirical guideline for uniform gates in training,
-not a guarantee: the margin depends on the scale and magnitude of q. It also depends on the size
-of the output gradient: the FP32 dq accumulator sums `k[j, c] 2^-g[j, c] dA[i, j]` over earlier
-tokens `j`, where `dA[i, j] = dO_i . U_j` pairs a token's output gradient with an earlier token's
-value update, before the `2^g` scale cancels it. With uniform `-5.25` gates, where `2^-g` reaches
-`2^114` within a chunk, a unit key component and a unit 128-wide value update made dq and dgate
-infinite once that `dA` entry reached `2^15` (`dO = 256`; `dO = 128` stayed accurate), in BF16
-and FP16 alike. The threshold scales with the key component and the number of contributing
-tokens, so `2^15` is that example's value, not a general cutoff. Loss scaling multiplies dO, and
-dA with it. Kimi-style
-`lower_bound * sigmoid(...)` gates with `lower_bound = -5.45` stayed at 0.6% (maximum absolute
-error over the FP64 gradient's maximum, ragged `H=2` sequences), because few 16-token sums reach
-the bound. On the same relative-RMS workload the forward error also roughly doubles at `-5.45`,
-from a separate, milder factor. A sum concentrated on the first token of its 16-token box leaves
-the backward no headroom: with the whole decay on one token of a 48-token sequence, dq and dgate
-were non-finite for 0 of 20 seeds at `-86.5`, 1 of 20 at `-86.9` and 10 of 20 at `-87.3`.
-Upstream cuDNN Frontend behaves identically. FP16 cannot hold the in-chunk decay factors (their
-ratio reaches `2^121` at a uniform `-5.25`), so warpdrive FP16 forms the in-chunk products from
-TF32 decay operands and computes the state-gradient products from the unscaled cotangent and
+results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). Staying above that
+threshold does not guarantee accurate gradients. About `-5.25` is an empirical training
+guideline for a uniform gate, not a safe cutoff for every input. Decayed Q/K operands can round
+to zero, and in backward the product of an inverse-decayed key and a score gradient can overflow
+before the opposing decay cancels it. Large key components, large output gradients (including
+loss scaling), or concentrating the decay on one token all reduce the margin. For example, at a
+uniform `-5.25`, `2^-g` reaches about `2^114` after 15 tokens. With a unit key and a score
+gradient of `2^15`, their product already exceeds the FP32 range.
+
+FP16 cannot hold the inverse decay after all 16 gates at `-5.25` (about `2^121`). Warpdrive
+FP16 therefore uses TF32 decay operands and forms the state-gradient products from the unscaled
+cotangent and
 `K_restore`, whose factors stay at or below one; it shares the gate range of the BF16 contract
-above. On the workload above (plus ragged sequences), FP16 relative RMS errors from a uniform
+above. On normalized inputs (one 512-token sequence, two heads, plus ragged sequences),
+FP16 relative RMS errors from a uniform
 `-0.1` to `-5.25` and for Kimi-style gates were 0.05% on the output, 0.03-0.06% on dq, dk, dv and
 dbeta and 0.05-0.14% on dgate, against 0.08%, 0.03-0.09% and 0.11-0.20% for fused FP16; the
 forward is non-finite past the same `-126 * ln(2)` bound. Finite does not mean accurate near the
-bound, in either dtype: a decayed operand too small for its TF32 (BF16) operand rounds to zero
+bound, in either dtype: a decayed operand too small for its TF32 or BF16 operand rounds to zero
 before the inverse decay cancels it. With sixteen `-5.45` gates, `k = e0` and a query component
 of `2^-13` on that channel (`scale=1`, only the last token writing a unit value), the output was 0
 instead of `2^-13`, with or without `fastmath`. The products with the recurrent state also still
@@ -590,8 +579,8 @@ are equal and both calls run the same plan:
 
 - **Inputs:** replay casts Q/K/V to BF16 and stores boundary states in the pool's dtype. The
   guarantee therefore holds for BF16 Q/K/V and an FP32 pool. FP16 inputs match a BF16-cast
-  `chunk_kda` instead, and a BF16 pool rounds each completed boundary state before the next call
-  resumes from it.
+  `chunk_kda` instead (with `intra_chunk_dtypes` resolved as for BF16 inputs), and a BF16 pool
+  rounds each completed boundary state before the next call resumes from it.
 - **Kernel configurations:** the fused backend autotunes some kernels per token-count bucket and
   packed mode (the output kernel picks `BK` 32 or 64), so a 64-token replay window and a
   full-stream call can reduce in a different order. Bitwise agreement needs
@@ -644,6 +633,74 @@ bitwise identical. For packed inputs it requires the TMA output path (Hopper or 
 warpdrive backend accepts every `schedule` value and ignores it: its persistent grids follow the SM
 count and always stride over the active work only, so it needs no option for over-captured graphs.
 
+### Operand precision
+
+`kernel_options["intra_chunk_dtypes"]` controls warpdrive chunk KDA, including paged and staged
+calls and context parallelism. It is not a GDN option. Within each 16-token KDA chunk, the first
+dtype is for products of decayed keys and queries; the second is for the triangular solve and
+its contribution to the output. A single dtype sets both. All products accumulate in FP32.
+
+The table describes the standard recurrence, not approximate forgetting-horizon splits.
+**Operands** lists decay / solve / inter-chunk state matmuls in forward and backward; B = BF16,
+T = TF32, F = FP16. **Match** asks whether backward reconstructs the forward's rounded operands,
+not whether gradients are exact in real arithmetic. **Causal** means
+that at fixed shape and plan, later tokens cannot change earlier output bits through rounding.
+This assumes finite intermediates; even a masked product of zero and NaN can produce NaN.
+**FP64 error vs fused** ranks each choice against Triton by its error from the FP64 recurrence,
+for the output and all five input gradients on the BF16 capture below. **Speed** ranks forward +
+backward on the three BF16 shapes. Dashes mean native FP16 is outside this BF16 comparison.
+
+| Choice | Operands | Match | Causal | FP64 error vs fused | Speed | Use when |
+| --- | --- | --- | --- | --- | --- | --- |
+| `"bf16"` | B/B/B | No² | Yes | Higher | Fastest | Preserve legacy warpdrive bits |
+| `"tf32+bf16"` (BF16 default) | T/B/B | Yes¹ | Yes | Lower | Second | Balance accuracy and speed |
+| `"tf32"` | T/T/B | Yes¹ | Yes | Lowest | Third | Minimize numerical error |
+| `"tf32+fp16"` (FP16 default) | T/F/F | No² | Yes | — | — | Native FP16 |
+| Triton fused | Separate kernels | No³ | Yes | Baseline | Fourth | Use the portable backend |
+
+¹ On the ordinary per-tile path these two BF16 modes reconstruct the forward's rounded operands
+and differentiate with the output scale in the matching place. The shared-prep forward is an
+exception: it folds the inverse and beta into records for **both** the output and state updates;
+backward recomputes the per-tile formula and can round differently. Operand agreement is not a
+promise that forward and backward choose the same work plan: each may chain pieces independently.
+
+² Legacy BF16 and native FP16 backward apply the output scale to Q before rounding the decayed
+query and the attention scores built from it. Forward rounds both without that scale and applies
+it to the output. Legacy BF16 backward also decays the state gradient before rounding it, then
+multiplies by an inverse-decayed key; forward rounds a key already decayed to the chunk end.
+Native FP16 uses TF32 decay products because inverse decay can overflow FP16. Its solve operands
+are FP16 without per-tile range scaling.
+
+³ Triton uses 64-token chunks and its own factorization. It builds diagonal inverse blocks in
+FP32 and stores the assembled inverse and attention scores in the Q/K/V kernel dtype. Its
+backward can split decay factors around a different reference row than its forward. See
+[Fast math and precision](#fast-math-and-precision).
+
+Optimized `chunk_kda` and `paged_chunk_kda` cast mixed or FP32 Q/K/V to BF16. Paged replay uses
+BF16 even for FP16 inputs. In both cases, use a BF16 choice. The staged `chunk_kda_prepare`
+requires matching FP16 or BF16 Q/K/V; pass the same precision to its backward preparation.
+A precision choice incompatible with the kernel dtype raises
+`ValueError` before dispatch. Triton and `impl="reference"` validate but ignore the option.
+
+**Measurements.** GB300, November 2026, PyTorch `2.16.0.dev20261113+cu134`, CuTeDSL 4.8.1,
+BF16 Q/K/V, head width 128. Errors are relative RMS (error norm / reference norm) against an
+FP64 recurrence, in units of 1e-3. The inputs are 4096 tokens × 8 heads from step 600 of
+`examples/linear/delta_rule_training.py`. Lower is better; rounding the FP64 output to BF16
+alone gives about 1.66 in these units on the full capture.
+
+Each latency cell gives **forward / forward + backward**, in µs of warm CUDA Graph replay
+(median of three interleaved rounds; normalized Q/K, gates sampled uniformly in [-5, 0],
+Triton autotuning enabled). The columns are A: 1 × 8192 tokens, 16 heads; B: 8 × 2048, 16 heads;
+C: 1 × 2048, 8 heads. The unchanged legacy BF16 kernels were timed separately on the same GPU
+model. The FP16-input path is not part of this BF16 comparison.
+
+| Choice | Output | dq | dk | dv | dgate | dbeta | A (µs) | B (µs) | C (µs) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `"bf16"` | 3.78 | 3.27 | 3.36 | 3.26 | 4.80 | 2.89 | 193/681 | 120/713 | 68/207 |
+| `"tf32+bf16"` | 3.45 | 2.90 | 2.99 | 2.92 | 2.72 | 2.46 | 209/774 | 146/868 | 70/220 |
+| `"tf32"` | 1.82 | 1.83 | 1.94 | 1.78 | 1.62 | 0.73 | 230/860 | 164/980 | 72/229 |
+| Triton fused | 3.60 | 2.98 | 3.03 | 2.99 | 2.87 | 2.51 | 388/1659 | 637/2355 | 77/315 |
+
 ### Fast math and precision
 
 `fastmath` controls gating exponentials in KDA's forward, backward, recomputation, and CP summaries.
@@ -677,9 +734,8 @@ carried states to zero. The reciprocal of the in-chunk decay stays finite while 
 aligned 16-token per-channel sum exceeds about `-128 * ln(2)` (a uniform gate of at least `-5.54`)
 instead of `-126 * ln(2)`. Results stay finite there only while each key entry times that
 reciprocal fits FP32, so `|k|` must stay below 2 at the limit; L2-normalized keys satisfy this.
-Accuracy in that band stays poor (BF16, uniform `-5.5`: 1.3% relative RMS error on the output
-and 45% on dgate, against 0.4% and 0.3% for the fused backend with `False`), so the gradient
-guideline of about `-5.25` applies in both modes.
+Preserving subnormals does not restore contributions already lost when staging matmul operands.
+The training guideline of about `-5.25` therefore applies with either setting.
 
 Use the same value for staged forward and backward preparation. Choose it before warmup and
 CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.

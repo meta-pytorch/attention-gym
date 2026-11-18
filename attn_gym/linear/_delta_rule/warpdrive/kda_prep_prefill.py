@@ -81,21 +81,31 @@ from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strid
 from attn_gym.warpdrive.compat import LayoutEnum
 
 from .kda_common import (
-    A_WORDS,
     B_T,
     CUTE_DTYPES,
     FINAL_DST,
     TORCH_NAMES,
     WORK_ITEM_FIELDS,
+    OperandDtypes,
     box128,
+    check_operand_dtypes,
     lds_v2_f32,
     lds_v4_f32,
     load_state,
     mask_pair,
     opaque_i32,
+    operand_dtypes,
+    pack_fragment,
     resolve_paged_state,
+    solve_mma,
+    solve_mma_desc,
+    solve_suffix,
+    solve_tile_bytes,
+    solve_tile_desc,
+    solve_type,
     spin_wait,
     state_align_suffix,
+    store_solve_operand,
     store_state_32,
     umma_commit,
     warp_arrive,
@@ -125,7 +135,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
-from .umma import SWIZZLE_32B, SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_op, smem_desc
+from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_op, smem_desc
 
 D_V = 64  # value tile width: the driver only runs the prep scheme under the d_v split
 RAW_STAGES = 8
@@ -147,16 +157,19 @@ QS_STAGES = 2
 #   ODONE  the chunk's O GEMM completed (MMA commits every chunk; CG2 waits only for an item's
 #          last, before the next item may rewrite the Y operand without a KS wait. Absent
 #          upstream, where that rewrite can overtake the in-flight O GEMM).
-SIN_L, SIN_R, KS, UIN, SACC_L, SACC_R, ODONE = 0, 1, 2, 3, 4, 8, 12
+#   Y32    tf32 Y operand of the O GEMM (CG2, ``tf32_solve`` only), published after UIN so its
+#          store stays off the state update's path; MMA waits before the O GEMM. Rewritten when
+#          the io Y operand is.
+SIN_L, SIN_R, KS, UIN, SACC_L, SACC_R, ODONE, Y32 = 0, 1, 2, 3, 4, 8, 12, 13
 TSTATE_COUNTS = (4, 4, 1, 8, *(1,) * 8, 1)
+Y32_COUNT = 4
 
 
 @cute.jit
 def _residual(v_word, ks0, ks1, dtype: cutlass.Constexpr):
-    """``v - ks`` for one packed V pair in fp32; only the final pack rounds."""
+    """``v - ks`` for one packed V pair, in fp32."""
     v0, v1 = f16x2_to_f32(v_word, dtype=dtype)
-    y0, y1 = fadd2(v0, v1, -ks0, -ks1)
-    return fp32_to_fp16(y0, y1, dtype=dtype)
+    return fadd2(v0, v1, -ks0, -ks1)
 
 
 @cute.jit
@@ -209,11 +222,12 @@ class KdaPrepPrefillParams:
 
 
 class KdaPrepPrefill(WarpSpecialized):
-    """Warpdrive prep-fed KDA prefill for ``io`` fp16/bf16 records, V and O.
+    """Warpdrive prep-fed KDA prefill for FP16/BF16 V and O, using records from ``KdaPrep``.
 
     The static state flags and ``paged_state`` (0 none, 1 routes, 2 routes + fresh-slot mask)
     select code; the state dtype follows the traced tensors. ``state_align`` is the byte
-    alignment of every state row, as in ``KdaPrefill``."""
+    alignment of every state row, as in ``KdaPrefill``. The output product uses the solve dtype
+    for both the ``a`` record and Y. The state update reads Y in the input dtype."""
 
     def __init__(
         self,
@@ -226,13 +240,21 @@ class KdaPrepPrefill(WarpSpecialized):
         num_ctas: int,
         state_align: int = 16,
         *,
+        solve_dtype: str,
         state_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the KDA prep prefill serves d_k in {HEAD_DIMS}, got {d_k}")
         if paged_state and not (use_initial_state and store_final_state):
             raise ValueError("paged state routes one pool in and out")
+        check_operand_dtypes(io, OperandDtypes("tf32", solve_dtype))
         self.io, self.d_k, self.tiles_per_head, self.num_ctas = io, d_k, tiles_per_head, num_ctas
+        self.solve_dtype = solve_dtype
+        # The a record's and the O GEMM's Y operand dtype (NOTE [KDA operand precision]):
+        # Float32 tiles and TMEM operands for tf32.
+        self.tf32_solve = solve_dtype == "tf32"
+        self.solve_type = solve_t = solve_type(OperandDtypes("tf32", solve_dtype))
+        self.tile_bytes = solve_tile_bytes(solve_t)
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         # Standalone compiles read these; a bundle's host passes its own tensors (None).
         self.state_dtype = state_dtype
@@ -245,7 +267,7 @@ class KdaPrepPrefill(WarpSpecialized):
             "Kdecay": plan.buffer("Kdecay", io_t, align=1024),
             "Qdecay": plan.buffer("Qdecay", io_t, align=1024),
             "T": plan.buffer("T", io_t, align=1024),
-            "A": plan.buffer("A", io_t, align=1024),
+            "A": plan.buffer("A", solve_t, align=1024),
             "V": plan.buffer("V", io_t, align=1024),
             "Diag": plan.buffer("Diag", Float32, align=1024),
             "O": plan.buffer("O", io_t, align=1024),
@@ -263,7 +285,7 @@ class KdaPrepPrefill(WarpSpecialized):
         # GEMM) and the loader waits for all three; the last of them is this ring's release.
         self.rec = Ring(
             REC_STAGES,
-            Tma(3 * B_T * d_k * io_b + B_T * B_T * io_b),
+            Tma(3 * B_T * d_k * io_b + self.tile_bytes),
             Umma,
             buffer={k: buf[k] for k in ("Kdecay", "Qdecay", "T", "A")},
         )
@@ -271,7 +293,8 @@ class KdaPrepPrefill(WarpSpecialized):
         self.o_smem = Ring(O_STAGES, Warps, Warps, commit_fence="smem_async", buffer=buf["O"])
         # The O drain issues no TMEM store: its release waits for the loads (tcgen05.wait::ld).
         self.o_acc = Ring(QS_STAGES, Umma, Warps, release_fence="tmem_load")
-        self.tstate = Barriers(len(TSTATE_COUNTS), counts=list(TSTATE_COUNTS))
+        counts = [*TSTATE_COUNTS, *((Y32_COUNT,) if self.tf32_solve else ())]
+        self.tstate = Barriers(len(counts), counts=counts)
         self.tmem_plan = (
             TmemPlan()
             .region("state", d_k)
@@ -280,6 +303,8 @@ class KdaPrepPrefill(WarpSpecialized):
             .region("ks", B_T)
             .region("uin", B_T // 2)
         )
+        if self.tf32_solve:  # the tf32 Y operand of the O GEMM
+            self.tmem_plan.region("y32", B_T)
         self.work = WorkStream(schedule=OneShot(grid="1d"), ready=PdlWait())
         # MMA geometry: KS/QS (TMEM state operand x k_decay/q_decay), O (TMEM Y x the 16 x 16
         # A tile), the state update (TMEM Y x MN-major T), split in two key halves at d_k = 128.
@@ -287,7 +312,7 @@ class KdaPrepPrefill(WarpSpecialized):
         f32 = Float32
         acc_idesc = instr_desc(f32, io_t, io_t, m=D_V, n=B_T)
         self.ks_desc = MmaDesc(M=D_V, N=B_T, K=d_k, bpe_a=2, bpe_b=2, idesc=acc_idesc)
-        self.a_desc = MmaDesc(M=D_V, N=B_T, K=B_T, bpe_a=2, bpe_b=2, idesc=acc_idesc)
+        self.a_desc = solve_mma_desc(D_V, solve_t)
         self.t_desc = MmaDesc(
             M=D_V,
             N=self.n_update,
@@ -306,7 +331,7 @@ class KdaPrepPrefill(WarpSpecialized):
         flags = f"{int(self.use_initial_state)}{int(self.store_final_state)}{self.paged_state}"
         return (
             f"wd_kda_prep_prefill_{self.io}_k{self.d_k}_t{self.tiles_per_head}_f{flags}"
-            f"{state_align_suffix(self.state_align)}"
+            f"{state_align_suffix(self.state_align)}" + solve_suffix(self.io, self.solve_dtype)
         )
 
     # ---- work decode -------------------------------------------------------------------
@@ -456,9 +481,9 @@ class KdaPrepPrefill(WarpSpecialized):
                     )
             _tma_box(
                 params.tma_a,
-                cute.local_tile(params.mA[None, head_o, row], (A_WORDS,), (0,)),
-                params.s_a + h.index * (B_T * B_T * 2),
-                cute.make_layout((A_WORDS,)),
+                cute.local_tile(params.mA[None, head_o, row], (self.tile_bytes // 4,), (0,)),
+                params.s_a + h.index * self.tile_bytes,
+                cute.make_layout((self.tile_bytes // 4,)),
                 h.barrier,
                 Int32,
             )
@@ -594,7 +619,8 @@ class KdaPrepPrefill(WarpSpecialized):
         ov_row = (lane // 16) * 8 + (lane & 7)
         ov_col = ((lane // 8) & 1) * 8
         lane_base = tmem.base.toint() + ((32 * warp) << 16)  # warp-uniform: this subpartition
-        cols = {name: lane_base + tmem.cols(name) for name in ("state", "sin", "ks", "uin")}
+        names = ["state", "sin", "ks", "uin"] + (["y32"] if self.tf32_solve else [])
+        cols = {name: lane_base + tmem.cols(name) for name in names}
         geo = (
             lane,
             cols,
@@ -710,18 +736,32 @@ class KdaPrepPrefill(WarpSpecialized):
                     params.s_diag + rh.index * (self.d_k * 4),
                 )
         v = self.load_v(params, rh.index, geo, chunk_start, seqlen)
-        y = v
+        y = []
+        for r in cutlass.range_constexpr(4):
+            y += f16x2_to_f32(v[r], dtype=io)
         if seed:
             with self.trace_region("ks.wait"):
                 spin_wait(tstate + KS, n_ks & 1)
             n_ks += 1
             ks = tmem_ld("16x256b", 2, cols["ks"])
-            y = [_residual(v[r], ks[2 * r], ks[2 * r + 1], io) for r in range(4)]
-        tmem_st("16x128b", cols["uin"], y)
-        cute.arch.fence_view_async_tmem_store()
-        warp_arrive(tstate + UIN)
+            for r in cutlass.range_constexpr(4):
+                y[2 * r], y[2 * r + 1] = _residual(v[r], ks[2 * r], ks[2 * r + 1], io)
+        self.stage_y(tstate, geo, y)
         rh.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         return raw, n_ks
+
+    @cute.jit
+    def stage_y(self, tstate, geo, y):
+        """Publish Y in the input dtype for the state update, then in TF32 for the output
+        product if the solve uses TF32."""
+        _l, cols, _ov, _pc, _vd = geo
+        tmem_st("16x128b", cols["uin"], pack_fragment(y, self.io_dtype))
+        cute.arch.fence_view_async_tmem_store()
+        warp_arrive(tstate + UIN)
+        if cutlass.const_expr(self.tf32_solve):
+            store_solve_operand([(cols["y32"], y)], Float32)
+            cute.arch.fence_view_async_tmem_store()
+            warp_arrive(tstate + Y32)
 
     @cute.jit
     def seed_state(self, params, geo, tstate, seed_row, head_o, v_offset, load_initial, s_diag):
@@ -803,10 +843,10 @@ class KdaPrepPrefill(WarpSpecialized):
             spin_wait(tstate + KS, n_ks & 1)
         n_ks += 1
         ks = tmem_ld("16x256b", 2, cols["ks"])
-        y = [_residual(v[r], ks[2 * r], ks[2 * r + 1], io) for r in range(4)]
-        tmem_st("16x128b", cols["uin"], y)
-        cute.arch.fence_view_async_tmem_store()
-        warp_arrive(tstate + UIN)
+        y = []
+        for r in cutlass.range_constexpr(4):
+            y += _residual(v[r], ks[2 * r], ks[2 * r + 1], io)
+        self.stage_y(tstate, geo, y)
         rh.release()
         return raw, n_ks, n_upd
 
@@ -932,6 +972,8 @@ class KdaPrepPrefill(WarpSpecialized):
         uin_col = t0 + tmem.cols("uin")
         qs_col = t0 + tmem.cols("qs")
         state_col = t0 + tmem.cols("state")
+        if cutlass.const_expr(self.tf32_solve):
+            y32_col = t0 + tmem.cols("y32")
         a_seg = ksd.sps_B * ksd.tmem_advance_A  # TMEM columns of one 64-wide K box
         b_seg = ksd.smem_subtile_B >> 4
         half_steps = ksd.num_k_steps // 2
@@ -1015,10 +1057,15 @@ class KdaPrepPrefill(WarpSpecialized):
                         )
                     umma_commit(tstate + SACC_R + (cum & 3), elect)
                     # ---- O += Y A -----------------------------------------------------------
-                    desc_a = desc_opaque(
-                        smem_desc(params.s_a + kh.index * (B_T * B_T * 2), 16, 256, SWIZZLE_32B)
+                    desc_a = solve_tile_desc(
+                        params.s_a + kh.index * self.tile_bytes, self.solve_type
                     )
-                    mma_ts_op(ad, uin_col, desc_a, qs, 0, have_state, elect)
+                    if cutlass.const_expr(self.tf32_solve):  # Y's tf32 copy
+                        with self.trace_region("y32.wait"):
+                            spin_wait(tstate + Y32, cum & 1)
+                        solve_mma(ad, y32_col, desc_a, qs, have_state, elect)
+                    else:
+                        mma_ts_op(ad, uin_col, desc_a, qs, 0, have_state, elect)
                     oh.commit(signal=False)
                     umma_commit(oh.full_barrier, elect)
                     kh.release(signal=False)  # the role's elected lane commits
@@ -1102,7 +1149,7 @@ class KdaPrepPrefill(WarpSpecialized):
         k_decay: cute.Tensor,  # (record rows, heads, 16, d_k)
         q_decay: cute.Tensor,
         t: cute.Tensor,
-        a: cute.Tensor,  # (record rows, heads, 128) int32: 32-byte swizzled 16 x 16 b16 tiles
+        a: cute.Tensor,  # (record rows, heads, a_record_words) int32
         diag: cute.Tensor,  # (record rows, heads, d_k) fp32
         state_in: cute.Tensor | None,  # (rows, heads, d_v x tiles_per_head, d_k)
         o: cute.Tensor,  # (tokens, heads, d_v x tiles_per_head)
@@ -1147,7 +1194,7 @@ class KdaPrepPrefill(WarpSpecialized):
         tma_qd, mQd = cpasync.make_tiled_tma_atom(g2s, record(q_decay), box_io, (B_T, 64))
         tma_t, mT = cpasync.make_tiled_tma_atom(g2s, record(t), box_io, (B_T, 64))
         tma_a, mA = cpasync.make_tiled_tma_atom(
-            g2s, vector(a), cute.make_layout((A_WORDS,)), (A_WORDS,)
+            g2s, vector(a), cute.make_layout((self.tile_bytes // 4,)), (self.tile_bytes // 4,)
         )
         tma_diag, mDiag = cpasync.make_tiled_tma_atom(
             g2s, vector(diag), cute.make_layout((self.d_k,)), (self.d_k,)
@@ -1271,7 +1318,7 @@ def compile_kda_prep_prefill(op: KdaPrepPrefill):
         rec(io, B_T, op.d_k),
         rec(io, B_T, op.d_k),
         rec(io, B_T, op.d_k),
-        rec(i32, A_WORDS),
+        rec(i32, op.tile_bytes // 4),
         rec(Float32, op.d_k),
         state if op.use_initial_state else None,
         packed(heads),
@@ -1299,11 +1346,13 @@ def kda_prep_prefill(
     scale: float,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
+    intra_chunk_dtypes: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, d_v]`` KDA forward over prep records ``[rows, H, 16, d_k]`` (k_decay,
-    q_decay, T), ``[rows, H, 128]`` int32 (A) and ``[rows, H, d_k]`` fp32 (diag), sequence ``b``
-    chunk ``j`` at row ``record_rows(cu_seqlens)[b] + j``; state ``[N, H, d_v, d_k]``. Returns
-    ``(o, final_state)``."""
+    q_decay, T), ``[rows, H, a_words]`` int32 (A) and ``[rows, H, d_k]`` FP32 (diag). Sequence
+    ``b``'s chunk ``j`` is at row ``record_rows(cu_seqlens)[b] + j``. Pass the precision used
+    to prepare the records: ``a_words`` is 256 for a TF32 solve, otherwise 128. State shape is
+    ``[N, H, d_v, d_k]``; returns ``(o, final_state)``."""
     if v.dtype not in (torch.float16, torch.bfloat16) or k_decay.dtype != v.dtype:
         raise TypeError("v and the records must share a 16-bit dtype")
     heads, d_k, d_v = diag.shape[1], diag.shape[2], v.shape[-1]
@@ -1331,6 +1380,7 @@ def kda_prep_prefill(
         final is not None,
         0,
         torch.cuda.get_device_properties(v.device).multi_processor_count,
+        solve_dtype=operand_dtypes(TORCH_NAMES[v.dtype], intra_chunk_dtypes).solve_dtype,
         state_dtype=state_name,
     )
     table, count, scheduler = uncut_work_items(cu_seqlens, heads, tiles)

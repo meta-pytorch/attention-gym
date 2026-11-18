@@ -13,12 +13,10 @@ pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeD
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear._delta_rule.warpdrive.drivers import kda as kda_driver
 from attn_gym.linear._delta_rule.warpdrive.drivers import summary as native_summary
-from attn_gym.linear._delta_rule.warpdrive.launchers.state_summary import (
-    build_warpdrive_state_grad_summaries,
-    build_warpdrive_state_summaries,
-)
+from attn_gym.linear._delta_rule.warpdrive.launchers import state_summary
 from attn_gym.linear.context_parallel import merge_state
 from attn_gym.linear.kda.stages import chunk_kda_prepare, chunk_kda_prepare_backward
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     clone_kda_inputs,
@@ -27,6 +25,15 @@ from attn_gym.testing.kda import (
     make_kda_test_inputs,
 )
 from attn_gym.utils import cdiv
+
+# Direct kernel calls use the same precision as public calls with BF16 Q/K/V.
+PRECISION = {"intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
+build_warpdrive_state_summaries = partial(
+    state_summary.build_warpdrive_state_summaries, **PRECISION
+)
+build_warpdrive_state_grad_summaries = partial(
+    state_summary.build_warpdrive_state_grad_summaries, **PRECISION
+)
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -87,7 +94,12 @@ def _native_no_state_final(
     sequences); the automatic plan may pick the d_v split, whose rounding differs.
     """
     _, final = kda_driver.kda_forward(
-        *(t[0] for t in inputs), cu_seqlens, scale=SCALE, output_final_state=True, split=True
+        *(t[0] for t in inputs),
+        cu_seqlens,
+        scale=SCALE,
+        output_final_state=True,
+        split=True,
+        **PRECISION,
     )
     assert final is not None
     return final
