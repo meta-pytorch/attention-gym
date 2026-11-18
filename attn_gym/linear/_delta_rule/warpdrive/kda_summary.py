@@ -195,14 +195,18 @@ class KdaSummaryParams:
 
 class KdaSummary(WarpSpecialized):
     """Warpdrive KDA piece summaries for ``io`` fp16/bf16 operands and an fp32 or ``io`` gate;
-    fp32 ``H`` and ``M``."""
+    fp32 ``H`` and ``M``.
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
-    def __init__(self, io: str, gate: str, d_k: int, d_v: int, num_ctas: int):
+    def __init__(
+        self, io: str, gate: str, d_k: int, d_v: int, num_ctas: int, fastmath: bool = True
+    ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.d_v, self.num_ctas = io, gate, d_k, d_v, num_ctas
+        self.fastmath = fastmath
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         # An fp32 gate is exchanged in place (exp2 prefixes over the raw gate stage); a 16-bit
@@ -317,7 +321,8 @@ class KdaSummary(WarpSpecialized):
         return tma_slot_rows(3, B_T, heads)
 
     def get_name(self) -> str:
-        return f"wd_kda_summary_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
+        name = f"wd_kda_summary_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
+        return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
 
@@ -608,7 +613,7 @@ class KdaSummary(WarpSpecialized):
             g[2 * pair + 1] = p1
             acc = p1
         for row in cutlass.range_constexpr(B_T):
-            g[row] = cute.math.exp2(g[row], fastmath=True)
+            g[row] = cute.math.exp2(g[row], fastmath=self.fastmath)
         if cutlass.const_expr(self.gate == "fp32"):
             s_ex = s_gate  # in place over this raw gate stage
         else:
@@ -672,8 +677,8 @@ class KdaSummary(WarpSpecialized):
                 r0 = half * 8 + 2 * p
                 kd0, kd1 = fmul2(raw_k[r0], raw_k[r0 + 1], exp_g[r0], exp_g[r0 + 1])
                 kd_pack.append(fp32_to_fp16(kd0, kd1, dtype=io))
-                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=True)
-                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=True)
+                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=self.fastmath)
+                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=self.fastmath)
                 ki0, ki1 = fmul2(raw_k[r0], raw_k[r0 + 1], inv0, inv1)
                 ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])
@@ -1573,6 +1578,8 @@ def kda_summary(
     work_items: torch.Tensor,
     work_count: torch.Tensor,
     scheduler: torch.Tensor | None = None,
+    *,
+    fastmath: bool = True,
 ) -> None:
     """Packed ``[T, H, D]`` piece summaries into ``state_h [pieces, H, d_v, d_k]`` and
     ``state_m [pieces, H, d_k, d_k]`` (fp32): natural-log channel gate ``[T, H, d_k]``, beta
@@ -1591,6 +1598,7 @@ def kda_summary(
         k.shape[-1],
         v.shape[-1],
         torch.cuda.get_device_properties(k.device).multi_processor_count,
+        fastmath,
     )
     fn = compile_kda_summary(op, TORCH_NAMES[beta.dtype])
     slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), k.device)

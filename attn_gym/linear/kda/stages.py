@@ -64,7 +64,6 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
 from attn_gym.linear.kda.validation import (
     resolve_kernel_options,
     validate_kda_inputs,
-    validate_warpdrive_fastmath,
 )
 from attn_gym.linear.types import KernelOptions
 
@@ -209,6 +208,7 @@ class ChunkKDAWarpdrivePrepared:
     saved: ChunkKDAWarpdriveSaved
     metadata: RaggedChunkMetadata
     scale: float
+    fastmath: bool
 
     def state_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` map per row of ``bounds`` in a single launch.
@@ -224,7 +224,13 @@ class ChunkKDAWarpdrivePrepared:
 
         saved = self.saved
         return build_warpdrive_state_summaries(
-            saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds
+            saved.k,
+            saved.v,
+            saved.gate,
+            saved.beta,
+            saved.cu_seqlens,
+            bounds=bounds,
+            fastmath=self.fastmath,
         )
 
     def run(
@@ -248,6 +254,7 @@ class ChunkKDAWarpdrivePrepared:
             initial_state,
             saved.cu_seqlens,
             self.scale,
+            self.fastmath,
         )
         if output_final_state:
             return chunk_warpdrive_packed_fwd_with_state_op(*args)
@@ -273,7 +280,7 @@ def chunk_kda_prepare(
     dimension must be one so token offsets index one packed span (NOTE [Terminology] in
     ``attn_gym.linear.context_parallel``).
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
-    Pass the same value to ``chunk_kda_prepare_backward``. Native warpdrive requires ``True``.
+    Pass the same value to ``chunk_kda_prepare_backward``.
     ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both summaries with
     warpdrive's kernels. Split schedules are not available with entry states. ``"autotune"``
     follows ``chunk_kda``.
@@ -281,8 +288,6 @@ def chunk_kda_prepare(
     backend, split_backward, split_forward, autotune, schedule = resolve_kernel_options(
         kernel_options, op_name="chunk_kda_prepare"
     )
-    if backend == "warpdrive":
-        validate_warpdrive_fastmath(fastmath)
     if split_backward or split_forward:
         raise ValueError("split schedules are not supported by chunk_kda_prepare")
     validate_kda_inputs(
@@ -311,7 +316,7 @@ def chunk_kda_prepare(
         saved = ChunkKDAWarpdriveSaved(
             q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets
         )
-        return ChunkKDAWarpdrivePrepared(saved, metadata, scale)
+        return ChunkKDAWarpdrivePrepared(saved, metadata, scale, fastmath)
     factors = _prepare_chunk_kda_fwd(
         q,
         k,
@@ -420,6 +425,7 @@ class ChunkKDAWarpdriveBackward:
     d_output: torch.Tensor
     initial_state: torch.Tensor | None
     scale: float
+    fastmath: bool
 
     def state_grad_summaries(self, bounds: torch.Tensor) -> torch.Tensor:
         """Return one FP32 ``[HV, V + K, K]`` reverse map per row of ``bounds`` in one launch.
@@ -442,6 +448,7 @@ class ChunkKDAWarpdriveBackward:
             self.scale,
             transpose_forward_transition=True,
             bounds=bounds,
+            fastmath=self.fastmath,
         )
 
     def run(
@@ -465,11 +472,16 @@ class ChunkKDAWarpdriveBackward:
         operands = (saved.q, saved.k, saved.v, saved.gate, saved.beta, self.d_output)
         if self.initial_state is None:
             grads = chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
-                *operands, saved.cu_seqlens, d_final_state, self.scale
+                *operands, saved.cu_seqlens, d_final_state, self.scale, self.fastmath
             )
             return (*grads, None)
         return chunk_warpdrive_packed_bwd_with_state_op(
-            *operands, saved.cu_seqlens, self.initial_state, d_final_state, self.scale
+            *operands,
+            saved.cu_seqlens,
+            self.initial_state,
+            d_final_state,
+            self.scale,
+            self.fastmath,
         )
 
 
@@ -490,8 +502,7 @@ def chunk_kda_prepare_backward(
     caller's autograd function owns them. Pass the forward's ``fastmath`` and
     ``kernel_options`` for matching factors, launch geometry (``"schedule"``), and tuning
     (``"autotune"``). The tape selects the backend: a warpdrive tape
-    (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward` and requires
-    ``fastmath=True``.
+    (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward`.
     """
     if d_output is None:
         d_output = torch.zeros_like(saved.v)
@@ -502,9 +513,8 @@ def chunk_kda_prepare_backward(
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by chunk_kda_prepare_backward")
     if isinstance(saved, ChunkKDAWarpdriveSaved):
-        validate_warpdrive_fastmath(fastmath)
         return ChunkKDAWarpdriveBackward(
-            saved, d_output, _normalize_warpdrive_state(initial_state), scale
+            saved, d_output, _normalize_warpdrive_state(initial_state), scale, fastmath
         )
     metadata = None
     if saved.cu_seqlens is not None:

@@ -229,7 +229,8 @@ class KdaPrefill(WarpSpecialized):
 
     ``d_v`` is the tile width (64 under the d_v split, ``tiles_per_head = 2``). The static state
     flags and ``paged_state`` (0 none, 1 routes, 2 routes + fresh-slot mask) select code; the
-    state dtype follows the traced tensors."""
+    state dtype follows the traced tensors.
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
     def __init__(
         self,
@@ -242,6 +243,7 @@ class KdaPrefill(WarpSpecialized):
         store_final_state: bool,
         paged_state: int,
         num_ctas: int,
+        fastmath: bool = True,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA prefill serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
@@ -252,7 +254,7 @@ class KdaPrefill(WarpSpecialized):
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
         self.tiles_per_head, self.num_ctas = tiles_per_head, num_ctas
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
-        self.paged_state = paged_state
+        self.paged_state, self.fastmath = paged_state, fastmath
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         gate_bytes = self.gate_dtype.width // 8
@@ -373,7 +375,7 @@ class KdaPrefill(WarpSpecialized):
         flags = f"{int(self.use_initial_state)}{int(self.store_final_state)}{self.paged_state}"
         return (
             f"wd_kda_prefill_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
-            f"_t{self.tiles_per_head}_f{flags}"
+            f"_t{self.tiles_per_head}_f{flags}" + ("" if self.fastmath else "_nofm")
         )
 
     # ---- work decode -------------------------------------------------------------------
@@ -703,7 +705,7 @@ class KdaPrefill(WarpSpecialized):
             g[2 * pair + 1] = p1
             acc = p1
         for row in cutlass.range_constexpr(B_T):
-            g[row] = cute.math.exp2(g[row], fastmath=True)
+            g[row] = cute.math.exp2(g[row], fastmath=self.fastmath)
         if cutlass.const_expr(self.gate == "fp32"):
             s_ex = s_gate  # in place over this raw gate stage
         else:
@@ -775,8 +777,8 @@ class KdaPrefill(WarpSpecialized):
                 r0 = half * 8 + 2 * p
                 kd0, kd1 = fmul2(raw_k[r0], raw_k[r0 + 1], exp_g[r0], exp_g[r0 + 1])
                 kd_pack.append(fp32_to_fp16(kd0, kd1, dtype=io))
-                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=True)
-                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=True)
+                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=self.fastmath)
+                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=self.fastmath)
                 ki0, ki1 = fmul2(raw_k[r0], raw_k[r0 + 1], inv0, inv1)
                 ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])

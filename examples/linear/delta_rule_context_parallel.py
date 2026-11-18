@@ -266,8 +266,7 @@ def main(
     fastmath: Annotated[
         bool,
         typer.Option(
-            help="Permit approximate gating math (default); --no-fastmath requests non-fast "
-            "math and is unsupported by native warpdrive KDA."
+            help="Permit approximate gating math (default); --no-fastmath requests non-fast math."
         ),
     ] = True,
     batch_size: Annotated[

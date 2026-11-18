@@ -209,6 +209,7 @@ def _compile_chain_backward(
     chain_rows: int,
     num_sm: int,
     use_int64_offsets: bool,
+    fastmath: bool = True,
 ):
     """Compile the chain backward host over fake tensors with dynamic extents, int64 outer strides
     under ``use_int64_offsets`` and the last mode contiguous."""
@@ -228,10 +229,12 @@ def _compile_chain_backward(
         return strided(cutlass.Float32, 4, 16)
 
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
-    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm)
-    bwd_summary_op = kda_bprop_summary.bundle_hook(io_dtype, gate_dtype, d_k, d_o, True)
-    series_op = kda_recompute.KdaRecompute(io, gate_name, d_k, d_v, True, num_sm)
-    bprop_op = kda_bprop.KdaBprop(io, gate_name, d_k, d_v, True, True, has_dstate0, num_sm)
+    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm, fastmath)
+    bwd_summary_op = kda_bprop_summary.bundle_hook(io_dtype, gate_dtype, d_k, d_o, True, fastmath)
+    series_op = kda_recompute.KdaRecompute(io, gate_name, d_k, d_v, True, num_sm, fastmath)
+    bprop_op = kda_bprop.KdaBprop(
+        io, gate_name, d_k, d_v, True, True, has_dstate0, num_sm, fastmath
+    )
     static = (
         has_dstate0,
         d_k,
@@ -250,6 +253,7 @@ def _compile_chain_backward(
         "kda_chain_backward_"
         + "_".join(str(int(flag)) for flag in static)
         + f"_{dtype_names}_{seed_name}_{dseed_name}"
+        + ("" if fastmath else "_nofm")
     )
     return compile_tvm_ffi(
         chain_backward_host,
@@ -342,9 +346,11 @@ def build_chain_backward(
     scale,
     chain_rows,
     num_sm,
+    fastmath=True,
 ):
     """Compile (persisted per static config) the chain backward launch over the buffers of one
-    plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments."""
+    plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments. ``fastmath=False``
+    selects the non-flushing gate exponentials."""
     if not log_gate or b_t != B_T:
         raise ValueError(
             "the warpdrive KDA chain backward serves 16-token chunks of natural-log gates"
@@ -401,6 +407,7 @@ def build_chain_backward(
         int(chain_rows),
         int(num_sm),
         requires_int64_abi(*(t for t in tensors if t is not None)),
+        bool(fastmath),
     )
 
 

@@ -198,14 +198,16 @@ class KdaBpropSummaryParams:
 class KdaBpropSummary(WarpSpecialized):
     """Warpdrive KDA backward summaries for ``io`` fp16/bf16 operands, ``d_k``/``d_v`` 64 or 128,
     an fp32 natural-log gate and beta, and fp32 state gradients; ``seeded`` starts every item
-    from ``d_final_state`` instead of zero."""
+    from ``d_final_state`` instead of zero.
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
-    def __init__(self, io: str, d_k: int, d_v: int, seeded: bool):
+    def __init__(self, io: str, d_k: int, d_v: int, seeded: bool, fastmath: bool = True):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(
                 f"the KDA bprop summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}"
             )
         self.io, self.d_k, self.d_v, self.seeded = io, d_k, d_v, seeded
+        self.fastmath = fastmath
         self.io_dtype = io_t = _CUTE_DTYPES[io]
         plan = self.smem_plan = SmemPlan()
         names = ("Kdecay", "Kinv", "Qdecay", "A", "Tinv", "dO", "Q", "K")
@@ -256,7 +258,8 @@ class KdaBpropSummary(WarpSpecialized):
         return tma_slot_rows(4, B_T, heads)
 
     def get_name(self) -> str:
-        return f"wd_kda_bprop_summary_{self.io}_k{self.d_k}_v{self.d_v}_s{int(self.seeded)}"
+        name = f"wd_kda_bprop_summary_{self.io}_k{self.d_k}_v{self.d_v}_s{int(self.seeded)}"
+        return name if self.fastmath else f"{name}_nofm"
 
     def _descs(self):
         """Static geometry of the five GEMMs (TMEM accumulators are ``d_v`` rows)."""
@@ -470,7 +473,7 @@ class KdaBpropSummary(WarpSpecialized):
             g[2 * pair + 1] = p1
             acc = p1
         for row in cutlass.range_constexpr(B_T):
-            g[row] = cute.math.exp2(g[row], fastmath=True)
+            g[row] = cute.math.exp2(g[row], fastmath=self.fastmath)
         # exp2(g) in place over this raw gate stage: a channel's stores land in slots that only
         # its own warp read, and the warp sync orders every lane's reads before them.
         cute.arch.sync_warp()
@@ -531,8 +534,8 @@ class KdaBpropSummary(WarpSpecialized):
         for i in cutlass.range_constexpr(dk_halves * 4):
             kd0, kd1 = fmul2(raw_k[2 * i], raw_k[2 * i + 1], exp_g[2 * i], exp_g[2 * i + 1])
             kd_pack.append(fp32_to_fp16(kd0, kd1, dtype=io))
-            inv0 = cute.math.rcp(exp_g[2 * i], approx=True, ftz=True)
-            inv1 = cute.math.rcp(exp_g[2 * i + 1], approx=True, ftz=True)
+            inv0 = cute.math.rcp(exp_g[2 * i], approx=True, ftz=self.fastmath)
+            inv1 = cute.math.rcp(exp_g[2 * i + 1], approx=True, ftz=self.fastmath)
             ki0, ki1 = fmul2(raw_k[2 * i], raw_k[2 * i + 1], inv0, inv1)
             ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
         with kk.produce() as kh:
@@ -1109,14 +1112,16 @@ class KdaBpropSummary(WarpSpecialized):
         )
 
 
-def bundle_hook(io_dtype, gate_dtype, d_k: int, d_v: int, log_gate: bool) -> KdaBpropSummary:
+def bundle_hook(
+    io_dtype, gate_dtype, d_k: int, d_v: int, log_gate: bool, fastmath: bool = True
+) -> KdaBpropSummary:
     """The zero-seeded op for launch bundles that run it inside their own ``@cute.jit`` host:
     ``op.launch(q, k, gate, do, beta, d_initial_state, None, work_items, work_count, tma_slots,
     scale, stream)``."""
     if not log_gate or gate_dtype is not Float32:
         raise ValueError("the KDA bprop summary takes fp32 natural-log gates")
     names = {cutlass.Float16: "fp16", cutlass.BFloat16: "bf16"}
-    return KdaBpropSummary(names[io_dtype], d_k, d_v, seeded=False)
+    return KdaBpropSummary(names[io_dtype], d_k, d_v, seeded=False, fastmath=fastmath)
 
 
 @jit_cache
@@ -1162,6 +1167,7 @@ def kda_bprop_summary(
     *,
     scale: float,
     d_final_state: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> None:
     """Fill ``d_initial_state`` (``[N, H, d_v, d_k]`` fp32, row-contiguous) for the work table
     (see the module docstring); packed ``[T, H, D]`` operands, fp32 natural-log gate
@@ -1178,7 +1184,9 @@ def kda_bprop_summary(
     heads = gate.shape[1]
     if heads % q.shape[1] or heads % k.shape[1] or do.shape[1] != heads:
         raise ValueError("heads must match dO and be a multiple of the query and key head counts")
-    op = KdaBpropSummary(_IO_NAMES[q.dtype], q.shape[-1], do.shape[-1], d_final_state is not None)
+    op = KdaBpropSummary(
+        _IO_NAMES[q.dtype], q.shape[-1], do.shape[-1], d_final_state is not None, fastmath
+    )
     slots = new_tma_slots(op.tma_slot_rows(heads), q.device)
     compile_kda_bprop_summary(op)(
         q, k, gate, do, beta, d_initial_state, d_final_state, work_items, work_count, slots, scale
