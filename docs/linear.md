@@ -583,6 +583,27 @@ replay_state.count.zero_()
 The current fused KDA kernel requires key and value dimensions of 128. A pool may pad the
 stride between slots, and the count tensor may be shaped `[num_slots, 1]` or `[num_slots]`.
 
+Replay runs on either chunk backend. Triton kernels maintain the replay caches for both, and the
+prefix and tail chunk passes run on the backend that `kernel_options["backend"]` selects. The
+result reproduces that backend's `chunk_kda` over the whole stream bit for bit when the inputs
+are equal and both calls run the same plan:
+
+- **Inputs:** replay casts Q/K/V to BF16 and stores boundary states in the pool's dtype. The
+  guarantee therefore holds for BF16 Q/K/V and an FP32 pool. FP16 inputs match a BF16-cast
+  `chunk_kda` instead, and a BF16 pool rounds each completed boundary state before the next call
+  resumes from it.
+- **Kernel configurations:** the fused backend autotunes some kernels per token-count bucket and
+  packed mode (the output kernel picks `BK` 32 or 64), so a 64-token replay window and a
+  full-stream call can reduce in a different order. Bitwise agreement needs
+  `kernel_options={"autotune": False}`, or the same tuning winners, on both calls.
+- **Plans:** apart from those configurations the fused backend has a single plan. warpdrive's plan
+  depends on how many sequences are packed and how long they are: with few sequences times heads per
+  GPU it splits the value dimension, and a long full-stream `chunk_kda` can pick the piece-chain
+  plan, while paged replay always runs the unchained plan. Either choice rounds differently, so a
+  replay step can differ at rounding level from a `chunk_kda` call that packs a different number of
+  sequences, or from one over a stream long enough to chain, even with the same request and head
+  count.
+
 `chunk_kda(..., kernel_options={"backend": "warpdrive"})` selects an opt-in SM100-family
 training backend for applications that already hold per-token natural-log gate increments. It
 applies the fused backend's dtype policy: Q/K/V that share FP16 or BF16 run as given, FP32 or mixed

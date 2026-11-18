@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 from attn_gym._backends.cute.utils import initialized_cuda_device
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import assert_packed_offsets
 from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
 from attn_gym.utils import cdiv, fork_join_streams
 
@@ -63,9 +64,7 @@ def _select_summary_work(
     seq = tl.program_id(0)
     head = tl.program_id(1)
     start, stop = tl.load(cu + seq), tl.load(cu + seq + 1)
-    valid = (start <= stop) & ((seq != 0) | (start == 0))
-    valid &= (seq != tl.num_programs(0) - 1) | (stop <= tokens)
-    tl.device_assert(valid, "invalid packed cu_seqlens")
+    assert_packed_offsets(start, stop, seq, tokens, True)
     bound = tl.arange(0, ROW_BLOCK)
     lo = tl.load(bounds + 2 * bound, bound < rows, other=-1)
     hi = tl.load(bounds + 2 * bound + 1, bound < rows, other=-1)

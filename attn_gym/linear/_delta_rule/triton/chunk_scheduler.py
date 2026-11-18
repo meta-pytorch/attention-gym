@@ -262,6 +262,18 @@ class GridScheduler:
         return self._resolve(request, True, self.metadata.capacity, workers, "a ragged kernel")
 
 
+@triton.jit
+def assert_packed_offsets(begin, end, index, tokens, mask):
+    """Abort with ``invalid packed cu_seqlens`` unless the offset pair ``[begin, end]`` of sequence
+    ``index`` never decreases, ends within the ``tokens`` packed tokens, and starts at zero for the
+    first sequence; across all pairs that is the whole contract (a zero start, nondecreasing, an
+    end within the tokens). The first kernel that reads caller offsets calls it, and needs
+    ``debug=True`` for the assert to compile. Returns the per-pair validity."""
+    valid = (begin <= end) & (end <= tokens) & ((index != 0) | (begin == 0))
+    tl.device_assert(valid, "invalid packed cu_seqlens", mask=mask)
+    return valid
+
+
 @triton.jit(debug=True, do_not_specialize=["num_sequences", "tokens"])
 def _prepare_ragged_chunk_offsets_kernel(
     cu_seqlens,
@@ -276,8 +288,7 @@ def _prepare_ragged_chunk_offsets_kernel(
     sequence_mask = sequence < num_sequences
     begin = tl.load(cu_seqlens + sequence, mask=sequence_mask, other=0)
     end = tl.load(cu_seqlens + sequence + 1, mask=sequence_mask, other=0)
-    valid = (begin >= 0) & (begin <= end) & (end <= tokens) & ((sequence != 0) | (begin == 0))
-    tl.device_assert(valid, "invalid packed cu_seqlens", mask=sequence_mask)
+    valid = assert_packed_offsets(begin, end, sequence, tokens, sequence_mask)
 
     count = tl.where(sequence_mask & valid, (end - begin + chunk_size - 1) // chunk_size, 0)
     inclusive_offset = tl.cumsum(count, axis=0)

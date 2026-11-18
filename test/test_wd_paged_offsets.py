@@ -21,9 +21,9 @@ pytestmark = pytest.mark.skipif(
 _CODE = """
 import torch
 import torch.nn.functional as F
-from attn_gym.linear import paged_chunk_gdn, paged_chunk_kda
+from attn_gym.linear import ReplayState, paged_chunk_gdn, paged_chunk_kda
 
-family, offsets = {family!r}, {offsets!r}
+family, offsets, replay = {family!r}, {offsets!r}, {replay!r}
 T, H = 200, 2
 q = F.normalize(torch.randn(1, T, H, 128, device="cuda"), dim=-1).bfloat16()
 k = F.normalize(torch.randn(1, T, H, 128, device="cuda"), dim=-1).bfloat16()
@@ -35,26 +35,38 @@ slots = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
 cu = torch.tensor([0, 100, 200], dtype=torch.int32, device="cuda")
 call = paged_chunk_kda if family == "kda" else paged_chunk_gdn
 options = {{"backend": "warpdrive"}}
+extra = {{}}
+if replay:
+    layout = ReplayState.slot_layout(H, 128)
+    extra["replay_state"] = ReplayState(
+        *(torch.zeros(4, *shape, dtype=dtype, device="cuda") for shape, dtype in layout)
+    )
 with torch.no_grad():
-    call(q, k, v, gate, beta, pool, slots, cu_seqlens=cu, kernel_options=options)
+    call(q, k, v, gate, beta, pool, slots, cu_seqlens=cu, kernel_options=options, **extra)
     torch.cuda.synchronize()
     print("valid offsets completed", flush=True)
     cu.copy_(torch.tensor(offsets, dtype=torch.int32, device="cuda"))
-    call(q, k, v, gate, beta, pool, slots, cu_seqlens=cu, kernel_options=options)
+    call(q, k, v, gate, beta, pool, slots, cu_seqlens=cu, kernel_options=options, **extra)
     torch.cuda.synchronize()
 """
 
 
-@pytest.mark.parametrize("family", ["gdn", "kda"])
+@pytest.mark.parametrize(
+    ("family", "replay"),
+    [("gdn", False), ("kda", False), ("kda", True)],
+    ids=["gdn", "kda", "kda-replay"],
+)
 @pytest.mark.parametrize(
     "offsets",
     [[1, 50, 100], [0, 100, 50], [0, 100, 260], [0, 100, 2**31 - 1]],
     ids=["nonzero-start", "decreasing", "past-end", "int32-max"],
 )
-def test_paged_warpdrive_rejects_invalid_packed_offsets(family, offsets):
-    """Without the check these read and write past the tensors or fault (illegal address)."""
+def test_paged_warpdrive_rejects_invalid_packed_offsets(family, replay, offsets):
+    """Without the check these read and write past the tensors or fault (illegal address). The
+    replay planner reads the caller's offsets before warpdrive sees the derived prefix offsets,
+    so it checks them itself."""
     result = subprocess.run(
-        [sys.executable, "-c", _CODE.format(family=family, offsets=offsets)],
+        [sys.executable, "-c", _CODE.format(family=family, offsets=offsets, replay=replay)],
         capture_output=True,
         text=True,
         check=False,

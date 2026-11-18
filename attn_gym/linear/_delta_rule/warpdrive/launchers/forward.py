@@ -39,13 +39,15 @@ def run_forward_on_current_device(
     output_final_state: bool,
     split: bool = False,
     fastmath: bool = True,
+    nonempty: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one packed forward invocation.
 
     ``split`` enables the forgetting-horizon work table: long sequences are cut where the gate has
     saturated and each cut item rebuilds its entry state from zero over a warmup window, so it is
     approximate and only offered for calls without recurrent state. ``fastmath=False`` selects
-    the non-flushing gate exponentials.
+    the non-flushing gate exponentials. ``nonempty`` promises that every sequence holds a token
+    (dense batches), so the final state needs no seeding for empty sequences.
     """
     paged_state = state if isinstance(state, PagedState) else None
     if split and (state is not None or output_final_state):
@@ -114,6 +116,7 @@ def run_forward_on_current_device(
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
         fastmath=fastmath,
+        nonempty=nonempty,
     )
     return output.unsqueeze(0), final_state
 
@@ -131,6 +134,7 @@ def run_forward(
     output_final_state: bool,
     split: bool = False,
     fastmath: bool = True,
+    nonempty: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -148,6 +152,7 @@ def run_forward(
             output_final_state=output_final_state,
             split=split,
             fastmath=fastmath,
+            nonempty=nonempty,
         )
 
 

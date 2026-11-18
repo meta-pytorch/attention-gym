@@ -308,8 +308,6 @@ def paged_chunk_kda(
         raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
-        if options.backend != "fused":
-            raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
         num_slots = state_cache.shape[0]
         layout = ReplayState.slot_layout(q.shape[2], q.shape[3], value_dim=v.shape[3])
         for name, tensor, (slot_shape, expected_dtype) in zip(
@@ -357,6 +355,7 @@ def paged_chunk_kda(
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
             scale=resolve_scale(None, q.shape[-1]),
+            replay_state=replay_state,
         )
     return _fused_paged_chunk_forward(
         q,

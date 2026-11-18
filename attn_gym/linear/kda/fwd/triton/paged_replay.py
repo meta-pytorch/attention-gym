@@ -21,6 +21,7 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import assert_packed_offsets
 from attn_gym.linear._delta_rule.validation import (
     state_checkpoints_from_op_args,
     validate_state_checkpoints_metadata,
@@ -100,16 +101,21 @@ def _token_strides(tensor: torch.Tensor) -> tuple[int, ...]:
 
 def _validate_replay_aliases(
     replay_tensors: tuple[tuple[str, torch.Tensor], ...],
+    state_cache: torch.Tensor,
     read_only_tensors: tuple[tuple[str, torch.Tensor | None], ...],
 ) -> None:
-    """Reject storage aliasing that would make replay updates order-dependent."""
+    """Reject storage aliasing that would make replay updates order-dependent: the replay buffers
+    and the state pool are written while the inputs and routes are still being read."""
     for index, (name, tensor) in enumerate(replay_tensors):
         for other_name, other_tensor in replay_tensors[index + 1 :]:
             if _tensors_overlap(tensor, other_tensor):
                 raise ValueError(f"replay_state {name} must not alias replay_state {other_name}")
-        for other_name, other_tensor in read_only_tensors:
+        for other_name, other_tensor in (("state_cache", state_cache), *read_only_tensors):
             if other_tensor is not None and _tensors_overlap(tensor, other_tensor):
                 raise ValueError(f"replay_state {name} must not alias {other_name}")
+    for other_name, other_tensor in read_only_tensors:
+        if other_tensor is not None and _tensors_overlap(state_cache, other_tensor):
+            raise ValueError(f"state_cache must not alias {other_name}")
 
 
 @triton.heuristics(
@@ -123,7 +129,9 @@ def _validate_replay_aliases(
         "pack_cu_seqlens",
     )
 )
-@triton.jit(do_not_specialize=["num_sequences", "search_capacity"])
+# debug=True for assert_packed_offsets: this is the first kernel that reads the caller's offsets;
+# warpdrive and the fused kernels only see the derived prefix offsets.
+@triton.jit(debug=True, do_not_specialize=["num_sequences", "search_capacity", "tokens"])
 def _plan_prefill_kernel(
     replay_count,
     state_indices,
@@ -135,6 +143,7 @@ def _plan_prefill_kernel(
     count_stride_s: tl.constexpr,
     num_sequences,
     search_capacity,
+    tokens,
     use_has_initial_state: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -157,9 +166,10 @@ def _plan_prefill_kernel(
             count,
             0,
         )
-    input_length = tl.load(cu_seqlens + sequence_offset + 1, mask=in_bounds, other=0) - tl.load(
-        cu_seqlens + sequence_offset, mask=in_bounds, other=0
-    )
+    begin = tl.load(cu_seqlens + sequence_offset, mask=in_bounds, other=0)
+    end = tl.load(cu_seqlens + sequence_offset + 1, mask=in_bounds, other=0)
+    assert_packed_offsets(begin, end, sequence, tokens, in_bounds)
+    input_length = end - begin
     logical_length = tl.where(in_bounds & (slot > 0), count + input_length, 0)
     complete_length = logical_length // _CHUNK_SIZE * _CHUNK_SIZE
     tail_count = logical_length - complete_length
@@ -626,13 +636,13 @@ def prepare_paged_chunk_replay(
             ("beta", replay_beta),
             ("count", replay_count),
         ),
+        state_cache,
         (
             ("q", q),
             ("k", k),
             ("v", v),
             ("gate", gate),
             ("beta", beta),
-            ("state_cache", state_cache),
             ("state_indices", state_indices),
             ("has_initial_state", has_initial_state),
         ),
@@ -770,13 +780,13 @@ def prepare_paged_chunk_prefill(
             ("beta", replay_beta),
             ("count", replay_count),
         ),
+        state_cache,
         (
             ("q", q),
             ("k", k),
             ("v", v),
             ("gate", gate),
             ("beta", beta),
-            ("state_cache", state_cache),
             ("state_indices", state_indices),
             ("has_initial_state", has_initial_state),
             ("cu_seqlens", input_cu_seqlens),
@@ -817,6 +827,7 @@ def prepare_paged_chunk_prefill(
         count_stride_s=replay_count.stride(0),
         num_sequences=num_sequences,
         search_capacity=search_capacity,
+        tokens=output_capacity,
         use_has_initial_state=has_initial_state is not None,
         BLOCK=plan_block,
         num_warps=min(8, max(1, plan_block // 32)),
