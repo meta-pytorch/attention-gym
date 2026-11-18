@@ -35,7 +35,6 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
-from attn_gym.warpdrive.scheduling import IndexSchedule
 
 # Every size but the head dimension comes from the model (QwenDecodeMegakernel, check_model).
 QWEN3_0_6B = QwenConfig()
@@ -147,22 +146,6 @@ class ScratchLayout:
             self.offsets[name] = offset
             offset += (math.prod(shape) + 15) // 16 * 16  # 128-byte aligned
         self.size = offset
-
-
-@dataclass(frozen=True)
-class SmPersistent(IndexSchedule):
-    """SM-keyed persistent schedule: SM s runs table rows s, s + grid, ...
-
-    This lets the host place rows on chosen SMs, for example by memory side. Requires a grid
-    covering every SM, shared memory limiting residency to one CTA per SM, and an exit wait
-    until all CTAs of the launch have arrived (the kernel's arrival counter).
-    """
-
-    def first_index(self, problem):
-        return cute.arch.smid()
-
-    def next_index(self, index, problem):
-        return index + problem.units()
 
 
 @dataclass(frozen=True)
@@ -537,8 +520,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.x_width = max(self.hidden, self.inter // DOWN_SPLITS, self.heads_per_split * HEAD_DIM)
         if self.moe_batched:  # an expert down row's input is one expert's activation slot
             self.x_width = max(self.x_width, self.expert_inter)
-        if schedule not in ("static", "atomic", "sm"):
-            raise ValueError(f"schedule must be 'static', 'atomic' or 'sm', got {schedule!r}")
+        if schedule not in ("static", "atomic"):
+            raise ValueError(f"schedule must be 'static' or 'atomic', got {schedule!r}")
         # The GEMV (ROWS_PER_WARP rows per warp), prologue (token_warps per token) and attention
         # (8 positions per warp per block) tilings fix the compute role's size.
         compute = (roles or {}).get("compute")
@@ -560,9 +543,6 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if not 2 <= stages <= fit:
             raise ValueError(f"stages must be in [2, {fit}] for this model, got {stages}")
         self.stages = stages
-        self.keyed_by_sm = schedule == "sm"
-        if schedule == "sm" and 2 * (self.fixed_smem_bytes() + stages * STAGE_BYTES) <= SMEM_BYTES:
-            raise ValueError("the 'sm' schedule needs one CTA per SM: use more stages")
         self.scratch_layout = ScratchLayout(model, splits, batch, self.streams_inputs)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
@@ -581,11 +561,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         self.engine = CudaCoreGemv()
         self.work = WorkStream(
             mapping=InstructionTable(),
-            schedule={
-                "static": StaticPersistent(),
-                "atomic": AtomicPersistent(stages=1),
-                "sm": SmPersistent(),
-            }[schedule],
+            schedule=StaticPersistent() if schedule == "static" else AtomicPersistent(stages=1),
         )
 
     @property
@@ -595,9 +571,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
 
     @property
     def state_words(self) -> int:
-        """Number of int32 state words: one epoch, one completion counter per launch, and,
-        for the SM-keyed schedule, one arrival counter per launch."""
-        return 1 + self.launches * (2 if self.keyed_by_sm else 1)
+        """Number of int32 state words: one epoch, then one completion counter per launch."""
+        return 1 + self.launches
 
     def weight_consumers(self):
         """The weight ring's consumer mechanism (the engine may add an MMA warp)."""
@@ -879,14 +854,6 @@ class QwenDecodeMegakernel(WarpSpecialized):
         tid, warp, lane = me.tid, me.warp, me.lane
         ctas = cute.arch.grid_dim()[0]
         epoch = p.state[0] + 1
-        # SM-keyed slots require an exit wait until all CTAs of this launch have arrived;
-        # otherwise another CTA of this launch could reuse the same SM slot.
-        # State word 1 + launches + l counts launch l's arrivals.
-        keyed = self.keyed_by_sm
-        arrived = p.state.iterator + 1 + self.launches + p.launch
-        if cutlass.const_expr(keyed):
-            if tid == 0:
-                cute.arch.atomic_add(arrived, Int32(1), sem="relaxed", scope="gpu")
         xkey = Int32(-1)
         xbuf = Int32(0)
         while work.valid:
@@ -942,10 +909,6 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # Every CTA has read the epoch by the time it finishes. Launches overlap, so each counts
         # its own CTAs; the last CTA of the step's last launch advances the epoch.
         if tid == 0:
-            if cutlass.const_expr(keyed):
-                seen = Int32(0)
-                while seen < ctas:
-                    seen = cute.arch.load(arrived, Int32, sem="relaxed", scope="gpu")
             finished = cute.arch.atomic_add(
                 p.state.iterator + 1 + p.launch, Int32(1), sem="acq_rel", scope="gpu"
             )
@@ -954,8 +917,6 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 # resets them for the next step's launch of this layer, which starts a whole step
                 # later; gpu-scope atomics keep the reset ordered with that launch's counting.
                 cute.arch.atomic_exch(p.state.iterator + 1 + p.launch, Int32(0), scope="gpu")
-                if cutlass.const_expr(keyed):
-                    cute.arch.atomic_exch(arrived, Int32(0), scope="gpu")
                 if p.launch == self.launches - 1:
                     p.state[0] = epoch
         return chans, work
