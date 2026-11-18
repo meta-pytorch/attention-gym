@@ -1006,7 +1006,7 @@ def _launch_backward(
     if rope_dim and not use_shared_schedule:
         raise ValueError(ROPE_REQUIREMENTS)
     if use_shared_schedule:
-        block_h = 16 if head_dim == 512 else min(32, triton.next_power_of_2(heads))
+        block_h = 16 if head_dim == 512 else max(16, min(32, triton.next_power_of_2(heads)))
         block_k = 16 if head_dim == 512 else max(16, min(64, triton.next_power_of_2(topk)))
         grad_sink_partials = torch.empty(
             batch, heads, seq_len, device=query.device, dtype=torch.float32

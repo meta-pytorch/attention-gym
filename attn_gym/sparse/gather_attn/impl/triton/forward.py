@@ -867,7 +867,7 @@ _FWD_TMA = TritonTuner(
 
 ROPE_REQUIREMENTS = (
     "Triton gather_attn supports key-only RoPE tensors only on the shared-KV schedule: "
-    "Ampere or newer, BF16, shared KV, 16-128 heads, latent width <= 128 or 512, RoPE width "
+    "Ampere or newer, BF16, shared KV, 1-128 heads, latent width <= 128 or 512, RoPE width "
     "16, 32, 64, or 128, with sparse RoPE (and local RoPE under a window) broadcast across heads."
 )
 

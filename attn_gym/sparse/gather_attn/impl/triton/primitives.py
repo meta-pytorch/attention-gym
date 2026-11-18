@@ -42,18 +42,21 @@ def can_use_shared_kv_schedule(
             rope is not None
             and rope.dtype == torch.bfloat16
             and rope.shape[-1] == query_rope.shape[-1]
-            and rope.stride(1) == 0
+            and (rope.shape[1] == 1 or rope.stride(1) == 0)
             for rope in rope_tensors
         )
     )
     return (
         query.dtype == torch.bfloat16
-        and sparse_kv.stride(1) == 0
+        and (sparse_kv.shape[1] == 1 or sparse_kv.stride(1) == 0)
         and query.stride(-1) == 1
         and sparse_kv.stride(-1) == 1
         # Without a window the kernels never read local KV, so it may be absent.
-        and (sliding_window_size == 0 or (local_kv.stride(1) == 0 and local_kv.stride(-1) == 1))
-        and 16 <= heads <= 128
+        and (
+            sliding_window_size == 0
+            or ((local_kv.shape[1] == 1 or local_kv.stride(1) == 0) and local_kv.stride(-1) == 1)
+        )
+        and (1 if query_rope is not None else 16) <= heads <= 128
         and head_dim % 16 == 0
         and (head_dim <= 128 or head_dim == 512)
         and rope_ok
@@ -128,7 +131,7 @@ def shared_forward_tiles(query: torch.Tensor, rope_dim: int) -> tuple[int, int]:
     """
     _, heads, _, head_dim = query.shape
     # A smaller head tile keeps D=512 accumulators within on-chip resources.
-    block_h = triton.next_power_of_2(heads)
+    block_h = max(16, triton.next_power_of_2(heads))
     if head_dim > 128:
         block_h = min(32, block_h)
     candidates = [

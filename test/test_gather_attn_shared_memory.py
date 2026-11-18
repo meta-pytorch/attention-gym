@@ -180,11 +180,11 @@ def test_shared_kv_launches_fit_99_kib_shared_memory(capability, heads, latent_d
 
 
 @pytest.mark.parametrize("capability", [SM86_CAPABILITY, SM90_CAPABILITY, SM120_CAPABILITY])
-@pytest.mark.parametrize("heads,latent_dim,rope_dim", [(16, 128, 128), (16, 512, 128)])
+@pytest.mark.parametrize("heads,latent_dim,rope_dim", [(1, 128, 128), (12, 512, 128)])
 def test_paired_deterministic_launches_fit_shared_memory(
     capability, heads, latent_dim, rope_dim, deterministic_algorithms
 ):
-    """Deterministic RoPE backward fits both Hopper and 99 KiB targets."""
+    """The padded-head and deterministic RoPE paths fit both Hopper and 99 KiB targets."""
     skip_unsupported("triton")
     inputs = make_mla_inputs(
         heads=heads, latent_dim=latent_dim, rope_dim=rope_dim, seq_len=33, topk=16

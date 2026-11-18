@@ -26,6 +26,9 @@ pytestmark = pytest.mark.usefixtures("gather_attn_single_config")
         ("triton", 16, 512, 128, True, 7, True, 1, False),
         ("triton", 32, 128, 64, True, 7, False, 2, False),
         ("triton", 128, 128, 64, True, 7, True, 1, False),
+        ("triton", 1, 128, 32, True, 7, True, 1, False),
+        ("triton", 12, 512, 64, False, 0, False, 2, False),
+        ("triton", 15, 96, 16, True, 7, True, 1, False),
         ("cute", 64, 512, 64, False, 0, True, 1, False),
         ("cute", 64, 512, 64, True, 7, True, 1, False),
         ("cute", 128, 512, 64, True, 7, False, 2, True),
@@ -359,7 +362,7 @@ def test_triton_paired_dynamic_training(window, deterministic, request):
     operation = torch.compile(gather_attn, fullgraph=True, dynamic=True, backend=counter)
     for tokens in (33, 49):
         inputs = make_inputs(
-            heads=16, latent_dim=128, rope_dim=64, seq_len=tokens, local=bool(window)
+            heads=12, latent_dim=128, rope_dim=64, seq_len=tokens, local=bool(window)
         )
         expected = triton_step(inputs, window)
         actual = triton_step(inputs, window, operation)
@@ -395,7 +398,7 @@ def test_triton_paired_operator_contracts(window, deterministic, request):
         request.getfixturevalue("deterministic_algorithms")
     from attn_gym.sparse.gather_attn.impl.ops import _gather_attn_bwd_op, _gather_attn_fwd_op
 
-    inputs = make_inputs(heads=16, latent_dim=128, rope_dim=64, local=bool(window))
+    inputs = make_inputs(heads=12, latent_dim=128, rope_dim=64, local=bool(window))
     args = tree_map(lambda t: t.detach() if isinstance(t, torch.Tensor) else t, inputs.kwargs())
     q, qr = args["query"]
     # Dense permuted query components exercise real/fake normalization of output strides.
@@ -441,8 +444,8 @@ def test_triton_paired_operator_contracts(window, deterministic, request):
 @pytest.mark.parametrize(
     "heads,dim,rope,window,packed,batch",
     [
-        (16, 128, 32, 7, True, 1),
-        (32, 512, 64, 0, False, 2),
+        (1, 128, 32, 7, True, 1),
+        (12, 512, 64, 0, False, 2),
         (16, 512, 128, 7, True, 1),
         (17, 96, 16, 0, True, 1),
     ],
@@ -512,7 +515,7 @@ def test_triton_paired_reuses_shape_specializations(triton_compiles):
 @pytest.mark.full_autotune
 def test_triton_paired_pinning(no_benchmarking, request):
     skip_unsupported("triton")
-    inputs = make_inputs(heads=16, local=False)
+    inputs = make_inputs(heads=12, local=False)
     results = []
     for deterministic in (False, True):
         if deterministic:
@@ -538,7 +541,7 @@ def test_triton_paired_deterministic_graph_replay(window, deterministic_algorith
     from dataclasses import replace
 
     skip_unsupported("triton")
-    inputs = make_inputs(heads=16, latent_dim=128, seq_len=35, local=bool(window), with_docs=True)
+    inputs = make_inputs(heads=12, latent_dim=128, seq_len=35, local=bool(window), with_docs=True)
     inputs = replace(
         inputs,
         sparse_kv=RopePair(*(t[:, :, :11].detach().requires_grad_() for t in inputs.sparse_kv)),
