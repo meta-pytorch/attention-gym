@@ -23,9 +23,17 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
-from attn_gym.linear.types import KERNEL_OPTION_SPEC, STAGE_OPTION_SPEC, ReplayState
+from attn_gym.linear.types import (
+    KERNEL_OPTION_SPEC,
+    STAGE_OPTION_SPEC,
+    IntraChunkDtypes,
+    ReplayState,
+)
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# ``intra_chunk_dtypes`` when the option is omitted, and the one kernel set of FP16 Q/K/V.
+DEFAULT_INTRA_CHUNK_DTYPES: IntraChunkDtypes = "tf32+bf16"
+FP16_INTRA_CHUNK_DTYPES: IntraChunkDtypes = "tf32+fp16"
 
 
 class ResolvedKernelOptions(NamedTuple):
@@ -36,7 +44,9 @@ class ResolvedKernelOptions(NamedTuple):
     split_backward: bool
     split_forward: bool
     autotune: bool
-    schedule: ScheduleRequest = ScheduleRequest.AUTO
+    schedule: ScheduleRequest
+    # ``None`` when omitted; ``resolve_intra_chunk_dtypes`` picks the default by input dtype.
+    intra_chunk_dtypes: IntraChunkDtypes | None
     batch_invariant: bool = False  # staged handles only
 
 
@@ -51,8 +61,37 @@ def resolve_kernel_options(
     spec = STAGE_OPTION_SPEC if staged else KERNEL_OPTION_SPEC
     options = resolve_chunk_kernel_options(kernel_options, spec, op_name=op_name)
     # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
-    schedule = ScheduleRequest(options.pop("schedule"))
-    return ResolvedKernelOptions(**options, schedule=schedule)
+    options["schedule"] = ScheduleRequest(options["schedule"])
+    return ResolvedKernelOptions(**options)
+
+
+def resolve_intra_chunk_dtypes(
+    intra_chunk_dtypes: IntraChunkDtypes | None,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    *,
+    op_name: str,
+) -> IntraChunkDtypes:
+    """Resolve the requested ``intra_chunk_dtypes`` (``None`` when omitted) for these inputs.
+
+    FP16 Q/K/V (all three FP16) have one kernel set, ``FP16_INTRA_CHUNK_DTYPES``: an omitted
+    option selects it and any other value raises. Other inputs run in BF16 and default to
+    ``DEFAULT_INTRA_CHUNK_DTYPES``. The KDA ops resolve this for every backend and
+    implementation, so whether a call is valid never depends on the backend ``"auto"`` picks or
+    on the GPU, and under ``torch.compile`` it raises while tracing rather than inside a compiled
+    op.
+    """
+    if q.dtype == k.dtype == v.dtype == torch.float16:
+        if intra_chunk_dtypes not in (None, FP16_INTRA_CHUNK_DTYPES):
+            raise ValueError(
+                f"{op_name}: FP16 q/k/v take only "
+                f"kernel_options['intra_chunk_dtypes']={FP16_INTRA_CHUNK_DTYPES!r}, got "
+                f"{intra_chunk_dtypes!r}: their decay products need TF32 (the in-chunk decay "
+                "factors 2^-g overflow FP16) and their solve operands are FP16"
+            )
+        return FP16_INTRA_CHUNK_DTYPES
+    return DEFAULT_INTRA_CHUNK_DTYPES if intra_chunk_dtypes is None else intra_chunk_dtypes
 
 
 def cast_to_kernel_dtypes(
@@ -158,8 +197,11 @@ def validate_replay_state(
 
 
 __all__ = [
+    "DEFAULT_INTRA_CHUNK_DTYPES",
+    "FP16_INTRA_CHUNK_DTYPES",
     "SUPPORTED_INPUT_DTYPES",
     "cast_to_kernel_dtypes",
+    "resolve_intra_chunk_dtypes",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_replay_state",

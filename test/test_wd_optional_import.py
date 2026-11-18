@@ -92,7 +92,9 @@ for heads in (1, num_sm // 7, num_sm // 5):  # chained; d_v split forward; uncut
     out, _ = chunk_kda(q, k, v, gate, beta, cu_seqlens=cu, kernel_options=split)
     torch.autograd.grad(out.sum(), (q, k, v, gate, beta))
 staged = [t.detach()[:, :, :1].contiguous() for t in (k, v, gate)]
-summary.build_state_summaries(*staged, beta.detach()[:, :, :1].contiguous(), cu)
+summary.build_state_summaries(
+    *staged, beta.detach()[:, :, :1].contiguous(), cu, intra_chunk_dtypes="tf32+fp16"
+)
 torch.cuda.synchronize()
 
 for family in ("gdn", "kda"):

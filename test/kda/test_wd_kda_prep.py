@@ -36,10 +36,10 @@ def _inputs(lens, heads, q_heads, key_heads, d, dtype, gate_dtype, beta_dtype, s
     return q, k, gate, beta, cu
 
 
-def _run(q, k, gate, beta, cu):
+def _run(q, k, gate, beta, cu, intra_chunk_dtypes="tf32+fp16"):
     from attn_gym.linear._delta_rule.warpdrive import kda_prep
 
-    return kda_prep.kda_prep(q, k, gate, beta, cu)
+    return kda_prep.kda_prep(q, k, gate, beta, cu, intra_chunk_dtypes=intra_chunk_dtypes)
 
 
 def _chunks(x, rows, heads):
@@ -60,17 +60,17 @@ def _tf32(x):
     return ((bits + 0x1000) & ~0x1FFF).view(torch.float32).double()
 
 
-def _reference(q, k, gate, beta, rows, round_dtype=None):
+def _reference(q, k, gate, beta, rows, round_dtype=None, a_dtype=None, tf32_decay=False):
     """Records of each valid row from the module docstring's formulas in fp64; ``round_dtype``
     rounds the operands the kernel stores in 16 bits at the same points (the low-precision
-    reference of the error budget). Under fp16 the KK and A operands are tf32 instead: the
-    kernel forms them in fp32 (NOTE [TF32 decay operands] in ``kda_common``), and 2^-g
-    overflows fp16 from a uniform gate of about -0.7."""
+    reference of the error budget), ``a_dtype`` those of the ``a`` product. With ``tf32_decay``
+    the KK and A operands are tf32 instead: the kernel forms them in fp32 (NOTE [TF32 decay
+    operands] in ``kda_common``), and 2^-g overflows fp16 from a uniform gate of about -0.7."""
 
-    def rnd(x):
-        return x if round_dtype is None else x.to(round_dtype).double()
+    def rnd(x, dtype=round_dtype):
+        return x if dtype is None else x.to(dtype).double()
 
-    rnd_decay = _tf32 if round_dtype == torch.float16 else rnd
+    rnd_decay = _tf32 if round_dtype is not None and tf32_decay else rnd
 
     heads = gate.shape[1]
     qc, kc = _chunks(q, rows, heads), _chunks(k, rows, heads)
@@ -84,26 +84,27 @@ def _reference(q, k, gate, beta, rows, round_dtype=None):
     lower = torch.tril(torch.ones(B_T, B_T, dtype=torch.float64, device=q.device))
     kk = rnd_decay(k_decay) @ k_inv.transpose(-1, -2)
     L = b[..., :, None] * kk * (lower - eye)
-    inv_beta = rnd(torch.linalg.inv(eye + L) * b[..., None, :])
-    a_left = rnd((rnd_decay(q_decay) @ k_inv.transpose(-1, -2)) * lower)
+    inv_beta = torch.linalg.inv(eye + L) * b[..., None, :]
+    a_left = (rnd_decay(q_decay) @ k_inv.transpose(-1, -2)) * lower
     return {
         "k_decay": rnd(k_decay),
         "q_decay": rnd(q_decay),
-        "t": inv_beta.transpose(-1, -2) @ k_restore,
-        "a": a_left @ inv_beta,
+        "t": rnd(inv_beta).transpose(-1, -2) @ k_restore,
+        "a": rnd(a_left, a_dtype) @ rnd(inv_beta, a_dtype),
         "diag": torch.exp2(g[:, :, -1]),
     }
 
 
-def _decode(out, dtype):
-    """The kernel's records at the valid rows, with ``a`` unpacked from its SW32 image."""
+def _decode(out, a_dtype):
+    """The kernel's records at the valid rows, with ``a`` (``a_dtype``) unpacked from its SW32
+    image."""
     rows = out["rows"][: int(out["row_count"][0])]
     tile_row = (rows[:, 2] // B_T + rows[:, 1] + rows[:, 0]).long()
     rec = {name: out[name][tile_row] for name in ("k_decay", "q_decay", "t", "diag")}
     row = torch.arange(B_T)[:, None]
     col = torch.arange(B_T)[None, :]
     swz = ((col // 8) ^ ((row >> 2) & 1)) * 8 + col % 8
-    flat = out["a"][tile_row].view(dtype)  # [R, H, 256] 16-bit SW32 image
+    flat = out["a"][tile_row].view(a_dtype)  # [R, H, 256] 16-bit SW32 image
     rec["a"] = flat[..., (row * B_T + swz).flatten().cuda()].unflatten(-1, (B_T, B_T))
     return rows, rec
 
@@ -123,15 +124,23 @@ CASES = {
 }
 
 
+@pytest.mark.parametrize("intra_chunk_dtypes", ["tf32+fp16", "bf16+fp16", "bf16"])
 @pytest.mark.parametrize("case", CASES, ids=list(CASES))
-def test_kda_prep_matches_reference(case):
+def test_kda_prep_matches_reference(case, intra_chunk_dtypes):
     lens, heads, q_heads, key_heads, d, dtype, aux = CASES[case]
+    if dtype == torch.float16 and intra_chunk_dtypes != "tf32+fp16":
+        pytest.skip("fp16 operands have one precision")
     aux_dtype = torch.float32 if aux == "f32" else dtype
     q, k, gate, beta, cu = _inputs(lens, heads, q_heads, key_heads, d, dtype, aux_dtype, aux_dtype)
-    out = _run(q, k, gate, beta, cu)
-    rows, rec = _decode(out, dtype)
+    out = _run(q, k, gate, beta, cu, intra_chunk_dtypes)
+    # The dtype of the ``a`` record and of its product's operands.
+    a_dtype = dtype if intra_chunk_dtypes == "bf16" else torch.float16
+    rows, rec = _decode(out, a_dtype)
     hi = _reference(q, k, gate, beta, rows)
-    lo = _reference(q, k, gate, beta, rows, round_dtype=dtype)
+    tf32_decay = intra_chunk_dtypes.startswith("tf32")
+    lo = _reference(
+        q, k, gate, beta, rows, round_dtype=dtype, a_dtype=a_dtype, tf32_decay=tf32_decay
+    )
     for name in ("k_decay", "q_decay", "t", "a", "diag"):
         assert_matches_low_precision_reference(
             rec[name], hi[name], lo[name], name, source_dtype=dtype
@@ -147,7 +156,7 @@ def test_kda_prep_fp16_matches_reference_where_the_inverse_decay_overflows_fp16(
     out = _run(q, k, gate, beta, cu)
     rows, rec = _decode(out, torch.float16)
     hi = _reference(q, k, gate, beta, rows)
-    lo = _reference(q, k, gate, beta, rows, round_dtype=torch.float16)
+    lo = _reference(q, k, gate, beta, rows, round_dtype=torch.float16, tf32_decay=True)
     for name in ("t", "a"):
         assert torch.isfinite(lo[name]).all(), name
         assert_matches_low_precision_reference(

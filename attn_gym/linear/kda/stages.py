@@ -60,6 +60,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 from attn_gym.linear.kda.validation import (
+    resolve_intra_chunk_dtypes,
     resolve_kernel_options,
     validate_kda_inputs,
 )
@@ -216,6 +217,8 @@ class ChunkKDAWarpdrivePrepared:
     metadata: RaggedChunkMetadata
     scale: float
     fastmath: bool
+    # ``kernel_options["intra_chunk_dtypes"]`` of every forward launch (summaries and ``run``).
+    intra_chunk_dtypes: str
     batch_invariant: bool = False
     # Set when the summaries split: ``run`` starts every piece at once from their maps (NOTE
     # [Staged piece plans] in ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
@@ -245,6 +248,7 @@ class ChunkKDAWarpdrivePrepared:
             saved.cu_seqlens,
             bounds=bounds,
             fastmath=self.fastmath,
+            intra_chunk_dtypes=self.intra_chunk_dtypes,
             batch_invariant=self.batch_invariant,
         )
 
@@ -267,6 +271,7 @@ class ChunkKDAWarpdrivePrepared:
                 initial_state=_normalize_warpdrive_state(initial_state),
                 output_final_state=output_final_state,
                 fastmath=self.fastmath,
+                intra_chunk_dtypes=self.intra_chunk_dtypes,
             )
             return output.unsqueeze(0), final_state
         if initial_state is None:
@@ -284,9 +289,10 @@ class ChunkKDAWarpdrivePrepared:
             self.scale,
             self.fastmath,
         )
+        dtypes = {"intra_chunk_dtypes": self.intra_chunk_dtypes}
         if output_final_state:
-            return chunk_warpdrive_packed_fwd_with_state_op(*args)
-        return chunk_warpdrive_packed_fwd_with_initial_state_op(*args), None
+            return chunk_warpdrive_packed_fwd_with_state_op(*args, **dtypes)
+        return chunk_warpdrive_packed_fwd_with_initial_state_op(*args, **dtypes), None
 
 
 def chunk_kda_prepare(
@@ -310,9 +316,10 @@ def chunk_kda_prepare(
     ``fastmath`` follows ``chunk_kda`` and applies to preparation, summaries, and ``run``.
     Pass the same value to ``chunk_kda_prepare_backward``.
     ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both summaries with
-    warpdrive's kernels. Split schedules are not available with entry states. ``"autotune"``
-    follows ``chunk_kda``; ``"batch_invariant"`` (warpdrive only) keeps each sequence's summary
-    bits independent of the rest of the stream (:class:`attn_gym.linear.types.StageKernelOptions`).
+    warpdrive's kernels. Split schedules are not available with entry states. ``"autotune"`` and
+    ``"intra_chunk_dtypes"`` follow ``chunk_kda``; ``"batch_invariant"`` (warpdrive only) keeps
+    each sequence's summary bits independent of the rest of the stream
+    (:class:`attn_gym.linear.types.StageKernelOptions`).
     """
     options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare", staged=True)
     backend, autotune, schedule = options.backend, options.autotune, options.schedule
@@ -320,6 +327,9 @@ def chunk_kda_prepare(
         raise ValueError("split schedules are not supported by chunk_kda_prepare")
     validate_kda_inputs(
         q, k, v, gate, beta, None, cu_seqlens, op_name="chunk_kda_prepare", gate_name="gate"
+    )
+    intra_chunk_dtypes = resolve_intra_chunk_dtypes(
+        options.intra_chunk_dtypes, q, k, v, op_name="chunk_kda_prepare"
     )
     _validate_fused_constraints(q, v)
     if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
@@ -349,10 +359,11 @@ def chunk_kda_prepare(
         pieces = None
         if not options.batch_invariant:
             pieces = staged.forward_pieces(
-                k[0], v[0], gate[0], beta[0], cu_seqlens, fastmath=fastmath
-            )
+                k[0], v[0], gate[0], beta[0], cu_seqlens, fastmath=fastmath,
+                intra_chunk_dtypes=intra_chunk_dtypes,
+            )  # fmt: skip
         return ChunkKDAWarpdrivePrepared(
-            saved, metadata, scale, fastmath, options.batch_invariant, pieces
+            saved, metadata, scale, fastmath, intra_chunk_dtypes, options.batch_invariant, pieces
         )
     factors = _prepare_chunk_kda_fwd(
         q,
@@ -464,6 +475,9 @@ class ChunkKDAWarpdriveBackward:
     initial_state: torch.Tensor | None
     scale: float
     fastmath: bool
+    # The forward's ``intra_chunk_dtypes``, which the checkpoint recompute and the forward
+    # transitions the reverse maps transpose repeat.
+    intra_chunk_dtypes: str
     batch_invariant: bool = False
     # Set when the summaries split: the maps and checkpoints ``run`` finishes from (NOTE
     # [Staged piece plans] in ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
@@ -494,6 +508,7 @@ class ChunkKDAWarpdriveBackward:
             transpose_forward_transition=True,
             bounds=bounds,
             fastmath=self.fastmath,
+            intra_chunk_dtypes=self.intra_chunk_dtypes,
             batch_invariant=self.batch_invariant,
         )
 
@@ -531,7 +546,12 @@ class ChunkKDAWarpdriveBackward:
             return (*(grad.unsqueeze(0) for grad in grads), d_initial_state)
         if self.initial_state is None:
             grads = chunk_warpdrive_packed_bwd_with_exit_cotangent_op(
-                *operands, saved.cu_seqlens, d_final_state, self.scale, self.fastmath
+                *operands,
+                saved.cu_seqlens,
+                d_final_state,
+                self.scale,
+                self.fastmath,
+                self.intra_chunk_dtypes,
             )
             return (*grads, None)
         return chunk_warpdrive_packed_bwd_with_state_op(
@@ -541,6 +561,7 @@ class ChunkKDAWarpdriveBackward:
             d_final_state,
             self.scale,
             self.fastmath,
+            self.intra_chunk_dtypes,
         )
 
 
@@ -560,8 +581,10 @@ def chunk_kda_prepare_backward(
     re-derived scale would corrupt every gradient. Both live outside ``saved`` because the
     caller's autograd function owns them. Pass the forward's ``fastmath`` and
     ``kernel_options`` for matching factors, launch geometry (``"schedule"``), tuning
-    (``"autotune"``), and summary plans (``"batch_invariant"``). The tape selects the backend: a
-    warpdrive tape (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward`.
+    (``"autotune"``), the warpdrive forward transitions the reverse maps transpose
+    (``"intra_chunk_dtypes"``), and summary plans (``"batch_invariant"``). The tape selects the
+    backend: a warpdrive tape (:class:`ChunkKDAWarpdriveSaved`) returns
+    :class:`ChunkKDAWarpdriveBackward`.
     """
     if d_output is None:
         d_output = torch.zeros_like(saved.v)
@@ -570,6 +593,9 @@ def chunk_kda_prepare_backward(
     scale = float(scale)
     options = resolve_kernel_options(
         kernel_options, op_name="chunk_kda_prepare_backward", staged=True
+    )
+    intra_chunk_dtypes = resolve_intra_chunk_dtypes(
+        options.intra_chunk_dtypes, saved.q, saved.k, saved.v, op_name="chunk_kda_prepare_backward"
     )
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by chunk_kda_prepare_backward")
@@ -585,9 +611,17 @@ def chunk_kda_prepare_backward(
                 scale=scale,
                 initial_state=initial_state,
                 fastmath=fastmath,
+                intra_chunk_dtypes=intra_chunk_dtypes,
             )
         return ChunkKDAWarpdriveBackward(
-            saved, d_output, initial_state, scale, fastmath, options.batch_invariant, pieces
+            saved,
+            d_output,
+            initial_state,
+            scale,
+            fastmath,
+            intra_chunk_dtypes,
+            options.batch_invariant,
+            pieces,
         )
     metadata = None
     if saved.cu_seqlens is not None:

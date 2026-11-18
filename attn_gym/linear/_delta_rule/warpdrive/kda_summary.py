@@ -100,6 +100,7 @@ from .kda_common import (
     as_i32,
     beta_residual,
     box128,
+    check_operand_dtypes,
     decay_fragment_offsets,
     decay_stage_addresses,
     ldg_l2_f32,
@@ -111,10 +112,15 @@ from .kda_common import (
     mask_pair,
     mma_decay_16x16,
     opaque_i32,
+    operand_dtypes,
+    precision_suffix,
     raw_beta_release,
     raw_beta_wait,
+    row_halves,
     spin_wait,
     stg_v4,
+    store_solve_rows,
+    store_unscaled_rows,
     sts_f32,
     sts_tf32x8,
     swz32,
@@ -191,7 +197,7 @@ class KdaSummaryParams:
     s_ex: Int32
     s_kdecay: Int32
     s_krestore: Int32
-    s_kinv: Int32  # fp32 (tf32) under fp16 io
+    s_kinv: Int32  # fp32 (tf32) under tf32 decay products
     s_tinv: Int32
     s_beta: Int32
 
@@ -199,7 +205,9 @@ class KdaSummaryParams:
 class KdaSummary(WarpSpecialized):
     """Warpdrive KDA piece summaries for ``io`` fp16/bf16 operands and an fp32 or ``io`` gate;
     fp32 ``H`` and ``M``.
-    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal.
+    ``decay_dtype`` (of KK) and ``solve_dtype`` (of T^-1 and Y) are the operand dtypes of
+    NOTE [KDA operand precision] in kda_common; U stays io for the state update."""
 
     def __init__(
         self,
@@ -210,22 +218,28 @@ class KdaSummary(WarpSpecialized):
         num_ctas: int,
         fastmath: bool = True,
         *,
+        decay_dtype: str,
+        solve_dtype: str,
         beta_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA summary serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
+        check_operand_dtypes(io, decay_dtype, solve_dtype)
         self.io, self.gate, self.d_k, self.d_v, self.num_ctas = io, gate, d_k, d_v, num_ctas
         self.fastmath = fastmath
+        self.decay_dtype, self.solve_dtype = decay_dtype, solve_dtype
         # Standalone compiles read these; a bundle's host passes its own tensors (None).
         self.beta_dtype = beta_dtype
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
-        # fp16 computes KK from tf32 decay tiles (NOTE [TF32 decay operands] in
-        # ``kda_common``).
-        self.tf32_decay = io == "fp16"
+        # KK from tf32 decay tiles (NOTE [TF32 decay operands] in ``kda_common``).
+        self.tf32_decay = decay_dtype == "tf32"
         self.decay_t = Float32 if self.tf32_decay else self.io_dtype
+        # T^-1 and Y operand dtype; scaled fp16 under bf16 io (NOTE [KDA operand precision]).
+        self.solve_type = solve_t = CUTE_DTYPES[solve_dtype]
+        self.scaled_solve = solve_dtype != io
         # An fp32 gate is exchanged in place (exp2 prefixes over the raw gate stage); a 16-bit
         # gate exchanges through its own 4-stage fp32 buffer.
         self.ex_stages = RAW_STAGES if gate == "fp32" else 4
@@ -234,7 +248,7 @@ class KdaSummary(WarpSpecialized):
         buf = {
             "Kdecay": plan.buffer("Kdecay", io_t, align=1024),
             "Krestore": plan.buffer("Krestore", io_t, align=1024),
-            "Tinv": plan.buffer("Tinv", io_t, align=1024),
+            "Tinv": plan.buffer("Tinv", solve_t, align=1024),
             "K": plan.buffer("K", io_t, align=1024),
             "V": plan.buffer("V", io_t, align=1024),
             "Gate": plan.buffer("Gate", self.gate_dtype, align=1024),
@@ -324,7 +338,8 @@ class KdaSummary(WarpSpecialized):
         for chain, rows in ((H, d_v), (M, d_k)):
             acc_idesc = instr_desc(f32, io_t, io_t, m=rows, n=B_T)
             self.ks_desc[chain] = MmaDesc(M=rows, N=B_T, K=d_k, bpe_a=2, bpe_b=2, idesc=acc_idesc)
-            self.t_desc[chain] = MmaDesc(M=rows, N=B_T, K=B_T, bpe_a=2, bpe_b=2, idesc=acc_idesc)
+            u_idesc = instr_desc(f32, solve_t, solve_t, m=rows, n=B_T)
+            self.t_desc[chain] = MmaDesc(M=rows, N=B_T, K=B_T, bpe_a=2, bpe_b=2, idesc=u_idesc)
             self.kr_desc[chain] = MmaDesc(
                 M=rows,
                 N=self.n_update,
@@ -341,6 +356,7 @@ class KdaSummary(WarpSpecialized):
 
     def get_name(self) -> str:
         name = f"wd_kda_summary_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
+        name += precision_suffix(self.io, self.decay_dtype, self.solve_dtype)
         return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
@@ -680,7 +696,7 @@ class KdaSummary(WarpSpecialized):
         kd_pack = []
         ki_pack = []
         kr_pack = []
-        kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (fp16 io)
+        kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (tf32 decay products)
         ki32 = []
         for half in cutlass.range_constexpr(dk_halves):
             dim_base = half * 64 + lane_in_row * 8
@@ -915,28 +931,32 @@ class KdaSummary(WarpSpecialized):
         stage = raw_beta_wait(raw, beta, n_raw, RAW_STAGES)
         v_lo, v_hi = self.load_v(params, stage, geo, chunk_start, seqlen)
         betas = self.load_betas(params, stage, lane)
-        y_lo = [Int32(0)] * 4
-        y_hi = [Int32(0)] * 4
+        y_lo = [Float32(0.0)] * 8
+        y_hi = [Float32(0.0)] * 8
         for r in cutlass.range_constexpr(4):
-            y_lo[r] = beta_residual(v_lo[r], *betas[r], None, None, io, False)
-            y_hi[r] = beta_residual(v_hi[r], *betas[r], None, None, io, False)
-        self.stage_y(tstate, geo, H, y_lo, y_hi)
+            y_lo[2 * r], y_lo[2 * r + 1] = beta_residual(v_lo[r], *betas[r], None, None, io, False)
+            y_hi[2 * r], y_hi[2 * r + 1] = beta_residual(v_hi[r], *betas[r], None, None, io, False)
+        exp_h = self.stage_y(tstate, geo, H, y_lo, y_hi)
         zero = opaque_i32_zero()
         if seeded:
             with self.trace_region("ks.wait"):
                 spin_wait(tstate + M + KS, n_ks_m & 1)
             n_ks_m += 1
             ys_lo, ys_hi = self.residual_with_state(geo, M, [zero] * 4, [zero] * 4, betas)
-            for r in cutlass.range_constexpr(4):
-                y_lo[r] = ys_lo[r]
-                y_hi[r] = ys_hi[r]
+            for i in cutlass.range_constexpr(8):
+                y_lo[i] = ys_lo[i]
+                y_hi[i] = ys_hi[i]
         else:
             for r in cutlass.range_constexpr(4):
-                y_lo[r] = beta_residual(zero, *betas[r], None, None, io, False)
-                y_hi[r] = beta_residual(zero, *betas[r], None, None, io, False)
-        self.stage_y(tstate, geo, M, y_lo, y_hi)
+                y_lo[2 * r], y_lo[2 * r + 1] = beta_residual(
+                    zero, *betas[r], None, None, io, False
+                )
+                y_hi[2 * r], y_hi[2 * r + 1] = beta_residual(
+                    zero, *betas[r], None, None, io, False
+                )
+        exp_m = self.stage_y(tstate, geo, M, y_lo, y_hi)
         raw_beta_release(raw, beta, stage)
-        n_u = self.stage_u(tstate, n_u, geo)
+        n_u = self.stage_u(tstate, n_u, geo, (exp_h, exp_m))
         eh.release(signal=False)  # signal-only channel (see __init__)
         return exchange, n_ks_m, n_u
 
@@ -1011,46 +1031,59 @@ class KdaSummary(WarpSpecialized):
 
     @cute.jit
     def residual_with_state(self, geo, chain: cutlass.Constexpr, v_lo, v_hi, betas):
-        """``beta (V - KS)`` of ``chain`` from its KS accumulator (after its ``KS`` wait)."""
+        """fp32 ``beta (V - KS)`` fragments (``16x256b`` layout) of ``chain`` from its KS
+        accumulator (after its ``KS`` wait)."""
         _l, cols, _lo, _hi, _vd, _rvh, _kd, _rvm = geo
         io = self.io_dtype
         two = self.d_v == 128 if chain == H else self.d_k == 128
-        y_lo = [Int32(0)] * 4
-        y_hi = [Int32(0)] * 4
+        y_lo = []
+        y_hi = [Float32(0.0)] * 8
         ks_lo = tmem_ld("16x256b", 2, cols[chain, "ks"])
         for r in cutlass.range_constexpr(4):
-            y_lo[r] = beta_residual(v_lo[r], *betas[r], ks_lo[2 * r], ks_lo[2 * r + 1], io, True)
+            y_lo += beta_residual(v_lo[r], *betas[r], ks_lo[2 * r], ks_lo[2 * r + 1], io, True)
         if cutlass.const_expr(two):
             ks_hi = tmem_ld("16x256b", 2, cols[chain, "ks"] + (16 << 16))
             for r in cutlass.range_constexpr(4):
-                y_hi[r] = beta_residual(
+                y_hi[2 * r], y_hi[2 * r + 1] = beta_residual(
                     v_hi[r], *betas[r], ks_hi[2 * r], ks_hi[2 * r + 1], io, True
                 )
         return y_lo, y_hi
 
     @cute.jit
     def stage_y(self, tstate, geo, chain: cutlass.Constexpr, y_lo, y_hi):
-        """Publish ``chain``'s packed Y operand to TMEM."""
+        """Pack ``chain``'s fp32 Y fragments into its Y operand and publish it. Returns the
+        exponent of its scale (``store_solve_rows``)."""
         _l, cols, _lo, _hi, _vd, _rvh, _kd, _rvm = geo
         two = self.d_v == 128 if chain == H else self.d_k == 128
-        tmem_st("16x128b", cols[chain, "yin"], y_lo)
-        if cutlass.const_expr(two):
-            tmem_st("16x128b", cols[chain, "yin"] + (16 << 16), y_hi)
+        rows = [(cols[chain, "yin"] + h, y) for h, y in zip(row_halves(two), (y_lo, y_hi))]
+        y_exp = store_solve_rows(rows, self.solve_type, self.scaled_solve)
         cute.arch.fence_view_async_tmem_store()
         warp_arrive(tstate + chain + YIN)
+        return y_exp
 
     @cute.jit
-    def stage_u(self, tstate, n_u, geo):
-        """Wait for U_X = T Y_X and publish its fp16 copy as the next MMA operand, H then M."""
+    def stage_u(self, tstate, n_u, geo, y_exps):
+        """Wait for U_X = T Y_X and publish its io copy as the next MMA operand, H then M. Under
+        ``scaled_solve`` U_X comes back scaled by Y_X's scale 2^``y_exps[X]`` and is unscaled
+        (exactly) before the pack."""
         _l, cols, _lo, _hi, _vd, _rvh, _kd, _rvm = geo
         for chain in cutlass.range_constexpr(H, M + 1, CHAIN):
             with self.trace_region("u.wait"):
                 spin_wait(tstate + chain + U, n_u & 1)
-            vals = tmem_ld("32x32b", B_T, cols[chain, "u"])
-            words = [
-                fp32_to_fp16(vals[2 * i], vals[2 * i + 1], dtype=self.io_dtype) for i in range(8)
-            ]
-            tmem_st("32x32b", cols[chain, "uin"], words)
+            if cutlass.const_expr(self.scaled_solve):
+                two = self.d_v == 128 if chain == H else self.d_k == 128
+                rows = [
+                    (cols[chain, "uin"] + h, tmem_ld("16x256b", 2, cols[chain, "u"] + h))
+                    for h in row_halves(two)
+                ]
+                store_unscaled_rows(rows, y_exps[0 if chain == H else 1], self.io_dtype)
+            else:
+                vals = tmem_ld("32x32b", B_T, cols[chain, "u"])
+                words = [
+                    fp32_to_fp16(vals[2 * i], vals[2 * i + 1], dtype=self.io_dtype)
+                    for i in range(8)
+                ]
+                tmem_st("32x32b", cols[chain, "uin"], words)
             cute.arch.fence_view_async_tmem_store()
             warp_arrive(tstate + chain + UIN)
         return n_u + 1
@@ -1132,15 +1165,15 @@ class KdaSummary(WarpSpecialized):
             spin_wait(tstate + H + KS, n_ks_h & 1)
         n_ks_h += 1
         y_lo, y_hi = self.residual_with_state(geo, H, v_lo, v_hi, betas)
-        self.stage_y(tstate, geo, H, y_lo, y_hi)
+        exp_h = self.stage_y(tstate, geo, H, y_lo, y_hi)
         zero = opaque_i32_zero()
         with self.trace_region("ks.wait"):
             spin_wait(tstate + M + KS, n_ks_m & 1)
         n_ks_m += 1
         y_lo, y_hi = self.residual_with_state(geo, M, [zero] * 4, [zero] * 4, betas)
-        self.stage_y(tstate, geo, M, y_lo, y_hi)
+        exp_m = self.stage_y(tstate, geo, M, y_lo, y_hi)
         raw_beta_release(raw, beta, stage)
-        n_u = self.stage_u(tstate, n_u, geo)
+        n_u = self.stage_u(tstate, n_u, geo, (exp_h, exp_m))
         eh.release(signal=False)  # signal-only channel (see __init__)
         return exchange, n_ks_h, n_ks_m, n_u, n_upd
 
@@ -1191,7 +1224,6 @@ class KdaSummary(WarpSpecialized):
         me: Local,
     ):
         lane = me.lane
-        io = self.io_dtype
         t_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         t_col = 8 if lane // 8 >= 2 else 0
         t_idx = t_row * B_T + swz32(t_row, t_col)
@@ -1239,12 +1271,13 @@ class KdaSummary(WarpSpecialized):
                             l_regs[2 * p], l_regs[2 * p + 1], bs, bs
                         )
                     bh.release()
-                    t = invert_unit_lower_16x16_fragments(l_regs, lane, io)
+                    solve = self.solve_type
+                    t = invert_unit_lower_16x16_fragments(l_regs, lane, solve)
                     with tinv.produce() as th:
                         th.access(write=True, by="threads")
                         stmatrix(
                             params.s_tinv + th.index * (B_T * B_T * 2) + 2 * t_idx,
-                            [fp32_to_fp16(t[2 * i], t[2 * i + 1], dtype=io) for i in range(4)],
+                            [fp32_to_fp16(t[2 * i], t[2 * i + 1], dtype=solve) for i in range(4)],
                         )
                     kh.release()
                 cum_base += n_local
@@ -1614,10 +1647,12 @@ def kda_summary(
     scheduler: torch.Tensor | None = None,
     *,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
 ) -> None:
     """Packed ``[T, H, D]`` piece summaries into ``state_h [pieces, H, d_v, d_k]`` and
     ``state_m [pieces, H, d_k, d_k]`` (fp32): natural-log channel gate ``[T, H, d_k]``, beta
-    ``[T, H]``, the first ``work_count[0]`` rows of ``work_items`` (see the module docstring)."""
+    ``[T, H]``, the first ``work_count[0]`` rows of ``work_items`` (see the module docstring).
+    ``intra_chunk_dtypes`` is the public option (``operand_dtypes``)."""
     if k.dtype not in (torch.float16, torch.bfloat16) or v.dtype != k.dtype:
         raise TypeError("k and v must share a 16-bit dtype")
     if state_h.dtype != torch.float32 or state_m.dtype != torch.float32:
@@ -1626,6 +1661,7 @@ def kda_summary(
         raise ValueError("work_items must be compact and beta contiguous over heads")
     if scheduler is None:
         scheduler = torch.zeros(1, dtype=torch.int32, device=k.device)
+    decay, solve = operand_dtypes(TORCH_NAMES[k.dtype], intra_chunk_dtypes)
     op = KdaSummary.get_or_build(
         TORCH_NAMES[k.dtype],
         TORCH_NAMES[gate.dtype],
@@ -1633,6 +1669,8 @@ def kda_summary(
         v.shape[-1],
         torch.cuda.get_device_properties(k.device).multi_processor_count,
         fastmath,
+        decay_dtype=decay,
+        solve_dtype=solve,
         beta_dtype=TORCH_NAMES[beta.dtype],
     )
     fn = compile_kda_summary(op)

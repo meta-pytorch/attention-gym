@@ -104,6 +104,7 @@ from .kda_common import (
     WORK_ITEM_FIELDS,
     beta_residual,
     box128,
+    check_operand_dtypes,
     decay_fragment_offsets,
     decay_stage_addresses,
     gate_offset,
@@ -117,12 +118,18 @@ from .kda_common import (
     mask_pair,
     mma_decay_16x16,
     opaque_i32,
+    operand_dtypes,
+    pow2_pair,
+    precision_suffix,
     raw_beta_release,
     raw_beta_wait,
     resolve_paged_state,
+    row_halves,
     spin_wait,
     state_align_suffix,
+    store_solve_rows,
     store_state_32,
+    store_unscaled_rows,
     sts_f32,
     sts_tf32x8,
     swz32,
@@ -133,6 +140,7 @@ from .kda_common import (
 from .ptx import (
     elect_sync,
     f16x2_to_f32,
+    fadd2,
     fmul2,
     fp32_to_fp16,
     ldmatrix,
@@ -163,9 +171,9 @@ from .umma import (
 
 LOG2_E = 1.4426950408889634
 RAW_STAGES = 8
-# Each fp16 decay stage needs three extra fp32 tiles for TF32 math. We use 4 raw stages
-# instead of 8 to make room in shared memory. On 8x4096 with 32 heads, 6 and 7 stages
-# were no faster (4: 559 us, 6: 567 us, 7: 563 us). Since 4 is a power of two, the raw
+# With tf32 decay products, each decay stage needs three extra fp32 tiles for TF32 math. We use
+# 4 raw stages instead of 8 to make room in shared memory. On 8x4096 with 32 heads, 6 and 7
+# stages were no faster (4: 559 us, 6: 567 us, 7: 563 us). Since 4 is a power of two, the raw
 # and exchange rings can wrap their indices with a bitmask.
 TF32_RAW_STAGES = 4
 SCHED_STAGES = 8
@@ -187,14 +195,18 @@ assert QS_STAGES >= 2, "CG1's late o_acc release needs two O accumulator slots"
 #   UIN    U operand (CG1) and the left-half state decay (CG0 instance): 4 + 4 arrivals; MMA
 #          waits before the state update.
 #   SACC_L / SACC_R (2 stages)  left / right state update committed; CG0 / CG1 read the state.
+#   U16    scaled fp16 U operand (CG1, ``scaled_solve`` only), published after UIN so its
+#          range check stays off the state update's path; MMA waits before A U. Rewritten
+#          after U(c+1) completes, as the U operand is.
 # The TMEM loads need no tcgen05.wait::ld where the same warp issues a tcgen05.st after them
 # and completes it (wait::st) before the signal that lets the MMA overwrite their columns: a
 # warp's ld -> st pair is pipelined (PTX ISA 9.7.18.6.2), while a register dependency orders no
 # memory (9.7.18.6.4.5). Each load names its store; drain_o has none and waits for its loads.
 # final_state's loads precede the next item's stores, or on the CTA's last item the layer's
 # teardown, which completes every TMEM user's loads before the allocator warp frees TMEM.
-SIN_L, SIN_R, KS, U, YIN, UIN, SACC_L, SACC_R = 0, 1, 2, 3, 4, 5, 6, 8
+SIN_L, SIN_R, KS, U, YIN, UIN, SACC_L, SACC_R, U16 = 0, 1, 2, 3, 4, 5, 6, 8, 10
 TSTATE_COUNTS = (4, 4, 1, 1, 4, 8, 1, 1, 1, 1)
+U16_COUNT = 4
 
 
 @dataclass(frozen=True)
@@ -226,7 +238,7 @@ class KdaPrefillParams:
     s_kdecay: Int32
     s_qdecay: Int32
     s_krestore: Int32
-    s_kinv: Int32  # fp32 (tf32) under fp16 io
+    s_kinv: Int32  # fp32 (tf32) under tf32 decay products
     s_a: Int32
     s_tinv: Int32
     s_o: Int32
@@ -241,7 +253,8 @@ class KdaPrefill(WarpSpecialized):
     state dtype follows the traced tensors. ``state_align`` is the byte alignment of every state
     row: below 16 only for a paged pool with unaligned rows (NOTE [Unaligned state rows] in
     kda_common). ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and
-    reciprocal."""
+    reciprocal. ``decay_dtype`` and ``solve_dtype`` are the operand dtypes of NOTE [KDA
+    operand precision] in kda_common (``operand_dtypes`` resolves the public options)."""
 
     def __init__(
         self,
@@ -257,6 +270,8 @@ class KdaPrefill(WarpSpecialized):
         fastmath: bool = True,
         state_align: int = 16,
         *,
+        decay_dtype: str,
+        solve_dtype: str,
         beta_dtype: str | None = None,
         state_dtype: str | None = None,
     ):
@@ -266,7 +281,9 @@ class KdaPrefill(WarpSpecialized):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         if paged_state and not (use_initial_state and store_final_state):
             raise ValueError("paged state routes one pool in and out")
+        check_operand_dtypes(io, decay_dtype, solve_dtype)
         self.io, self.gate, self.d_k, self.d_v = io, gate, d_k, d_v
+        self.decay_dtype, self.solve_dtype = decay_dtype, solve_dtype
         self.tiles_per_head, self.num_ctas = tiles_per_head, num_ctas
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         self.paged_state, self.fastmath = paged_state, fastmath
@@ -276,10 +293,13 @@ class KdaPrefill(WarpSpecialized):
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         gate_bytes = self.gate_dtype.width // 8
-        # fp16 computes A and KK from tf32 decay tiles (NOTE [TF32 decay operands] in
-        # ``kda_common``).
-        self.tf32_decay = io == "fp16"
+        # A and KK from tf32 decay tiles (NOTE [TF32 decay operands] in ``kda_common``).
+        self.tf32_decay = decay_dtype == "tf32"
         self.decay_t = Float32 if self.tf32_decay else self.io_dtype
+        # T^-1, Y, A and U operand dtype; scaled fp16 under bf16 io (NOTE [KDA operand
+        # precision]): Y and U carry power-of-two scales, A U accumulates apart from Q_decay S.
+        self.solve_type = solve_t = CUTE_DTYPES[solve_dtype]
+        self.scaled_solve = solve_dtype != io
         self.raw_stages = TF32_RAW_STAGES if self.tf32_decay else RAW_STAGES
         # An fp32 gate is exchanged in place (exp2 prefixes over the raw gate stage); a 16-bit
         # gate exchanges through its own 4-stage fp32 buffer.
@@ -290,8 +310,8 @@ class KdaPrefill(WarpSpecialized):
             "Kdecay": plan.buffer("Kdecay", io_t, align=1024),
             "Qdecay": plan.buffer("Qdecay", io_t, align=1024),
             "Krestore": plan.buffer("Krestore", io_t, align=1024),
-            "A": plan.buffer("A", io_t, align=1024),
-            "Tinv": plan.buffer("Tinv", io_t, align=1024),
+            "A": plan.buffer("A", solve_t, align=1024),
+            "Tinv": plan.buffer("Tinv", solve_t, align=1024),
             "Q": plan.buffer("Q", io_t, align=1024),
             "K": plan.buffer("K", io_t, align=1024),
             "V": plan.buffer("V", io_t, align=1024),
@@ -361,7 +381,8 @@ class KdaPrefill(WarpSpecialized):
         # The TMEM state recurrence (upstream protocol): signal-only barriers whose stage reuse
         # is implied by the recurrence itself (see ``TSTATE``), so no channel reuse waits sit
         # on the per-chunk critical path.
-        self.tstate = Barriers(len(TSTATE_COUNTS), counts=list(TSTATE_COUNTS))
+        counts = [*TSTATE_COUNTS, *((U16_COUNT,) if self.scaled_solve else ())]
+        self.tstate = Barriers(len(counts), counts=counts)
         # Each CG0 instance syncs its four warps between its exchange stores and their reads.
         self.exchange_sync = NamedBarriers(2, threads=128)
         self.tmem_plan = (
@@ -374,14 +395,23 @@ class KdaPrefill(WarpSpecialized):
             .region("yin", B_T // 2)
             .region("uin", B_T // 2)
         )
+        if self.scaled_solve:  # the A U accumulator (16-column aligned) and fp16 U operand
+            self.tmem_plan.region("au", B_T, QS_STAGES).region("uin16", B_T // 2)
         self.work = WorkStream(schedule=OneShot(grid="1d"), ready=PdlWait())
         # MMA geometry: KS/QS (TMEM state operand x K/Q decay), U and O (TMEM Y/U x the 16 x 16
-        # T_inv/A tiles), the state update (TMEM U x MN-major K_restore), split in two key halves
-        # when d_k = 128.
+        # T_inv/A tiles, intra-chunk dtype), the state update (TMEM U x MN-major K_restore),
+        # split in two key halves when d_k = 128.
         self.n_update = d_k // 2 if d_k // 2 >= 64 else d_k
         acc_idesc = instr_desc(f32, io_t, io_t, m=d_v, n=B_T)
         self.ks_desc = MmaDesc(M=d_v, N=B_T, K=d_k, bpe_a=2, bpe_b=2, idesc=acc_idesc)
-        self.t_desc = MmaDesc(M=d_v, N=B_T, K=B_T, bpe_a=2, bpe_b=2, idesc=acc_idesc)
+        self.t_desc = MmaDesc(
+            M=d_v,
+            N=B_T,
+            K=B_T,
+            bpe_a=2,
+            bpe_b=2,
+            idesc=instr_desc(f32, solve_t, solve_t, m=d_v, n=B_T),
+        )
         self.kr_desc = MmaDesc(
             M=d_v,
             N=self.n_update,
@@ -402,6 +432,7 @@ class KdaPrefill(WarpSpecialized):
         return (
             f"wd_kda_prefill_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}"
             f"_t{self.tiles_per_head}_f{flags}{state_align_suffix(self.state_align)}"
+            + precision_suffix(self.io, self.decay_dtype, self.solve_dtype)
             + ("" if self.fastmath else "_nofm")
         )
 
@@ -782,7 +813,7 @@ class KdaPrefill(WarpSpecialized):
         kd_pack = []
         ki_pack = []
         kr_pack = []
-        kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (fp16 io)
+        kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (tf32 decay products)
         ki32 = []
         for half in cutlass.range_constexpr(dk_halves):
             dim_base = half * 64 + lane_in_row * 8
@@ -955,7 +986,10 @@ class KdaPrefill(WarpSpecialized):
         lane_base = tmem.base.toint() + (
             (32 * (warp % 4)) << 16
         )  # warp-uniform: this subpartition
-        cols = {name: tmem.cols(name) for name in ("state", "sin", "qs", "ks", "u", "yin", "uin")}
+        names = ["state", "sin", "qs", "ks", "u", "yin", "uin"]
+        if cutlass.const_expr(self.scaled_solve):
+            names += ["au", "uin16"]
+        cols = {name: tmem.cols(name) for name in names}
         ov_lo = box128(ov_row, value_base + ov_col)
         ov_hi = box128(ov_row, value_base + 16 + ov_col)
         pack_col = opaque_i32(2 * (lane % 4))
@@ -966,6 +1000,7 @@ class KdaPrefill(WarpSpecialized):
         n_u = Int32(0)
         n_upd = Int32(0)
         n_raw = Int32(0)  # chunks consumed from raw and beta (see raw_beta_wait)
+        u_exp = Int32(0)  # the last staged U's exponent (``stage_u``), for its O drain
         while work.valid:
             unit, _, _ = work.item
             total = params.work_count[0]
@@ -985,7 +1020,7 @@ class KdaPrefill(WarpSpecialized):
                 if cutlass.const_expr(self.paged_state > 0):
                     seed_row = slot
                 if n_local > 0:
-                    exchange, n_ks, n_u = self.cg1_first(
+                    exchange, n_ks, n_u, u_exp = self.cg1_first(
                         params,
                         raw,
                         beta,
@@ -1004,7 +1039,7 @@ class KdaPrefill(WarpSpecialized):
                         seqlen,
                     )
                 for local in cutlass.range(1, n_local, 1, unroll=1):
-                    exchange, o_acc, o_smem, n_ks, n_u, n_upd = self.cg1_chunk(
+                    exchange, o_acc, o_smem, n_ks, n_u, n_upd, u_exp = self.cg1_chunk(
                         params,
                         raw,
                         beta,
@@ -1020,6 +1055,7 @@ class KdaPrefill(WarpSpecialized):
                         active,
                         (compute_start + local) * B_T,
                         seqlen,
+                        (local > 1 or seed, u_exp),
                     )
                 n_raw += n_local
                 if n_local > 0:
@@ -1027,7 +1063,9 @@ class KdaPrefill(WarpSpecialized):
                         # The last update; drain_o's O wait fences its TMEM loads.
                         spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1, fence=False)
                     n_upd += 1
-                    o_acc, o_smem = self.drain_o(params, o_acc, o_smem, geo, active)
+                    o_acc, o_smem = self.drain_o(
+                        params, o_acc, o_smem, geo, active, (n_local > 1 or seed, u_exp)
+                    )
                 final_dst = params.work_items[tile, FINAL_DST]
                 if cutlass.const_expr(self.store_final_state):
                     self.final_state(
@@ -1067,7 +1105,7 @@ class KdaPrefill(WarpSpecialized):
         seqlen,
     ):
         """An item's first chunk: optional seed of both state halves, Y (carrying the seeded
-        state), U."""
+        state), U. Returns U's exponent last (``stage_u``)."""
         lane, lane_base, cols, _lo, _hi, _pc, _pcx, _vd, _rv = geo
         io = self.io_dtype
         # Without an initial state no seed loads TMEM before the next fenced wait.
@@ -1088,8 +1126,8 @@ class KdaPrefill(WarpSpecialized):
         for r in cutlass.range_constexpr(4):
             token0 = ((r // 2) * 4 + (lane & 3)) * 2
             betas.append((lds_f32(s_beta + 4 * token0), lds_f32(s_beta + 4 * token0 + 4)))
-        y_lo = [Int32(0)] * 4
-        y_hi = [Int32(0)] * 4
+        y_lo = [Float32(0.0)] * 8
+        y_hi = [Float32(0.0)] * 8
         if seed:
             with self.trace_region("ks.wait"):
                 spin_wait(tstate + KS, n_ks & 1)
@@ -1097,25 +1135,29 @@ class KdaPrefill(WarpSpecialized):
             # Ordered before KS(c+1) by stage_y's Y store and its wait::st.
             ks_lo = tmem_ld("16x256b", 2, lane_base + cols["ks"])
             for r in cutlass.range_constexpr(4):
-                y_lo[r] = beta_residual(
+                y_lo[2 * r], y_lo[2 * r + 1] = beta_residual(
                     v_lo[r], *betas[r], ks_lo[2 * r], ks_lo[2 * r + 1], io, True
                 )
             if cutlass.const_expr(self.d_v == 128):
                 ks_hi = tmem_ld("16x256b", 2, lane_base + (16 << 16) + cols["ks"])
                 for r in cutlass.range_constexpr(4):
-                    y_hi[r] = beta_residual(
+                    y_hi[2 * r], y_hi[2 * r + 1] = beta_residual(
                         v_hi[r], *betas[r], ks_hi[2 * r], ks_hi[2 * r + 1], io, True
                     )
         else:
             for r in cutlass.range_constexpr(4):
-                y_lo[r] = beta_residual(v_lo[r], *betas[r], None, None, io, False)
+                y_lo[2 * r], y_lo[2 * r + 1] = beta_residual(
+                    v_lo[r], *betas[r], None, None, io, False
+                )
                 if cutlass.const_expr(self.d_v == 128):
-                    y_hi[r] = beta_residual(v_hi[r], *betas[r], None, None, io, False)
-        self.stage_y(tstate, geo, y_lo, y_hi)
-        n_u = self.stage_u(tstate, n_u, geo)
+                    y_hi[2 * r], y_hi[2 * r + 1] = beta_residual(
+                        v_hi[r], *betas[r], None, None, io, False
+                    )
+        y_exp = self.stage_y(tstate, geo, y_lo, y_hi)
+        n_u, u_exp = self.stage_u(tstate, n_u, geo, y_exp)
         raw_beta_release(raw, beta, stage)
         eh.release(signal=False)  # signal-only channel (see __init__)
-        return exchange, n_ks, n_u
+        return exchange, n_ks, n_u, u_exp
 
     @cute.jit
     def seed_state(self, params, geo, tstate, seed_row, head_o, v_offset, load_initial, s_ex):
@@ -1171,27 +1213,73 @@ class KdaPrefill(WarpSpecialized):
 
     @cute.jit
     def stage_y(self, tstate, geo, y_lo, y_hi):
-        """Publish the packed Y operand to TMEM."""
+        """Pack the fp32 Y fragments (``16x256b`` layout) into the Y operand and publish it.
+        Returns the exponent of its scale (``store_solve_rows``)."""
         _l, lane_base, cols, _lo, _hi, _pc, _pcx, _vd, _rv = geo
-        tmem_st("16x128b", lane_base + cols["yin"], y_lo)
-        if cutlass.const_expr(self.d_v == 128):
-            tmem_st("16x128b", lane_base + (16 << 16) + cols["yin"], y_hi)
+        rows = [
+            (lane_base + h + cols["yin"], y)
+            for h, y in zip(row_halves(self.d_v == 128), (y_lo, y_hi))
+        ]
+        y_exp = store_solve_rows(rows, self.solve_type, self.scaled_solve)
         cute.arch.fence_view_async_tmem_store()
         warp_arrive(tstate + YIN)
+        return y_exp
 
     @cute.jit
-    def stage_u(self, tstate, n_u, geo):
-        """Wait for U = T Y and publish its fp16 copy as the next MMA operand."""
+    def stage_u(self, tstate, n_u, geo, y_exp):
+        """Wait for U = T Y and publish its 16-bit copy as the next MMA operand. Under
+        ``scaled_solve``, U' = T Y' carries Y's scale 2^y_exp: publish U'/2^y_exp in bf16 for
+        the state update (UIN), then U' packed (and scaled) in fp16 for A U (U16). Returns the U
+        operand's total exponent (``y_exp`` plus its own), 0 otherwise."""
         _l, lane_base, cols, _lo, _hi, _pc, _pcx, _vd, _rv = geo
         with self.trace_region("u.wait"):
             spin_wait(tstate + U, n_u & 1)
-        # Ordered before U(c+1) by the UIN store below and its wait::st.
-        vals = tmem_ld("32x32b", B_T, lane_base + cols["u"])
-        words = [fp32_to_fp16(vals[2 * i], vals[2 * i + 1], dtype=self.io_dtype) for i in range(8)]
-        tmem_st("32x32b", lane_base + cols["uin"], words)
-        cute.arch.fence_view_async_tmem_store()
-        warp_arrive(tstate + UIN)
-        return n_u + 1
+        # Ordered before U(c+1) by the UIN stores below and their wait::st.
+        exp = Int32(0)
+        if cutlass.const_expr(self.scaled_solve):
+            halves = row_halves(self.d_v == 128)
+            u = [tmem_ld("16x256b", 2, lane_base + h + cols["u"]) for h in halves]
+            store_unscaled_rows(
+                [(lane_base + h + cols["uin"], f) for h, f in zip(halves, u)], y_exp, self.io_dtype
+            )
+            cute.arch.fence_view_async_tmem_store()
+            warp_arrive(tstate + UIN)
+            u16 = [(lane_base + h + cols["uin16"], f) for h, f in zip(halves, u)]
+            exp = y_exp + store_solve_rows(u16, self.solve_type, True)
+            cute.arch.fence_view_async_tmem_store()
+            warp_arrive(tstate + U16)
+        else:
+            vals = tmem_ld("32x32b", B_T, lane_base + cols["u"])
+            words = [
+                fp32_to_fp16(vals[2 * i], vals[2 * i + 1], dtype=self.io_dtype) for i in range(8)
+            ]
+            tmem_st("32x32b", lane_base + cols["uin"], words)
+            cute.arch.fence_view_async_tmem_store()
+            warp_arrive(tstate + UIN)
+        return n_u + 1, exp
+
+    @cute.jit
+    def load_o(self, geo, slot, drained):
+        """Chunk ``slot``'s O accumulator tile ``(lo, hi)`` (``16x256b`` layout). Under
+        ``scaled_solve`` it is Q_decay S (when the chunk had a state) plus its separate A U''
+        accumulator times 2^-exp, ``drained = (has_state, exp)`` of the chunk (``stage_u``)."""
+        _l, lane_base, cols, _lo, _hi, _pc, _pcx, _vd, _rv = geo
+        two = self.d_v == 128
+        halves = row_halves(two)
+        o = [tmem_ld("16x256b", 2, lane_base + h + cols["qs"] + slot * B_T) for h in halves]
+        if cutlass.const_expr(self.scaled_solve):
+            has_state, exp = drained
+            au = [tmem_ld("16x256b", 2, lane_base + h + cols["au"] + slot * B_T) for h in halves]
+            zero = Float32(0.0)
+            f0, f1 = pow2_pair(exp)
+            for i in cutlass.range_constexpr(len(halves)):
+                for r in cutlass.range_constexpr(4):
+                    a0, a1 = fmul2(au[i][2 * r], au[i][2 * r + 1], f0, f0)
+                    a0, a1 = fmul2(a0, a1, f1, f1)
+                    q0 = Float32(cutlass.select_(has_state, o[i][2 * r], zero))
+                    q1 = Float32(cutlass.select_(has_state, o[i][2 * r + 1], zero))
+                    o[i][2 * r], o[i][2 * r + 1] = fadd2(q0, q1, a0, a1)
+        return o[0], (o[1] if two else [Float32(0.0)] * 8)
 
     @cute.jit
     def cg1_chunk(
@@ -1211,8 +1299,10 @@ class KdaPrefill(WarpSpecialized):
         active,
         chunk_start,
         seqlen,
+        drained,
     ):
-        """A chunk after the first: right state half, the previous chunk's O, Y, U."""
+        """A chunk after the first: right state half, the previous chunk's O (``drained`` as for
+        ``load_o``), Y, U. Returns U's exponent last (``stage_u``)."""
         lane, lane_base, cols, ov_lo, ov_hi, pack_col, pack_col_x, _vd, _rv = geo
         io = self.io_dtype
         d_k = self.d_k
@@ -1280,10 +1370,7 @@ class KdaPrefill(WarpSpecialized):
         warp_arrive(tstate + SIN_R)
         oa = o_acc.wait()
         # Ordered before oa.release() by the state store below and stage_y's wait::st.
-        o_lo = tmem_ld("16x256b", 2, lane_base + cols["qs"] + oa.index * B_T)
-        o_hi = [Float32(0.0)] * 8
-        if cutlass.const_expr(self.d_v == 128):
-            o_hi = tmem_ld("16x256b", 2, lane_base + (16 << 16) + cols["qs"] + oa.index * B_T)
+        o_lo, o_hi = self.load_o(geo, oa.index, drained)
         if cutlass.const_expr(self.d_v == 128):
             for j in cutlass.range_constexpr(half_blocks):
                 tmem_st(
@@ -1310,24 +1397,26 @@ class KdaPrefill(WarpSpecialized):
         if cutlass.const_expr(self.d_v == 128):
             ks_hi = tmem_ld("16x256b", 2, lane_base + (16 << 16) + cols["ks"])
         y_lo = []
-        y_hi = [Int32(0)] * 4
+        y_hi = [Float32(0.0)] * 8
         for r in cutlass.range_constexpr(4):
             token0 = ((r // 2) * 4 + (lane & 3)) * 2
             b0 = lds_f32(s_beta + 4 * token0)
             b1 = lds_f32(s_beta + 4 * token0 + 4)
-            y_lo.append(beta_residual(v_lo[r], b0, b1, ks_lo[2 * r], ks_lo[2 * r + 1], io, True))
+            y_lo += beta_residual(v_lo[r], b0, b1, ks_lo[2 * r], ks_lo[2 * r + 1], io, True)
             if cutlass.const_expr(self.d_v == 128):
-                y_hi[r] = beta_residual(v_hi[r], b0, b1, ks_hi[2 * r], ks_hi[2 * r + 1], io, True)
-        self.stage_y(tstate, geo, y_lo, y_hi)
+                y_hi[2 * r], y_hi[2 * r + 1] = beta_residual(
+                    v_hi[r], b0, b1, ks_hi[2 * r], ks_hi[2 * r + 1], io, True
+                )
+        y_exp = self.stage_y(tstate, geo, y_lo, y_hi)
         # Publish the staged O only now: its smem_async commit fence (MEMBAR.ALL.CTA) stalls the
         # warp, which between SIN_R and Y lay on the per-chunk recurrence; here it overlaps the
         # U wait (0.9% at d128, 3% at d64). Needs QS_STAGES >= 2 (see its declaration).
         oh.commit(skip_fence="before", reason=BEFORE_FENCE_COVERED)
         oa.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
-        n_u = self.stage_u(tstate, n_u, geo)
+        n_u, u_exp = self.stage_u(tstate, n_u, geo, y_exp)
         raw_beta_release(raw, beta, stage)
         eh.release(signal=False)  # signal-only channel (see __init__)
-        return exchange, o_acc, o_smem, n_ks, n_u, n_upd
+        return exchange, o_acc, o_smem, n_ks, n_u, n_upd, u_exp
 
     @cute.jit
     def stage_o(self, params, oh, o_lo, o_hi, ov_lo, ov_hi, active):
@@ -1355,14 +1444,11 @@ class KdaPrefill(WarpSpecialized):
             stmatrix(s_o + 2 * ov_hi, hi, trans=True)
 
     @cute.jit
-    def drain_o(self, params, o_acc, o_smem, geo, active):
-        """The item's last chunk's O."""
-        _l, lane_base, cols, ov_lo, ov_hi, _pc, _pcx, _vd, _rv = geo
+    def drain_o(self, params, o_acc, o_smem, geo, active, drained):
+        """The item's last chunk's O (``drained`` as for ``load_o``)."""
+        _l, _lb, _c, ov_lo, ov_hi, _pc, _pcx, _vd, _rv = geo
         oa = o_acc.wait()
-        o_lo = tmem_ld("16x256b", 2, lane_base + cols["qs"] + oa.index * B_T)
-        o_hi = [Float32(0.0)] * 8
-        if cutlass.const_expr(self.d_v == 128):
-            o_hi = tmem_ld("16x256b", 2, lane_base + (16 << 16) + cols["qs"] + oa.index * B_T)
+        o_lo, o_hi = self.load_o(geo, oa.index, drained)
         # Without a final state store, no TMEM access follows before the next fenced wait.
         skip = None if self.store_final_state else "after"
         with o_smem.produce(skip_fence=skip, reason=AFTER_FENCE_COVERED) as oh:
@@ -1428,7 +1514,7 @@ class KdaPrefill(WarpSpecialized):
         me: Local,
     ):
         lane = me.lane
-        io = self.io_dtype
+        solve = self.solve_type
         t_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         t_col = 8 if lane // 8 >= 2 else 0
         t_idx = t_row * B_T + swz32(t_row, t_col)
@@ -1470,12 +1556,12 @@ class KdaPrefill(WarpSpecialized):
                             l_regs[2 * p], l_regs[2 * p + 1], bs, bs
                         )
                     bh.release()
-                    t = invert_unit_lower_16x16_fragments(l_regs, lane, io)
+                    t = invert_unit_lower_16x16_fragments(l_regs, lane, solve)
                     with tinv.produce() as th:
                         th.access(write=True, by="threads")
                         stmatrix(
                             params.s_tinv + th.index * (B_T * B_T * 2) + 2 * t_idx,
-                            [fp32_to_fp16(t[2 * i], t[2 * i + 1], dtype=io) for i in range(4)],
+                            [fp32_to_fp16(t[2 * i], t[2 * i + 1], dtype=solve) for i in range(4)],
                         )
                     kh.release()
                 sched, tile = self.next_tile(sched)
@@ -1499,7 +1585,6 @@ class KdaPrefill(WarpSpecialized):
         me: Local,
     ):
         lane = me.lane
-        io = self.io_dtype
         a_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         a_col = 8 if lane // 8 >= 2 else 0
         a_idx = a_row * B_T + swz32(a_row, a_col)
@@ -1535,7 +1620,10 @@ class KdaPrefill(WarpSpecialized):
                         ah.access(write=True, by="threads")
                         stmatrix(
                             params.s_a + ah.index * (B_T * B_T * 2) + 2 * a_idx,
-                            [fp32_to_fp16(acc[2 * i], acc[2 * i + 1], dtype=io) for i in range(4)],
+                            [
+                                fp32_to_fp16(acc[2 * i], acc[2 * i + 1], dtype=self.solve_type)
+                                for i in range(4)
+                            ],
                         )
                     kh.release()
                     qh.release()
@@ -1630,6 +1718,9 @@ class KdaPrefill(WarpSpecialized):
         uin_col = t0 + tmem.cols("uin")
         qs_col = t0 + tmem.cols("qs")
         state_col = t0 + tmem.cols("state")
+        if cutlass.const_expr(self.scaled_solve):
+            au_col = t0 + tmem.cols("au")
+            uin16_col = t0 + tmem.cols("uin16")
         a_seg = ksd.sps_B * ksd.tmem_advance_A  # TMEM columns of one 64-wide K box
         b_seg = ksd.smem_subtile_B >> 4
         half_steps = ksd.num_k_steps // 2
@@ -1746,7 +1837,13 @@ class KdaPrefill(WarpSpecialized):
                     desc_a = desc_opaque(
                         smem_desc(params.s_a + ah.index * (B_T * B_T * 2), 16, 256, SWIZZLE_32B)
                     )
-                    mma_ts_op(td, uin_col, desc_a, qs, 0, have_state, elect)
+                    if cutlass.const_expr(self.scaled_solve):  # apart from QS (see load_o)
+                        with self.trace_region("u16.wait"):
+                            spin_wait(tstate + U16, (n_uin - 1) & 1)
+                        au = au_col + oh.index * B_T
+                        mma_ts_op(td, uin16_col, desc_a, au, 0, cutlass.Boolean(False), elect)
+                    else:
+                        mma_ts_op(td, uin_col, desc_a, qs, 0, have_state, elect)
                     oh.commit(signal=False)
                     umma_commit(oh.full_barrier, elect)
                     ah.release(signal=False)
@@ -2041,9 +2138,11 @@ def kda_prefill(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
     tiles_per_head: int = 1,
+    intra_chunk_dtypes: str,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, D]`` KDA forward: natural-log channel gate ``[T, H, d_k]``, beta ``[T, H]``,
-    state ``[N, H, d_v, d_k]``; returns ``(o, final_state)``."""
+    state ``[N, H, d_v, d_k]``; returns ``(o, final_state)``. ``intra_chunk_dtypes`` is the public
+    option (``operand_dtypes``)."""
     if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype or v.dtype != q.dtype:
         raise TypeError("q, k and v must share a 16-bit dtype")
     heads, d_k, d_v = gate.shape[1], q.shape[-1], v.shape[-1]
@@ -2060,6 +2159,7 @@ def kda_prefill(
     for t in (initial_state, final):
         if t is not None:
             state_name = TORCH_NAMES[t.dtype]
+    decay, solve = operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes)
     op = KdaPrefill.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
@@ -2070,6 +2170,8 @@ def kda_prefill(
         final is not None,
         0,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
+        decay_dtype=decay,
+        solve_dtype=solve,
         beta_dtype=TORCH_NAMES[beta.dtype],
         state_dtype=state_name,
     )

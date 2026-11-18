@@ -39,8 +39,8 @@ class Variant(NamedTuple):
 
 
 KDA = Variant(
-    native_summary.build_state_summaries,
-    native_summary.build_state_grad_summaries,
+    partial(native_summary.build_state_summaries, intra_chunk_dtypes="tf32+fp16"),
+    partial(native_summary.build_state_grad_summaries, intra_chunk_dtypes="tf32+fp16"),
     True,
     16,
     native_summary.KDA_SUMMARY_COST,

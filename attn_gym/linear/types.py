@@ -7,7 +7,7 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple, TypedDict
+from typing import Literal, NamedTuple, TypedDict, get_args
 
 import torch
 
@@ -102,6 +102,9 @@ class SplitOptions(BackendOptions, total=False):
     """Split the forward recurrence."""
 
 
+IntraChunkDtypes = Literal["tf32+fp16", "tf32+bf16", "bf16+fp16", "bf16"]
+
+
 class KernelOptions(SplitOptions, total=False):
     """KDA backend controls and experimental scheduling options."""
 
@@ -112,6 +115,26 @@ class KernelOptions(SplitOptions, total=False):
     active. Outputs are bitwise identical. Hopper or newer for packed inputs. The warpdrive
     backend accepts and ignores every value: its persistent grids follow the SM count and
     always stride over the active work only."""
+
+    intra_chunk_dtypes: IntraChunkDtypes
+    """Operand dtypes of the warpdrive KDA forward's intra-chunk matmuls, as ``"<decay
+    products>+<solve operands>"`` (one name: both). The decay products are K_decay K_inv^T (the
+    delta-rule matrix L) and Q_decay K_inv^T (the intra-chunk attention A); the solve operands
+    are T^-1 (and its inverse), Y, U and A in U = T^-1 Y and A U.
+    ``"tf32+bf16"`` (the default for BF16 inputs) forms the decay products from TF32-rounded FP32
+    decay tiles and keeps the solve operands in BF16 (and BF16's range). ``"tf32+fp16"`` packs
+    the solve operands as FP16 instead: Y and U carry exact power-of-two scales where their range
+    needs one, so they overflow only where FP32 would (the 32 value channels a warp packs share
+    one scale, so a channel far below the largest of its warp can flush); A and T^-1 are plain
+    FP16, so ``|q . k|``
+    (before ``scale``) must stay below 65504, which L2-normalized Q/K satisfy. ``"bf16+fp16"``
+    keeps the decay products in BF16 with FP16 solve operands, and ``"bf16"`` is BF16
+    throughout, the warpdrive kernels of earlier releases. The inter-chunk state matmuls
+    (K_decay S, Q_decay S, K_restore^T U) always take the input dtype, and the backward's
+    checkpoint recompute repeats the forward's choice. FP16 inputs have one kernel set,
+    ``"tf32+fp16"``: they run it when the option is omitted and reject any other value, on every
+    backend; the fused backend accepts and ignores every value for BF16 inputs ("Operand
+    precision" in ``docs/linear.md``)."""
 
 
 class _StageOptions(TypedDict, total=False):
@@ -156,6 +179,8 @@ SPLIT_OPTION_SPEC: KernelOptionSpec = {
 KERNEL_OPTION_SPEC: KernelOptionSpec = {
     **SPLIT_OPTION_SPEC,
     "schedule": (("auto", "static", "persistent"), "auto"),
+    # ``None``: the default by input dtype (``resolve_intra_chunk_dtypes``, ``kda/validation.py``).
+    "intra_chunk_dtypes": (get_args(IntraChunkDtypes), None),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
 STAGE_OPTION_SPEC: KernelOptionSpec = {**KERNEL_OPTION_SPEC, "batch_invariant": (bool, False)}

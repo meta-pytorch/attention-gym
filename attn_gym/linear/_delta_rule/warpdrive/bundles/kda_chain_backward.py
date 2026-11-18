@@ -38,6 +38,7 @@ from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 from .. import kda_bprop, kda_bprop_summary, kda_recompute, kda_summary, piece_chain
 from ..contract import dtype_name, get_dtype, op_dtype_name
+from ..kda_common import TORCH_NAMES, operand_dtypes
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -209,10 +210,14 @@ def _compile_chain_backward(
     chain_rows: int,
     num_sm: int,
     use_int64_offsets: bool,
+    decay_dtype: str,
+    solve_dtype: str,
     fastmath: bool = True,
 ):
     """Compile the chain backward host over fake tensors with dynamic extents, int64 outer strides
-    under ``use_int64_offsets`` and the last mode contiguous."""
+    under ``use_int64_offsets`` and the last mode contiguous. ``decay_dtype`` and
+    ``solve_dtype`` are the forward's resolved operand dtypes, which the piece summaries and
+    the checkpoint recompute repeat (``kda_common.operand_dtypes``)."""
     sym_int = cute.sym_int
 
     def strided(dtype, rank, align):
@@ -229,9 +234,12 @@ def _compile_chain_backward(
         return strided(cutlass.Float32, 4, 16)
 
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
-    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm, fastmath)
+    precision = {"decay_dtype": decay_dtype, "solve_dtype": solve_dtype}
+    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm, fastmath, **precision)
     bwd_summary_op = kda_bprop_summary.bundle_hook(io_dtype, gate_dtype, d_k, d_o, True, fastmath)
-    series_op = kda_recompute.KdaRecompute(io, gate_name, d_k, d_v, True, num_sm, fastmath)
+    series_op = kda_recompute.KdaRecompute(
+        io, gate_name, d_k, d_v, True, num_sm, fastmath, **precision
+    )
     bprop_op = kda_bprop.KdaBprop(
         io, gate_name, d_k, d_v, True, True, has_dstate0, num_sm, fastmath
     )
@@ -346,11 +354,13 @@ def build_chain_backward(
     scale,
     chain_rows,
     num_sm,
+    intra_chunk_dtypes,
     fastmath=True,
 ):
     """Compile (persisted per static config) the chain backward launch over the buffers of one
     plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments. ``fastmath=False``
-    selects the non-flushing gate exponentials."""
+    selects the non-flushing gate exponentials; ``intra_chunk_dtypes`` is the forward's option,
+    which the piece summaries and recompute repeat."""
     if not log_gate or b_t != B_T:
         raise ValueError(
             "the warpdrive KDA chain backward serves 16-token chunks of natural-log gates"
@@ -407,6 +417,7 @@ def build_chain_backward(
         int(chain_rows),
         int(num_sm),
         requires_int64_abi(*(t for t in tensors if t is not None)),
+        *operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes),
         bool(fastmath),
     )
 

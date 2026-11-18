@@ -79,6 +79,7 @@ from .kda_common import (
     CUTE_DTYPES,
     TORCH_NAMES,
     box128,
+    check_operand_dtypes,
     decay_fragment_offsets,
     lds_16_f32,
     lds_f32,
@@ -87,6 +88,8 @@ from .kda_common import (
     load_rows,
     mma_decay_16x16,
     opaque_i32,
+    operand_dtypes,
+    precision_suffix,
     spin_wait,
     sts_f32,
     sts_tf32x8,
@@ -147,21 +150,25 @@ class KdaPrepParams:
     s_k: Int32
     s_g: Int32
     s_ex: Int32
-    s_kinv: Int32  # fp32 (tf32) under fp16 io
+    s_kinv: Int32  # fp32 (tf32) under tf32 decay products
     s_krestore: Int32
     s_inter: Int32
+    s_inter16: Int32  # the fp16 inverse_beta copy under bf16 io and fp16 intra-chunk operands
     s_beta: Int32
     s_kdecay: Int32
     s_qdecay: Int32
     s_t: Int32
-    s_kdecay32: Int32  # fp16 io only: tf32 copies of K_decay / Q_decay
+    s_kdecay32: Int32  # tf32 decay products only: tf32 copies of K_decay / Q_decay
     s_qdecay32: Int32
 
 
 class KdaPrep(WarpSpecialized):
     """Warpdrive KDA prep for ``io`` fp16/bf16 operands and an fp32 or ``io`` gate; beta may be
     any float dtype (its loads follow the traced tensor). ``num_sm`` sizes the grid.
-    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal.
+    ``decay_dtype`` (of KK and A) and ``solve_dtype`` (of the inverse and of the ``a``
+    record and its product) are the operand dtypes of NOTE [KDA operand precision] in kda_common;
+    ``t`` stays io (the state path)."""
 
     def __init__(
         self,
@@ -171,21 +178,26 @@ class KdaPrep(WarpSpecialized):
         num_sm: int,
         fastmath: bool = True,
         *,
+        decay_dtype: str,
+        solve_dtype: str,
         beta_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the KDA prep serves d_k in {HEAD_DIMS}, got {d_k}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
+        check_operand_dtypes(io, decay_dtype, solve_dtype)
         self.io, self.gate, self.d_k, self.num_sm = io, gate, d_k, num_sm
         self.fastmath = fastmath
+        self.decay_dtype, self.solve_dtype = decay_dtype, solve_dtype
+        self.solve_type = CUTE_DTYPES[solve_dtype]
+        self.scaled_solve = solve_dtype != io
         # Standalone compiles read these; a bundle's host passes its own tensors (None).
         self.beta_dtype = beta_dtype
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
-        # fp16 computes A and KK from tf32 decay tiles (NOTE [TF32 decay operands] in
-        # ``kda_common``).
-        self.tf32_decay = io == "fp16"
+        # A and KK from tf32 decay tiles (NOTE [TF32 decay operands] in ``kda_common``).
+        self.tf32_decay = decay_dtype == "tf32"
         self.decay_t = Float32 if self.tf32_decay else self.io_dtype
         self.ctas_per_sm = TF32_CTAS_PER_SM if self.tf32_decay else CTAS_PER_SM
         io_t, f32 = self.io_dtype, Float32
@@ -203,6 +215,8 @@ class KdaPrep(WarpSpecialized):
         buf["Kinv"] = plan.buffer("Kinv", self.decay_t, align=1024)
         buf["Krestore"] = plan.buffer("Krestore", io_t, align=1024)
         buf["Inter"] = plan.buffer("Inter", io_t, align=1024)
+        if self.scaled_solve:
+            buf["Inter16"] = plan.buffer("Inter16", self.solve_type, align=1024)
         buf["Beta"] = plan.buffer("Beta", f32, align=128)
         buf["Kdecay"] = plan.buffer("Kdecay", io_t, align=1024)
         buf["Qdecay"] = plan.buffer("Qdecay", io_t, align=1024)
@@ -235,6 +249,7 @@ class KdaPrep(WarpSpecialized):
 
     def get_name(self) -> str:
         name = f"wd_kda_prep_{self.io}_g{self.gate}_k{self.d_k}_sm{self.num_sm}"
+        name += precision_suffix(self.io, self.decay_dtype, self.solve_dtype)
         return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
@@ -574,7 +589,7 @@ class KdaPrep(WarpSpecialized):
                 exp_last += lds_v4_f32(s_ex + 4 * idx)
             kd_pack = []
             ki_pack = []
-            kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (fp16 io)
+            kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (tf32 decay products)
             ki32 = []
             for p in cutlass.range_constexpr(4):
                 r0 = half * 8 + 2 * p
@@ -643,7 +658,7 @@ class KdaPrep(WarpSpecialized):
             for p in cutlass.range_constexpr(4):
                 bs = beta_hi if cutlass.const_expr(p % 2 == 1) else beta_lo
                 l_regs[2 * p], l_regs[2 * p + 1] = fmul2(l_regs[2 * p], l_regs[2 * p + 1], bs, bs)
-            inv = invert_unit_lower_16x16_fragments(l_regs, lane, io)
+            inv = invert_unit_lower_16x16_fragments(l_regs, lane, self.solve_type)
             for p in cutlass.range_constexpr(4):
                 cc = (p // 2) * 8 + col_pair
                 beta_c0 = lds_f32(params.s_beta + 4 * cc)
@@ -653,6 +668,14 @@ class KdaPrep(WarpSpecialized):
                 params.s_inter + 2 * inverse_idx,
                 [fp32_to_fp16(inv[2 * i], inv[2 * i + 1], dtype=io) for i in range(4)],
             )
+            if cutlass.const_expr(self.scaled_solve):  # the a record's operand
+                stmatrix(
+                    params.s_inter16 + 2 * inverse_idx,
+                    [
+                        fp32_to_fp16(inv[2 * i], inv[2 * i + 1], dtype=self.solve_type)
+                        for i in range(4)
+                    ],
+                )
 
         # ---- phase 2, warp 2: A = lower(Q decay @ K inv^T) ----------------------------------
         a_acc = cute.make_rmem_tensor((8,), Float32)
@@ -681,24 +704,28 @@ class KdaPrep(WarpSpecialized):
 
         # ---- warp 2: a = A @ inverse_beta (SW32 order, packed words) ------------------------
         if warp == 2:
+            solve = self.solve_type
+            a_inv = ainv
+            if cutlass.const_expr(self.scaled_solve):
+                a_inv = ldmatrix(params.s_inter16 + 2 * inverse_idx, 4)
             a_rec = cute.make_rmem_tensor((8,), Float32)
             for i in cutlass.range_constexpr(8):
                 a_rec[i] = Float32(0.0)
             mma_step(
                 a_rec,
-                [fp32_to_fp16(a_acc[2 * i], a_acc[2 * i + 1], dtype=io) for i in range(4)],
-                [movmatrix_16b(ainv[i]) for i in range(4)],
+                [fp32_to_fp16(a_acc[2 * i], a_acc[2 * i + 1], dtype=solve) for i in range(4)],
+                [movmatrix_16b(a_inv[i]) for i in range(4)],
                 k_step=0,
                 M=16,
                 N=16,
-                dtype=io,
+                dtype=solve,
             )
             for p in cutlass.range_constexpr(4):
                 rr = row_hi if cutlass.const_expr(p % 2 == 1) else row_lo
                 cc = (p // 2) * 8 + col_pair
                 word = (rr * B_T + swz32(rr, cc)) // 2
                 params.a[tile_row, head, word] = fp32_to_fp16(
-                    a_rec[2 * p], a_rec[2 * p + 1], dtype=io
+                    a_rec[2 * p], a_rec[2 * p + 1], dtype=solve
                 )
 
         # ---- warps 1 and 3: t = inverse_beta^T @ K restore, key halves ----------------------
@@ -781,6 +808,7 @@ class KdaPrep(WarpSpecialized):
             s_kinv=addr["Kinv"],
             s_krestore=addr["Krestore"],
             s_inter=addr["Inter"],
+            s_inter16=addr.get("Inter16", addr["Inter"]),
             s_beta=addr["Beta"],
             s_kdecay=addr["Kdecay"],
             s_qdecay=addr["Qdecay"],
@@ -855,6 +883,8 @@ class KdaPrep(WarpSpecialized):
         if cutlass.const_expr(self.tf32_decay):
             for name in ("Kdecay32", "Qdecay32"):
                 layouts[name] = cute.make_layout((tile, 1))
+        if cutlass.const_expr(self.scaled_solve):
+            layouts["Inter16"] = cute.make_layout((B_T * B_T, 1))
         if cutlass.const_expr(self.gate != "fp32"):
             layouts["Exchange"] = cute.make_layout((tile, 1))
         units = cutlass.max(
@@ -978,10 +1008,13 @@ def kda_prep(
     gate: torch.Tensor,
     beta: torch.Tensor,
     cu_seqlens: torch.Tensor,
+    *,
+    intra_chunk_dtypes: str,
 ) -> dict[str, torch.Tensor]:
     """Packed ``[T, H, d_k]`` q / k (grouped heads allowed), natural-log channel gate
     ``[T, H, d_k]`` and beta ``[T, H]``; returns the records (see the module docstring) with
-    the ``rows`` / ``row_count`` table that addresses them."""
+    the ``rows`` / ``row_count`` table that addresses them. ``intra_chunk_dtypes`` is the public
+    option (``operand_dtypes``)."""
     if q.dtype not in (torch.float16, torch.bfloat16) or k.dtype != q.dtype:
         raise TypeError("q and k must share a 16-bit dtype")
     tokens, heads, d_k = gate.shape
@@ -994,11 +1027,14 @@ def kda_prep(
     }
     out["a"] = torch.zeros(n_rows, heads, A_WORDS, dtype=torch.int32, device=dev)
     out["diag"] = torch.zeros(n_rows, heads, d_k, dtype=torch.float32, device=dev)
+    decay, solve = operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes)
     op = KdaPrep.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
         d_k,
         torch.cuda.get_device_properties(dev).multi_processor_count,
+        decay_dtype=decay,
+        solve_dtype=solve,
         beta_dtype=TORCH_NAMES[beta.dtype],
     )
     fn = compile_kda_prep(op)

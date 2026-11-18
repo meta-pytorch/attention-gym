@@ -38,6 +38,7 @@ from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 
 from .. import kda_bprop, kda_recompute, work_tables
 from ..contract import get_dtype, op_dtype_name
+from ..kda_common import TORCH_NAMES, operand_dtypes
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -173,10 +174,14 @@ def _compile_warmup_backward(
     has_dstate0: bool,
     has_dstate_in: bool,
     use_int64_offsets: bool,
+    decay_dtype: str,
+    solve_dtype: str,
     fastmath: bool = True,
 ):
     """Compile the warmup / uncut backward host over fake tensors with dynamic extents, int64
-    outer strides under ``use_int64_offsets`` and the last mode contiguous."""
+    outer strides under ``use_int64_offsets`` and the last mode contiguous. ``decay_dtype`` and
+    ``solve_dtype`` are the forward's resolved operand dtypes, which the checkpoint
+    recompute repeats (``kda_common.operand_dtypes``)."""
     sym_int = cute.sym_int
 
     def strided(dtype, rank, align):
@@ -191,7 +196,15 @@ def _compile_warmup_backward(
 
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
     recompute_op = kda_recompute.KdaRecompute(
-        io, gate_name, d_k, d_v, has_state_in, num_sms, fastmath
+        io,
+        gate_name,
+        d_k,
+        d_v,
+        has_state_in,
+        num_sms,
+        fastmath,
+        decay_dtype=decay_dtype,
+        solve_dtype=solve_dtype,
     )
     bprop_op = kda_bprop.KdaBprop(
         io, gate_name, d_k, d_v, use_initial_state, has_dstate_in, has_dstate0, num_sms, fastmath
@@ -289,12 +302,14 @@ def build_warmup_backward(
     b_t,
     log_gate,
     scale,
+    intra_chunk_dtypes,
     fastmath=True,
 ):
     """Compile (persisted per static config) the warmup or uncut backward launch over the buffers
     of one plan; return ``(compiled, facts)`` with ``facts`` the split table's
     :class:`~work_tables.SplitTableFacts` (None for the uncut table). ``fastmath=False``
-    selects the non-flushing gate exponentials."""
+    selects the non-flushing gate exponentials; ``intra_chunk_dtypes`` is the forward's option,
+    which the checkpoint recompute repeats."""
     if not log_gate or b_t != B_T:
         raise ValueError("the warpdrive KDA backward serves 16-token chunks of natural-log gates")
     facts = None
@@ -342,6 +357,7 @@ def build_warmup_backward(
         dstate0 is not None,
         dstate_in is not None,
         requires_int64_abi(*(t for t in tensors if t is not None)),
+        *operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes),
         bool(fastmath),
     )
     return compiled, facts

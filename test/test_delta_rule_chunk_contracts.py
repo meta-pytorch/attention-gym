@@ -135,7 +135,8 @@ def test_warpdrive_backward_zeroes_only_the_dgate_tail(monkeypatch, family, head
         beta = torch.rand(q.shape[:3], device="cuda", generator=generator)
         for end in ends:
             cu_seqlens = torch.tensor([0, end // 2, end], dtype=torch.int32, device="cuda")
-            dgate = backward(q, k, v, gate, beta, torch.ones_like(v), cu_seqlens)[3]
+            options = {"intra_chunk_dtypes": "tf32+fp16"} if family == "kda" else {}
+            dgate = backward(q, k, v, gate, beta, torch.ones_like(v), cu_seqlens, **options)[3]
             assert dgate.shape == gate.shape
             assert not dgate[:, end:].any(), (tokens, end)
             assert dgate[:, :end].isfinite().all(), (tokens, end)
