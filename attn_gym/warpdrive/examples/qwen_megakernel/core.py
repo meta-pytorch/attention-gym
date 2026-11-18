@@ -895,7 +895,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 t, split = self.attn_token(b)
                 pos = p.step[t, 1]
                 blk0, blk1 = self.split_blocks(pos, split)
-                if (blk0 == blk1) & (split != self.splits - 1):
+                if blk0 == blk1:
                     self.publish_empty_partial(p, layer, a, split, t, epoch, tid)
                 else:
                     w = self.attention(
@@ -1036,6 +1036,13 @@ class QwenDecodeMegakernel(WarpSpecialized):
         """An attention row's (token, KV split) from its b word, t * splits + split."""
         t = b // self.splits
         return t, b - t * self.splits
+
+    @cute.jit
+    def newest_split(self, pos):
+        """The split of the last KV block of ``[0, pos)`` (``pos > 0``): it also merges the new
+        token at pos. Later splits are empty."""
+        blocks, per = self.kv_blocks(pos)
+        return (blocks - 1) // per
 
     @cute.jit
     def split_blocks(self, pos, split):
@@ -1540,10 +1547,8 @@ class QwenDecodeMegakernel(WarpSpecialized):
     @cute.jit
     def publish_empty_partial(self, p: MegakernelParams, layer, group, split, t, epoch, tid):
         """An attention row whose split has no KV blocks at this position (short contexts leave
-        most splits empty) and does not hold the new token (the last split): its partial is empty,
-        m = -1e30 and l = 0 (zero weight in o_proj's merge) and O = 0, published at once without
-        waiting for QKV. Such a split never appends the new K/V row: that is the split whose
-        block holds pos, or the last split when pos starts a new block."""
+        most splits empty), past ``newest_split``: its partial is empty, m = -1e30 and l = 0
+        (zero weight in o_proj's merge) and O = 0, published at once without waiting for QKV."""
         heads = self.per_row
         if tid < heads * HEAD_DIM:
             hq = tid // HEAD_DIM
@@ -1577,7 +1582,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         positions 8w + 4i + g (i = 0, 1) of each 64-position block: lane group g = lane // 8
         holds a position, lane j = lane % 8 its dims 8j..8j+7 and 64+8j..64+8j+7 (the
         rotate-half pairs). Each warp keeps its own online-softmax state; the warps, plus the
-        new token in the last split, merge through SMEM at the end."""
+        new token in the newest split (``newest_split``), merge through SMEM at the end."""
         g = lane // 8
         j = lane % 8
         d0 = 8 * j
@@ -1677,14 +1682,14 @@ class QwenDecodeMegakernel(WarpSpecialized):
                             for hq in cutlass.range_constexpr(heads):
                                 for e in cutlass.range_constexpr(16):
                                     o[hq, e] = o[hq, e] + pr[hq, i] * vv[e]
-        # Append the new K/V row at pos. Only the split whose KV block holds pos TMA-loads that
-        # row (masked above), and it stores after its own loads completed, so no async-proxy
-        # read races the generic store. When pos starts a new block, no split reads it.
-        blocks, per = self.kv_blocks(pos)
-        writer = cutlass.select_(pos // BLOCK < blocks, pos // BLOCK // per, self.splits - 1)
+        # The new token belongs to the split of the last KV block (``newest_split``), which also
+        # appends its K/V row at pos. Only that split's last block can hold pos, so only it
+        # TMA-loads that row (masked above), and it stores after its own loads completed: no
+        # async-proxy read races the generic store. When pos starts a new block, no split reads it.
+        newest = split == self.newest_split(pos)
         # Of the kv head's groups, the first writes. The others read the block too but mask
         # pos (K scores select -inf, V is skipped), so the racing store's value never matters.
-        if (split == writer) & (group * heads % self.group_size == 0):
+        if newest & (group * heads % self.group_size == 0):
             if tid < 8:  # warp 0, lane group 0
                 row = ((t * self.layers + layer) * self.kv_heads + kvh) * max_len + pos
                 # A batch's caches can pass 2^31 elements: offset the row in 64 bits.
@@ -1717,8 +1722,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
                 for hq in cutlass.range_constexpr(heads):
                     att[warp, heads * HEAD_DIM + hq] = m[hq]
                     att[warp, heads * HEAD_DIM + heads + hq] = lsum[hq]
-        last = split == self.splits - 1
-        if last:
+        if newest:
             if warp == 0:  # entry COMPUTE_WARPS is the new token: m = its score, l = 1, O = v
                 for hq in cutlass.range_constexpr(heads):
                     dot = Float32(0.0)
@@ -1738,27 +1742,27 @@ class QwenDecodeMegakernel(WarpSpecialized):
         # HEAD_DIM.. sit out (their head's ATT columns do not exist).
         if cutlass.const_expr(heads * HEAD_DIM < COMPUTE_THREADS):
             if tid < heads * HEAD_DIM:
-                self.merge_partials(p, layer, group, split, t, last, tid, epoch)
+                self.merge_partials(p, layer, group, split, t, newest, tid, epoch)
         else:
-            self.merge_partials(p, layer, group, split, t, last, tid, epoch)
+            self.merge_partials(p, layer, group, split, t, newest, tid, epoch)
         # The next attention row rewrites att and qkvs.
         self.csync.sync(skip_fence="before", reason=COMPUTE_TMEM_FENCED)
         return w
 
     @cute.jit
-    def merge_partials(self, p: MegakernelParams, layer, group, split, t, last, tid, epoch):
-        """Merge the warps' online-softmax states in ATT (plus the new token's in the last split)
+    def merge_partials(self, p: MegakernelParams, layer, group, split, t, newest, tid, epoch):
+        """Merge the warps' online-softmax states in ATT (plus the new token's in the newest split)
         into this split's partial O, m and l for dim ``tid % HEAD_DIM`` of q head
         ``tid // HEAD_DIM``, and publish them."""
         heads = self.per_row
         att = p.att
         hq = tid // HEAD_DIM
         d = tid % HEAD_DIM
-        # Entry COMPUTE_WARPS (the new token) is written only in the last split.
+        # Entry COMPUTE_WARPS (the new token) is written only in the newest split.
         mx = Float32(-1e30)
         for e in cutlass.range_constexpr(COMPUTE_WARPS):
             mx = cutlass.max(mx, att[e, heads * HEAD_DIM + hq])
-        if last:
+        if newest:
             mx = cutlass.max(mx, att[COMPUTE_WARPS, heads * HEAD_DIM + hq])
         num = Float32(0.0)
         den = Float32(0.0)
@@ -1766,7 +1770,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
             scale = cute.math.exp2(att[e, heads * HEAD_DIM + hq] - mx)
             num = num + att[e, hq * HEAD_DIM + d] * scale
             den = den + att[e, heads * HEAD_DIM + heads + hq] * scale
-        if last:
+        if newest:
             scale = cute.math.exp2(att[COMPUTE_WARPS, heads * HEAD_DIM + hq] - mx)
             num = num + att[COMPUTE_WARPS, hq * HEAD_DIM + d] * scale
             den = den + att[COMPUTE_WARPS, heads * HEAD_DIM + heads + hq] * scale
