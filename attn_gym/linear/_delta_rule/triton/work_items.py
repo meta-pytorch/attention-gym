@@ -6,8 +6,8 @@
 
 """Device-side work planning and composition for the affine-summary kernels.
 
-The summary kernels (``_delta_rule/cute/affine_summary_fwd`` / ``_rev`` and the Triton fallbacks)
-scan chunks as a serial chain, one CTA per (column tile, head, work item). This module owns the
+The Triton summary kernels (``_delta_rule/triton/affine_summary_fwd`` / ``_rev``) scan chunks as
+a serial chain, one CTA per (column tile, head, work item). This module owns the
 ``work`` table those kernels read and the fold that turns their outputs back into one summary per
 range. Both run on the device with static shapes, so a CUDA Graph captured around them replays
 for any layout with the same number of ranges. *Chunk*, *range*, and *column tile* are defined in

@@ -84,7 +84,7 @@ def chunk_gdn(
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
             for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
-            (default ``True``) benchmarks candidate configurations of the repo-local fused
+            (default ``True``) benchmarks candidate configurations of the Triton fused
             kernels; winners are cached and reused. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
             fixed configurations, so bits repeat across processes and winner-cache states on
@@ -182,7 +182,7 @@ def paged_chunk_gdn(
         kernel_options: Backend options. The repo-local path is the default;
             ``{"backend": "warpdrive"}`` selects the optional warpdrive backend. Split schedules
             are not supported. ``"autotune"`` (default ``True``) benchmarks candidate
-            configurations of the repo-local factor and output kernels. When ``False``, and
+            configurations of the Triton factor and output kernels. When ``False``, and
             always under ``torch.use_deterministic_algorithms(True)``, they launch fixed
             configurations. The recurrence that advances ``state_cache`` and the warpdrive
             backend always use fixed configurations.

@@ -30,7 +30,7 @@ Public and persistent state uses axis order `[N, H, V, K]`; paged pools replace 
 slot count. `chunk_gdn` uses a chunk-parallel decomposition for training and prefill.
 `recurrent_gdn` consumes
 tokens in order for decoding, inference prefill, and state-carrying correctness checks. Like
-`chunk_kda`, `chunk_gdn` defaults to the repo-local fused chunk pipeline (`impl="fused"`);
+`chunk_kda`, `chunk_gdn` defaults to the Triton fused chunk pipeline (`impl="fused"`);
 `impl="reference"` selects eager PyTorch. Pass `kernel_options={"backend": "warpdrive"}` to select
 the optional warpdrive CuTeDSL backend; it accepts the same approximate `split_forward` and
 `split_backward` forgetting-horizon options as warpdrive KDA (see
@@ -56,7 +56,7 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
   with `cu_seqlens`.
 - Separate recurrent and chunked operations with explicit initial and final state.
 - CPU and CUDA execution through eager PyTorch operations.
-- A repo-local fused chunk pipeline on CUDA capability 8.0+ with dense and packed inputs, grouped
+- A Triton fused chunk pipeline on CUDA capability 8.0+ with dense and packed inputs, grouped
   Q/K heads, tails, empty sequences, initial/final state, strict `torch.compile`, and CUDA Graph
   support. On CUDA capability 8.0+, `paged_chunk_gdn` advances selected
   `[num_slots, H, V, K]` cache rows in place for inference prefill without caller-side
@@ -74,7 +74,7 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
 
 !!! note "What the fused paths keep in FP32"
 
-    Every optimized GDN and KDA path (repo-local fused and warpdrive) carries the recurrent state
+    Every optimized GDN and KDA path (Triton fused and warpdrive) carries the recurrent state
     from `initial_state` to `final_state`, and the state cotangent from `d_final_state` to
     `d_initial_state`, in FP32 accumulators with FP32 decay. Internal chunk-entry states and
     state-cotangent tapes are staged in the Q/K/V dtype because they are tensor-core operands.
@@ -89,44 +89,20 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
     unnormalized Q/K or unusually large V can likewise push attention, solve, and value
     intermediates outside the FP16 range between FP32-accumulating GEMMs.
 
-The repo-local fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
+The Triton fused chunk backend requires CUDA capability 8.0+, matching FP16 or BF16 Q/K/V,
 and equal `K = V` of 64 or 128, but has no cuDNN runtime dependency. Kernels contract raw QK/KK
 before applying masked nonpositive causal decay differences; the scalar natural-log gate has the
 numerical-range contract below. The public
 chunk size is BT64; internal 16x16 blocks are only the hierarchical triangular-solve representation.
-Layouts requiring int64 tensor offsets are rejected until every repo-local kernel has a
-wide-address path. For `K = V = 128`, backward uses the tuned CuTe kernels on SM100-family GPUs
-and portable Triton kernels on other supported architectures (see
-[Legacy CuTe routing](#legacy-cute-routing)). The `K = V = 64` backward uses portable Triton on
-every architecture.
+Layouts requiring int64 tensor offsets are rejected until every fused kernel has a
+wide-address path. Forward, backward, the context-parallel summaries and the gate transform run
+Triton kernels on every supported architecture, so the fused backend needs no CuTeDSL.
 
 The warpdrive chunk backend requires the optional `linear` dependencies and an SM100-family GPU,
 FP16/BF16 Q/K/V, and `K = V` of 64 or 128. Like the fused backend it runs gate, beta, and entry
 states in FP32 (returning their gradients in the caller's dtypes), packs dense batches into one
 sequence per row, and copies operands whose layout its kernels cannot address. It uses the same
 scalar natural-log gate contract and exact execution by default.
-
-#### Legacy CuTe routing
-
-The repo-local fused pipelines (`chunk_gdn`, `chunk_kda`, their paged, staged and
-context-parallel forms, and `gate_transform`/`bound_gate`) implement every stage in portable
-Triton, which runs on every supported CUDA architecture. On SM100-family GPUs some stages still
-default to legacy CuTeDSL kernels: the KDA forward factor engines, the KDA backward delta-H,
-WY/dQKG and intra-chunk kernels (the first two also serve the `K = V = 128` GDN backward), the
-native context-parallel summaries, and the per-channel `D=128` gate kernels.
-`ATTN_GYM_LEGACY_CUTE=0` routes those stages to Triton there as well; `1`, the default, keeps
-them. The variable is read on every launch inside the registered operators, so changing it needs
-no recompilation. It exists to validate and measure the portable route on Blackwell before the
-legacy kernels are removed; it does not affect `kernel_options={"backend": "warpdrive"}` kernels.
-Without the optional CuTeDSL dependency every architecture takes the Triton route, including the
-staged and context-parallel entry points. Host composition lives in `kda/impl/chunk.py` and
-`_delta_rule/summaries.py`, independently of the legacy kernel files.
-
-The reverse-summary wrapper retains its route-dependent `fastmath=None` default: fast
-exponentials on Triton (including SM100-family GPUs with `ATTN_GYM_LEGACY_CUTE=0`), non-fast on
-legacy CuTe. Pass an explicit `fastmath` value to match a local backward using a different setting;
-staged KDA handles already pass their resolved value. Removing the legacy route therefore keeps
-the current forced-Triton default rather than preserving the former SM100 CuTe default.
 
 #### Scalar gate numerical range
 
@@ -142,7 +118,7 @@ Q/K/V, FP32 gates, two heads, `K = V = 128`, packed lengths `[200, 65, 0, 127]`,
 One gate every 37 tokens has the listed value; other gates
 are in `[-1, 0]`. Error is `max(abs(output - reference)) / max(abs(reference))`:
 
-| Isolated gate | Repo-local fused error | warpdrive error |
+| Isolated gate | Triton fused error | warpdrive error |
 | --- | --- | --- |
 | `-1e4` | 0.6% | 0.6% |
 | `-1e5` | 1.5% | 1.6% |
@@ -269,11 +245,9 @@ KDA-specific spelling of `kind="bounded"` for per-channel gates with `lower_boun
 Both producers default to `fastmath=True`; see [Fast math and precision](#fast-math-and-precision).
 
 `impl="fused"` uses portable Triton kernels for both kinds and both gate shapes on every CUDA
-architecture. On SM100-family GPUs, per-channel `D=128` gates still default to legacy CuTeDSL
-kernels when they are installed (`ATTN_GYM_LEGACY_CUTE=0` selects Triton there too; see
-[Legacy CuTe routing](#legacy-cute-routing)). On GB300 the Triton kernels take 1.1-1.2x the
-CuTeDSL forward time and 1.1-1.25x its backward time (BF16, 16-134M elements). Both backwards
-reduce the `A_log` and `dt_bias` gradients in FP32 from per-block partials, so they are
+architecture. On GB300 they took 1.1-1.2x the forward time and 1.1-1.25x the backward time of
+the removed per-channel `D=128` CuTeDSL gate kernels (BF16, 16-134M elements). The backward
+reduces the `A_log` and `dt_bias` gradients in FP32 from per-block partials, so they are
 deterministic. The Triton bounded backward evaluates `sigmoid'(x)` as `e / (1 + e)^2` with
 `e = exp(-|x|)`, so saturated logits keep gradients that `s * (1 - s)` would cancel to zero. The
 decode kernels (`recurrent_kda_decode`, `recurrent_gdn_decode`) evaluate the same transforms
@@ -349,10 +323,8 @@ contract. A correctness-first integration can keep the KDA unit under an FP32 po
 its projections explicitly compute in BF16; isolating only the strict-FP32 decay state is
 a future bandwidth optimization.
 The optimized `chunk_kda` core requires Ampere or newer and `head_dim=128`; its public
-boundary accepts FP16, BF16, or FP32 inputs. SM100-family GPUs select the specialized CuTe path;
-SM120 and earlier supported architectures use the portable Triton stages for the forward and the
-backward (see [Legacy CuTe routing](#legacy-cute-routing)). Homogeneous FP16 and
-BF16 Q/K/V stay in their input dtype, while
+boundary accepts FP16, BF16, or FP32 inputs. The Triton fused backend runs the same stages on
+every supported architecture. Homogeneous FP16 and BF16 Q/K/V stay in their input dtype, while
 FP32 or mixed-dtype inputs retain the existing BF16 normalization. The core chunks internally at
 64 tokens. Complete `B=1` inputs whose length is a multiple of the chunk size run on the
 direct dense route; other dense `[B, T, H, D]` inputs are lowered internally to
@@ -511,7 +483,7 @@ natural-log decay before any prefix sum. `chunk_kda` owns the natural-log-to-log
 conversion and its sequence-local BT64 cumulative sum; `recurrent_kda` performs only the
 conversion because recurrence consumes one token decay at a time. This keeps chunking out
 of model code and lets callers switch execution modes without changing gate
-representation. Custom producers should return finite, nonpositive values. The repo-local fused
+representation. Custom producers should return finite, nonpositive values. The Triton fused
 backend requires approximately `[-5.914, 0]`. warpdrive BF16 instead requires every aligned
 16-token per-channel sum to exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
 results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). That bound keeps the
@@ -678,17 +650,18 @@ count and always stride over the active work only, so it needs no option for ove
 
 | Backend | `True` (default) | `False` |
 |---|---|---|
-| Repo-local fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
+| Triton fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
 | warpdrive KDA | Flush-to-zero approximate exponentials and reciprocals | Non-flushing approximate exponentials and reciprocals that preserve FP32 subnormal results |
 
-One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100-family GPUs always uses
-the flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
-in the normal range, so both values give the same Aqk/Akk factors (for model-scale Q/K entries;
-entries must stay below `2^63` in magnitude). The backward intra-chunk kernel splits its decays so
-that a factor flushes only when the decay it belongs to is below `2^-126`, so `fastmath=True`
-gradients stay accurate up to the gate bound; such a decay is still lost with `fastmath=True` even
-when a large K entry would make its term normal. Its in-subchunk factors reach `2^68.3` there, so
+The fused forward intra-chunk diagonal kernel rebases each 16-row subchunk at its first row, so
+every output depends only on earlier gates. At steep gates the last rows' factors then fall below
+`2^-126`: `fastmath=True` flushes them, losing those rows' within-subchunk terms at constant
+gates below about `-5.82` (inside the `-5.914` bound), while `fastmath=False` keeps them as
+subnormals. The fused backward intra-chunk kernel splits its decays so that a factor flushes only
+when the decay it belongs to is below `2^-126`, so `fastmath=True` gradients stay accurate up to
+the gate bound; such a decay is still lost with `fastmath=True` even when a large K entry would
+make its term normal. Its in-subchunk factors reach `2^68.3` there, so
 at the gate bound the backward needs Q entries and `beta`-scaled K entries below `2^59.7`.
 
 warpdrive gives bitwise-identical results in both modes while every in-chunk decay stays at or
@@ -801,10 +774,10 @@ dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 ```
 
 Each `bounds` row names one local `cu_seqlens` segment (or a whole-chunk run inside one), and
-one call returns every row's map; the context-parallel routing supplies the rows. Both the native
-SM100 summaries and the portable Triton summaries split long ranges into work items when their
-static budget permits, then compose the partial maps on the device. The budget depends on the
-span length, head count, backend tile size, and SM count; budget 1 scans whole ranges in one kernel
+one call returns every row's map; the context-parallel routing supplies the rows. The Triton
+summaries split long ranges into work items when their static budget permits, then compose the
+partial maps on the device. The budget depends on the span length, head count, selected tile
+size, and SM count; budget 1 scans whole ranges in one kernel
 without a planner or compose launch. Work planning reads only device values, preserving CUDA Graph
 replay across different `bounds` values of the same shape.
 `attn_gym.linear.context_parallel` holds the pure-PyTorch algebra on summaries (`merge_state`,

@@ -1,7 +1,7 @@
 """Portable Triton KDA forward, backward, and compiler integration tests.
 
-Every test forces the portable route, so it also runs on SM100-family GPUs, where the fused pipeline
-otherwise defaults to the legacy CuTe stages.
+Every test runs the fused chunk backend, which is the portable Triton pipeline on every
+architecture.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ import pytest
 import torch
 
 from attn_gym.linear import Impl, chunk_kda, paged_chunk_kda
-from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV
 from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_delta_h_triton import (
     chunk_kda_bwd_delta_h_triton,
 )
@@ -37,11 +36,6 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
     reason="the portable KDA route requires CUDA capability 8.0 or newer",
 )
-
-
-@pytest.fixture(autouse=True)
-def portable_route(monkeypatch) -> None:
-    monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
 
 
 @pytest.fixture(autouse=True)
