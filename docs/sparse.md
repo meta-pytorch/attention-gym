@@ -260,6 +260,10 @@ At 64 sequences and the same pool size, the difference was small: 153.32 vs. 151
 
 Both scorers cap the grid and loop over visible candidates on the GPU. With Triton scoring,
 rows with all-zero head weights return the first visible IDs without reading Q, K or scores.
+The Warpdrive radix selector uses 1024 threads per decode query (512 for whole documents).
+It stops refining a boundary bucket when its ordered-key extrema match or every member is
+needed, even if the bucket exceeds the shared shrink buffer. Deterministic selection still
+chooses the lowest IDs at the cutoff and returns ascending IDs.
 The portable Triton selector can finish its radix search early at an exact zero cutoff or
 when a prefix contains exactly `topk` candidates. Reserved capacity still determines score
 strides and slab sizes, so a large reservation can require more launches.

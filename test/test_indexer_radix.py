@@ -275,6 +275,10 @@ def test_radix_threshold_and_overflow(selector, topk, tokens, deterministic):
                 torch.where(ids < topk, 2, -1),
             ),
             random * 1e30,
+            # The tie budget isn't met until the tail, potentially in the next bitmap window.
+            torch.where(ids >= tokens - topk - 1, ones, -ones),
+            # Conversely, satisfying the tie budget early must not lose a later strict winner.
+            torch.where(ids == tokens - 1, 2, torch.where(ids <= topk, 1, -1)).float(),
         ]
     )
     batch = rows.shape[0]
@@ -319,11 +323,8 @@ def test_radix_threshold_and_overflow(selector, topk, tokens, deterministic):
         from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
 
         paged = selector == "paged_cute"
-        with compile_target_scope(detect_compile_target(torch.cuda.current_device())):
-            if paged:
-                kernel = impl._compile_topk(topk, False, 1, False, deterministic, True, paged=True)
-            else:
-                kernel = impl._compile_topk(topk, False, 1, False, deterministic, False)
+        with compile_target_scope(detect_compile_target(rows.device.index)):
+            kernel = impl._compile_topk(topk, False, 1, False, deterministic, paged, paged=paged)
 
         def select():
             # Long deterministic rows reuse the score slab as sorting scratch.
@@ -375,11 +376,7 @@ def test_radix_deterministic_causal_window_boundary(
     """Causal rows whose visible candidates straddle one 65536-bit bitmap window."""
     import cutlass
 
-    from attn_gym.warpdrive.cache import (
-        detect_compile_target,
-        get_compile_target,
-        set_compile_target,
-    )
+    from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
 
     candidates = 65538
     tokens = candidates * compress_ratio
@@ -394,14 +391,10 @@ def test_radix_deterministic_causal_window_boundary(
             0, 16, (4, 2, candidates), device="cuda", generator=generator
         ).float()
     output = torch.empty((1, tokens, topk), device="cuda", dtype=torch.int32)
-    previous = get_compile_target()
-    try:
-        set_compile_target(detect_compile_target(torch.cuda.current_device()))
+    with compile_target_scope(detect_compile_target(scores.device.index)):
         kernel = radix_impl._compile_topk(
             topk, True, compress_ratio, use_int64_offsets, True, False
         )
-    finally:
-        set_compile_target(previous)
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     kernel(scores.clone(), output, integer(first_pair), None)
     visible = []
