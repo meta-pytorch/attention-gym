@@ -12,7 +12,8 @@ _SCHEMA_ARGS = (
     "(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor indices,"
     " Tensor cu_seqlens_q, Tensor seqused_k, Tensor? topk_length, Tensor? window_key_cache,"
     " Tensor? window_value_cache, Tensor? window_block_table, Tensor? attention_sink,"
-    " SymInt max_seqlen_q, int index_block_size, int window_size, float scale)"
+    " SymInt max_seqlen_q, int index_block_size, int window_size, float scale,"
+    " *, bool batch_invariant=False)"
 )
 # Separate schemas let tracing know the output structure without an optional Tensor result.
 torch.library.define("attn_gym::paged_sparse_decode", _SCHEMA_ARGS + " -> Tensor")
@@ -21,7 +22,11 @@ torch.library.define(
 )
 
 
-def _decode_cuda(*args, return_lse: bool):
+def _decode_cuda(*args, return_lse: bool, batch_invariant: bool = False):
+    if batch_invariant:
+        from .._batch_invariant import paged_forward
+
+        return paged_forward(*args, return_lse=return_lse)
     from .impl import triton
 
     return triton.paged_sparse_decode(*args, return_lse=return_lse)
@@ -30,22 +35,24 @@ def _decode_cuda(*args, return_lse: bool):
 torch.library.impl(
     "attn_gym::paged_sparse_decode",
     "CUDA",
-    lambda *args: _decode_cuda(*args, return_lse=False)[0],
+    lambda *args, **kwargs: _decode_cuda(*args, return_lse=False, **kwargs)[0],
 )
 torch.library.impl(
     "attn_gym::paged_sparse_decode_with_lse",
     "CUDA",
-    lambda *args: _decode_cuda(*args, return_lse=True),
+    lambda *args, **kwargs: _decode_cuda(*args, return_lse=True, **kwargs),
 )
 
 
 @torch.library.register_fake("attn_gym::paged_sparse_decode")
-def _decode_fake(query, key_cache, value_cache, *args) -> torch.Tensor:
+def _decode_fake(query, key_cache, value_cache, *args, batch_invariant=False) -> torch.Tensor:
     return query.new_empty(*query.shape[:2], value_cache.shape[-1])
 
 
 @torch.library.register_fake("attn_gym::paged_sparse_decode_with_lse")
-def _decode_with_lse_fake(query, *args) -> tuple[torch.Tensor, torch.Tensor]:
+def _decode_with_lse_fake(
+    query, *args, batch_invariant=False
+) -> tuple[torch.Tensor, torch.Tensor]:
     return _decode_fake(query, *args), query.new_empty(query.shape[:2], dtype=torch.float32)
 
 

@@ -179,6 +179,17 @@ given a fixed configuration. The guarantees, strongest first:
 
 The reference implementations compute in FP32 even inside an autocast region.
 
+## Sparse batch invariance
+
+`gather_attn`, `paged_sparse_decode`, `lightning_indexer`, and
+`paged_lightning_indexer` accept `kernel_options={"batch_invariant": True}`.
+This fixes forward arithmetic across batch sizes and packed offsets, and aligns
+gather/paged attention and whole-document/paged index selection for identical logical
+inputs on one GPU model and software stack. Deterministic mode or disabling autotuning
+alone does not provide this guarantee. Gather backward remains supported, without a
+bitwise-gradient guarantee. See [Sparse attention](sparse.md#batch-invariance) for the
+input contract, backend restrictions, and integration example.
+
 
 ## References
 

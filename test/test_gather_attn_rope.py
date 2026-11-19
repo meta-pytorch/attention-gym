@@ -394,9 +394,13 @@ def test_triton_paired_operator_contracts(window):
     ropes = {"query_rope": qr, "sparse_rope": sr, "local_rope": lr}
     for training in (False, True):
         torch.library.opcheck(
-            _gather_attn_fwd_op, (*fwd, training, "triton"), {**ropes, "autotune": True}
+            _gather_attn_fwd_op,
+            (*fwd, training, "triton"),
+            {**ropes, "autotune": True, "batch_invariant": False},
         )
-    out, lse, state = _gather_attn_fwd_op(*fwd, True, "triton", **ropes, autotune=True)
+    out, lse, state = _gather_attn_fwd_op(
+        *fwd, True, "triton", **ropes, autotune=True, batch_invariant=False
+    )
     assert state == [None, None]
     torch.library.opcheck(
         _gather_attn_bwd_op,
@@ -560,9 +564,13 @@ def test_fa4_zero_capacity_pool_training(paired, with_sink, recompute):
         "sparse_rope": None if sr is None else sr.detach(),
     }
     torch.library.opcheck(
-        _gather_attn_fwd_op, (*fwd, True, "cute", recompute), {**ropes, "autotune": True}
+        _gather_attn_fwd_op,
+        (*fwd, True, "cute", recompute),
+        {**ropes, "autotune": True, "batch_invariant": False},
     )
-    out, lse, state = _gather_attn_fwd_op(*fwd, True, "cute", recompute, **ropes, autotune=True)
+    out, lse, state = _gather_attn_fwd_op(
+        *fwd, True, "cute", recompute, **ropes, autotune=True, batch_invariant=False
+    )
     torch.library.opcheck(
         _gather_attn_bwd_op,
         (*fwd[:4], state, *fwd[4:7], out, lse, torch.randn_like(out), *fwd[7:], "cute", recompute),

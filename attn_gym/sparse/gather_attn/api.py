@@ -48,11 +48,18 @@ class GatherAttnKernelOptions(TuningOptions, total=False):
     them in forward instead (BF16, tokens x heads x keys, with backend padding). Triton always
     recomputes and ignores this option."""
 
+    batch_invariant: bool
+    """Use fixed Triton forward arithmetic, independent of batching and packing.
+    Defaults to False. Preserves output/LSE bits for the same ordered keys, sink and scale
+    on one GPU model/software stack. The fixed forward never tunes; backward tuning still
+    follows ``autotune`` and its bits are not covered. Explicit CuTe requests are rejected."""
+
 
 KERNEL_OPTION_SPEC: KernelOptionSpec = {
     **TUNING_OPTION_SPEC,
     "backend": (("cute", "triton"), None),
     "bwd_recompute_p": (bool, True),
+    "batch_invariant": (bool, False),
 }
 
 
@@ -386,6 +393,13 @@ def gather_attn(
             Impl.REFERENCE (or "reference") uses eager PyTorch on CPU or CUDA.
 
         kernel_options: Fused backend options, see :class:`GatherAttnKernelOptions`.
+            "batch_invariant" (default False): use fixed Triton forward arithmetic for
+            output and LSE, including across document packing and selection padding.
+            Explicit CuTe requests raise. Forward supports FP16/BF16/FP32, head dims <= 512
+            and RoPE <= 128 (with the existing shared-KV RoPE restrictions);
+            other existing fused input restrictions still apply. Backward remains supported
+            and tunes per "autotune", but gradient bits are not covered by this forward
+            guarantee.
             "backend": "cute" or "triton" overrides the backend; omit it to prefer
             eligible CuTe calls, otherwise Triton. "bwd_recompute_p" (default True):
             CuTe backward recomputes attention probabilities; False saves them in forward
@@ -534,6 +548,10 @@ def gather_attn(
         if paired and query_rope.shape[-1] > 0 and not share_kv:
             raise ValueError("Fused paired attention requires a single shared KV head.")
         backend = options["backend"]
+        if options["batch_invariant"]:
+            if backend == "cute":
+                raise ValueError("batch_invariant gather_attn requires backend='triton'")
+            backend = "triton"
         grouped = uses_grouped_schedule(query_latent.shape[1], kv_heads, sparse_v is not None)
         if grouped and backend == "cute":
             raise ValueError(
@@ -576,6 +594,7 @@ def gather_attn(
             backend=backend,
             bwd_recompute_p=options["bwd_recompute_p"],
             autotune=options["autotune"],
+            batch_invariant=options["batch_invariant"],
             local_v=local_v,
             sparse_v=sparse_v,
         )

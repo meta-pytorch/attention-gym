@@ -28,6 +28,7 @@ class _GatherAttnFunction(torch.autograd.Function):
         sparse_v: Tensor | None,
         local_v: Tensor | None,
         autotune: bool,
+        batch_invariant: bool,
     ) -> tuple[Tensor, Tensor]:
         output, lse, state = _gather_attn_fwd_op(
             query,
@@ -49,6 +50,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             sparse_v,
             local_v,
             autotune=autotune,
+            batch_invariant=batch_invariant,
         )
         ctx.save_for_backward(
             query,
@@ -116,6 +118,7 @@ class _GatherAttnFunction(torch.autograd.Function):
             *(dq, ds, dl, None, dsink, None, None, None, None, None, None, None),
             *(dqr, dsr, dlr, dsv, dlv),
             None,
+            None,
         )
 
 
@@ -134,6 +137,7 @@ def gather_attn(
     backend: str,
     bwd_recompute_p: bool = True,
     autotune: bool,
+    batch_invariant: bool,
     query_rope: Tensor | None = None,
     sparse_rope: Tensor | None = None,
     local_rope: Tensor | None = None,
@@ -165,7 +169,9 @@ def gather_attn(
         value_inputs = tuple(
             None if tensor is None else tensor.view_as(tensor) for tensor in values
         )
-        return _GatherAttnFunction.apply(*inputs, *options, *rope_inputs, *value_inputs, autotune)
+        return _GatherAttnFunction.apply(
+            *inputs, *options, *rope_inputs, *value_inputs, autotune, batch_invariant
+        )
     output, lse, _ = _gather_attn_fwd_op(
         *tensors,
         sliding_window_size,
@@ -177,5 +183,6 @@ def gather_attn(
         *ropes,
         *values,
         autotune=autotune,
+        batch_invariant=batch_invariant,
     )
     return output, lse

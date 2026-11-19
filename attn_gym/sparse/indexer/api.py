@@ -15,10 +15,17 @@ class IndexerKernelOptions(TypedDict, total=False):
     """Fused ``lightning_indexer`` options, validated and then ignored by ``Impl.REFERENCE``."""
 
     backend: Literal["cute", "triton"]
+
+    batch_invariant: bool
+    """Use fixed Triton scoring and deterministic selection shared with the paged API.
+    Defaults to False. ``backend`` selects only the selector in this mode."""
     """See :func:`lightning_indexer` for default selection and backend requirements."""
 
 
-KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), None)}
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    "backend": (("cute", "triton"), None),
+    "batch_invariant": (bool, False),
+}
 
 
 def _validate_inputs(
@@ -173,6 +180,11 @@ def lightning_indexer(
             Impl.FUSED (default, or ``"fused"``) uses optimized CUDA kernels.
 
         kernel_options: Fused backend override, see :class:`IndexerKernelOptions`:
+            ``{"batch_invariant": True}`` uses the paged API's fixed Triton scoring
+            (FP16/BF16, SM80+, H <= 128, D <= 256, candidate capacity <= 2**22) and
+            deterministic selection, including without global deterministic mode.
+            Backend selects the selector in this mode. Matching scores/IDs requires the
+            same queries, weights and transformed candidate keys on one GPU/software stack.
             ``{"backend": "cute"}`` or ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100-family GPUs and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
@@ -212,9 +224,9 @@ def lightning_indexer(
 
     selected_impl = resolve_impl(impl)
     _validate_inputs(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
-    backend = validate_kernel_options(
+    options = validate_kernel_options(
         kernel_options, KERNEL_OPTION_SPEC, op_name="lightning_indexer"
-    )["backend"]
+    )
     match selected_impl:
         case Impl.REFERENCE:
             from .impl import reference
@@ -232,7 +244,8 @@ def lightning_indexer(
                 topk,
                 causal,
                 compress_ratio,
-                backend or "auto",
+                options["backend"] or "auto",
                 cu_seqlens,
                 cu_seqlens_k,
+                batch_invariant=options["batch_invariant"],
             )

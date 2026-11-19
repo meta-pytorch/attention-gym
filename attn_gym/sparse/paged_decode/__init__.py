@@ -2,6 +2,13 @@
 
 from attn_gym.types import AuxRequest, Impl
 
-from .api import PagedKV, PagedSparseDecodeAux, paged_sparse_decode
+from .api import PagedKV, PagedSparseDecodeAux, PagedSparseDecodeKernelOptions, paged_sparse_decode
 
-__all__ = ["AuxRequest", "Impl", "PagedKV", "PagedSparseDecodeAux", "paged_sparse_decode"]
+__all__ = [
+    "AuxRequest",
+    "Impl",
+    "PagedKV",
+    "PagedSparseDecodeAux",
+    "PagedSparseDecodeKernelOptions",
+    "paged_sparse_decode",
+]

@@ -15,8 +15,15 @@ class PagedIndexerKernelOptions(TypedDict, total=False):
 
     backend: Literal["cute", "triton"]
 
+    batch_invariant: bool
+    """Use fixed scoring and deterministic selection, independent of query batching.
+    Defaults to False. Matches the whole-document API for identical transformed keys."""
 
-PAGED_KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), None)}
+
+PAGED_KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    "backend": (("cute", "triton"), None),
+    "batch_invariant": (bool, False),
+}
 
 
 def paged_lightning_indexer(
@@ -73,6 +80,10 @@ def paged_lightning_indexer(
             on SM100-family GPUs (default there); ``"triton"`` uses Triton
             throughout (default on other GPUs). Both score paged keys with
             Triton. Reference validates and ignores these choices.
+            ``batch_invariant=True`` fixes scoring tiles and enables deterministic
+            selection irrespective of global deterministic mode. This matches
+            batch-invariant whole-document selection for identical query, weight and
+            transformed key values on one GPU model and software stack.
 
     Offset values, nonnegative sequence lengths, cache capacity for completed
     blocks, and referenced page IDs are caller invariants, never read on the host
@@ -94,9 +105,9 @@ def paged_lightning_indexer(
     overrides this indexer only.
     """
     selected_impl = resolve_impl(impl)
-    backend = validate_kernel_options(
+    options = validate_kernel_options(
         kernel_options, PAGED_KERNEL_OPTION_SPEC, op_name="paged_lightning_indexer"
-    )["backend"]
+    )
     operands = {
         "query": query,
         "key_cache": key_cache,
@@ -169,5 +180,6 @@ def paged_lightning_indexer(
         topk,
         compress_ratio,
         query_positions,
-        backend or "auto",
+        options["backend"] or "auto",
+        batch_invariant=options["batch_invariant"],
     )
