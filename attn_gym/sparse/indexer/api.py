@@ -21,10 +21,14 @@ class IndexerKernelOptions(TypedDict, total=False):
     selector: Literal["auto", "default", "gvr2"]
     """Exact Top-K algorithm. GVR2 is available only on the CuTe backend."""
 
+    batch_invariant: bool
+    """Use fixed FP16/BF16 scoring and deterministic selection shared with the paged API."""
+
 
 KERNEL_OPTION_SPEC: KernelOptionSpec = {
     "backend": (("cute", "triton"), None),
     "selector": (("auto", "default", "gvr2"), "auto"),
+    "batch_invariant": (bool, False),
 }
 
 
@@ -197,6 +201,11 @@ def lightning_indexer(
             and keeps Triton's streaming Top-K; ``"default"`` forces CuTe radix /
             Triton streaming. Explicit ``"gvr2"`` requires CuTe on SM100/SM103, dense
             inputs, and nondeterministic mode. On other supported CuTe calls, auto uses radix.
+            ``batch_invariant=True`` uses the paged API's fixed Triton scoring (FP16/BF16,
+            SM80+, H <= 128, D <= 256, candidate capacity <= 2**22) and deterministic radix
+            selection. Backend chooses only the selector in this mode; explicit GVR2 and
+            fused MXFP8 scoring are not supported. Matching IDs requires identical queries,
+            weights and transformed candidate keys on one GPU model and software stack.
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are unspecified, and
@@ -273,4 +282,5 @@ def lightning_indexer(
                 options["selector"],
                 q_scale,
                 k_scale,
+                batch_invariant=options["batch_invariant"],
             )

@@ -15,7 +15,7 @@ torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
     'str backend, Tensor? cu_seqlens=None, Tensor? cu_seqlens_k=None, str selector="default", '
-    "Tensor? q_scale=None, Tensor? k_scale=None) -> Tensor",
+    "Tensor? q_scale=None, Tensor? k_scale=None, *, bool batch_invariant=False) -> Tensor",
 )
 
 
@@ -32,6 +32,8 @@ def _indexer_cuda(
     selector: str = "default",
     q_scale: Tensor | None = None,
     k_scale: Tensor | None = None,
+    *,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries.
 
@@ -44,6 +46,25 @@ def _indexer_cuda(
         capability = torch.cuda.get_device_capability(q.device)
         backend = "cute" if runs_sm100_kernels(capability) else "triton"
     match backend, selector:
+        case "cute" | "triton", "auto" | "default" | "gvr2" if batch_invariant:
+            from .impl.batch_invariant import launch
+
+            validate_precision(q, k, weights, q_scale, k_scale, batch_invariant=True)
+            if selector == "gvr2":
+                raise ValueError(
+                    "GVR2 is not deterministic; use selector='auto' with batch_invariant=True."
+                )
+            return launch(
+                q,
+                k,
+                weights,
+                topk,
+                causal,
+                compress_ratio,
+                cu_seqlens,
+                cu_seqlens_k,
+                backend=backend,
+            )
         case "cute", _:
             from .impl.cute import launch
         case "triton", _ if q.dtype == torch.float8_e4m3fn:
@@ -97,6 +118,8 @@ def _indexer_fake(
     selector: str = "default",
     q_scale: Tensor | None = None,
     k_scale: Tensor | None = None,
+    *,
+    batch_invariant: bool = False,
 ) -> Tensor:
     """Describe the common contiguous, nondifferentiable index output."""
     return q.new_empty((q.shape[0], q.shape[1], topk), dtype=torch.int32)
@@ -109,7 +132,8 @@ torch.library.define(
     "attn_gym::_paged_indexer",
     "(Tensor query, Tensor key_cache, Tensor weights, Tensor block_table, "
     "Tensor cu_seqlens_q, Tensor seqused_k, int topk, int compress_ratio, "
-    "Tensor? query_positions, str backend, Tensor? q_scale=None, Tensor? k_scale=None) -> Tensor",
+    "Tensor? query_positions, str backend, Tensor? q_scale=None, Tensor? k_scale=None, "
+    "*, bool batch_invariant=False) -> Tensor",
 )
 
 
@@ -126,6 +150,8 @@ def _paged_indexer_cuda(
     backend,
     q_scale=None,
     k_scale=None,
+    *,
+    batch_invariant=False,
 ):
     if backend == "auto":
         backend = (
@@ -148,6 +174,7 @@ def _paged_indexer_cuda(
         backend,
         q_scale,
         k_scale,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -168,6 +195,8 @@ def _paged_indexer_fake(
     backend,
     q_scale=None,
     k_scale=None,
+    *,
+    batch_invariant=False,
 ):
     return query.new_empty((query.shape[0], topk), dtype=torch.int32)
 

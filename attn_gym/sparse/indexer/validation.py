@@ -10,6 +10,8 @@ def validate_precision(
     weights: Tensor,
     q_scale: Tensor | None,
     k_scale: Tensor | None,
+    *,
+    batch_invariant: bool = False,
 ) -> None:
     """Check storage/scaling contracts without reading device-resident values."""
     if not q.is_floating_point():
@@ -25,6 +27,11 @@ def validate_precision(
             )
         return
 
+    if batch_invariant:
+        raise ValueError(
+            "Fused MXFP8 scoring requires batch_invariant=False; use FP16/BF16 inputs "
+            "for batch-invariant indexing."
+        )
     if weights.dtype not in (torch.bfloat16, torch.float32):
         raise TypeError("MXFP8 Q/K require BF16 or FP32 weights.")
     if q.shape[-1] % 32:

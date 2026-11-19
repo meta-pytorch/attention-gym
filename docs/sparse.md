@@ -1,5 +1,56 @@
 # Sparse attention
 
+## Batch invariance
+
+All four sparse operations accept `kernel_options={"batch_invariant": True}`. It defaults
+to `False` and is independent of `torch.use_deterministic_algorithms`: deterministic mode
+alone does not enable it. Reference implementations validate the option and ignore it.
+
+```python
+options = {"batch_invariant": True}
+blocks = paged_lightning_indexer(
+    query, key_cache, weights, block_table, cu_seqlens_q, seqused_k,
+    topk=512, compress_ratio=4, kernel_options=options,
+)
+output = paged_sparse_decode(
+    attention_query, kv, blocks, cu_seqlens_q, seqused_k,
+    max_seqlen_q=1, index_block_size=4, kernel_options=options,
+)
+```
+
+For a fixed GPU model and software stack, the fused paths preserve a sequence's forward
+output bits across batch composition, packed document offsets, selection padding and
+query chunking, provided its logical inputs are identical:
+
+- `lightning_indexer` and `paged_lightning_indexer` use the same 32-candidate Triton scoring
+  tile and deterministic Top-K, with lower IDs winning equal scores and valid IDs ascending.
+  `backend` chooses the selector only in this mode. Scoring supports FP16/BF16 on SM80+,
+  H <= 128, D <= 256 and candidate capacity <= 2**22. Native MXFP8 scoring cannot use
+  `batch_invariant=True`. Whole-document `selector="auto"` uses deterministic radix;
+  explicit GVR2 is incompatible. The caller must produce identical pooled/normalized/rotated
+  keys; this option does not change upstream projections.
+- `gather_attn` and `paged_sparse_decode` use the same fixed forward arithmetic: each CTA
+  owns up to 16 query heads and uses tiles chosen only from the GPU, dtype and feature widths,
+  without batch-dependent splits or a packing-dependent dense schedule. Selection padding is
+  compacted, preserving order and duplicates, then the local window follows in the same
+  stream. They produce identical
+  output and LSE bits for identical Q/K/V, ordered keys, scale and sink. Qwen's caller
+  expands four-token block IDs and appends the incomplete tail on the gather side.
+
+Gather requires the Triton backend in this mode and rejects an explicit CuTe request.
+Gather supports FP16/BF16/FP32 in this mode; FP64 requires the reference implementation.
+Head dimensions are limited to 512, with at most 128 key-only RoPE dimensions; the existing
+RoPE eligibility and other fused input restrictions still apply. Gather's backward remains supported and
+its tuning follows `autotune` as usual, but this is a **forward guarantee**, not a
+bitwise-gradient guarantee.
+Paged attention and indexer selection remain nondifferentiable.
+
+This mode trades throughput for fixed arithmetic and extra selection metadata. It does
+not promise that enabling the option preserves the default kernels' output bits.
+CUDA Graphs retain the mode chosen during capture. Model integrations must pass the option
+to both training and generation calls; a model's global batch-invariance flag cannot
+configure these kernels on its own.
+
 ## Lightning indexer
 
 `lightning_indexer` selects a shared pool of key positions using multi-head weighted
@@ -28,9 +79,10 @@ whose tokens all lie at positions `<= t` (candidates `0..t` with the default rat
 rows with fewer than `topk` candidates contain `-1` padding. `compress_ratio != 1` requires
 `causal=True`. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
 position rather than an invalid position. `topk=0` returns an empty last dimension.
-Output order and tie-breaking are unspecified, including between repeated calls, unless
-`torch.use_deterministic_algorithms(True)` is enabled: fused backends are repeatable, and
-CuTe returns ascending indices with equal ordered-FP32 scores resolved toward lower indices.
+Outside [batch-invariant mode](#batch-invariance), output order and tie-breaking are unspecified,
+including between repeated calls, unless `torch.use_deterministic_algorithms(True)` is enabled:
+fused backends are repeatable, and CuTe returns ascending indices with equal ordered-FP32
+scores resolved toward lower indices.
 
 ### Implementations and device dispatch
 
@@ -76,8 +128,8 @@ other supported devices use Triton by default.
 CuTe uses GVR2 for `topk < 2048` and radix otherwise, and Triton uses its streaming selector.
 `"default"` forces the backend-native selector (CuTe radix, Triton streaming). Explicit
 `"gvr2"` requires CuTe on SM100/SM103 with dense inputs and nondeterministic mode. For
-packed or deterministic calls and on SM107, CuTe auto stays on radix. GVR2 guesses a cutoff
-from a row sample, verifies it over the full row, and refines exactly with radix passes
+packed, deterministic or batch-invariant calls and on SM107, CuTe auto stays on radix. GVR2
+guesses a cutoff from a row sample, verifies it over the full row, and refines with radix passes
 when the guess misses, so the result is the exact Top-K of the scorer's finite FP32 values.
 
 ```python
@@ -249,9 +301,10 @@ The scorer is used only when `tokens × reserved candidates per sequence > 32768
 smaller grids use Triton to avoid the fixed pipeline setup cost. Unsupported layouts
 also use Triton scoring, without copying the cache or changing the selector. Both routes
 use the same visibility rules. Order and ties are unspecified unless deterministic
-algorithms are enabled. No benchmarking occurs in the launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
-bounds buffer; query slabs reuse that allocation. Candidate capacity
-per sequence is limited to `2**22`.
+algorithms or [batch invariance](#batch-invariance) are enabled. No benchmarking occurs in
+the launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
+bounds buffer; query slabs reuse that allocation. Candidate capacity per sequence is limited
+to `2**22`.
 
 On a GB300, BF16 decode with 16 queries in 16 sequences, 32,768 live candidates each and
 K=512 took 68.66 µs with the Triton scorer and 57.51 µs with Warpdrive. Both timings

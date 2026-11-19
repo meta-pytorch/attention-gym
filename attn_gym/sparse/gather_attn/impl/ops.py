@@ -5,6 +5,8 @@ GPU tensor state. Returning the native buffers avoids packing/copying backward w
 no worst-case scratch reservation or CPU bookkeeping output is needed.
 """
 
+from functools import partial
+
 import torch
 from torch import Tensor
 
@@ -19,7 +21,8 @@ torch.library.define(
     "int sliding_window_size, bool share_kv, float scale, bool needs_backward, "
     "str backend, bool bwd_recompute_p=True, Tensor? query_rope=None, "
     "Tensor? sparse_rope=None, Tensor? local_rope=None, Tensor? sparse_v=None, "
-    "Tensor? local_v=None, *, bool autotune) -> (Tensor, Tensor, Tensor?[])",
+    "Tensor? local_v=None, *, bool autotune, bool batch_invariant=False) "
+    "-> (Tensor, Tensor, Tensor?[])",
 )
 torch.library.define(
     "attn_gym::_gather_attn_bwd",
@@ -68,6 +71,7 @@ def _gather_attn_fwd_cuda(
     local_v: Tensor | None = None,
     *,
     autotune: bool,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor, list[Tensor | None]]:
     with torch.cuda.device(query.device):
         if backend not in ("cute", "triton"):
@@ -129,7 +133,12 @@ def _gather_attn_fwd_cuda(
                 local_rope = (
                     None if local_rope is None else local_rope.expand(-1, query.shape[1], -1, -1)
                 )
-            output, lse = _launch_forward(
+            if batch_invariant:
+                # The fixed forward never tunes, like l2norm; backward still follows autotune.
+                from ..._batch_invariant import gather_forward as launch_forward
+            else:
+                launch_forward = partial(_launch_forward, autotune=should_autotune(autotune))
+            output, lse = launch_forward(
                 query,
                 sparse_kv,
                 local_kv,
@@ -145,7 +154,6 @@ def _gather_attn_fwd_cuda(
                 query_rope=query_rope,
                 sparse_rope=sparse_rope,
                 local_rope=local_rope,
-                autotune=should_autotune(autotune),
             )
             if needs_backward:
                 # Only full-width backward uses the reverse map, including when determinism
@@ -309,6 +317,7 @@ def _gather_attn_fwd_fake(
     local_v: Tensor | None = None,
     *,
     autotune: bool,
+    batch_invariant: bool = False,
 ) -> tuple[Tensor, Tensor, list[Tensor | None]]:
     if backend not in ("cute", "triton"):
         raise ValueError(f"gather-attention operators require a concrete backend, got {backend!r}")
