@@ -3,6 +3,7 @@
 Triton covers general layouts on SM80+. The SM100-family route can use a Warpdrive
 scorer for compact decode inputs. Both scorers write the same bounded FP32 slab;
 the radix selector returns sequence-local IDs without materializing a dense KV pool.
+Triton scoring uses a bounded grid whose workers loop over GPU-visible candidates.
 """
 
 import torch
@@ -30,7 +31,7 @@ def paged_candidate_bounds(
     WIDE: tl.constexpr,
     Bounds=None,
 ):
-    """Find the query's sequence and completed prefix; record [0, visible) for CuTe."""
+    """Find the query's sequence and completed prefix; optionally record it for selection."""
     sequence = _document_ids(CuQ, row, sequences, WIDE)
     if WIDE:
         sequence = sequence.to(tl.int64)
@@ -55,6 +56,16 @@ def weighted_relu_scores(keys, query, weights, H: tl.constexpr, D: tl.constexpr)
     """Reduce the per-head ReLU dot products to one scaled score per candidate."""
     dots = tl.dot(keys, tl.trans(query))
     return tl.sum(tl.maximum(dots, 0.0) * weights[None, :], 1) * (H * D) ** -0.5
+
+
+@triton.jit
+def paged_score_weights(W, Bounds, row, heads, w_strides, H: tl.constexpr, TOPK: tl.constexpr):
+    """For rows with more than K candidates, all-zero weights select the first K IDs."""
+    weights = tl.load(W + ptr_offset((row, heads), w_strides), heads < H, 0).to(tl.float32)
+    all_zero = tl.sum((weights != 0).to(tl.int32), 0) == 0
+    if all_zero and tl.program_id(1) == 0:
+        tl.store(Bounds + ptr_offset((row, 1), (2, 1)), TOPK)
+    return weights, all_zero
 
 
 # Triton 3.9 specializes tuple members even when the tuple is in do_not_specialize.
@@ -112,7 +123,7 @@ def paged_score_kernel(
     Q_UNIT_D: tl.constexpr,
     K_UNIT_D: tl.constexpr,
 ):
-    """Gather a tile of candidate keys from arbitrary strided pages and score it."""
+    """Gather and score visible candidate tiles from arbitrary strided pages."""
     local = tl.program_id(0).to(tl.int64 if WIDE else tl.int32)
     tile = tl.program_id(1)
     row = row_start + local
@@ -121,13 +132,9 @@ def paged_score_kernel(
     )
     if visible <= TOPK or tile * BN >= visible:
         return
-    candidates = tile * BN + tl.arange(0, BN)
     dims = tl.arange(0, BD)
     heads = tl.arange(0, BH)
     table_strides = offset_strides((stride_table_seq, stride_table_page), WIDE)
-    pages = tl.load(
-        Table + ptr_offset((sequence, candidates // PAGE), table_strides), candidates < visible, 0
-    )
     k_strides = offset_strides(
         (stride_k_page, stride_k_slot, 1 if K_UNIT_D else stride_k_dim), WIDE
     )
@@ -135,19 +142,31 @@ def paged_score_kernel(
         (stride_q_token, stride_q_head, 1 if Q_UNIT_D else stride_q_dim), WIDE
     )
     w_strides = offset_strides((stride_w_token, stride_w_head), WIDE)
-    keys = tl.load(
-        K + ptr_offset((pages[:, None], (candidates % PAGE)[:, None], dims[None, :]), k_strides),
-        (candidates[:, None] < visible) & (dims[None, :] < D),
-        0,
-    )
+    weights, all_zero = paged_score_weights(W, Bounds, row, heads, w_strides, H, TOPK)
+    if all_zero:
+        return
     query = tl.load(
         Q + ptr_offset((row, heads[:, None], dims[None, :]), q_strides),
         (heads[:, None] < H) & (dims[None, :] < D),
         0,
     )
-    weights = tl.load(W + ptr_offset((row, heads), w_strides), heads < H, 0).to(tl.float32)
-    scores = weighted_relu_scores(keys, query, weights, H, D)
-    tl.store(Scores + ptr_offset((local, candidates), (capacity, 1)), scores, candidates < visible)
+    for begin in range(tile * BN, visible, tl.num_programs(1) * BN):
+        candidates = begin + tl.arange(0, BN)
+        pages = tl.load(
+            Table + ptr_offset((sequence, candidates // PAGE), table_strides),
+            candidates < visible,
+            0,
+        )
+        keys = tl.load(
+            K
+            + ptr_offset((pages[:, None], (candidates % PAGE)[:, None], dims[None, :]), k_strides),
+            (candidates[:, None] < visible) & (dims[None, :] < D),
+            0,
+        )
+        scores = weighted_relu_scores(keys, query, weights, H, D)
+        tl.store(
+            Scores + ptr_offset((local, candidates), (capacity, 1)), scores, candidates < visible
+        )
 
 
 @triton.jit(
@@ -202,17 +221,22 @@ def paged_score_tma_kernel(
     heads = tl.arange(0, BH)
     w_strides = offset_strides((stride_w_token, stride_w_head), WIDE)
     table_strides = offset_strides((stride_table_seq, stride_table_page), WIDE)
+    weights, all_zero = paged_score_weights(W, Bounds, row, heads, w_strides, H, TOPK)
+    if all_zero:
+        return
     # Descriptor coordinates are int32; Q and K retain their full byte strides in the descriptors.
     query = Q.load([row.to(tl.int32), 0, 0]).reshape(BH, BD)
-    weights = tl.load(W + ptr_offset((row, heads), w_strides), heads < H, 0).to(tl.float32)
-    for begin in tl.range(start, tl.minimum(start + BN * TILES, visible), BN):
-        page = tl.load(Table + ptr_offset((sequence, begin // PAGE), table_strides))
-        keys = K.load([page, (begin % PAGE).to(tl.int32), 0]).reshape(BN, BD)
-        scores = weighted_relu_scores(keys, query, weights, H, D)
-        candidates = begin + tl.arange(0, BN)
-        tl.store(
-            Scores + ptr_offset((local, candidates), (capacity, 1)), scores, candidates < visible
-        )
+    for work in range(start, visible, tl.num_programs(1) * BN * TILES):
+        for begin in tl.range(work, tl.minimum(work + BN * TILES, visible), BN):
+            page = tl.load(Table + ptr_offset((sequence, begin // PAGE), table_strides))
+            keys = K.load([page, (begin % PAGE).to(tl.int32), 0]).reshape(BN, BD)
+            scores = weighted_relu_scores(keys, query, weights, H, D)
+            candidates = begin + tl.arange(0, BN)
+            tl.store(
+                Scores + ptr_offset((local, candidates), (capacity, 1)),
+                scores,
+                candidates < visible,
+            )
 
 
 @triton.jit
@@ -229,6 +253,7 @@ def paged_radix_topk_kernel(
     CuQ,
     Lengths,
     Positions,
+    Bounds,
     sequences,
     capacity,
     row_start,
@@ -241,9 +266,12 @@ def paged_radix_topk_kernel(
     """Select one row's Top-K IDs by radix threshold, keeping lower IDs at the boundary."""
     local = tl.program_id(0).to(tl.int64 if WIDE else tl.int32)
     row = row_start + local
-    _, visible = paged_candidate_bounds(
-        CuQ, Lengths, Positions, row, sequences, RATIO, EXPLICIT, WIDE
-    )
+    if Bounds is not None:
+        visible = tl.load(Bounds + ptr_offset((row, 1), (2, 1)))
+    else:
+        _, visible = paged_candidate_bounds(
+            CuQ, Lengths, Positions, row, sequences, RATIO, EXPLICIT, WIDE
+        )
     offsets = tl.arange(0, BLOCK)
     # Slab scores and the output are allocated contiguous, unlike caller-owned inputs.
     row_scores = Scores + ptr_offset((local, offsets), (capacity, 1))
@@ -253,11 +281,19 @@ def paged_radix_topk_kernel(
             rank = start + offsets
             tl.store(row_out + rank, tl.where(rank < visible, rank, -1), rank < TOPK)
         return
-    prefix = tl.full((), 0, tl.uint32)
-    need = tl.full((), TOPK, tl.int32)
-    # Binary radix uses warp reductions instead of contended shared-memory
-    # histograms (the high exponent bytes often occupy only one or two bins).
-    for bit in range(31, -1, -1):
+    positive = tl.full((), 0, tl.int32)
+    nonnegative = tl.full((), 0, tl.int32)
+    for start in range(0, visible, BLOCK):
+        indices = start + offsets
+        scores = tl.load(row_scores + start, indices < visible, 0)
+        positive += tl.sum(((indices < visible) & (scores > 0)).to(tl.int32), 0)
+        nonnegative += tl.sum(((indices < visible) & (scores >= 0)).to(tl.int32), 0)
+    # The sign pass decides bit 31 and detects an exact zero cutoff. Binary radix
+    # avoids contended shared-memory histograms; stop once a prefix retains exactly K.
+    prefix = tl.where(nonnegative >= TOPK, 0x80000000, 0).to(tl.uint32)
+    bit = tl.where((positive < TOPK) & (nonnegative >= TOPK), -1, 30)
+    count = nonnegative
+    while (bit >= 0) & (count != TOPK):
         trial = prefix | (tl.full((), 1, tl.uint32) << bit)
         above = tl.full((), 0, tl.int32)
         for start in range(0, visible, BLOCK):
@@ -266,6 +302,8 @@ def paged_radix_topk_kernel(
             keys = float_radix_keys(scores)
             above += tl.sum(((indices < visible) & (keys >= trial)).to(tl.int32), 0)
         prefix = tl.where(above >= TOPK, trial, prefix)
+        count = above
+        bit -= 1
     strict = tl.full((), 0, tl.int32)
     for start in range(0, visible, BLOCK):
         indices = start + offsets
@@ -273,7 +311,7 @@ def paged_radix_topk_kernel(
         strict += tl.sum(
             ((indices < visible) & (float_radix_keys(scores) > prefix)).to(tl.int32), 0
         )
-    need -= strict
+    need = TOPK - strict
     # need is the number of equal boundary scores to retain. Prefix scans break
     # those ties toward lower IDs, and write selected IDs in sequence order.
     written = tl.full((), 0, tl.int32)
@@ -398,13 +436,12 @@ def launch(
         (pairs, 2, capacity) if capacity > topk else (0,), dtype=torch.float32
     )
     use_cute = backend == "cute" and capacity > topk
-    bounds = query.new_empty((tokens, 2), dtype=torch.int32) if use_cute else None
+    bounds = query.new_empty((tokens, 2), dtype=torch.int32) if capacity > topk else None
+    metadata = (cu_seqlens_q, seqused_k, query_positions)
     # The absolute row index can exceed int32 even when query and weights are broadcast.
-    shared_wide = tokens > 2**31 or requires_int64_offsets(
-        scores, cu_seqlens_q, seqused_k, query_positions
-    )
+    shared_wide = tokens > 2**31 or requires_int64_offsets(scores, bounds)
     score_wide = capacity > topk and (
-        shared_wide or requires_int64_offsets(query, key_cache, weights, block_table, bounds)
+        shared_wide or requires_int64_offsets(query, key_cache, weights, block_table, *metadata)
     )
     if mxfp8 and score_wide:
         raise ValueError("fused paged MXFP8 scoring requires int32 input offsets.")
@@ -459,34 +496,63 @@ def launch(
                 )
         integer = cutlass.Int64 if select_wide else cutlass.Int32
     else:
-        select_wide = shared_wide or requires_int64_offsets(output)
-    tma = (
-        warpdrive_score is None
-        and capacity > topk
-        and key_cache.shape[1] % 32 == 0
-        and can_use_tma(query)
-        and can_use_tma(key_cache)
-    )
-    if tma:
-        from triton.tools.tensor_descriptor import TensorDescriptor
-
-        # Measured on B200: split short pools to fill the GPU; amortize page
-        # routing and Q loads over 4/8 tiles once there are enough work items.
-        work = tokens * capacity
-        bn = 32 if work <= 32768 or key_cache.shape[1] % 64 else 64
-        tiles = 1 if work <= 32768 else 4 if work <= 262144 else 8
+        # The bounded selector reads no sequence metadata. Canonical arguments let
+        # all scoring ratios and position modes share the same selector binary.
+        select_metadata = metadata if bounds is None else (None, None, None)
+        select_modes = (
+            (compress_ratio, query_positions is not None) if bounds is None else (1, False)
+        )
+        select_wide = shared_wide or requires_int64_offsets(output, *select_metadata)
+    triton_score = warpdrive_score is None and capacity > topk
+    if triton_score:
+        properties = torch.cuda.get_device_properties(query.device)
         bh, bd = max(16, triton.next_power_of_2(heads)), max(16, triton.next_power_of_2(dim))
-        query_desc = TensorDescriptor.from_tensor(query, [1, bh, bd])
-        key_desc = TensorDescriptor.from_tensor(key_cache, [1, bn, bd])
+        grid_capacity = min(capacity, 32768)
+        workers = 32 * properties.multi_processor_count
+        if key_cache.shape[1] % 32 == 0 and can_use_tma(query) and can_use_tma(key_cache):
+            from triton.tools.tensor_descriptor import TensorDescriptor
+
+            # Measured on B200 with full pools: split short pools to fill the GPU;
+            # amortize page routing and Q loads over 4/8 tiles once there are enough
+            # work items. The cap favors short live pools despite large reservations.
+            # On GB300 (H64, D128, scoring only), uncapped tiles score one row of
+            # 131072 live keys in 6.7 us instead of 10.7 us, but 4096 live keys in a
+            # 2**22-candidate reservation in 6.6 us instead of 3.1 us.
+            work = min(tokens, slab) * grid_capacity
+            bn = 32 if work <= 32768 or key_cache.shape[1] % 64 else 64
+            tiles = 1 if work <= 32768 else 4 if work <= 262144 else 8
+            score_kernel = paged_score_tma_kernel
+            score_query = TensorDescriptor.from_tensor(query, [1, bh, bd])
+            score_keys = TensorDescriptor.from_tensor(key_cache, [1, bn, bd])
+            qk_strides = ()  # The descriptors carry these strides.
+            score_options = {"TILES": tiles, "num_stages": 2}
+        else:
+            # tl.dot stages the key and hoisted query tiles together (Triton 3.9).
+            # With H128, D256 and BN128 they exceed the 99 KiB SM86/89/120 limit.
+            budget = properties.shared_memory_per_block_optin
+            element_size = query.element_size()
+            bn = next((n for n in (128, 64, 32) if (n + bh) * bd * element_size <= budget), 16)
+            tiles = 1
+            score_kernel = paged_score_kernel
+            score_query, score_keys = query, key_cache
+            qk_strides = (*query.stride(), *key_cache.stride())
+            score_options = {
+                "Q_UNIT_D": query.stride(-1) == 1,
+                "K_UNIT_D": key_cache.stride(-1) == 1,
+            }
+        tiles_per_row = triton.cdiv(grid_capacity, bn * tiles)
     with torch.cuda.device(query.device):
         for start in range(0, tokens, slab):
             rows = min(slab, tokens - start)
             if warpdrive_score is not None:
                 warpdrive_score(start, rows)
-            elif tma:
-                paged_score_tma_kernel[(rows, triton.cdiv(capacity, bn * tiles))](
-                    query_desc,
-                    key_desc,
+            elif triton_score:
+                # Bound the launch in both dimensions of work: visible pools can be
+                # far shorter than the reservation. CTAs stride over any remaining tiles.
+                grid = (rows, min(tiles_per_row, triton.cdiv(workers, rows)))
+                score_kernel[grid](
+                    score_query,
+                    score_keys,
                     weights,
                     block_table,
                     cu_seqlens_q,
@@ -497,6 +563,7 @@ def launch(
                     seqused_k.numel(),
                     capacity,
                     start,
+                    *qk_strides,
                     *weights.stride(),
                     *block_table.stride(),
                     heads,
@@ -509,41 +576,8 @@ def launch(
                     bn,
                     bh,
                     bd,
-                    tiles,
                     num_warps=4,
-                    num_stages=2,
-                )
-            elif capacity > topk:
-                paged_score_kernel[(rows, triton.cdiv(capacity, 128))](
-                    query,
-                    key_cache,
-                    weights,
-                    block_table,
-                    cu_seqlens_q,
-                    seqused_k,
-                    query_positions,
-                    scores,
-                    bounds,
-                    seqused_k.numel(),
-                    capacity,
-                    start,
-                    *query.stride(),
-                    *key_cache.stride(),
-                    *weights.stride(),
-                    *block_table.stride(),
-                    heads,
-                    dim,
-                    key_cache.shape[1],
-                    topk,
-                    compress_ratio,
-                    query_positions is not None,
-                    score_wide,
-                    128,
-                    max(16, triton.next_power_of_2(heads)),
-                    max(16, triton.next_power_of_2(dim)),
-                    query.stride(-1) == 1,
-                    key_cache.stride(-1) == 1,
-                    num_warps=4,
+                    **score_options,
                 )
             if use_cute:
                 topk_kernel(
@@ -557,15 +591,13 @@ def launch(
                 paged_radix_topk_kernel[(rows,)](
                     scores,
                     output,
-                    cu_seqlens_q,
-                    seqused_k,
-                    query_positions,
+                    *select_metadata,
+                    bounds,
                     seqused_k.numel(),
                     capacity,
                     start,
                     topk,
-                    compress_ratio,
-                    query_positions is not None,
+                    *select_modes,
                     select_wide,
                     block,
                     num_warps=4,
