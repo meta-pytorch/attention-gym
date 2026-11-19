@@ -441,9 +441,9 @@ def mma_decay_16x16(
 ):
     """``acc[16, 16] += A K_inv^T`` over ``d_k`` columns of one decay stage, ``A`` the decayed
     rows (K_decay for KK, Q_decay for A) at ``s_a + stage`` and K_inv at ``s_kinv + stage``:
-    tf32 tiles (offsets from ``tf32_fragment_offsets``, ``umma`` selecting their layout) when
-    ``dtype`` is Float32, else ``dtype`` tiles of 64-column 128-byte-swizzled boxes (element
-    offsets of the first box's four 16-column steps)."""
+    tf32 tiles (``umma`` selecting their layout) when ``dtype`` is Float32, else ``dtype`` tiles
+    of 64-column 128-byte-swizzled boxes. ``a_offs`` and ``b_offs`` come from
+    ``decay_fragment_offsets`` (the tcgen05 layout's from ``tf32_fragment_offsets``)."""
     if cutlass.const_expr(dtype is Float32):
         mma_tf32_16x16(acc, s_a + stage, s_kinv + stage, a_offs, b_offs, d_k, umma)
     else:
@@ -452,6 +452,24 @@ def mma_decay_16x16(
             kif = ldmatrix(s_kinv + stage + 2 * (b_offs[i % 4] + box), 4)
             af = ldmatrix(s_a + stage + 2 * (a_offs[i % 4] + box), 4)
             mma_step(acc, af, kif, k_step=0, M=16, N=16, dtype=dtype)
+
+
+@cute.jit
+def decay_fragment_offsets(lane, d_k: cutlass.Constexpr[int], tf32: cutlass.Constexpr[bool]):
+    """This lane's ``mma_decay_16x16`` fragment offsets ``(a_offs, kinv_offs)``, hoisted out of
+    the chunk loop by the caller: ``tf32_fragment_offsets`` under ``tf32``, else the element
+    offsets of the first 16-bit box's four 16-column steps."""
+    if cutlass.const_expr(tf32):
+        a_offs = tf32_fragment_offsets(lane, d_k, b_operand=False)
+        kinv_offs = tf32_fragment_offsets(lane, d_k, b_operand=True)
+    else:
+        ki_row = lane % 8 + (8 if lane // 16 else 0)
+        ki_col = 8 if (lane // 8) % 2 else 0
+        a_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
+        a_col = 8 if (lane // 8) // 2 else 0
+        kinv_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
+        a_offs = [opaque_i32(swz128(a_row, a_row * 64 + i * 16 + a_col)) for i in range(4)]
+    return a_offs, kinv_offs
 
 
 def decay_stage_addresses(h_rows, rows: str, kh, s_rows, s_kinv, d_k: int, tf32: bool):

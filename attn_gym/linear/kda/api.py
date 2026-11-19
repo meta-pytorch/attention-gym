@@ -102,8 +102,11 @@ def chunk_kda(
             ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
             ``docs/linear.md`` gives the measurements). warpdrive FP16 forms its in-chunk decay
             products from TF32 operands, forward and backward, and shares the BF16 gate range
-            above. These limits are not checked at runtime and do not apply to reference or
-            recurrent execution.
+            above. Backward headroom also shrinks with large output gradients and key components.
+            The FP16 backward needs state cotangents, and FP16 products of them, within the FP16
+            range, and keys decayed below the FP16 subnormals round up or to zero in the forward
+            state update and the backward (same section of ``docs/linear.md``). These limits are
+            not checked at runtime and do not apply to reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.

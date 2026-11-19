@@ -105,6 +105,7 @@ from .kda_common import (
     as_i32,
     beta_residual,
     box128,
+    decay_fragment_offsets,
     decay_stage_addresses,
     lds_16_f32,
     lds_f32,
@@ -125,7 +126,6 @@ from .kda_common import (
     sts_tf32x8,
     swz32,
     swz128,
-    tf32_fragment_offsets,
     umma_commit,
     warp_arrive,
 )
@@ -289,11 +289,10 @@ class KdaPrefill(WarpSpecialized):
         }
         if gate != "fp32":
             buf["Exchange"] = plan.buffer("Exchange", f32, align=1024)
+        buf["Kinv"] = plan.buffer("Kinv", self.decay_t, align=1024)
         if self.tf32_decay:
-            for name in ("Kinv", "Kdecay32", "Qdecay32"):
+            for name in ("Kdecay32", "Qdecay32"):
                 buf[name] = plan.buffer(name, f32, align=1024)
-        else:
-            buf["Kinv"] = plan.buffer("Kinv", io_t, align=1024)
         buf["O"] = plan.buffer("O", io_t, align=1024)
         buf["Beta"] = plan.buffer("Beta", f32, align=16)
         self.buf = buf
@@ -1472,19 +1471,10 @@ class KdaPrefill(WarpSpecialized):
     ):
         lane = me.lane
         io = self.io_dtype
-        ki_row = lane % 8 + (8 if lane // 16 else 0)
-        ki_col = 8 if (lane // 8) % 2 else 0
-        kd_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
-        kd_col = 8 if (lane // 8) // 2 else 0
         t_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         t_col = 8 if lane // 8 >= 2 else 0
         t_idx = t_row * B_T + swz32(t_row, t_col)
-        if cutlass.const_expr(self.tf32_decay):
-            kd_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=False)
-            ki_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=True)
-        else:
-            ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
-            kd_offs = [opaque_i32(swz128(kd_row, kd_row * 64 + i * 16 + kd_col)) for i in range(4)]
+        kd_offs, ki_offs = decay_fragment_offsets(lane, self.d_k, self.tf32_decay)
         row_lo = lane // 4
         row_hi = row_lo + 8
         # Kept in registers: otherwise ptxas rematerializes the lane id (S2R) in the chunk loop
@@ -1552,19 +1542,10 @@ class KdaPrefill(WarpSpecialized):
     ):
         lane = me.lane
         io = self.io_dtype
-        ki_row = lane % 8 + (8 if lane // 16 else 0)
-        ki_col = 8 if (lane // 8) % 2 else 0
-        qd_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
-        qd_col = 8 if (lane // 8) // 2 else 0
         a_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         a_col = 8 if lane // 8 >= 2 else 0
         a_idx = a_row * B_T + swz32(a_row, a_col)
-        if cutlass.const_expr(self.tf32_decay):
-            qd_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=False)
-            ki_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=True)
-        else:
-            ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
-            qd_offs = [opaque_i32(swz128(qd_row, qd_row * 64 + i * 16 + qd_col)) for i in range(4)]
+        qd_offs, ki_offs = decay_fragment_offsets(lane, self.d_k, self.tf32_decay)
         while work.valid:
             unit, _, _ = work.item
             total = params.work_count[0]

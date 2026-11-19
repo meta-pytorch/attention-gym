@@ -103,6 +103,7 @@ from .kda_common import (
     WORK_ITEM_FIELDS,
     beta_residual,
     box128,
+    decay_fragment_offsets,
     decay_stage_addresses,
     lds_16_f32,
     lds_f32,
@@ -119,7 +120,6 @@ from .kda_common import (
     sts_tf32x8,
     swz32,
     swz128,
-    tf32_fragment_offsets,
     umma_commit,
     warp_arrive,
 )
@@ -261,11 +261,9 @@ class KdaRecompute(WarpSpecialized):
         }
         if gate != "fp32":
             buf["Exchange"] = plan.buffer("Exchange", f32, align=1024)
+        buf["Kinv"] = plan.buffer("Kinv", self.decay_t, align=1024)
         if self.tf32_decay:
-            for name in ("Kinv", "Kdecay32"):
-                buf[name] = plan.buffer(name, f32, align=1024)
-        else:
-            buf["Kinv"] = plan.buffer("Kinv", io_t, align=1024)
+            buf["Kdecay32"] = plan.buffer("Kdecay32", f32, align=1024)
         buf["Beta"] = plan.buffer("Beta", f32, align=1024)
         buf["Ckpt"] = plan.buffer("Ckpt", io_t, align=1024)
         self.buf = buf
@@ -1270,19 +1268,10 @@ class KdaRecompute(WarpSpecialized):
     ):
         lane = me.lane
         io = self.io_dtype
-        ki_row = lane % 8 + (8 if lane // 16 else 0)
-        ki_col = 8 if (lane // 8) % 2 else 0
-        kd_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
-        kd_col = 8 if (lane // 8) // 2 else 0
         t_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         t_col = 8 if lane // 8 >= 2 else 0
         t_idx = t_row * B_T + swz32(t_row, t_col)
-        if cutlass.const_expr(self.tf32_decay):
-            kd_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=False)
-            ki_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=True)
-        else:
-            ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
-            kd_offs = [opaque_i32(swz128(kd_row, kd_row * 64 + i * 16 + kd_col)) for i in range(4)]
+        kd_offs, ki_offs = decay_fragment_offsets(lane, self.d_k, self.tf32_decay)
         row_lo = lane // 4
         row_hi = row_lo + 8
         while work.valid:

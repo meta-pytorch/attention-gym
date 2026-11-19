@@ -104,6 +104,7 @@ from .kda_common import (
     B_T,
     WORK_ITEM_FIELDS,
     box128,
+    decay_fragment_offsets,
     decay_stage_addresses,
     gate_offset,
     lds_f32,
@@ -117,7 +118,6 @@ from .kda_common import (
     sts_tf32x8,
     swz32,
     swz128,
-    tf32_fragment_offsets,
 )
 from .ptx import (
     f16x2_to_f32,
@@ -223,9 +223,8 @@ class KdaBpropSummary(WarpSpecialized):
         self.decay_t = Float32 if self.tf32_decay else io_t
         plan = self.smem_plan = SmemPlan()
         names = ("Kdecay", "Kinv", "Qdecay", "A", "Tinv", "dO", "Q", "K")
-        wide = ("Kinv",) if self.tf32_decay else ()
         buf = {
-            name: plan.buffer(name, Float32 if name in wide else io_t, align=1024)
+            name: plan.buffer(name, self.decay_t if name == "Kinv" else io_t, align=1024)
             for name in names
         }
         buf["Gate"] = plan.buffer("Gate", Float32, align=1024)
@@ -643,19 +642,10 @@ class KdaBpropSummary(WarpSpecialized):
     ):
         lane = me.lane
         io = self.io_dtype
-        ki_row = lane % 8 + (8 if lane // 16 else 0)
-        ki_col = 8 if (lane // 8) % 2 else 0
-        kd_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
-        kd_col = 8 if (lane // 8) // 2 else 0
         t_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         t_col = 8 if lane // 8 >= 2 else 0
         t_idx = t_row * B_T + swz32(t_row, t_col)
-        if cutlass.const_expr(self.tf32_decay):
-            kd_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=False)
-            ki_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=True)
-        else:
-            ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
-            kd_offs = [opaque_i32(swz128(kd_row, kd_row * 64 + i * 16 + kd_col)) for i in range(4)]
+        kd_offs, ki_offs = decay_fragment_offsets(lane, self.d_k, self.tf32_decay)
         row_lo = lane // 4
         row_hi = row_lo + 8
         while work.valid:
@@ -711,19 +701,10 @@ class KdaBpropSummary(WarpSpecialized):
     ):
         lane = me.lane
         io = self.io_dtype
-        ki_row = lane % 8 + (8 if lane // 16 else 0)
-        ki_col = 8 if (lane // 8) % 2 else 0
-        qd_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
-        qd_col = 8 if (lane // 8) // 2 else 0
         a_row = (lane & 7) + (8 if (lane // 8) & 1 else 0)
         a_col = 8 if lane // 8 >= 2 else 0
         a_idx = a_row * B_T + swz32(a_row, a_col)
-        if cutlass.const_expr(self.tf32_decay):
-            qd_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=False)
-            ki_offs = tf32_fragment_offsets(lane, self.d_k, b_operand=True)
-        else:
-            ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
-            qd_offs = [opaque_i32(swz128(qd_row, qd_row * 64 + i * 16 + qd_col)) for i in range(4)]
+        qd_offs, ki_offs = decay_fragment_offsets(lane, self.d_k, self.tf32_decay)
         while work.valid:
             _seq, _head, write_start, compute_end, _start, _end = work.item
             for _ in cutlass.range(compute_end - write_start, unroll=1):
