@@ -47,13 +47,6 @@ def _float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
 
 
 @cute.jit
-def _ordered_key(value: Float32) -> Uint32:
-    """Map signed finite FP32 values to monotonically increasing unsigned keys."""
-    bits = _float_bits(value)
-    return bits ^ Uint32(0xFFFFFFFF) if bits & Uint32(0x80000000) else bits | Uint32(0x80000000)
-
-
-@cute.jit
 def _warp_scan_inclusive(value: Int32, lane_id: Int32, lanes: cutlass.Constexpr) -> Int32:
     """Inclusive sum across the first power-of-two number of participating lanes."""
     mask = cutlass.const_expr(((1 << lanes) - 1) & 0xFFFFFFFF)
@@ -109,7 +102,9 @@ class IndexerTopKKernel(IndexerKernelBase):
         *,
         compress_ratio: int = 1,
         deterministic: bool = False,
+        paged: bool = False,
     ):
+        self.paged = paged
         self.topk = topk
         self.deterministic = deterministic
         self.causal = causal
@@ -121,7 +116,17 @@ class IndexerTopKKernel(IndexerKernelBase):
         return (
             f"indexer_topk_k{self.topk}_c{int(self.causal)}_r{self.compress_ratio}_"
             f"i64{int(self.use_int64_offsets)}_d{int(self.deterministic)}_th{self.block_threads}"
+            f"_paged{int(self.paged)}"
         )
+
+    @cute.jit
+    def ordered_key(self, value: Float32) -> Uint32:
+        """Map finite FP32 scores to unsigned radix keys in increasing score order."""
+        bits = _float_bits(value)
+        # Negation maps -0 to the +0 key; complement preserves the document
+        # selector's established -0 < +0 order. Both reverse negative magnitudes.
+        negative = Uint32(0) - bits if cutlass.const_expr(self.paged) else ~bits
+        return negative if bits & Uint32(0x80000000) else bits | Uint32(0x80000000)
 
     @cute.jit
     def select_lowest_ties(
@@ -148,7 +153,7 @@ class IndexerTopKKernel(IndexerKernelBase):
         for window in range(0, seg_len, _BITMAP_BITS):
             span = cutlass.min(seg_len - window, _BITMAP_BITS)
             for i in range(tidx, span, self.block_threads):
-                if _ordered_key(row[window + i]) == tie_key:
+                if self.ordered_key(row[window + i]) == tie_key:
                     self.mark(scratch, i)
             cute.arch.barrier()
             if use_bitmap:
@@ -413,7 +418,7 @@ class IndexerTopKKernel(IndexerKernelBase):
 
                 # Pass 1: highest 11-bit histogram over exactly the valid row.
                 for i in range(tidx, seg_len, self.block_threads):
-                    key = _ordered_key(row[i])
+                    key = self.ordered_key(row[i])
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     cute.arch.atomic_add(
                         histogram.iterator + bin0, Int32(1), sem="relaxed", scope="cta"
@@ -425,7 +430,7 @@ class IndexerTopKKernel(IndexerKernelBase):
 
                 # Pass 2: emit strict winners and stage the first boundary bin.
                 for i in range(tidx, seg_len, self.block_threads):
-                    key = _ordered_key(row[i])
+                    key = self.ordered_key(row[i])
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     if bin0 > bin0_threshold:
                         self.emit(Int32(i), use_bitmap, selected, counters, row_output)
@@ -459,7 +464,7 @@ class IndexerTopKKernel(IndexerKernelBase):
                         key = shrink_keys[i]
                         idx = shrink_indices[i]
                     else:
-                        key = _ordered_key(row[i])
+                        key = self.ordered_key(row[i])
                         idx = Int32(i)
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     if bin0 == bin0_threshold:
@@ -496,7 +501,7 @@ class IndexerTopKKernel(IndexerKernelBase):
                         key = shrink_keys[i]
                         idx = shrink_indices[i]
                     else:
-                        key = _ordered_key(row[i])
+                        key = self.ordered_key(row[i])
                         idx = Int32(i)
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     bin1 = Int32((key >> 10) & Uint32(0x7FF))

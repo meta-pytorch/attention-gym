@@ -6,16 +6,17 @@ import torch
 
 
 def launch(
-    query,
-    key_cache,
-    weights,
-    block_table,
-    cu_seqlens_q,
-    seqused_k,
-    topk,
-    compress_ratio,
-    query_positions,
-):
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    weights: torch.Tensor,
+    block_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    seqused_k: torch.Tensor,
+    topk: int,
+    compress_ratio: int,
+    query_positions: torch.Tensor | None,
+) -> torch.Tensor:
+    """Score visible candidates in logical block order, independently of physical pages."""
     output = torch.full((query.shape[0], topk), -1, device=query.device, dtype=torch.int32)
     if topk == 0:
         return output
@@ -39,7 +40,12 @@ def launch(
         )
         visible = ((positions + 1) // compress_ratio).clamp(min=0, max=candidates)
         scores.masked_fill_(logical[None, :] >= visible[:, None], -torch.inf)
-        selected = scores.topk(min(topk, candidates), dim=-1).indices
+        width = min(topk, candidates)
+        if torch.are_deterministic_algorithms_enabled():
+            ranked = scores.argsort(dim=-1, descending=True, stable=True)
+            selected = ranked[:, :width].sort(dim=-1).values
+        else:
+            selected = scores.topk(width, dim=-1).indices
         output[start:end, : selected.shape[1]] = torch.where(
             selected < visible[:, None], selected, -1
         ).int()

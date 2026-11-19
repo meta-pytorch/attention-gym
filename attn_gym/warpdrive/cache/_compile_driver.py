@@ -58,12 +58,8 @@ def main(request_path: Path, calls_path: Path) -> int:
         target_fields["capability"] = tuple(capability)
     # CuTeDSL reads CUTE_DSL_ARCH when cutlass is first imported, and importing attn_gym
     # imports cutlass: set it before the imports below.
-    if target_fields.get("configured_arch") is not None:
-        os.environ["CUTE_DSL_ARCH"] = target_fields["configured_arch"]
-    elif capability is not None:
-        major, minor = capability
-        suffix = "a" if major >= 9 else ""
-        os.environ["CUTE_DSL_ARCH"] = f"sm_{major}{minor}{suffix}"
+    if request["gpu_arch"] is not None:
+        os.environ["CUTE_DSL_ARCH"] = request["gpu_arch"]
 
     from attn_gym.warpdrive.cache.compile import CACHE_STORAGE_EXIT
     from attn_gym.warpdrive.cache.jit import CacheStorageError, set_cache_path

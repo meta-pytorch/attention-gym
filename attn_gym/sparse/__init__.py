@@ -10,6 +10,7 @@ from .gather_attn import (
 )
 from .indexer import (
     IndexerKernelOptions,
+    PagedIndexerKernelOptions,
     lightning_indexer,
     paged_lightning_indexer,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "GatherAttnKernelOptions",
     "Impl",
     "IndexerKernelOptions",
+    "PagedIndexerKernelOptions",
     "PagedKV",
     "PagedSparseDecodeAux",
     "RopePair",
