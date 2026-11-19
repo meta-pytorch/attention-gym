@@ -43,20 +43,13 @@ _BITMAP_BITS = _NUM_BINS_11 * 32  # One 8 KiB bitmap window of candidate indices
 
 
 @dsl_user_op
-def _float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
+def float_bits(value: Float32, *, loc=None, ip=None) -> Uint32:
     """Reinterpret an FP32 register as unsigned bits without numerical conversion."""
     return Uint32(llvm.bitcast(Uint32.mlir_type, value.ir_value(), loc=loc, ip=ip))
 
 
 @cute.jit
-def _ordered_key(value: Float32) -> Uint32:
-    """Map signed finite FP32 values to monotonically increasing unsigned keys."""
-    bits = _float_bits(value)
-    return bits ^ Uint32(0xFFFFFFFF) if bits & Uint32(0x80000000) else bits | Uint32(0x80000000)
-
-
-@cute.jit
-def _warp_scan_inclusive(value: Int32, lane_id: Int32, lanes: cutlass.Constexpr) -> Int32:
+def warp_scan_inclusive(value: Int32, lane_id: Int32, lanes: cutlass.Constexpr) -> Int32:
     """Inclusive sum across the first power-of-two number of participating lanes."""
     mask = cutlass.const_expr(((1 << lanes) - 1) & 0xFFFFFFFF)
     for i in cutlass.range_constexpr(lanes.bit_length() - 1):
@@ -68,7 +61,7 @@ def _warp_scan_inclusive(value: Int32, lane_id: Int32, lanes: cutlass.Constexpr)
 
 
 @cute.jit
-def _block_scan_inclusive(
+def block_scan_inclusive(
     value: Int32,
     warp_sums: cute.Tensor,
     tidx: Int32,
@@ -77,12 +70,12 @@ def _block_scan_inclusive(
     """Inclusive CTA sum using one shared partial per warp and two barriers."""
     warp_id = tidx // 32
     lane_id = tidx % 32
-    value = _warp_scan_inclusive(value, lane_id, 32)
+    value = warp_scan_inclusive(value, lane_id, 32)
     if lane_id == 31:
         warp_sums[warp_id] = value
     cute.arch.barrier()
     if warp_id == 0 and lane_id < threads // 32:
-        partial = _warp_scan_inclusive(warp_sums[lane_id], lane_id, threads // 32)
+        partial = warp_scan_inclusive(warp_sums[lane_id], lane_id, threads // 32)
         warp_sums[lane_id] = partial
     cute.arch.barrier()
     if warp_id > 0:
@@ -141,7 +134,7 @@ class IndexerRadixPrimitives(IndexerKernelBase):
             histogram[bin_id] = Int32(0)
             local_sum += counts[i]
 
-        inclusive = _block_scan_inclusive(local_sum, warp_sums, tidx, self.block_threads)
+        inclusive = block_scan_inclusive(local_sum, warp_sums, tidx, self.block_threads)
         running = inclusive - local_sum
         for i in cutlass.range_constexpr(items):
             count = counts[i]
@@ -179,7 +172,9 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
         *,
         compress_ratio: int = 1,
         deterministic: bool = False,
+        paged: bool = False,
     ):
+        self.paged = paged
         self.topk = topk
         self.deterministic = deterministic
         self.causal = causal
@@ -206,7 +201,17 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
         return (
             f"indexer_topk_k{self.topk}_c{int(self.causal)}_r{self.compress_ratio}_"
             f"i64{int(self.use_int64_offsets)}_d{int(self.deterministic)}_th{self.block_threads}"
+            f"_paged{int(self.paged)}"
         )
+
+    @cute.jit
+    def ordered_key(self, value: Float32) -> Uint32:
+        """Map finite FP32 scores to unsigned radix keys in increasing score order."""
+        bits = float_bits(value)
+        # Negation maps -0 to the +0 key; complement preserves the document
+        # selector's established -0 < +0 order. Both reverse negative magnitudes.
+        negative = Uint32(0) - bits if cutlass.const_expr(self.paged) else ~bits
+        return negative if bits & Uint32(0x80000000) else bits | Uint32(0x80000000)
 
     @cute.jit
     def select_lowest_ties(
@@ -233,7 +238,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
         for window in range(0, seg_len, _BITMAP_BITS):
             span = cutlass.min(seg_len - window, _BITMAP_BITS)
             for i in range(tidx, span, self.block_threads):
-                if _ordered_key(row[window + i]) == tie_key:
+                if self.ordered_key(row[window + i]) == tie_key:
                     self.mark(scratch, i)
             cute.arch.barrier()
             if use_bitmap:
@@ -324,7 +329,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
                     word = (word >> Uint32(first_bit & 31)) & mask
             words.append(word)
             count += Int32(cute.arch.popc(word))
-        inclusive = _block_scan_inclusive(count, warp_sums, tidx, self.block_threads)
+        inclusive = block_scan_inclusive(count, warp_sums, tidx, self.block_threads)
         dst = written + inclusive - count
         cap = Int32(0x7FFFFFFF) if cutlass.const_expr(limit is None) else limit
         for j in cutlass.range_constexpr(_BITMAP_BITS // self.block_threads // 32):
@@ -434,7 +439,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
 
                 # Pass 1: highest 11-bit histogram over exactly the valid row.
                 for i in range(tidx, seg_len, self.block_threads):
-                    key = _ordered_key(row[i])
+                    key = self.ordered_key(row[i])
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     cute.arch.atomic_add(
                         histogram.iterator + bin0, Int32(1), sem="relaxed", scope="cta"
@@ -446,7 +451,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
 
                 # Pass 2: emit strict winners and stage the first boundary bin.
                 for i in range(tidx, seg_len, self.block_threads):
-                    key = _ordered_key(row[i])
+                    key = self.ordered_key(row[i])
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     if bin0 > bin0_threshold:
                         self.emit(Int32(i), use_bitmap, selected, counters, row_output)
@@ -480,7 +485,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
                         key = shrink_keys[i]
                         idx = shrink_indices[i]
                     else:
-                        key = _ordered_key(row[i])
+                        key = self.ordered_key(row[i])
                         idx = Int32(i)
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     if bin0 == bin0_threshold:
@@ -517,7 +522,7 @@ class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
                         key = shrink_keys[i]
                         idx = shrink_indices[i]
                     else:
-                        key = _ordered_key(row[i])
+                        key = self.ordered_key(row[i])
                         idx = Int32(i)
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     bin1 = Int32((key >> 10) & Uint32(0x7FF))
