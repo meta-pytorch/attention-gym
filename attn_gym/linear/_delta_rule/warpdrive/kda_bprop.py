@@ -205,7 +205,7 @@ DECAY_STAGES = 2
 INTER_STAGES = 2
 INTER_TILES = 5  # per stage: A, T, dA, dM, -dM (16 x 16 each, 32-byte swizzle)
 TILE = B_T * B_T * 2  # bytes of one 16 x 16 16-bit tile
-# fp16 (see ``KdaBprop``): Inter keeps A and T; dA, dA^T, dM, dM^T are fp32 (tf32) tiles of
+# fp16 (module docstring): Inter keeps A and T; dA, dA^T, dM, dM^T are fp32 (tf32) tiles of
 # ``Inter32``, K-major without swizzle (8-row x 16-byte core matrices: LBO 128, SBO 512).
 TF32_INTER_TILES = 2
 TF32_TILE = B_T * B_T * 4
@@ -415,8 +415,7 @@ class KdaBprop(WarpSpecialized):
             "BetaM": plan.buffer("BetaM", f32, align=64),
         }
         for name in ("State", "Dstate", "Kdecay", "Kinv", "Qdecay"):
-            wide = self.tf32_decay and name == "Kinv"
-            buf[name] = plan.buffer(name, f32 if wide else io_t, align=1024)
+            buf[name] = plan.buffer(name, self.decay_t if name == "Kinv" else io_t, align=1024)
         buf["Scale"] = plan.buffer("Scale", f32, align=16)
         for name in ("Inter", "Do", "Dv", "Q", "K", "V"):
             buf[name] = plan.buffer(name, io_t, align=1024)

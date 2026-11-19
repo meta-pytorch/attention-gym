@@ -79,6 +79,7 @@ from .kda_common import (
     CUTE_DTYPES,
     TORCH_NAMES,
     box128,
+    decay_fragment_offsets,
     lds_16_f32,
     lds_f32,
     lds_v4,
@@ -91,7 +92,6 @@ from .kda_common import (
     sts_tf32x8,
     swz32,
     swz128,
-    tf32_fragment_offsets,
 )
 from .ptx import (
     f16x2_to_f32,
@@ -189,7 +189,7 @@ class KdaPrep(WarpSpecialized):
         # gate exchanges through one fp32 tile.
         if gate != "fp32":
             buf["Exchange"] = plan.buffer("Exchange", f32, align=1024)
-        buf["Kinv"] = plan.buffer("Kinv", f32 if self.tf32_decay else io_t, align=1024)
+        buf["Kinv"] = plan.buffer("Kinv", self.decay_t, align=1024)
         buf["Krestore"] = plan.buffer("Krestore", io_t, align=1024)
         buf["Inter"] = plan.buffer("Inter", io_t, align=1024)
         buf["Beta"] = plan.buffer("Beta", f32, align=128)
@@ -378,17 +378,10 @@ class KdaPrep(WarpSpecialized):
         decay_row = warp * 4 + lane // 8
         lane_in_row = lane - (lane // 8) * 8
         # ---- phase 2 ldmatrix / stmatrix lane decode (the prefill's warps 12 and 15) ------
-        ki_row = lane % 8 + (8 if lane // 16 else 0)
-        ki_col = 8 if (lane // 8) % 2 else 0
         a_row = lane % 8 + (8 if (lane // 8) % 2 else 0)
         a_col = 8 if (lane // 8) // 2 else 0
         inverse_idx = a_row * B_T + swz32(a_row, a_col)
-        if cutlass.const_expr(self.tf32_decay):
-            ki_offs = tf32_fragment_offsets(lane, d_k, b_operand=True)
-            kd_offs = tf32_fragment_offsets(lane, d_k, b_operand=False)
-        else:
-            ki_offs = [opaque_i32(ki_row * 64 + swz128(ki_row, i * 16 + ki_col)) for i in range(4)]
-            kd_offs = [opaque_i32(swz128(a_row, a_row * 64 + i * 16 + a_col)) for i in range(4)]
+        kd_offs, ki_offs = decay_fragment_offsets(lane, d_k, self.tf32_decay)
         geo = (
             lane,
             warp,

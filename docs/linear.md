@@ -494,7 +494,15 @@ dgate and dbeta then lose precision. Measured as relative RMS error against FP64
 sequence of `T=512`, `H=2`, normalized q/k, default scale), a constant per-token gate of `-5.0`
 gave 0.4-0.7% on dv, dgate and dbeta, comparable to the fused backend; `-5.3` gave 0.7-2% and
 `-5.45` 6-20%. About `-5.25` is therefore an empirical guideline for uniform gates in training,
-not a guarantee: the margin depends on the scale and magnitude of q. Kimi-style
+not a guarantee: the margin depends on the scale and magnitude of q. It also depends on the size
+of the output gradient: the FP32 dq accumulator sums `k[j, c] 2^-g[j, c] dA[i, j]` over earlier
+tokens `j`, where `dA[i, j] = dO_i . U_j` pairs a token's output gradient with an earlier token's
+value update, before the `2^g` scale cancels it. With uniform `-5.25` gates, where `2^-g` reaches
+`2^114` within a chunk, a unit key component and a unit 128-wide value update made dq and dgate
+infinite once that `dA` entry reached `2^15` (`dO = 256`; `dO = 128` stayed accurate), in BF16
+and FP16 alike. The threshold scales with the key component and the number of contributing
+tokens, so `2^15` is that example's value, not a general cutoff. Loss scaling multiplies dO, and
+dA with it. Kimi-style
 `lower_bound * sigmoid(...)` gates with `lower_bound = -5.45` stayed at 0.6% (maximum absolute
 error over the FP64 gradient's maximum, ragged `H=2` sequences), because few 16-token sums reach
 the bound. On the same relative-RMS workload the forward error also roughly doubles at `-5.45`,
@@ -515,8 +523,23 @@ of `2^-13` on that channel (`scale=1`, only the last token writing a unit value)
 instead of `2^-13`, with or without `fastmath`. The products with the recurrent state also still
 read FP16 `Q_decay` and `K_decay`, which flush below the FP16 range: with five `-3.5` gates, an
 entry-state value of 4096, a unit query selecting it and `beta = 0`, warpdrive and fused FP16
-both returned 0 where the exact output is the FP16-normal `1.03e-4` (BF16: `1.03e-4`). These
-limits are not checked at runtime. The training example uses the Kimi-style FP32 transform
+both returned 0 where the exact output is the FP16-normal `1.03e-4` (BF16: `1.03e-4`). The FP16
+backward also stages the FP32 state cotangent `dS` itself as an FP16 operand. Each element must
+round within 65504 (an exit cotangent of 65520 made dk, dv, dgate and dbeta non-finite where 65504
+was accurate), but that per-element limit is not a safe loss-scaling bound: products built from
+`dS` are also cast to FP16 before later factors shrink them. `dU = dS K_restore` is cast before
+`beta` scales it, so one token with zero gate, a normalized key of 64 components `1/8`, `beta =
+1/8` and a `dS` row of 8192 on those components gave dv = inf where the exact value is 8192.
+`K_restore = k 2^(g_last - g)` falls below the smallest FP16 subnormal, `2^-24`, once
+`g_last - g < -24 - log2|k|`, and then rounds up to `2^-24` or down to zero even when its product
+with `dS` is FP16-normal, so the gradients lose or misstate that term: a key `2^-11 e0` followed
+by fourteen `-ln 2` gates on its channel gave dv = 0 instead of `2^-13` (thirteen gates:
+accurate). This rounding is shared with the forward, whose state update reads the same FP16
+`K_restore`: with a value of 4096 at that first token, the FP16 final state was 0 instead of
+`2^-13`. Widening `dS` alone therefore cannot recover the term; a TF32 or power-of-two-scaled
+fix has to keep the key's range before that cast, in the forward and the backward, and the full
+backward kernel has no tensor or shared memory left for it without a redesign. These limits are not checked at runtime. The training
+example uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
