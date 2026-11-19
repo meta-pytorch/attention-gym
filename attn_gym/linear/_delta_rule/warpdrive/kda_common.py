@@ -15,7 +15,16 @@ from cutlass.cute.arch import inline_ptx
 
 from attn_gym.warpdrive.thread_sync import tcgen05_after_thread_sync, tcgen05_before_thread_sync
 
-from .ptx import elect_sync, f16x2_to_f32, fmul2, fp32_to_fp16
+from .ptx import (
+    elect_sync,
+    f16x2_to_f32,
+    fmul2,
+    fp32_to_fp16,
+    ldmatrix,
+    mma_step,
+    mma_step_tf32,
+    st_shared_v4,
+)
 from .ragged import RaggedTma, ragged_load
 
 B_T = 16
@@ -304,3 +313,104 @@ def ldg_l2_f32(addr, dtype: cutlass.Constexpr):
         write_only_types=[Float32],
         read_only_args=[Int64(addr)],
     )
+
+
+# ---- TF32 decay operands (fp16 io) -------------------------------------------------------
+# NOTE [TF32 decay operands]
+# With g the per-channel prefix log2 decay of a 16-token chunk, the in-chunk products are
+# A[i, j] = (Q[i] * 2^g[i]) . (K[j] * 2^-g[j]) for j <= i, and KK[i, j], which uses K[i] in place
+# of Q[i]. On the diagonal the decay cancels exactly in the math, but staging the operands in
+# fp16 can turn one into zero and the other into infinity before they multiply: their ratio spans
+# the whole 16-token gate sum (about 2^121 at the gate bound). That is why the fp16 kernels form
+# these operands (Q_decay or K_decay, and K_inv) in fp32 and round them to tf32 for m16n8k8 tf32
+# mma.sync: they need the exponent range, not accumulator precision.
+#
+# The operands are fp32 ``[16, d_k]`` tiles with one layout, ``tf32_tile``, which both the row
+# stores (``sts_tf32x8``) and the fragment loads (``tf32_fragment_offsets``) index by
+# (row, column). Rows are 16-byte chunks of four fp32 columns; the layout places logical chunk
+# ``c = (c4, c3 c2 c1, c0)`` at physical chunk ``(c4, c0, c3 c2 c1 ^ row & 7)``, so the eight
+# rows each ``ldmatrix`` matrix reads, and the eight chunks ``2 l + c0`` that eight lanes of a
+# row store, land in distinct 16-byte bank groups.
+
+
+def tf32_tile(d_k: int):
+    """Layout of a tf32 decay tile in fp32 elements, indexed by ``(row, column)`` (NOTE [TF32
+    decay operands]): the column permutation, then ``Swizzle<3, 2, log2(d_k) - 2>`` XORs the
+    chunk bits ``c3 c2 c1`` with ``row & 7``."""
+    perm = cute.make_layout((B_T, (4, 2, 8, d_k // 64)), stride=(d_k, (1, 32, 4, 64)))
+    return cute.make_composed_layout(cute.make_swizzle(3, 2, d_k.bit_length() - 3), 0, perm)
+
+
+@cute.jit
+def tf32_offset(row, dim, d_k: cutlass.Constexpr[int]):
+    """Byte offset of fp32 ``(row, dim)`` in a tf32 decay tile."""
+    return 4 * cute.crd2idx((row, dim), tf32_tile(d_k))
+
+
+@cute.jit
+def sts_tf32x8(base, row, dim, values, d_k: cutlass.Constexpr[int]):
+    """Round eight fp32 ``values`` of row ``row``, columns ``[dim, dim + 8)``, to tf32 and store
+    them into the tile at ``base``."""
+    words = [cute.arch.cvt_f32_tf32(v) for v in values]
+    for half in cutlass.range_constexpr(2):
+        st_shared_v4(base + tf32_offset(row, dim + 4 * half, d_k), words[4 * half : 4 * half + 4])
+
+
+def tf32_fragment_offsets(lane, d_k: int, *, b_operand: bool):
+    """This lane's ``ldmatrix.x4`` row offsets of k-steps ``0..7`` (add ``256 * (ks // 8)`` for
+    k-step ``ks``). With ``lane = r + 8 u + 16 v``, k-step ``s`` reads ``(r + 8 u, 8 s + 4 v)``
+    for the A fragment of rows ``[0, 16)`` and, swapping ``u`` and ``v``, ``(r + 8 v, 8 s + 4 u)``
+    for the B fragment of tokens ``[0, 16)``. The swizzle only permutes a row's chunks, so step
+    ``s`` is step 0 XOR the row-0 offset of column ``8 s``. Evaluating ``tf32_tile`` at every
+    step instead lengthened the roles' setup code and measured about 9% slower FP16 prefill."""
+    r, u, v = lane % 8, (lane // 8) % 2, lane // 16
+    if b_operand:
+        u, v = v, u
+    base = tf32_offset(r + 8 * u, 4 * v, d_k)
+    return [opaque_i32(base ^ tf32_offset(0, 8 * ks, d_k)) for ks in range(8)]
+
+
+@cute.jit
+def mma_tf32_16x16(acc, s_a, s_b, a_offs, b_offs, d_k: cutlass.Constexpr[int]):
+    """``acc[16, 16] += A B^T`` over ``d_k`` columns of two tf32 decay tiles (A rows at ``s_a``,
+    B rows at ``s_b``), in the m16n8k16 accumulator layout."""
+    for ks in cutlass.range_constexpr(d_k // 8):
+        box = (ks // 8) * 256
+        af = ldmatrix(s_a + a_offs[ks % 8] + box, 4)
+        bf = ldmatrix(s_b + b_offs[ks % 8] + box, 4)
+        mma_step_tf32(acc, af, bf, M=16, N=16)
+
+
+@cute.jit
+def mma_decay_16x16(
+    acc, s_a, s_kinv, stage, a_offs, b_offs, d_k: cutlass.Constexpr[int], dtype: cutlass.Constexpr
+):
+    """``acc[16, 16] += A K_inv^T`` over ``d_k`` columns of one decay stage, ``A`` the decayed
+    rows (K_decay for KK, Q_decay for A) at ``s_a + stage`` and K_inv at ``s_kinv + stage``:
+    tf32 tiles (offsets from ``tf32_fragment_offsets``) when ``dtype`` is Float32, else
+    ``dtype`` tiles of 64-column 128-byte-swizzled boxes (element offsets of the first box's
+    four 16-column steps)."""
+    if cutlass.const_expr(dtype is Float32):
+        mma_tf32_16x16(acc, s_a + stage, s_kinv + stage, a_offs, b_offs, d_k)
+    else:
+        for i in cutlass.range_constexpr(d_k // 16):
+            box = (i // 4) * (B_T * 64)
+            kif = ldmatrix(s_kinv + stage + 2 * (b_offs[i % 4] + box), 4)
+            af = ldmatrix(s_a + stage + 2 * (a_offs[i % 4] + box), 4)
+            mma_step(acc, af, kif, k_step=0, M=16, N=16, dtype=dtype)
+
+
+def decay_stage_addresses(h_rows, rows: str, kh, s_rows, s_kinv, d_k: int, tf32: bool):
+    """``mma_decay_16x16``'s ``(s_a, s_kinv, stage)`` at a decay ring stage, recording the
+    reads: the views of the tf32 tiles ``rows + "32"`` of handle ``h_rows`` and ``Kinv`` of
+    ``kh`` (stage 0) under ``tf32``, else the 16-bit tiles at ``s_rows`` and ``s_kinv`` and
+    ``h_rows``'s stage offset (the rings advance together)."""
+    if tf32:
+        return (
+            h_rows.view(rows + "32", read=True).iterator.toint(),
+            kh.view("Kinv", read=True).iterator.toint(),
+            0,
+        )
+    h_rows.access(rows, read=True, by="threads")
+    kh.access("Kinv", read=True, by="threads")
+    return s_rows, s_kinv, h_rows.index * (d_k * B_T * 2)

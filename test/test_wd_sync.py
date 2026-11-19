@@ -351,6 +351,14 @@ FENCE_UNVERIFIED = {
     ("kda_prefill", "qk commit_fence smem_async"): (
         _GENERIC_TO_UMMA + " (Krestore); the epilogue reads only Qdecay"
     ),
+    ("kda_recompute", "kk commit_fence smem_async"): (
+        _GENERIC_TO_UMMA + " (Kdecay); under fp16 the regmma consumer reads only the tf32 tiles "
+        "(Kdecay32, Kinv), which the check reports as a missing Kdecay access"
+    ),
+    ("kda_summary", "kk commit_fence smem_async"): (
+        _GENERIC_TO_UMMA + " (Kdecay); under fp16 the regmma consumer reads only the tf32 tiles "
+        "(Kdecay32, Kinv), which the check reports as a missing Kdecay access"
+    ),
     ("kda_prep", "raw release_fence smem_async"): (
         "warp 0 refills the stage by TMA after the empty wait (external producer); consumers "
         "read it, and with an fp32 gate write it, generically: smem_async"
