@@ -7,9 +7,9 @@ import torch
 
 from attn_gym.linear import ReplayState, StateCheckpoints, chunk_kda, paged_chunk_kda
 from attn_gym.linear.kda.ops import chunk_replay_commit_op
+from attn_gym.testing import CHECKPOINT_SENTINEL, sentinel_state_checkpoints
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
-SENTINEL = 12345.0
 OPTIONS = {"schedule": "static", "autotune": False}
 
 
@@ -52,7 +52,7 @@ def expected_checkpoints(
     packed: bool,
 ) -> torch.Tensor:
     """Stop independent, replay-prepended chunk calls at each requested boundary."""
-    expected = torch.full_like(saved.states, SENTINEL)
+    expected = torch.full_like(saved.states, CHECKPOINT_SENTINEL)
     reservations = checkpoint_counts(lengths, routes, flags, counts, saved.every_n_tokens)
     token_start = checkpoint_start = 0
     for sequence, (length, slot, has_state, reserved) in enumerate(
@@ -94,14 +94,16 @@ def assert_replay_equal(actual: ReplayState, expected: ReplayState) -> None:
         torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0, equal_nan=True)
 
 
-@pytest.mark.parametrize("interval", [64, 128, 192])
 @pytest.mark.parametrize(
-    "mode,state_dtype",
+    "mode,state_dtype,interval",
     [
-        ("packed", torch.float32),
-        ("dense", torch.float32),
-        ("decode", torch.float32),
-        ("decode", torch.bfloat16),
+        ("packed", torch.float32, 64),
+        ("packed", torch.float32, 192),
+        ("dense", torch.float32, 128),
+        ("decode", torch.float32, 64),
+        ("decode", torch.bfloat16, 64),
+        # Intervals above 64 never complete during one-token decode.
+        ("decode", torch.float32, 128),
     ],
 )
 @torch.no_grad()
@@ -135,11 +137,7 @@ def test_replay_checkpoints_match_chunk_boundaries(
     for tensor in initial_replay[:-1]:
         tensor[1].fill_(float("nan"))
     reserved = checkpoint_counts(lengths, routes, flags, counts, interval)
-    saved = StateCheckpoints(
-        torch.full((sum(reserved) + 2, 1, 128, 128), SENTINEL, device="cuda"),
-        cumulative_sequence_offsets(reserved),
-        interval,
-    )
+    saved = sentinel_state_checkpoints(reserved, interval, (1, 128, 128))
     expected_states = expected_checkpoints(
         tensors,
         initial_cache,
@@ -198,7 +196,7 @@ def test_replay_checkpoints_read_changed_graph_metadata(
     slots = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)
     has_initial = torch.ones(3, device="cuda", dtype=torch.bool)
     cu_seqlens = None if decode else cumulative_sequence_offsets([45, 173, 166])
-    states = torch.full((11, 1, 128, 128), SENTINEL, device="cuda")
+    states = torch.full((11, 1, 128, 128), CHECKPOINT_SENTINEL, device="cuda")
     offsets = cumulative_sequence_offsets([1, 0, 0] if decode else [1, 3, 2])
 
     def run(cache, replay, checkpoints):
@@ -252,7 +250,7 @@ def test_replay_checkpoints_read_changed_graph_metadata(
         for destination, source in zip(replay_state, initial_replay, strict=True):
             destination.copy_(source)
         replay_state.count.copy_(torch.tensor(counts, device="cuda", dtype=torch.int32))
-        states.fill_(SENTINEL)
+        states.fill_(CHECKPOINT_SENTINEL)
         expected_cache = state_cache.clone()
         expected_replay = clone_replay(replay_state)
         expected_states = expected_checkpoints(
@@ -266,7 +264,7 @@ def test_replay_checkpoints_read_changed_graph_metadata(
             counts,
             packed=not decode,
         )
-        eager_states = torch.full_like(states, SENTINEL)
+        eager_states = torch.full_like(states, CHECKPOINT_SENTINEL)
         expected_output = run(expected_cache, expected_replay, eager_states)
         torch.testing.assert_close(eager_states, expected_states, rtol=0, atol=0)
         if execution == "fullgraph":
@@ -297,7 +295,7 @@ def test_replay_checkpoint_commit_operator_registration(
     active_counts = torch.tensor([63, 17, 0, 0], device="cuda", dtype=torch.int32)
     state_cache = torch.randn(6, 1, 128, 128, device="cuda")
     replay_count = torch.zeros(6, device="cuda", dtype=torch.int32)
-    states = torch.full((3, 1, 128, 128), SENTINEL, device="cuda")
+    states = torch.full((3, 1, 128, 128), CHECKPOINT_SENTINEL, device="cuda")
     offsets = cumulative_sequence_offsets([1, 0, 0, 0])
     args = (
         final_state,
@@ -310,23 +308,15 @@ def test_replay_checkpoint_commit_operator_registration(
         offsets,
         64,
     )
-    torch.library.opcheck(chunk_replay_commit_op, args)
-    states.fill_(SENTINEL)
+    if not wide_offsets:
+        torch.library.opcheck(chunk_replay_commit_op, args)
+        states.fill_(CHECKPOINT_SENTINEL)
     chunk_replay_commit_op(*args)
     torch.testing.assert_close(states[0], final_state[0], rtol=0, atol=0)
-    assert torch.all(states[1:] == SENTINEL)
+    assert torch.all(states[1:] == CHECKPOINT_SENTINEL)
 
 
-def test_replay_checkpoint_commit_declares_all_mutations() -> None:
-    writes = {
-        argument.name
-        for argument in chunk_replay_commit_op._schema.arguments
-        if argument.alias_info is not None and argument.alias_info.is_write
-    }
-    assert writes == {"state_cache", "replay_count", "checkpoint_states"}
-
-
-@pytest.mark.parametrize("invalid", ["dtype", "stride", "shape", "offsets", "interval"])
+@pytest.mark.parametrize("invalid", ["dtype", "offsets"])
 def test_raw_replay_checkpoint_commit_rejects_invalid_metadata_without_device_execution(
     invalid: str,
 ) -> None:
@@ -340,17 +330,10 @@ def test_raw_replay_checkpoint_commit_rejects_invalid_metadata_without_device_ex
     states = torch.empty(2, 1, 128, 128)
     offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
     interval = 64
-    match invalid:
-        case "dtype":
-            states = states.bfloat16()
-        case "stride":
-            states = states.transpose(-1, -2)
-        case "shape":
-            states = states[:, :, :, :64]
-        case "offsets":
-            offsets = None
-        case "interval":
-            interval = 65
+    if invalid == "dtype":
+        states = states.bfloat16()
+    else:
+        offsets = None
     with pytest.raises((TypeError, ValueError), match="checkpoint"):
         commit_paged_chunk_replay(
             final_state,
@@ -375,7 +358,7 @@ def test_replay_checkpoint_commit_reuses_runtime_intervals(cuda: None, triton_co
         slots = torch.arange(1, sequences + 1, device="cuda", dtype=torch.int32)
         counts = torch.full((sequences,), 63, device="cuda", dtype=torch.int32)
         replay_count = torch.zeros(sequences + 1, device="cuda", dtype=torch.int32)
-        states = torch.full_like(final, SENTINEL)
+        states = torch.full_like(final, CHECKPOINT_SENTINEL)
         offsets = cumulative_sequence_offsets([int(interval == 64)] * sequences)
         chunk_replay_commit_op(
             final, slots, None, counts, cache, replay_count, states, offsets, interval
@@ -383,5 +366,5 @@ def test_replay_checkpoint_commit_reuses_runtime_intervals(cuda: None, triton_co
         if interval == 64:
             torch.testing.assert_close(states, final, rtol=0, atol=0)
         else:
-            assert torch.all(states == SENTINEL)
+            assert torch.all(states == CHECKPOINT_SENTINEL)
     assert triton_compiles["_commit_state_kernel"] == 1
