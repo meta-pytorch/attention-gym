@@ -180,6 +180,51 @@ reservations can require more scoring/selection launches to preserve the 32 MiB
 workspace bound. The bounded scoring grid removes launches of CTAs for every
 reserved candidate tile; it does not make latency independent of reserved capacity.
 
+Measure the complete decode workload and profile scoring and Top-K within the same
+CUDA Graph replay. Install the pinned Transformer Nuggets revision shown by the
+benchmark’s `--help` first:
+
+```bash
+python benchmarks/sparse/paged_indexer_benchmark.py \
+  --batch 1 16 64 --candidates 1024 8192 32768 --topk 512 \
+  --profile-rep 20 --peak-memory-gbps 8000 --peak-compute-tflops 2250 --reference \
+  --output agent_space/paged-indexer.json --trace agent_space/paged-indexer.json
+```
+
+These example ceilings are advertised B200 values; supply ceilings for your device.
+The CUDA-event median measures a complete warm, fixed-pointer graph replay. A separate
+profile of the same graph reports mean kernel time for scoring, Top-K, and any PyTorch
+initialization fills (on by default under `--deterministic`). Top-K's share includes all
+three stages in its denominator. These diagnostic means need not sum to the event median.
+Profiling uses `cuda.bindings` to check each captured kernel's launch count against the
+profiler events. Trace filenames include batch, live candidates, and reserved capacity.
+Profiling is optional: omit `--profile-rep` for CUDA-event timings alone, without
+hardware ceilings. Like the whole-document benchmark, timing defaults to 25 warmup
+replays and 100 measured replays, with `--warmup`, `--rep`, `--dtype`, and `--seed`
+overrides. Use `--capacity 4194304 --candidates 32768` to hold the live pool fixed
+while reserving more page-table space. `--weights negative` stresses zero-score cutoff
+ties, `--weights zero` exercises the no-scoring shortcut, and `--deterministic`
+measures selection with lower-ID tie breaking and ascending output IDs on both routes.
+The deterministic dense baseline stably sorts the full pool; the default uses `topk`.
+Each timed implementation is checked against the FP64 oracle before timing; `--ncu`
+also checks the fused case before profiling.
+
+`model_scenario.modeled_serial_estimate_us` is a **what-if estimate, not a lower bound
+on replay latency**. For scoring and Top-K, it sums the per-stage maximum of useful
+FLOPs at peak compute, all logical bytes at peak HBM bandwidth, and an assumed cost
+per captured launch (`--launch-latency-us`, default 1 µs). Besides Q, K, weights, page IDs, lengths, and query offsets, logical bytes count FP32
+scores, the visibility bounds written by scoring and read by the selected backend,
+and output IDs. Warm replay can serve these bytes from L2, and the launch cost is
+not measured. Initialization time is reported but not modeled. Integer radix passes,
+shared-memory atomics, and synchronization have no modeled compute ceiling, so the
+complete operation's roofline percentage remains unset.
+
+For physical counters, use Nsight Compute with `--profile-from-start off` and pass
+`--ncu --batch 64 --candidates 32768` to the benchmark. This warms the complete
+operation and brackets one CUDA Graph replay with `cudaProfilerStart/Stop`.
+Use `--replay-mode application --cache-control none --clock-control none` to preserve
+the warmed execution context across counter passes.
+
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 
 

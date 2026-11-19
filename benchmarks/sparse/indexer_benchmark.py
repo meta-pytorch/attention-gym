@@ -1,7 +1,7 @@
 """Benchmark the indexer's Top-K selection across backends and shapes.
 
 Requires Transformer Nuggets with CUDA graph sample statistics:
-    uv pip install "git+https://github.com/drisspg/transformer_nuggets.git@b8ae46be93f7c9d2133c025a7f15310484df8685"
+    uv pip install "git+https://github.com/drisspg/transformer_nuggets.git@020d19f700a35bd9be7417a4a3111156204bd23b"
 
 Usage:
     python benchmarks/sparse/indexer_benchmark.py
