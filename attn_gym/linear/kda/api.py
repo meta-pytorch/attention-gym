@@ -100,11 +100,10 @@ def chunk_kda(
             for finite results. Gradients need more margin: their error grows quickly past a
             uniform gate of about ``-5.25``, an empirical training guideline, while the common
             ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
-            ``docs/linear.md`` gives the measurements). The warpdrive FP16 forward forms its
-            in-chunk decay products from TF32 operands and has the BF16 bound above for
-            finite results; the FP16 backward still stages those operands in FP16, and its
-            gradients are non-finite from a uniform gate of about ``-1``. These limits are not
-            checked at runtime and do not apply to reference or recurrent execution.
+            ``docs/linear.md`` gives the measurements). warpdrive FP16 forms its in-chunk decay
+            products from TF32 operands, forward and backward, and shares the BF16 gate range
+            above. These limits are not checked at runtime and do not apply to reference or
+            recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
