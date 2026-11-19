@@ -36,8 +36,15 @@ from attn_gym._backends.triton.utils import (
     fixed_tree_sum,
     ptr_offset,
 )
+from attn_gym.linear._delta_rule.state_checkpoints import (
+    checkpoint_writes,
+    validate_state_checkpoints,
+)
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
-from attn_gym.linear._delta_rule.validation import validate_state_checkpoints
+from attn_gym.linear._delta_rule.triton.state_checkpoints import (
+    checkpoint_slot,
+    store_checkpoint,
+)
 from attn_gym.linear.types import StateCheckpoints
 
 configure_triton_allocator()
@@ -251,7 +258,11 @@ def _recurrent_delta_rule_fwd_kernel(
 
     if checkpoints is not None:
         checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n).to(tl.int64)
+        checkpoint_end = tl.load(checkpoints.cu_checkpoint_offsets + i_n + 1)
         next_checkpoint = checkpoints.every_n_tokens.to(tl.int64)
+        # Resolve each destination one interval early: this latency-bound scan would otherwise
+        # stall on the load at every store.
+        slot = checkpoint_slot(checkpoints, checkpoint_row, checkpoint_row < checkpoint_end)
 
     # Load key-indexed operands as [BK, BV] tiles in the state's layout; broadcasting [BK]
     # vectors costs a layout conversion per operand per token.
@@ -303,13 +314,18 @@ def _recurrent_delta_rule_fwd_kernel(
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
         if checkpoints is not None:  # noqa: SIM102 - optional counters need their constexpr guard
             if i_t + 1 == next_checkpoint:
-                # Widen before products: the tape can exceed int32 element offsets.
-                p_checkpoint = ptr_offset(
-                    (checkpoint_row, i_h, o_v[None, :], o_k[:, None]),
-                    (H * V * K, V * K, K, 1),
+                # Slots are int64: tapes and pools can exceed int32 element offsets.
+                store_checkpoint(
+                    checkpoints,
+                    slot,
+                    ptr_offset((i_h, o_v[None, :], o_k[:, None]), (V * K, K, 1)),
+                    b_state,
+                    m_kv,
                 )
-                tl.store(checkpoints.states + p_checkpoint, b_state, mask=m_kv)
                 checkpoint_row += 1
+                slot = checkpoint_slot(
+                    checkpoints, checkpoint_row, checkpoint_row < checkpoint_end
+                )
                 next_checkpoint += checkpoints.every_n_tokens
 
     if STORE_FINAL_STATE:
@@ -424,8 +440,8 @@ def launch_recurrent_delta_rule_fwd(
         batch_invariant: Use one formula, fixed-order sums over K and no FMA fusion, so a
             sequence's output and state bits do not depend on the launch config that the batch
             shape picks. Composes with ``autotune`` and prefetching.
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots; requires paged mode
-            and receives the accumulator after each complete interval.
+        state_checkpoints: Optional caller-owned periodic snapshots; requires paged mode and
+            receives the accumulator after each complete interval.
 
     Returns:
         The output in ``q.dtype`` plus the final state (``None`` unless requested). In paged
@@ -482,7 +498,7 @@ def launch_recurrent_delta_rule_fwd(
         cu_seqlens,
         state_indices,
         has_initial_state,
-        state_checkpoints,
+        checkpoint_writes(state_checkpoints),
     )
     options: dict[str, Any] = {
         "scale": scale,

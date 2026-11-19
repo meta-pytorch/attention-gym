@@ -10,6 +10,7 @@ from attn_gym.linear import StateCheckpoints, recurrent_gdn
 from attn_gym.linear.gdn.ops import recurrent_fwd_paged_op
 from attn_gym.testing import (
     CHECKPOINT_SENTINEL,
+    assert_pool_checkpoints_match_tape,
     cumulative_sequence_offsets,
     sentinel_state_checkpoints,
     strided_state_pool,
@@ -100,7 +101,7 @@ def test_raw_metadata_validated_without_device_execution(invalid: str) -> None:
     from attn_gym.linear.gdn.impl.fused import _gdn_recurrent_fwd_paged_cuda
 
     with FakeTensorMode():
-        args, slots, (states, offsets, interval) = metadata_inputs()
+        args, slots, (states, offsets, interval, _) = metadata_inputs()
         if invalid == "dtype":
             states = states.bfloat16()
         else:
@@ -220,6 +221,79 @@ def test_dense_checkpoints_capture_fp32_before_pool_rounding(
     assert torch.all(saved.states[4:] == CHECKPOINT_SENTINEL)
 
 
+@pytest.mark.parametrize("batch_invariant", [False, True])
+@torch.no_grad()
+def test_checkpoints_written_into_a_strided_bf16_pool_match_the_tape(
+    cuda: None, batch_invariant: bool
+) -> None:
+    lengths = [129, 64, 200]
+    tensors = make_gdn_test_inputs(sum(lengths), key_dim=32, value_dim=17)[:5]
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    slots = torch.tensor([1, -1, 2], device="cuda", dtype=torch.int32)
+    _storage, cache = strided_state_pool(8, 2, 32, 17, dtype=torch.bfloat16)
+
+    def run(cache: torch.Tensor, saved: StateCheckpoints) -> torch.Tensor:
+        output, _ = recurrent_gdn(
+            *tensors,
+            cache,
+            state_indices=slots,
+            cu_seqlens=cu_seqlens,
+            state_checkpoints=saved,
+            kernel_options={"batch_invariant": batch_invariant},
+        )
+        return output
+
+    # Rows: 2 for the first sequence plus 1 spare, 1 reserved by the null route, 3 for the last.
+    tape = sentinel_state_checkpoints([3, 1, 3], 64, (2, 17, 32), spare=0)
+    assert_pool_checkpoints_match_tape(run, cache, tape, [3, 0, 6, 4, 5, -1, 7])
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("execution", ["fullgraph", "cuda_graph"])
+def test_graph_replay_reads_updated_destinations_in_the_state_cache(
+    cuda: None, execution: str
+) -> None:
+    tensors = make_gdn_test_inputs(256, key_dim=32, value_dim=17)[:5]
+    initial = torch.randn(8, 2, 17, 32, device="cuda") * 0.01
+    cache = initial.clone()
+    slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    destinations = torch.tensor([3, 4, 5, 6], device="cuda", dtype=torch.int32)
+    sequence_offsets = cumulative_sequence_offsets([128, 128])
+    checkpoint_offsets = cumulative_sequence_offsets([2, 2])
+
+    def run(cache: torch.Tensor, destinations: torch.Tensor) -> torch.Tensor:
+        output, _ = recurrent_gdn(
+            *tensors,
+            cache,
+            state_indices=slots,
+            cu_seqlens=sequence_offsets,
+            state_checkpoints=StateCheckpoints(cache, checkpoint_offsets, 64, destinations),
+            kernel_options={"batch_invariant": True},
+        )
+        return output
+
+    run(cache, destinations)
+    if execution == "fullgraph":
+        compiled = torch.compile(run, fullgraph=True)
+        compiled(cache, destinations)
+    else:
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = run(cache, destinations)
+    for selected in ([3, 0, 4, -1], [7, 6, 5, 4]):
+        destinations.copy_(torch.tensor(selected, device="cuda", dtype=torch.int32))
+        cache.copy_(initial)
+        expected_cache = initial.clone()
+        expected = run(expected_cache, destinations.clone())
+        if execution == "fullgraph":
+            output = compiled(cache, destinations)
+        else:
+            graph.replay()
+        assert_bits(output, expected)
+        assert_bits(cache, expected_cache)
+
+
 @torch.no_grad()
 def test_empty_sequences_and_zero_capacity_checkpoints(cuda: None) -> None:
     tensors = make_gdn_test_inputs(1, key_dim=32, value_dim=17)[:5]
@@ -237,13 +311,18 @@ def test_empty_sequences_and_zero_capacity_checkpoints(cuda: None) -> None:
     assert_bits(cache, initial)
 
 
-def test_checkpoint_operator_registration(cuda: None) -> None:
+@pytest.mark.parametrize("into_state_cache", [False, True])
+def test_checkpoint_operator_registration(cuda: None, into_state_cache: bool) -> None:
     tensors = make_gdn_test_inputs(128, key_dim=32, value_dim=17, gate_pattern="near_zero")[:5]
     cache = torch.randn(5, 2, 17, 32, device="cuda", dtype=torch.bfloat16) * 0.01
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     flags = torch.tensor([True, False], device="cuda")
     sequence_offsets = cumulative_sequence_offsets([64, 64])
     saved = snapshots([64, 64], 64, spare=0)
+    if into_state_cache:
+        # Destinations alias the advanced pool: slots 2 and 4 are not routed.
+        destinations = torch.tensor([2, 4], device="cuda", dtype=torch.int32)
+        saved = saved._replace(states=cache, destinations=destinations)
     torch.library.opcheck(
         recurrent_fwd_paged_op,
         (*tensors, cache, slots, flags, sequence_offsets, 32**-0.5, True, *saved),

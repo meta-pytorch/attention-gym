@@ -7,7 +7,11 @@ import torch
 
 from attn_gym.linear import ReplayState, StateCheckpoints, chunk_kda, paged_chunk_kda
 from attn_gym.linear.kda.ops import chunk_replay_commit_op
-from attn_gym.testing import CHECKPOINT_SENTINEL, sentinel_state_checkpoints
+from attn_gym.testing import (
+    CHECKPOINT_SENTINEL,
+    assert_pool_checkpoints_match_tape,
+    sentinel_state_checkpoints,
+)
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 OPTIONS = {"schedule": "static", "autotune": False}
@@ -179,6 +183,39 @@ def test_replay_checkpoints_match_chunk_boundaries(
     torch.testing.assert_close(saved.states, expected_states, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("mode", ["packed", "decode"])
+@torch.no_grad()
+def test_replay_checkpoints_written_into_the_state_cache_match_the_tape(
+    cuda: None, mode: str, no_benchmarking: None
+) -> None:
+    decode = mode == "decode"
+    lengths = [1, 1, 1] if decode else [45, 173, 70]
+    counts = [0, 63, 19, 63, 0, 0, 0, 0]  # Slots 4-7 receive checkpoints.
+    tensors = make_kda_test_inputs(
+        1 if decode else sum(lengths), batch=3 if decode else 1, gate_scale=0.1
+    )
+    initial_replay = replay_buffers(counts)
+    slots = torch.tensor([1, 2, 3], device="cuda", dtype=torch.int32)
+    cu_seqlens = None if decode else cumulative_sequence_offsets(lengths)
+    cache = torch.randn(len(counts), 1, 128, 128, device="cuda") * 0.01
+
+    def run(cache: torch.Tensor, saved: StateCheckpoints) -> torch.Tensor:
+        return paged_chunk_kda(
+            *tensors,
+            cache,
+            slots,
+            cu_seqlens=cu_seqlens,
+            replay_state=clone_replay(initial_replay),
+            state_checkpoints=saved,
+            kernel_options=OPTIONS,
+        )
+
+    reserved = checkpoint_counts(lengths, [1, 2, 3], [True] * 3, counts, 64)
+    tape = sentinel_state_checkpoints(reserved, 64, (1, 128, 128), spare=0)
+    destinations = [4, 5] if decode else [4, 0, 5, 6, -1, 7]
+    assert_pool_checkpoints_match_tape(run, cache, tape, destinations)
+
+
 @pytest.mark.parametrize("mode", ["decode", "prefill"])
 @pytest.mark.parametrize("execution", ["fullgraph", "cuda_graph"])
 @torch.no_grad()
@@ -310,6 +347,15 @@ def test_replay_checkpoint_commit_operator_registration(
     )
     if not wide_offsets:
         torch.library.opcheck(chunk_replay_commit_op, args)
+        # Destinations alias the state cache: slot 5 is not routed.
+        alias_args = (
+            *args[:6],
+            state_cache,
+            offsets,
+            64,
+            torch.tensor([5], device="cuda", dtype=torch.int32),
+        )
+        torch.library.opcheck(chunk_replay_commit_op, alias_args)
         states.fill_(CHECKPOINT_SENTINEL)
     chunk_replay_commit_op(*args)
     torch.testing.assert_close(states[0], final_state[0], rtol=0, atol=0)

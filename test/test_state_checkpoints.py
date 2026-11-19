@@ -18,7 +18,11 @@ from attn_gym.linear import (
 )
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
-from attn_gym.testing import CHECKPOINT_SENTINEL, sentinel_state_checkpoints
+from attn_gym.testing import (
+    CHECKPOINT_SENTINEL,
+    assert_pool_checkpoints_match_tape,
+    sentinel_state_checkpoints,
+)
 from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
@@ -120,6 +124,37 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
         checkpoint_start += length // interval
 
     torch.testing.assert_close(saved.states, expected_states, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+@torch.no_grad()
+def test_checkpoints_written_into_the_state_cache_match_the_tape(
+    rule: Rule, cuda: None, state_dtype: torch.dtype, triton_compiles
+) -> None:
+    paged, _ = operations(rule)
+    # Rows: 2 for the second sequence, 1 reserved by the null route, 3 for the last.
+    lengths = [0, 130, 64, 200]
+    tensors = inputs(rule, sum(lengths))
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    slots = torch.tensor([1, 2, -1, 3], device="cuda", dtype=torch.int32)
+    cache = torch.randn(9, 2, 128, 128, device="cuda", dtype=state_dtype) * 0.01
+
+    def run(cache: torch.Tensor, saved: StateCheckpoints) -> torch.Tensor:
+        return paged(
+            *tensors,
+            cache,
+            slots,
+            cu_seqlens=cu_seqlens,
+            state_checkpoints=saved,
+            kernel_options=options(rule),
+        )
+
+    # The last sequence reserves one row more than it produces.
+    tape = sentinel_state_checkpoints([0, 2, 1, 4], 64, (2, 128, 128), spare=0)
+    # Destination values are runtime data: both selections reuse one compiled recurrence.
+    for destinations in ([4, 0, 5, -1, 6, 7, 8], [8, 7, 0, 6, 5, 4, 3]):
+        assert_pool_checkpoints_match_tape(run, cache, tape, destinations)
+    assert triton_compiles["chunk_delta_h_kernel"] == 2
 
 
 @torch.no_grad()
@@ -254,8 +289,15 @@ def checkpoint_operator_inputs(rule: Rule) -> tuple[torch._ops.OpOverload, tuple
     return op, (*args, *checkpoints([64, 64], 64))
 
 
-def test_checkpoint_paged_operator_registration(rule: Rule, cuda: None) -> None:
+@pytest.mark.parametrize("into_state_cache", [False, True])
+def test_checkpoint_paged_operator_registration(
+    rule: Rule, cuda: None, into_state_cache: bool
+) -> None:
     op, args = checkpoint_operator_inputs(rule)
+    if into_state_cache:
+        # Destinations alias the advanced pool: slots 2 and 4 are not routed.
+        destinations = torch.tensor([2, 4], device="cuda", dtype=torch.int32)
+        args = (*args[:-4], args[5], args[-3], args[-2], destinations)
     torch.library.opcheck(op, args)
 
 
@@ -264,13 +306,13 @@ def test_raw_checkpoint_operator_validates_before_launch(
     rule: Rule, cuda: None, invalid: str
 ) -> None:
     op, args = checkpoint_operator_inputs(rule)
-    states, offsets, interval = args[-3:]
+    states, offsets, interval, _ = args[-4:]
     if invalid == "dtype":
         states = states.bfloat16()
     else:
         offsets = None
     with pytest.raises((TypeError, ValueError), match="checkpoint"):
-        op(*args[:-3], states, offsets, interval)
+        op(*args[:-4], states, offsets, interval)
 
 
 def fake_paged_call(
@@ -328,6 +370,22 @@ INVALID_METADATA = {
     ),
     "offset_device": lambda c: c._replace(cu_checkpoint_offsets=c.cu_checkpoint_offsets.cpu()),
     "autograd": lambda c: c._replace(states=c.states.requires_grad_()),
+    "destination_dtype": lambda c: c._replace(
+        destinations=torch.empty(4, device="cuda", dtype=torch.int64)
+    ),
+    "destination_shape": lambda c: c._replace(
+        destinations=torch.empty(2, 2, device="cuda", dtype=torch.int32)
+    ),
+    "destination_stride": lambda c: c._replace(
+        destinations=torch.empty(8, device="cuda", dtype=torch.int32)[::2]
+    ),
+    "pool_dtype": lambda c: c._replace(
+        states=c.states.half(), destinations=torch.empty(4, device="cuda", dtype=torch.int32)
+    ),
+    "pool_slot_stride": lambda c: c._replace(
+        states=c.states.transpose(-1, -2),
+        destinations=torch.empty(4, device="cuda", dtype=torch.int32),
+    ),
 }
 
 

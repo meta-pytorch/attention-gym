@@ -13,8 +13,8 @@ from attn_gym._backends.cute import (
     tensor_supports_tma_rows,
 )
 from attn_gym._backends.profiler import profiler_range
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoints_from_op_args
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
-from attn_gym.linear._delta_rule.validation import state_checkpoints_from_op_args
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk
@@ -451,6 +451,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_destinations: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_paged_private_abi(
@@ -481,7 +482,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         schedule=ScheduleRequest(schedule),
         fastmath=True,
         state_checkpoints=state_checkpoints_from_op_args(
-            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_destinations
         ),
     )
     return output

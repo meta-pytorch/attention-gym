@@ -13,7 +13,8 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
 )
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,

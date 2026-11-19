@@ -11,7 +11,8 @@ from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._lazy import register_lazy_cuda_impls
 from attn_gym.linear.types import StateCheckpoints
 
@@ -56,7 +57,7 @@ torch.library.define(
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
     "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune, "
     "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
-    "int checkpoint_interval=0) "
+    "int checkpoint_interval=0, Tensor? checkpoint_destinations=None) "
     "-> Tensor",
 )
 _RECURRENT_ARGS = (
@@ -70,7 +71,8 @@ torch.library.define(
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale, "
     "bool batch_invariant, Tensor(b!)? checkpoint_states=None, "
-    "Tensor? cu_checkpoint_offsets=None, int checkpoint_interval=0) -> Tensor",
+    "Tensor? cu_checkpoint_offsets=None, int checkpoint_interval=0, "
+    "Tensor? checkpoint_destinations=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_recurrent_decode",
@@ -237,6 +239,7 @@ def _chunk_fwd_packed_paged_fake(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_destinations: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty(v.shape, dtype=q.dtype, device=v.device)
 
@@ -355,9 +358,16 @@ def _recurrent_fwd_paged_fake(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_destinations: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
-    del batch_invariant, checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+    del (
+        batch_invariant,
+        checkpoint_states,
+        cu_checkpoint_offsets,
+        checkpoint_interval,
+        checkpoint_destinations,
+    )
     return torch.empty_like(v, dtype=q.dtype)
 
 

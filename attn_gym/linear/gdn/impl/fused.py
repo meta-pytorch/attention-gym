@@ -6,7 +6,7 @@ import torch
 
 from attn_gym.linear._delta_rule.decode import GateTransform, launch_recurrent_delta_rule_decode
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
-from attn_gym.linear._delta_rule.validation import state_checkpoints_from_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoints_from_op_args
 from attn_gym.linear.types import StateCheckpoints
 
 
@@ -118,6 +118,7 @@ def _gdn_recurrent_fwd_paged_cuda(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_destinations: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Advance selected cache slots with the shared scalar-gate scan."""
     return _launch_recurrent(
@@ -135,7 +136,7 @@ def _gdn_recurrent_fwd_paged_cuda(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         state_checkpoints=state_checkpoints_from_op_args(
-            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_destinations
         ),
     )[0]
 

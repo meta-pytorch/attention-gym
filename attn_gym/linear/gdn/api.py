@@ -6,13 +6,13 @@ import torch
 
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
+from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
-    validate_state_checkpoints,
 )
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
 from attn_gym.linear.gdn.impl.warpdrive import chunk_forward as warpdrive_chunk_forward
@@ -187,8 +187,9 @@ def paged_chunk_gdn(
             The recurrence that advances ``state_cache`` and the warpdrive backend always use
             fixed configurations.
 
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
-            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+        state_checkpoints: Optional caller-owned periodic snapshots, into an FP32 tape or
+            selected state-pool slots. See :class:`attn_gym.linear.StateCheckpoints` for
+            layouts and boundary semantics.
             Requires the fused backend.
 
     Returns:
@@ -300,8 +301,8 @@ def recurrent_gdn(
             autotune cache states. That config still follows the batch shape:
             ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
             the batch.
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots, written directly
-            from the recurrent accumulator before any pool-storage conversion. Requires
+        state_checkpoints: Optional caller-owned periodic snapshots, written directly from
+            the FP32 recurrent accumulator into a tape or selected state-pool slots. Requires
             ``state_indices`` and ``impl="fused"``. Boundaries are relative to this call;
             see :class:`attn_gym.linear.StateCheckpoints` for layout and boundary semantics.
 

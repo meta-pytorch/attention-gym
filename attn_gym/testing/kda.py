@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -42,6 +42,39 @@ def sentinel_state_checkpoints(
     """
     states = torch.full((sum(counts) + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
     return StateCheckpoints(states, cumulative_sequence_offsets(counts), every_n_tokens)
+
+
+def assert_pool_checkpoints_match_tape(
+    run: Callable[[torch.Tensor, StateCheckpoints], torch.Tensor],
+    cache: torch.Tensor,
+    tape: StateCheckpoints,
+    destinations: Sequence[int],
+) -> None:
+    """Check that writing checkpoint rows into the state cache matches the FP32 tape.
+
+    ``run(cache, checkpoints)`` advances ``cache`` in place. Each positive destination of a
+    written tape row receives that row in the cache dtype; every other slot, including the
+    destinations of unwritten rows, matches the tape run. Outputs must match too. Both runs use
+    the layout of ``cache``, including padding between slots.
+    """
+
+    def clone(tensor: torch.Tensor) -> torch.Tensor:
+        copy = torch.empty_strided(
+            tensor.shape, tensor.stride(), dtype=tensor.dtype, device=tensor.device
+        )
+        return copy.copy_(tensor)
+
+    tape_cache = clone(cache)
+    tape.states.fill_(CHECKPOINT_SENTINEL)
+    expected_output = run(tape_cache, tape)
+    pool_cache = clone(cache)
+    rows = torch.tensor(destinations, device=cache.device, dtype=torch.int32)
+    output = run(pool_cache, tape._replace(states=pool_cache, destinations=rows))
+    for row, slot in enumerate(destinations):
+        if slot > 0 and not torch.all(tape.states[row] == CHECKPOINT_SENTINEL):
+            tape_cache[slot] = tape.states[row]
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool_cache, tape_cache, rtol=0, atol=0, equal_nan=True)
 
 
 def packed_chunk_routes(

@@ -16,27 +16,41 @@ from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOpt
 
 
 class StateCheckpoints(NamedTuple):
-    """Caller-owned periodic FP32 snapshots for paged GDN and KDA inference.
+    """Caller-owned periodic snapshots of the recurrent state for paged GDN and KDA inference.
 
-    ``states`` is a contiguous buffer shaped ``[capacity, H, V, K]``. Sequence ``i``
-    writes its post-update states every ``every_n_tokens`` tokens, measured from that
-    sequence's start in this call. With KDA ``replay_state``, count from the start of
-    the slot's unfinished chunk instead: cached replay tokens precede the new tokens.
-    The interval must be a positive multiple of 64. A final state exactly on an interval
-    boundary is included; incomplete intervals produce no snapshot.
+    Sequence ``i`` produces its post-update state every ``every_n_tokens`` tokens, measured
+    from that sequence's start in this call. With KDA ``replay_state``, count from the start
+    of the slot's unfinished chunk instead: cached replay tokens precede the new tokens. The
+    interval must be a positive multiple of 64. A final state exactly on an interval boundary
+    is included; incomplete intervals produce no snapshot.
 
     ``cu_checkpoint_offsets`` is contiguous int32 on the input device, shaped ``[N + 1]``.
-    It starts at zero and never decreases. Each active sequence reserves
-    ``sequence_length // every_n_tokens`` rows, or
-    ``(replayed_tokens + sequence_length) // every_n_tokens`` for KDA replay. A fresh slot
-    (``has_initial_state=False``) has zero replayed tokens. Inactive sequences may reserve
-    unused rows. The final offset must not exceed ``capacity``. These values are caller
-    responsibilities: no device-to-host synchronization is performed to check them.
+    It is nonnegative and never decreases; sequence ``i`` owns rows ``offsets[i]`` up to
+    ``offsets[i + 1]``, and rows outside those ranges are not written. Each active sequence
+    produces ``sequence_length // every_n_tokens`` rows, or
+    ``(replayed_tokens + sequence_length) // every_n_tokens`` for KDA replay, and must reserve
+    at least that many; they fill its first rows. A fresh slot (``has_initial_state=False``)
+    has zero replayed tokens. Inactive sequences may reserve unused rows.
 
-    Inactive sequences (non-positive state indices) and unused capacity are not written.
-    Both tensors must be on the input device. The writable buffer must not alias any
-    input, including the state cache and checkpoint offsets. Snapshots come directly from
-    the FP32 recurrence accumulator, even when the persistent state cache uses BF16.
+    Rows are stored in one of two ways:
+
+    - Without ``destinations``, ``states`` is a contiguous FP32 tape shaped
+      ``[capacity, H, V, K]`` and row ``r`` is ``states[r]``. It holds the FP32 recurrence
+      accumulator exactly, even when the persistent state cache uses BF16. It must not
+      alias any input.
+    - With ``destinations``, a contiguous 1-D int32 tensor with one entry per row, row ``r``
+      is written to slot ``destinations[r]`` of ``states``, and non-positive entries skip the
+      row. ``states`` is then a state pool with the paged state-cache layout (FP32 or BF16,
+      contiguous within each ``[H, V, K]`` slot) and may be the state cache itself, so an
+      engine can publish prefix-cache states straight into its own slots. A BF16 pool rounds
+      the snapshots. Destinations of produced rows must be distinct and, when ``states``
+      aliases the state cache, must not be routed by this call.
+
+    The final offset must not exceed ``capacity``: the number of rows of the tape, or the
+    length of ``destinations``. Offset and destination values are caller responsibilities:
+    no device-to-host synchronization is performed to check them. Inactive sequences
+    (non-positive state indices) and unused rows are not written.
+
     Checkpointing is inference-only and requires the repo-local fused backend:
     ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or ``recurrent_gdn``
     with ``state_indices``.
@@ -50,6 +64,7 @@ class StateCheckpoints(NamedTuple):
     states: torch.Tensor
     cu_checkpoint_offsets: torch.Tensor
     every_n_tokens: int
+    destinations: torch.Tensor | None = None
 
 
 class ReplayState(NamedTuple):
