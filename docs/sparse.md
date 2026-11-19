@@ -181,9 +181,12 @@ On a GB300, BF16 decode with 16 queries in 16 sequences, 32,768 live candidates 
 K=512 took 68.66 µs with the Triton scorer and 57.51 µs with Warpdrive. Both timings
 include the same CuTe Top-K selector (warm CUDA Graph medians, shuffled physical pages).
 At 64 sequences and the same pool size, the difference was small: 153.32 vs. 151.98 µs.
-The scorer bounds the number of CTAs per query and reads page IDs only for visible
-tiles, so reserving a large table does not require a scoring CTA per reserved tile.
-The 32 MiB scratch limit still determines how many query slabs are launched.
+
+Both scorers cap the grid and loop over visible candidates on the GPU. With Triton scoring,
+rows with all-zero head weights return the first visible IDs without reading Q, K or scores.
+The portable Triton selector can finish its radix search early at an exact zero cutoff or
+when a prefix contains exactly `topk` candidates. Reserved capacity still determines score
+strides and slab sizes, so a large reservation can require more launches.
 
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 
