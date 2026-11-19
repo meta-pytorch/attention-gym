@@ -164,6 +164,18 @@ def test_shape_specialization_reuse(backend, permuted, triton_compiles):
         assert info.currsize == 1 and info.hits + info.misses == 3
 
 
+@pytest.mark.parametrize("topk", [7, 512])
+def test_zero_weights_and_pool_growth(backend, topk):
+    capacity = 4 * 16389 + 1
+    args = make_paged_indexer_test_inputs((1,), (capacity,))
+    args[2].zero_()
+    ids = torch.arange(topk, device="cuda", dtype=torch.int32)[None]
+    for length in (3, 4, 5, 7, 8, 17, 4096, capacity):
+        args[-1].fill_(length)
+        selected = paged_lightning_indexer(*args, topk=topk, kernel_options={"backend": backend})
+        torch.testing.assert_close(selected, torch.where(ids < length // 4, ids, -1))
+
+
 def test_zero_sequences_and_empty_gpu():
     args = list(make_paged_indexer_test_inputs((0,), (0,), tail=2))
     args[3] = args[3][:0]

@@ -168,6 +168,16 @@ launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[toke
 bounds buffer; query slabs reuse that allocation. Candidate capacity
 per sequence is limited to `2**22`.
 
+Scoring uses a bounded grid whose workers loop over visible candidates on the GPU.
+Rows with zero head weights return the first visible IDs without reading queries,
+keys, or scores. The portable Triton selector detects an exact zero cutoff during its sign pass
+and stops refinement as soon as a prefix contains exactly `topk` candidates.
+
+Reserved capacity still determines the score stride and query slab size: large
+reservations can require more scoring/selection launches to preserve the 32 MiB
+workspace bound. The bounded scoring grid removes launches of CTAs for every
+reserved candidate tile; it does not make latency independent of reserved capacity.
+
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 
 
