@@ -114,6 +114,19 @@ torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_paralle
 torchrun --standalone --nproc_per_node=4 examples/flex_attention/context_parallel_styles.py --seq-len 131072 --backend FLASH --trace-dir traces/
 ```
 
+## KDA Prefix-Cache Checkpoints
+
+[`examples/linear/kda_prefix_cache_checkpoints.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
+— Prefill one request through replay-backed `paged_chunk_kda` with periodic
+[state checkpoints](linear.md#paged-state-checkpoints-gdn-and-kda), then serve a second request that
+shares its prompt prefix. The second slot is seeded with the checkpoint and the prefix's replay tail
+and prefills only its own suffix; the script checks that output, state, and replay tail match a full
+prefill bitwise.
+
+```bash
+python examples/linear/kda_prefix_cache_checkpoints.py
+```
+
 ## Delta-Rule Context Parallelism
 
 [`examples/linear/delta_rule_context_parallel.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/delta_rule_context_parallel.py)

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.naive import naive_recurrent_kda
+from attn_gym.linear.types import StateCheckpoints
 
 
 def cumulative_sequence_offsets(
@@ -22,6 +23,25 @@ def cumulative_sequence_offsets(
     for length in lengths:
         offsets.append(offsets[-1] + length)
     return torch.tensor(offsets, device=device, dtype=torch.int32)
+
+
+CHECKPOINT_SENTINEL = 12345.0
+
+
+def sentinel_state_checkpoints(
+    counts: Sequence[int],
+    every_n_tokens: int,
+    state_shape: tuple[int, int, int],
+    *,
+    spare: int = 2,
+) -> StateCheckpoints:
+    """Reserve ``counts[i]`` snapshot rows per sequence, plus spare rows, filled with a sentinel.
+
+    Rows a kernel must not write keep ``CHECKPOINT_SENTINEL``, so whole-buffer comparisons also
+    check reserved-but-inactive rows and unused capacity.
+    """
+    states = torch.full((sum(counts) + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
+    return StateCheckpoints(states, cumulative_sequence_offsets(counts), every_n_tokens)
 
 
 def packed_chunk_routes(
