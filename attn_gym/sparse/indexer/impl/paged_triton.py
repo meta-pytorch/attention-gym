@@ -365,6 +365,7 @@ def launch(
                 wide,
                 torch.are_deterministic_algorithms_enabled(),
                 True,
+                1024,
                 True,
             )
         integer = cutlass.Int64 if wide else cutlass.Int32

@@ -8,7 +8,9 @@ Adapted from NVIDIA cuDNN Frontend's ``compress_top_k_sm100.py`` at
 (1) histogram the highest 11 ordered-float bits; (2) emit strict winners and
 stage the boundary bin; (3) refine its next 11 bits; (4) refine the final 10
 bits and emit the final winners. The fixed shared shrink buffer avoids
-full-row refinement scans unless its boundary bin overflows.
+full-row refinement scans unless its boundary bin overflows. The decode configuration
+also tracks exact extrema while staging: a homogeneous boundary bucket bypasses
+further radix passes, as does a bucket whose every member is needed.
 
 By default winners take output slots from a shared atomic counter, so index
 order and the choice among exact cutoff ties depend on thread timing. The
@@ -92,8 +94,6 @@ class IndexerTopKKernel(IndexerKernelBase):
     overwrite it.
     """
 
-    block_threads = 512
-
     def __init__(
         self,
         topk: int,
@@ -102,8 +102,12 @@ class IndexerTopKKernel(IndexerKernelBase):
         *,
         compress_ratio: int = 1,
         deterministic: bool = False,
+        block_threads: int = 512,
         paged: bool = False,
     ):
+        if block_threads not in (512, 1024):
+            raise ValueError("radix selection requires 512 or 1024 threads")
+        self.block_threads = block_threads
         self.paged = paged
         self.topk = topk
         self.deterministic = deterministic
@@ -150,13 +154,27 @@ class IndexerTopKKernel(IndexerKernelBase):
         ``selected`` or after the ``topk - need`` strict winners in ``row_output``.
         """
         seen = Int32(0)
-        for window in range(0, seg_len, _BITMAP_BITS):
+        window = Int32(0)
+        # Every lane reads the same CTA count after compaction, so all lanes
+        # stop scanning together once enough of the lowest ties are selected.
+        while window < seg_len and seen < need:
             span = cutlass.min(seg_len - window, _BITMAP_BITS)
             for i in range(tidx, span, self.block_threads):
                 if self.ordered_key(row[window + i]) == tie_key:
                     self.mark(scratch, i)
             cute.arch.barrier()
-            if use_bitmap:
+            if cutlass.const_expr(selected is None):
+                self.compact_bitmap(
+                    scratch,
+                    row_output,
+                    warp_sums,
+                    span,
+                    window,
+                    Int32(self.topk) - need + seen,
+                    tidx,
+                    limit=Int32(self.topk),
+                )
+            elif use_bitmap:
                 self.compact_bitmap(
                     scratch,
                     selected,
@@ -185,6 +203,7 @@ class IndexerTopKKernel(IndexerKernelBase):
             for i in range(tidx, _NUM_BINS_11, self.block_threads):
                 scratch[i] = Int32(0)
             cute.arch.barrier()
+            window += _BITMAP_BITS
 
     @cute.jit
     def mark(self, bitmap: cute.Tensor, idx: Int32):
@@ -209,6 +228,86 @@ class IndexerTopKKernel(IndexerKernelBase):
         """Write one index to the next output slot claimed from the shared counter."""
         dst = cute.arch.atomic_add(counters.iterator, Int32(1), sem="relaxed", scope="cta")
         row_output[dst] = idx
+
+    @cute.jit
+    def finish_bucket(
+        self,
+        row,
+        row_output,
+        histogram,
+        warp_sums,
+        selected,
+        counters,
+        shrink_keys,
+        shrink_indices,
+        seg_len,
+        count,
+        need,
+        key,
+        bin0,
+        homogeneous,
+        use_bitmap,
+        tidx,
+    ):
+        """Finish a proven tie or a boundary bucket whose every member is needed."""
+        use_shrink = count <= _SHRINK_MAX
+        scan_len = count if use_shrink else seg_len
+        if cutlass.const_expr(not self.deterministic):
+            if need <= _SHRINK_MAX:
+                # Strict winners already occupy [0, K-need). Any `need` members
+                # suffice for a tie, and all members are staged when all are needed.
+                for i in range(tidx, need, self.block_threads):
+                    row_output[self.topk - need + i] = shrink_indices[i]
+            elif homogeneous:
+                for i in range(tidx, _NUM_BINS_11, self.block_threads):
+                    histogram[i] = Int32(0)
+                cute.arch.barrier()
+                self.select_lowest_ties(
+                    row,
+                    row_output,
+                    key,
+                    need,
+                    seg_len,
+                    histogram,
+                    warp_sums,
+                    False,
+                    selected,
+                    tidx,
+                )
+            else:
+                for i in range(tidx, scan_len, self.block_threads):
+                    idx = shrink_indices[i] if use_shrink else Int32(i)
+                    value = shrink_keys[i] if use_shrink else self.ordered_key(row[i])
+                    if Int32(value >> 21) == bin0:
+                        self.emit(idx, use_bitmap, selected, counters, row_output)
+        else:
+            for i in range(tidx, _NUM_BINS_11, self.block_threads):
+                histogram[i] = Int32(0)
+            cute.arch.barrier()
+            if not homogeneous:
+                for i in range(tidx, scan_len, self.block_threads):
+                    idx = shrink_indices[i] if use_shrink else Int32(i)
+                    value = shrink_keys[i] if use_shrink else self.ordered_key(row[i])
+                    if Int32(value >> 21) == bin0:
+                        self.emit(idx, use_bitmap, selected, counters, row_output)
+                cute.arch.barrier()
+            self.order_selection(
+                row,
+                row_output,
+                histogram,
+                warp_sums,
+                selected,
+                shrink_keys,
+                shrink_indices,
+                seg_len,
+                scan_len,
+                use_bitmap,
+                use_shrink,
+                not homogeneous,
+                need,
+                key,
+                tidx,
+            )
 
     @cute.jit
     def compact_bitmap(
@@ -381,6 +480,11 @@ class IndexerTopKKernel(IndexerKernelBase):
         shrink_indices = smem.allocate_tensor(
             Int32, cute.make_layout((_SHRINK_MAX,)), byte_alignment=128
         )
+        boundary_range = None
+        if cutlass.const_expr(self.paged):
+            boundary_range = smem.allocate_tensor(
+                Uint32, cute.make_layout((2,)), byte_alignment=128
+            )
         selected = None
         if cutlass.const_expr(self.deterministic):
             selected = smem.allocate_tensor(
@@ -428,13 +532,24 @@ class IndexerTopKKernel(IndexerKernelBase):
                     histogram, _NUM_BINS_11, Int32(self.topk), warp_sums, threshold, tidx
                 )
 
-                # Pass 2: emit strict winners and stage the first boundary bin.
+                low = Uint32(0xFFFFFFFF)
+                high = Uint32(0)
+                if cutlass.const_expr(self.paged):
+                    if tidx == 0:
+                        boundary_range[0] = Uint32(0xFFFFFFFF)
+                        boundary_range[1] = Uint32(0)
+                    cute.arch.barrier()
+                # Pass 2: stage the boundary bucket and track its actual extrema.
+                # Equal coarse radix bins alone do not establish a tie.
                 for i in range(tidx, seg_len, self.block_threads):
                     key = self.ordered_key(row[i])
                     bin0 = Int32((key >> 21) & Uint32(0x7FF))
                     if bin0 > bin0_threshold:
                         self.emit(Int32(i), use_bitmap, selected, counters, row_output)
                     elif bin0 == bin0_threshold:
+                        if cutlass.const_expr(self.paged):
+                            low = min(low, key)
+                            high = max(high, key)
                         bin1 = Int32((key >> 10) & Uint32(0x7FF))
                         cute.arch.atomic_add(
                             histogram.iterator + bin1, Int32(1), sem="relaxed", scope="cta"
@@ -445,98 +560,167 @@ class IndexerTopKKernel(IndexerKernelBase):
                         if slot < _SHRINK_MAX:
                             shrink_keys[slot] = key
                             shrink_indices[slot] = Int32(i)
+                if cutlass.const_expr(self.paged):
+                    low = cute.arch.warp_redux_sync(low, "umin")
+                    high = cute.arch.warp_redux_sync(high, "umax")
+                    if tidx % 32 == 0:
+                        cute.arch.atomic_min(
+                            boundary_range.iterator, low, sem="relaxed", scope="cta"
+                        )
+                        cute.arch.atomic_max(
+                            boundary_range.iterator + 1, high, sem="relaxed", scope="cta"
+                        )
                 cute.arch.barrier()
-                bin1_threshold, need1, _ = self.find_threshold(
-                    histogram, _NUM_BINS_11, need0, warp_sums, threshold, tidx
-                )
-
-                # Derive overflow from the atomic count after the barrier: no
-                # concurrently written non-atomic overflow flag is necessary.
-                shrink_count = counters[2]
-                use_shrink = shrink_count <= _SHRINK_MAX
-                scan_len = shrink_count if use_shrink else seg_len
-
-                # Pass 3: refine the middle 11 bits, falling back to a full scan.
-                for i in range(tidx, scan_len, self.block_threads):
-                    key = Uint32(0)
-                    idx = Int32(0)
-                    if use_shrink:
-                        key = shrink_keys[i]
-                        idx = shrink_indices[i]
-                    else:
-                        key = self.ordered_key(row[i])
-                        idx = Int32(i)
-                    bin0 = Int32((key >> 21) & Uint32(0x7FF))
-                    if bin0 == bin0_threshold:
-                        bin1 = Int32((key >> 10) & Uint32(0x7FF))
-                        if bin1 > bin1_threshold:
-                            self.emit(idx, use_bitmap, selected, counters, row_output)
-                        elif bin1 == bin1_threshold:
-                            bin2 = Int32(key & Uint32(0x3FF))
-                            cute.arch.atomic_add(
-                                histogram.iterator + bin2, Int32(1), sem="relaxed", scope="cta"
-                            )
-                cute.arch.barrier()
-                bin2_threshold, need2, tie_count = self.find_threshold(
-                    histogram,
-                    _NUM_BINS_10,
-                    need1,
-                    warp_sums,
-                    threshold,
-                    tidx,
-                    publish_count=self.deterministic,
-                )
-
-                # Pass 4: emit the final strict winners and exact ties. Deterministic
-                # mode emits ties here only when all are needed and otherwise chooses
-                # them by index afterwards.
-                take_all_ties = tie_count == need2
-                tie_budget = need2
-                if cutlass.const_expr(self.deterministic):
-                    tie_budget = need2 if take_all_ties else Int32(0)
-                for i in range(tidx, scan_len, self.block_threads):
-                    key = Uint32(0)
-                    idx = Int32(0)
-                    if use_shrink:
-                        key = shrink_keys[i]
-                        idx = shrink_indices[i]
-                    else:
-                        key = self.ordered_key(row[i])
-                        idx = Int32(i)
-                    bin0 = Int32((key >> 21) & Uint32(0x7FF))
-                    bin1 = Int32((key >> 10) & Uint32(0x7FF))
-                    if bin0 == bin0_threshold and bin1 == bin1_threshold:
-                        bin2 = Int32(key & Uint32(0x3FF))
-                        if bin2 > bin2_threshold:
-                            self.emit(idx, use_bitmap, selected, counters, row_output)
-                        elif bin2 == bin2_threshold:
-                            slot = cute.arch.atomic_add(
-                                counters.iterator + 1, Int32(1), sem="relaxed", scope="cta"
-                            )
-                            if slot < tie_budget:
-                                self.emit(idx, use_bitmap, selected, counters, row_output)
-
-                if cutlass.const_expr(self.deterministic):
-                    cute.arch.barrier()
-                    self.order_selection(
+                finished = False
+                if cutlass.const_expr(self.paged):
+                    homogeneous = boundary_range[0] == boundary_range[1]
+                    finished = homogeneous or counters[2] == need0
+                    if finished:
+                        self.finish_bucket(
+                            row,
+                            row_output,
+                            histogram,
+                            warp_sums,
+                            selected,
+                            counters,
+                            shrink_keys,
+                            shrink_indices,
+                            seg_len,
+                            counters[2],
+                            need0,
+                            boundary_range[0],
+                            bin0_threshold,
+                            homogeneous,
+                            use_bitmap,
+                            tidx,
+                        )
+                if not finished:
+                    self.refine_bucket(
                         row,
                         row_output,
                         histogram,
                         warp_sums,
                         selected,
+                        counters,
                         shrink_keys,
                         shrink_indices,
                         seg_len,
-                        scan_len,
+                        bin0_threshold,
+                        need0,
+                        threshold,
                         use_bitmap,
-                        use_shrink,
-                        take_all_ties,
-                        need2,
-                        (Uint32(bin0_threshold) << 21)
-                        | (Uint32(bin1_threshold) << 10)
-                        | Uint32(bin2_threshold),
                         tidx,
                     )
+
+    @cute.jit
+    def refine_bucket(
+        self,
+        row,
+        row_output,
+        histogram,
+        warp_sums,
+        selected,
+        counters,
+        shrink_keys,
+        shrink_indices,
+        seg_len,
+        bin0_threshold,
+        need0,
+        threshold,
+        use_bitmap,
+        tidx,
+    ):
+        bin1_threshold, need1, _ = self.find_threshold(
+            histogram, _NUM_BINS_11, need0, warp_sums, threshold, tidx
+        )
+
+        # Derive overflow from the atomic count after the barrier: no
+        # concurrently written non-atomic overflow flag is necessary.
+        shrink_count = counters[2]
+        use_shrink = shrink_count <= _SHRINK_MAX
+        scan_len = shrink_count if use_shrink else seg_len
+
+        # Pass 3: refine the middle 11 bits, falling back to a full scan.
+        for i in range(tidx, scan_len, self.block_threads):
+            key = Uint32(0)
+            idx = Int32(0)
+            if use_shrink:
+                key = shrink_keys[i]
+                idx = shrink_indices[i]
+            else:
+                key = self.ordered_key(row[i])
+                idx = Int32(i)
+            bin0 = Int32((key >> 21) & Uint32(0x7FF))
+            if bin0 == bin0_threshold:
+                bin1 = Int32((key >> 10) & Uint32(0x7FF))
+                if bin1 > bin1_threshold:
+                    self.emit(idx, use_bitmap, selected, counters, row_output)
+                elif bin1 == bin1_threshold:
+                    bin2 = Int32(key & Uint32(0x3FF))
+                    cute.arch.atomic_add(
+                        histogram.iterator + bin2, Int32(1), sem="relaxed", scope="cta"
+                    )
+        cute.arch.barrier()
+        bin2_threshold, need2, tie_count = self.find_threshold(
+            histogram,
+            _NUM_BINS_10,
+            need1,
+            warp_sums,
+            threshold,
+            tidx,
+            publish_count=self.deterministic,
+        )
+
+        # Pass 4: emit the final strict winners and exact ties. Deterministic
+        # mode emits ties here only when all are needed and otherwise chooses
+        # them by index afterwards.
+        take_all_ties = tie_count == need2
+        tie_budget = need2
+        if cutlass.const_expr(self.deterministic):
+            tie_budget = need2 if take_all_ties else Int32(0)
+        for i in range(tidx, scan_len, self.block_threads):
+            key = Uint32(0)
+            idx = Int32(0)
+            if use_shrink:
+                key = shrink_keys[i]
+                idx = shrink_indices[i]
+            else:
+                key = self.ordered_key(row[i])
+                idx = Int32(i)
+            bin0 = Int32((key >> 21) & Uint32(0x7FF))
+            bin1 = Int32((key >> 10) & Uint32(0x7FF))
+            if bin0 == bin0_threshold and bin1 == bin1_threshold:
+                bin2 = Int32(key & Uint32(0x3FF))
+                if bin2 > bin2_threshold:
+                    self.emit(idx, use_bitmap, selected, counters, row_output)
+                elif bin2 == bin2_threshold:
+                    slot = cute.arch.atomic_add(
+                        counters.iterator + 1, Int32(1), sem="relaxed", scope="cta"
+                    )
+                    if slot < tie_budget:
+                        self.emit(idx, use_bitmap, selected, counters, row_output)
+
+        if cutlass.const_expr(self.deterministic):
+            cute.arch.barrier()
+            self.order_selection(
+                row,
+                row_output,
+                histogram,
+                warp_sums,
+                selected,
+                shrink_keys,
+                shrink_indices,
+                seg_len,
+                scan_len,
+                use_bitmap,
+                use_shrink,
+                take_all_ties,
+                need2,
+                (Uint32(bin0_threshold) << 21)
+                | (Uint32(bin1_threshold) << 10)
+                | Uint32(bin2_threshold),
+                tidx,
+            )
 
     @cute.jit
     def order_selection(
@@ -613,7 +797,7 @@ class IndexerTopKKernel(IndexerKernelBase):
         candidate_bounds: cute.Tensor | None,
         stream: cuda.CUstream,
     ):
-        """Launch one 512-thread CTA per physical query row in the score slab.
+        """Launch one CTA per physical query row in the score slab.
 
         ``candidate_bounds`` selects the packed specialization; None selects from each
         query's full or causal candidate prefix.
