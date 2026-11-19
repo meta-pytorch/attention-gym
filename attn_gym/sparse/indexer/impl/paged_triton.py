@@ -3,6 +3,7 @@
 Keys are gathered directly from pages; no dense repacking or host readback is
 needed. Score storage is capped at 32 MiB and reused across query slabs. Radix
 selection is linear in candidate count and independent of the requested Top-K.
+Scoring grids are bounded; their workers loop over GPU-visible candidates.
 """
 
 import torch
@@ -105,7 +106,6 @@ def _score(
             tl.store(Bounds + row * 2 + 1, visible)
     if visible <= TOPK or tile * BN >= visible:
         return
-    candidates = tile * BN + tl.arange(0, BN)
     dims = tl.arange(0, BD)
     heads = tl.arange(0, BH)
     if WIDE:
@@ -115,23 +115,29 @@ def _score(
         QD = 1
     if K_UNIT_D:
         KD = 1
-    pages = tl.load(Table + sequence * BT + (candidates // PAGE) * BS, candidates < visible, 0)
-    if WIDE:
-        pages = pages.to(tl.int64)
-    keys = tl.load(
-        K + pages[:, None] * KH + (candidates[:, None] % PAGE) * KS + dims[None, :] * KD,
-        (candidates[:, None] < visible) & (dims[None, :] < D),
-        0,
-    )
+    weights = tl.load(W + row * WT + heads * WH, heads < H, 0).to(tl.float32)
+    if tl.sum((weights != 0).to(tl.int32), 0) == 0:
+        if tile == 0:
+            tl.store(Bounds + row * 2 + 1, tl.minimum(visible, TOPK))
+        return
     query = tl.load(
         Q + row * QT + heads[:, None] * QH + dims[None, :] * QD,
         (heads[:, None] < H) & (dims[None, :] < D),
         0,
     )
-    weights = tl.load(W + row * WT + heads * WH, heads < H, 0).to(tl.float32)
-    dots = tl.dot(keys, tl.trans(query))
-    scores = tl.sum(tl.maximum(dots, 0.0) * weights[None, :], 1) * (H * D) ** -0.5
-    tl.store(Scores + local * capacity + candidates, scores, candidates < visible)
+    for begin in range(tile * BN, visible, tl.num_programs(1) * BN):
+        candidates = begin + tl.arange(0, BN)
+        pages = tl.load(Table + sequence * BT + (candidates // PAGE) * BS, candidates < visible, 0)
+        if WIDE:
+            pages = pages.to(tl.int64)
+        keys = tl.load(
+            K + pages[:, None] * KH + (candidates[:, None] % PAGE) * KS + dims[None, :] * KD,
+            (candidates[:, None] < visible) & (dims[None, :] < D),
+            0,
+        )
+        dots = tl.dot(keys, tl.trans(query))
+        scores = tl.sum(tl.maximum(dots, 0.0) * weights[None, :], 1) * (H * D) ** -0.5
+        tl.store(Scores + local * capacity + candidates, scores, candidates < visible)
 
 
 @triton.jit(do_not_specialize=["sequences", "capacity", "row_start", "WT", "WH", "BT", "BS"])
@@ -182,15 +188,20 @@ def _score_tma(
     heads = tl.arange(0, BH)
     if WIDE:
         heads = heads.to(tl.int64)
-    query = Q.load([row.to(tl.int32), 0, 0]).reshape(BH, BD)
     weights = tl.load(W + row * WT + heads * WH, heads < H, 0).to(tl.float32)
-    for begin in tl.range(start, tl.minimum(start + BN * TILES, visible), BN):
-        page = tl.load(Table + sequence * BT + (begin // PAGE) * BS)
-        keys = K.load([page, (begin % PAGE).to(tl.int32), 0]).reshape(BN, BD)
-        dots = tl.dot(keys, tl.trans(query))
-        scores = tl.sum(tl.maximum(dots, 0.0) * weights[None, :], 1) * (H * D) ** -0.5
-        candidates = begin + tl.arange(0, BN)
-        tl.store(Scores + local * capacity + candidates, scores, candidates < visible)
+    if tl.sum((weights != 0).to(tl.int32), 0) == 0:
+        if tile == 0:
+            tl.store(Bounds + row * 2 + 1, tl.minimum(visible, TOPK))
+        return
+    query = Q.load([row.to(tl.int32), 0, 0]).reshape(BH, BD)
+    for work in range(start, visible, tl.num_programs(1) * BN * TILES):
+        for begin in tl.range(work, tl.minimum(work + BN * TILES, visible), BN):
+            page = tl.load(Table + sequence * BT + (begin // PAGE) * BS)
+            keys = K.load([page, (begin % PAGE).to(tl.int32), 0]).reshape(BN, BD)
+            dots = tl.dot(keys, tl.trans(query))
+            scores = tl.sum(tl.maximum(dots, 0.0) * weights[None, :], 1) * (H * D) ** -0.5
+            candidates = begin + tl.arange(0, BN)
+            tl.store(Scores + local * capacity + candidates, scores, candidates < visible)
 
 
 @triton.jit
@@ -199,55 +210,17 @@ def _ordered(scores):
     return bits ^ tl.where((bits >> 31) != 0, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
 
 
-@triton.jit(do_not_specialize=["sequences", "capacity", "row_start"])
-def _select(
-    Scores,
-    Out,
-    CuQ,
-    Lengths,
-    Positions,
-    sequences,
-    capacity,
-    row_start,
-    TOPK: tl.constexpr,
-    RATIO: tl.constexpr,
-    EXPLICIT: tl.constexpr,
-    WIDE: tl.constexpr,
-    BLOCK: tl.constexpr,
+@triton.jit
+def _emit_selection(
+    Scores, Out, local, row, capacity, visible, prefix, TOPK: tl.constexpr, BLOCK: tl.constexpr
 ):
-    local = tl.program_id(0)
-    if WIDE:
-        local = local.to(tl.int64)
-        row_start = row_start.to(tl.int64)
-    row = row_start + local
-    _, visible = _bounds(CuQ, Lengths, Positions, row, sequences, RATIO, EXPLICIT, WIDE)
     offsets = tl.arange(0, BLOCK)
-    if visible <= TOPK:
-        for start in range(0, TOPK, BLOCK):
-            rank = start + offsets
-            tl.store(Out + row * TOPK + rank, tl.where(rank < visible, rank, -1), rank < TOPK)
-        return
-    prefix = tl.full((), 0, tl.uint32)
-    need = tl.full((), TOPK, tl.int32)
-    # Binary radix uses warp reductions instead of contended shared-memory
-    # histograms (the high exponent bytes often occupy only one or two bins).
-    for bit in range(31, -1, -1):
-        trial = prefix | (tl.full((), 1, tl.uint32) << bit)
-        above = tl.full((), 0, tl.int32)
-        for start in range(0, visible, BLOCK):
-            indices = start + offsets
-            scores = tl.load(Scores + local * capacity + indices, indices < visible, 0)
-            keys = _ordered(scores)
-            above += tl.sum(((indices < visible) & (keys >= trial)).to(tl.int32), 0)
-        prefix = tl.where(above >= TOPK, trial, prefix)
     strict = tl.full((), 0, tl.int32)
     for start in range(0, visible, BLOCK):
         indices = start + offsets
         scores = tl.load(Scores + local * capacity + indices, indices < visible, 0)
         strict += tl.sum(((indices < visible) & (_ordered(scores) > prefix)).to(tl.int32), 0)
-    need -= strict
-    # need is the number of equal boundary scores to retain. Prefix scans break
-    # those ties toward lower IDs, and write selected IDs in sequence order.
+    need = TOPK - strict
     written = tl.full((), 0, tl.int32)
     ties_seen = tl.full((), 0, tl.int32)
     for start in range(0, visible, BLOCK):
@@ -263,6 +236,63 @@ def _select(
         tl.store(Out + row * TOPK + rank, indices.to(tl.int32), selected & (rank < TOPK))
         written += tl.sum(selected.to(tl.int32), 0)
         ties_seen += tl.sum(ties.to(tl.int32), 0)
+
+
+@triton.jit(do_not_specialize=["sequences", "capacity", "row_start"])
+def _select(
+    Scores,
+    Out,
+    CuQ,
+    Lengths,
+    Positions,
+    Bounds,
+    sequences,
+    capacity,
+    row_start,
+    TOPK: tl.constexpr,
+    RATIO: tl.constexpr,
+    EXPLICIT: tl.constexpr,
+    WIDE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    local = tl.program_id(0)
+    if WIDE:
+        local = local.to(tl.int64)
+        row_start = row_start.to(tl.int64)
+    row = row_start + local
+    _, visible = _bounds(CuQ, Lengths, Positions, row, sequences, RATIO, EXPLICIT, WIDE)
+    if Bounds is not None:
+        visible = tl.load(Bounds + row * 2 + 1)
+    offsets = tl.arange(0, BLOCK)
+    if visible <= TOPK:
+        for start in range(0, TOPK, BLOCK):
+            rank = start + offsets
+            tl.store(Out + row * TOPK + rank, tl.where(rank < visible, rank, -1), rank < TOPK)
+        return
+    positive = tl.full((), 0, tl.int32)
+    nonnegative = tl.full((), 0, tl.int32)
+    for start in range(0, visible, BLOCK):
+        indices = start + offsets
+        scores = tl.load(Scores + local * capacity + indices, indices < visible, 0)
+        positive += tl.sum(((indices < visible) & (scores > 0)).to(tl.int32), 0)
+        nonnegative += tl.sum(((indices < visible) & (scores >= 0)).to(tl.int32), 0)
+    # The sign pass also detects an exact zero cutoff, including the common
+    # nonpositive-weight case. Otherwise keep the original single-count radix
+    # passes, stopping as soon as the accepted prefix contains exactly K keys.
+    prefix = tl.where(nonnegative >= TOPK, 0x80000000, 0).to(tl.uint32)
+    bit = tl.where((positive < TOPK) & (nonnegative >= TOPK), -1, 30)
+    count = nonnegative
+    while (bit >= 0) & (count != TOPK):
+        trial = prefix | (tl.full((), 1, tl.uint32) << bit)
+        above = tl.full((), 0, tl.int32)
+        for start in range(0, visible, BLOCK):
+            indices = start + offsets
+            scores = tl.load(Scores + local * capacity + indices, indices < visible, 0)
+            above += tl.sum(((indices < visible) & (_ordered(scores) >= trial)).to(tl.int32), 0)
+        prefix = tl.where(above >= TOPK, trial, prefix)
+        count = above
+        bit -= 1
+    _emit_selection(Scores, Out, local, row, capacity, visible, prefix, TOPK, BLOCK)
 
 
 def launch(
@@ -299,7 +329,7 @@ def launch(
         (pairs, 2, capacity) if capacity > topk else (0,), dtype=torch.float32
     )
     use_cute = backend == "cute" and capacity > topk
-    bounds = query.new_empty((tokens, 2), dtype=torch.int32) if use_cute else None
+    bounds = query.new_empty((tokens, 2), dtype=torch.int32) if capacity > topk else None
     wide = requires_int64_offsets(
         query,
         key_cache,
@@ -332,7 +362,12 @@ def launch(
         try:
             set_compile_target(detect_compile_target(query.device.index))
             topk_kernel = _compile_topk(
-                topk, False, 1, wide, torch.are_deterministic_algorithms_enabled(), True
+                topk,
+                False,
+                1,
+                wide,
+                torch.are_deterministic_algorithms_enabled(),
+                True,
             )
         finally:
             set_compile_target(previous)
@@ -349,17 +384,21 @@ def launch(
 
         # Measured on B200: split short pools to fill the GPU; amortize page
         # routing and Q loads over 4/8 tiles once there are enough work items.
-        work = tokens * capacity
+        work = min(tokens, slab) * min(capacity, 32768)
         bn = 32 if work <= 32768 or key_cache.shape[1] % 64 else 64
         tiles = 1 if work <= 32768 else 4 if work <= 262144 else 8
         bh, bd = max(16, triton.next_power_of_2(heads)), max(16, triton.next_power_of_2(dim))
         query_desc = TensorDescriptor.from_tensor(query, [1, bh, bd])
         key_desc = TensorDescriptor.from_tensor(key_cache, [1, bn, bd])
     with torch.cuda.device(query.device):
+        workers = 32 * torch.cuda.get_device_properties(query.device).multi_processor_count
+        grid_capacity = min(capacity, 32768)
         for start in range(0, tokens, slab):
             rows = min(slab, tokens - start)
             if tma:
-                _score_tma[(rows, triton.cdiv(capacity, bn * tiles))](
+                _score_tma[
+                    (rows, min(triton.cdiv(grid_capacity, bn * tiles), triton.cdiv(workers, rows)))
+                ](
                     query_desc,
                     key_desc,
                     weights,
@@ -389,7 +428,7 @@ def launch(
                     num_stages=2,
                 )
             elif capacity > topk:
-                _score[(rows, triton.cdiv(capacity, 128))](
+                _score[(rows, min(triton.cdiv(grid_capacity, 128), triton.cdiv(workers, rows)))](
                     query,
                     key_cache,
                     weights,
@@ -435,6 +474,7 @@ def launch(
                     cu_seqlens_q,
                     seqused_k,
                     query_positions,
+                    bounds,
                     seqused_k.numel(),
                     capacity,
                     start,
