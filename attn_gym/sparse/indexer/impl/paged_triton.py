@@ -91,6 +91,8 @@ def _score(
     BD: tl.constexpr,
     Q_UNIT_D: tl.constexpr,
     K_UNIT_D: tl.constexpr,
+    KeyOffsets=None,
+    WHOLE: tl.constexpr = False,
 ):
     local = tl.program_id(0)
     tile = tl.program_id(1)
@@ -125,13 +127,25 @@ def _score(
         (heads[:, None] < H) & (dims[None, :] < D),
         0,
     )
+    key_start = 0 if KeyOffsets is None else tl.load(KeyOffsets + sequence)
     for begin in range(tile * BN, visible, tl.num_programs(1) * BN):
         candidates = begin + tl.arange(0, BN)
-        pages = tl.load(Table + sequence * BT + (candidates // PAGE) * BS, candidates < visible, 0)
+        logical = candidates + key_start
+        if WHOLE:
+            pages = tl.load(Table + sequence * BT)
+            slots = logical
+        else:
+            pages = tl.load(
+                Table + sequence * BT + (logical // PAGE) * BS, candidates < visible, 0
+            )
+            slots = logical % PAGE
         if WIDE:
             pages = pages.to(tl.int64)
         keys = tl.load(
-            K + pages[:, None] * KH + (candidates[:, None] % PAGE) * KS + dims[None, :] * KD,
+            K
+            + (pages * KH if WHOLE else pages[:, None] * KH)
+            + slots[:, None] * KS
+            + dims[None, :] * KD,
             (candidates[:, None] < visible) & (dims[None, :] < D),
             0,
         )
@@ -306,6 +320,10 @@ def launch(
     compress_ratio,
     query_positions,
     backend,
+    *,
+    batch_invariant=False,
+    key_offsets=None,
+    whole_pool=False,
 ):
     if torch.version.hip or torch.cuda.get_device_capability(query.device)[0] < 8:
         raise ValueError("paged_lightning_indexer requires an SM80+ NVIDIA GPU.")
@@ -341,6 +359,7 @@ def launch(
         scores,
         output,
         bounds,
+        key_offsets,
     )
     if use_cute:
         import cutlass
@@ -366,7 +385,7 @@ def launch(
                 False,
                 1,
                 wide,
-                torch.are_deterministic_algorithms_enabled(),
+                batch_invariant or torch.are_deterministic_algorithms_enabled(),
                 True,
                 1024,
                 True,
@@ -376,7 +395,8 @@ def launch(
         integer = cutlass.Int64 if wide else cutlass.Int32
         cute_output = output.unsqueeze(0)
     tma = (
-        capacity > topk
+        not batch_invariant
+        and capacity > topk
         and key_cache.shape[1] % 32 == 0
         and can_use_tma(query)
         and can_use_tma(key_cache)
@@ -430,7 +450,10 @@ def launch(
                     num_stages=2,
                 )
             elif capacity > topk:
-                _score[(rows, min(triton.cdiv(grid_capacity, 128), triton.cdiv(workers, rows)))](
+                score_bn = 32 if batch_invariant else 128
+                _score[
+                    (rows, min(triton.cdiv(grid_capacity, score_bn), triton.cdiv(workers, rows)))
+                ](
                     query,
                     key_cache,
                     weights,
@@ -449,17 +472,20 @@ def launch(
                     *block_table.stride(),
                     heads,
                     dim,
-                    key_cache.shape[1],
+                    1 if whole_pool else key_cache.shape[1],
                     topk,
                     compress_ratio,
                     query_positions is not None,
                     wide,
-                    128,
+                    score_bn,
                     max(16, triton.next_power_of_2(heads)),
                     max(16, triton.next_power_of_2(dim)),
                     query.stride(-1) == 1,
                     key_cache.stride(-1) == 1,
+                    KeyOffsets=key_offsets,
+                    WHOLE=whole_pool,
                     num_warps=4,
+                    enable_fp_fusion=not batch_invariant,
                 )
             if use_cute:
                 topk_kernel(
