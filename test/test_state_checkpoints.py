@@ -347,9 +347,9 @@ def test_kda_validates_checkpoint_metadata() -> None:
         fake_paged_call("kda", INVALID_METADATA["state_dtype"], kernel_options=options("kda"))
 
 
-def test_cudnn_rejects_checkpoints_before_backend_dispatch(rule: Rule) -> None:
+def test_warpdrive_rejects_checkpoints_before_backend_dispatch(rule: Rule) -> None:
     with pytest.raises(ValueError, match="checkpoint"):
-        fake_paged_call(rule, kernel_options={"backend": "cudnn"})
+        fake_paged_call(rule, kernel_options={"backend": "warpdrive"})
 
 
 @torch.no_grad()

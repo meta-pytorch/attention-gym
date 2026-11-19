@@ -214,7 +214,13 @@ completed chunk, not the state after all 100 new tokens.
 A caller restoring a prefix that ends inside the next chunk must copy the tokens after the
 checkpoint and their count into the destination slot's replay buffers as well. Attention Gym
 continues to advance the source slot's replay state normally; `state_checkpoints` does not
-snapshot replay-token buffers. The same contract applies to the one-token replay path: 63
+snapshot replay-token buffers. A prefix ending exactly on a chunk boundary copies no tokens but
+must still set the destination count to zero, and resumes with `has_initial_state=True` (or
+omitted): `False` would discard the restored state. Stale tokens beyond the count need not be
+cleared.
+[`examples/linear/kda_prefix_cache_checkpoints.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
+restores a shared prompt prefix this way and checks that the suffix output matches a full
+prefill bitwise. The same contract applies to the one-token replay path: 63
 replayed tokens plus one new token produce an interval-64 checkpoint. The interval origin is
 recomputed for each call, so intervals longer than 64 never complete during one-token replay
 decode.

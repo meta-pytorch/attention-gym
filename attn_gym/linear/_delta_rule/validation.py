@@ -312,6 +312,8 @@ def state_checkpoints_from_op_args(
     below ``2**31`` shares one compiled variant.
     """
     if states is None:
+        if offsets is not None:
+            raise ValueError("cu_checkpoint_offsets requires checkpoint_states")
         return None
     if offsets is None:
         raise ValueError("checkpoint_states requires cu_checkpoint_offsets")

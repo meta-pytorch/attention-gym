@@ -316,7 +316,7 @@ def test_replay_checkpoint_commit_operator_registration(
     assert torch.all(states[1:] == CHECKPOINT_SENTINEL)
 
 
-@pytest.mark.parametrize("invalid", ["dtype", "offsets"])
+@pytest.mark.parametrize("invalid", ["dtype", "offsets", "states"])
 def test_raw_replay_checkpoint_commit_rejects_invalid_metadata_without_device_execution(
     invalid: str,
 ) -> None:
@@ -330,10 +330,13 @@ def test_raw_replay_checkpoint_commit_rejects_invalid_metadata_without_device_ex
     states = torch.empty(2, 1, 128, 128)
     offsets = torch.tensor([0, 1, 2], dtype=torch.int32)
     interval = 64
-    if invalid == "dtype":
-        states = states.bfloat16()
-    else:
-        offsets = None
+    match invalid:
+        case "dtype":
+            states = states.bfloat16()
+        case "offsets":
+            offsets = None
+        case "states":
+            states = None
     with pytest.raises((TypeError, ValueError), match="checkpoint"):
         commit_paged_chunk_replay(
             final_state,
@@ -368,3 +371,36 @@ def test_replay_checkpoint_commit_reuses_runtime_intervals(cuda: None, triton_co
         else:
             assert torch.all(states == CHECKPOINT_SENTINEL)
     assert triton_compiles["_commit_state_kernel"] == 1
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_properties(0).total_memory < 16 * 1024**3,
+    reason="the executed-overflow regression allocates about 8.6 GiB",
+)
+@torch.no_grad()
+def test_replay_checkpoint_commit_executes_offsets_past_int32() -> None:
+    # The last request's first element sits past INT32_MAX: its program must widen before
+    # multiplying by the block size, or its route, count and checkpoint row lookups wrap.
+    sequences = 2**31 // (128 * 128) + 1
+    final = torch.zeros(sequences, 1, 128, 128, device="cuda")
+    final[-1].normal_()
+    slots = torch.zeros(sequences, device="cuda", dtype=torch.int32)
+    slots[-1] = 1
+    counts = torch.zeros(sequences, device="cuda", dtype=torch.int32)
+    counts[-1] = 63
+    cache = torch.zeros(2, 1, 128, 128, device="cuda")
+    replay_count = torch.full((2,), 63, device="cuda", dtype=torch.int32)
+    saved = sentinel_state_checkpoints([0] * (sequences - 1) + [1], 64, (1, 128, 128), spare=0)
+    chunk_replay_commit_op(final, slots, None, counts, cache, replay_count, *saved)
+    torch.testing.assert_close(cache[1], final[-1], rtol=0, atol=0)
+    torch.testing.assert_close(saved.states[0], final[-1], rtol=0, atol=0)
+    assert replay_count[1].item() == 0
+
+
+@pytest.mark.parametrize("prefix", [150, 128], ids=["mid-chunk", "chunk-boundary"])
+@torch.no_grad()
+def test_prefix_cache_example_restores_checkpoint_and_replay_tail(cuda: None, prefix: int) -> None:
+    from examples.linear.kda_prefix_cache_checkpoints import restore_shared_prefix
+
+    assert restore_shared_prefix(prefix) == 128
