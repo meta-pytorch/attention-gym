@@ -75,3 +75,67 @@ def _indexer_fake(
 
 
 _indexer_op = torch.ops.attn_gym._indexer.default
+
+
+torch.library.define(
+    "attn_gym::_paged_indexer",
+    "(Tensor query, Tensor key_cache, Tensor weights, Tensor block_table, "
+    "Tensor cu_seqlens_q, Tensor seqused_k, int topk, int compress_ratio, "
+    "Tensor? query_positions, str backend) -> Tensor",
+)
+
+
+def _paged_indexer_cuda(
+    query,
+    key_cache,
+    weights,
+    block_table,
+    cu_seqlens_q,
+    seqused_k,
+    topk,
+    compress_ratio,
+    query_positions,
+    backend,
+):
+    if backend == "auto":
+        backend = (
+            "cute"
+            if runs_sm100_kernels(torch.cuda.get_device_capability(query.device))
+            else "triton"
+        )
+    from .impl.paged_triton import launch
+
+    return launch(
+        query,
+        key_cache,
+        weights,
+        block_table,
+        cu_seqlens_q,
+        seqused_k,
+        topk,
+        compress_ratio,
+        query_positions,
+        backend,
+    )
+
+
+torch.library.impl("attn_gym::_paged_indexer", "CUDA", _paged_indexer_cuda)
+
+
+@torch.library.register_fake("attn_gym::_paged_indexer")
+def _paged_indexer_fake(
+    query,
+    key_cache,
+    weights,
+    block_table,
+    cu_seqlens_q,
+    seqused_k,
+    topk,
+    compress_ratio,
+    query_positions,
+    backend,
+):
+    return query.new_empty((query.shape[0], topk), dtype=torch.int32)
+
+
+_paged_indexer_op = torch.ops.attn_gym._paged_indexer.default

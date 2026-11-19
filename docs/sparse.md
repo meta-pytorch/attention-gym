@@ -110,7 +110,6 @@ block_ids = paged_lightning_indexer(
     seqused_k,           # int32 [sequences], RAW tokens including current queries
     topk=512,
     compress_ratio=4,
-    impl="reference",
 )
 output = paged_sparse_decode(
     query,
@@ -158,9 +157,16 @@ candidate. Page allocation, prefix sharing, copy-on-write, and rolling back spec
 tokens remain caller responsibilities. Unused page-table entries may be -1; all visible
 completed blocks must have valid pages. Device metadata values are caller invariants.
 
-`impl="reference"` supplies an eager CPU/CUDA implementation and is the default.
-It reads metadata on the host and does not support fullgraph compilation or CUDA
-Graph capture. Selection order and ties are unspecified.
+The fused operation supports FP16/BF16 on SM80+ NVIDIA GPUs, arbitrary nonnegative
+tensor strides, `torch.compile(fullgraph=True)`, and CUDA Graph replay with updated
+query offsets, lengths, positions, and page tables. `impl="reference"` supplies an eager
+CPU/CUDA oracle. On SM100-family GPUs the default combines paged Triton scoring with
+the existing cached CuTe radix selector; other GPUs use Triton selection. Override with
+`kernel_options={"backend": "triton"}` or `{"backend": "cute"}`. Order and ties are
+unspecified unless deterministic algorithms are enabled. No benchmarking occurs in the
+launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
+bounds buffer; query slabs reuse that allocation. Candidate capacity
+per sequence is limited to `2**22`.
 
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 
