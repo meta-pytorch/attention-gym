@@ -101,7 +101,7 @@ class Model(WarpSpecialized):
 
 
 class CrossWarpPOverS(Model):
-    def __init__(self, barrier: bool):
+    def __init__(self, barrier: str):
         self.barrier = barrier
         self.s = Slots(1, Umma, Threads, release_fence="tmem_store")
         self.tmem_plan = TmemPlan().region("S", 128).alias("P", of="S", offset=64, cols=64)
@@ -119,42 +119,68 @@ class CrossWarpPOverS(Model):
     def softmax(self, ctx, *, s: Consumer, tmem: Tmem):
         for _ in cutlass.range(ctx.n, unroll=1):
             with s.consume(0):
-                tmem.access("S", read=True)  # every warp loads S on its 32 lanes
-                if cutlass.const_expr(self.barrier):
-                    named_barrier(3, 256)
-                # Warpgroup g writes P columns [32 g, 32 g + 32): the other warpgroup's warp on
-                # the same lanes reads those S columns.
-                tmem.access(
-                    "P", write=True, cols=lambda w: range(32 * (w // 4), 32 * (w // 4) + 32)
-                )
+                if cutlass.const_expr(self.barrier == "access_branch"):
+                    if ctx.n > 1:
+                        self.softmax_accesses(ctx, tmem)
+                else:
+                    self.softmax_accesses(ctx, tmem)
         return s
+
+    @cute.jit
+    def softmax_accesses(self, ctx, tmem):
+        tmem.access("S", read=True)  # every warp loads S on its 32 lanes
+        if cutlass.const_expr(self.barrier == "branch"):
+            if ctx.n > 1:
+                named_barrier(3, 256)
+        elif cutlass.const_expr(self.barrier == "loop"):
+            for _ in cutlass.range(ctx.n - 1, unroll=1):
+                named_barrier(3, 256)
+        elif cutlass.const_expr(self.barrier != "none"):
+            named_barrier(3, 256)
+        # Warpgroup g writes P columns [32 g, 32 g + 32): the other warpgroup's warp on
+        # the same lanes reads those S columns.
+        tmem.access("P", write=True, cols=lambda w: range(32 * (w // 4), 32 * (w // 4) + 32))
 
 
 def test_cross_warp_p_over_s_needs_a_barrier():
-    op = CrossWarpPOverS(barrier=False)
+    op = CrossWarpPOverS(barrier="none")
     _, alias = compile_quietly(op, "cross_warp_0")
     assert len(alias) == 1 and "P~S" in alias[0]
     text = alias_section(op)
     assert status(op, "P ~ S") == "unverified"
     found = re.search(
         r"softmax read S\[0\] by threads @ .*and softmax write P\[0\] by threads @ .*: warps "
-        r"(\d) and (\d) touch the same TMEM lanes and columns in one handle with no recorded "
+        r"(\d) and (\d) touch the same TMEM lanes and columns in one handle with no applicable "
         r"named_barrier",
         text,
     )
     assert found and abs(int(found[1]) - int(found[2])) == 4, text  # same lanes, other group
 
-    fixed = CrossWarpPOverS(barrier=True)
+    fixed = CrossWarpPOverS(barrier="always")
     _, alias = compile_quietly(fixed, "cross_warp_1")
     assert alias == []
     assert status(fixed, "P ~ S") == "no hazard found"
+
+
+@pytest.mark.parametrize(
+    "barrier, expected",
+    [("branch", "unverified"), ("loop", "unverified"), ("access_branch", "no hazard found")],
+)
+def test_cross_warp_barrier_must_run_when_the_accesses_do(barrier, expected):
+    op = CrossWarpPOverS(barrier=barrier)
+    _, alias = compile_quietly(op, f"cross_warp_{barrier}")
+    assert status(op, "P ~ S") == expected
+    if expected == "unverified":
+        assert len(alias) == 1 and "P~S" in alias[0], alias
+    else:
+        assert alias == []
 
 
 def test_diagnostic_emits_no_device_code():
     """The same kernel lowers to identical IR with the diagnostic on and off."""
     ir = []
     for mode in ("warn", "off"):
-        op = CrossWarpPOverS(barrier=True, alias_check=mode)
+        op = CrossWarpPOverS(barrier="always", alias_check=mode)
         fn = compile_toy.__wrapped__(op, "cross_warp_1")  # the compiled IR, not a cached artifact
         ir.append(str(fn.ir_module))
     assert ir[0] == ir[1]
