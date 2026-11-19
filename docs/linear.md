@@ -167,53 +167,47 @@ elementwise kernels run per decode step.
 
 ### Paged state checkpoints (GDN and KDA)
 
-Both `paged_chunk_gdn` and `paged_chunk_kda` accept `state_checkpoints=StateCheckpoints(...)`
-to write periodic snapshots into caller-owned storage while still advancing the ordinary
-state cache. Paged `recurrent_gdn` (with `state_indices`) accepts the same argument, including
-under `kernel_options={"batch_invariant": True}`. Checkpointing requires the repo-local fused
-backend and does not change the operations' return types.
+`paged_chunk_gdn`, `paged_chunk_kda` (with or without `replay_state`), and paged `recurrent_gdn`
+(with `state_indices`, including `kernel_options={"batch_invariant": True}`) accept
+`state_checkpoints=StateCheckpoints(...)`. While advancing the ordinary state cache, they write
+selected recurrent states straight into slots of a state pool. This is how a serving engine
+publishes prefix-cache entries: SGLang's tracked slot, or vLLM's per-block state pages, with no
+follow-up copy. Checkpointing requires the repo-local fused backend and does not change the
+operations' return types.
+
+The common case is one snapshot per sequence, built with `StateCheckpoints.from_positions`:
 
 ```python
 from attn_gym.linear import StateCheckpoints, paged_chunk_gdn
 
-# Packed sequence lengths are 600 and 300; checkpoint every 256 tokens.
-# Sequence 0 produces snapshots at 256 and 512; sequence 1 produces one at 256.
-checkpoints = StateCheckpoints(
-    states=torch.empty(3, heads, value_dim, key_dim, device="cuda", dtype=torch.float32),
-    cu_checkpoint_offsets=torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32),
-    every_n_tokens=256,
+# Packed sequence lengths are 600 and 300. Publish sequence 0's state after 512 tokens into
+# free slot 7 of the same pool; sequence 1 publishes nothing.
+checkpoints = StateCheckpoints.from_positions(
+    state_cache,
+    cu_seqlens,
+    snapshot_positions=torch.tensor([512, 0], device="cuda", dtype=torch.int32),
+    snapshot_slots=torch.tensor([7, -1], device="cuda", dtype=torch.int32),
+    num_tokens=900,
 )
 output = paged_chunk_gdn(
     q, k, v, gate, beta, state_cache, state_indices,
     cu_seqlens=cu_seqlens, state_checkpoints=checkpoints,
 )
-# paged_chunk_kda accepts the same state_checkpoints argument.
 ```
 
-Without KDA replay, boundaries are measured from each sequence's start **in this call**, not from its absolute
-prefix-cache position. The interval must be a positive multiple of 64. Snapshots contain the
-state **after** that many tokens, including a final state exactly on an interval; incomplete
-intervals do not produce a snapshot. Each snapshot is written directly from the FP32 recurrence
-accumulator in public `[H, V, K]` order, not copied from the lower-precision internal
-chunk-entry tape. Tape snapshots are not rounded to the persistent cache dtype.
+Underneath, each sequence produces its post-update state every `every_n_tokens` tokens (a
+positive multiple of 64), measured from its start **in this call**, including a final state
+exactly on an interval. Each state covers the sequence's whole history, including the slot's
+initial state. States are numbered as rows, packed by sequence through `cu_checkpoint_offsets`,
+and `destinations` maps row `r` to slot `destinations[r]`; non-positive entries (an engine's
+`PAD_SLOT_ID = -1`, or the null slot 0) skip the row. States come from the FP32 recurrence
+accumulator, not the lower-precision internal chunk-entry tape; a BF16 pool rounds them, so pass
+an FP32 pool for exact states.
 
-An engine usually wants only a few of those states, in its own cache slots: SGLang's tracked
-prefix-cache slot, or vLLM's per-block state pages. Pass `destinations`, one int32 slot per row,
-and set `states` to the state pool (it may be `state_cache` itself). Row `r` is then written to
-`states[destinations[r]]`, rows with a non-positive destination are skipped, and no tape or
-follow-up copy is needed. The pool uses the state-cache layout (FP32 or BF16, contiguous within
-each slot, any slot stride); a BF16 pool rounds the snapshots. Destinations of produced rows must
-be distinct and, when the pool aliases `state_cache`, must not be routed by the same call.
-
-```python
-# Publish only sequence 0's state after 512 tokens, into free slot 7 of the same pool.
-checkpoints = StateCheckpoints(
-    states=state_cache,
-    cu_checkpoint_offsets=torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32),
-    every_n_tokens=256,
-    destinations=torch.tensor([0, 7, 0], device="cuda", dtype=torch.int32),
-)
-```
+The pool uses the state-cache layout (`[slots, H, V, K]`, FP32 or BF16, contiguous within each
+slot, any slot stride) and may be `state_cache` itself, but must not alias any other input.
+Destinations of produced rows must be distinct and, when the pool aliases `state_cache`, must not
+be routed by the same call.
 
 A sequence may reserve more rows than it produces, and offsets need not start at zero, so a padded
 per-sequence slot table can serve as `destinations` directly. For vLLM's per-block state pages,
@@ -221,20 +215,20 @@ with `every_n_tokens` equal to the block size and every call starting on a block
 flattened `[N, max_blocks]` block table with `cu_checkpoint_offsets[i] = i * max_blocks +
 num_computed_blocks[i]` and `cu_checkpoint_offsets[N] = N * max_blocks`.
 
-For CUDA graphs, allocate a fixed-capacity tape (or `destinations` tensor) and update the
-offsets and destinations on device between replays. Without KDA replay, each active sequence must
-reserve at least `sequence_length // every_n_tokens` rows, and the terminal offset must fit the
-capacity. Offsets must be nondecreasing; null routes may reserve unused rows, which are left
-untouched along with spare capacity. These offset and destination values, and the absence of
-other aliasing with inputs (a tape aliases nothing; a pool may only alias the state cache), are
-caller responsibilities; validation checks tensor metadata without synchronizing with the host.
+For CUDA graphs, keep the offsets and destinations at a fixed capacity and update them on device
+between replays (`from_positions` sizes them at `num_tokens // 64 + N` rows). Each active sequence
+must reserve at least the rows it produces, offsets must be nondecreasing, and
+`cu_checkpoint_offsets[N]` must not exceed the length of `destinations`. Offset and
+destination values are caller responsibilities; validation checks tensor metadata without
+synchronizing with the host.
 
 With KDA `replay_state`, checkpoint intervals start at the beginning of each slot's unfinished
-chunk, **before** the new input. Counts are `(replayed_tokens + sequence_length) // every_n_tokens`,
-where `replayed_tokens` is the slot's pre-call replay count, or zero for a fresh slot. For example,
-19 replayed tokens plus 100 new tokens produce one interval-64 checkpoint, after 45 new tokens;
-the other 55 tokens belong to the unfinished chunk. The checkpoint is FP32 state after the
-completed chunk, not the state after all 100 new tokens.
+chunk, **before** the new input. A sequence produces `(replayed_tokens + sequence_length) //
+every_n_tokens` rows, where `replayed_tokens` is the slot's pre-call replay count, or zero for a
+fresh slot; `from_positions` reads it from the `replay_state` passed to it. For example, 19 replayed
+tokens plus 100 new tokens produce one interval-64 checkpoint, after 45 new tokens; the other 55
+tokens belong to the unfinished chunk. The checkpoint is the state after the completed chunk, not
+the state after all 100 new tokens.
 
 A caller restoring a prefix that ends inside the next chunk must copy the tokens after the
 checkpoint and their count into the destination slot's replay buffers as well. Attention Gym
@@ -244,8 +238,8 @@ must still set the destination count to zero, and resumes with `has_initial_stat
 omitted): `False` would discard the restored state. Stale tokens beyond the count need not be
 cleared.
 [`examples/linear/kda_prefix_cache_checkpoints.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
-publishes a shared prompt prefix into a cache slot through `destinations`, restores it this way,
-and checks that the suffix output matches a full prefill bitwise. The same contract applies to the
+publishes a shared prompt prefix into a cache slot with `from_positions`, restores it this way, and
+checks that the suffix output matches a full prefill bitwise. The same contract applies to the
 one-token replay path: 63 replayed tokens plus one new token produce an interval-64 checkpoint.
 The interval origin is recomputed for each call, so intervals longer than 64 never complete
 during one-token replay decode.

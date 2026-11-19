@@ -35,27 +35,39 @@ def sentinel_state_checkpoints(
     *,
     spare: int = 2,
 ) -> StateCheckpoints:
-    """Reserve ``counts[i]`` snapshot rows per sequence, plus spare rows, filled with a sentinel.
+    """Reserve ``counts[i]`` rows per sequence, plus spare rows, in a sentinel-filled FP32 pool.
 
-    Rows a kernel must not write keep ``CHECKPOINT_SENTINEL``, so whole-buffer comparisons also
-    check reserved-but-inactive rows and unused capacity.
+    Row ``r`` is stored in slot ``r + 1``, so :func:`checkpoint_rows` reads the rows back in
+    order. Slots a kernel must not write, including the null slot 0, keep
+    ``CHECKPOINT_SENTINEL``, so whole-pool comparisons also check reserved-but-inactive rows and
+    unused capacity.
     """
-    states = torch.full((sum(counts) + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
-    return StateCheckpoints(states, cumulative_sequence_offsets(counts), every_n_tokens)
+    rows = sum(counts) + spare
+    pool = torch.full((rows + 1, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
+    destinations = torch.arange(1, rows + 1, device="cuda", dtype=torch.int32)
+    return StateCheckpoints(
+        pool, cumulative_sequence_offsets(counts), every_n_tokens, destinations
+    )
 
 
-def assert_pool_checkpoints_match_tape(
+def checkpoint_rows(checkpoints: StateCheckpoints) -> torch.Tensor:
+    """View the rows of :func:`sentinel_state_checkpoints` in row order."""
+    return checkpoints.state_pool[1:]
+
+
+def assert_checkpoints_into_cache_match(
     run: Callable[[torch.Tensor, StateCheckpoints], torch.Tensor],
     cache: torch.Tensor,
-    tape: StateCheckpoints,
+    reference: StateCheckpoints,
     destinations: Sequence[int],
 ) -> None:
-    """Check that writing checkpoint rows into the state cache matches the FP32 tape.
+    """Check that checkpoints written into the state cache match a separate FP32 pool.
 
-    ``run(cache, checkpoints)`` advances ``cache`` in place. Each positive destination of a
-    written tape row receives that row in the cache dtype; every other slot, including the
-    destinations of unwritten rows, matches the tape run. Outputs must match too. Both runs use
-    the layout of ``cache``, including padding between slots.
+    ``run(cache, checkpoints)`` advances ``cache`` in place. ``reference`` comes from
+    :func:`sentinel_state_checkpoints`; rerunning with ``state_pool=cache`` and these
+    destinations must give each positive destination of a written row that row in the cache
+    dtype and leave every other slot as in the reference run. Outputs must match too. Both
+    runs use the layout of ``cache``, including padding between slots.
     """
 
     def clone(tensor: torch.Tensor) -> torch.Tensor:
@@ -64,17 +76,18 @@ def assert_pool_checkpoints_match_tape(
         )
         return copy.copy_(tensor)
 
-    tape_cache = clone(cache)
-    tape.states.fill_(CHECKPOINT_SENTINEL)
-    expected_output = run(tape_cache, tape)
+    reference_cache = clone(cache)
+    reference.state_pool.fill_(CHECKPOINT_SENTINEL)
+    expected_output = run(reference_cache, reference)
+    rows = checkpoint_rows(reference)
     pool_cache = clone(cache)
-    rows = torch.tensor(destinations, device=cache.device, dtype=torch.int32)
-    output = run(pool_cache, tape._replace(states=pool_cache, destinations=rows))
+    slots = torch.tensor(destinations, device=cache.device, dtype=torch.int32)
+    output = run(pool_cache, reference._replace(state_pool=pool_cache, destinations=slots))
     for row, slot in enumerate(destinations):
-        if slot > 0 and not torch.all(tape.states[row] == CHECKPOINT_SENTINEL):
-            tape_cache[slot] = tape.states[row]
+        if slot > 0 and not torch.all(rows[row] == CHECKPOINT_SENTINEL):
+            reference_cache[slot] = rows[row]
     torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
-    torch.testing.assert_close(pool_cache, tape_cache, rtol=0, atol=0, equal_nan=True)
+    torch.testing.assert_close(pool_cache, reference_cache, rtol=0, atol=0, equal_nan=True)
 
 
 def packed_chunk_routes(

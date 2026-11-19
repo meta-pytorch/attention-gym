@@ -1,10 +1,7 @@
-"""Caller-owned recurrent-state checkpoints: validation, custom-op arguments, and kernel stores.
+"""Host side of :class:`~attn_gym.linear.StateCheckpoints`: validation, op arguments, kernel view.
 
-Public operations take a :class:`~attn_gym.linear.StateCheckpoints`. Custom-op schemas receive
-its four fields flattened, and Triton kernels receive one :class:`CheckpointWrites` tuple (or
-``None``) and store each completed interval with
-``attn_gym.linear._delta_rule.triton.state_checkpoints.store_checkpoint``. This module stays
-free of Triton so the public APIs validate checkpoints without it.
+Kept free of Triton so public APIs validate checkpoints without it; the kernels' store lives in
+``_delta_rule/triton/state_checkpoints.py``.
 """
 
 from __future__ import annotations
@@ -26,10 +23,10 @@ class CheckpointWrites(NamedTuple):
     of one pool layout share a compiled variant.
     """
 
-    states: torch.Tensor
+    state_pool: torch.Tensor
     cu_checkpoint_offsets: torch.Tensor
     every_n_tokens: int
-    destinations: torch.Tensor | None
+    destinations: torch.Tensor
     slot_stride: int
 
 
@@ -37,7 +34,7 @@ def checkpoint_writes(checkpoints: StateCheckpoints | None) -> CheckpointWrites 
     """Return the kernel argument for optional, already validated checkpoints."""
     if checkpoints is None:
         return None
-    return CheckpointWrites(*checkpoints, checkpoints.states.stride(0))
+    return CheckpointWrites(*checkpoints, checkpoints.state_pool.stride(0))
 
 
 def validate_state_checkpoints(
@@ -67,48 +64,42 @@ def validate_state_checkpoints_metadata(
     """Validate caller-owned snapshots, including commits that have no token operands."""
     if not isinstance(checkpoints, StateCheckpoints):
         raise TypeError("state_checkpoints must be a StateCheckpoints instance")
-    states, offsets, interval, destinations = checkpoints
+    state_pool, offsets, interval, destinations = checkpoints
     if type(interval) is not int:
         raise TypeError("state_checkpoints.every_n_tokens must be an int")
     if interval <= 0 or interval % 64:
         raise ValueError("state_checkpoints.every_n_tokens must be a positive multiple of 64")
-    if destinations is None:
-        if states.ndim != 4 or states.shape[1:] != state_shape:
-            raise ValueError("state_checkpoints.states must have shape [capacity, H, V, K]")
-        if states.dtype != torch.float32:
-            raise TypeError("state_checkpoints.states must use float32")
-        if not states.is_contiguous():
-            raise ValueError("state_checkpoints.states must be contiguous")
-    else:
-        heads, value_dim, key_dim = state_shape
-        validate_state_pool(
-            states,
-            heads=heads,
-            value_dim=value_dim,
-            key_dim=key_dim,
-            device=device,
-            name="state_checkpoints.states",
+    heads, value_dim, key_dim = state_shape
+    validate_state_pool(
+        state_pool,
+        heads=heads,
+        value_dim=value_dim,
+        key_dim=key_dim,
+        device=device,
+        name="state_checkpoints.state_pool",
+    )
+    if (
+        destinations.ndim != 1
+        or destinations.dtype != torch.int32
+        or not destinations.is_contiguous()
+        or destinations.device != device
+    ):
+        raise ValueError(
+            "state_checkpoints.destinations must be a contiguous 1-D int32 tensor "
+            "on the input device"
         )
-        if (
-            destinations.ndim != 1
-            or destinations.dtype != torch.int32
-            or not destinations.is_contiguous()
-            or destinations.device != device
-        ):
-            raise ValueError(
-                "state_checkpoints.destinations must be a contiguous 1-D int32 tensor "
-                "on the input device"
-            )
-    if offsets.shape != (num_sequences + 1,):
-        raise ValueError("state_checkpoints.cu_checkpoint_offsets must have shape [N + 1]")
-    if offsets.dtype != torch.int32:
-        raise TypeError("state_checkpoints.cu_checkpoint_offsets must use int32")
-    if not offsets.is_contiguous():
-        raise ValueError("state_checkpoints.cu_checkpoint_offsets must be contiguous")
-    if states.device != device or offsets.device != device:
-        raise ValueError("state_checkpoints tensors must be on the input device")
+    if (
+        offsets.shape != (num_sequences + 1,)
+        or offsets.dtype != torch.int32
+        or not offsets.is_contiguous()
+        or offsets.device != device
+    ):
+        raise ValueError(
+            "state_checkpoints.cu_checkpoint_offsets must be a contiguous int32 tensor of shape "
+            "[N + 1] on the input device"
+        )
     require_inference_only(
-        (states,),
+        (state_pool,),
         "state_checkpoints is inference-only; call under torch.no_grad() or torch.inference_mode()",
     )
 
@@ -121,19 +112,20 @@ def state_checkpoint_op_args(
 
 
 def state_checkpoints_from_op_args(
-    states: torch.Tensor | None,
+    state_pool: torch.Tensor | None,
     offsets: torch.Tensor | None,
     every_n_tokens: int,
     destinations: torch.Tensor | None,
 ) -> StateCheckpoints | None:
     """Rebuild the snapshots a custom-op schema received as flattened arguments."""
-    if states is None:
-        if offsets is not None or destinations is not None:
-            raise ValueError("cu_checkpoint_offsets and destinations require checkpoint_states")
+    if state_pool is None and offsets is None and destinations is None:
         return None
-    if offsets is None:
-        raise ValueError("checkpoint_states requires cu_checkpoint_offsets")
-    return StateCheckpoints(states, offsets, every_n_tokens, destinations)
+    if state_pool is None or offsets is None or destinations is None:
+        raise ValueError(
+            "state checkpoints require checkpoint_states, cu_checkpoint_offsets, "
+            "and checkpoint_destinations together"
+        )
+    return StateCheckpoints(state_pool, offsets, every_n_tokens, destinations)
 
 
 __all__ = [

@@ -170,8 +170,6 @@ def _run_chunk_delta_h_sequence(
 
     if checkpoints is not None:
         checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n)
-        if USE_INT64_OFFSETS:
-            checkpoint_row = checkpoint_row.to(tl.int64)
         checkpoint_chunks = checkpoints.every_n_tokens // BT
         next_checkpoint_chunk = checkpoint_chunks
 
@@ -583,10 +581,6 @@ def _delta_h_launch(
             h,
             initial_state,
             final_state,
-            # Pool slots are int64 already; only a tape's extent widens other offsets.
-            None
-            if state_checkpoints is None or state_checkpoints.destinations is not None
-            else state_checkpoints.states,
         ),
         "SCALAR_GATE": scalar_gate,
         "FASTMATH": fastmath,

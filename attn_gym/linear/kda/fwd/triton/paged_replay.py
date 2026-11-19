@@ -22,7 +22,6 @@ import triton.language as tl
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear._delta_rule.state_checkpoints import (
-    CheckpointWrites,
     checkpoint_writes,
     state_checkpoints_from_op_args,
     validate_state_checkpoints_metadata,
@@ -38,16 +37,9 @@ _CHUNK_SIZE = tl.constexpr(DEFAULT_CHUNK_SIZE)
 
 
 def _int64_offset_heuristic(*tensor_names: str):
-    def tensors(value):
-        if isinstance(value, CheckpointWrites):
-            # Pool slots are int64 already; only a tape's extent widens other offsets.
-            tape = value.states if value.destinations is None else None
-            return tape, value.cu_checkpoint_offsets
-        return (value,)
-
     return {
         "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            *(tensor for name in tensor_names for tensor in tensors(args[name]))
+            *(args[name] for name in tensor_names)
         )
     }
 
@@ -544,7 +536,6 @@ def _gather_state_kernel(
         "active_counts",
         "state_cache",
         "replay_count",
-        "checkpoints",
     )
 )
 @triton.jit
@@ -593,8 +584,6 @@ def _commit_state_kernel(
         checkpoint_index = tl.load(
             checkpoints.cu_checkpoint_offsets + active_index, mask=checkpoint_mask, other=0
         )
-        if USE_INT64_OFFSETS:
-            checkpoint_index = checkpoint_index.to(tl.int64)
         store_checkpoint(
             checkpoints,
             checkpoint_slot(checkpoints, checkpoint_index, checkpoint_mask),

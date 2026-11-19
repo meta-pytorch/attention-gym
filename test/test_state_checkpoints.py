@@ -10,6 +10,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
 
 from attn_gym.linear import (
+    ReplayState,
     StateCheckpoints,
     chunk_gdn,
     chunk_kda,
@@ -20,7 +21,7 @@ from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.testing import (
     CHECKPOINT_SENTINEL,
-    assert_pool_checkpoints_match_tape,
+    checkpoint_rows,
     sentinel_state_checkpoints,
 )
 from attn_gym.testing.gdn import make_gdn_test_inputs
@@ -70,7 +71,8 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
     rule: Rule, cuda: None, interval: int, state_dtype: torch.dtype
 ) -> None:
     # Covers an empty sequence, an incomplete interval, aligned final states, null routes that
-    # reserve unwritten rows, and FP32 snapshots taken before BF16 pool rounding.
+    # reserve unwritten rows, a sequence that reserves a row more than it produces, and FP32
+    # snapshots taken before BF16 pool rounding.
     paged, chunk = operations(rule)
     lengths = [0, interval - 1, 2 * interval, interval + 7, interval, interval]
     tensors = inputs(rule, sum(lengths))
@@ -84,8 +86,10 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
     initial_cache[1].fill_(float("nan"))
     expected_cache = initial_cache.clone()
     actual_cache = initial_cache.clone()
-    saved = checkpoints(lengths, interval)
-    expected_states = saved.states.clone()
+    reserved = [length // interval for length in lengths]
+    reserved[2] += 1
+    saved = sentinel_state_checkpoints(reserved, interval, (2, 128, 128))
+    expected_states = checkpoint_rows(saved).clone()
     kwargs = {"cu_seqlens": cu_seqlens, "has_initial_state": has_initial}
 
     expected_output = paged(
@@ -105,7 +109,9 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
 
     # Compare each post-boundary state to the same chunk arithmetic stopped at that boundary.
     token_start = checkpoint_start = 0
-    for length, slot, has_state in zip(lengths, routes, initial_flags, strict=True):
+    for length, slot, has_state, rows in zip(
+        lengths, routes, initial_flags, reserved, strict=True
+    ):
         if slot > 0:
             initial = initial_cache[slot : slot + 1].float()
             if not has_state:
@@ -121,40 +127,121 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
                 )
                 expected_states[checkpoint_start + index].copy_(final_state[0])
         token_start += length
-        checkpoint_start += length // interval
+        checkpoint_start += rows
 
-    torch.testing.assert_close(saved.states, expected_states, rtol=0, atol=0)
+    torch.testing.assert_close(checkpoint_rows(saved), expected_states, rtol=0, atol=0)
+    assert torch.all(saved.state_pool[0] == CHECKPOINT_SENTINEL)
+
+
+@pytest.mark.parametrize(
+    "replay,slots,offsets,destinations",
+    [
+        # Rows per sequence: 200 // 64, 130 // 64, 0, 130 // 64. Sequence 1 has no slot,
+        # sequence 2 asks past its length, and sequence 3 asks for a non-boundary length.
+        (False, [7, -1, 5, 9], [0, 3, 5, 5, 7], [0, 7, 0, 0, 0, 9, 0, 0, 0, 0, 0]),
+        # Replayed tokens 19, 63, 0 (fresh slot), 10 shift each sequence's boundaries.
+        (True, [7, 8, 5, 9], [0, 3, 6, 6, 8], [0, 7, 0, 8, 0, 0, 9, 0, 0, 0, 0]),
+        # An inactive route replays nothing, even when the null slot holds a large count.
+        (True, [7, 8, 5, -1], [0, 3, 6, 6, 8], [0, 7, 0, 8, 0, 0, 0, 0, 0, 0, 0]),
+    ],
+    ids=["new-tokens", "replay", "replay-inactive"],
+)
+def test_from_positions_selects_one_row_per_sequence(
+    replay: bool, slots: list[int], offsets: list[int], destinations: list[int]
+) -> None:
+    def ints(values: list[int]) -> torch.Tensor:
+        return torch.tensor(values, dtype=torch.int32)
+
+    replay_kwargs = {}
+    if replay:
+        counts = ints([63, 19, 63, 50, 10])
+        inactive = slots[3] < 0
+        replay_kwargs = {
+            "replay_state": ReplayState(*(torch.empty(5, 0) for _ in range(5)), counts),
+            "state_indices": ints([1, 2, 3, -1 if inactive else 4]),
+            "has_initial_state": torch.tensor([True, True, False, True]),
+        }
+    checkpoints = StateCheckpoints.from_positions(
+        torch.empty(10, 2, 128, 128),
+        cu_seqlens=ints([0, 200, 330, 330, 460]),
+        snapshot_positions=ints([128, 64, 64, 100]),
+        snapshot_slots=ints(slots),
+        num_tokens=460,
+        **replay_kwargs,
+    )
+    assert checkpoints.every_n_tokens == 64
+    torch.testing.assert_close(checkpoints.cu_checkpoint_offsets, ints(offsets), rtol=0, atol=0)
+    torch.testing.assert_close(checkpoints.destinations, ints(destinations), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
-def test_checkpoints_written_into_the_state_cache_match_the_tape(
+def test_from_positions_publishes_prefix_states_into_the_cache(
     rule: Rule, cuda: None, state_dtype: torch.dtype, triton_compiles
 ) -> None:
-    paged, _ = operations(rule)
-    # Rows: 2 for the second sequence, 1 reserved by the null route, 3 for the last.
-    lengths = [0, 130, 64, 200]
+    paged, chunk = operations(rule)
+    lengths = [200, 130]
     tensors = inputs(rule, sum(lengths))
     cu_seqlens = cumulative_sequence_offsets(lengths)
-    slots = torch.tensor([1, 2, -1, 3], device="cuda", dtype=torch.int32)
-    cache = torch.randn(9, 2, 128, 128, device="cuda", dtype=state_dtype) * 0.01
-
-    def run(cache: torch.Tensor, saved: StateCheckpoints) -> torch.Tensor:
-        return paged(
+    initial_cache = torch.randn(10, 2, 128, 128, device="cuda", dtype=state_dtype) * 0.01
+    slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
+    # Position 100 is not a boundary, so it publishes the state after 64 tokens. Positions and
+    # slots are runtime data: the second request compiles nothing new.
+    compiles = []
+    for positions, published in (
+        ([128, 100], {7: (0, 128), 9: (200, 264)}),
+        ([192, 128], {9: (0, 192), 7: (200, 328)}),
+    ):
+        cache = initial_cache.clone()
+        paged(
             *tensors,
             cache,
             slots,
             cu_seqlens=cu_seqlens,
-            state_checkpoints=saved,
+            state_checkpoints=StateCheckpoints.from_positions(
+                cache,
+                cu_seqlens,
+                snapshot_positions=torch.tensor(positions, device="cuda", dtype=torch.int32),
+                snapshot_slots=torch.tensor(list(published), device="cuda", dtype=torch.int32),
+                num_tokens=sum(lengths),
+            ),
             kernel_options=options(rule),
         )
+        for slot, (start, stop) in published.items():
+            route = 1 if start == 0 else 2
+            _, expected = chunk(
+                *(tensor[:, start:stop] for tensor in tensors),
+                initial_cache[route : route + 1].float(),
+                cu_seqlens=cumulative_sequence_offsets([stop - start]),
+                output_final_state=True,
+                kernel_options=options(rule),
+            )
+            torch.testing.assert_close(cache[slot], expected[0].to(state_dtype), rtol=0, atol=0)
+        for slot in set(range(10)) - {1, 2, *published}:
+            torch.testing.assert_close(cache[slot], initial_cache[slot], rtol=0, atol=0)
+        compiles.append(sum(triton_compiles.values()))
+    assert compiles[0] == compiles[1]
 
-    # The last sequence reserves one row more than it produces.
-    tape = sentinel_state_checkpoints([0, 2, 1, 4], 64, (2, 128, 128), spare=0)
-    # Destination values are runtime data: both selections reuse one compiled recurrence.
-    for destinations in ([4, 0, 5, -1, 6, 7, 8], [8, 7, 0, 6, 5, 4, 3]):
-        assert_pool_checkpoints_match_tape(run, cache, tape, destinations)
-    assert triton_compiles["chunk_delta_h_kernel"] == 2
+
+@torch.no_grad()
+def test_from_positions_replays_in_cuda_graphs_with_new_positions(cuda: None) -> None:
+    cu_seqlens = cumulative_sequence_offsets([200, 130])
+    positions = torch.tensor([128, 64], device="cuda", dtype=torch.int32)
+    slots = torch.tensor([7, 9], device="cuda", dtype=torch.int32)
+    pool = torch.empty(10, 2, 128, 128, device="cuda")
+
+    def build() -> StateCheckpoints:
+        return StateCheckpoints.from_positions(pool, cu_seqlens, positions, slots, num_tokens=330)
+
+    build()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = build()
+    positions.copy_(torch.tensor([192, 128], device="cuda", dtype=torch.int32))
+    graph.replay()
+    torch.testing.assert_close(captured.destinations, build().destinations, rtol=0, atol=0)
+    assert captured.destinations.tolist()[:5] == [0, 0, 7, 0, 9]
 
 
 @torch.no_grad()
@@ -172,9 +259,10 @@ def test_dense_batch_checkpoints_include_aligned_final_state(rule: Rule, cuda: N
         output_final_state=True,
         kernel_options=options(rule),
     )
-    torch.testing.assert_close(saved.states[:2], expected, rtol=0, atol=0)
-    torch.testing.assert_close(saved.states[:2], state_cache[slots.long()], rtol=0, atol=0)
-    assert torch.all(saved.states[2:] == CHECKPOINT_SENTINEL)
+    rows = checkpoint_rows(saved)
+    torch.testing.assert_close(rows[:2], expected, rtol=0, atol=0)
+    torch.testing.assert_close(rows[:2], state_cache[slots.long()], rtol=0, atol=0)
+    assert torch.all(rows[2:] == CHECKPOINT_SENTINEL)
 
 
 @pytest.mark.parametrize("execution", ["fullgraph", "cuda_graph"])
@@ -191,18 +279,25 @@ def test_checkpoint_graph_replay_reads_changed_offsets_and_routes(
     state_cache = initial_cache.clone()
     saved = checkpoints([128, 128], 128)
 
-    def run(cache, states, sequence_offsets, checkpoint_offsets, routes, initial_flags):
+    def run(cache, pool, sequence_offsets, checkpoint_offsets, routes, initial_flags):
         return paged(
             *tensors,
             cache,
             routes,
             cu_seqlens=sequence_offsets,
             has_initial_state=initial_flags,
-            state_checkpoints=StateCheckpoints(states, checkpoint_offsets, 128),
+            state_checkpoints=StateCheckpoints(pool, checkpoint_offsets, 128, saved.destinations),
             kernel_options=options(rule),
         )
 
-    args = (state_cache, saved.states, cu_seqlens, saved.cu_checkpoint_offsets, slots, has_initial)
+    args = (
+        state_cache,
+        saved.state_pool,
+        cu_seqlens,
+        saved.cu_checkpoint_offsets,
+        slots,
+        has_initial,
+    )
     run(*args)
     if execution == "fullgraph":
         replay = torch.compile(run, fullgraph=True)
@@ -226,9 +321,9 @@ def test_checkpoint_graph_replay_reads_changed_offsets_and_routes(
             cumulative_sequence_offsets([length // 128 for length in lengths])
         )
         state_cache.copy_(initial_cache)
-        saved.states.fill_(CHECKPOINT_SENTINEL)
+        saved.state_pool.fill_(CHECKPOINT_SENTINEL)
         expected_cache = initial_cache.clone()
-        expected_states = torch.full_like(saved.states, CHECKPOINT_SENTINEL)
+        expected_states = torch.full_like(saved.state_pool, CHECKPOINT_SENTINEL)
         expected_output = run(
             expected_cache,
             expected_states,
@@ -244,7 +339,7 @@ def test_checkpoint_graph_replay_reads_changed_offsets_and_routes(
         torch.cuda.synchronize()
         torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
         torch.testing.assert_close(state_cache, expected_cache, rtol=0, atol=0)
-        torch.testing.assert_close(saved.states, expected_states, rtol=0, atol=0)
+        torch.testing.assert_close(saved.state_pool, expected_states, rtol=0, atol=0)
 
 
 def checkpoint_operator_inputs(rule: Rule) -> tuple[torch._ops.OpOverload, tuple]:
@@ -301,18 +396,18 @@ def test_checkpoint_paged_operator_registration(
     torch.library.opcheck(op, args)
 
 
-@pytest.mark.parametrize("invalid", ["dtype", "missing_offsets"])
+@pytest.mark.parametrize("invalid", ["dtype", "missing_destinations"])
 def test_raw_checkpoint_operator_validates_before_launch(
     rule: Rule, cuda: None, invalid: str
 ) -> None:
     op, args = checkpoint_operator_inputs(rule)
-    states, offsets, interval, _ = args[-4:]
+    pool, offsets, interval, destinations = args[-4:]
     if invalid == "dtype":
-        states = states.bfloat16()
+        pool = pool.half()
     else:
-        offsets = None
+        destinations = None
     with pytest.raises((TypeError, ValueError), match="checkpoint"):
-        op(*args[:-4], states, offsets, interval)
+        op(*args[:-4], pool, offsets, interval, destinations)
 
 
 def fake_paged_call(
@@ -337,6 +432,7 @@ def fake_paged_call(
             torch.empty(4, 2, 128, 128, device="cuda"),
             torch.empty(3, device="cuda", dtype=torch.int32),
             64,
+            torch.empty(4, device="cuda", dtype=torch.int32),
         )
         return paged(
             q,
@@ -359,17 +455,17 @@ INVALID_METADATA = {
     "unaligned_interval": lambda c: c._replace(every_n_tokens=65),
     "bool_interval": lambda c: c._replace(every_n_tokens=True),
     "float_interval": lambda c: c._replace(every_n_tokens=64.0),
-    "state_dtype": lambda c: c._replace(states=c.states.bfloat16()),
-    "state_shape": lambda c: c._replace(states=c.states[:, :1]),
-    "state_stride": lambda c: c._replace(states=c.states.transpose(-1, -2)),
-    "state_device": lambda c: c._replace(states=c.states.cpu()),
+    "pool_dtype": lambda c: c._replace(state_pool=c.state_pool.half()),
+    "pool_shape": lambda c: c._replace(state_pool=c.state_pool[:, :1]),
+    "pool_slot_layout": lambda c: c._replace(state_pool=c.state_pool.transpose(-1, -2)),
+    "pool_device": lambda c: c._replace(state_pool=c.state_pool.cpu()),
     "offset_dtype": lambda c: c._replace(cu_checkpoint_offsets=c.cu_checkpoint_offsets.long()),
     "offset_shape": lambda c: c._replace(cu_checkpoint_offsets=c.cu_checkpoint_offsets[:2]),
     "offset_stride": lambda c: c._replace(
         cu_checkpoint_offsets=torch.empty(6, device="cuda", dtype=torch.int32)[::2]
     ),
     "offset_device": lambda c: c._replace(cu_checkpoint_offsets=c.cu_checkpoint_offsets.cpu()),
-    "autograd": lambda c: c._replace(states=c.states.requires_grad_()),
+    "autograd": lambda c: c._replace(state_pool=c.state_pool.requires_grad_()),
     "destination_dtype": lambda c: c._replace(
         destinations=torch.empty(4, device="cuda", dtype=torch.int64)
     ),
@@ -379,13 +475,7 @@ INVALID_METADATA = {
     "destination_stride": lambda c: c._replace(
         destinations=torch.empty(8, device="cuda", dtype=torch.int32)[::2]
     ),
-    "pool_dtype": lambda c: c._replace(
-        states=c.states.half(), destinations=torch.empty(4, device="cuda", dtype=torch.int32)
-    ),
-    "pool_slot_stride": lambda c: c._replace(
-        states=c.states.transpose(-1, -2),
-        destinations=torch.empty(4, device="cuda", dtype=torch.int32),
-    ),
+    "destination_device": lambda c: c._replace(destinations=c.destinations.cpu()),
 }
 
 
@@ -402,7 +492,7 @@ def test_checkpoint_calls_reject_operand_autograd(rule: Rule) -> None:
 
 def test_kda_validates_checkpoint_metadata() -> None:
     with pytest.raises(TypeError, match="state_checkpoints"):
-        fake_paged_call("kda", INVALID_METADATA["state_dtype"], kernel_options=options("kda"))
+        fake_paged_call("kda", INVALID_METADATA["pool_dtype"], kernel_options=options("kda"))
 
 
 def test_warpdrive_rejects_checkpoints_before_backend_dispatch(rule: Rule) -> None:
@@ -433,9 +523,10 @@ def test_checkpoint_intervals_and_shapes_reuse_recurrence(rule: Rule, cuda: None
             kernel_options=options(rule),
         )
         active = sequences * (length // interval)
-        assert torch.isfinite(saved.states[:active]).all()
-        assert torch.all(saved.states[:active] != CHECKPOINT_SENTINEL)
-        assert torch.all(saved.states[active:] == CHECKPOINT_SENTINEL)
+        rows = checkpoint_rows(saved)
+        assert torch.isfinite(rows[:active]).all()
+        assert torch.all(rows[:active] != CHECKPOINT_SENTINEL)
+        assert torch.all(rows[active:] == CHECKPOINT_SENTINEL)
     assert triton_compiles["chunk_delta_h_kernel"] == 1
 
 
@@ -464,7 +555,7 @@ def test_gdn_d64_grouped_checkpoints(cuda: None, monkeypatch, wide_offsets: bool
             output_final_state=True,
             kernel_options={"autotune": False},
         )
-        torch.testing.assert_close(saved.states[row], expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(checkpoint_rows(saved)[row], expected[0], rtol=0, atol=0)
 
 
 @torch.no_grad()
@@ -490,5 +581,5 @@ def test_persistent_recurrence_writes_every_sequence_checkpoint(
         state_checkpoints=saved,
         kernel_options={"autotune": False},
     )
-    torch.testing.assert_close(saved.states, cache[1:], rtol=0, atol=0)
+    torch.testing.assert_close(checkpoint_rows(saved), cache[1:], rtol=0, atol=0)
     assert triton_compiles["chunk_delta_h_persistent_kernel"] == 1

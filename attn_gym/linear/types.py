@@ -6,6 +6,8 @@
 
 """Types shared by public linear-attention operations."""
 
+from __future__ import annotations
+
 from enum import Enum
 from typing import Literal, NamedTuple
 
@@ -16,55 +18,92 @@ from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOpt
 
 
 class StateCheckpoints(NamedTuple):
-    """Caller-owned periodic snapshots of the recurrent state for paged GDN and KDA inference.
+    """Periodic recurrent-state snapshots written into caller-chosen slots of a state pool.
 
-    Sequence ``i`` produces its post-update state every ``every_n_tokens`` tokens, measured
-    from that sequence's start in this call. With KDA ``replay_state``, count from the start
-    of the slot's unfinished chunk instead: cached replay tokens precede the new tokens. The
-    interval must be a positive multiple of 64. A final state exactly on an interval boundary
-    is included; incomplete intervals produce no snapshot.
+    Every ``every_n_tokens`` tokens (a positive multiple of 64, counted from each sequence's
+    start in this call, or from its slot's unfinished chunk with KDA ``replay_state``), a
+    sequence produces one row: its full post-update state, including the slot's history.
+    ``cu_checkpoint_offsets`` (int32 ``[N + 1]``, nondecreasing) packs rows by sequence: an
+    active sequence's rows fill ``offsets[i]`` onward, and it must reserve at least
+    ``(replayed_tokens + sequence_length) // every_n_tokens`` of them (no replayed tokens
+    without replay or for a fresh slot). ``destinations`` (int32, one entry per row) sends row
+    ``r`` to slot ``destinations[r]`` of ``state_pool``; non-positive entries, such as
+    ``PAD_SLOT_ID = -1`` or the null slot 0, skip it. :meth:`from_positions` builds both for
+    one snapshot per sequence.
 
-    ``cu_checkpoint_offsets`` is contiguous int32 on the input device, shaped ``[N + 1]``.
-    It is nonnegative and never decreases; sequence ``i`` owns rows ``offsets[i]`` up to
-    ``offsets[i + 1]``, and rows outside those ranges are not written. Each active sequence
-    produces ``sequence_length // every_n_tokens`` rows, or
-    ``(replayed_tokens + sequence_length) // every_n_tokens`` for KDA replay, and must reserve
-    at least that many; they fill its first rows. A fresh slot (``has_initial_state=False``)
-    has zero replayed tokens. Inactive sequences may reserve unused rows.
+    ``state_pool`` has the paged state-cache layout (``[slots, H, V, K]``, FP32 or BF16,
+    contiguous within each slot) and may be the state cache itself, but no other input. A BF16
+    pool rounds the FP32 snapshots. Destinations of produced rows must be distinct and, when the
+    pool is the state cache, not routed by the call; ``offsets[N]`` must not exceed the length of
+    ``destinations``. These values are not checked on device. Nothing else is written.
 
-    Rows are stored in one of two ways:
-
-    - Without ``destinations``, ``states`` is a contiguous FP32 tape shaped
-      ``[capacity, H, V, K]`` and row ``r`` is ``states[r]``. It holds the FP32 recurrence
-      accumulator exactly, even when the persistent state cache uses BF16. It must not
-      alias any input.
-    - With ``destinations``, a contiguous 1-D int32 tensor with one entry per row, row ``r``
-      is written to slot ``destinations[r]`` of ``states``, and non-positive entries skip the
-      row. ``states`` is then a state pool with the paged state-cache layout (FP32 or BF16,
-      contiguous within each ``[H, V, K]`` slot) and may be the state cache itself, so an
-      engine can publish prefix-cache states straight into its own slots. A BF16 pool rounds
-      the snapshots. Destinations of produced rows must be distinct and, when ``states``
-      aliases the state cache, must not be routed by this call.
-
-    The final offset must not exceed ``capacity``: the number of rows of the tape, or the
-    length of ``destinations``. Offset and destination values are caller responsibilities:
-    no device-to-host synchronization is performed to check them. Inactive sequences
-    (non-positive state indices) and unused rows are not written.
-
-    Checkpointing is inference-only and requires the repo-local fused backend:
-    ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or ``recurrent_gdn``
-    with ``state_indices``.
-    A replay checkpoint contains only the completed chunk's recurrent state. To resume at
-    a position within the next chunk, the caller must also preserve that position's replay
-    tokens and count; the operation does not snapshot replay buffers. The replay interval
-    origin is recomputed for each call, so intervals longer than 64 never complete during
-    one-token replay decode.
+    Requires the fused backend: ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or
+    ``recurrent_gdn`` with ``state_indices``; inference only. A replay checkpoint holds the
+    state after a completed chunk: restoring a later position also needs the caller to copy its
+    replay tail and count. Intervals above 64 never complete during one-token replay decode.
     """
 
-    states: torch.Tensor
+    state_pool: torch.Tensor
     cu_checkpoint_offsets: torch.Tensor
     every_n_tokens: int
-    destinations: torch.Tensor | None = None
+    destinations: torch.Tensor
+
+    @classmethod
+    def from_positions(
+        cls,
+        state_pool: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        snapshot_positions: torch.Tensor,
+        snapshot_slots: torch.Tensor,
+        *,
+        num_tokens: int,
+        replay_state: ReplayState | None = None,
+        state_indices: torch.Tensor | None = None,
+        has_initial_state: torch.Tensor | None = None,
+    ) -> StateCheckpoints:
+        """Snapshot each sequence at a position of this call, into one slot per sequence.
+
+        A position counts the sequence's tokens of this call before the snapshot. Without
+        replay it should be a multiple of 64 (other positions snapshot the boundary below);
+        with replay, any position whose replayed plus new tokens reach a 64-token boundary
+        works, and the caller copies the tail. Positions past the sequence or before its first
+        boundary, and non-positive slots, take no snapshot. Runs on device without host
+        synchronization, so CUDA graphs can replay it with new positions and slots.
+
+        Args:
+            state_pool: The ``[slots, H, V, K]`` pool receiving the snapshots.
+            cu_seqlens: Packed int32 boundaries ``[N + 1]`` of this call's sequences.
+            snapshot_positions: int32 ``[N]`` positions.
+            snapshot_slots: int32 ``[N]`` pool slots; positive slots must be distinct.
+            num_tokens: Static token count, at least ``cu_seqlens[-1]``; the tables hold
+                ``num_tokens // 64 + N`` rows.
+            replay_state, state_indices, has_initial_state: The same call's KDA replay buffers
+                and routing, from which replayed token counts are read.
+        """
+        interval = DEFAULT_CHUNK_SIZE
+        lengths = cu_seqlens.diff()
+        targets = snapshot_positions
+        if replay_state is not None:
+            if state_indices is None:
+                raise ValueError("replay_state requires the call's state_indices")
+            replayed = replay_state.count.reshape(-1)[state_indices.clamp(min=0).long()]
+            resumed = state_indices > 0
+            if has_initial_state is not None:
+                resumed = resumed & has_initial_state
+            replayed = torch.where(resumed, replayed, 0)
+            lengths = lengths + replayed
+            targets = targets + replayed
+        offsets = torch.nn.functional.pad(torch.cumsum(lengths // interval, 0), (1, 0))
+        capacity = num_tokens // interval + lengths.shape[0]
+        # A target before the first boundary or past the sequence has no row of its own; it and
+        # every unselected sequence write the extra last row, which is sliced off.
+        rows = offsets[:-1] + targets // interval - 1
+        selected = (snapshot_slots > 0) & (targets >= interval) & (targets <= lengths)
+        selected &= rows < capacity
+        rows = torch.where(selected, rows, capacity)
+        destinations = torch.zeros(capacity + 1, dtype=torch.int32, device=cu_seqlens.device)
+        destinations[rows] = torch.where(selected, snapshot_slots, 0).to(torch.int32)
+        return cls(state_pool, offsets.to(torch.int32), interval, destinations[:capacity])
 
 
 class ReplayState(NamedTuple):

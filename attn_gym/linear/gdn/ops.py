@@ -361,13 +361,8 @@ def _recurrent_fwd_paged_fake(
     checkpoint_destinations: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
-    del (
-        batch_invariant,
-        checkpoint_states,
-        cu_checkpoint_offsets,
-        checkpoint_interval,
-        checkpoint_destinations,
-    )
+    del batch_invariant, checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+    del checkpoint_destinations
     return torch.empty_like(v, dtype=q.dtype)
 
 

@@ -257,7 +257,7 @@ def _recurrent_delta_rule_fwd_kernel(
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 
     if checkpoints is not None:
-        checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n).to(tl.int64)
+        checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n)
         checkpoint_end = tl.load(checkpoints.cu_checkpoint_offsets + i_n + 1)
         next_checkpoint = checkpoints.every_n_tokens.to(tl.int64)
         # Resolve each destination one interval early: this latency-bound scan would otherwise
@@ -314,7 +314,6 @@ def _recurrent_delta_rule_fwd_kernel(
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
         if checkpoints is not None:  # noqa: SIM102 - optional counters need their constexpr guard
             if i_t + 1 == next_checkpoint:
-                # Slots are int64: tapes and pools can exceed int32 element offsets.
                 store_checkpoint(
                     checkpoints,
                     slot,
