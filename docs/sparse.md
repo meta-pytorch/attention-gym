@@ -183,6 +183,45 @@ reservations can require more scoring/selection launches to preserve the 32 MiB
 workspace bound. The bounded scoring grid removes launches of CTAs for every
 reserved candidate tile; it does not make latency independent of reserved capacity.
 
+Measure the complete decode workload and profile scoring and Top-K within the same
+CUDA Graph replay:
+
+```bash
+python benchmarks/sparse/paged_indexer_benchmark.py \
+  --batch 1 16 64 --candidates 1024 8192 32768 --topk 512 \
+  --profile-rep 20 --peak-memory-gbps 8000 --peak-compute-tflops 2250 --reference \
+  --output agent_space/paged-indexer.json --trace agent_space/paged-indexer.json
+```
+
+These example ceilings are advertised B200 values; supply ceilings for your device.
+The end-to-end CUDA-event median includes selection. Separate profiler means show
+scoring and Top-K time while preserving the score-buffer cache reuse between them;
+they are diagnostic measurements and need not sum to the independently measured median.
+Trace filenames are suffixed with batch, live candidates, and reserved capacity.
+Profiling is optional: omit `--profile-rep` for CUDA-event timings alone, without
+hardware ceilings. Like the whole-document benchmark, timing defaults to 25 warmup
+replays and 100 measured replays, with `--warmup`, `--rep`, `--dtype`, and `--seed`
+overrides. Use `--capacity 4194304 --candidates 32768` to hold the live pool fixed
+while reserving more page-table space. `--weights negative` stresses zero-score cutoff
+ties, `--weights zero` exercises the no-scoring shortcut, and `--deterministic`
+measures ordered selection. Every fused case is checked against the FP64 oracle
+before timing.
+
+The benchmark applies Transformer Nuggets' `max(useful FLOPs / peak FLOPs,
+minimal bytes / bandwidth, launch count * launch latency)` to each stage. It includes
+the intermediate FP32 score writes and Top-K's minimum score reads and ID writes.
+Serial stage bounds are summed, but this remains a **partial lower bound**: integer
+radix passes, shared-memory atomics, and synchronization have no modeled compute
+ceiling. Their cost is unknown, not zero. The report therefore leaves the complete
+operation's roofline percentage unset. Warm fixed-pointer replay can hit L2; logical
+bytes do not measure physical DRAM or L2 traffic.
+
+For physical counters, use Nsight Compute with `--profile-from-start off` and pass
+`--ncu --batch 64 --candidates 32768` to the benchmark. This warms the complete
+operation and brackets one CUDA Graph replay with `cudaProfilerStart/Stop`.
+Use `--replay-mode application --cache-control none --clock-control none` to preserve
+the warmed execution context across counter passes.
+
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 
 
