@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.naive import naive_recurrent_kda
+from attn_gym.linear.types import StateCheckpoints
 
 
 def cumulative_sequence_offsets(
@@ -22,6 +23,25 @@ def cumulative_sequence_offsets(
     for length in lengths:
         offsets.append(offsets[-1] + length)
     return torch.tensor(offsets, device=device, dtype=torch.int32)
+
+
+CHECKPOINT_SENTINEL = 12345.0
+
+
+def sentinel_state_checkpoints(
+    counts: Sequence[int],
+    every_n_tokens: int,
+    state_shape: tuple[int, int, int],
+    *,
+    spare: int = 2,
+) -> StateCheckpoints:
+    """Reserve ``counts[i]`` snapshot rows per sequence, plus spare rows, filled with a sentinel.
+
+    Rows a kernel must not write keep ``CHECKPOINT_SENTINEL``, so whole-buffer comparisons also
+    check reserved-but-inactive rows and unused capacity.
+    """
+    states = torch.full((sum(counts) + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
+    return StateCheckpoints(states, cumulative_sequence_offsets(counts), every_n_tokens)
 
 
 def packed_chunk_routes(
@@ -86,6 +106,7 @@ def make_kda_test_inputs(
     seed: int = 41,
     gate_scale: float = 5.0,
     gate_value: float | None = None,
+    sigmoid_gate_bound: float | None = None,
     log_uniform_gate: bool = True,
     sigmoid_beta: bool = False,
     dtype: torch.dtype = torch.bfloat16,
@@ -93,7 +114,11 @@ def make_kda_test_inputs(
     value_scale: float = 1.0,
     requires_grad: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """Create deterministic public KDA inputs with model-range values and log gates."""
+    """Create deterministic public KDA inputs with model-range values and log gates.
+
+    ``gate_value`` gives uniform gates; ``sigmoid_gate_bound`` Kimi-style bounded gates
+    ``-bound * sigmoid(2 z)`` with standard normal ``z``.
+    """
     generator = torch.Generator(device="cuda").manual_seed(seed)
     shape = (batch, tokens, heads, 128)
     if normalize_qk:
@@ -107,6 +132,9 @@ def make_kda_test_inputs(
     value = (_model_rows(shape, generator) * value_scale).to(dtype)
     if gate_value is not None:
         gate = torch.full(shape, gate_value, device="cuda")
+    elif sigmoid_gate_bound is not None:
+        z = torch.randn(shape, device="cuda", generator=generator)
+        gate = -sigmoid_gate_bound * torch.sigmoid(2 * z)
     elif log_uniform_gate:
         gate = (
             torch.empty(shape, device="cuda")

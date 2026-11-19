@@ -54,31 +54,41 @@ def _chunks(x, rows, heads):
     return g.transpose(1, 2)  # [R, heads, 16, ...]
 
 
+def _tf32(x):
+    """``x`` rounded to tf32 (nearest, ties away from zero) as fp64."""
+    bits = x.float().view(torch.int32)
+    return ((bits + 0x1000) & ~0x1FFF).view(torch.float32).double()
+
+
 def _reference(q, k, gate, beta, rows, round_dtype=None):
     """Records of each valid row from the module docstring's formulas in fp64; ``round_dtype``
     rounds the operands the kernel stores in 16 bits at the same points (the low-precision
-    reference of the error budget)."""
+    reference of the error budget). Under fp16 the KK and A operands are tf32 instead: the
+    kernel forms them in fp32 (NOTE [TF32 decay operands] in ``kda_common``), and 2^-g
+    overflows fp16 from a uniform gate of about -0.7."""
 
     def rnd(x):
         return x if round_dtype is None else x.to(round_dtype).double()
+
+    rnd_decay = _tf32 if round_dtype == torch.float16 else rnd
 
     heads = gate.shape[1]
     qc, kc = _chunks(q, rows, heads), _chunks(k, rows, heads)
     g = torch.cumsum(_chunks(gate, rows, heads) / math.log(2), dim=2)
     b = _chunks(beta[..., None], rows, heads)[..., 0]  # [R, H, 16]
-    k_decay = rnd(kc * torch.exp2(g))
-    q_decay = rnd(qc * torch.exp2(g))
-    k_inv = rnd(kc * torch.exp2(-g))
+    k_decay = kc * torch.exp2(g)
+    q_decay = qc * torch.exp2(g)
+    k_inv = rnd_decay(kc * torch.exp2(-g))
     k_restore = rnd(kc * torch.exp2(g[:, :, -1:] - g))
     eye = torch.eye(B_T, dtype=torch.float64, device=q.device)
     lower = torch.tril(torch.ones(B_T, B_T, dtype=torch.float64, device=q.device))
-    kk = k_decay @ k_inv.transpose(-1, -2)
+    kk = rnd_decay(k_decay) @ k_inv.transpose(-1, -2)
     L = b[..., :, None] * kk * (lower - eye)
     inv_beta = rnd(torch.linalg.inv(eye + L) * b[..., None, :])
-    a_left = rnd((q_decay @ k_inv.transpose(-1, -2)) * lower)
+    a_left = rnd((rnd_decay(q_decay) @ k_inv.transpose(-1, -2)) * lower)
     return {
-        "k_decay": k_decay,
-        "q_decay": q_decay,
+        "k_decay": rnd(k_decay),
+        "q_decay": rnd(q_decay),
         "t": inv_beta.transpose(-1, -2) @ k_restore,
         "a": a_left @ inv_beta,
         "diag": torch.exp2(g[:, :, -1]),
@@ -125,6 +135,23 @@ def test_kda_prep_matches_reference(case):
     for name in ("k_decay", "q_decay", "t", "a", "diag"):
         assert_matches_low_precision_reference(
             rec[name], hi[name], lo[name], name, source_dtype=dtype
+        )
+
+
+def test_kda_prep_fp16_matches_reference_where_the_inverse_decay_overflows_fp16():
+    """At a uniform gate of -2 the in-chunk inverse decay reaches exp(32), past the FP16 maximum
+    65504: the records stay finite and match the tf32-operand reference."""
+    f32 = torch.float32
+    q, k, gate, beta, cu = _inputs((300, 77), 4, 4, 4, 128, torch.float16, f32, f32)
+    gate.fill_(-2.0)
+    out = _run(q, k, gate, beta, cu)
+    rows, rec = _decode(out, torch.float16)
+    hi = _reference(q, k, gate, beta, rows)
+    lo = _reference(q, k, gate, beta, rows, round_dtype=torch.float16)
+    for name in ("t", "a"):
+        assert torch.isfinite(lo[name]).all(), name
+        assert_matches_low_precision_reference(
+            rec[name], hi[name], lo[name], name, source_dtype=torch.float16
         )
 
 

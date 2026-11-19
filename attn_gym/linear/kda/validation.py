@@ -69,15 +69,6 @@ def cast_to_kernel_dtypes(
     )
 
 
-def validate_warpdrive_fastmath(fastmath: bool) -> None:
-    """Reject a precision request that the native warpdrive KDA kernels cannot honor."""
-    if not fastmath:
-        raise ValueError(
-            "warpdrive KDA cannot honor fastmath=False; "
-            "use fastmath=True or the repo-local fused backend"
-        )
-
-
 def validate_kda_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -124,5 +115,4 @@ __all__ = [
     "cast_to_kernel_dtypes",
     "resolve_kernel_options",
     "validate_kda_inputs",
-    "validate_warpdrive_fastmath",
 ]

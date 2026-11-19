@@ -21,6 +21,11 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
+from attn_gym.linear._delta_rule.validation import (
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints_metadata,
+)
+from attn_gym.linear.types import StateCheckpoints
 
 # Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as
 # compile-time constants even in runtime argument slots; cast such sizes with ``int()``.
@@ -28,11 +33,25 @@ _CHUNK_SIZE = tl.constexpr(DEFAULT_CHUNK_SIZE)
 
 
 def _int64_offset_heuristic(*tensor_names: str):
+    def tensors(value):
+        if isinstance(value, StateCheckpoints):
+            return value.states, value.cu_checkpoint_offsets
+        return (value,)
+
     return {
         "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            *(args[name] for name in tensor_names)
+            *(tensor for name in tensor_names for tensor in tensors(args[name]))
         )
     }
+
+
+@triton.jit
+def _block_offsets(BLOCK: tl.constexpr, USE_INT64_OFFSETS: tl.constexpr):
+    """Return this program's element offsets, widened before the block product can overflow."""
+    block = tl.program_id(0)
+    if USE_INT64_OFFSETS:
+        block = block.to(tl.int64)
+    return block * BLOCK + tl.arange(0, BLOCK)
 
 
 def _packed_rows_are_disjoint(left: torch.Tensor, right: torch.Tensor) -> bool:
@@ -201,9 +220,7 @@ def _pack_prefill_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        offset = offset.to(tl.int64)
+    offset = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     feature_size = num_heads * head_dim
     feature = offset % feature_size
     packed_token = offset // feature_size
@@ -324,9 +341,7 @@ def _scatter_output_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        offset = offset.to(tl.int64)
+    offset = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     in_bounds = offset < num_elements
     output_token = offset // feature_size
     feature = offset % feature_size
@@ -367,9 +382,7 @@ def _commit_tail_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        offset = offset.to(tl.int64)
+    offset = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     feature_size = num_heads * head_dim
     sequence_size = _CHUNK_SIZE * feature_size
     in_bounds = offset < num_elements
@@ -414,9 +427,7 @@ def _gather_counts_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    active_index = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        active_index = active_index.to(tl.int64)
+    active_index = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     in_bounds = active_index < num_active
     slot = tl.load(state_indices + active_index, mask=in_bounds, other=0).to(tl.int64)
     count = tl.load(
@@ -455,9 +466,7 @@ def _update_and_gather_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        offset = offset.to(tl.int64)
+    offset = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     in_bounds = offset < num_elements
     feature = offset % feature_size
     remaining = offset // feature_size
@@ -501,9 +510,7 @@ def _gather_state_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        offset = offset.to(tl.int64)
+    offset = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     in_bounds = offset < num_elements
     state_offset = offset % state_size
     active_index = offset // state_size
@@ -512,9 +519,9 @@ def _gather_state_kernel(
     if use_has_initial_state:
         active &= tl.load(has_initial_state + active_index, mask=in_bounds, other=0)
     tl.store(
-        active_state + active_index * active_stride_b + state_offset,
+        active_state + ptr_offset((active_index, state_offset), (active_stride_b, 1)),
         tl.load(
-            state_cache + slot * state_stride_s + state_offset,
+            state_cache + ptr_offset((slot, state_offset), (state_stride_s, 1)),
             mask=active,
             other=0.0,
         ),
@@ -530,6 +537,7 @@ def _gather_state_kernel(
         "active_counts",
         "state_cache",
         "replay_count",
+        "checkpoints",
     )
 )
 @triton.jit
@@ -540,6 +548,7 @@ def _commit_state_kernel(
     active_counts,
     state_cache,
     replay_count,
+    checkpoints,
     final_stride_b: tl.constexpr,
     state_stride_s: tl.constexpr,
     count_stride_s: tl.constexpr,
@@ -550,9 +559,7 @@ def _commit_state_kernel(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    offset = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    if USE_INT64_OFFSETS:
-        offset = offset.to(tl.int64)
+    offset = _block_offsets(BLOCK, USE_INT64_OFFSETS)
     in_bounds = offset < num_elements
     state_offset = offset % state_size
     active_index = offset // state_size
@@ -563,19 +570,29 @@ def _commit_state_kernel(
     fresh_slot = False
     if use_has_initial_state:
         fresh_slot = ~tl.load(has_initial_state + active_index, mask=in_bounds, other=0)
+    boundary_state = tl.load(
+        final_state + ptr_offset((active_index, state_offset), (final_stride_b, 1)),
+        mask=active & completes_chunk,
+        other=0.0,
+    )
     tl.store(
-        state_cache + slot * state_stride_s + state_offset,
-        tl.where(
-            completes_chunk,
-            tl.load(
-                final_state + active_index * final_stride_b + state_offset,
-                mask=active & completes_chunk,
-                other=0.0,
-            ),
-            0.0,
-        ),
+        state_cache + ptr_offset((slot, state_offset), (state_stride_s, 1)),
+        boundary_state,
         mask=active & (completes_chunk | fresh_slot),
     )
+    if checkpoints is not None:
+        # A single new token can cross only the first 64-token checkpoint.
+        checkpoint_mask = active & completes_chunk & (checkpoints.every_n_tokens == chunk_size)
+        checkpoint_index = tl.load(
+            checkpoints.cu_checkpoint_offsets + active_index, mask=checkpoint_mask, other=0
+        )
+        if USE_INT64_OFFSETS:
+            checkpoint_index = checkpoint_index.to(tl.int64)
+        tl.store(
+            checkpoints.states + ptr_offset((checkpoint_index, state_offset), (state_size, 1)),
+            boundary_state,
+            mask=checkpoint_mask,
+        )
     tl.store(
         replay_count + slot * count_stride_s,
         tl.where(count == chunk_size - 1, 0, count + 1),
@@ -688,8 +705,21 @@ def commit_paged_chunk_replay(
     active_counts: torch.Tensor,
     state_cache: torch.Tensor,
     replay_count: torch.Tensor,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> None:
-    """Commit completed boundaries and advance active replay counts."""
+    """Commit completed boundaries, their optional snapshots, and active replay counts."""
+    checkpoints = state_checkpoints_from_op_args(
+        checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+    )
+    if checkpoints is not None:
+        validate_state_checkpoints_metadata(
+            checkpoints,
+            num_sequences=final_state.shape[0],
+            state_shape=final_state.shape[1:],
+            device=final_state.device,
+        )
     num_active = final_state.shape[0]
     state_size = final_state.shape[1] * final_state.shape[2] * final_state.shape[3]
     num_elements = num_active * state_size
@@ -701,6 +731,7 @@ def commit_paged_chunk_replay(
         active_counts,
         state_cache,
         replay_count,
+        checkpoints,
         final_stride_b=final_state.stride(0),
         state_stride_s=state_cache.stride(0),
         count_stride_s=replay_count.stride(0),

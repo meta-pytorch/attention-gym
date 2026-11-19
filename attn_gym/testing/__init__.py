@@ -1,7 +1,12 @@
 """Shared test utilities for Attention Gym implementations."""
 
 from .gdn import make_gdn_test_inputs
-from .kda import cumulative_sequence_offsets, strided_state_pool
+from .kda import (
+    CHECKPOINT_SENTINEL,
+    cumulative_sequence_offsets,
+    sentinel_state_checkpoints,
+    strided_state_pool,
+)
 from .profiling import (
     TraceFormat,
     annotate_kernels,
@@ -12,6 +17,7 @@ from .profiling import (
 )
 
 __all__ = [
+    "CHECKPOINT_SENTINEL",
     "TraceFormat",
     "annotate_kernels",
     "cumulative_sequence_offsets",
@@ -20,5 +26,6 @@ __all__ = [
     "profile_trace",
     "record_distributed_profile",
     "record_function",
+    "sentinel_state_checkpoints",
     "strided_state_pool",
 ]

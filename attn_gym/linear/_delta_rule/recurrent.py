@@ -37,6 +37,8 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
+from attn_gym.linear._delta_rule.validation import validate_state_checkpoints
+from attn_gym.linear.types import StateCheckpoints
 
 configure_triton_allocator()
 
@@ -177,6 +179,7 @@ def _recurrent_delta_rule_fwd_kernel(
     cu_seqlens,
     state_indices,
     has_initial_state,
+    checkpoints,
     scale,
     T,
     N,
@@ -246,6 +249,10 @@ def _recurrent_delta_rule_fwd_kernel(
     else:
         b_state = tl.zeros([BK, BV], dtype=tl.float32)
 
+    if checkpoints is not None:
+        checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n).to(tl.int64)
+        next_checkpoint = checkpoints.every_n_tokens.to(tl.int64)
+
     # Load key-indexed operands as [BK, BV] tiles in the state's layout; broadcasting [BK]
     # vectors costs a layout conversion per operand per token.
     o_k_tile = tl.broadcast_to(o_k[:, None], (BK, BV))
@@ -294,6 +301,16 @@ def _recurrent_delta_rule_fwd_kernel(
             b_state += b_k * b_delta[None, :]
             b_o = tl.sum(b_q * b_state, 0)
         tl.store(output + row * V + o_v, b_o.to(output.dtype.element_ty), mask=m_v)
+        if checkpoints is not None:  # noqa: SIM102 - optional counters need their constexpr guard
+            if i_t + 1 == next_checkpoint:
+                # Widen before products: the tape can exceed int32 element offsets.
+                p_checkpoint = ptr_offset(
+                    (checkpoint_row, i_h, o_v[None, :], o_k[:, None]),
+                    (H * V * K, V * K, K, 1),
+                )
+                tl.store(checkpoints.states + p_checkpoint, b_state, mask=m_kv)
+                checkpoint_row += 1
+                next_checkpoint += checkpoints.every_n_tokens
 
     if STORE_FINAL_STATE:
         tl.store(ht + p_state, b_state, mask=m_kv)
@@ -370,6 +387,7 @@ def launch_recurrent_delta_rule_fwd(
     has_initial_state: torch.Tensor | None = None,
     autotune: bool,
     batch_invariant: bool,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch a scalar- or vector-gated recurrent delta-rule specialization.
 
@@ -406,11 +424,16 @@ def launch_recurrent_delta_rule_fwd(
         batch_invariant: Use one formula, fixed-order sums over K and no FMA fusion, so a
             sequence's output and state bits do not depend on the launch config that the batch
             shape picks. Composes with ``autotune`` and prefetching.
+        state_checkpoints: Optional caller-owned periodic FP32 snapshots; requires paged mode
+            and receives the accumulator after each complete interval.
 
     Returns:
         The output in ``q.dtype`` plus the final state (``None`` unless requested). In paged
         mode the returned state aliases ``initial_state``.
     """
+    if state_checkpoints is not None and state_indices is None:
+        raise ValueError("state_checkpoints requires state_indices")
+    validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
     assert k.shape == q.shape
     assert v.shape[:2] == q.shape[:2]
     assert gate.shape == (
@@ -459,6 +482,7 @@ def launch_recurrent_delta_rule_fwd(
         cu_seqlens,
         state_indices,
         has_initial_state,
+        state_checkpoints,
     )
     options: dict[str, Any] = {
         "scale": scale,

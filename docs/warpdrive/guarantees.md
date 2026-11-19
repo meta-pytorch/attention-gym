@@ -92,8 +92,10 @@ What the layer supplies, checks and leaves to you:
     the available threads. Raw IDs must avoid 1, 2 and all allocated IDs.
 
     A named barrier shared between roles leaves liveness unverified. Supply an acknowledgement for a
-    reusable arrive/sync protocol. A sync covering exactly the calling role orders its warps
-    in the alias model; an arrive alone does not.
+    reusable arrive/sync protocol. The alias model credits an intervening sync covering exactly
+    the calling role only if its enclosing regions also enclose at least one access. A sync
+    inside a branch or possibly zero-trip loop enclosing neither access supplies no ordering
+    in the model; an arrive alone supplies none.
 
 6. <a id="tma"></a>**TMA.** The layer arms declared transaction bytes. The check follows
     channel barrier pointers to recognized

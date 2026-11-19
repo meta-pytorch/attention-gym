@@ -38,10 +38,16 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_sequence_work,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
+from attn_gym.linear._delta_rule.validation import (
+    state_checkpoint_op_args,
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints,
+)
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
 from attn_gym.linear.kda.utils import exp2, is_sm100_kda_target
+from attn_gym.linear.types import StateCheckpoints
 
 
 @triton.jit
@@ -54,6 +60,7 @@ def _run_chunk_delta_h_sequence(
     gk_desc,
     h0,
     ht,
+    checkpoints,
     state_indices,
     has_initial_state,
     cu_seqlens,
@@ -155,6 +162,13 @@ def _run_chunk_delta_h_sequence(
             tl.float32,
         )
 
+    if checkpoints is not None:
+        checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n)
+        if USE_INT64_OFFSETS:
+            checkpoint_row = checkpoint_row.to(tl.int64)
+        checkpoint_chunks = checkpoints.every_n_tokens // BT
+        next_checkpoint_chunk = checkpoint_chunks
+
     for i_t in tl.range(0, NT_full, warp_specialize=WARP_SPECIALIZE, num_stages=NUM_STAGES):
         chunk = boh + i_t
         tok = bos + i_t * BT
@@ -177,6 +191,17 @@ def _run_chunk_delta_h_sequence(
             b_h = b_h * exp2(b_decay, FASTMATH)[:, None]
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
+
+        if checkpoints is not None:  # noqa: SIM102 - optional counters need their constexpr guard
+            # Store the post-chunk FP32 accumulator, not the rounded chunk-entry tape.
+            if i_t + 1 == next_checkpoint_chunk:
+                p_checkpoint = ptr_offset(
+                    (checkpoint_row, i_h, o_v[None, :], o_k[:, None]),
+                    (H * V * K, V * K, K, 1),
+                )
+                tl.store(checkpoints.states + p_checkpoint, b_h)
+                checkpoint_row += 1
+                next_checkpoint_chunk += checkpoint_chunks
 
     if NT_full < NT:
         # Peeled partial tail chunk: masked pointers keep the loads and the
@@ -236,6 +261,7 @@ def chunk_delta_h_kernel(
     gk_desc,
     h0,
     ht,
+    checkpoints,
     state_indices,
     has_initial_state,
     cu_seqlens,
@@ -281,6 +307,7 @@ def chunk_delta_h_kernel(
         gk_desc,
         h0,
         ht,
+        checkpoints,
         state_indices,
         has_initial_state,
         cu_seqlens,
@@ -324,6 +351,7 @@ def chunk_delta_h_persistent_kernel(
     gk_desc,
     h0,
     ht,
+    checkpoints,
     state_indices,
     has_initial_state,
     cu_seqlens,
@@ -376,6 +404,7 @@ def chunk_delta_h_persistent_kernel(
             gk_desc,
             h0,
             ht,
+            checkpoints,
             state_indices,
             has_initial_state,
             cu_seqlens,
@@ -458,8 +487,10 @@ def _delta_h_launch(
     final_state: torch.Tensor | None,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     fastmath: bool = True,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Allocate outputs and launch the recurrence; runs eagerly inside the op."""
+    validate_state_checkpoints(state_checkpoints, k, u, cu_seqlens)
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     h = k.new_empty(batch, capacity, heads, key_dim, value_dim)
@@ -507,6 +538,7 @@ def _delta_h_launch(
         *descriptors,
         initial_state,
         final_state,
+        state_checkpoints,
         state_indices,
         has_initial_state,
         cu_seqlens,
@@ -535,7 +567,15 @@ def _delta_h_launch(
         "USE_STATE_INDICES": state_indices is not None,
         "USE_HAS_INITIAL_STATE": has_initial_state is not None,
         "USE_INT64_OFFSETS": requires_int64_offsets(
-            k, w, u, gk, v_new, h, initial_state, final_state
+            k,
+            w,
+            u,
+            gk,
+            v_new,
+            h,
+            initial_state,
+            final_state,
+            None if state_checkpoints is None else state_checkpoints.states,
         ),
         "SCALAR_GATE": scalar_gate,
         "FASTMATH": fastmath,
@@ -652,6 +692,9 @@ def _delta_h_paged_cuda(
     chunk_offsets: torch.Tensor | None,
     capacity: int,
     fastmath: bool = True,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _delta_h_launch(
         k,
@@ -666,6 +709,9 @@ def _delta_h_paged_cuda(
         capacity,
         state_cache,
         fastmath=fastmath,
+        state_checkpoints=state_checkpoints_from_op_args(
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+        ),
     )
 
 
@@ -682,6 +728,7 @@ def chunk_gated_delta_rule_fwd_h(
     output_final_state: bool = True,
     metadata: RaggedChunkMetadata | None = None,
     fastmath: bool = True,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Run the fixed-length or packed inter-chunk delta-rule state recurrence.
 
@@ -689,6 +736,8 @@ def chunk_gated_delta_rule_fwd_h(
     scalar decay per head (GDN). Launch configurations are chosen heuristically, not tuned.
     ``fastmath`` selects the decay ``exp2``.
     """
+    if state_checkpoints is not None and state_indices is None:
+        raise ValueError("state_checkpoints requires paged state_indices")
     batch, tokens, heads, key_dim = k.shape
     value_dim = u.shape[-1]
     if metadata is None:
@@ -809,6 +858,7 @@ def chunk_gated_delta_rule_fwd_h(
             chunk_offsets,
             chunks,
             fastmath,
+            *state_checkpoint_op_args(state_checkpoints),
         )
         return h, v_new, None
     if output_final_state:

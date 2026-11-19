@@ -13,7 +13,7 @@ from attn_gym.linear._delta_rule.chunk_schedule import (
 )
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only
+from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
 from attn_gym.linear.kda.ops import (
     chunk_bwd_op,
     chunk_bwd_with_state_grad_op,
@@ -29,7 +29,7 @@ from attn_gym.linear.kda.ops import (
     chunk_replay_state_gather_op,
 )
 from attn_gym.linear.kda.validation import cast_to_kernel_dtypes
-from attn_gym.linear.types import ReplayState
+from attn_gym.linear.types import ReplayState, StateCheckpoints
 
 _HEAD_DIM = 128
 
@@ -283,6 +283,7 @@ def paged_chunk_forward(
     autotune: bool,
     schedule: ScheduleRequest = ScheduleRequest.AUTO,
     replay_state: ReplayState | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Run paged chunk prefill or replay-backed decode."""
     _validate_fused_constraints(q, v)
@@ -304,6 +305,7 @@ def paged_chunk_forward(
             has_initial_state=has_initial_state,
             autotune=autotune,
             schedule=schedule,
+            state_checkpoints=state_checkpoints,
         )
 
     replay_q, replay_k, replay_v, replay_gate, replay_beta, replay_count = replay_state
@@ -353,6 +355,7 @@ def paged_chunk_forward(
             active_counts,
             state_cache,
             replay_count,
+            *state_checkpoint_op_args(state_checkpoints),
         )
         token_indices = active_counts.to(torch.int64).reshape(-1, 1, 1, 1)
         return output.gather(1, token_indices.expand(-1, 1, output.shape[2], output.shape[3])).to(
@@ -404,6 +407,7 @@ def paged_chunk_forward(
         has_initial_state=has_initial_state,
         autotune=autotune,
         schedule=schedule,
+        state_checkpoints=state_checkpoints,
     )
     tail_output, _ = chunk_forward(
         tail_q,
@@ -452,6 +456,7 @@ def _paged_chunk_state_forward(
     has_initial_state: torch.Tensor | None,
     autotune: bool,
     schedule: ScheduleRequest,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Run the original paged state-only chunk path."""
     output_dtype = q.dtype
@@ -483,6 +488,7 @@ def _paged_chunk_state_forward(
         metadata.chunk_offsets,
         autotune,
         schedule.value,
+        *state_checkpoint_op_args(state_checkpoints),
     )
     return output.reshape(output_shape).to(output_dtype)
 

@@ -6,6 +6,8 @@ import torch
 
 from attn_gym.linear._delta_rule.decode import GateTransform, launch_recurrent_delta_rule_decode
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
+from attn_gym.linear._delta_rule.validation import state_checkpoints_from_op_args
+from attn_gym.linear.types import StateCheckpoints
 
 
 def _launch_recurrent(
@@ -23,6 +25,7 @@ def _launch_recurrent(
     output_final_state: bool,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch the scalar-gate specialization of the shared log2-space scan."""
     return launch_recurrent_delta_rule_fwd(
@@ -40,6 +43,7 @@ def _launch_recurrent(
         has_initial_state=has_initial_state,
         autotune=autotune,
         batch_invariant=batch_invariant,
+        state_checkpoints=state_checkpoints,
     )
 
 
@@ -111,6 +115,9 @@ def _gdn_recurrent_fwd_paged_cuda(
     cu_seqlens: torch.Tensor | None,
     scale: float,
     batch_invariant: bool,
+    checkpoint_states: torch.Tensor | None = None,
+    cu_checkpoint_offsets: torch.Tensor | None = None,
+    checkpoint_interval: int = 0,
 ) -> torch.Tensor:
     """Advance selected cache slots with the shared scalar-gate scan."""
     return _launch_recurrent(
@@ -127,6 +134,9 @@ def _gdn_recurrent_fwd_paged_cuda(
         output_final_state=True,
         state_indices=state_indices,
         has_initial_state=has_initial_state,
+        state_checkpoints=state_checkpoints_from_op_args(
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+        ),
     )[0]
 
 

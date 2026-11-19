@@ -35,7 +35,7 @@ from itertools import combinations
 from cutlass import cute
 
 from attn_gym.warpdrive import fences
-from attn_gym.warpdrive.protocol import PTX, ProtocolError, current_trace, fence_skip
+from attn_gym.warpdrive.protocol import PTX, Event, ProtocolError, current_trace, fence_skip
 from attn_gym.warpdrive.thread_sync import after_sync, before_sync
 
 MODES = ("warn", "strict", "off")
@@ -415,13 +415,21 @@ def access_warps(parts, role_warps) -> set:
     return {w for w, _, _ in parts or () if w is not None} or set(role_warps)
 
 
+def _on_path(event: Event, first: Event, second: Event) -> bool:
+    """Whether the event's enclosing regions also enclose either endpoint.
+
+    This checks region membership; callers establish event order.
+    """
+    return any(where[: len(event.where)] == event.where for where in (first.where, second.where))
+
+
 def _between(role: RoleEvents, seq: list[int], lo: int, hi: int):
     """Events of ``role`` at positions ``lo < p < hi`` of ``seq`` (event indices) that run
     whenever the events at ``lo`` and ``hi`` both do: those outside any branch or loop that
     encloses neither. A conditional or possibly zero-trip event completes nothing."""
-    ends = [role.events[seq[lo]].where, role.events[seq[hi]].where]
+    ends = role.events[seq[lo]], role.events[seq[hi]]
     events = (role.events[seq[p]] for p in range(lo + 1, hi))
-    return [ev for ev in events if any(w[: len(ev.where)] == ev.where for w in ends)]
+    return [ev for ev in events if _on_path(ev, *ends)]
 
 
 def _bulk_done(between: list) -> bool:
@@ -583,8 +591,12 @@ def _same_period(first: Access, second: Access, warp_pairs, between=None) -> Fin
     """
     if between is None:
         between = first.role.events[first.index + 1 : second.index]
+    ends = first.role.events[first.index], second.role.events[second.index]
     barrier = any(
-        e.kind == "barrier" and e.data["threads"] == 32 * len(first.role.warps) for e in between
+        e.kind == "barrier"
+        and e.data["threads"] == 32 * len(first.role.warps)
+        and _on_path(e, *ends)
+        for e in between
     )
     for wa, wb in warp_pairs:
         if wa != wb:  # TMEM warp indices, or (None, None) for SMEM
@@ -592,7 +604,7 @@ def _same_period(first: Access, second: Access, warp_pairs, between=None) -> Fin
                 return Finding(
                     UNVERIFIED,
                     f"{first.describe()} and {second.describe()}: warps {wa} and {wb} touch the "
-                    "same TMEM lanes and columns in one handle with no recorded named_barrier "
+                    "same TMEM lanes and columns in one handle with no applicable named_barrier "
                     "between them",
                     "barrier",
                 )

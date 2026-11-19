@@ -76,9 +76,10 @@ output, final_state = chunk_gdn(query, key, value, gate, beta, output_final_stat
 
     Every optimized GDN and KDA path (repo-local fused and warpdrive) carries the recurrent state
     from `initial_state` to `final_state`, and the state cotangent from `d_final_state` to
-    `d_initial_state`, in FP32 accumulators with FP32 decay. The chunk-entry state that each
-    chunk reads, the per-chunk state checkpoints, and the per-chunk state-cotangent tape are
-    staged in the Q/K/V dtype because they are tensor-core operands. BF16 shares the FP32
+    `d_initial_state`, in FP32 accumulators with FP32 decay. Internal chunk-entry states and
+    state-cotangent tapes are staged in the Q/K/V dtype because they are tensor-core operands.
+    Caller-owned `StateCheckpoints` instead store post-update snapshots directly from the FP32
+    accumulator. For the internal tapes, BF16 shares the FP32
     exponent range, so this only costs mantissa precision. FP16 also limits the range: state
     values that round beyond the FP16 finite range (about 65504) become non-finite when a chunk
     reads them, and cotangent values in the FP16 subnormal range (below `2^-14`) lose precision
@@ -163,6 +164,68 @@ elementwise kernels run per decode step.
 ::: attn_gym.linear.recurrent_gdn
 
 ::: attn_gym.linear.recurrent_gdn_decode
+
+### Paged state checkpoints (GDN and KDA)
+
+Both `paged_chunk_gdn` and `paged_chunk_kda` accept `state_checkpoints=StateCheckpoints(...)`
+to write periodic FP32 snapshots into caller-owned storage while still advancing the ordinary
+state cache. Paged `recurrent_gdn` (with `state_indices`) accepts the same argument, including
+under `kernel_options={"batch_invariant": True}`. Checkpointing requires the repo-local fused
+backend and does not change the operations' return types.
+
+```python
+from attn_gym.linear import StateCheckpoints, paged_chunk_gdn
+
+# Packed sequence lengths are 600 and 300; checkpoint every 256 tokens.
+# Sequence 0 produces snapshots at 256 and 512; sequence 1 produces one at 256.
+checkpoints = StateCheckpoints(
+    states=torch.empty(3, heads, value_dim, key_dim, device="cuda", dtype=torch.float32),
+    cu_checkpoint_offsets=torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32),
+    every_n_tokens=256,
+)
+output = paged_chunk_gdn(
+    q, k, v, gate, beta, state_cache, state_indices,
+    cu_seqlens=cu_seqlens, state_checkpoints=checkpoints,
+)
+# paged_chunk_kda accepts the same state_checkpoints argument.
+```
+
+Without KDA replay, boundaries are measured from each sequence's start **in this call**, not from its absolute
+prefix-cache position. The interval must be a positive multiple of 64. Snapshots contain the
+state **after** that many tokens, including a final state exactly on an interval; incomplete
+intervals do not produce a snapshot. Each snapshot is written directly from the FP32 recurrence
+accumulator in public `[H, V, K]` order, not copied from the lower-precision internal
+chunk-entry tape. Snapshots are not rounded to the persistent cache dtype.
+
+For CUDA graphs, allocate a fixed-capacity `states` buffer and update the offsets on device
+between replays. Without KDA replay, counts must equal `sequence_length // every_n_tokens`
+for every active sequence, and the terminal offset must fit the buffer. Offsets must be
+nondecreasing; null routes may reserve unused rows, which are left untouched along with spare
+capacity. These offset values and the absence of aliasing with inputs are
+caller responsibilities; validation checks tensor metadata without synchronizing with the host.
+
+With KDA `replay_state`, checkpoint intervals start at the beginning of each slot's unfinished
+chunk, **before** the new input. Counts are `(replayed_tokens + sequence_length) // every_n_tokens`,
+where `replayed_tokens` is the slot's pre-call replay count, or zero for a fresh slot. For example,
+19 replayed tokens plus 100 new tokens produce one interval-64 checkpoint, after 45 new tokens;
+the other 55 tokens belong to the unfinished chunk. The checkpoint is FP32 state after the
+completed chunk, not the state after all 100 new tokens.
+
+A caller restoring a prefix that ends inside the next chunk must copy the tokens after the
+checkpoint and their count into the destination slot's replay buffers as well. Attention Gym
+continues to advance the source slot's replay state normally; `state_checkpoints` does not
+snapshot replay-token buffers. A prefix ending exactly on a chunk boundary copies no tokens but
+must still set the destination count to zero, and resumes with `has_initial_state=True` (or
+omitted): `False` would discard the restored state. Stale tokens beyond the count need not be
+cleared.
+[`examples/linear/kda_prefix_cache_checkpoints.py`](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
+restores a shared prompt prefix this way and checks that the suffix output matches a full
+prefill bitwise. The same contract applies to the one-token replay path: 63
+replayed tokens plus one new token produce an interval-64 checkpoint. The interval origin is
+recomputed for each call, so intervals longer than 64 never complete during one-token replay
+decode.
+
+::: attn_gym.linear.StateCheckpoints
 
 ## Gate Transforms
 
@@ -423,7 +486,8 @@ of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The repo-local fused
 backend requires approximately `[-5.914, 0]`. warpdrive BF16 instead requires every aligned
 16-token per-channel sum to exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
-results are not finite. That bound keeps the forward finite; gradients need more margin. The
+results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). That bound keeps the
+forward finite; gradients need more margin. The
 backward stages `Q_decay = scale * q * exp(in-chunk cumulative decay)` as a BF16 MMA operand,
 which flushes to zero once `scale * |q| * exp(16-token sum)` falls below about `2^-126`, and dv,
 dgate and dbeta then lose precision. Measured as relative RMS error against FP64 (one BF16
@@ -437,9 +501,22 @@ the bound. On the same relative-RMS workload the forward error also roughly doub
 from a separate, milder factor. A sum concentrated on the first token of its 16-token box leaves
 the backward no headroom: with the whole decay on one token of a 48-token sequence, dq and dgate
 were non-finite for 0 of 20 seeds at `-86.5`, 1 of 20 at `-86.9` and 10 of 20 at `-87.3`.
-Upstream cuDNN Frontend behaves identically. warpdrive stages these MMA operands in the Q/K dtype
-rather than TF32, so warpdrive FP16 does not support usual model-range gates. These limits are not
-checked at runtime. The training example uses the Kimi-style FP32 transform
+Upstream cuDNN Frontend behaves identically. FP16 cannot hold the in-chunk decay factors (their
+ratio reaches `2^121` at a uniform `-5.25`), so warpdrive FP16 forms the in-chunk products from
+TF32 decay operands and computes the state-gradient products from the unscaled cotangent and
+`K_restore`, whose factors stay at or below one; it shares the gate range of the BF16 contract
+above. On the workload above (plus ragged sequences), FP16 relative RMS errors from a uniform
+`-0.1` to `-5.25` and for Kimi-style gates were 0.05% on the output, 0.03-0.06% on dq, dk, dv and
+dbeta and 0.05-0.14% on dgate, against 0.08%, 0.03-0.09% and 0.11-0.20% for fused FP16; the
+forward is non-finite past the same `-126 * ln(2)` bound. Finite does not mean accurate near the
+bound, in either dtype: a decayed operand too small for its TF32 (BF16) operand rounds to zero
+before the inverse decay cancels it. With sixteen `-5.45` gates, `k = e0` and a query component
+of `2^-13` on that channel (`scale=1`, only the last token writing a unit value), the output was 0
+instead of `2^-13`, with or without `fastmath`. The products with the recurrent state also still
+read FP16 `Q_decay` and `K_decay`, which flush below the FP16 range: with five `-3.5` gates, an
+entry-state value of 4096, a unit query selecting it and `beta = 0`, warpdrive and fused FP16
+both returned 0 where the exact output is the FP16-normal `1.03e-4` (BF16: `1.03e-4`). These
+limits are not checked at runtime. The training example uses the Kimi-style FP32 transform
 `lower_bound * sigmoid(exp(A_log) * (raw_gate.float() + dt_bias))`, but that model policy is not
 part of the public KDA API.
 
@@ -531,7 +608,7 @@ count and always stride over the active work only, so it needs no option for ove
 |---|---|---|
 | Repo-local fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
-| `kernel_options={"backend": "warpdrive"}` | Native backend math | `ValueError`: unsupported |
+| warpdrive KDA | Flush-to-zero approximate exponentials and reciprocals | Non-flushing approximate exponentials and reciprocals that preserve FP32 subnormal results |
 
 One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100-family GPUs always uses
 the flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
@@ -541,6 +618,19 @@ that a factor flushes only when the decay it belongs to is below `2^-126`, so `f
 gradients stay accurate up to the gate bound; such a decay is still lost with `fastmath=True` even
 when a large K entry would make its term normal. Its in-subchunk factors reach `2^68.3` there, so
 at the gate bound the backward needs Q entries and `beta`-scaled K entries below `2^59.7`.
+
+warpdrive gives bitwise-identical results in both modes while every in-chunk decay stays at or
+above `2^-126`, as the [KDA gate contract](#kimi-delta-attention) implies. Below that, `False`
+keeps the gate exponentials and their reciprocals from flushing, so a decayed state or summary
+entry stays an FP32 subnormal instead of zero. The exception is the 16-row tensor-core walk of the
+piece chain (used when sequences x heads x 16 exceeds the SM count): its TF32 operands flush
+subnormal carried states to zero. The reciprocal of the in-chunk decay stays finite while every
+aligned 16-token per-channel sum exceeds about `-128 * ln(2)` (a uniform gate of at least `-5.54`)
+instead of `-126 * ln(2)`. Results stay finite there only while each key entry times that
+reciprocal fits FP32, so `|k|` must stay below 2 at the limit; L2-normalized keys satisfy this.
+Accuracy in that band stays poor (BF16, uniform `-5.5`: 1.3% relative RMS error on the output
+and 45% on dgate, against 0.4% and 0.3% for the fused backend with `False`), so the gradient
+guideline of about `-5.25` applies in both modes.
 
 Use the same value for staged forward and backward preparation. Choose it before warmup and
 CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.

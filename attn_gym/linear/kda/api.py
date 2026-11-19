@@ -28,6 +28,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
+    validate_state_checkpoints,
 )
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
@@ -46,6 +47,7 @@ from attn_gym.linear.types import (
     KernelOptions,
     RecurrentKernelOptions,
     ReplayState,
+    StateCheckpoints,
     resolve_impl,
 )
 from attn_gym.types import validate_kernel_options
@@ -98,10 +100,10 @@ def chunk_kda(
             for finite results. Gradients need more margin: their error grows quickly past a
             uniform gate of about ``-5.25``, an empirical training guideline, while the common
             ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
-            ``docs/linear.md`` gives the measurements). warpdrive stages these MMA operands in
-            the Q/K dtype rather than TF32, so warpdrive FP16 does not support usual
-            model-range gates. These limits are not checked at runtime and do not apply to
-            reference or recurrent execution.
+            ``docs/linear.md`` gives the measurements). warpdrive FP16 forms its in-chunk decay
+            products from TF32 operands, forward and backward, and shares the BF16 gate range
+            above. These limits are not checked at runtime and do not apply to reference or
+            recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
@@ -119,9 +121,11 @@ def chunk_kda(
             didn’t improve accuracy in our tests. If you’re seeing unexpected outputs or
             gradients, especially with strong negative gates, try ``False`` and compare
             against the reference. It can preserve small contributions that fast math
-            drops when intermediate values fall into the subnormal range.
-            The reference backend uses normal PyTorch math for either value; native warpdrive
-            requires ``True``. Configure gate production separately with ``bound_gate`` or
+            drops when intermediate values fall into the subnormal range. On warpdrive both
+            values give the same bits inside its gate range; ``False`` only keeps results
+            finite slightly past it, where accuracy is already poor ("Fast math and
+            precision" in ``docs/linear.md``). The reference backend uses normal PyTorch math
+            for either value. Configure gate production separately with ``bound_gate`` or
             ``gate_transform``.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
             differentiable eager PyTorch in FP32. There is no automatic fallback.
@@ -211,6 +215,7 @@ def paged_chunk_kda(
     has_initial_state: torch.Tensor | None = None,
     kernel_options: KernelOptions | None = None,
     replay_state: ReplayState | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
     """Apply inference-only chunk KDA while advancing a paged state cache in place.
 
@@ -262,6 +267,14 @@ def paged_chunk_kda(
             captured bucket. Graph replay may change packed offsets, slot routing, initialization
             flags, and replay counts while tensor shapes remain fixed to that bucket.
 
+        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
+            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+            Requires the fused backend. With ``replay_state``, intervals start at the beginning
+            of each slot's unfinished chunk, counting replayed tokens before new input tokens.
+            A false ``has_initial_state`` entry counts no replayed tokens. Snapshots contain only
+            complete-chunk states; callers must separately preserve any replay tail needed to
+            restore a checkpoint.
+
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
     """
@@ -287,6 +300,9 @@ def paged_chunk_kda(
     options = resolve_kernel_options(kernel_options, op_name="paged_chunk_kda")
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
+    validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
+    if state_checkpoints is not None and options.backend != "fused":
+        raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
         if options.backend != "fused":
@@ -352,6 +368,7 @@ def paged_chunk_kda(
         autotune=should_autotune(options.autotune),
         schedule=options.schedule,
         replay_state=replay_state,
+        state_checkpoints=state_checkpoints,
     )
 
 
