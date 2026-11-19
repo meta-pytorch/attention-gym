@@ -138,6 +138,8 @@ def _compile_topk(
     use_int64_offsets: bool,
     deterministic: bool,
     has_candidate_bounds: bool,
+    block_threads: int = 512,
+    early_exit_ties: bool = False,
 ) -> Callable[..., None]:
     """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
     import cutlass
@@ -168,6 +170,8 @@ def _compile_topk(
         use_int64_offsets,
         compress_ratio=compress_ratio,
         deterministic=deterministic,
+        block_threads=block_threads,
+        early_exit_ties=early_exit_ties,
     )
     return compile_tvm_ffi(
         operation,

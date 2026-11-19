@@ -368,6 +368,8 @@ def launch(
                 wide,
                 torch.are_deterministic_algorithms_enabled(),
                 True,
+                1024,
+                True,
             )
         finally:
             set_compile_target(previous)

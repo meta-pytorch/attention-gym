@@ -297,7 +297,9 @@ def test_radix_threshold_and_overflow(selector, topk, tokens, deterministic):
         previous = get_compile_target()
         try:
             set_compile_target(detect_compile_target(torch.cuda.current_device()))
-            kernel = impl._compile_topk(topk, False, 1, False, deterministic, paged)
+            kernel = impl._compile_topk(
+                topk, False, 1, False, deterministic, paged, 1024 if paged else 512, paged
+            )
         finally:
             set_compile_target(previous)
 
