@@ -152,14 +152,16 @@ class KdaPrepParams:
 
 class KdaPrep(WarpSpecialized):
     """Warpdrive KDA prep for ``io`` fp16/bf16 operands and an fp32 or ``io`` gate; beta may be
-    any float dtype (its loads follow the traced tensor). ``num_sm`` sizes the grid."""
+    any float dtype (its loads follow the traced tensor). ``num_sm`` sizes the grid.
+    ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
-    def __init__(self, io: str, gate: str, d_k: int, num_sm: int):
+    def __init__(self, io: str, gate: str, d_k: int, num_sm: int, fastmath: bool = True):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the KDA prep serves d_k in {HEAD_DIMS}, got {d_k}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.num_sm = io, gate, d_k, num_sm
+        self.fastmath = fastmath
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         io_t, f32 = self.io_dtype, Float32
@@ -205,7 +207,8 @@ class KdaPrep(WarpSpecialized):
         return tma_slot_rows(3, B_T, heads)
 
     def get_name(self) -> str:
-        return f"wd_kda_prep_{self.io}_g{self.gate}_k{self.d_k}_sm{self.num_sm}"
+        name = f"wd_kda_prep_{self.io}_g{self.gate}_k{self.d_k}_sm{self.num_sm}"
+        return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
 
@@ -473,7 +476,7 @@ class KdaPrep(WarpSpecialized):
             g[2 * pair + 1] = p1
             acc = p1
         for row in cutlass.range_constexpr(B_T):
-            g[row] = cute.math.exp2(g[row], fastmath=True)
+            g[row] = cute.math.exp2(g[row], fastmath=self.fastmath)
         s_ex = s_gate if cutlass.const_expr(self.gate == "fp32") else params.s_ex
         for row_off in cutlass.range_constexpr(store_rows):
             if cutlass.const_expr(channel_rows < 32):
@@ -548,8 +551,8 @@ class KdaPrep(WarpSpecialized):
                 r0 = half * 8 + 2 * p
                 kd0, kd1 = fmul2(raw_k[r0], raw_k[r0 + 1], exp_g[r0], exp_g[r0 + 1])
                 kd_pack.append(fp32_to_fp16(kd0, kd1, dtype=io))
-                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=True)
-                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=True)
+                inv0 = cute.math.rcp(exp_g[r0], approx=True, ftz=self.fastmath)
+                inv1 = cute.math.rcp(exp_g[r0 + 1], approx=True, ftz=self.fastmath)
                 ki0, ki1 = fmul2(raw_k[r0], raw_k[r0 + 1], inv0, inv1)
                 ki_pack.append(fp32_to_fp16(ki0, ki1, dtype=io))
                 kr0, kr1 = fmul2(ki0, ki1, exp_last[2 * p], exp_last[2 * p + 1])

@@ -69,8 +69,10 @@ def kda_forward(
     split: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    fastmath: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
+    ``fastmath=False`` selects the non-flushing gate exponentials.
 
     With ``state_indices`` the call is paged: ``initial_state`` is a ``[P,H,V,K]`` pool updated in
     place through the routes (non-positive routes are null; the optional uint8
@@ -147,6 +149,7 @@ def kda_forward(
             scale=scale,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             num_sm=plan.num_sm,
+            fastmath=fastmath,
         )
         run_chain_forward(
             launch,
@@ -190,6 +193,7 @@ def kda_forward(
         **_GATE_FLAGS,
         checkpoint_every_n_tokens=0,
         scale=scale,
+        fastmath=fastmath,
     )
     run_warmup_forward(*launch, **buffers, scale=scale)
     return o, final_state
@@ -250,6 +254,7 @@ def kda_backward(
     initial_state: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
     split: bool = False,
+    fastmath: bool = True,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
 ]:
@@ -339,6 +344,7 @@ def kda_backward(
                 dim_v, dim_k, num_seqs, heads_out, plan.num_sm, chains=2
             ),
             num_sm=plan.num_sm,
+            fastmath=fastmath,
         )
         run_chain_backward(launch, **buffers, **schedule)
     else:
@@ -370,6 +376,7 @@ def kda_backward(
             ideal_chunks=ideal,
             num_sm=plan.num_sm,
             **_GATE_FLAGS,
+            fastmath=fastmath,
         )
         run_warmup_backward(*launch, **buffers, scale=scale)
     dq, dk, dv = (

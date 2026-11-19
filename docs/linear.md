@@ -423,7 +423,8 @@ of model code and lets callers switch execution modes without changing gate
 representation. Custom producers should return finite, nonpositive values. The repo-local fused
 backend requires approximately `[-5.914, 0]`. warpdrive BF16 instead requires every aligned
 16-token per-channel sum to exceed `-126 * ln(2)` (a uniform gate of at least `-5.45`); past it
-results are not finite. That bound keeps the forward finite; gradients need more margin. The
+results are not finite (with `fastmath=False`, past about `-128 * ln(2)`). That bound keeps the
+forward finite; gradients need more margin. The
 backward stages `Q_decay = scale * q * exp(in-chunk cumulative decay)` as a BF16 MMA operand,
 which flushes to zero once `scale * |q| * exp(16-token sum)` falls below about `2^-126`, and dv,
 dgate and dbeta then lose precision. Measured as relative RMS error against FP64 (one BF16
@@ -531,7 +532,7 @@ count and always stride over the active work only, so it needs no option for ove
 |---|---|---|
 | Repo-local fused KDA | Fast, approximate exponentials | Non-fast exponentials that preserve FP32 subnormal results |
 | `impl="reference"` | Normal PyTorch math | Normal PyTorch math |
-| `kernel_options={"backend": "warpdrive"}` | Native backend math | `ValueError`: unsupported |
+| warpdrive KDA | Flush-to-zero approximate exponentials and reciprocals | Non-flushing approximate exponentials and reciprocals that preserve FP32 subnormal results |
 
 One kernel ignores the flag: the BF16 forward intra-chunk engine on SM100-family GPUs always uses
 the flush-to-zero exponential, and its strip rebase keeps every factor that contributes above `2^-62`
@@ -541,6 +542,19 @@ that a factor flushes only when the decay it belongs to is below `2^-126`, so `f
 gradients stay accurate up to the gate bound; such a decay is still lost with `fastmath=True` even
 when a large K entry would make its term normal. Its in-subchunk factors reach `2^68.3` there, so
 at the gate bound the backward needs Q entries and `beta`-scaled K entries below `2^59.7`.
+
+warpdrive gives bitwise-identical results in both modes while every in-chunk decay stays at or
+above `2^-126`, as the [KDA gate contract](#kimi-delta-attention) implies. Below that, `False`
+keeps the gate exponentials and their reciprocals from flushing, so a decayed state or summary
+entry stays an FP32 subnormal instead of zero. The exception is the 16-row tensor-core walk of the
+piece chain (used when sequences x heads x 16 exceeds the SM count): its TF32 operands flush
+subnormal carried states to zero. The reciprocal of the in-chunk decay stays finite while every
+aligned 16-token per-channel sum exceeds about `-128 * ln(2)` (a uniform gate of at least `-5.54`)
+instead of `-126 * ln(2)`. Results stay finite there only while each key entry times that
+reciprocal fits FP32, so `|k|` must stay below 2 at the limit; L2-normalized keys satisfy this.
+Accuracy in that band stays poor (BF16, uniform `-5.5`: 1.3% relative RMS error on the output
+and 45% on dgate, against 0.4% and 0.3% for the fused backend with `False`), so the gradient
+guideline of about `-5.25` applies in both modes.
 
 Use the same value for staged forward and backward preparation. Choose it before warmup and
 CUDA Graph capture. FP16/BF16 rounding and the documented gate-range limits apply in both modes.
