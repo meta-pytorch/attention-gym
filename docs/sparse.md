@@ -317,6 +317,11 @@ out = paged_sparse_decode(
   `_tile_config` documents the measured tile heuristics and `_choose_splits` and the launcher
   document split selection.
 
+  Multi-token and mixed prefill/decode batches launch one program per packed query row, KV head,
+  and split. The kernel looks up each row's sequence in `cu_seqlens_q`, skipping empty sequences.
+  A long prefill therefore does not pad every decode request to `max_seqlen_q`. Single-token
+  decode keeps a direct sequence-to-row mapping without that lookup.
+
   Each split stores an unnormalized weighted-value sum, exponential sum, and maximum. The
   merge rescales these to a common maximum and normalizes once; a single split writes the
   result directly. The kernel needs FP16/BF16 inputs, power-of-two head dimensions of at
