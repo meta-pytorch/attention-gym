@@ -1,9 +1,22 @@
 """Causal selection from persistent, paged pools of completed indexer keys."""
 
+from typing import Literal, TypedDict
+
 import torch
 from torch import Tensor
 
-from attn_gym.types import Impl, resolve_impl
+from attn_gym.types import Impl, KernelOptionSpec, resolve_impl, validate_kernel_options
+
+from .ops import _paged_indexer_op
+
+
+class PagedIndexerKernelOptions(TypedDict, total=False):
+    """Implementation choices for :func:`paged_lightning_indexer`."""
+
+    backend: Literal["cute", "triton"]
+
+
+PAGED_KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), None)}
 
 
 def paged_lightning_indexer(
@@ -17,14 +30,16 @@ def paged_lightning_indexer(
     topk: int,
     compress_ratio: int = 4,
     query_positions: Tensor | None = None,
-    impl: Impl | str = Impl.REFERENCE,
+    impl: Impl | str = Impl.FUSED,
+    kernel_options: PagedIndexerKernelOptions | None = None,
 ) -> Tensor:
     """Select completed blocks from cached candidates for each new query.
 
     Scores are ``sum_h(weights[t, h] * relu(query[t, h] @ key)) / sqrt(H * D)``,
     as in :func:`lightning_indexer`. Returns contiguous int32 ``[tokens, topk]``
     **sequence-local block IDs**, with -1 padding after the valid IDs. Order and
-    tie-breaking are unspecified. Selection is nondifferentiable.
+    tie-breaking are unspecified. Deterministic algorithms mode makes selection
+    repeatable, with ties resolved toward lower IDs. Selection is nondifferentiable.
     Every new query requires selection even when the indexer weights are frozen.
 
     Args:
@@ -50,12 +65,19 @@ def paged_lightning_indexer(
         query_positions: Optional contiguous int32 ``[tokens]`` absolute,
             zero-based sequence positions, replacing the appended-query rule.
             Negative positions select nothing.
-        impl: ``"reference"`` runs eager PyTorch on CPU or CUDA. This reference
-            implementation reads metadata on the host and does not support
-            fullgraph compilation or CUDA Graph capture.
+        impl: ``"reference"`` runs eager PyTorch on CPU or CUDA; ``"fused"``
+            runs Triton on NVIDIA CUDA devices (SM80+), supporting FP16/BF16,
+            heads <= 128 and head_dim <= 256. Arbitrary nonnegative strides
+            are supported.
+        kernel_options: ``backend="cute"`` uses the cached CuTe radix selector
+            on SM100-family GPUs (default there); ``"triton"`` uses Triton
+            throughout (default on other GPUs). Both score paged keys with
+            Triton. Reference validates and ignores these choices.
 
     Offset values, nonnegative sequence lengths, cache capacity for completed
-    blocks, and referenced page IDs are caller invariants.
+    blocks, and referenced page IDs are caller invariants, never read on the host
+    by the fused path. It supports ``torch.compile(fullgraph=True)`` and CUDA
+    Graph replay with changing metadata values.
 
     The caller owns cache updates: retain raw keys for the incomplete block,
     average a block in FP32 once complete, apply the model's post-pooling
@@ -72,8 +94,9 @@ def paged_lightning_indexer(
     overrides this indexer only.
     """
     selected_impl = resolve_impl(impl)
-    if selected_impl != Impl.REFERENCE:
-        raise NotImplementedError("paged_lightning_indexer currently supports impl='reference'.")
+    backend = validate_kernel_options(
+        kernel_options, PAGED_KERNEL_OPTION_SPEC, op_name="paged_lightning_indexer"
+    )["backend"]
     operands = {
         "query": query,
         "key_cache": key_cache,
@@ -120,9 +143,23 @@ def paged_lightning_indexer(
                 raise TypeError(f"{name} must have dtype int32.")
             if name != "block_table" and not tensor.is_contiguous():
                 raise ValueError(f"{name} must be contiguous.")
-    from .impl.paged_reference import launch
+    if selected_impl == Impl.REFERENCE:
+        from .impl.paged_reference import launch
 
-    return launch(
+        return launch(
+            query,
+            key_cache,
+            weights,
+            block_table,
+            cu_seqlens_q,
+            seqused_k,
+            topk,
+            compress_ratio,
+            query_positions,
+        )
+    if not query.is_cuda:
+        raise ValueError("the fused paged_lightning_indexer requires CUDA tensors.")
+    return _paged_indexer_op(
         query,
         key_cache,
         weights,
@@ -132,4 +169,5 @@ def paged_lightning_indexer(
         topk,
         compress_ratio,
         query_positions,
+        backend or "auto",
     )
