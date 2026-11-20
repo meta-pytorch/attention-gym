@@ -76,8 +76,10 @@ def _packed_rows_are_disjoint(left: torch.Tensor, right: torch.Tensor) -> bool:
         return False
     left_start, left_size, left_stride, left_rows = left_layout
     right_start, right_size, right_stride, right_rows = right_layout
-    if left_rows == right_rows == 1:
-        return left_start + left_size <= right_start or right_start + right_size <= left_start
+    left_end = left_start + (left_rows - 1) * left_stride + left_size
+    right_end = right_start + (right_rows - 1) * right_stride + right_size
+    if left_end <= right_start or right_end <= left_start:
+        return True
     if left_stride <= 0 or left_stride != right_stride:
         return False
     if left_size > left_stride or right_size > right_stride:
@@ -97,7 +99,7 @@ def _token_strides(tensor: torch.Tensor) -> tuple[int, ...]:
 
 def _validate_replay_aliases(
     replay_tensors: tuple[tuple[str, torch.Tensor], ...],
-    state_cache: torch.Tensor,
+    state_cache: torch.Tensor | None,
     read_only_tensors: tuple[tuple[str, torch.Tensor | None], ...],
 ) -> None:
     """Reject storage aliasing that would make replay updates order-dependent: the replay buffers
@@ -110,7 +112,11 @@ def _validate_replay_aliases(
             if other_tensor is not None and _tensors_overlap(tensor, other_tensor):
                 raise ValueError(f"replay_state {name} must not alias {other_name}")
     for other_name, other_tensor in read_only_tensors:
-        if other_tensor is not None and _tensors_overlap(state_cache, other_tensor):
+        if (
+            state_cache is not None
+            and other_tensor is not None
+            and _tensors_overlap(state_cache, other_tensor)
+        ):
             raise ValueError(f"state_cache must not alias {other_name}")
 
 

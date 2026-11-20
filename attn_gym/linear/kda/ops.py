@@ -89,6 +89,14 @@ torch.library.define(
     " Tensor(f!) replay_count, Tensor output_template) -> Tensor",
 )
 
+torch.library.define(
+    "attn_gym::kda_copy_replay_tails",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) replay_q, "
+    "Tensor(b!) replay_k, Tensor(c!) replay_v, Tensor(d!) replay_gate, Tensor(e!) replay_beta, "
+    "Tensor(f!) replay_count, Tensor cu_seqlens, Tensor state_indices, Tensor? has_initial_state, "
+    "Tensor checkpoint_positions, Tensor checkpoint_slots) -> ()",
+)
+
 _CHUNK_BWD_ARGS = (
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, Tensor Aqk, "
     "Tensor Akk, Tensor? cu_seqlens, Tensor? chunk_offsets, Tensor? d_output, "
@@ -195,6 +203,10 @@ register_lazy_cuda_impls(
         "kda_chunk_bwd": "_chunk_kda_bwd_cuda",
         "kda_chunk_bwd_with_state_grad": "_chunk_kda_bwd_with_state_grad_cuda",
     },
+)
+register_lazy_cuda_impls(
+    lambda: importlib.import_module("attn_gym.linear.kda.fwd.triton.copy_replay_tails"),
+    {"kda_copy_replay_tails": "copy_replay_tails_cuda"},
 )
 register_lazy_cuda_impls(
     _replay_backend,
@@ -443,6 +455,28 @@ def _chunk_replay_prefill_prepare_fake(
         replay_count.new_empty((num_sequences,)),
         None if checkpoint_positions is None else torch.empty_like(checkpoint_positions),
     )
+
+
+@torch.library.register_fake("attn_gym::kda_copy_replay_tails")
+def _copy_replay_tails_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    replay_q: torch.Tensor,
+    replay_k: torch.Tensor,
+    replay_v: torch.Tensor,
+    replay_gate: torch.Tensor,
+    replay_beta: torch.Tensor,
+    replay_count: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    has_initial_state: torch.Tensor | None,
+    checkpoint_positions: torch.Tensor,
+    checkpoint_slots: torch.Tensor,
+) -> None:
+    return None
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_replay_state_gather")
@@ -728,6 +762,7 @@ chunk_fwd_ragged_paged_op = torch.ops.attn_gym.kda_chunk_fwd_ragged_paged.defaul
 chunk_replay_prepare_op = torch.ops.attn_gym.kda_chunk_replay_prepare.default
 chunk_replay_commit_op = torch.ops.attn_gym.kda_chunk_replay_commit.default
 chunk_replay_prefill_prepare_op = torch.ops.attn_gym.kda_chunk_replay_prefill_prepare.default
+copy_replay_tails_op = torch.ops.attn_gym.kda_copy_replay_tails.default
 chunk_replay_state_gather_op = torch.ops.attn_gym.kda_chunk_replay_state_gather.default
 chunk_replay_prefill_commit_op = torch.ops.attn_gym.kda_chunk_replay_prefill_commit.default
 chunk_bwd_op = torch.ops.attn_gym.kda_chunk_bwd.default
