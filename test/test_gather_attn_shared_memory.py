@@ -179,6 +179,31 @@ def test_shared_kv_launches_fit_99_kib_shared_memory(capability, heads, latent_d
     assert not over_shared_memory(launches, SM86_MAX_SHARED_MEMORY)
 
 
+@pytest.mark.parametrize("capability", [SM86_CAPABILITY, SM90_CAPABILITY, SM120_CAPABILITY])
+@pytest.mark.parametrize("heads,latent_dim,rope_dim", [(16, 128, 128), (16, 512, 128)])
+def test_paired_deterministic_launches_fit_shared_memory(
+    capability, heads, latent_dim, rope_dim, deterministic_algorithms
+):
+    """Deterministic RoPE backward fits both Hopper and 99 KiB targets."""
+    skip_unsupported("triton")
+    inputs = make_mla_inputs(
+        heads=heads, latent_dim=latent_dim, rope_dim=rope_dim, seq_len=33, topk=16
+    )
+    budget = SM90_MAX_SHARED_MEMORY if capability == SM90_CAPABILITY else SM86_MAX_SHARED_MEMORY
+    with compile_only_for_target(capability, budget) as launches:
+        output = gather_attn(
+            **inputs.kwargs(),
+            sliding_window_size=7,
+            scale=0.0625,
+            kernel_options={"backend": "triton"},
+        )
+        output.sum().backward()
+    kernels = {launch.kernel for launch in launches}
+    assert "_gather_attn_bwd_dsparse_kv" in kernels
+    assert "_gather_attn_bwd_dsparse_kv_shared_atomic" not in kernels
+    assert not over_shared_memory(launches, budget)
+
+
 @pytest.mark.parametrize("rope_dim", [0, 64], ids=["bare", "paired"])
 def test_absorbed_mla_small_key_tiles_match_reference(rope_dim):
     """Key tiles selected for a 99 KiB budget match reference outputs and gradients."""
