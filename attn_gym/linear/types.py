@@ -16,40 +16,38 @@ from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOpt
 
 
 class StateCheckpoints(NamedTuple):
-    """Caller-owned periodic FP32 snapshots for paged GDN and KDA inference.
+    """Periodic recurrent-state snapshots written into caller-chosen slots of a state pool.
 
-    ``states`` is a contiguous buffer shaped ``[capacity, H, V, K]``. Sequence ``i``
-    writes its post-update states every ``every_n_tokens`` tokens, measured from that
-    sequence's start in this call. With KDA ``replay_state``, count from the start of
-    the slot's unfinished chunk instead: cached replay tokens precede the new tokens.
-    The interval must be a positive multiple of 64. A final state exactly on an interval
-    boundary is included; incomplete intervals produce no snapshot.
+    Every ``every_n_tokens`` tokens (a positive multiple of 64, counted from each sequence's
+    start in this call, or from its slot's unfinished chunk with KDA ``replay_state``), a
+    sequence produces one logical checkpoint row: its full post-update state, including the
+    slot's history. ``cu_checkpoint_offsets`` (int32 ``[N + 1]``, nonnegative, nondecreasing)
+    gives each sequence's starting row: an active sequence's rows fill ``offsets[i]`` onward,
+    and it must reserve at least ``(replayed_tokens + sequence_length) // every_n_tokens`` of
+    them (no replayed tokens without replay or for a fresh slot).
 
-    ``cu_checkpoint_offsets`` is contiguous int32 on the input device, shaped ``[N + 1]``.
-    It starts at zero and never decreases. Each active sequence reserves
-    ``sequence_length // every_n_tokens`` rows, or
-    ``(replayed_tokens + sequence_length) // every_n_tokens`` for KDA replay. A fresh slot
-    (``has_initial_state=False``) has zero replayed tokens. Inactive sequences may reserve
-    unused rows. The final offset must not exceed ``capacity``. These values are caller
-    responsibilities: no device-to-host synchronization is performed to check them.
+    ``block_table`` is a 1-D int32 tensor mapping logical checkpoint rows to physical
+    ``state_pool`` slots: row ``r`` is written to slot ``block_table[r]``, and non-positive
+    entries (such as ``PAD_SLOT_ID = -1`` or the null slot 0) skip the write, so an engine can
+    pass its flattened block table. ``state_pool`` has the paged state-cache layout
+    (``[slots, H, V, K]``, FP32 or BF16, contiguous within each slot) and may be the state
+    cache itself, but no other input. A BF16 pool rounds the FP32 snapshots.
 
-    Inactive sequences (non-positive state indices) and unused capacity are not written.
-    Both tensors must be on the input device. The writable buffer must not alias any
-    input, including the state cache and checkpoint offsets. Snapshots come directly from
-    the FP32 recurrence accumulator, even when the persistent state cache uses BF16.
-    Checkpointing is inference-only and requires the repo-local fused backend:
-    ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or ``recurrent_gdn``
-    with ``state_indices``.
-    A replay checkpoint contains only the completed chunk's recurrent state. To resume at
-    a position within the next chunk, the caller must also preserve that position's replay
-    tokens and count; the operation does not snapshot replay buffers. The replay interval
-    origin is recomputed for each call, so intervals longer than 64 never complete during
-    one-token replay decode.
+    The caller guarantees, without a device check: ``offsets[N]`` does not exceed the length
+    of ``block_table``; positive entries of produced rows are smaller than
+    ``state_pool.shape[0]`` and distinct; and, when the pool is the state cache, they are not
+    slots the call routes. Nothing else is written.
+
+    Requires the fused backend: ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or
+    ``recurrent_gdn`` with ``state_indices``; inference only. A replay checkpoint holds the
+    state after a completed chunk: restoring a later position also needs the caller to copy its
+    replay tail and count. Intervals above 64 never complete during one-token replay decode.
     """
 
-    states: torch.Tensor
+    state_pool: torch.Tensor
     cu_checkpoint_offsets: torch.Tensor
     every_n_tokens: int
+    block_table: torch.Tensor
 
 
 class ReplayState(NamedTuple):

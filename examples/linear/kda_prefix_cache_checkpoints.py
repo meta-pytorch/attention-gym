@@ -1,9 +1,10 @@
 """Reuse a cached KDA prompt prefix with state checkpoints and replay tails.
 
-A serving engine prefills request A in a paged state slot and asks ``paged_chunk_kda`` for
-periodic FP32 state checkpoints. Request B shares A's first ``prefix`` tokens. Instead of
-recomputing them, B's slot is seeded with the checkpoint at the last full chunk before the
-prefix end, plus the prefix tokens after that chunk as B's replay tail. B then prefills only
+A serving engine prefills request A in a paged state slot. ``paged_chunk_kda`` writes the
+state at the last full chunk of the prefix that later requests may share straight into a
+prefix-cache slot of the same pool, the way an engine publishes a cache entry. Request B
+shares A's first ``prefix`` tokens. Instead of recomputing them, B's slot is seeded from the
+cached state plus the prefix tokens after that chunk as B's replay tail. B then prefills only
 its own suffix, and its output matches a from-scratch prefill bit for bit.
 
 """
@@ -21,7 +22,7 @@ HEADS = 2
 HEAD_DIM = 128  # Required by fused paged_chunk_kda.
 TOKENS = 200  # Each request's prompt length.
 INTERVAL = 64  # Checkpoint every chunk.
-SLOT_A, SLOT_B, SLOT_REFERENCE = 1, 2, 3  # Slot 0 is the null slot.
+SLOT_A, SLOT_B, SLOT_REFERENCE, SLOT_CACHED = 1, 2, 3, 4  # Slot 0 is the null slot.
 OPTIONS = {"autotune": False}  # Fixed heuristics keep kernel selection repeatable.
 
 
@@ -66,7 +67,7 @@ def restore_shared_prefix(prefix: int) -> int:
         torch.cat((a[:, :prefix], b), dim=1) for a, b in zip(prompt_a, suffix_b, strict=True)
     )
 
-    slots = SLOT_REFERENCE + 1
+    slots = SLOT_CACHED + 1
     state_cache = torch.zeros(slots, HEADS, HEAD_DIM, HEAD_DIM, device="cuda")
     replay = ReplayState(
         *(
@@ -79,17 +80,21 @@ def restore_shared_prefix(prefix: int) -> int:
         cache[SLOT_B].normal_()
     replay.count[SLOT_B] = 37
 
-    # Request A: a fresh slot replays nothing, so it reserves TOKENS // INTERVAL rows.
+    # Request A: a fresh slot replays nothing, so it reserves TOKENS // INTERVAL rows. Only the
+    # row at the shared boundary has a destination; the others are skipped.
+    block_table = torch.zeros(TOKENS // INTERVAL, device="cuda", dtype=torch.int32)
+    block_table[restored // INTERVAL - 1] = SLOT_CACHED
     checkpoints = StateCheckpoints(
-        torch.empty(TOKENS // INTERVAL, HEADS, HEAD_DIM, HEAD_DIM, device="cuda"),
+        state_cache,
         torch.tensor([0, TOKENS // INTERVAL], device="cuda", dtype=torch.int32),
         INTERVAL,
+        block_table,
     )
     prefill(SLOT_A, prompt_a, state_cache, replay, fresh=True, checkpoints=checkpoints)
 
-    # Request B: copy the checkpoint and the prefix tokens after it into B's slot. A prefix
+    # Request B: copy the cached state and the prefix tokens after it into B's slot. A prefix
     # ending exactly on a chunk boundary copies no tokens, but must still set the count to 0.
-    state_cache[SLOT_B].copy_(checkpoints.states[restored // INTERVAL - 1])
+    state_cache[SLOT_B].copy_(state_cache[SLOT_CACHED])
     for cache, tokens in zip(replay[:-1], prompt_a, strict=True):
         cache[SLOT_B, :tail].copy_(tokens[0, restored:prefix])
     replay.count[SLOT_B] = tail

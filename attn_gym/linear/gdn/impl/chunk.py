@@ -18,7 +18,9 @@ from attn_gym.linear._delta_rule.span import zero_state
 from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoints_from_op_args
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata
 from attn_gym.linear._delta_rule.triton.group_sum import group_sum
-from attn_gym.linear._delta_rule.validation import validate_paged_state
+from attn_gym.linear._delta_rule.validation import (
+    validate_paged_state,
+)
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_delta_h import chunk_gdn_bwd_delta_h
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_intra import (
     chunk_gdn_bwd_intra_dense,
@@ -332,6 +334,7 @@ def _gdn_chunk_fwd_packed_paged_cuda(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_block_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run packed scalar GDN while advancing selected cache slots in place.
 
@@ -377,7 +380,7 @@ def _gdn_chunk_fwd_packed_paged_cuda(
         output_final_state=False,
         metadata=metadata,
         state_checkpoints=state_checkpoints_from_op_args(
-            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
         ),
     )
     assert final_state is None
