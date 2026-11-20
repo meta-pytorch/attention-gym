@@ -463,7 +463,7 @@ def test_hopper_int64_specializations_match_default(monkeypatch):
             "attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_wy_triton",
             "requires_int64_offsets",
         ),
-        ("attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra", "requires_int64_abi"),
+        ("attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_intra", "requires_int64_offsets"),
     ):
         monkeypatch.setattr(importlib.import_module(module_name), attribute, lambda *_args: True)
 
