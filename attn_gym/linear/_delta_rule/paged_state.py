@@ -117,19 +117,6 @@ class PagedState:
                 raise ValueError("the paged state pool must not alias read-only inputs")
         return cls(cache, indices, has_initial_state)
 
-    def require_alignment(self, alignment_bytes: int) -> PagedState:
-        """Refine the common contract with a backend's pointer-alignment requirement."""
-        element_bytes = self.cache.element_size()
-        if alignment_bytes % element_bytes:
-            raise ValueError("alignment must be a multiple of the state element size")
-        if self.cache.data_ptr() % alignment_bytes or self.cache.stride(0) % (
-            alignment_bytes // element_bytes
-        ):
-            raise TypeError(
-                f"the paged state pool base and slot origins must be {alignment_bytes}-byte aligned"
-            )
-        return self
-
     @property
     def byte_mask(self) -> torch.Tensor | None:
         """Expose the bool mask through byte-oriented foreign-function ABIs."""

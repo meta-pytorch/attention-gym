@@ -212,7 +212,7 @@ def _packed_fwd_paged_cuda(
         key_dim=q.shape[3],
         device=q.device,
         read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
-    ).require_alignment(16)
+    )
     output, _ = backend.run_forward(
         q,
         k,
