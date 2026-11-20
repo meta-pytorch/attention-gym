@@ -267,8 +267,33 @@ def test_split_counts_agree(splits, monkeypatch):
     """Changing the split count preserves attention; empty splits contribute nothing."""
     from attn_gym.sparse.paged_decode.impl import triton
 
-    inputs = make_paged_sparse_decode_inputs([3000, 300], [1, 2], attention_sink=True)
+    inputs = make_paged_sparse_decode_inputs(
+        [0, 3000, 300, 0, 100, 0], [0, 1, 17, 0, 1, 0], attention_sink=True
+    )
     monkeypatch.setattr(triton, "_choose_splits", lambda *args: splits)
+    _assert_matches_reference(inputs)
+
+
+@requires_cuda
+@pytest.mark.parametrize("max_seqlen_q", [33, 32768])
+def test_mixed_queries_launch_only_packed_rows(max_seqlen_q, monkeypatch):
+    """Long queries must not multiply decode work or overflow CUDA's second grid axis."""
+    from attn_gym.sparse.paged_decode.impl import triton
+
+    inputs = make_paged_sparse_decode_inputs(
+        [0, 100, 100, 0, 100, 0], [0, 1, 33, 0, 1, 0], head_dim=32, topk=16
+    )
+    inputs["max_seqlen_q"] = max_seqlen_q
+    kernel = triton._paged_sparse_decode_kernel
+
+    class CheckedGrid:
+        def __getitem__(self, grid):
+            assert grid[0] * grid[1] <= (
+                inputs["query"].shape[0] * inputs["kv"].key_cache.shape[2]
+            )
+            return kernel[grid]
+
+    monkeypatch.setattr(triton, "_paged_sparse_decode_kernel", CheckedGrid())
     _assert_matches_reference(inputs)
 
 
@@ -290,21 +315,46 @@ def test_empty_batches_and_selections():
 
 @requires_cuda
 @pytest.mark.parametrize("small", [False, True])
-def test_cuda_graph_replay_tracks_new_inputs(small):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_cuda_graph_replay_tracks_new_inputs(small, mixed):
     kwargs = {"heads": 6, "kv_heads": 1} if small else {}
-    inputs = make_paged_sparse_decode_inputs([3003, 900, 64], [1, 1, 1], seed=3, **kwargs)
-    fresh = make_paged_sparse_decode_inputs([3003, 900, 64], [1, 1, 1], seed=4, **kwargs)
+    query_lens = [0, 1, 7, 0, 1, 0] if mixed else [1, 1, 1]
+    fresh_lens = [1, 0, 0, 6, 0, 0] if mixed else query_lens
+    seqlens = [3003, 900, 64, 128, 32, 0] if mixed else [3003, 900, 64]
+    inputs = make_paged_sparse_decode_inputs(seqlens, query_lens, seed=3, **kwargs)
+    fresh = make_paged_sparse_decode_inputs(seqlens, fresh_lens, seed=4, **kwargs)
     paged_sparse_decode(**inputs)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         out = paged_sparse_decode(**inputs)
     for name in ("query", "indices", "topk_length"):
-        inputs[name].copy_(fresh[name])
+        inputs[name][: fresh[name].shape[0]].copy_(fresh[name])
+    inputs["cu_seqlens_q"].copy_(fresh["cu_seqlens_q"])
     inputs["kv"].key_cache.copy_(fresh["kv"].key_cache)
     inputs["kv"].value_cache.copy_(fresh["kv"].value_cache)
     graph.replay()
     expected = paged_sparse_decode(**inputs, impl="reference")
-    assert_relative_rms_within(out, expected.double(), "graph replay", max_eps=2.0)
+    num_live = sum(fresh_lens)
+    torch.testing.assert_close(out[:num_live], expected[:num_live], atol=2e-2, rtol=2e-2)
+    assert_relative_rms_within(
+        out[:num_live], expected[:num_live].double(), "graph replay", max_eps=2.0
+    )
+
+
+@requires_cuda
+def test_mixed_query_shapes_reuse_kernels(triton_compiles):
+    """Packed row lookup must not specialize on sequence count or maximum query length."""
+    compiled = torch.compile(paged_sparse_decode, fullgraph=True, dynamic=True)
+    for num_sequences, query_len in ((1, 17), (16, 2), (17, 16), (33, 3)):
+        query_lens = [1] * (num_sequences - 1) + [query_len]
+        inputs = make_paged_sparse_decode_inputs(
+            [100] * num_sequences, query_lens, heads=2, kv_heads=1, head_dim=32, topk=16
+        )
+        actual = compiled(**inputs)
+        expected = paged_sparse_decode(**inputs, impl="reference")
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        assert_relative_rms_within(actual, expected.double(), "dynamic query lengths", max_eps=2.0)
+    assert triton_compiles["_paged_sparse_decode_kernel"] == 1
 
 
 @requires_cuda

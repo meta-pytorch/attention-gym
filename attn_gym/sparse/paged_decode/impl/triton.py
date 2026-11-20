@@ -1,9 +1,10 @@
 """Paged sparse decode without materializing expanded entries or physical addresses.
 
-The producer grid is ``(num_sequences, max_seqlen_q * kv_heads, num_splits)``. Its middle axis
-packs ``query_within_sequence * kv_heads + kv_head``. Each program serves one query row and one
-KV head's consecutive query-head group. Programs beyond a sequence's query count read metadata
-but write no results.
+The producer grid is ``(num_rows * kv_heads, 1, num_splits)`` for multi-token queries. Each
+program finds its packed row's sequence in the query offsets and serves one KV head's
+consecutive query-head group. Single-token decode uses ``(num_sequences, kv_heads, num_splits)``
+and maps sequences directly to rows without a search. Padded rows read metadata but write no
+results.
 
 A row's key tiles are ordered sparse first, window second. Split ``s`` takes tiles
 ``s, s + num_splits, ...``. Sparse columns expand block ids into logical entries; window columns
@@ -28,7 +29,12 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from attn_gym._backends.triton.utils import offset_strides, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    _document_ids,
+    offset_strides,
+    ptr_offset,
+    requires_int64_offsets,
+)
 
 # log2(e) and ln(2) stay literals: Triton rechecks every module global a kernel reads on each
 # launch, and reading the shared LOG2_E/LN_2 constexprs added about 5 us of host time per call
@@ -129,6 +135,7 @@ def _natural_lse(m, l):
 @triton.jit(
     do_not_specialize=[
         "num_rows",
+        "num_sequences",
         "num_splits",
         "topk",
         "stride_table",
@@ -156,6 +163,7 @@ def _paged_sparse_decode_kernel(
     PartialOut,
     PartialStats,
     num_rows,
+    num_sequences,
     num_splits,
     stride_q_row,
     stride_q_head,
@@ -197,20 +205,25 @@ def _paged_sparse_decode_kernel(
     BLOCK_N: tl.constexpr,
     K_ROWS: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
+    SINGLE_QUERY: tl.constexpr,
     USE_PDL: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
-    # A sequence-based grid avoids searching cu_seqlens_q to map a packed row to its sequence.
-    sequence = tl.program_id(0)
-    query = tl.program_id(1) // KV_HEADS
-    kv_head = tl.program_id(1) % KV_HEADS
     split = tl.program_id(2)
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
-    query_start = tl.load(CuQ + sequence)
+    if SINGLE_QUERY:
+        kv_head = tl.program_id(1)
+        sequence = tl.program_id(0)
+        row = tl.load(CuQ + sequence)
+    else:
+        row = tl.program_id(0) // KV_HEADS
+        kv_head = tl.program_id(0) % KV_HEADS
+        sequence = _document_ids(CuQ, row, num_sequences, USE_INT64_OFFSETS)
+        # Inactive graph capacity maps past the last sequence; keep metadata loads in bounds.
+        sequence = tl.minimum(sequence, num_sequences - 1)
     query_end = tl.load(CuQ + sequence + 1)
-    row = query_start + query
     position = tl.load(SeqUsed + sequence) - (query_end - row)
     has_row = row < query_end
     active = has_row & (position >= 0)
@@ -635,7 +648,14 @@ def paged_sparse_decode(
     sink_arg = attention_sink if attention_sink is not None else query
     lse_arg = lse if lse is not None else out
 
-    _paged_sparse_decode_kernel[(seqused_k.shape[0], max_seqlen_q * kv_heads, num_splits)](
+    num_sequences = seqused_k.shape[0]
+    single_query = max_seqlen_q == 1
+    grid = (
+        (num_sequences, kv_heads, num_splits)
+        if single_query
+        else (num_rows * kv_heads, 1, num_splits)
+    )
+    _paged_sparse_decode_kernel[grid](
         query,
         key_cache,
         value_cache,
@@ -653,6 +673,7 @@ def paged_sparse_decode(
         partial_out,
         partial_stats,
         num_rows,
+        num_sequences,
         num_splits,
         *query.stride()[:2],
         *key_cache.stride()[:3],
@@ -684,6 +705,7 @@ def paged_sparse_decode(
         BLOCK_N=block_n,
         K_ROWS=k_rows,
         SINGLE_TILE=single_tile,
+        SINGLE_QUERY=single_query,
         USE_PDL=use_pdl,
         num_warps=num_warps,
         num_stages=num_stages,
