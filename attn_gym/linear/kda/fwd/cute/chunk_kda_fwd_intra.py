@@ -4,8 +4,9 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# KDA forward factor composition. The SM100 family retains its CuTe factor engines;
-# every other supported GPU uses the FP32/TF32 BC16 stage plus Triton K3/K4.
+# KDA forward factor composition. The SM100 family retains its CuTe factor engines unless
+# ``ATTN_GYM_LEGACY_CUTE=0`` (see _delta_rule/routing.py); every other supported GPU uses the
+# FP32/TF32 BC16 stage plus Triton K3/K4.
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.profiler import profiler_range
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
@@ -32,7 +34,6 @@ from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_k4_triton import (
     chunk_kda_fwd_k4b_triton,
 )
 from attn_gym.linear.kda.fwd.triton.recompute_w_u import recompute_w_u_fwd_triton
-from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 
 def chunk_kda_fwd_factors(
@@ -56,7 +57,7 @@ def chunk_kda_fwd_factors(
         shape = (batch, tokens, heads, chunk_size)
         return k.new_empty(shape), k.new_empty(shape)
 
-    if not is_sm100_kda_target(k.device):
+    if not uses_legacy_cute(k.device):
         Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
             q, k, gk, beta, scale, metadata, chunk_size, fastmath=fastmath
         )

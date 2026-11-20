@@ -92,6 +92,7 @@ from torch._subclasses.fake_tensor import FakeTensor
 from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym._backends.cute import get_device_properties
 from attn_gym._backends.cute.utils import requires_int64_abi
+from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, work_table
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive import (
@@ -1107,7 +1108,7 @@ def build_state_summaries(
     capability = (properties.major, properties.minor)
     if capability < (8, 0):
         raise ValueError(f"affine_summary_fwd requires CUDA capability 8.0+, got {capability}")
-    portable = not runs_sm100_kernels(capability)
+    portable = not uses_legacy_cute(kg.device)
     sm_count = properties.multi_processor_count
     if portable:
         if capability[0] in (10, 12):
