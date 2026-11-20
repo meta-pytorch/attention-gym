@@ -49,8 +49,8 @@ torch.library.define(
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
     "Tensor cu_seqlens, "
     "Tensor chunk_offsets, bool autotune, str schedule, "
-    "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
-    "int checkpoint_interval=0, Tensor? checkpoint_block_table=None) -> Tensor",
+    "Tensor(b!)? checkpoint_states=None, Tensor? checkpoint_positions=None, "
+    "Tensor? checkpoint_slots=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_replay_prepare",
@@ -64,17 +64,17 @@ torch.library.define(
     "attn_gym::kda_chunk_replay_commit",
     "(Tensor final_state, Tensor state_indices, Tensor? has_initial_state,"
     " Tensor active_counts, Tensor(a!) state_cache, Tensor(b!) replay_count,"
-    " Tensor(c!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None,"
-    " int checkpoint_interval=0, Tensor? checkpoint_block_table=None) -> ()",
+    " Tensor(c!)? checkpoint_states=None, Tensor? checkpoint_positions=None,"
+    " Tensor? checkpoint_slots=None) -> ()",
 )
 torch.library.define(
     "attn_gym::kda_chunk_replay_prefill_prepare",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor state_cache,"
     " Tensor replay_q, Tensor replay_k, Tensor replay_v, Tensor replay_gate,"
     " Tensor replay_beta, Tensor replay_count, Tensor state_indices,"
-    " Tensor? has_initial_state, Tensor input_cu_seqlens)"
+    " Tensor? has_initial_state, Tensor input_cu_seqlens, Tensor? checkpoint_positions=None)"
     " -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor,"
-    " Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+    " Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor?)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_replay_state_gather",
@@ -146,8 +146,8 @@ torch.library.define(
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, "
     "Tensor? chunk_offsets, "
     "SymInt capacity, bool fastmath=True, "
-    "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
-    "int checkpoint_interval=0, Tensor? checkpoint_block_table=None) -> (Tensor, Tensor)",
+    "Tensor(b!)? checkpoint_states=None, Tensor? checkpoint_positions=None, "
+    "Tensor? checkpoint_slots=None) -> (Tensor, Tensor)",
 )
 
 
@@ -339,9 +339,8 @@ def _chunk_fwd_ragged_paged_fake(
     autotune: bool,
     schedule: str,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
-    checkpoint_block_table: torch.Tensor | None = None,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del (
         k,
@@ -397,12 +396,11 @@ def _chunk_replay_commit_fake(
     state_cache: torch.Tensor,
     replay_count: torch.Tensor,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
-    checkpoint_block_table: torch.Tensor | None = None,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> None:
     del final_state, state_indices, has_initial_state, active_counts, state_cache, replay_count
-    del checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
+    del checkpoint_states, checkpoint_positions, checkpoint_slots
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_replay_prefill_prepare")
@@ -422,7 +420,8 @@ def _chunk_replay_prefill_prepare_fake(
     state_indices: torch.Tensor,
     has_initial_state: torch.Tensor | None,
     input_cu_seqlens: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
+    checkpoint_positions: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, ...]:
     del k, v, gate, beta, state_cache, has_initial_state, input_cu_seqlens
     num_sequences = state_indices.shape[0]
     prefix_capacity = (
@@ -442,6 +441,7 @@ def _chunk_replay_prefill_prepare_fake(
             for cache in (replay_q, replay_k, replay_v, replay_gate, replay_beta)
         ),
         replay_count.new_empty((num_sequences,)),
+        None if checkpoint_positions is None else torch.empty_like(checkpoint_positions),
     )
 
 
@@ -712,9 +712,8 @@ def _delta_h_paged_fake(
     capacity: int,
     fastmath: bool = True,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
-    checkpoint_block_table: torch.Tensor | None = None,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del w, gk, state_cache, state_indices, has_initial_state, cu_seqlens, chunk_offsets
     del fastmath

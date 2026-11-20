@@ -29,46 +29,32 @@ CHECKPOINT_SENTINEL = 12345.0
 
 
 def sentinel_state_checkpoints(
-    counts: Sequence[int],
-    every_n_tokens: int,
+    positions: Sequence[int],
     state_shape: tuple[int, int, int],
     *,
     spare: int = 2,
 ) -> StateCheckpoints:
-    """Reserve ``counts[i]`` rows per sequence, plus spare rows, in a sentinel-filled FP32 pool.
-
-    Row ``r`` is stored in slot ``r + 1``, so :func:`checkpoint_rows` reads the rows back in
-    order. Slots a kernel must not write, including the null slot 0, keep
-    ``CHECKPOINT_SENTINEL``, so whole-pool comparisons also check reserved-but-inactive rows and
-    unused capacity.
-    """
-    rows = sum(counts) + spare
-    pool = torch.full((rows + 1, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
-    block_table = torch.arange(1, rows + 1, device="cuda", dtype=torch.int32)
-    return StateCheckpoints(pool, cumulative_sequence_offsets(counts), every_n_tokens, block_table)
-
-
-def checkpoint_rows(checkpoints: StateCheckpoints) -> torch.Tensor:
-    """View the rows of :func:`sentinel_state_checkpoints` in row order."""
-    return checkpoints.state_pool[1:]
+    """Give sequence i slot i + 1 in an FP32 pool; untouched slots retain the sentinel."""
+    n = len(positions)
+    pool = torch.full((1 + n + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
+    return StateCheckpoints(
+        pool,
+        torch.tensor(positions, device="cuda", dtype=torch.int32),
+        torch.arange(1, n + 1, device="cuda", dtype=torch.int32),
+    )
 
 
 def assert_checkpoints_into_cache_match(
     run: Callable[[torch.Tensor, StateCheckpoints], torch.Tensor],
     cache: torch.Tensor,
     reference: StateCheckpoints,
-    block_table: Sequence[int],
-    produced_rows: Sequence[int],
+    checkpoint_slots: Sequence[int],
+    produced_sequences: Sequence[int],
 ) -> None:
     """Check that checkpoints written into the state cache match a separate FP32 pool.
 
-    ``run(cache, checkpoints)`` advances ``cache`` in place. ``reference`` comes from
-    :func:`sentinel_state_checkpoints`, and the reference run must write exactly
-    ``produced_rows``. Rerunning with ``state_pool=cache`` and ``block_table`` must give each
-    positive entry of a produced row that row in the cache dtype and leave every other slot as
-    in the reference run. Outputs must match too. Both runs use copies of the whole storage
-    behind ``cache``, at its storage offset, and compare all of it, so padding between slots
-    must stay untouched.
+    ``reference`` comes from :func:`sentinel_state_checkpoints`. Compare the whole backing
+    storage, not just the visible states, so writes into page padding also fail.
     """
 
     def clone(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -80,15 +66,14 @@ def assert_checkpoints_into_cache_match(
     reference_storage, reference_cache = clone(cache)
     reference.state_pool.fill_(CHECKPOINT_SENTINEL)
     expected_output = run(reference_cache, reference)
-    rows = checkpoint_rows(reference)
-    written = [not torch.all(row == CHECKPOINT_SENTINEL).item() for row in rows]
-    assert written == [row in produced_rows for row in range(len(rows))]
+    written = (reference.state_pool != CHECKPOINT_SENTINEL).flatten(1).any(dim=1)
+    assert written.nonzero().flatten().tolist() == sorted(i + 1 for i in produced_sequences)
     pool_storage, pool_cache = clone(cache)
-    slots = torch.tensor(block_table, device=cache.device, dtype=torch.int32)
-    output = run(pool_cache, reference._replace(state_pool=pool_cache, block_table=slots))
-    for row in produced_rows:
-        if block_table[row] > 0:
-            reference_cache[block_table[row]] = rows[row]
+    slots = torch.tensor(checkpoint_slots, device=cache.device, dtype=torch.int32)
+    output = run(pool_cache, reference._replace(state_pool=pool_cache, checkpoint_slots=slots))
+    for i in produced_sequences:
+        if checkpoint_slots[i] > 0:
+            reference_cache[checkpoint_slots[i]] = reference.state_pool[i + 1]
     torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
     torch.testing.assert_close(pool_storage, reference_storage, rtol=0, atol=0, equal_nan=True)
 

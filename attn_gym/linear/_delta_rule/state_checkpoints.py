@@ -16,17 +16,11 @@ from attn_gym.linear.types import StateCheckpoints
 
 
 class CheckpointWrites(NamedTuple):
-    """The kernel view of :class:`~attn_gym.linear.StateCheckpoints`.
-
-    Triton specializes the integer fields only on equality to 1, divisibility by 16, and int32
-    range, so every interval (a positive multiple of 64 below ``2**31``) and every slot stride
-    of one pool layout share a compiled variant.
-    """
+    """Per-sequence checkpoint requests plus the pool's physical slot stride."""
 
     state_pool: torch.Tensor
-    cu_checkpoint_offsets: torch.Tensor
-    every_n_tokens: int
-    block_table: torch.Tensor
+    checkpoint_positions: torch.Tensor
+    checkpoint_slots: torch.Tensor
     slot_stride: int
 
 
@@ -43,7 +37,7 @@ def validate_state_checkpoints(
     v: torch.Tensor,
     cu_seqlens: torch.Tensor | None,
 ) -> None:
-    """Check snapshot metadata against token-major operands without reading device values."""
+    """Check checkpoint metadata against token-major operands without reading device values."""
     if checkpoints is None:
         return
     validate_state_checkpoints_metadata(
@@ -61,14 +55,10 @@ def validate_state_checkpoints_metadata(
     state_shape: tuple[int, int, int],
     device: torch.device,
 ) -> None:
-    """Validate caller-owned snapshots, including commits that have no token operands."""
+    """Validate caller-owned checkpoints, including commits that have no token operands."""
     if not isinstance(checkpoints, StateCheckpoints):
         raise TypeError("state_checkpoints must be a StateCheckpoints instance")
-    state_pool, offsets, interval, block_table = checkpoints
-    if type(interval) is not int:
-        raise TypeError("state_checkpoints.every_n_tokens must be an int")
-    if interval <= 0 or interval % 64:
-        raise ValueError("state_checkpoints.every_n_tokens must be a positive multiple of 64")
+    state_pool, positions, slots = checkpoints
     heads, value_dim, key_dim = state_shape
     validate_state_pool(
         state_pool,
@@ -79,26 +69,17 @@ def validate_state_checkpoints_metadata(
         name="state_checkpoints.state_pool",
         any_unit_dim_stride=True,
     )
-    if (
-        block_table.ndim != 1
-        or block_table.dtype != torch.int32
-        or not block_table.is_contiguous()
-        or block_table.device != device
-    ):
-        raise ValueError(
-            "state_checkpoints.block_table must be a contiguous 1-D int32 tensor "
-            "on the input device"
-        )
-    if (
-        offsets.shape != (num_sequences + 1,)
-        or offsets.dtype != torch.int32
-        or not offsets.is_contiguous()
-        or offsets.device != device
-    ):
-        raise ValueError(
-            "state_checkpoints.cu_checkpoint_offsets must be a contiguous int32 tensor of shape "
-            "[N + 1] on the input device"
-        )
+    for name, tensor in (("checkpoint_positions", positions), ("checkpoint_slots", slots)):
+        if (
+            tensor.shape != (num_sequences,)
+            or tensor.dtype != torch.int32
+            or not tensor.is_contiguous()
+            or tensor.device != device
+        ):
+            raise ValueError(
+                f"state_checkpoints.{name} must be a contiguous int32 tensor of shape [N] "
+                "on the input device"
+            )
     require_inference_only(
         (state_pool,),
         "state_checkpoints is inference-only; call under torch.no_grad() or torch.inference_mode()",
@@ -107,26 +88,25 @@ def validate_state_checkpoints_metadata(
 
 def state_checkpoint_op_args(
     checkpoints: StateCheckpoints | None,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, int, torch.Tensor | None]:
-    """Flatten optional snapshots into the trailing arguments of a custom-op schema."""
-    return (None, None, 0, None) if checkpoints is None else checkpoints
+) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+    """Flatten optional checkpoints into the trailing arguments of a custom-op schema."""
+    return (None, None, None) if checkpoints is None else checkpoints
 
 
 def state_checkpoints_from_op_args(
     state_pool: torch.Tensor | None,
-    offsets: torch.Tensor | None,
-    every_n_tokens: int,
-    block_table: torch.Tensor | None,
+    checkpoint_positions: torch.Tensor | None,
+    checkpoint_slots: torch.Tensor | None,
 ) -> StateCheckpoints | None:
-    """Rebuild the snapshots a custom-op schema received as flattened arguments."""
-    if state_pool is None and offsets is None and block_table is None:
+    """Rebuild the checkpoints a custom-op schema received as flattened arguments."""
+    if state_pool is None and checkpoint_positions is None and checkpoint_slots is None:
         return None
-    if state_pool is None or offsets is None or block_table is None:
+    if state_pool is None or checkpoint_positions is None or checkpoint_slots is None:
         raise ValueError(
-            "state checkpoints require checkpoint_states, cu_checkpoint_offsets, "
-            "and checkpoint_block_table together"
+            "state checkpoints require checkpoint_states, checkpoint_positions, "
+            "and checkpoint_slots together"
         )
-    return StateCheckpoints(state_pool, offsets, every_n_tokens, block_table)
+    return StateCheckpoints(state_pool, checkpoint_positions, checkpoint_slots)
 
 
 __all__ = [

@@ -449,9 +449,8 @@ def _chunk_kda_fwd_ragged_paged_cuda(
     autotune: bool,
     schedule: str,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
-    checkpoint_block_table: torch.Tensor | None = None,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     q, k, v = (normalize_tma_rows(tensor) for tensor in (q, k, v))
     _validate_paged_private_abi(
@@ -482,7 +481,7 @@ def _chunk_kda_fwd_ragged_paged_cuda(
         schedule=ScheduleRequest(schedule),
         fastmath=True,
         state_checkpoints=state_checkpoints_from_op_args(
-            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
+            checkpoint_states, checkpoint_positions, checkpoint_slots
         ),
     )
     return output

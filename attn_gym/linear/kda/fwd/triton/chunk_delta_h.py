@@ -45,7 +45,7 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
 from attn_gym.linear._delta_rule.triton.state_checkpoints import (
-    checkpoint_slot,
+    load_checkpoint_target,
     store_checkpoint,
 )
 from attn_gym.linear._delta_rule.validation import validate_paged_state
@@ -169,9 +169,7 @@ def _run_chunk_delta_h_sequence(
         )
 
     if checkpoints is not None:
-        checkpoint_row = tl.load(checkpoints.cu_checkpoint_offsets + i_n)
-        checkpoint_chunks = checkpoints.every_n_tokens // BT
-        next_checkpoint_chunk = checkpoint_chunks
+        checkpoint_position, slot = load_checkpoint_target(checkpoints, i_n, T)
 
     for i_t in tl.range(0, NT_full, warp_specialize=WARP_SPECIALIZE, num_stages=NUM_STAGES):
         chunk = boh + i_t
@@ -196,18 +194,16 @@ def _run_chunk_delta_h_sequence(
         b_k = tl.reshape(k_desc.load([0, tok, i_h, 0]), [BT, K])
         b_h = tl.dot(tl.permute(b_k, [1, 0]), b_vnew.to(k.dtype.element_ty), acc=b_h)
 
-        if checkpoints is not None:  # noqa: SIM102 - optional counters need their constexpr guard
+        if checkpoints is not None:  # noqa: SIM102 - optional target needs its constexpr guard
             # Store the post-chunk FP32 accumulator, not the rounded chunk-entry tape.
-            if i_t + 1 == next_checkpoint_chunk:
+            if (i_t + 1) * BT == checkpoint_position:
                 store_checkpoint(
                     checkpoints,
-                    checkpoint_slot(checkpoints, checkpoint_row, None),
+                    slot,
                     ptr_offset((i_h, o_v[None, :], o_k[:, None]), (V * K, K, 1)),
                     b_h,
                     None,
                 )
-                checkpoint_row += 1
-                next_checkpoint_chunk += checkpoint_chunks
 
     if NT_full < NT:
         # Peeled partial tail chunk: masked pointers keep the loads and the
@@ -698,9 +694,8 @@ def _delta_h_paged_cuda(
     capacity: int,
     fastmath: bool = True,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
-    checkpoint_block_table: torch.Tensor | None = None,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return _delta_h_launch(
         k,
@@ -716,7 +711,7 @@ def _delta_h_paged_cuda(
         state_cache,
         fastmath=fastmath,
         state_checkpoints=state_checkpoints_from_op_args(
-            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
+            checkpoint_states, checkpoint_positions, checkpoint_slots
         ),
     )
 

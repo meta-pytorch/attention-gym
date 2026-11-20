@@ -27,10 +27,7 @@ from attn_gym.linear._delta_rule.state_checkpoints import (
     validate_state_checkpoints_metadata,
 )
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import assert_packed_offsets
-from attn_gym.linear._delta_rule.triton.state_checkpoints import (
-    checkpoint_slot,
-    store_checkpoint,
-)
+from attn_gym.linear._delta_rule.triton.state_checkpoints import store_checkpoint
 
 # Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as
 # compile-time constants even in runtime argument slots; cast such sizes with ``int()``.
@@ -139,6 +136,8 @@ def _plan_prefill_kernel(
     tail_counts,
     prefix_cu_seqlens,
     pack_cu_seqlens,
+    checkpoint_positions,
+    prefix_checkpoint_positions,
     count_stride_s: tl.constexpr,
     num_sequences,
     search_capacity,
@@ -172,6 +171,14 @@ def _plan_prefill_kernel(
     logical_length = tl.where(in_bounds & (slot > 0), count + input_length, 0)
     complete_length = logical_length // _CHUNK_SIZE * _CHUNK_SIZE
     tail_count = logical_length - complete_length
+
+    if checkpoint_positions is not None:
+        # Positions count only this call's tokens. The prefix pass sees replayed tokens too,
+        # and can publish only the completed boundary at or before the selected position.
+        position = tl.load(checkpoint_positions + sequence_offset, mask=in_bounds, other=0)
+        valid = (slot > 0) & (position > 0) & (position <= input_length)
+        boundary = (tl.where(valid, position, 0) + count) // _CHUNK_SIZE * _CHUNK_SIZE
+        tl.store(prefix_checkpoint_positions + sequence_offset, boundary, mask=in_bounds)
 
     tl.store(prefix_cu_seqlens, 0)
     tl.store(pack_cu_seqlens, 0)
@@ -589,18 +596,17 @@ def _commit_state_kernel(
         mask=active & (completes_chunk | fresh_slot),
     )
     if checkpoints is not None:
-        # A single new token can cross only the first 64-token checkpoint.
-        checkpoint_mask = active & completes_chunk & (checkpoints.every_n_tokens == chunk_size)
-        checkpoint_index = tl.load(
-            checkpoints.cu_checkpoint_offsets + active_index, mask=checkpoint_mask, other=0
+        position = tl.load(checkpoints.checkpoint_positions + active_index, mask=active, other=0)
+        publish = active & completes_chunk & (position == 1)
+        # In debug builds, a positive destination requires a reachable boundary. The extra
+        # slot lookup for a skipped write is used only by the assertion.
+        tl.device_assert(
+            tl.load(checkpoints.checkpoint_slots + active_index, mask=active & ~publish, other=0)
+            <= 0,
+            "invalid state checkpoint position",
         )
-        store_checkpoint(
-            checkpoints,
-            checkpoint_slot(checkpoints, checkpoint_index, checkpoint_mask),
-            state_offset,
-            boundary_state,
-            checkpoint_mask,
-        )
+        target = tl.load(checkpoints.checkpoint_slots + active_index, mask=publish, other=0)
+        store_checkpoint(checkpoints, target, state_offset, boundary_state, publish & (target > 0))
     tl.store(
         replay_count + slot * count_stride_s,
         tl.where(count == chunk_size - 1, 0, count + 1),
@@ -714,13 +720,12 @@ def commit_paged_chunk_replay(
     state_cache: torch.Tensor,
     replay_count: torch.Tensor,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
-    checkpoint_block_table: torch.Tensor | None = None,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> None:
-    """Commit completed boundaries, their optional snapshots, and active replay counts."""
+    """Commit completed boundaries, their optional checkpoints, and active replay counts."""
     checkpoints = state_checkpoints_from_op_args(
-        checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
+        checkpoint_states, checkpoint_positions, checkpoint_slots
     )
     if checkpoints is not None:
         validate_state_checkpoints_metadata(
@@ -768,7 +773,8 @@ def prepare_paged_chunk_prefill(
     state_indices: torch.Tensor,
     has_initial_state: torch.Tensor | None,
     input_cu_seqlens: torch.Tensor,
-) -> tuple[torch.Tensor, ...]:
+    checkpoint_positions: torch.Tensor | None = None,
+) -> tuple[torch.Tensor | None, ...]:
     """Pack complete chunks and tails for graph-safe two-pass replay prefill."""
     _validate_replay_aliases(
         (
@@ -792,6 +798,18 @@ def prepare_paged_chunk_prefill(
         ),
     )
     num_sequences = state_indices.shape[0]
+    prefix_checkpoint_positions = None
+    if checkpoint_positions is not None:
+        if (
+            checkpoint_positions.shape != (num_sequences,)
+            or checkpoint_positions.dtype != torch.int32
+            or checkpoint_positions.device != q.device
+            or not checkpoint_positions.is_contiguous()
+        ):
+            raise ValueError(
+                "checkpoint_positions must be contiguous int32 [N] on the input device"
+            )
+        prefix_checkpoint_positions = torch.empty_like(checkpoint_positions)
     chunk_size = int(_CHUNK_SIZE)
     # Keep all work on grid X: CUDA grid Y is limited to 65,535. This aggregate
     # capacity also avoids repeating the total packed-token bound for every request.
@@ -823,6 +841,8 @@ def prepare_paged_chunk_prefill(
         tail_counts,
         prefix_cu_seqlens,
         pack_cu_seqlens,
+        checkpoint_positions,
+        prefix_checkpoint_positions,
         count_stride_s=replay_count.stride(0),
         num_sequences=num_sequences,
         search_capacity=search_capacity,
@@ -878,6 +898,7 @@ def prepare_paged_chunk_prefill(
         output_route,
         *tail_caches,
         tail_counts,
+        prefix_checkpoint_positions,
     )
 
 
