@@ -84,9 +84,9 @@ def replay_paged_chunk_forward(
 ) -> torch.Tensor:
     """Run replay-backed decode (one token per dense batch row) or streaming prefill.
 
-    ``state_checkpoints`` intervals start at each slot's unfinished chunk, so they count replayed
-    tokens before new ones. Decode commits them with the completed boundary; prefill writes them
-    from ``paged_forward`` over the replayed-plus-new prefix, which ends at a chunk boundary.
+    Checkpoint positions count new tokens only. The state pool receives the last complete chunk
+    boundary at or before the requested position, if one was completed during this call. The
+    caller retains the intervening replay tokens separately.
     """
     replay_q, replay_k, replay_v, replay_gate, replay_beta, replay_count = replay_state
     if cu_seqlens is None and q.shape[1] == 1:
@@ -155,6 +155,7 @@ def replay_paged_chunk_forward(
         tail_gate,
         tail_beta,
         tail_counts,
+        prefix_checkpoint_positions,
     ) = chunk_replay_prefill_prepare_op(
         q.to(torch.bfloat16),
         k.to(torch.bfloat16),
@@ -171,7 +172,14 @@ def replay_paged_chunk_forward(
         state_indices,
         has_initial_state,
         cu_seqlens,
+        None if state_checkpoints is None else state_checkpoints.checkpoint_positions,
     )
+    if state_checkpoints is not None:
+        state_checkpoints = StateCheckpoints(
+            state_checkpoints.state_pool,
+            prefix_checkpoint_positions,
+            state_checkpoints.checkpoint_slots,
+        )
     prefix_output = paged_forward(
         prefix_q,
         prefix_k,

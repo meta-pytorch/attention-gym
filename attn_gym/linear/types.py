@@ -16,38 +16,30 @@ from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOpt
 
 
 class StateCheckpoints(NamedTuple):
-    """Periodic recurrent-state snapshots written into caller-chosen slots of a state pool.
+    """Publish one selected prefix per sequence into a caller-owned recurrent-state pool.
 
-    Every ``every_n_tokens`` tokens (a positive multiple of 64, counted from each sequence's
-    start in this call, or from its slot's unfinished chunk with KDA ``replay_state``), a
-    sequence produces one logical checkpoint row: its full post-update state, including the
-    slot's history. ``cu_checkpoint_offsets`` (int32 ``[N + 1]``, nonnegative, nondecreasing)
-    gives each sequence's starting row: an active sequence's rows fill ``offsets[i]`` onward,
-    and it must reserve at least ``(replayed_tokens + sequence_length) // every_n_tokens`` of
-    them (no replayed tokens without replay or for a fresh slot).
+    For sequence i, ``checkpoint_positions[i]`` counts new tokens in this call and
+    ``checkpoint_slots[i]`` names the destination. Both are contiguous int32 vectors of
+    shape ``[N]`` on the input device. Without replay, only positive multiples of 64
+    within the sequence are written; other positions do not round down. Non-positive slots
+    and inactive sequences do not write. An invalid position for a selected slot is a caller
+    error: debug kernels can assert, and an untouched slot must not be published.
 
-    ``block_table`` is a 1-D int32 tensor mapping logical checkpoint rows to physical
-    ``state_pool`` slots: row ``r`` is written to slot ``block_table[r]``, and non-positive
-    entries (such as ``PAD_SLOT_ID = -1`` or the null slot 0) skip the write, so an engine can
-    pass its flattened block table. ``state_pool`` has the paged state-cache layout
-    (``[slots, H, V, K]``, FP32 or BF16, contiguous within each slot) and may be the state
-    cache itself, but no other input. A BF16 pool rounds the FP32 snapshots.
+    With KDA replay, the stored state is the last 64-token boundary reached by the requested
+    position, counting the slot's previously buffered tokens. No state is published before
+    the first completed chunk or past the sequence. To resume mid-chunk, the caller must also
+    preserve the trailing replay inputs and count; an exact boundary needs a zero count.
 
-    The caller guarantees, without a device check: ``offsets[N]`` does not exceed the length
-    of ``block_table``; positive entries of produced rows are smaller than
-    ``state_pool.shape[0]`` and distinct; and, when the pool is the state cache, they are not
-    slots the call routes. Nothing else is written.
-
-    Requires the fused backend: ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or
-    ``recurrent_gdn`` with ``state_indices``; inference only. A replay checkpoint holds the
-    state after a completed chunk: restoring a later position also needs the caller to copy its
-    replay tail and count. Intervals above 64 never complete during one-token replay decode.
+    ``state_pool`` is an FP32 or BF16 ``[slots, H, V, K]`` tensor, contiguous within
+    disjoint slots. It may be the running state cache, but no other input. Positive destination
+    slots must be in bounds, distinct among writers and, if sharing the cache, not routed by
+    this call. Neither request vector may overlap storage the call modifies (including replay
+    counts). These are caller guarantees, not host-side checks of device values.
     """
 
     state_pool: torch.Tensor
-    cu_checkpoint_offsets: torch.Tensor
-    every_n_tokens: int
-    block_table: torch.Tensor
+    checkpoint_positions: torch.Tensor
+    checkpoint_slots: torch.Tensor
 
 
 class ReplayState(NamedTuple):

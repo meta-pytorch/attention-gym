@@ -1949,6 +1949,9 @@ def test_paged_chunk_kda_replay_custom_op_registration():
         torch.arange(3, device="cuda", dtype=torch.int32),
     )
     torch.library.opcheck(chunk_replay_prefill_prepare_op, prefill_args)
+    torch.library.opcheck(
+        chunk_replay_prefill_prepare_op, (*prefill_args, torch.ones_like(state_indices))
+    )
     prefill_prepared = chunk_replay_prefill_prepare_op(*prefill_args)
     torch.library.opcheck(chunk_replay_state_gather_op, (state_cache, state_indices))
     torch.library.opcheck(

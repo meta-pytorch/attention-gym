@@ -21,7 +21,6 @@ CHUNK_SIZE = 64
 HEADS = 2
 HEAD_DIM = 128  # Required by fused paged_chunk_kda.
 TOKENS = 200  # Each request's prompt length.
-INTERVAL = 64  # Checkpoint every chunk.
 SLOT_A, SLOT_B, SLOT_REFERENCE, SLOT_CACHED = 1, 2, 3, 4  # Slot 0 is the null slot.
 OPTIONS = {"autotune": False}  # Fixed heuristics keep kernel selection repeatable.
 
@@ -56,11 +55,11 @@ def prefill(slot: int, prompt, state_cache, replay, *, fresh: bool, checkpoints=
 
 
 def restore_shared_prefix(prefix: int) -> int:
-    """Serve request B from request A's checkpoint; return the prefill tokens it skips."""
-    restored = prefix // INTERVAL * INTERVAL  # The last checkpoint inside the shared prefix.
+    """Serve request B from request A's checkpoint; return the restored state boundary."""
+    if not CHUNK_SIZE <= prefix < TOKENS:
+        raise ValueError(f"the shared prefix must hold a full chunk and leave a suffix: {prefix}")
+    restored = prefix // CHUNK_SIZE * CHUNK_SIZE  # The last chunk boundary of the shared prefix.
     tail = prefix - restored
-    if not 0 < restored or tail >= CHUNK_SIZE:
-        raise ValueError("the shared prefix must contain a checkpoint within one chunk")
     prompt_a = make_prompt(seed=1, tokens=TOKENS)
     suffix_b = make_prompt(seed=2, tokens=TOKENS - prefix)
     prompt_b = tuple(
@@ -80,15 +79,12 @@ def restore_shared_prefix(prefix: int) -> int:
         cache[SLOT_B].normal_()
     replay.count[SLOT_B] = 37
 
-    # Request A: a fresh slot replays nothing, so it reserves TOKENS // INTERVAL rows. Only the
-    # row at the shared boundary has a destination; the others are skipped.
-    block_table = torch.zeros(TOKENS // INTERVAL, device="cuda", dtype=torch.int32)
-    block_table[restored // INTERVAL - 1] = SLOT_CACHED
+    # Request A publishes its state at the shared prefix into the cache slot. With replay, the
+    # kernel stores the last chunk boundary at or before the prefix; the tail is copied below.
     checkpoints = StateCheckpoints(
         state_cache,
-        torch.tensor([0, TOKENS // INTERVAL], device="cuda", dtype=torch.int32),
-        INTERVAL,
-        block_table,
+        checkpoint_positions=torch.tensor([prefix], device="cuda", dtype=torch.int32),
+        checkpoint_slots=torch.tensor([SLOT_CACHED], device="cuda", dtype=torch.int32),
     )
     prefill(SLOT_A, prompt_a, state_cache, replay, fresh=True, checkpoints=checkpoints)
 
@@ -123,9 +119,11 @@ def main() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
         raise SystemExit("paged_chunk_kda requires CUDA capability 8.0 or newer")
 
-    skipped = restore_shared_prefix(args.prefix)
+    boundary = restore_shared_prefix(args.prefix)
     print("suffix output, state, and replay tail match a full prefill bitwise")
-    print(f"prefill tokens skipped for request B: {skipped} of {TOKENS}")
+    print(
+        f"state restored at token {boundary}; request B prefills only {TOKENS - args.prefix} tokens"
+    )
 
 
 if __name__ == "__main__":
