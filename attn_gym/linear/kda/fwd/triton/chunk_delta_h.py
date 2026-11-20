@@ -29,6 +29,11 @@ from attn_gym._backends.triton.utils import (
     ptr_offset,
     requires_int64_offsets,
 )
+from attn_gym.linear._delta_rule.state_checkpoints import (
+    state_checkpoint_op_args,
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints,
+)
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     GridScheduler,
     RaggedChunkMetadata,
@@ -38,11 +43,7 @@ from attn_gym.linear._delta_rule.triton.chunk_scheduler import (
     load_ragged_sequence_work,
 )
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
-from attn_gym.linear._delta_rule.validation import (
-    state_checkpoint_op_args,
-    state_checkpoints_from_op_args,
-    validate_state_checkpoints,
-)
+from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.kda.ops import delta_h_op as _delta_h_op
 from attn_gym.linear.kda.ops import delta_h_paged_op as _delta_h_paged_op
 from attn_gym.linear.kda.ops import delta_h_with_state_op as _delta_h_with_state_op
@@ -786,34 +787,7 @@ def chunk_gated_delta_rule_fwd_h(
             raise ValueError("state_indices requires initial_state as the paged state pool")
         if output_final_state:
             raise ValueError("paged state is advanced in place; drop output_final_state")
-        paged_state_shape = (heads, value_dim, key_dim)
-        if initial_state.ndim != 4 or initial_state.shape[1:] != paged_state_shape:
-            raise ValueError(
-                "the paged state pool must have shape "
-                f"[num_slots, {heads}, {value_dim}, {key_dim}], got {tuple(initial_state.shape)}"
-            )
-        if initial_state.dtype not in (torch.float32, torch.bfloat16):
-            raise TypeError("the paged state pool must use float32 or bfloat16")
-        if initial_state.stride()[1:] != (value_dim * key_dim, key_dim, 1):
-            raise TypeError("the paged state pool must be contiguous within each [H, V, K] slot")
-        if initial_state.stride(0) < heads * key_dim * value_dim:
-            raise ValueError("paged state pool slots must not overlap")
-        if (
-            state_indices.shape != (state_batch,)
-            or state_indices.dtype != torch.int32
-            or not state_indices.is_contiguous()
-            or state_indices.device != k.device
-        ):
-            raise ValueError(f"state_indices must be contiguous int32 with shape ({state_batch},)")
-        if has_initial_state is not None and (
-            has_initial_state.shape != (state_batch,)
-            or has_initial_state.dtype != torch.bool
-            or not has_initial_state.is_contiguous()
-            or has_initial_state.device != k.device
-        ):
-            raise ValueError(
-                f"has_initial_state must be contiguous bool with shape ({state_batch},)"
-            )
+        validate_paged_state(k, u, initial_state, cu_seqlens, state_indices, has_initial_state)
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
     elif initial_state is not None:

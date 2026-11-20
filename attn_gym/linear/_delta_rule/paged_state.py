@@ -29,6 +29,28 @@ def validate_has_initial_state(
         )
 
 
+def validate_state_pool(
+    cache: torch.Tensor,
+    *,
+    heads: int,
+    value_dim: int,
+    key_dim: int,
+    device: torch.device,
+    name: str = "the paged state pool",
+) -> None:
+    """Validate an FP32 or BF16 ``[slots, H, V, K]`` pool with contiguous, disjoint slots."""
+    if cache.ndim != 4 or cache.shape[1:] != (heads, value_dim, key_dim):
+        raise ValueError(f"{name} must have shape [slots, {heads}, {value_dim}, {key_dim}]")
+    if cache.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(f"{name} must use float32 or bfloat16")
+    if cache.device != device:
+        raise ValueError(f"{name} must be on q.device")
+    if cache.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+        raise TypeError(f"{name} must be contiguous within each [H, V, K] slot")
+    if cache.stride(0) < heads * value_dim * key_dim:
+        raise ValueError(f"{name} slots must not overlap")
+
+
 @dataclass(frozen=True, slots=True)
 class PagedState:
     """A mutable state pool and its per-sequence device routing metadata.
@@ -64,20 +86,9 @@ class PagedState:
         read_only_inputs: tuple[torch.Tensor, ...] = (),
     ) -> PagedState:
         """Validate the common pool ABI and return its routing metadata."""
-        expected_inner_strides = (value_dim * key_dim, key_dim, 1)
-        slot_elements = heads * value_dim * key_dim
-        if cache.ndim != 4 or cache.shape[1:] != (heads, value_dim, key_dim):
-            raise ValueError(
-                f"the paged state pool must have shape [slots, {heads}, {value_dim}, {key_dim}]"
-            )
-        if cache.dtype not in (torch.float32, torch.bfloat16):
-            raise TypeError("the paged state pool must use float32 or bfloat16")
-        if cache.device != device:
-            raise ValueError("the paged state pool must be on q.device")
-        if cache.stride()[1:] != expected_inner_strides:
-            raise TypeError("the paged state pool must be contiguous within each [H, V, K] slot")
-        if cache.stride(0) < slot_elements:
-            raise ValueError("paged state pool slots must not overlap")
+        validate_state_pool(
+            cache, heads=heads, value_dim=value_dim, key_dim=key_dim, device=device
+        )
         if (
             indices.shape != (num_sequences,)
             or indices.dtype != torch.int32
@@ -115,4 +126,4 @@ class PagedState:
         return None if self.has_initial_state is None else self.has_initial_state.view(torch.uint8)
 
 
-__all__ = ["PagedState", "validate_has_initial_state"]
+__all__ = ["PagedState", "validate_has_initial_state", "validate_state_pool"]

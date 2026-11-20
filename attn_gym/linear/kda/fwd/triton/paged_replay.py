@@ -21,11 +21,11 @@ import triton.language as tl
 
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
-from attn_gym.linear._delta_rule.triton.chunk_scheduler import assert_packed_offsets
-from attn_gym.linear._delta_rule.validation import (
+from attn_gym.linear._delta_rule.state_checkpoints import (
     state_checkpoints_from_op_args,
     validate_state_checkpoints_metadata,
 )
+from attn_gym.linear._delta_rule.triton.chunk_scheduler import assert_packed_offsets
 from attn_gym.linear.types import StateCheckpoints
 
 # Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as

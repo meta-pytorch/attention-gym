@@ -6,7 +6,7 @@ import torch
 
 from attn_gym.linear._delta_rule.decode import GateTransform, launch_recurrent_delta_rule_decode
 from attn_gym.linear._delta_rule.recurrent import GateKind, launch_recurrent_delta_rule_fwd
-from attn_gym.linear._delta_rule.validation import state_checkpoints_from_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoints_from_op_args
 from attn_gym.linear.types import StateCheckpoints
 
 

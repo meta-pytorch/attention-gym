@@ -11,7 +11,8 @@ from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._lazy import register_lazy_cuda_impls
 from attn_gym.linear.types import StateCheckpoints
 

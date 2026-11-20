@@ -16,7 +16,7 @@ from typing import Protocol
 
 import torch
 
-from attn_gym.linear._delta_rule.validation import state_checkpoint_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
 from attn_gym.linear.kda.ops import (
     chunk_replay_commit_op,
     chunk_replay_prefill_commit_op,
