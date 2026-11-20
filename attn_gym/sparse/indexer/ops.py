@@ -75,3 +75,67 @@ def _indexer_fake(
 
 
 _indexer_op = torch.ops.attn_gym._indexer.default
+
+
+torch.library.define(
+    "attn_gym::_paged_indexer_key_update",
+    "(Tensor raw_keys, Tensor(a!) key_cache, Tensor(b!) raw_cache, Tensor block_table, "
+    "Tensor raw_block_table, Tensor cu_seqlens_q, Tensor seqused_k, Tensor norm_weight, "
+    "Tensor rope_cache, int compress_ratio, float eps, int? max_seqlen_q) -> ()",
+)
+
+
+def _paged_indexer_key_update_cuda(
+    raw_keys,
+    key_cache,
+    raw_cache,
+    block_table,
+    raw_block_table,
+    cu_seqlens_q,
+    seqused_k,
+    norm_weight,
+    rope_cache,
+    compress_ratio,
+    eps,
+    max_seqlen_q,
+):
+    from .impl.key_update_triton import launch
+
+    launch(
+        raw_keys,
+        key_cache,
+        raw_cache,
+        block_table,
+        raw_block_table,
+        cu_seqlens_q,
+        seqused_k,
+        norm_weight,
+        rope_cache,
+        compress_ratio,
+        eps,
+        max_seqlen_q,
+    )
+
+
+torch.library.impl("attn_gym::_paged_indexer_key_update", "CUDA", _paged_indexer_key_update_cuda)
+
+
+@torch.library.register_fake("attn_gym::_paged_indexer_key_update")
+def _paged_indexer_key_update_fake(
+    raw_keys,
+    key_cache,
+    raw_cache,
+    block_table,
+    raw_block_table,
+    cu_seqlens_q,
+    seqused_k,
+    norm_weight,
+    rope_cache,
+    compress_ratio,
+    eps,
+    max_seqlen_q,
+):
+    return None
+
+
+_paged_indexer_key_update_op = torch.ops.attn_gym._paged_indexer_key_update.default

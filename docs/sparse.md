@@ -93,6 +93,40 @@ Selection with NaN/Inf scores is unspecified and may differ across backends.
 ::: attn_gym.sparse.indexer.lightning_indexer
 
 
+## Paged indexer key updates
+
+`paged_indexer_key_update` maintains a paged cache of completed-block indexer keys during
+decode: the candidates a paged indexer scores. Each step it pools every newly completed
+block of raw indexer keys in FP32, applies the offset RMSNorm and rotate-half RoPE at the
+block's first position, stores the result as one candidate, and keeps the keys of each
+sequence's incomplete block in a small per-sequence ring. It reads every pooled member
+before overwriting the ring, so prefill and chunked-prefill steps are safe;
+`max_seqlen_q` below `ring_capacity - 2` lets it do both in one launch:
+
+```python
+from attn_gym.sparse import paged_indexer_key_update
+
+paged_indexer_key_update(
+    raw_index_keys,      # [tokens, index_head_dim], this step's keys before pooling
+    index_key_cache,     # [candidate_pages, candidate_page_size, index_head_dim], in place
+    raw_index_ring,      # [ring_pages, ring_capacity, index_head_dim], in place
+    candidate_table,     # int32 [sequences, max_candidate_pages]
+    ring_table,          # int32 [sequences, columns >= 1]; column 0 is the ring page
+    cu_seqlens_q,        # int32 [sequences + 1], packed query offsets
+    seqused_k,           # int32 [sequences], raw tokens including current queries
+    k_norm_weight,       # [index_head_dim]
+    rope_cache,          # fp32 [positions, 2 * rotary_dim], rows [cos | sin]
+    compress_ratio=4,
+    max_seqlen_q=1,
+)
+```
+
+For a sequence with `n` new queries and raw length `L`, query `i` has absolute position
+`p = L - n + i`. Candidate `b` is written to
+`index_key_cache[candidate_table[s, b // candidate_page_size], b % candidate_page_size]`.
+
+::: attn_gym.sparse.indexer.paged_indexer_key_update
+
 ## Gather attention and sparse MLA
 
 `gather_attn` takes a query, a local KV pool, a sparse KV pool, and selected sparse indices.
