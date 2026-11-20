@@ -25,6 +25,7 @@ from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_S
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
+    require_inference_only,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -38,9 +39,14 @@ from attn_gym.linear.kda.impl.warpdrive import (
     paged_chunk_forward as _warpdrive_paged_chunk_forward,
 )
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
+from attn_gym.linear.kda.ops import copy_replay_tails_op
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
-from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
+from attn_gym.linear.kda.validation import (
+    resolve_kernel_options,
+    validate_kda_inputs,
+    validate_replay_state,
+)
 from attn_gym.linear.types import (
     RECURRENT_OPTION_SPEC,
     Impl,
@@ -306,41 +312,7 @@ def paged_chunk_kda(
         raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
-        num_slots = state_cache.shape[0]
-        layout = ReplayState.slot_layout(q.shape[2], q.shape[3], value_dim=v.shape[3])
-        for name, tensor, (slot_shape, expected_dtype) in zip(
-            ReplayState._fields[:-1], replay_state[:-1], layout[:-1], strict=True
-        ):
-            expected_shape = (num_slots, *slot_shape)
-            if tensor.shape != expected_shape:
-                raise ValueError(
-                    f"replay_state {name} tensor must have shape {expected_shape}, "
-                    f"got {tuple(tensor.shape)}"
-                )
-            if tensor.dtype != expected_dtype or tensor.device != q.device:
-                raise TypeError(
-                    f"replay_state {name} tensor must use {expected_dtype} on the input device"
-                )
-            expected_stride = 1
-            dense_inner = True
-            for size, stride in reversed(tuple(zip(tensor.shape[2:], tensor.stride()[2:]))):
-                dense_inner &= size == 1 or stride == expected_stride
-                expected_stride *= size
-            if not dense_inner or tensor.stride(1) != expected_stride:
-                raise ValueError(f"replay_state {name} tensor must have dense per-token rows")
-            if num_slots > 1 and tensor.stride(0) < _CHUNK_SIZE * expected_stride:
-                raise ValueError(f"replay_state {name} tensor slots must not overlap")
-        count_shape, count_dtype = layout[-1]
-        if replay_state.count.shape not in ((num_slots,), (num_slots, *count_shape)):
-            raise ValueError(
-                f"replay_state count tensor must have shape ({num_slots},) or "
-                f"({num_slots}, 1), got {tuple(replay_state.count.shape)}"
-            )
-        if replay_state.count.dtype != count_dtype or replay_state.count.device != q.device:
-            raise TypeError("replay_state count tensor must be int32 on the input device")
-        if num_slots > 1 and replay_state.count.stride(0) == 0:
-            raise ValueError("replay_state count tensor slots must not overlap")
-        # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
+        validate_replay_state(replay_state, q, v, state_cache.shape[0])
     if options.backend == "warpdrive":
         return _warpdrive_paged_chunk_forward(
             q,
@@ -369,6 +341,54 @@ def paged_chunk_kda(
         schedule=options.schedule,
         replay_state=replay_state,
         state_checkpoints=state_checkpoints,
+    )
+
+
+def copy_replay_tails(
+    replay_state: ReplayState,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    checkpoint_positions: torch.Tensor,
+    checkpoint_slots: torch.Tensor,
+    has_initial_state: torch.Tensor | None = None,
+) -> None:
+    """Copy the unfinished KDA chunk for each selected prefix into its destination replay slot.
+
+    Call immediately **before** packed ``paged_chunk_kda`` on the same stream, with the same
+    Q, K, V, gate, beta inputs, replay state, packed offsets and source routing. The helper
+    reads the pre-call counts (zero for a fresh route). Pass the positions and slots used by
+    ``StateCheckpoints``; publish the destinations only after both calls complete. This op
+    copies replay data, not the recurrent boundary state.
+
+    Positions count new tokens in this call. With 19 buffered tokens and position 50, the
+    last completed boundary is at new-token position 45: copy input rows [45:50] and set the
+    count to five. At position 45, just reset the count. Inactive routes, non-positive
+    destinations and prefixes that reach no boundary in this call do not write.
+
+    The contiguous int32 position and slot vectors have one entry per sequence. Written slots
+    must be in bounds, distinct, and disjoint from **all** active source slots. The replay
+    buffers may share packed pages but their rows must not overlap one another or the inputs.
+    Mixed-dtype views of one allocation work in eager mode and CUDA graphs. For
+    ``torch.compile(fullgraph=True)``, use separate backing allocations: AOTAutograd cannot
+    functionalize mutations of differently typed views on the same storage. This inference-only
+    CUDA operation updates the destination buffers and counts in place.
+    """
+    require_inference_only((*inputs, *replay_state), "copy_replay_tails is inference-only")
+    q, k, v, gate, beta = inputs
+    copy_replay_tails_op(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        *replay_state,
+        cu_seqlens,
+        state_indices,
+        has_initial_state,
+        checkpoint_positions,
+        checkpoint_slots,
     )
 
 
@@ -633,6 +653,7 @@ __all__ = [
     "KernelOptions",
     "ReplayState",
     "chunk_kda",
+    "copy_replay_tails",
     "paged_chunk_kda",
     "recurrent_kda",
     "recurrent_kda_decode",

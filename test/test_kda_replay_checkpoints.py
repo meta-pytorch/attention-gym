@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+import math
+import subprocess
+import sys
+
 import pytest
 import torch
 
-from attn_gym.linear import ReplayState, StateCheckpoints, chunk_kda, paged_chunk_kda
+from attn_gym.linear import (
+    ReplayState,
+    StateCheckpoints,
+    chunk_kda,
+    copy_replay_tails,
+    paged_chunk_kda,
+)
 from attn_gym.linear.kda.ops import chunk_replay_commit_op
 from attn_gym.testing import (
     CHECKPOINT_SENTINEL,
@@ -411,6 +421,247 @@ def test_replay_checkpoint_commit_executes_offsets_past_int32() -> None:
         source, slots[-1:], None, counts[-1:], cache, replay_count, *into_last_slot
     )
     torch.testing.assert_close(final[-1], source[0], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("execution", ["cuda_graph", "fullgraph"])
+def test_batched_copy_replay_tails_reads_new_graph_metadata(cuda: None, execution: str) -> None:
+    from torch._dynamo.testing import CompileCounterWithBackend
+
+    lengths = [70, 90, 4, 9]
+    offsets = cumulative_sequence_offsets(lengths)
+    layout = ReplayState.slot_layout(2, 96, value_dim=40)
+    # Head-major projections: one sequence's token features need not be flattenable as a row.
+    inputs = tuple(
+        torch.randn(1, shape[1], sum(lengths), *shape[2:], device="cuda", dtype=dtype).transpose(
+            1, 2
+        )
+        for shape, dtype in layout[:-1]
+    )
+    # Token-innermost FP32 K exercises the feature stride and the BF16 replay-storage cast.
+    k = torch.randn(1, 2, 96, sum(lengths), device="cuda").movedim(-1, 1)
+    inputs = (inputs[0], k, *inputs[2:])
+    # Include a guard row at each end of every slot. Comparing the entire allocation catches
+    # padding writes, writes to unselected slots, and writes past a short tail.
+    pages = tuple(
+        torch.full((8, 66, *shape[1:]), -7, device="cuda", dtype=dtype)
+        for shape, dtype in layout[:-1]
+    )
+    counts = torch.full((8, 2), 37, device="cuda", dtype=torch.int32)
+    replay = ReplayState(*(p[:, 1:65] for p in pages), counts[:, :1])
+    positions, slots, sources = (int32([0] * 4) for _ in range(3))
+    has_initial = torch.ones(4, device="cuda", dtype=torch.bool)
+
+    def copy() -> None:
+        copy_replay_tails(
+            replay,
+            inputs,
+            cu_seqlens=offsets,
+            state_indices=sources,
+            has_initial_state=has_initial,
+            checkpoint_positions=positions,
+            checkpoint_slots=slots,
+        )
+
+    if execution == "fullgraph":
+        counter = CompileCounterWithBackend("inductor")
+        run = torch.compile(copy, fullgraph=True, backend=counter)
+        run()
+    else:
+        copy()  # compile before capture
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            copy()
+        run = graph.replay
+
+    for seq_lengths, pos, dest, routes, flags, source_counts, writes in (
+        # Mid-chunk, fresh (stale count) exactly on a boundary, unselected, no boundary.
+        (
+            lengths,
+            [50, 64, 4, 9],
+            [3, 1, -1, 2],
+            [6, 5, 7, 4],
+            [True, False, True, False],
+            [0, 17, 41, 37, 63, 37, 19, 63],
+            [(3, 45, 5), (1, 134, 0)],
+        ),
+        # Changed offsets: past-end, long tail spanning several tiles, one token after 63, null.
+        (
+            [67, 92, 4, 10],
+            [68, 90, 1, 9],
+            [1, 2, 3, 0],
+            [5, 6, 4, 7],
+            [True] * 4,
+            [0, 17, 41, 37, 63, 0, 37, 63],
+            [(2, 94, 63), (3, 160, 0)],
+        ),
+        # Neither a nonpositive source nor a nonpositive position publishes a checkpoint.
+        (
+            [67, 92, 4, 10],
+            [65, 70, 0, 9],
+            [1, 3, 2, 5],
+            [0, -1, 4, 6],
+            [True] * 4,
+            [0, 17, 41, 37, 63, 0, 60, 63],
+            [(5, 167, 5)],
+        ),
+    ):
+        offsets.copy_(cumulative_sequence_offsets(seq_lengths))
+        positions.copy_(int32(pos))
+        slots.copy_(int32(dest))
+        sources.copy_(int32(routes))
+        has_initial.copy_(torch.tensor(flags, device="cuda"))
+        counts[:, 0].copy_(int32(source_counts))
+        expected = [page.clone() for page in pages]
+        expected_counts = counts.clone()
+        for slot, first, tail in writes:
+            expected_counts[slot, 0] = tail
+            for page, source in zip(expected, inputs, strict=True):
+                page[slot, 1 : 1 + tail].copy_(source[0, first : first + tail])
+        run()
+        for actual, reference in zip((*pages, counts), (*expected, expected_counts), strict=True):
+            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+    if execution == "fullgraph":
+        assert counter.frame_count == 1
+
+
+@pytest.mark.parametrize("layout_kind", ["interleaved", "slabs"])
+def test_copy_replay_tails_into_mixed_dtype_pages(cuda: None, layout_kind: str) -> None:
+    # Serving engines can carve all five buffers and the count out of the same slot page.
+    # Exercise actual shared storage under CUDA capture (fullgraph uses separate allocations).
+    layout = ReplayState.slot_layout(1, 128)
+    sizes = [math.prod(shape) * dtype.itemsize for shape, dtype in layout]
+    storage = torch.zeros(4, sum(sizes) + 12, device="cuda", dtype=torch.uint8)
+
+    def views(pages):
+        fields = []
+        start = 0
+        for (shape, dtype), size in zip(layout, sizes, strict=True):
+            if layout_kind == "slabs":
+                field = pages.view(-1)[4 * start : 4 * (start + size)]
+            else:
+                field = pages[:, start : start + size]
+            fields.append(field.view(dtype).view(4, *shape))
+            start += size
+        return ReplayState(*fields)
+
+    replay = views(storage)
+    replay.count[1] = 63
+    inputs = make_kda_test_inputs(3)
+    metadata = {
+        "cu_seqlens": int32([0, 3]),
+        "state_indices": int32([1]),
+        "checkpoint_positions": int32([3]),
+        "checkpoint_slots": int32([2]),
+    }
+    expected = storage.clone()
+    reference = views(expected)
+    reference.count[2] = 2
+    for cache, tokens in zip(reference[:-1], inputs, strict=True):
+        cache[2, :2].copy_(tokens[0, 1:3])
+    copy_replay_tails(replay, inputs, **metadata)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        copy_replay_tails(replay, inputs, **metadata)
+    for field in replay:
+        field[2].zero_()
+    graph.replay()
+    torch.testing.assert_close(storage, expected, rtol=0, atol=0)
+
+
+def test_copy_replay_tails_rejects_nonzero_first_offset(cuda: None) -> None:
+    # A device assert poisons the CUDA context, so run the malformed call in its own process.
+    code = """
+import torch
+from attn_gym.linear import ReplayState, copy_replay_tails
+from attn_gym.testing.kda import make_kda_test_inputs
+
+def ints(values):
+    return torch.tensor(values, device="cuda", dtype=torch.int32)
+
+replay = ReplayState(*make_kda_test_inputs(64, batch=3), ints([0, 0, 0]))
+copy_replay_tails(replay, make_kda_test_inputs(66), cu_seqlens=ints([1, 66]),
+                  state_indices=ints([1]), checkpoint_positions=ints([65]),
+                  checkpoint_slots=ints([2]))
+torch.cuda.synchronize()
+"""
+    run = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, check=False, timeout=60
+    )
+    assert run.returncode != 0 and "invalid packed cu_seqlens" in run.stderr, run.stderr
+
+
+@pytest.mark.parametrize("token_innermost", [False, True])
+def test_copy_replay_tails_operator_registration(cuda: None, token_innermost: bool) -> None:
+    inputs = make_kda_test_inputs(5)
+    if token_innermost:
+        inputs = tuple(t.movedim(1, -1).contiguous().movedim(-1, 1) for t in inputs)
+    replay = replay_buffers([0, 61, 62, 0, 0])
+    torch.library.opcheck(
+        torch.ops.attn_gym.kda_copy_replay_tails.default,
+        (*inputs, *replay, int32([0, 3, 5]), int32([2, 1]), None, int32([3, 2]), int32([4, 3])),
+    )
+
+
+def test_copy_replay_tails_requires_inference_before_compilation(cuda: None) -> None:
+    inputs = make_kda_test_inputs(3, requires_grad=True)
+    replay = replay_buffers([0, 63, 0])
+    metadata = {
+        "cu_seqlens": int32([0, 3]),
+        "state_indices": int32([1]),
+        "checkpoint_positions": int32([3]),
+        "checkpoint_slots": int32([2]),
+    }
+
+    def copy():
+        copy_replay_tails(replay, inputs, **metadata)
+
+    compiled = torch.compile(copy, backend="aot_eager", fullgraph=True)
+    with pytest.raises(RuntimeError, match="inference-only"):
+        copy()
+    with pytest.raises(torch._dynamo.exc.Unsupported, match="[Ee]xception"):
+        compiled()
+    assert replay.count[2].item() == 0
+    with torch.no_grad():
+        compiled()
+    assert replay.count[2].item() == 2
+
+
+def test_copy_replay_tails_rejects_positions_aliasing_mutated_count(cuda: None) -> None:
+    replay = replay_buffers([0, 63, 2])
+    with pytest.raises(ValueError, match="alias|overlap"):
+        copy_replay_tails(
+            replay,
+            make_kda_test_inputs(2),
+            cu_seqlens=int32([0, 2]),
+            state_indices=int32([1]),
+            checkpoint_positions=replay.count[2:],
+            checkpoint_slots=int32([2]),
+        )
+
+
+def test_copy_replay_tails_reuses_binary_across_packed_shapes(cuda: None, triton_compiles) -> None:
+    # Cross 1, divisible-by-16 and odd classes for sequence count and packed token capacity.
+    for lengths, capacity in (([1], 3), ([2] * 16, 48), ([2] * 16 + [3], 35)):
+        sequences = len(lengths)
+        # The feature stride scales with total tokens instead of being a model constant.
+        inputs = tuple(
+            t.movedim(1, -1).contiguous().movedim(-1, 1)
+            for t in make_kda_test_inputs(sum(lengths))
+        )
+        replay = replay_buffers([0] + [63] * sequences + [37] * (capacity - sequences - 1))
+        sources = torch.arange(1, sequences + 1, device="cuda", dtype=torch.int32)
+        destinations = sources + sequences
+        torch.ops.attn_gym.kda_copy_replay_tails.default(
+            *inputs,
+            *replay,
+            cumulative_sequence_offsets(lengths),
+            sources,
+            None,
+            int32(lengths),
+            destinations,
+        )
+        torch.testing.assert_close(replay.count[destinations], int32([n - 1 for n in lengths]))
+    assert triton_compiles.total() == 1
 
 
 @pytest.mark.parametrize("prefix", [150, 128], ids=["mid-chunk", "chunk-boundary"])

@@ -214,14 +214,20 @@ For example, with 19 buffered tokens, position 45 is exactly a boundary. Positio
 the same boundary state and needs five additional replay tokens to resume. A position before
 the first completed boundary or outside the sequence publishes nothing.
 
-Checkpointing writes the **boundary state only**. To restore a mid-chunk prefix, also preserve
-its trailing Q, K, V, gate and beta inputs and set the destination replay count. At an exact
-boundary copy no tokens but set the count to zero, even when reusing an old slot. Resume with
-`has_initial_state=True` (or omit it) so the restored state is not discarded. See the
+Checkpointing writes the **boundary state only**. To make the selected slots resumable, call
+`copy_replay_tails` **before** packed `paged_chunk_kda` on the same CUDA stream. Pass both
+operations the same routing and requested positions, with destination slots distinct from all
+active sources. The helper reads each source's pre-call count (zero for a fresh slot), copies
+the trailing Q, K, V, gate and beta inputs and sets the destination count. At an exact boundary
+it only resets the count to zero. Publish the slots after both operations; neither operation
+alone produces a complete replay checkpoint. Resume with `has_initial_state=True` (or omit it).
+See the
 [prefix-cache example](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
 for a bitwise comparison against a full prefill.
 
 ::: attn_gym.linear.StateCheckpoints
+
+::: attn_gym.linear.copy_replay_tails
 
 ## Gate Transforms
 
