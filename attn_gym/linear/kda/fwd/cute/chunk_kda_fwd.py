@@ -13,8 +13,8 @@ from attn_gym._backends.cute import (
     tensor_supports_tma_rows,
 )
 from attn_gym._backends.profiler import profiler_range
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoints_from_op_args
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
-from attn_gym.linear._delta_rule.validation import state_checkpoints_from_op_args
 from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra import chunk_kda_fwd_intra
 from attn_gym.linear.kda.fwd.triton.chunk_delta_h import chunk_gated_delta_rule_fwd_h
 from attn_gym.linear.kda.fwd.triton.chunk_gla_fwd_o import chunk_gla_fwd_o_gk

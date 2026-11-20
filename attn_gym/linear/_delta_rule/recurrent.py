@@ -36,8 +36,8 @@ from attn_gym._backends.triton.utils import (
     fixed_tree_sum,
     ptr_offset,
 )
+from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.triton.paged_state import resolve_paged_state
-from attn_gym.linear._delta_rule.validation import validate_state_checkpoints
 from attn_gym.linear.types import StateCheckpoints
 
 configure_triton_allocator()

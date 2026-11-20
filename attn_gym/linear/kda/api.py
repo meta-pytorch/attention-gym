@@ -23,12 +23,12 @@ import torch
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
+from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
-    validate_state_checkpoints,
 )
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward

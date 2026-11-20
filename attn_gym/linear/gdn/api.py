@@ -6,13 +6,13 @@ import torch
 
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
+from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
-    validate_state_checkpoints,
 )
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
 from attn_gym.linear.gdn.impl.warpdrive import chunk_forward as warpdrive_chunk_forward
