@@ -270,8 +270,9 @@ def paged_chunk_kda(
             captured bucket. Graph replay may change packed offsets, slot routing, initialization
             flags, and replay counts while tensor shapes remain fixed to that bucket.
 
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
-            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+        state_checkpoints: Optional periodic snapshots written into caller-chosen slots of a
+            state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
+            semantics.
             Requires the fused backend. With ``replay_state``, intervals start at the beginning
             of each slot's unfinished chunk, counting replayed tokens before new input tokens.
             A false ``has_initial_state`` entry counts no replayed tokens. Snapshots contain only

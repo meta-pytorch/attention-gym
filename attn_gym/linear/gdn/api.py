@@ -187,8 +187,9 @@ def paged_chunk_gdn(
             The recurrence that advances ``state_cache`` and the warpdrive backend always use
             fixed configurations.
 
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
-            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+        state_checkpoints: Optional periodic snapshots written into caller-chosen slots of a
+            state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
+            semantics.
             Requires the fused backend.
 
     Returns:
@@ -300,8 +301,8 @@ def recurrent_gdn(
             autotune cache states. That config still follows the batch shape:
             ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
             the batch.
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots, written directly
-            from the recurrent accumulator before any pool-storage conversion. Requires
+        state_checkpoints: Optional periodic snapshots, written directly from the FP32
+            recurrent accumulator into caller-chosen slots of a state pool. Requires
             ``state_indices`` and ``impl="fused"``. Boundaries are relative to this call;
             see :class:`attn_gym.linear.StateCheckpoints` for layout and boundary semantics.
 

@@ -22,11 +22,15 @@ import triton.language as tl
 from attn_gym._backends.triton.utils import ptr_offset, requires_int64_offsets
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear._delta_rule.state_checkpoints import (
+    checkpoint_writes,
     state_checkpoints_from_op_args,
     validate_state_checkpoints_metadata,
 )
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import assert_packed_offsets
-from attn_gym.linear.types import StateCheckpoints
+from attn_gym.linear._delta_rule.triton.state_checkpoints import (
+    checkpoint_slot,
+    store_checkpoint,
+)
 
 # Host arithmetic on this value yields ``tl.constexpr`` objects, which Triton treats as
 # compile-time constants even in runtime argument slots; cast such sizes with ``int()``.
@@ -34,14 +38,9 @@ _CHUNK_SIZE = tl.constexpr(DEFAULT_CHUNK_SIZE)
 
 
 def _int64_offset_heuristic(*tensor_names: str):
-    def tensors(value):
-        if isinstance(value, StateCheckpoints):
-            return value.states, value.cu_checkpoint_offsets
-        return (value,)
-
     return {
         "USE_INT64_OFFSETS": lambda args: requires_int64_offsets(
-            *(tensor for name in tensor_names for tensor in tensors(args[name]))
+            *(args[name] for name in tensor_names)
         )
     }
 
@@ -547,7 +546,6 @@ def _gather_state_kernel(
         "active_counts",
         "state_cache",
         "replay_count",
-        "checkpoints",
     )
 )
 @triton.jit
@@ -596,12 +594,12 @@ def _commit_state_kernel(
         checkpoint_index = tl.load(
             checkpoints.cu_checkpoint_offsets + active_index, mask=checkpoint_mask, other=0
         )
-        if USE_INT64_OFFSETS:
-            checkpoint_index = checkpoint_index.to(tl.int64)
-        tl.store(
-            checkpoints.states + ptr_offset((checkpoint_index, state_offset), (state_size, 1)),
+        store_checkpoint(
+            checkpoints,
+            checkpoint_slot(checkpoints, checkpoint_index, checkpoint_mask),
+            state_offset,
             boundary_state,
-            mask=checkpoint_mask,
+            checkpoint_mask,
         )
     tl.store(
         replay_count + slot * count_stride_s,
@@ -718,10 +716,11 @@ def commit_paged_chunk_replay(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_block_table: torch.Tensor | None = None,
 ) -> None:
     """Commit completed boundaries, their optional snapshots, and active replay counts."""
     checkpoints = state_checkpoints_from_op_args(
-        checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+        checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
     )
     if checkpoints is not None:
         validate_state_checkpoints_metadata(
@@ -741,7 +740,7 @@ def commit_paged_chunk_replay(
         active_counts,
         state_cache,
         replay_count,
-        checkpoints,
+        checkpoint_writes(checkpoints),
         final_stride_b=final_state.stride(0),
         state_stride_s=state_cache.stride(0),
         count_stride_s=replay_count.stride(0),

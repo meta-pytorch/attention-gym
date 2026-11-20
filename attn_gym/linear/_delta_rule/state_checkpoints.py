@@ -1,11 +1,40 @@
-"""Host side of :class:`~attn_gym.linear.StateCheckpoints`: validation and custom-op arguments."""
+"""Host side of :class:`~attn_gym.linear.StateCheckpoints`: validation, op arguments, kernel view.
+
+Kept free of Triton so public APIs validate checkpoints without it; the kernels' store lives in
+``_delta_rule/triton/state_checkpoints.py``.
+"""
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import torch
 
+from attn_gym.linear._delta_rule.paged_state import validate_state_pool
 from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear.types import StateCheckpoints
+
+
+class CheckpointWrites(NamedTuple):
+    """The kernel view of :class:`~attn_gym.linear.StateCheckpoints`.
+
+    Triton specializes the integer fields only on equality to 1, divisibility by 16, and int32
+    range, so every interval (a positive multiple of 64 below ``2**31``) and every slot stride
+    of one pool layout share a compiled variant.
+    """
+
+    state_pool: torch.Tensor
+    cu_checkpoint_offsets: torch.Tensor
+    every_n_tokens: int
+    block_table: torch.Tensor
+    slot_stride: int
+
+
+def checkpoint_writes(checkpoints: StateCheckpoints | None) -> CheckpointWrites | None:
+    """Return the kernel argument for optional, already validated checkpoints."""
+    if checkpoints is None:
+        return None
+    return CheckpointWrites(*checkpoints, checkpoints.state_pool.stride(0))
 
 
 def validate_state_checkpoints(
@@ -35,57 +64,74 @@ def validate_state_checkpoints_metadata(
     """Validate caller-owned snapshots, including commits that have no token operands."""
     if not isinstance(checkpoints, StateCheckpoints):
         raise TypeError("state_checkpoints must be a StateCheckpoints instance")
-    states, offsets, interval = checkpoints
+    state_pool, offsets, interval, block_table = checkpoints
     if type(interval) is not int:
         raise TypeError("state_checkpoints.every_n_tokens must be an int")
     if interval <= 0 or interval % 64:
         raise ValueError("state_checkpoints.every_n_tokens must be a positive multiple of 64")
-    if states.ndim != 4 or states.shape[1:] != state_shape:
-        raise ValueError("state_checkpoints.states must have shape [capacity, H, V, K]")
-    if states.dtype != torch.float32:
-        raise TypeError("state_checkpoints.states must use float32")
-    if not states.is_contiguous():
-        raise ValueError("state_checkpoints.states must be contiguous")
-    if offsets.shape != (num_sequences + 1,):
-        raise ValueError("state_checkpoints.cu_checkpoint_offsets must have shape [N + 1]")
-    if offsets.dtype != torch.int32:
-        raise TypeError("state_checkpoints.cu_checkpoint_offsets must use int32")
-    if not offsets.is_contiguous():
-        raise ValueError("state_checkpoints.cu_checkpoint_offsets must be contiguous")
-    if states.device != device or offsets.device != device:
-        raise ValueError("state_checkpoints tensors must be on the input device")
+    heads, value_dim, key_dim = state_shape
+    validate_state_pool(
+        state_pool,
+        heads=heads,
+        value_dim=value_dim,
+        key_dim=key_dim,
+        device=device,
+        name="state_checkpoints.state_pool",
+        any_unit_dim_stride=True,
+    )
+    if (
+        block_table.ndim != 1
+        or block_table.dtype != torch.int32
+        or not block_table.is_contiguous()
+        or block_table.device != device
+    ):
+        raise ValueError(
+            "state_checkpoints.block_table must be a contiguous 1-D int32 tensor "
+            "on the input device"
+        )
+    if (
+        offsets.shape != (num_sequences + 1,)
+        or offsets.dtype != torch.int32
+        or not offsets.is_contiguous()
+        or offsets.device != device
+    ):
+        raise ValueError(
+            "state_checkpoints.cu_checkpoint_offsets must be a contiguous int32 tensor of shape "
+            "[N + 1] on the input device"
+        )
     require_inference_only(
-        (states,),
+        (state_pool,),
         "state_checkpoints is inference-only; call under torch.no_grad() or torch.inference_mode()",
     )
 
 
 def state_checkpoint_op_args(
     checkpoints: StateCheckpoints | None,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, int]:
+) -> tuple[torch.Tensor | None, torch.Tensor | None, int, torch.Tensor | None]:
     """Flatten optional snapshots into the trailing arguments of a custom-op schema."""
-    return (None, None, 0) if checkpoints is None else checkpoints
+    return (None, None, 0, None) if checkpoints is None else checkpoints
 
 
 def state_checkpoints_from_op_args(
-    states: torch.Tensor | None, offsets: torch.Tensor | None, every_n_tokens: int
+    state_pool: torch.Tensor | None,
+    offsets: torch.Tensor | None,
+    every_n_tokens: int,
+    block_table: torch.Tensor | None,
 ) -> StateCheckpoints | None:
-    """Rebuild the snapshots a custom-op schema received as flattened arguments.
-
-    Triton kernels take the result as one tuple argument. Triton specializes its interval only
-    on equality to 1, divisibility by 16, and int32 range, so every positive multiple of 64
-    below ``2**31`` shares one compiled variant.
-    """
-    if states is None:
-        if offsets is not None:
-            raise ValueError("cu_checkpoint_offsets requires checkpoint_states")
+    """Rebuild the snapshots a custom-op schema received as flattened arguments."""
+    if state_pool is None and offsets is None and block_table is None:
         return None
-    if offsets is None:
-        raise ValueError("checkpoint_states requires cu_checkpoint_offsets")
-    return StateCheckpoints(states, offsets, every_n_tokens)
+    if state_pool is None or offsets is None or block_table is None:
+        raise ValueError(
+            "state checkpoints require checkpoint_states, cu_checkpoint_offsets, "
+            "and checkpoint_block_table together"
+        )
+    return StateCheckpoints(state_pool, offsets, every_n_tokens, block_table)
 
 
 __all__ = [
+    "CheckpointWrites",
+    "checkpoint_writes",
     "state_checkpoint_op_args",
     "state_checkpoints_from_op_args",
     "validate_state_checkpoints",

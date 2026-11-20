@@ -37,15 +37,25 @@ def validate_state_pool(
     key_dim: int,
     device: torch.device,
     name: str = "the paged state pool",
+    any_unit_dim_stride: bool = False,
 ) -> None:
-    """Validate an FP32 or BF16 ``[slots, H, V, K]`` pool with contiguous, disjoint slots."""
+    """Validate an FP32 or BF16 ``[slots, H, V, K]`` pool with contiguous, disjoint slots.
+
+    ``any_unit_dim_stride`` accepts any stride on size-one slot dimensions, as
+    :meth:`torch.Tensor.is_contiguous` does, for writers that address slots only through
+    their slot stride.
+    """
     if cache.ndim != 4 or cache.shape[1:] != (heads, value_dim, key_dim):
         raise ValueError(f"{name} must have shape [slots, {heads}, {value_dim}, {key_dim}]")
     if cache.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(f"{name} must use float32 or bfloat16")
     if cache.device != device:
         raise ValueError(f"{name} must be on q.device")
-    if cache.stride()[1:] != (value_dim * key_dim, key_dim, 1):
+    dense_strides = (value_dim * key_dim, key_dim, 1)
+    if any(
+        stride != expected and not (any_unit_dim_stride and size == 1)
+        for size, stride, expected in zip(cache.shape[1:], cache.stride()[1:], dense_strides)
+    ):
         raise TypeError(f"{name} must be contiguous within each [H, V, K] slot")
     if cache.stride(0) < heads * value_dim * key_dim:
         raise ValueError(f"{name} slots must not overlap")

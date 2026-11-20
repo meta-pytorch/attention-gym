@@ -50,7 +50,7 @@ torch.library.define(
     "Tensor cu_seqlens, "
     "Tensor chunk_offsets, bool autotune, str schedule, "
     "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
-    "int checkpoint_interval=0) -> Tensor",
+    "int checkpoint_interval=0, Tensor? checkpoint_block_table=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_replay_prepare",
@@ -65,7 +65,7 @@ torch.library.define(
     "(Tensor final_state, Tensor state_indices, Tensor? has_initial_state,"
     " Tensor active_counts, Tensor(a!) state_cache, Tensor(b!) replay_count,"
     " Tensor(c!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None,"
-    " int checkpoint_interval=0) -> ()",
+    " int checkpoint_interval=0, Tensor? checkpoint_block_table=None) -> ()",
 )
 torch.library.define(
     "attn_gym::kda_chunk_replay_prefill_prepare",
@@ -147,7 +147,7 @@ torch.library.define(
     "Tensor? chunk_offsets, "
     "SymInt capacity, bool fastmath=True, "
     "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
-    "int checkpoint_interval=0) -> (Tensor, Tensor)",
+    "int checkpoint_interval=0, Tensor? checkpoint_block_table=None) -> (Tensor, Tensor)",
 )
 
 
@@ -341,6 +341,7 @@ def _chunk_fwd_ragged_paged_fake(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_block_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del (
         k,
@@ -398,9 +399,10 @@ def _chunk_replay_commit_fake(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_block_table: torch.Tensor | None = None,
 ) -> None:
     del final_state, state_indices, has_initial_state, active_counts, state_cache, replay_count
-    del checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+    del checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
 
 
 @torch.library.register_fake("attn_gym::kda_chunk_replay_prefill_prepare")
@@ -712,6 +714,7 @@ def _delta_h_paged_fake(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_block_table: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     del w, gk, state_cache, state_indices, has_initial_state, cu_seqlens, chunk_offsets
     del fastmath

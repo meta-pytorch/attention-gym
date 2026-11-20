@@ -118,6 +118,7 @@ def _gdn_recurrent_fwd_paged_cuda(
     checkpoint_states: torch.Tensor | None = None,
     cu_checkpoint_offsets: torch.Tensor | None = None,
     checkpoint_interval: int = 0,
+    checkpoint_block_table: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Advance selected cache slots with the shared scalar-gate scan."""
     return _launch_recurrent(
@@ -135,7 +136,7 @@ def _gdn_recurrent_fwd_paged_cuda(
         state_indices=state_indices,
         has_initial_state=has_initial_state,
         state_checkpoints=state_checkpoints_from_op_args(
-            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+            checkpoint_states, cu_checkpoint_offsets, checkpoint_interval, checkpoint_block_table
         ),
     )[0]
 
