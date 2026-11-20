@@ -8,6 +8,39 @@ import torch
 _SCORE_TILE_BYTES = 64 * 1024 * 1024
 
 
+def make_paged_indexer_test_inputs(
+    query_lengths=(1, 3, 0, 2),
+    key_lengths=(4099, 37, 0, 514),
+    *,
+    heads=4,
+    head_dim=128,
+    page_size=64,
+    compress_ratio=4,
+    dtype=torch.bfloat16,
+    device="cuda",
+    tail=0,
+    seed=77,
+):
+    """Paged operands with shuffled physical pages and unused page-table entries."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    sequences = len(query_lengths)
+    pages_per_sequence = max(
+        1, (max(key_lengths, default=0) // compress_ratio + page_size - 1) // page_size
+    )
+    pages = sequences * pages_per_sequence
+    tokens = sum(query_lengths) + tail
+    q = torch.randn(tokens, heads, head_dim, device=device, dtype=dtype, generator=generator)
+    k = torch.randn(pages, page_size, head_dim, device=device, dtype=dtype, generator=generator)
+    w = torch.randn(tokens, heads, device=device, dtype=dtype, generator=generator)
+    table = torch.randperm(pages, device=device, generator=generator).int().reshape(sequences, -1)
+    for sequence, length in enumerate(key_lengths):
+        used = (length // compress_ratio + page_size - 1) // page_size
+        table[sequence, used:] = -1
+    cu = torch.tensor([0, *query_lengths], dtype=torch.int32, device=device).cumsum(0).int()
+    lengths = torch.tensor(key_lengths, dtype=torch.int32, device=device)
+    return q, k, w, table, cu, lengths
+
+
 @torch.no_grad()
 def indexer_reference_scores(
     q: torch.Tensor, k: torch.Tensor, weights: torch.Tensor
@@ -194,3 +227,50 @@ def assert_indexer_selection(
         valid,
         2 * reduction_eps / (1 - reduction_eps),
     )
+
+
+def assert_paged_indexer_selection(args, actual, topk, ratio=4, positions=None):
+    """Check paged IDs, causal visibility, padding, and FP64 selection regret."""
+    q, cache, w, table, cu, lengths = args
+    assert actual.shape == (q.shape[0], topk)
+    assert actual.dtype == torch.int32 and actual.is_contiguous()
+    assert not actual.requires_grad
+    torch.testing.assert_close(actual[int(cu[-1]) :], torch.full_like(actual[int(cu[-1]) :], -1))
+    for sequence, length in enumerate(lengths.tolist()):
+        begin, end = cu[sequence : sequence + 2].tolist()
+        for row in range(begin, end):
+            position = (
+                length - (end - begin) + row - begin if positions is None else int(positions[row])
+            )
+            count = min(max(0, (position + 1) // ratio), length // ratio)
+            selected = actual[row]
+            valid = selected >= 0
+            assert int(valid.sum()) == min(topk, count)
+            assert (selected[valid] < count).all() and (selected >= -1).all()
+            assert selected[valid].unique().numel() == valid.sum()
+            assert not valid[min(topk, count) :].any()
+            if count == 0 or topk == 0:
+                continue
+            logical = torch.arange(count, device=q.device)
+            keys = cache[
+                table[sequence, logical // cache.shape[1]].long(), logical % cache.shape[1]
+            ]
+            dots = q[row].double() @ keys.double().T
+            scores = (dots.relu() * w[row].double()[:, None]).sum(0)
+            boundary = scores.topk(min(topk, count)).values[-1]
+            chosen = scores[selected[valid].long()]
+            error = (boundary - chosen).clamp_min(0)[None, :]
+            magnitude = (
+                ((q[row].double().abs() @ keys.double().abs().T) * w[row].double().abs()[:, None])
+                .sum(0)
+                .max()
+                .reshape(1, 1)
+            )
+            eps = (q.shape[1] + q.shape[2] + 2) * torch.finfo(torch.float32).eps
+            assert_selection_regret_within(
+                error,
+                torch.zeros_like(error),
+                magnitude,
+                torch.ones_like(error, dtype=torch.bool),
+                2 * eps / (1 - eps),
+            )
