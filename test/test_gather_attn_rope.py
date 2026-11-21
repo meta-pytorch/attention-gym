@@ -423,30 +423,42 @@ def test_triton_paired_operator_contracts(window):
 
 @pytest.mark.parametrize("warn_only", [False, True])
 @pytest.mark.parametrize("after_forward", [False, True])
-def test_triton_paired_determinism(warn_only, after_forward):
+@pytest.mark.parametrize(
+    "heads,dim,rope,local,window,packed,batch",
+    [
+        (16, 128, 32, False, 0, True, 1),
+        (17, 96, 16, True, 7, True, 1),
+        (16, 512, 128, True, 7, True, 1),
+        (64, 512, 64, False, 0, False, 2),
+        (128, 128, 64, True, 7, True, 1),
+    ],
+)
+def test_triton_paired_determinism(
+    warn_only, after_forward, heads, dim, rope, local, window, packed, batch
+):
     skip_unsupported("triton")
-    inputs = make_inputs(heads=16, latent_dim=128, rope_dim=64, local=False)
+    inputs = make_inputs(
+        heads=heads, latent_dim=dim, rope_dim=rope, local=local, with_docs=packed, batch=batch
+    )
+    ref_inputs = as_fp64(inputs)
+    kwargs = {"sliding_window_size": window, "scale": 0.0625}
+    grad = torch.randn_like(latent(inputs.query))
+    ref = gather_attn(**ref_inputs.kwargs(), **kwargs, impl="reference")
+    ref_grads = torch.autograd.grad(ref, ref_inputs.differentiable(), grad.double())
     enabled = torch.are_deterministic_algorithms_enabled()
     old_warn = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
-        if not after_forward:
-            torch.use_deterministic_algorithms(True, warn_only=warn_only)
-        out = gather_attn(
-            **inputs.kwargs(),
-            sliding_window_size=0,
-            scale=0.0625,
-            kernel_options={"backend": "triton"},
-        )
+        torch.use_deterministic_algorithms(not after_forward, warn_only=warn_only)
+        out = gather_attn(**inputs.kwargs(), **kwargs, kernel_options={"backend": "triton"})
         torch.use_deterministic_algorithms(True, warn_only=warn_only)
-        context = (
-            pytest.warns(UserWarning, match="no deterministic backward")
-            if warn_only
-            else pytest.raises(RuntimeError, match="no deterministic backward")
-        )
-        with context:
-            gs = torch.autograd.grad(out, inputs.differentiable(), torch.randn_like(out))
-        if warn_only:
-            assert all(torch.isfinite(g).all() for g in gs)
+        grads = torch.autograd.grad(out, inputs.differentiable(), grad, retain_graph=True)
+        assert_numerics(out, ref, "output")
+        for i, (got, expected) in enumerate(zip(grads, ref_grads, strict=True)):
+            assert_numerics(got, expected, f"gradient {i}")
+        for _ in range(2):
+            repeated = torch.autograd.grad(out, inputs.differentiable(), grad, retain_graph=True)
+            for got, expected in zip(repeated, grads, strict=True):
+                torch.testing.assert_close(got, expected, atol=0, rtol=0)
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=old_warn)
 

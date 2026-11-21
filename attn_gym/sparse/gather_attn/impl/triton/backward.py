@@ -1,7 +1,5 @@
 """Backward kernels and launcher for Triton gather attention."""
 
-import warnings
-
 import torch
 import triton
 import triton.language as tl
@@ -566,6 +564,13 @@ def _gather_attn_bwd_dsparse_kv(
     USE_INT64_OFFSETS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_D: tl.constexpr,
+    query_rope_ptr,
+    sparse_rope_ptr,
+    grad_sparse_rope_ptr,
+    QUERY_ROPE_STRIDES,
+    SPARSE_ROPE_STRIDES,
+    GRAD_SPARSE_ROPE_STRIDES,
+    ROPE_DIM: tl.constexpr,
 ):
     """Compute sparse-KV gradients from an inverted index of selecting queries."""
     S = tl.cast(S, tl.int64 if USE_INT64_OFFSETS else tl.int32)
@@ -601,6 +606,20 @@ def _gather_attn_bwd_dsparse_kv(
         0.0,
     )
     grad_value = tl.zeros((16, BLOCK_D), tl.float32)
+    if ROPE_DIM:
+        QUERY_ROPE_STRIDES = offset_strides(QUERY_ROPE_STRIDES, USE_INT64_OFFSETS)
+        SPARSE_ROPE_STRIDES = offset_strides(SPARSE_ROPE_STRIDES, USE_INT64_OFFSETS)
+        GRAD_SPARSE_ROPE_STRIDES = offset_strides(GRAD_SPARSE_ROPE_STRIDES, USE_INT64_OFFSETS)
+        offsets_rope = tl.arange(0, ROPE_DIM)
+        sparse_rope = tl.load(
+            sparse_rope_ptr
+            + batch * SPARSE_ROPE_STRIDES[0]
+            + head * SPARSE_ROPE_STRIDES[1]
+            + sparse_index * SPARSE_ROPE_STRIDES[2]
+            + offsets_rope * SPARSE_ROPE_STRIDES[3]
+        )
+        dot_rope = tl.where(dot_rows[None, :] == 0, sparse_rope[:, None], 0.0)
+        grad_rope = tl.zeros((16, ROPE_DIM), tl.float32)
     entry_start = tl.load(
         block_offsets_ptr
         + batch * BLOCK_OFFSETS_STRIDES[0]
@@ -642,6 +661,17 @@ def _gather_attn_bwd_dsparse_kv(
             other=0.0,
         )
         score_tile = tl.dot(query, dot_value, input_precision="tf32x3")
+        if ROPE_DIM:
+            query_rope = load_bhsd(
+                query_rope_ptr,
+                QUERY_ROPE_STRIDES,
+                batch,
+                head,
+                query_positions,
+                offsets_rope,
+                query_mask[:, None],
+            )
+            score_tile = tl.dot(query_rope, dot_rope, acc=score_tile, input_precision="tf32x3")
         scores = tl.sum(score_tile * (dot_rows[None, :] == 0), axis=1) * SCALE
         grad_probability_tile = tl.dot(grad_output, dot_value, input_precision="tf32x3")
         grad_probabilities = tl.sum(grad_probability_tile * (dot_rows[None, :] == 0), axis=1)
@@ -662,6 +692,15 @@ def _gather_attn_bwd_dsparse_kv(
             input_precision="tf32x3",
         )
 
+        if ROPE_DIM:
+            score_weight_tile = tl.where(dot_rows[:, None] == 0, grad_scores[None, :], 0.0)
+            grad_rope = tl.dot(
+                score_weight_tile.to(query_rope.dtype),
+                query_rope,
+                acc=grad_rope,
+                input_precision="tf32x3",
+            )
+
     tl.store(
         grad_sparse_kv_ptr
         + batch * GRAD_SPARSE_KV_STRIDES[0]
@@ -671,6 +710,16 @@ def _gather_attn_bwd_dsparse_kv(
         tl.sum(grad_value * (dot_rows[:, None] == 0), axis=0),
         mask=dimension_mask,
     )
+
+    if ROPE_DIM:
+        tl.store(
+            grad_sparse_rope_ptr
+            + batch * GRAD_SPARSE_ROPE_STRIDES[0]
+            + head * GRAD_SPARSE_ROPE_STRIDES[1]
+            + sparse_index * GRAD_SPARSE_ROPE_STRIDES[2]
+            + offsets_rope * GRAD_SPARSE_ROPE_STRIDES[3],
+            tl.sum(grad_rope * (dot_rows[:, None] == 0), axis=0) * SCALE,
+        )
 
 
 _BWD_DLOCAL_KV_TMA = TritonTuner(
@@ -691,7 +740,7 @@ _BWD_DSPARSE_KV = TritonTuner(
         for num_warps in (4, 8)
         for num_stages in (1, 3)
     ],
-    key=tuning_key("query_ptr", "H", "D", "TOPK"),
+    key=tuning_key("query_ptr", "H", "D", "TOPK", "ROPE_DIM"),
     prune=prune_wide_backward_configs,
 )
 
@@ -835,8 +884,9 @@ def _launch_backward(
     dlocal_v)``; a gradient is None exactly when its input is. ``kv_heads`` is the KV head
     count before the op broadcasts a single shared head; separate values or
     1 < kv_heads < heads run on the grouped schedule. Key-only RoPE runs only on the
-    shared-KV schedule, whose sparse gradients are atomic, so the reverse query map may be
-    None. ``autotune=False`` pins each tuned kernel's configuration.
+    shared-KV schedule. Its reverse query map may be None and is built here when
+    deterministic sparse gradients need it. ``autotune=False`` pins each tuned kernel's
+    configuration.
     """
     if uses_grouped_schedule(query.shape[1], kv_heads, sparse_v is not None):
         dq, dsparse, dlocal, dsink, dsparse_v, dlocal_v = _launch_grouped_backward(
@@ -953,14 +1003,8 @@ def _launch_backward(
     use_shared_schedule = share_kv and can_use_shared_kv_schedule(
         query, sparse_kv, kernel_local_kv, window, query_rope, sparse_rope, kernel_local_rope
     )
-    if rope_dim:
-        if not use_shared_schedule:
-            raise ValueError(ROPE_REQUIREMENTS)
-        if torch.are_deterministic_algorithms_enabled():
-            message = "Triton gather_attn has no deterministic backward for key-only RoPE."
-            if not torch.is_deterministic_algorithms_warn_only_enabled():
-                raise RuntimeError(message)
-            warnings.warn(message, stacklevel=2)
+    if rope_dim and not use_shared_schedule:
+        raise ValueError(ROPE_REQUIREMENTS)
     if use_shared_schedule:
         block_h = 16 if head_dim == 512 else min(32, triton.next_power_of_2(heads))
         block_k = 16 if head_dim == 512 else max(16, min(64, triton.next_power_of_2(topk)))
@@ -1164,8 +1208,7 @@ def _launch_backward(
         grad_sparse_kv = sparse_kv.new_zeros((batch, kv_heads, sparse_seq_len, head_dim))
         if sparse_rope is not None:
             grad_sparse_rope = sparse_rope.new_zeros((batch, kv_heads, sparse_seq_len, rope_dim))
-    # Key-only RoPE has only the atomic schedule; warn-only determinism keeps it.
-    elif use_shared_schedule and (rope_dim or not torch.are_deterministic_algorithms_enabled()):
+    elif use_shared_schedule and not torch.are_deterministic_algorithms_enabled():
         grad_sparse_kv_fp32 = torch.zeros(
             batch, 1, sparse_seq_len, head_dim, device=sparse_kv.device, dtype=torch.float32
         )
@@ -1229,10 +1272,16 @@ def _launch_backward(
         if rope_dim:
             grad_sparse_rope = grad_sparse_rope_fp32.to(sparse_rope.dtype)
     else:
+        if rope_dim:
+            # The paired forward skips this map on the default atomic path.
+            selected_queries, block_offsets = _build_index_query_map(
+                kv_indices, sparse_seq_len, cu_seqlens, cu_seqlens_k
+            )
         assert selected_queries is not None and block_offsets is not None
-        # The shared CSR schedule flattens heads x query rows into a large D-wide tile.
-        # Use the per-head output-owned kernel for deterministic D=512 gradients instead.
-        if use_shared_schedule and head_dim != 512:
+        rope_args = {}
+        grad_sparse_rope_partials = None
+        # The per-head output-owned kernel supports RoPE and bounds D=512 tile storage.
+        if use_shared_schedule and head_dim != 512 and not rope_dim:
             grad_sparse_kv_partials = torch.zeros(
                 sparse_kv.shape,
                 device=sparse_kv.device,
@@ -1248,7 +1297,21 @@ def _launch_backward(
             grad_sparse_kv_partials = torch.empty(
                 sparse_kv.shape,
                 device=sparse_kv.device,
-                dtype=sparse_kv.dtype,
+                dtype=torch.float32 if rope_dim else sparse_kv.dtype,
+            )
+            grad_sparse_rope_partials = (
+                torch.empty(sparse_rope.shape, device=sparse_rope.device, dtype=torch.float32)
+                if rope_dim
+                else None
+            )
+            rope_args = dict(
+                query_rope_ptr=query_rope,
+                sparse_rope_ptr=sparse_rope,
+                grad_sparse_rope_ptr=grad_sparse_rope_partials,
+                QUERY_ROPE_STRIDES=optional_strides(query_rope),
+                SPARSE_ROPE_STRIDES=optional_strides(sparse_rope),
+                GRAD_SPARSE_ROPE_STRIDES=optional_strides(grad_sparse_rope_partials),
+                ROPE_DIM=rope_dim,
             )
             sparse_kernel = _BWD_DSPARSE_KV
             sparse_grid = (sparse_seq_len, batch * heads)
@@ -1274,15 +1337,23 @@ def _launch_backward(
             SPARSE_SEQ_LEN=sparse_seq_len,
             TOPK=topk,
             SCALE=scale,
-            USE_INT64_OFFSETS=use_int64_offsets or requires_int64_offsets(grad_sparse_kv_partials),
+            USE_INT64_OFFSETS=use_int64_offsets
+            or requires_int64_offsets(
+                grad_sparse_kv_partials, grad_sparse_rope_partials, selected_queries, block_offsets
+            ),
             BLOCK_D=block_d,
             autotune=autotune,
+            **rope_args,
         )
         grad_sparse_kv = (
             grad_sparse_kv_partials.sum(dim=1, keepdim=True)
             if share_kv
             else grad_sparse_kv_partials
-        )
+        ).to(sparse_kv.dtype)
+        if rope_dim:
+            grad_sparse_rope = grad_sparse_rope_partials.sum(dim=1, keepdim=True).to(
+                sparse_rope.dtype
+            )
 
     if share_kv and window:
         grad_local_kv = grad_local_kv.sum(dim=1, keepdim=True)
