@@ -4,9 +4,8 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 #
-# KDA forward factor composition. The SM100 family retains its CuTe factor engines unless
-# ``ATTN_GYM_LEGACY_CUTE=0`` (see _delta_rule/routing.py); every other supported GPU uses the
-# FP32/TF32 BC16 stage plus Triton K3/K4.
+# KDA forward factor composition: the FP32/TF32 BC16 diagonal stage plus Triton K3/K4 on every
+# supported GPU.
 
 from __future__ import annotations
 
@@ -14,7 +13,6 @@ import torch
 from torch._subclasses.fake_tensor import FakeTensor
 
 from attn_gym._backends.profiler import profiler_range
-from attn_gym.linear._delta_rule.routing import uses_legacy_cute
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import RaggedChunkMetadata, ScheduleRequest
 from attn_gym.linear.kda.constants import DEFAULT_CHUNK_SIZE
 from attn_gym.linear.kda.fwd.triton.chunk_kda_fwd_intra_sub_chunk_forloop import (
@@ -50,61 +48,11 @@ def chunk_kda_fwd_factors(
         shape = (batch, tokens, heads, chunk_size)
         return k.new_empty(shape), k.new_empty(shape)
 
-    if not uses_legacy_cute(k.device):
-        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
-            q, k, gk, beta, scale, metadata, chunk_size, fastmath=fastmath
-        )
-        AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata, fastmath=fastmath)
-        return Aqk, chunk_kda_fwd_k4b_triton(AkkOD, Akkd, metadata, output_dtype=q.dtype)
-
-    # The legacy CuTe stages import CuTeDSL, which the Triton route above must not need.
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_inter_solve import (
-        chunk_kda_fwd_inter_solve_cute,
-        chunk_kda_fwd_inter_solve_ragged_cute,
-        chunk_kda_fwd_k4b_dense_cute,
-        chunk_kda_fwd_k4b_ragged_cute,
+    Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
+        q, k, gk, beta, scale, metadata, chunk_size, fastmath=fastmath
     )
-    from attn_gym.linear.kda.fwd.cute.chunk_kda_fwd_intra_engine import kda_intra_engine_fwd
-
-    if q.dtype == torch.float16:
-        # The engine stores two-sided diagonal rebase factors in the I/O dtype. Their
-        # public gate-bound exponent fits BF16 but can overflow FP16, so keep the
-        # diagonal products in FP32/TF32 and use FP16 only for the safe solved factors.
-        Aqk, Akkd = chunk_kda_fwd_intra_diagonal(
-            q, k, gk, beta, scale, metadata, chunk_size, fastmath=fastmath
-        )
-        if metadata is None:
-            return chunk_kda_fwd_inter_solve_cute(
-                q,
-                k,
-                gk,
-                beta,
-                Akkd,
-                scale,
-                chunk_size,
-                Aqk=Aqk,
-                fastmath=fastmath,
-            )
-        return chunk_kda_fwd_inter_solve_ragged_cute(
-            q,
-            k,
-            gk,
-            beta,
-            Akkd,
-            Aqk,
-            scale,
-            metadata,
-            fastmath=fastmath,
-        )
-
-    with profiler_range("kda/cute/intra_engine"):
-        Aqk, AkkOD, Akkd = kda_intra_engine_fwd(q, k, gk, beta, scale, metadata)
-        Akk = (
-            chunk_kda_fwd_k4b_dense_cute(AkkOD, Akkd, chunk_size, output_dtype=q.dtype)
-            if metadata is None
-            else chunk_kda_fwd_k4b_ragged_cute(AkkOD, Akkd, metadata, output_dtype=q.dtype)
-        )
-    return Aqk, Akk
+    AkkOD = chunk_kda_fwd_k3b_triton(q, k, gk, beta, Aqk, scale, metadata, fastmath=fastmath)
+    return Aqk, chunk_kda_fwd_k4b_triton(AkkOD, Akkd, metadata, output_dtype=q.dtype)
 
 
 def chunk_kda_fwd_intra(

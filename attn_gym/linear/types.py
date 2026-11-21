@@ -83,7 +83,9 @@ class BackendOptions(TuningOptions, total=False):
     """Backend selection and tuning shared by optimized linear-attention operations."""
 
     backend: Literal["fused", "warpdrive"]
-    """Select the repo-local fused backend or the optional warpdrive backend."""
+    """Select the chunk kernels. ``"fused"`` (default) runs the portable Triton kernels on every
+    CUDA architecture; ``"warpdrive"`` runs the CuTeDSL warpdrive kernels (SM100-family GPUs,
+    ``[linear]`` extra)."""
 
 
 class SplitOptions(BackendOptions, total=False):

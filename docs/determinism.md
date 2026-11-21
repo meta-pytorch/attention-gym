@@ -147,9 +147,8 @@ given a fixed configuration. The guarantees, strongest first:
   select a different configuration; the next bullet removes that variable, as do
   deterministic algorithms (see [Autotuned kernels](#autotuned-kernels)).
 - **`chunk_kda(..., kernel_options={"autotune": False})`: bitwise by construction.** The
-  default benchmarks candidate configurations — Triton and CuTeDSL
-  stages alike — on a winner-cache miss and reuses the cached winner
-  afterwards; `{"autotune": False}` pins every stage to its fixed heuristic
+  default benchmarks candidate configurations of every Triton stage on a winner-cache miss and
+  reuses the cached winner afterwards; `{"autotune": False}` pins every stage to its fixed heuristic
   configuration instead, so kernel selection is repeatable across processes and
   cache states. With the same option, `recurrent_kda` uses its host shape heuristic without
   tuning. `causal_conv1d` never benchmarks: it launches fixed default schedules

@@ -100,7 +100,7 @@ def chunk_kda(
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
-            are internal. The repo-local fused implementation requires approximately
+            are internal. The Triton fused implementation requires approximately
             ``[-5.914, 0]``. warpdrive BF16 instead requires every aligned 16-token
             per-channel sum to exceed ``-126 * ln(2)`` (a uniform ``lower_bound >= -5.45``)
             for finite results. Gradients need more margin: their error grows quickly past a
@@ -255,7 +255,7 @@ def paged_chunk_kda(
             the optional warpdrive backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
             applies as in ``chunk_kda``. ``"autotune"`` (default
-            ``True``) benchmarks candidate configurations of the repo-local fused kernels;
+            ``True``) benchmarks candidate configurations of the Triton fused kernels;
             warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five

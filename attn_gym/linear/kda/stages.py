@@ -400,7 +400,6 @@ class ChunkKDABackward:
             self.metadata,
             self.prepared,
             scale=self.scale,
-            chunk_size=CHUNK_SIZE,
             fastmath=self.fastmath,
             autotune=should_autotune(self.autotune),
         )
