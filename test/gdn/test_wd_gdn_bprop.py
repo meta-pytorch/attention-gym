@@ -142,7 +142,9 @@ def test_gdn_bprop_column_fold_waits_for_slow_reader():
     q, k, v, gate, beta = (x[0] for x in (q, k, v, gate, beta))
     do = torch.randn_like(v)
     args = (q, k, v, gate, beta, do, cu, lens, None, None, 128**-0.5)
-    delayed = gdn_bprop.GdnBprop("bf16", 128, False, False, False, column_fold_delay=20000)
+    delayed = gdn_bprop.GdnBprop(
+        "bf16", 128, False, False, False, column_fold_delay=20000, gate_dtype="Float32"
+    )
     expected = _wd_backward(*args)
     actual = _wd_backward(*args, op=delayed)
     for name, got, want in zip(NAMES[:5], actual[:5], expected[:5], strict=True):

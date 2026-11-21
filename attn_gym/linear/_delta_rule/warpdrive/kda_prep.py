@@ -50,7 +50,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, standalone_dtype
 from attn_gym.warpdrive import (
     Consumer,
     Local,
@@ -163,13 +163,24 @@ class KdaPrep(WarpSpecialized):
     any float dtype (its loads follow the traced tensor). ``num_sm`` sizes the grid.
     ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal."""
 
-    def __init__(self, io: str, gate: str, d_k: int, num_sm: int, fastmath: bool = True):
+    def __init__(
+        self,
+        io: str,
+        gate: str,
+        d_k: int,
+        num_sm: int,
+        fastmath: bool = True,
+        *,
+        beta_dtype: str | None = None,
+    ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the KDA prep serves d_k in {HEAD_DIMS}, got {d_k}")
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         self.io, self.gate, self.d_k, self.num_sm = io, gate, d_k, num_sm
         self.fastmath = fastmath
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.beta_dtype = beta_dtype
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         # fp16 computes A and KK from tf32 decay tiles (NOTE [TF32 decay operands] in
@@ -928,7 +939,7 @@ def prep_rows(cu_seqlens: torch.Tensor, capacity: int):
 
 
 @jit_cache
-def compile_kda_prep(op: KdaPrep, beta_name: str):
+def compile_kda_prep(op: KdaPrep):
     """Compile for dynamic tokens, heads and record rows."""
     io, i32 = op.io_dtype, cutlass.Int32
     tokens, hq, hk, heads, rows = (cute.sym_int() for _ in range(5))
@@ -946,7 +957,9 @@ def compile_kda_prep(op: KdaPrep, beta_name: str):
         packed(io, hq),
         packed(io, hk),
         packed(op.gate_dtype, heads),
-        make_fake_strided_tensor(CUTE_DTYPES[beta_name], (tokens, heads), contiguous_dim=None),
+        make_fake_strided_tensor(
+            CUTE_DTYPES[standalone_dtype(op, "beta_dtype")], (tokens, heads), contiguous_dim=None
+        ),
         record(),
         record(),
         record(),
@@ -981,13 +994,14 @@ def kda_prep(
     }
     out["a"] = torch.zeros(n_rows, heads, A_WORDS, dtype=torch.int32, device=dev)
     out["diag"] = torch.zeros(n_rows, heads, d_k, dtype=torch.float32, device=dev)
-    op = KdaPrep(
+    op = KdaPrep.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
         d_k,
         torch.cuda.get_device_properties(dev).multi_processor_count,
+        beta_dtype=TORCH_NAMES[beta.dtype],
     )
-    fn = compile_kda_prep(op, TORCH_NAMES[beta.dtype])
+    fn = compile_kda_prep(op)
     fn(
         q,
         k,
