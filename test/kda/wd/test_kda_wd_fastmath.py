@@ -112,9 +112,11 @@ def test_fastmath_false_keeps_a_subnormal_state_decay(plan: str) -> None:
         assert torch.equal(tensor, torch.zeros_like(tensor))
 
 
-def test_fastmath_false_summaries_keep_a_subnormal_decay() -> None:
-    """The context-parallel summaries: A = diag(decay), B = C = 0 and R = A^T."""
-    zeros, gate, beta, _ = _decay_probe()
+@pytest.mark.parametrize("tokens", [64, 256, 512])
+def test_fastmath_false_summaries_keep_a_subnormal_decay(tokens: int) -> None:
+    """The context-parallel summaries: A = diag(decay), B = C = 0 and R = A^T, also over the
+    pieces of a split span (256 and 512 tokens), whose composition must not flush either."""
+    zeros, gate, beta, _ = _decay_probe(tokens)
     bounds = torch.tensor([[0, zeros.shape[1]]], dtype=torch.int32, device="cuda")
     prepared = chunk_kda_prepare(
         zeros, zeros, zeros, gate, beta, fastmath=False, kernel_options=WARPDRIVE

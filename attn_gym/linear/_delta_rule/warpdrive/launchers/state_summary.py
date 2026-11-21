@@ -4,9 +4,9 @@
 
 Forward maps pack [B; A] for ``exit = entry @ A + B``; reverse maps pack [C; R] for
 ``d_entry = d_exit @ R + C``. Native state/operand rounding makes these approximate affine
-maps, not bitwise reconstruction of an ordinary unsharded warpdrive run. The v1.30 summary kernels
-run every sequence uncut, so the arithmetic is independent of sequence ownership and packed
-token count (:mod:`attn_gym.linear._delta_rule.warpdrive.drivers.summary`).
+maps, not bitwise reconstruction of an ordinary unsharded warpdrive run. Long sequences on few
+heads split into pieces whose maps compose on the device, so the bits follow the span's shapes
+and SM count (:mod:`attn_gym.linear._delta_rule.warpdrive.drivers.summary`).
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ def build_warpdrive_state_summaries(
     *,
     bounds: torch.Tensor | None = None,
     fastmath: bool = True,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """Return FP32 ``[N, H, V + K, K]`` maps packed as ``[B; A]`` for subsequences.
 
@@ -34,11 +35,19 @@ def build_warpdrive_state_summaries(
     contiguous int32 ``bounds[R, 2]`` on k.device select, reorder, or duplicate consecutive
     cu_seqlens pairs. Empty intervals yield ``[0; I]``; zero rows yield no maps. Bounds values
     stay on device and may change during CUDA Graph replay. ``fastmath=False`` selects the
-    non-flushing gate exponentials.
+    non-flushing gate exponentials. ``batch_invariant`` scans every sequence uncut, so its bits
+    do not depend on the other sequences.
     """
     validate_available(k)
     return summary.build_state_summaries(
-        k, value, gate, beta, cu_seqlens, bounds=bounds, fastmath=fastmath
+        k,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        bounds=bounds,
+        fastmath=fastmath,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -55,13 +64,15 @@ def build_warpdrive_state_grad_summaries(
     transpose_forward_transition: bool = False,
     bounds: torch.Tensor | None = None,
     fastmath: bool = True,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """Return subsequence FP32 ``[N, H, V + K, K]`` maps packed as ``[C; R]``.
 
     C is the native entry cotangent with zero exit cotangent. R uses an identity exit
     cotangent and zero d_output. ``transpose_forward_transition=True`` instead uses A.T
-    from the forward summary: algebraically the adjoint, but not native backward rounding.
-    Inputs, bounds and ``fastmath`` follow :func:`build_warpdrive_state_summaries`.
+    from the forward summary: bit for bit the forward's A transposed, the exact adjoint, but not
+    native backward rounding. Inputs, bounds, ``fastmath`` and ``batch_invariant`` follow
+    :func:`build_warpdrive_state_summaries`.
     """
     validate_available(q)
     return summary.build_state_grad_summaries(
@@ -76,6 +87,7 @@ def build_warpdrive_state_grad_summaries(
         transpose_forward_transition=transpose_forward_transition,
         bounds=bounds,
         fastmath=fastmath,
+        batch_invariant=batch_invariant,
     )
 
 
@@ -87,14 +99,18 @@ def build_warpdrive_gdn_state_summaries(
     cu_seqlens: torch.Tensor,
     *,
     bounds: torch.Tensor | None = None,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """Return GDN FP32 ``[N, H, V + K, K]`` maps packed as ``[B; A]`` for subsequences.
 
     Inputs use staged ``[1, T, HK, K]`` keys, ``[1, T, H, V]`` values and FP32 per-head
-    ``[1, T, H]`` gate/beta; bounds follow :func:`build_warpdrive_state_summaries`.
+    ``[1, T, H]`` gate/beta; bounds and ``batch_invariant`` follow
+    :func:`build_warpdrive_state_summaries`.
     """
     validate_gdn_available(k)
-    return summary.build_gdn_state_summaries(k, value, gate, beta, cu_seqlens, bounds=bounds)
+    return summary.build_gdn_state_summaries(
+        k, value, gate, beta, cu_seqlens, bounds=bounds, batch_invariant=batch_invariant
+    )
 
 
 def build_warpdrive_gdn_state_grad_summaries(
@@ -108,13 +124,23 @@ def build_warpdrive_gdn_state_grad_summaries(
     scale: float,
     *,
     bounds: torch.Tensor | None = None,
+    batch_invariant: bool = False,
 ) -> torch.Tensor:
     """Return GDN subsequence FP32 ``[N, H, V + K, K]`` maps packed as ``[C; R]``.
 
     C is the native entry cotangent with zero exit cotangent and R is A.T from the forward
-    summary. Inputs follow :func:`build_warpdrive_gdn_state_summaries`.
+    summary, bit for bit. Inputs follow :func:`build_warpdrive_gdn_state_summaries`.
     """
     validate_gdn_available(q)
     return summary.build_gdn_state_grad_summaries(
-        q, k, value, gate, beta, d_output, cu_seqlens, scale, bounds=bounds
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        d_output,
+        cu_seqlens,
+        scale,
+        bounds=bounds,
+        batch_invariant=batch_invariant,
     )

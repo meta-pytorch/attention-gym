@@ -23,7 +23,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
-from attn_gym.linear.types import KERNEL_OPTION_SPEC, ReplayState
+from attn_gym.linear.types import KERNEL_OPTION_SPEC, STAGE_OPTION_SPEC, ReplayState
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
@@ -37,13 +37,19 @@ class ResolvedKernelOptions(NamedTuple):
     split_forward: bool
     autotune: bool
     schedule: ScheduleRequest = ScheduleRequest.AUTO
+    batch_invariant: bool = False  # staged handles only
 
 
 def resolve_kernel_options(
-    kernel_options: Mapping[str, object] | None, *, op_name: str = "chunk_kda"
+    kernel_options: Mapping[str, object] | None,
+    *,
+    op_name: str = "chunk_kda",
+    staged: bool = False,
 ) -> ResolvedKernelOptions:
-    """Validate chunk backend options and resolve their defaults."""
-    options = resolve_chunk_kernel_options(kernel_options, KERNEL_OPTION_SPEC, op_name=op_name)
+    """Validate chunk backend options and resolve their defaults; ``staged`` also accepts the
+    staged handles' ``batch_invariant`` (:class:`attn_gym.linear.types.StageKernelOptions`)."""
+    spec = STAGE_OPTION_SPEC if staged else KERNEL_OPTION_SPEC
+    options = resolve_chunk_kernel_options(kernel_options, spec, op_name=op_name)
     # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
     schedule = ScheduleRequest(options.pop("schedule"))
     return ResolvedKernelOptions(**options, schedule=schedule)

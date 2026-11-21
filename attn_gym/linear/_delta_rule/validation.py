@@ -111,7 +111,8 @@ def resolve_chunk_kernel_options(
 ) -> dict[str, Any]:
     """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
-    Split schedules require ``backend="warpdrive"``. The backend's former name, ``"cudnn"``, still
+    Split schedules and the staged handles' ``batch_invariant`` require
+    ``backend="warpdrive"``. The backend's former name, ``"cudnn"``, still
     selects it and warns once per process, outside ``torch.compile`` tracing (Dynamo cannot trace
     ``warnings.warn`` in a full graph).
     """
@@ -120,8 +121,8 @@ def resolve_chunk_kernel_options(
             warn_cudnn_backend_renamed()
         kernel_options = {**kernel_options, "backend": "warpdrive"}
     options = validate_kernel_options(kernel_options, spec, op_name=op_name)
-    for name in ("split_backward", "split_forward"):
-        if options[name] and options["backend"] != "warpdrive":
+    for name in ("split_backward", "split_forward", "batch_invariant"):
+        if options.get(name) and options["backend"] != "warpdrive":
             raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")
     return options
 
