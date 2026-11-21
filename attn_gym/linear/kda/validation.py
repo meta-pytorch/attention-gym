@@ -20,7 +20,6 @@ import torch
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.validation import (
-    resolve_chunk_backend,
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
@@ -95,39 +94,25 @@ def resolve_intra_chunk_dtypes(
     return DEFAULT_INTRA_CHUNK_DTYPES if intra_chunk_dtypes is None else intra_chunk_dtypes
 
 
-def kernel_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.dtype:
-    """Return the Q/K/V dtype the KDA chunk kernels compute in.
-
-    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16.
-    """
-    if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype:
-        return q.dtype
-    return torch.bfloat16
-
-
 def cast_to_kernel_dtypes(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor
 ) -> tuple[torch.Tensor, ...]:
     """Cast chunk operands to the dtypes the KDA chunk kernels compute in.
 
-    Q/K/V follow ``kernel_dtype``; gate and beta run in FP32. Callers return the output in the
-    original ``q.dtype``. Each cast is an autograd op, so gradients come back in the caller's
-    dtypes.
+    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16. Gate and beta
+    run in FP32. Callers return the output in the original ``q.dtype``. Each cast is an autograd
+    op, so gradients come back in the caller's dtypes.
     """
-    dtype = kernel_dtype(q, k, v)
-    return (*(tensor.to(dtype) for tensor in (q, k, v)), gate.float(), beta.float())
-
-
-def resolve_kda_backend(
-    backend: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, fused_only: bool = False
-) -> Literal["fused", "warpdrive"]:
-    """Resolve the backend of one KDA chunk call (NOTE [Default chunk backend]).
-
-    ``"auto"`` keeps FP16 kernels, and calls whose caller sets ``fused_only``, on the fused
-    backend.
-    """
-    fused_only = fused_only or kernel_dtype(q, k, v) == torch.float16
-    return resolve_chunk_backend(backend, q, fused_only=fused_only)
+    kernel_dtype = (
+        q.dtype
+        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
+        else torch.bfloat16
+    )
+    return (
+        *(tensor.to(kernel_dtype) for tensor in (q, k, v)),
+        gate.float(),
+        beta.float(),
+    )
 
 
 def validate_kda_inputs(
@@ -216,9 +201,7 @@ __all__ = [
     "FP16_INTRA_CHUNK_DTYPES",
     "SUPPORTED_INPUT_DTYPES",
     "cast_to_kernel_dtypes",
-    "kernel_dtype",
     "resolve_intra_chunk_dtypes",
-    "resolve_kda_backend",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_replay_state",

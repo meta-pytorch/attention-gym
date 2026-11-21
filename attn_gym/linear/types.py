@@ -88,8 +88,8 @@ class BackendOptions(TuningOptions, total=False):
     backend: Literal["auto", "fused", "warpdrive"]
     """Select the chunk kernels. ``"fused"`` runs the portable Triton kernels on every CUDA
     architecture; ``"warpdrive"`` runs the CuTeDSL warpdrive kernels (SM100-family GPUs,
-    ``[linear]`` extra). ``"auto"`` (default) runs warpdrive on SM100-family GPUs, except for FP16
-    KDA, and Triton otherwise (``docs/linear.md``, "Chunk backend selection")."""
+    ``[linear]`` extra). ``"auto"`` (default) runs warpdrive on SM100-family GPUs and Triton
+    otherwise (``docs/linear.md``, "Chunk backend selection")."""
 
 
 class SplitOptions(BackendOptions, total=False):
