@@ -649,25 +649,25 @@ def test_warpdrive_kernel_options_are_strict() -> None:
     from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
     from attn_gym.linear.kda.validation import ResolvedKernelOptions, resolve_kernel_options
 
-    fused = ResolvedKernelOptions(
-        "fused",
+    default = ResolvedKernelOptions(
+        "auto",
         split_backward=False,
         split_forward=False,
         autotune=True,
         schedule=ScheduleRequest.AUTO,
         intra_chunk_dtypes=None,
     )
-    assert resolve_kernel_options(None) == fused
-    assert resolve_kernel_options({}) == fused
+    assert resolve_kernel_options(None) == default
+    assert resolve_kernel_options({}) == default
     assert resolve_kernel_options({"backend": "warpdrive", "split_backward": True}) == (
-        fused._replace(backend="warpdrive", split_backward=True)
+        default._replace(backend="warpdrive", split_backward=True)
     )
     assert resolve_kernel_options({"backend": "warpdrive", "split_forward": True}) == (
-        fused._replace(backend="warpdrive", split_forward=True)
+        default._replace(backend="warpdrive", split_forward=True)
     )
     with pytest.raises(ValueError, match="unsupported chunk_kda kernel options"):
         resolve_kernel_options({"unknown": True})
-    with pytest.raises(ValueError, match="must be 'fused' or 'warpdrive'"):
+    with pytest.raises(ValueError, match="must be 'auto', 'fused', or 'warpdrive'"):
         resolve_kernel_options({"backend": "triton"})
     for name in ("split_backward", "split_forward"):
         with pytest.raises(TypeError, match="must be a bool"):

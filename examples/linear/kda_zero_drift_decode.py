@@ -3,7 +3,9 @@
 Token-at-a-time ``recurrent_kda`` groups floating-point additions differently than 64-row
 ``chunk_kda``, and the difference compounds in the FP32 recurrent state. Replay uses
 ``chunk_kda`` on the current partial chunk from the last FP32 boundary state. Determinism,
-prefix invariance, and FP32 boundary chaining make its output bitwise-identical to training.
+prefix invariance, and FP32 boundary chaining make its output bitwise-identical to training when
+both calls run the same kernels with the same plan; on warpdrive (the SM100-family default) the
+plan follows the packed shape (docs/linear.md).
 
 """
 

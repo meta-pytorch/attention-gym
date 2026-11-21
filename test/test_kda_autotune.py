@@ -6,7 +6,11 @@ import torch
 from attn_gym.linear import KernelOptions, chunk_kda
 from attn_gym.testing.kda import make_kda_test_inputs
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    # These cover the fused kernels, which the default no longer runs on SM100-family GPUs.
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 
 def _forward(

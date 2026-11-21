@@ -20,7 +20,10 @@ HEADS = 2
 HEAD_DIM = 128  # Required by fused paged_chunk_kda.
 TOKENS = 200  # Each request's prompt length.
 SLOT_A, SLOT_B, SLOT_REFERENCE = 1, 2, 3  # Slot 0 is the null slot.
-OPTIONS = {"autotune": False}  # Fixed heuristics keep kernel selection repeatable.
+# Fixed heuristics keep kernel selection repeatable. Checkpointed calls run the fused backend;
+# pinning it for the calls without checkpoints too keeps every call on one backend, which the
+# bitwise comparison needs (the default runs those calls on warpdrive on SM100-family GPUs).
+OPTIONS = {"backend": "fused", "autotune": False}
 
 
 def make_prompt(seed: int, tokens: int) -> tuple[torch.Tensor, ...]:

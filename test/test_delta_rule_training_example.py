@@ -14,7 +14,10 @@ pytest.importorskip("typer")
 pytest.importorskip("torch.cuda.graph_annotations", reason="the example requires a newer torch")
 
 from attn_gym.linear.context_parallel import ContextParallelRouting
-from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
+from attn_gym.linear.kda.constants import (
+    MAX_GATE_LOWER_BOUND_MAGNITUDE,
+    WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE,
+)
 from attn_gym.testing import profiling
 from attn_gym.testing.kda import assert_relative_rms_within
 from examples.linear import delta_rule_training
@@ -38,6 +41,13 @@ def test_example_validates_public_gate_configuration():
     with pytest.raises(ValueError, match="lower_bound"):
         make(lower_bound=too_low, backend="fused")
     make(lower_bound=too_low, backend="reference")
+    # A default or warpdrive core may run warpdrive, whose gate range is narrower; only the
+    # repo-local core admits the fused bound.
+    below_warpdrive = -(WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE + 1e-3)
+    for options in (None, {"backend": "auto"}, {"backend": "warpdrive"}):
+        with pytest.raises(ValueError, match="KDA core requires lower_bound"):
+            make(lower_bound=below_warpdrive, backend="fused", kernel_options=options)
+    make(lower_bound=below_warpdrive, backend="fused", kernel_options={"backend": "fused"})
     # GDN never reads lower_bound, so the KDA-only bound must not constrain it.
     make(variant="gdn", lower_bound=too_low, backend="fused")
     with pytest.raises(ValueError, match="finite and nonpositive"):
@@ -99,19 +109,29 @@ def test_example_writes_fastmath_and_kernel_options_through_to_the_core(monkeypa
         assert seen["core"]["fastmath"] is True
 
 
+@pytest.mark.parametrize("core", ["fused", "default"])
 @pytest.mark.parametrize(
     ("variant", "head_dim"),
     [("kda", 128), ("gdn", 128), ("gdn", 64)],
 )
-def test_example_fused_backend_matches_reference_module(variant, head_dim):
-    """Same weights, dense input: the fused bf16 module must track the fp32 reference recipe."""
+def test_example_fused_backend_matches_reference_module(variant, head_dim, core):
+    """Same weights, dense input: the fused bf16 module must track the fp32 reference recipe.
+
+    ``core="default"`` runs warpdrive on SM100-family GPUs. Its BF16 KDA dgate carries about 1.7x
+    the fused kernels' error (0.8% vs 0.5% relative RMS against FP32 at these sizes), which the
+    ``dt_bias`` reduction over only 128 tokens amplifies, so its KDA budgets are 1.5x wider.
+    """
     torch.manual_seed(5)
     options = {"hidden_size": 32, "num_heads": 2, "head_dim": head_dim, "variant": variant}
     reference = DeltaRuleAttention(**options, backend="reference", device="cuda")
     with torch.no_grad():  # zero-initialized gate parameters would make the gate a constant
         reference.A_log.uniform_(-1.0, 1.0)
         reference.dt_bias.uniform_(-1.0, 1.0)
-    fused = DeltaRuleAttention(**options, backend="fused", device="cuda")
+    kernel_options = {"backend": "fused"} if core == "fused" else None
+    fused = DeltaRuleAttention(
+        **options, backend="fused", kernel_options=kernel_options, device="cuda"
+    )
+    widen = 1.5 if core == "default" and variant == "kda" else 1.0
     fused.load_state_dict(reference.state_dict())
     hidden = torch.randn(2, 64, 32, device="cuda")
     cotangent = torch.randn_like(hidden)
@@ -130,9 +150,9 @@ def test_example_fused_backend_matches_reference_module(variant, head_dim):
     # The reference runs fp32 end to end; the fused module rounds every stage input to bf16,
     # so pointwise error scales with the tensor's magnitude (observed <= 4% of max, ~1 eps RMS).
     for (name, actual), (_, expected) in zip(run(fused), run(reference), strict=True):
-        budget = 5e-2 * expected.abs().max().item()
+        budget = widen * 5e-2 * expected.abs().max().item()
         torch.testing.assert_close(actual.float(), expected, rtol=0, atol=budget, msg=name)
-        assert_relative_rms_within(actual, expected, name, max_eps=8)
+        assert_relative_rms_within(actual, expected, name, max_eps=widen * 8)
 
 
 @pytest.mark.parametrize("variant", ["kda", "gdn"])
