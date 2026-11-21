@@ -12,12 +12,16 @@ from attn_gym.linear._delta_rule.warpdrive.work_tables import (
     build_split_table,
     chunk_scratch_rows,
 )
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     cumulative_sequence_offsets,
     kda_reference,
     make_kda_test_inputs,
 )
+
+# The default operand precision of the warpdrive forward for BF16 inputs (``KernelOptions``).
+PRECISION = {"intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -83,7 +87,16 @@ def test_warpdrive_forward_packed_tail_empty_and_deterministic(dtype: torch.dtyp
         q, k, value, gate, beta, zero_state, cu_seqlens, torch.float64
     )
     actual, _ = run_forward(
-        q, k, value, gate, beta, cu_seqlens, None, scale=None, output_final_state=False
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        None,
+        scale=None,
+        output_final_state=False,
+        **PRECISION,
     )
     assert_matches_low_precision_reference(
         actual, high_precision, low_precision, "output", source_dtype=dtype
@@ -91,7 +104,16 @@ def test_warpdrive_forward_packed_tail_empty_and_deterministic(dtype: torch.dtyp
     for _ in range(20):
         torch.testing.assert_close(
             run_forward(
-                q, k, value, gate, beta, cu_seqlens, None, scale=None, output_final_state=False
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                cu_seqlens,
+                None,
+                scale=None,
+                output_final_state=False,
+                **PRECISION,
             )[0],
             actual,
             rtol=0,
@@ -114,6 +136,7 @@ def test_warpdrive_forward_packed_tail_empty_and_deterministic(dtype: torch.dtyp
         initial_state,
         scale=None,
         output_final_state=True,
+        **PRECISION,
     )
     assert_matches_low_precision_reference(
         actual_output, high_output, low_output, "stateful output", source_dtype=dtype
@@ -183,6 +206,7 @@ def test_warpdrive_forward_rejects_misaligned_tma() -> None:
             None,
             scale=None,
             output_final_state=False,
+            **PRECISION,
         )
 
 
@@ -229,6 +253,7 @@ def test_warpdrive_public_forward_preserves_large_finite_state() -> None:
         initial_state,
         scale=None,
         output_final_state=True,
+        **PRECISION,
     )
     assert_matches_low_precision_reference(
         actual,

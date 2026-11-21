@@ -43,6 +43,7 @@ from attn_gym.linear.kda.ops import copy_replay_tails_op
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import (
+    resolve_intra_chunk_dtypes,
     resolve_kernel_options,
     validate_kda_inputs,
     validate_replay_state,
@@ -93,26 +94,31 @@ def chunk_kda(
 
     Args:
         q: Queries shaped ``[B, T, H, K]``, scaled by ``scale`` internally. Use
-            L2-normalized Q/K with fused FP16: unnormalized values can overflow the FP16
-            intermediates passed between FP32-accumulating GEMMs.
-        k: Keys shaped like ``q`` and subject to the same fused FP16 range limitation.
+            L2-normalized Q/K with FP16, and with BF16 on warpdrive under the FP16 solve
+            operands of ``intra_chunk_dtypes`` (``"tf32+fp16"``, ``"bf16+fp16"``):
+            unnormalized values can overflow the FP16 intermediates passed between
+            FP32-accumulating GEMMs. There the intra-chunk attention overflows once ``|q . k|``
+            (before ``scale``) reaches 65504; the default ``"tf32+bf16"`` and ``"bf16"`` keep
+            BF16 range.
+        k: Keys shaped like ``q`` and subject to the same FP16 range limitation.
         v: Values shaped ``[B, T, H, V]``.
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
             are internal. The Triton fused implementation requires approximately
-            ``[-5.914, 0]``. warpdrive BF16 instead requires every aligned 16-token
-            per-channel sum to exceed ``-126 * ln(2)`` (a uniform ``lower_bound >= -5.45``)
-            for finite results. Gradients need more margin: their error grows quickly past a
+            ``[-5.914, 0]``. warpdrive instead requires every aligned 16-token per-channel
+            sum to exceed ``-126 * ln(2)`` (a uniform ``lower_bound >= -5.45``) for finite
+            results, with FP16 and BF16 alike: FP16 always forms its in-chunk decay products
+            from TF32 operands, as BF16 does by default, and TF32 and BF16 share FP32's
+            exponent range. Gradients need more margin: their error grows quickly past a
             uniform gate of about ``-5.25``, an empirical training guideline, while the common
             ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
-            ``docs/linear.md`` gives the measurements). warpdrive FP16 forms its in-chunk decay
-            products from TF32 operands, forward and backward, and shares the BF16 gate range
-            above. Backward headroom also shrinks with large output gradients and key components.
-            The FP16 backward needs state cotangents, and FP16 products of them, within the FP16
-            range, and keys decayed below the FP16 subnormals round up or to zero in the forward
-            state update and the backward (same section of ``docs/linear.md``). These limits are
-            not checked at runtime and do not apply to reference or recurrent execution.
+            ``docs/linear.md`` gives the measurements). Backward headroom also shrinks with large
+            output gradients and key components. The FP16 backward needs state cotangents, and
+            FP16 products of them, within the FP16 range, and keys decayed below the FP16
+            subnormals round up or to zero in the forward state update and the backward (same
+            section of ``docs/linear.md``). These limits are not checked at runtime and do not
+            apply to reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
@@ -146,6 +152,10 @@ def chunk_kda(
             See :class:`attn_gym.linear.types.KernelOptions`. ``"autotune"`` (default
             ``True``) benchmarks candidate fused-kernel configurations; warpdrive accepts the
             option but uses its fixed schedule.
+            ``"intra_chunk_dtypes"`` (default ``"tf32+bf16"``) selects warpdrive's intra-chunk
+            operand dtypes for BF16 inputs ("Operand precision" in ``docs/linear.md``); FP16
+            inputs run ``"tf32+fp16"``, their one kernel set, and reject any other value, on
+            every backend.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -165,6 +175,9 @@ def chunk_kda(
         op_name="chunk_kda",
         gate_name="gate",
     )
+    intra_chunk_dtypes = resolve_intra_chunk_dtypes(
+        options.intra_chunk_dtypes, q, k, v, op_name="chunk_kda"
+    )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
         if options.backend == "warpdrive":
@@ -181,6 +194,7 @@ def chunk_kda(
                 fastmath=fastmath,
                 split_backward=options.split_backward,
                 split_forward=options.split_forward,
+                intra_chunk_dtypes=intra_chunk_dtypes,
             )
         return _fused_chunk_forward(
             q,
@@ -253,8 +267,8 @@ def paged_chunk_kda(
             advancing that slot. This is useful when a slot has just been assigned.
         kernel_options: Backend-specific options. ``{"backend": "warpdrive"}`` selects
             the optional warpdrive backend. ``split_backward`` and
-            ``split_forward`` are not supported by this paged operation; ``schedule``
-            applies as in ``chunk_kda``. ``"autotune"`` (default
+            ``split_forward`` are not supported by this paged operation; ``schedule`` and
+            ``intra_chunk_dtypes`` apply as in ``chunk_kda``. ``"autotune"`` (default
             ``True``) benchmarks candidate configurations of the Triton fused kernels;
             warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
@@ -305,6 +319,9 @@ def paged_chunk_kda(
         has_initial_state=has_initial_state,
     )
     options = resolve_kernel_options(kernel_options, op_name="paged_chunk_kda")
+    intra_chunk_dtypes = resolve_intra_chunk_dtypes(
+        options.intra_chunk_dtypes, q, k, v, op_name="paged_chunk_kda"
+    )
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
@@ -326,6 +343,7 @@ def paged_chunk_kda(
             has_initial_state=has_initial_state,
             scale=resolve_scale(None, q.shape[-1]),
             replay_state=replay_state,
+            intra_chunk_dtypes=intra_chunk_dtypes,
         )
     return _fused_paged_chunk_forward(
         q,

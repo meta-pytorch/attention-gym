@@ -26,6 +26,7 @@ from .ptx import (
     mma_step_tf32,
     st_shared_v4,
     tf32_round,
+    tmem_st,
 )
 from .ragged import RaggedTma, ragged_load
 
@@ -355,13 +356,14 @@ def store_state_32(tile, vals, align: cutlass.Constexpr[int] = 16):
 
 
 @cute.jit
-def beta_residual(v_word, beta0, beta1, ks0, ks1, dtype: cutlass.Constexpr, with_state):
-    """``beta * (v - ks)`` for one packed V pair in fp32; only the final pack rounds."""
+def beta_residual(
+    v_word, beta0, beta1, ks0, ks1, dtype: cutlass.Constexpr, with_state: cutlass.Constexpr
+):
+    """``beta * (v - ks)`` for one packed V pair, in fp32."""
     v0, v1 = f16x2_to_f32(v_word, dtype=dtype)
     if cutlass.const_expr(with_state):
         v0, v1 = cute.arch.add_packed_f32x2((v0, v1), (-ks0, -ks1))
-    y0, y1 = fmul2(beta0, beta1, v0, v1)
-    return fp32_to_fp16(y0, y1, dtype=dtype)
+    return fmul2(beta0, beta1, v0, v1)
 
 
 @cute.jit
@@ -458,16 +460,225 @@ def gate_offset(row, dim, d_k: cutlass.Constexpr[int]):
     return 4 * cute.crd2idx((row, dim ^ ((dim >> 5) << 2)), gate_tile(d_k))
 
 
-# ---- TF32 decay operands (fp16 io) -------------------------------------------------------
+# ---- Operand precision options -----------------------------------------------------------
+# NOTE [KDA operand precision]
+# The public ``intra_chunk_dtypes`` option ("<decay products>+<solve operands>", one name for
+# both) selects the operand dtypes of the intra-chunk matmuls, which the forward kernels (and the
+# backward's checkpoint recompute) take as two constructor arguments, each a dtype name:
+# ``decay_dtype`` ("tf32" or the io dtype) for the operands of K_decay K_inv^T (L) and
+# Q_decay K_inv^T (A), and ``solve_dtype`` ("fp16" or the io dtype) for T^-1 (and its 16 x 16
+# inverse), Y, U and A in U = T^-1 Y and O += A U. The inter-chunk state matmuls (K_decay S,
+# Q_decay S, K_restore^T U) always take the io dtype. ``operand_dtypes`` maps the option to the
+# two choices; it is the only place that does. fp16 io always takes tf32 tiles (2^-g overflows
+# fp16) and its solve operands are fp16 already, so it has one kernel set, the unchanged fp16
+# kernels, which ``operand_dtypes`` returns for every value: the public entry points
+# (``resolve_intra_chunk_dtypes`` in ``attn_gym.linear.kda.validation``) select "tf32+fp16"
+# for fp16 when the option is omitted and reject any other value, and the op schemas' default
+# "bf16" (the pre-option kernels of graphs serialized before the option) then means the same
+# kernels for both io dtypes.
+#
+# fp16 solve operands under bf16 io keep the state path (the S operand, K_restore and the U of
+# the state update) in bf16 and guard the fp16 range of Y and U with exact power-of-two scales
+# (``store_solve_rows``): a warp packs its rows of Y unscaled when every finite value is below
+# 2^15 and every 4-value row segment a lane holds is zero or reaches the fp16 normal range (a
+# subnormal's rounding error is then at most 2^-11 of the largest value packed beside it);
+# otherwise it repacks them times the one power of two that brings its largest finite magnitude
+# into [2^14, 2^15). NaN and inf pack as themselves, so they stay in their value channel as in
+# bf16. The scale is per warp, so its 32 value channels share it: a channel far below the warp's
+# largest finite value rounds in fp16 relative to that value (it can flush to zero), and since the
+# maximum skips non-finite values, a NaN or inf can change how the other channels round.
+# The check is lane-local plus two warp reductions issued after the unscaled stores, so a repack
+# costs one more store; it fires on none of the captured training chunks for Y and U and on
+# decayed rows of the summaries' transition chain. U' = T^-1 Y' comes back scaled by the same
+# factor (unscaled, exactly, for the bf16 state-update copy), and U' is packed the same way for
+# A U. A U'' accumulates apart from Q_decay S, and the O drain adds it back times the inverse
+# factors (``pow2_pair``), so Y and U round only in their fp16 packs and overflow only where fp32
+# would. A, T^-1 and the prep path's ``a`` record (A T^-1 diag(beta)) are plain fp16, unscaled:
+# |A| <= |q| |k| before ``scale`` and, for L2-normalized k and beta in [0, 1], the entries of
+# T^-1 stay at or below 2^14, so they are finite for L2-normalized Q/K but overflow once |q . k|
+# reaches the fp16 maximum 65504; "tf32+bf16" and "bf16" have no such bound.
+
+# ``intra_chunk_dtypes`` value -> (decay_dtype, solve_dtype) under bf16 io.
+INTRA_CHUNK_DTYPES = {
+    "tf32+fp16": ("tf32", "fp16"),
+    "tf32+bf16": ("tf32", "bf16"),
+    "bf16+fp16": ("bf16", "fp16"),
+    "bf16": ("bf16", "bf16"),
+}
+# The one value of fp16 io.
+FP16_INTRA_CHUNK_DTYPES = "tf32+fp16"
+# Biased fp32 exponent a repack gives the warp's largest magnitude (2^14, the top fp16 binade).
+INTRA_TOP_EXPONENT = 127 + 14
+
+
+def operand_dtypes(io: str, intra_chunk_dtypes: str) -> tuple[str, str]:
+    """Kernel dtype names ``(decay_dtype, solve_dtype)`` of the ``intra_chunk_dtypes`` option
+    for ``io`` operands; fp16 io has the one pair ``("tf32", "fp16")`` for every value.
+
+    Raises:
+        ValueError: an unknown value.
+    """
+    if intra_chunk_dtypes not in INTRA_CHUNK_DTYPES:
+        raise ValueError(
+            f"intra_chunk_dtypes must be one of {tuple(INTRA_CHUNK_DTYPES)}, "
+            f"got {intra_chunk_dtypes!r}"
+        )
+    if io == "fp16":
+        return INTRA_CHUNK_DTYPES[FP16_INTRA_CHUNK_DTYPES]
+    return INTRA_CHUNK_DTYPES[intra_chunk_dtypes]
+
+
+def check_operand_dtypes(io: str, decay_dtype: str, solve_dtype: str) -> None:
+    """Validate a kernel's resolved operand dtype names (``operand_dtypes``)."""
+    if decay_dtype not in ("tf32", io) or (io == "fp16" and decay_dtype != "tf32"):
+        raise ValueError(f"decay_dtype must be tf32 (or bf16 for bf16 io), got {decay_dtype}")
+    if solve_dtype not in ("fp16", io):
+        raise ValueError(f"solve_dtype must be fp16 or the io dtype, got {solve_dtype}")
+
+
+def solve_suffix(io: str, solve_dtype: str) -> str:
+    """Kernel-name tag of fp16 solve operands under bf16 io; empty for fp16 io."""
+    return "_icfp16" if io != "fp16" and solve_dtype == "fp16" else ""
+
+
+def precision_suffix(io: str, decay_dtype: str, solve_dtype: str) -> str:
+    """Kernel-name tag of non-io operand dtypes under bf16 io; empty for fp16 io."""
+    decay = "_kktf32" if io != "fp16" and decay_dtype == "tf32" else ""
+    return decay + solve_suffix(io, solve_dtype)
+
+
+@cute.jit
+def pow2(exponent):
+    """``2^exponent`` for an Int32 ``exponent`` in [-126, 127]."""
+    return as_f32((exponent + 127) << 23)
+
+
+@cute.jit
+def pow2_pair(exponent):
+    """Two factors whose product is ``2^-exponent`` for ``exponent`` in [-252, 252], each a
+    normal fp32 power of two, so multiplying by both in turn is exact."""
+    half = exponent >> 1
+    return pow2(-half), pow2(half - exponent)
+
+
+# Magnitude keys order fp32 values by magnitude and leave out NaN and inf at no extra cost: the
+# key of bits ``b`` is ``2 b + 2^31 + 2^24`` mod 2^32 as an int32. Doubling drops the sign and
+# puts a finite value's biased exponent e in the top byte as e + 1, which the 2^31 shifts into
+# signed order (the top byte reads e - 127), while e = 255 (NaN, inf) wraps below the key of zero.
+def magnitude_key_of(bits: int) -> int:
+    """Host-side ``magnitude_key`` of the non-negative fp32 bit pattern ``bits``."""
+    key = (2 * bits + (1 << 31) + (1 << 24)) % (1 << 32)
+    return key - (1 << 32) if key >= 1 << 31 else key
+
+
+# Keys of 0, 2^15 (above every unscaled solve operand, below the FP16 maximum 65504) and 2^-14
+# (the FP16 normal minimum).
+ZERO_KEY = magnitude_key_of(0)
+FP16_SAFE_KEY = magnitude_key_of(0x47000000)
+FP16_NORMAL_KEY = magnitude_key_of(0x38800000)
+
+
+@cute.jit
+def magnitude_key(value):
+    """The magnitude key of fp32 ``value`` (``magnitude_key_of``)."""
+    return inline_ptx(
+        f"mad.lo.s32 $0, $1, 2, {ZERO_KEY};",
+        write_only_types=[Int32],
+        read_only_args=[as_i32(value)],
+    )
+
+
+@cute.jit
+def warp_max(value):
+    """``redux.sync.max.s32`` of ``value`` over the warp."""
+    return inline_ptx(
+        "redux.sync.max.s32 $0, $1, 0xffffffff;", write_only_types=[Int32], read_only_args=[value]
+    )
+
+
+def row_halves(two: bool) -> tuple[int, ...]:
+    """TMEM address offsets of a fragment's 16-lane halves: ``(0, 16 << 16)`` when ``two``."""
+    return (0, 16 << 16) if two else (0,)
+
+
+@cute.jit
+def pack_fragment(vals, dtype: cutlass.Constexpr, factor=None):
+    """Pack the 4 pairs of one fp32 ``16x256b`` x2 fragment (``tmem_ld``'s layout: pairs 0 and
+    2 in row ``lane // 4``, 1 and 3 in row ``lane // 4 + 8``), times ``factor`` when given, into
+    4 ``dtype`` words."""
+    words = []
+    for r in cutlass.range_constexpr(4):
+        p0, p1 = vals[2 * r], vals[2 * r + 1]
+        if cutlass.const_expr(factor is not None):
+            p0, p1 = fmul2(p0, p1, factor, factor)
+        words.append(fp32_to_fp16(p0, p1, dtype=dtype))
+    return words
+
+
+@cute.jit
+def store_solve_rows(rows, dtype: cutlass.Constexpr, scaled: cutlass.Constexpr):
+    """Store the fp32 fragments of ``rows`` (``(TMEM address, 16x256b x2 fragment)`` pairs,
+    ``16x128b`` stores) as ``dtype`` and return the power-of-two exponent ``d`` the warp scaled
+    them by (NOTE [KDA operand precision]). Without ``scaled`` they are stored as they are and
+    ``d`` is 0; with it, ``d`` is 0 (unscaled) when every finite value of the warp is below
+    2^15 and the finite values of every 4-value row segment a lane holds are zero or reach the
+    fp16 normal range, else the one exponent in [-126, 126] that brings the warp's largest
+    finite magnitude into [2^14, 2^15), and the fragments are stored again scaled. NaN and inf
+    store as themselves (``magnitude_key`` leaves them out). The unscaled stores issue before the
+    two warp reductions, so their latency overlaps the stores; the outcome is uniform per warp,
+    whose rows no other warp packs or drains. The caller completes the stores
+    (``tcgen05.wait::st``)."""
+    lane_max = Int32(ZERO_KEY)
+    flagged = Int32(0)
+    for addr, vals in rows:
+        tmem_st("16x128b", addr, pack_fragment(vals, dtype))
+        if cutlass.const_expr(scaled):
+            for sub in cutlass.range_constexpr(2):
+                seg = Int32(ZERO_KEY)
+                for r in cutlass.range_constexpr(sub, 4, 2):
+                    for j in cutlass.range_constexpr(2):
+                        seg = cutlass.max(seg, magnitude_key(vals[2 * r + j]))
+                lane_max = cutlass.max(lane_max, seg)
+                subnormal = (seg > ZERO_KEY) & (seg < FP16_NORMAL_KEY)
+                flagged = cutlass.max(
+                    flagged, Int32(cutlass.select_(subnormal, Int32(1), Int32(0)))
+                )
+    exponent = Int32(0)
+    if cutlass.const_expr(scaled):
+        largest = warp_max(lane_max)
+        if largest >= FP16_SAFE_KEY or warp_max(flagged) > 0:  # warp-uniform, rare
+            # The key's top byte reads the biased exponent minus 127.
+            exponent = cutlass.max(
+                cutlass.min(Int32(INTRA_TOP_EXPONENT - 127) - (largest >> 24), Int32(126)),
+                Int32(-126),
+            )
+            factor = pow2(exponent)
+            cute.arch.fence_view_async_tmem_store()  # the unscaled stores land first
+            for addr, vals in rows:
+                tmem_st("16x128b", addr, pack_fragment(vals, dtype, factor))
+    return exponent
+
+
+@cute.jit
+def store_unscaled_rows(rows, exponent, dtype: cutlass.Constexpr):
+    """Store the fp32 fragments of ``rows`` (as for ``store_solve_rows``) times 2^-``exponent``
+    (exact) as ``dtype``."""
+    factor = pow2(-exponent)
+    for addr, vals in rows:
+        tmem_st("16x128b", addr, pack_fragment(vals, dtype, factor))
+
+
+# ---- TF32 decay operands -----------------------------------------------------------------
 # NOTE [TF32 decay operands]
 # With g the per-channel prefix log2 decay of a 16-token chunk, the in-chunk products are
 # A[i, j] = (Q[i] * 2^g[i]) . (K[j] * 2^-g[j]) for j <= i, and KK[i, j], which uses K[i] in place
 # of Q[i]. On the diagonal the decay cancels exactly in the math, but staging the operands in
 # fp16 can turn one into zero and the other into infinity before they multiply: their ratio spans
-# the whole 16-token gate sum (about 2^121 at the gate bound). That is why the fp16 kernels form
-# these operands (Q_decay or K_decay, and K_inv) in fp32 and round them to tf32 for m16n8k8 tf32
-# mma.sync (and, in the backward, tcgen05 ``.kind::tf32``): they need the exponent range, not
-# accumulator precision.
+# the whole 16-token gate sum (about 2^121 at the gate bound). That is why the fp16 kernels (and
+# the bf16 ones with "tf32" decay products, NOTE [KDA operand precision]) form these operands
+# (Q_decay or K_decay, and K_inv) in fp32 and round them to tf32 for m16n8k8 tf32 mma.sync (and,
+# in the backward, tcgen05 ``.kind::tf32``): they need the exponent range, not accumulator
+# precision.
 #
 # The operands are fp32 ``[16, d_k]`` tiles in one of two layouts (``tf32_tile``), which both the
 # row stores (``sts_tf32x8``) and the fragment loads (``tf32_fragment_offsets``) index by

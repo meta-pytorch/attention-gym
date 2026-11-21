@@ -70,10 +70,12 @@ def kda_forward(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
     nonempty: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
-    ``fastmath=False`` selects the non-flushing gate exponentials.
+    ``fastmath=False`` selects the non-flushing gate exponentials. ``intra_chunk_dtypes`` is
+    the public operand-precision option (NOTE [KDA operand precision] in ``kda_common``).
 
     With ``state_indices`` the call is paged: ``initial_state`` is a ``[P,H,V,K]`` pool updated in
     place through the routes (non-positive routes are null; the optional uint8
@@ -152,6 +154,7 @@ def kda_forward(
             scale=scale,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             num_sm=plan.num_sm,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
         )
         run_chain_forward(
@@ -196,6 +199,7 @@ def kda_forward(
         **_GATE_FLAGS,
         checkpoint_every_n_tokens=0,
         scale=scale,
+        intra_chunk_dtypes=intra_chunk_dtypes,
         fastmath=fastmath,
     )
     run_warmup_forward(*launch, **buffers, scale=scale)
@@ -258,10 +262,14 @@ def kda_backward(
     d_final_state: torch.Tensor | None = None,
     split: bool = False,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
 ]:
     """Recompute checkpoint series and differentiate KDA, with optional state/cotangent.
+    ``intra_chunk_dtypes`` is the forward's option: the checkpoint recompute (and the chain's
+    piece summaries) repeat it, so the checkpoints are the forward's states; the gradient
+    kernels run in the io dtype.
 
     Native bprop returns natural-log dgate directly; neither the safe-gate sigmoid
     derivative nor the composed BT64 cumulative-gate reverse scan is needed here. The bprop
@@ -347,6 +355,7 @@ def kda_backward(
                 dim_v, dim_k, num_seqs, heads_out, plan.num_sm, chains=2
             ),
             num_sm=plan.num_sm,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
         )
         run_chain_backward(launch, **buffers, **schedule)
@@ -379,6 +388,7 @@ def kda_backward(
             ideal_chunks=ideal,
             num_sm=plan.num_sm,
             **_GATE_FLAGS,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
         )
         run_warmup_backward(*launch, **buffers, scale=scale)

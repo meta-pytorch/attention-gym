@@ -75,7 +75,17 @@ def _run(k, v, gate, beta, cu, chunk_ranges=None, extra_rows=0):
     table, count = _work_table(cu, heads, chunk_ranges, extra_rows)
     state_h = torch.full((pieces, heads, d_v, d_k), float("nan"), device="cuda")
     state_m = torch.full((pieces, heads, d_k, d_k), float("nan"), device="cuda")
-    kda_summary.kda_summary(k, v, gate, beta, state_h, state_m, table, count)
+    kda_summary.kda_summary(
+        k,
+        v,
+        gate,
+        beta,
+        state_h,
+        state_m,
+        table,
+        count,
+        intra_chunk_dtypes="tf32+fp16",
+    )
     return state_h, state_m
 
 

@@ -18,12 +18,16 @@ pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeD
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.cute import tensor_supports_contiguous_dim, tensor_supports_tma
 from attn_gym.linear import chunk_kda, paged_chunk_kda
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_fused,
     clone_kda_inputs,
     cumulative_sequence_offsets,
     make_kda_test_inputs,
 )
+
+# The default operand precision of the warpdrive forward for BF16 inputs (``KernelOptions``).
+PRECISION = {"intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -235,13 +239,24 @@ def test_normalized_operands_return_the_fake_layouts() -> None:
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     for op, args in (
         (chunk_warpdrive_packed_fwd_op, (*tensors, offsets, False, scale)),
-        (chunk_warpdrive_packed_fwd_with_state_op, (*tensors, state, offsets, scale)),
+        (
+            chunk_warpdrive_packed_fwd_with_state_op,
+            (*tensors, state, offsets, scale),
+        ),
         (
             chunk_warpdrive_packed_local_bwd_op,
-            (*tensors, _feature_major(torch.randn_like(tensors[2])), offsets, False, scale),
+            (
+                *tensors,
+                _feature_major(torch.randn_like(tensors[2])),
+                offsets,
+                False,
+                scale,
+            ),
         ),
     ):
-        torch.library.opcheck(op, args, test_utils=test_utils, rtol=2e-2, atol=2e-2)
+        torch.library.opcheck(
+            op, args, kwargs=PRECISION, test_utils=test_utils, rtol=2e-2, atol=2e-2
+        )
 
 
 def test_layout_restore_allocates_only_to_copy() -> None:

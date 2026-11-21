@@ -52,7 +52,7 @@ from ..contract import (
     validate_tensor,
     validate_work_table,
 )
-from ..kda_common import B_T, state_align_suffix
+from ..kda_common import B_T, TORCH_NAMES, operand_dtypes, state_align_suffix
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -238,6 +238,8 @@ def _compile_warmup_forward(
     tiles_per_head: int,
     prep: bool,
     use_int64_offsets: bool,
+    decay_dtype: str,
+    solve_dtype: str,
     paged_state: int = 0,
     fastmath: bool = True,
     state_align: int = 16,
@@ -245,7 +247,9 @@ def _compile_warmup_forward(
     """Compile the warmup / uncut forward host for one static config over fake tensors that repeat
     the standalone builds' placeholders; absent tensors have a None dtype. ``paged_state`` is 0
     without paged routing, 1 with per-sequence routes and 2 with routes plus the fresh-slot byte
-    mask; ``state_align`` is the state rows' byte alignment (``paged_state_align``)."""
+    mask; ``state_align`` is the state rows' byte alignment (``paged_state_align``).
+    ``decay_dtype`` and ``solve_dtype`` are resolved operand dtypes
+    (``kda_common.operand_dtypes``)."""
     i64 = use_int64_offsets
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
     states = (state_in_dtype is not None, state_out_dtype is not None, paged_state, num_sms)
@@ -255,9 +259,22 @@ def _compile_warmup_forward(
         if d_v // tiles_per_head != kda_prep_prefill.D_V:
             raise ValueError("the KDA prep prefill runs 64-column value tiles")
         prefill_op = kda_prep_prefill.KdaPrepPrefill(
-            io, d_k, tiles_per_head, *states, state_align=state_align
+            io,
+            d_k,
+            tiles_per_head,
+            *states,
+            state_align=state_align,
+            solve_dtype=solve_dtype,
         )
-        prep_op = kda_prep.KdaPrep(io, gate_name, d_k, num_sms, fastmath)
+        prep_op = kda_prep.KdaPrep(
+            io,
+            gate_name,
+            d_k,
+            num_sms,
+            fastmath,
+            decay_dtype=decay_dtype,
+            solve_dtype=solve_dtype,
+        )
     else:
         prefill_op = kda_prefill.KdaPrefill(
             io,
@@ -268,6 +285,8 @@ def _compile_warmup_forward(
             *states,
             fastmath,
             state_align=state_align,
+            decay_dtype=decay_dtype,
+            solve_dtype=solve_dtype,
         )
     if prep:
         prep_signatures = [
@@ -312,6 +331,7 @@ def _compile_warmup_forward(
         "kda_warmup_forward_"
         + "_".join(str(int(flag)) for flag in static)
         + f"_split_{split_tag}_{dtype_names}{state_align_suffix(state_align)}"
+        + f"_{decay_dtype}_{solve_dtype}"
         + ("" if fastmath else "_nofm")
     )
     return compile_tvm_ffi(
@@ -532,6 +552,7 @@ def build_warmup_forward(
     prep_row_count=None,
     state_indices=None,
     has_initial_state=None,
+    intra_chunk_dtypes,
     fastmath=True,
 ):
     """Compile (persisted per static config: dtypes, dims, the split-K
@@ -542,7 +563,8 @@ def build_warmup_forward(
     ``has_initial_state`` select paged state: ``state_in`` and ``state_out`` are then one pool
     routed per sequence (null, fresh and resumed slots). The warpdrive KDA prefills route state
     through ``state_indices`` only and write no checkpoints. ``fastmath=False`` selects the
-    non-flushing gate exponentials."""
+    non-flushing gate exponentials. ``intra_chunk_dtypes`` is the public option
+    (``kda_common.operand_dtypes``)."""
     if not log_gate:
         raise ValueError("the warpdrive KDA prefills take natural-log gates")
     if seed_indices is not None or final_indices is not None:
@@ -637,6 +659,7 @@ def build_warmup_forward(
         int(tiles_per_head),
         bool(prep),
         use_int64_offsets,
+        *operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes),
         paged_state,
         bool(fastmath),
         state_align,

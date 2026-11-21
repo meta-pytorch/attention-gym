@@ -35,14 +35,19 @@ def reached_compiler(*args, **kwargs):
 reached_compiler.by_args = reached_compiler
 reached_compiler.by_static_key = reached_compiler
 
+PRECISION = {"decay_dtype": "tf32", "solve_dtype": "fp16"}
 OPS = {
-    "prefill": lambda io, gate, d: kda_prefill.KdaPrefill(io, gate, d, d, 1, True, True, 0, 148),
-    "prep": lambda io, gate, d: kda_prep.KdaPrep(io, gate, d, 148),
-    "prep_prefill": lambda io, gate, d: kda_prep_prefill.KdaPrepPrefill(
-        io, d, 2, True, True, 0, 1
+    "prefill": lambda io, gate, d: kda_prefill.KdaPrefill(
+        io, gate, d, d, 1, True, True, 0, 148, **PRECISION
     ),
-    "summary": lambda io, gate, d: kda_summary.KdaSummary(io, gate, d, d, 148),
-    "recompute": lambda io, gate, d: kda_recompute.KdaRecompute(io, gate, d, d, True, 148),
+    "prep": lambda io, gate, d: kda_prep.KdaPrep(io, gate, d, 148, **PRECISION),
+    "prep_prefill": lambda io, gate, d: kda_prep_prefill.KdaPrepPrefill(
+        io, d, 2, True, True, 0, 1, solve_dtype="fp16"
+    ),
+    "summary": lambda io, gate, d: kda_summary.KdaSummary(io, gate, d, d, 148, **PRECISION),
+    "recompute": lambda io, gate, d: kda_recompute.KdaRecompute(
+        io, gate, d, d, True, 148, **PRECISION
+    ),
     "bprop": lambda io, gate, d: kda_bprop.KdaBprop(io, gate, d, d, True, True, True, 148),
 }
 
@@ -78,7 +83,7 @@ def run_kda_forward(tokens):
     gate = packed(tokens, HEADS, DIM, dtype=torch.float32)
     beta = packed(tokens, HEADS, dtype=torch.float32)
     cu = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
-    kda.kda_forward(q, k, v, gate, beta, cu, scale=DIM**-0.5)
+    kda.kda_forward(q, k, v, gate, beta, cu, scale=DIM**-0.5, intra_chunk_dtypes="tf32+fp16")
 
 
 @needs_cuda

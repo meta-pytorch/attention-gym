@@ -177,9 +177,10 @@ def test_staged_pieces_ignore_call_order_and_bounds(variant):
     saved = prepared.saved
     q, k, v, gate, beta = (saved.q, saved.k, saved.v, saved.gate, saved.beta)
     if variant.channel_gate:
+        precision = {"intra_chunk_dtypes": "tf32+bf16"}  # chunk_kda_prepare's BF16 default
         forward, reverse = (
-            native_summary.build_state_summaries,
-            native_summary.build_state_grad_summaries,
+            partial(native_summary.build_state_summaries, **precision),
+            partial(native_summary.build_state_grad_summaries, **precision),
         )
         expected = (
             forward(k, v, gate, beta, cu_seqlens, bounds=every),

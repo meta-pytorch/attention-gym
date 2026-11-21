@@ -10,8 +10,12 @@ pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeD
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_kda, paged_chunk_kda
 from attn_gym.linear.kda.impl.warpdrive_ops import chunk_warpdrive_packed_fwd_paged_op
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing import cumulative_sequence_offsets, strided_state_pool
 from attn_gym.testing.kda import make_kda_test_inputs
+
+# The default operand precision of the warpdrive forward for BF16 inputs (``KernelOptions``).
+PRECISION = {"intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -132,6 +136,7 @@ def test_warpdrive_paged_raw_operator_registration(pool_dtype: torch.dtype) -> N
             None,
             cu_seqlens,
             128**-0.5,
+            *PRECISION.values(),
         ),
     )
 
@@ -346,7 +351,12 @@ def test_warpdrive_paged_runs_the_native_driver(pool_dtype: torch.dtype, monkeyp
     for options in ({"output_final_state": True}, {"split": True}):
         with pytest.raises(ValueError, match="paged KDA"):
             kda.kda_forward(
-                *packed, scale=1.0, initial_state=pool, state_indices=state_indices, **options
+                *packed,
+                scale=1.0,
+                initial_state=pool,
+                state_indices=state_indices,
+                **options,
+                **PRECISION,
             )
 
 

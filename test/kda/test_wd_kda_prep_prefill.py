@@ -43,15 +43,17 @@ def _swizzle32(rows, cols):
     return rows * B_T + ((cols // 8) ^ ((rows >> 2) & 1)) * 8 + cols % 8
 
 
-def _records(q, k, gate, beta, cu):
+def _records(q, k, gate, beta, cu, intra_chunk_dtypes="tf32+fp16"):
     """``(k_decay, q_decay, t, a, diag)`` of ``kda_prep_f16`` in fp32 math, rows past a sequence
-    end zero (sequence ``b`` chunk ``j`` at row ``cu[b] // 16 + b + j``)."""
+    end zero (sequence ``b`` chunk ``j`` at row ``cu[b] // 16 + b + j``); ``a`` is fp16 unless
+    ``intra_chunk_dtypes="bf16"`` (``kda_prep``'s option)."""
     dtype, heads, d = q.dtype, gate.shape[1], q.shape[-1]
+    a_dtype = dtype if intra_chunk_dtypes == "bf16" else torch.float16
     k = k.repeat_interleave(heads // k.shape[1], dim=1)
     num_seqs = cu.shape[0] - 1
     rows = q.shape[0] // B_T + num_seqs
     out = [torch.zeros(rows, heads, B_T, d, dtype=dtype, device="cuda") for _ in range(3)]
-    a_tiles = torch.zeros(rows, heads, B_T * B_T, dtype=dtype, device="cuda")
+    a_tiles = torch.zeros(rows, heads, B_T * B_T, dtype=a_dtype, device="cuda")
     diag = torch.zeros(rows, heads, d, device="cuda")
     r, c = torch.meshgrid(torch.arange(B_T), torch.arange(B_T), indexing="ij")
     a_index = _swizzle32(r, c).flatten().cuda()
@@ -80,7 +82,7 @@ def _records(q, k, gate, beta, cu):
         out[0][rows_b] = k_decay.to(dtype)
         out[1][rows_b] = (qc * torch.exp2(g)).to(dtype)
         out[2][rows_b] = (inv_beta.transpose(-1, -2) @ k_restore).to(dtype)
-        a_tiles[rows_b, :, a_index] = a_full.flatten(-2).to(dtype)
+        a_tiles[rows_b, :, a_index] = a_full.flatten(-2).to(a_dtype)
         diag[rows_b] = torch.exp2(g[:, :, -1])
     return (*out, a_tiles.view(torch.int32), diag)
 
@@ -99,11 +101,17 @@ def _reference(q, k, v, gate, beta, cu, state, dtype):
     return o[0], final
 
 
-def _run(v, records, cu, scale, state=None, final=False):
+def _run(v, records, cu, scale, state=None, final=False, intra_chunk_dtypes="tf32+fp16"):
     from attn_gym.linear._delta_rule.warpdrive import kda_prep_prefill
 
     return kda_prep_prefill.kda_prep_prefill(
-        v, *records, cu, scale=scale, initial_state=state, output_final_state=final
+        v,
+        *records,
+        cu,
+        scale=scale,
+        initial_state=state,
+        output_final_state=final,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
 
 
@@ -121,14 +129,22 @@ def _run(v, records, cu, scale, state=None, final=False):
     ],
     ids=["boundaries", "fp16-gqa-state", "d64-bf16-state", "ring-wrap"],
 )
-def test_kda_prep_prefill_matches_reference(lens, heads, key_heads, d, dtype, state_dtype):
+@pytest.mark.parametrize("operands", ["bf16+fp16", "bf16"])
+def test_kda_prep_prefill_matches_reference(
+    lens, heads, key_heads, d, dtype, state_dtype, operands
+):
+    if dtype == torch.float16:
+        if operands == "bf16":
+            pytest.skip("fp16 operands have one precision")
+        operands = "tf32+fp16"
     q, k, v, gate, beta, cu = _inputs(lens, heads, key_heads, d, dtype)
     state = None
     if state_dtype is not None:
         gen = torch.Generator(device="cuda").manual_seed(7)
         state = 0.1 * torch.randn(len(lens), heads, 128, d, device="cuda", generator=gen)
         state = state.to(state_dtype)
-    o, final = _run(v, _records(q, k, gate, beta, cu), cu, d**-0.5, state, state is not None)
+    records = _records(q, k, gate, beta, cu, operands)
+    o, final = _run(v, records, cu, d**-0.5, state, state is not None, operands)
     hi_o, hi_s = _reference(q, k, v, gate, beta, cu, state, torch.float64)
     lo_o, lo_s = _reference(q, k, v, gate, beta, cu, state, torch.float32)
     assert_matches_low_precision_reference(o, hi_o, lo_o, "o", source_dtype=dtype)
