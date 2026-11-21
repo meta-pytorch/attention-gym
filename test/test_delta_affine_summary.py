@@ -10,15 +10,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("cutlass")
-
-import attn_gym.linear._delta_rule.cute.affine_summary_fwd as native_fwd
-import attn_gym.linear._delta_rule.cute.affine_summary_rev as native_rev
 import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
 import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
 from attn_gym._backends.arch import runs_sm100_kernels
-from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
+from attn_gym.linear._delta_rule import summaries
 from attn_gym.linear._delta_rule.routing import LEGACY_CUTE_ENV, uses_legacy_cute
+from attn_gym.linear._delta_rule.summaries import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, plan_work_items
 from attn_gym.testing.kda import assert_relative_rms_within
 
@@ -232,8 +229,7 @@ def test_portable_affine_summaries_support_forced_int64_offsets(budget, monkeypa
     """Keep the portable single-item and split wide-address specializations executable."""
     plan_budget = Mock(return_value=budget)
     monkeypatch.setenv(LEGACY_CUTE_ENV, "0")
-    for module in (native_fwd, native_rev):
-        monkeypatch.setattr(module, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(20, tokens=640)
 
     expected_forward = build_state_summary(kg, w, u, cumulative_gate)
@@ -441,10 +437,10 @@ def test_reverse_transition_is_adjoint_of_forward_transition(dtype, tokens, head
 def test_plan_work_budget_fills_one_wave_without_tiny_items(
     max_chunks, work_tiles, sm_count, expected
 ):
-    budget = native_fwd.plan_work_budget(max_chunks, work_tiles, sm_count)
+    budget = summaries.plan_work_budget(max_chunks, work_tiles, sm_count)
     assert budget == expected
     # A scan level costs more than several chunks, so no split may produce short items.
-    assert budget == 1 or max_chunks // budget >= native_fwd.MIN_CHUNKS_PER_ITEM
+    assert budget == 1 or max_chunks // budget >= summaries.MIN_CHUNKS_PER_ITEM
 
 
 @pytest.mark.parametrize(
@@ -467,7 +463,7 @@ def test_plan_work_budget_fills_one_wave_without_tiny_items(
 def test_state_columns_leave_room_for_long_time_splits(
     max_chunks, heads, ranges, sm_count, expected
 ):
-    assert native_fwd.select_state_columns(max_chunks, heads, ranges, sm_count) == expected
+    assert summaries.select_state_columns(max_chunks, heads, ranges, sm_count) == expected
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
@@ -478,6 +474,7 @@ def test_native_summary_tile_choice_and_layout_replay(dtype, tokens, monkeypatch
         pytest.skip(
             "native state tile selection requires an SM100-family GPU and the legacy CuTe route"
         )
+    native_fwd = pytest.importorskip("attn_gym.linear._delta_rule.cute.affine_summary_fwd")
     heads = torch.cuda.get_device_properties().multi_processor_count // 8
     _, kg, w, u, _, _, gate = make_summary_inputs(89, dtype, tokens, heads)
     bounds = whole_stream(kg)
@@ -485,13 +482,13 @@ def test_native_summary_tile_choice_and_layout_replay(dtype, tokens, monkeypatch
     monkeypatch.setattr(native_fwd, "_compile_affine_summary", compile_summary)
     expected_bn = 32 if tokens == 8128 else 64
     for _ in range(2):
-        native_fwd.build_state_summaries(kg, w, u, gate, bounds)
+        summaries.build_state_summaries(kg, w, u, gate, bounds)
     assert compile_summary.call_args.args[2] == expected_bn
     assert compile_summary.call_args.kwargs["whole_ranges"] == (expected_bn == 32)
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual = native_fwd.build_state_summaries(kg, w, u, gate, bounds)
+        actual = summaries.build_state_summaries(kg, w, u, gate, bounds)
     for start, stop in ((0, tokens), (0, 0), ((tokens // 64 - 1) * 64, tokens)):
         bounds.copy_(torch.tensor([[start, stop]], device=kg.device, dtype=torch.int32))
         graph.replay()
@@ -604,8 +601,7 @@ def test_split_summaries_match_single_item_scans(dtype, monkeypatch):
     reverse_summary = partial(build_state_grad_summary, scale=128**-0.5)
     # Exercise splitting even on small devices where the production budget is one.
     plan_budget = Mock(return_value=2)
-    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
-    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     split = (
         build_state_summary(kg, w, u, cumulative_gate),
         reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
@@ -851,8 +847,7 @@ def test_range_summaries_survive_a_tiny_work_budget(dtype, monkeypatch):
     tensors = make_summary_inputs(47, dtype, tokens=640, heads=2)
     qg, kg, w, u, dout, aqk, cumulative_gate = tensors
     plan_budget = Mock(return_value=3)
-    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
-    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     ranges = [*RANGE_BOUNDS, (500, 501), (0, 65)]
     bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
 
@@ -884,8 +879,7 @@ def test_range_summaries_replay_across_layouts_in_one_cuda_graph(budget, monkeyp
     tensors = make_summary_inputs(43, tokens=640, heads=2)
     qg, kg, w, u, dout, aqk, cumulative_gate = tensors
     plan_budget = Mock(return_value=budget)
-    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
-    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     scale = 128**-0.5
     bounds = torch.tensor([[0, 256], [256, 640], [640, 640]], dtype=torch.int32, device="cuda")
 

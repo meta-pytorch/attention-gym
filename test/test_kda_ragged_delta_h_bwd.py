@@ -5,6 +5,10 @@ from __future__ import annotations
 import pytest
 import torch
 
+pytest.importorskip(
+    "attn_gym.linear.kda.bwd.cute.chunk_delta_h_bwd", reason="legacy CuTe kernel is not installed"
+)
+
 pytest.importorskip("cutlass")
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
