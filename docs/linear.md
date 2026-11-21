@@ -29,8 +29,8 @@ FP16 KDA follows the same rule as BF16. Paged calls that write
 Triton, and an explicit `"warpdrive"` raises because warpdrive cannot write checkpoints.
 
 Selection does not depend on batch size or sequence lengths. A staged backward uses the backend
-saved by its forward. Select `"warpdrive"` explicitly to use `split_forward`, `split_backward`,
-or the staged forward’s `batch_invariant` option.
+saved by its forward. Select `"warpdrive"` explicitly on forward calls to use `split_forward`,
+`split_backward` or [`batch_invariant`](#batch-invariance).
 
 Switching from Triton to warpdrive changes more than speed:
 
@@ -44,8 +44,9 @@ Switching from Triton to warpdrive changes more than speed:
   `bound_gate` floor of `-5` fits both ([KDA gate contract](#kimi-delta-attention)).
 - **Determinism.** warpdrive neither autotunes nor needs a tuning warm-up, and repeats its bits
   run to run, but its plan follows the packed shape and the SM count, so a sequence's bits can
-  depend on the rest of the batch ([Determinism](determinism.md#warpdrive-chunk-kernels)).
-  Document-aligned context parallelism is CP-degree invariant only on the fused backend
+  depend on the rest of the batch unless `batch_invariant` pins it
+  ([Batch invariance](#batch-invariance), [Determinism](determinism.md#warpdrive-chunk-kernels)).
+  Triton needs no batch-invariance flag for document-aligned context parallelism
   ([Document-aligned fragments](#document-aligned-fragments-cp-invariant-bits)).
 - **Speed.** On GB300, the default was faster than Triton on every measured BF16 GDN and KDA
   prefill and training shape below; small single-sequence calls gain least. For BF16 KDA operand
@@ -77,6 +78,45 @@ Prefill is a forward without gradients; training is a forward plus the gradients
 | KDA | 1 × 2048, 8 | no | 77 / 70 (1.10×) | 317 / 221 (1.44×) |
 | KDA | 1 × 2048, 8 | yes | 78 / 74 (1.06×) | 320 / 227 (1.41×) |
 
+### Batch invariance
+
+Set `kernel_options={"backend": "warpdrive", "batch_invariant": True}` if a sequence must give
+the same results alone or packed with other sequences. Keep its tokens, entry state, incoming
+gradients, math options, GPU model and software fixed. Its neighbors, their lengths and order,
+and the sequence's offset in the pack may change. This covers:
+
+- `chunk_kda` and `chunk_gdn`: output, final state and all gradients.
+- Paged KDA (including replay) and GDN: output and updated state slots.
+- Staged handles: `run` and state summaries in both directions. In context parallelism this
+  covers unchanged rank-local fragments, not a different split of a document across ranks.
+
+By default, warpdrive uses the packed shape and SM count to choose how to parallelize a scan.
+It may split a long sequence into pieces, compute each piece's state transition, then compose
+those transitions. KDA may instead share a preparation pass across two value tiles. Both can
+change rounding. With `batch_invariant` the forward and backward each scan the sequence without
+pieces, KDA skips shared prep, and staged summaries stay uncut. The forward may still split the
+value dimension: the two tiles update independent state rows, so their width does not change
+rounding. A staged backward inherits the forward's setting even if backward omits the flag or
+passes `False`. Passing `True` after an unpinned forward raises.
+
+The flag uses existing kernels. It leaves the default plan unchanged when neither direction
+uses a piece chain, KDA does not share prep, and staged summaries do not split. A few long
+sequences with few heads can be slower because they lose parallelism across pieces. The table
+shows that trade-off in warm CUDA Graph replay on GB300 (BF16, median of three interleaved
+rounds). The KDA measurements predate the matched TF32 backward kernels.
+
+| Shape | Forward off → on (µs) | Forward + backward off → on (µs) |
+| --- | ---: | ---: |
+| KDA 1 x 32768, 4 heads | 332 → 1938 (5.8x) | 1187 → 9759 (8.2x) |
+| KDA 1 x 32768, 16 heads | 592 → 1943 (3.3x) | 2274 → 9800 (4.3x) |
+| KDA 64 x 512, 16 heads | 246 → 246 (1.0x) | 1278 → 1278 (1.0x) |
+| GDN 1 x 32768, 4 heads | 152 → 707 (4.6x) | 574 → 4059 (7.1x) |
+| GDN 1 x 32768, 16 heads | 270 → 712 (2.6x) | 1099 → 4080 (3.7x) |
+| GDN 64 x 512, 16 heads | 123 → 123 (1.0x) | 684 → 685 (1.0x) |
+
+Select `"warpdrive"` explicitly. A forward call cannot request `batch_invariant` with `"auto"`,
+`"fused"`, `split_forward` or `split_backward`. The split schedules use the shape of the pack.
+
 ## Gated Delta Rule
 
 `chunk_gdn` and `recurrent_gdn` use the token-major layout
@@ -105,7 +145,8 @@ when few sequences leave the GPU idle and every head forgets quickly; heads that
 uncut. `recurrent_gdn(..., impl="fused")` selects the inference-only Triton scan. Pass
 `kernel_options={"batch_invariant": True}` to `recurrent_gdn` or `recurrent_kda` to make a
 sequence's bits independent of the rest of the batch
-(see [Determinism](determinism.md#kda-determinism)). Kernel-specific controls such as these live in
+(see [Determinism](determinism.md#kda-determinism)); for the chunk ops, select warpdrive
+explicitly ([Batch invariance](#batch-invariance)). These kernel controls live in
 `kernel_options`, including `{"autotune": False}`, which launches each tuned kernel's pinned
 configuration (see [Autotuned kernels](determinism.md#autotuned-kernels)); options that change the
 math, such as `fastmath`, are keyword arguments.
@@ -1101,8 +1142,9 @@ baseline, neither the fused CP baseline nor unsharded warpdrive. A split summary
 the span's token, sequence and head counts and the SM count (they fix the piece length), not on
 the bounds or on other sequences' contents; `kernel_options={"backend": "warpdrive",
 "batch_invariant": True}` on the staged handles scans every subsequence uncut instead, so its
-summaries keep their bits whatever else the stream packs (the handles' `run` still plans by the
-stream's shape); against FP64 it is as accurate as the unsplit scan,
+summaries and `run` keep their bits when their neighbors change
+([Batch invariance](#batch-invariance)). Compared with FP64, split maps are as accurate as the
+unsplit scan,
 whose 16-bit state operands already round the maps by about 4e-3 (bias) to 2e-2 (transition)
 relative L2 over thousands of tokens, so split and unsplit maps differ at that level
 (`test/test_wd_summary_split.py`). The same goes for the staged passes over the pieces: their

@@ -409,7 +409,34 @@ def test_a_later_huge_value_keeps_an_earlier_output(plan, monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("value", VALUES)
-def test_backward_differentiates_a_split_forward(value) -> None:
+def test_batch_invariant_bits_follow_the_document_not_the_pack(value) -> None:
+    """Adding a neighbor changes the forward's value tile width. With a pinned plan, that
+    must leave the document's output unchanged."""
+    heads = 64
+    q = torch.zeros(1, 1, heads, 128, device="cuda")
+    q[..., 0] = 1
+    v = torch.zeros_like(q)
+    v[..., 0], v[..., 16] = 1, 2.0**40
+    q, v = q.bfloat16(), v.bfloat16()
+    gate = torch.zeros(1, 1, heads, 128, device="cuda")
+    beta = torch.ones(1, 1, heads, device="cuda")
+    options = {**WARPDRIVE, "batch_invariant": True, "intra_chunk_dtypes": value}
+    with torch.no_grad():
+        alone, _ = chunk_kda(
+            q, q, v, gate, beta, scale=1.0, kernel_options=options,
+            cu_seqlens=cumulative_sequence_offsets([1]),
+        )  # fmt: skip
+        two = (torch.cat([t, t], 1) for t in (q, q, v, gate, beta))
+        packed, _ = chunk_kda(
+            *two, scale=1.0, kernel_options=options, cu_seqlens=cumulative_sequence_offsets([1, 1])
+        )
+    assert alone[0, 0, 0, 0].item() == 1.0
+    assert torch.equal(alone[0, 0], packed[0, 0])
+
+
+@pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "invariant"])
+@pytest.mark.parametrize("value", VALUES)
+def test_backward_differentiates_a_split_forward(value, batch_invariant) -> None:
     """Token 64 reads the unit state written by token 0 beside a much larger value channel.
     The split forward and full-width backward must both preserve that unit contribution."""
     tokens = 128
@@ -424,7 +451,7 @@ def test_backward_differentiates_a_split_forward(value) -> None:
     beta[0, 0] = 1
     d_output = torch.zeros(1, tokens, 1, 128, device="cuda", dtype=torch.bfloat16)
     d_output[0, 64, 0, 0] = 1
-    options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+    options = {**WARPDRIVE, "intra_chunk_dtypes": value, "batch_invariant": batch_invariant}
     leaves = [t.bfloat16().requires_grad_() for t in (q, k, v)]
     output, _ = chunk_kda(
         *leaves, gate, beta, scale=1.0, kernel_options=options,

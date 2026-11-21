@@ -653,6 +653,7 @@ def test_warpdrive_kernel_options_are_strict() -> None:
         "auto",
         split_backward=False,
         split_forward=False,
+        batch_invariant=False,
         autotune=True,
         schedule=ScheduleRequest.AUTO,
         intra_chunk_dtypes=None,
@@ -669,7 +670,7 @@ def test_warpdrive_kernel_options_are_strict() -> None:
         resolve_kernel_options({"unknown": True})
     with pytest.raises(ValueError, match="must be 'auto', 'fused', 'warpdrive', or 'cudnn'"):
         resolve_kernel_options({"backend": "triton"})
-    for name in ("split_backward", "split_forward"):
+    for name in ("split_backward", "split_forward", "batch_invariant"):
         with pytest.raises(TypeError, match="must be a bool"):
             resolve_kernel_options({name: 1})
         with pytest.raises(ValueError, match="requires.*warpdrive"):

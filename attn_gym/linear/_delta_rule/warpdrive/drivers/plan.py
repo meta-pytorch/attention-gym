@@ -188,6 +188,16 @@ class ForwardPlan:
         return cls(pieces, 1, num_sm) if pieces else cls.uncut(num_seqs, heads_out, dim_v, num_sm)
 
     @classmethod
+    def invariant(cls, num_seqs: int, heads_out: int, dim_v: int, device):
+        """Scan each sequence without chaining pieces. Splitting the value dimension is safe:
+        the tiles repeat the same key-side math and update independent state rows. KDA's driver
+        disables shared prep because it changes how those state updates round."""
+        # TODO: To parallelize a long sequence without depending on its neighbors, choose piece
+        # boundaries from its own length. The work table must have room for those pieces without
+        # charging short sequences the fixed cost of a chain.
+        return cls.uncut(num_seqs, heads_out, dim_v, _num_sm(device))
+
+    @classmethod
     def uncut(cls, num_seqs: int, heads_out: int, dim_v: int, num_sm: int):
         """The unchained plan, for shapes the chain does not serve (paged prefill) or loses on.
 
@@ -223,6 +233,11 @@ class BackwardPlan:
         num_sm = _num_sm(device)
         pieces = _chain_pieces(tokens, num_seqs, heads_out, num_sm, b_t, chain_cost, reverse=True)
         return cls(pieces, num_sm)
+
+    @classmethod
+    def invariant(cls, device):
+        """The uncut plan ``batch_invariant`` runs; see ``ForwardPlan.invariant``."""
+        return cls(0, _num_sm(device))
 
 
 def split_scratch(

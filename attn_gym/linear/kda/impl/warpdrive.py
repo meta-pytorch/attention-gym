@@ -33,10 +33,10 @@ def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) ->
 class ChunkKdaWarpdrive(torch.autograd.Function):
     """Attach warpdrive's BT16 backward to the warpdrive forward.
 
-    The kernel choice depends only on which states the call carries, never on the span length,
-    so a document's bits do not depend on the span it is packed into. With an entry
-    state the backward carries the state cotangent in FP32 across chunks, chain pieces and work
-    items (``test/linear/test_delta_rule_state_precision.py``).
+    Optional entry and exit states determine which operator is called. Forward and backward
+    normally choose their own plans from the packed shape. When the forward pins its plan with
+    ``batch_invariant``, the backward also runs unchained. With an entry state the backward
+    carries the state cotangent in FP32 across chunks, pieces and work items.
     """
 
     @staticmethod
@@ -56,11 +56,13 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         fastmath: bool,
         intra_chunk_dtypes: str,
         nonempty: bool,
+        batch_invariant: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # Rebuild the forward's operands at the same precision during backward.
         ctx.split_backward = split_backward
         ctx.intra_chunk_dtypes = intra_chunk_dtypes
         ctx.scale, ctx.fastmath = scale, fastmath
+        ctx.batch_invariant = batch_invariant
         if output_final_state:
             # A zero entry state has no cotangent: the backward then skips every state access.
             entry_state = initial_state
@@ -85,6 +87,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 fastmath,
                 nonempty,
                 intra_chunk_dtypes,
+                batch_invariant,
             )
         elif initial_state is None:
             output = chunk_warpdrive_packed_fwd_op(
@@ -98,6 +101,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 scale,
                 fastmath,
                 intra_chunk_dtypes,
+                batch_invariant,
             )
         else:
             output = chunk_warpdrive_packed_fwd_with_initial_state_op(
@@ -111,6 +115,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 scale,
                 fastmath,
                 intra_chunk_dtypes,
+                batch_invariant,
             )
         ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
         ctx.set_materialize_grads(False)
@@ -136,6 +141,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 ctx.scale,
                 ctx.fastmath,
                 ctx.intra_chunk_dtypes,
+                ctx.batch_invariant,
             )
             gradients = (*gradients, None)
         elif initial_state is None:
@@ -151,6 +157,7 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 ctx.scale,
                 ctx.fastmath,
                 ctx.intra_chunk_dtypes,
+                ctx.batch_invariant,
             )
             gradients = (*gradients, None)
         else:
@@ -167,8 +174,9 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 ctx.scale,
                 ctx.fastmath,
                 ctx.intra_chunk_dtypes,
+                ctx.batch_invariant,
             )
-        return *gradients, *(None,) * 8
+        return *gradients, *(None,) * 9
 
 
 def validate_warpdrive_constraints(q: torch.Tensor, value: torch.Tensor) -> None:
@@ -198,6 +206,7 @@ def chunk_forward(
     split_backward: bool = False,
     split_forward: bool = False,
     intra_chunk_dtypes: str,
+    batch_invariant: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Run the optional warpdrive implementation behind the shared ``chunk_kda`` contract."""
     scale = resolve_scale(scale, q.shape[-1])
@@ -234,6 +243,7 @@ def chunk_forward(
         fastmath,
         intra_chunk_dtypes,
         nonempty,
+        batch_invariant,
     )
     output, final_state = result if output_final_state else (result, None)
     return output.reshape(output_shape).to(output_dtype), final_state
@@ -253,9 +263,10 @@ def paged_chunk_forward(
     scale: float,
     replay_state: ReplayState | None = None,
     intra_chunk_dtypes: str,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     """Advance selected state-cache slots with the warpdrive KDA kernels, optionally through
-    replay-backed decode and prefill."""
+    replay-backed decode and prefill; ``batch_invariant`` pins the plans of both."""
     require_inference_only(
         (q, k, value, gate, beta, state_cache, *(replay_state or ())),
         "paged_chunk_kda is inference-only; call under torch.no_grad() or torch.inference_mode()",
@@ -263,9 +274,8 @@ def paged_chunk_forward(
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
     validate_warpdrive_constraints(q, value)
-    paged_forward = partial(
-        _paged_chunk_state_forward, scale=scale, intra_chunk_dtypes=intra_chunk_dtypes
-    )
+    options = {"intra_chunk_dtypes": intra_chunk_dtypes, "batch_invariant": batch_invariant}
+    paged_forward = partial(_paged_chunk_state_forward, scale=scale, **options)
     if replay_state is None:
         return paged_forward(
             q,
@@ -289,7 +299,7 @@ def paged_chunk_forward(
         replay_state,
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
-        chunk_forward=partial(chunk_forward, scale=scale, intra_chunk_dtypes=intra_chunk_dtypes),
+        chunk_forward=partial(chunk_forward, scale=scale, **options),
         paged_forward=paged_forward,
     )
 
@@ -307,6 +317,7 @@ def _paged_chunk_state_forward(
     has_initial_state: torch.Tensor | None,
     scale: float,
     intra_chunk_dtypes: str,
+    batch_invariant: bool,
     state_checkpoints: None = None,
 ) -> torch.Tensor:
     """Advance selected state-cache slots with the paged warpdrive KDA forward.
@@ -331,6 +342,7 @@ def _paged_chunk_state_forward(
         cu_seqlens,
         scale,
         intra_chunk_dtypes,
+        batch_invariant,
     )
     return output.reshape(output_shape).to(output_dtype)
 

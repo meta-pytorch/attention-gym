@@ -23,12 +23,7 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
-from attn_gym.linear.types import (
-    KERNEL_OPTION_SPEC,
-    STAGE_OPTION_SPEC,
-    IntraChunkDtypes,
-    ReplayState,
-)
+from attn_gym.linear.types import KERNEL_OPTION_SPEC, IntraChunkDtypes, ReplayState
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 # ``intra_chunk_dtypes`` when the option is omitted, and the one kernel set of FP16 Q/K/V.
@@ -43,27 +38,22 @@ class ResolvedKernelOptions(NamedTuple):
     backend: Literal["auto", "fused", "warpdrive"]
     split_backward: bool
     split_forward: bool
+    batch_invariant: bool
     autotune: bool
     schedule: ScheduleRequest
     # ``None`` when omitted; ``resolve_intra_chunk_dtypes`` picks the default by input dtype.
     intra_chunk_dtypes: IntraChunkDtypes | None
-    batch_invariant: bool = False  # staged handles only
 
 
 def resolve_kernel_options(
     kernel_options: Mapping[str, object] | None,
     *,
     op_name: str = "chunk_kda",
-    staged: bool = False,
     tape_backend: str | None = None,
 ) -> ResolvedKernelOptions:
-    """Validate chunk backend options and resolve their defaults; ``staged`` also accepts the
-    staged handles' ``batch_invariant`` (:class:`attn_gym.linear.types.StageKernelOptions`).
-    ``tape_backend`` resolves a staged backward's options against its saved tape's backend
-    (:func:`attn_gym.linear._delta_rule.validation.resolve_chunk_kernel_options`)."""
-    spec = STAGE_OPTION_SPEC if staged else KERNEL_OPTION_SPEC
+    """Validate chunk options, using the saved forward backend for a staged backward."""
     options = resolve_chunk_kernel_options(
-        kernel_options, spec, op_name=op_name, tape_backend=tape_backend
+        kernel_options, KERNEL_OPTION_SPEC, op_name=op_name, tape_backend=tape_backend
     )
     # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
     options["schedule"] = ScheduleRequest(options["schedule"])

@@ -168,13 +168,6 @@ following guarantees apply to Triton:
   (GB300). The fused decode ops (`recurrent_kda_decode`, `recurrent_gdn_decode`)
   do not support it. For batch-invariant decode, apply `gate_transform`, the beta
   sigmoid and `l2norm` yourself, then call the scan with one token per sequence.
-- **Warpdrive context-parallel summaries with `kernel_options={"backend": "warpdrive",
-  "batch_invariant": True}` on `chunk_kda_prepare` / `chunk_gdn_prepare` (and their backward
-  handles): bitwise across packs.** By default a long sequence's `state_summaries` and
-  `state_grad_summaries` split into pieces whose length follows the packed stream's shape, so
-  its bits change with the other sequences. The option scans every sequence uncut in both
-  directions. It does not cover the handles' `run`, whose plan still follows the stream's
-  shape; like the split schedules, it requires an explicit `"backend": "warpdrive"`.
 - **CUDA-graph replay: bitwise** by construction, and the intended serving mode
   for decode.
 - **Across lowerings: never bitwise.** Dense versus packed, chunked versus
@@ -195,14 +188,17 @@ for the selection rule. Set `kernel_options={"backend": "fused"}` to use Triton 
 - **Run to run: bitwise.** Warpdrive does not autotune. Its atomics assign work and populate
   work tables; they do not determine the order of a numerical reduction. Repeating a call with
   the same inputs, shape, GPU and software reproduces its outputs, final states and gradients.
-- **Across batch compositions: not bitwise.** The plan (forward and backward piece chains, the
-  KDA value split and its prep pass, the piece length of the staged and context-parallel
-  summaries) follows the packed shape and the SM count, so a sequence's bits can change with
-  the other sequences packed beside it, and between GPU models with different SM counts. When
-  the summaries split, the staged `run` reuses their pieces, so its bits follow that piece
-  length too and differ from the public op's on the same stream.
-  [Document-aligned fragments](linear.md#document-aligned-fragments-cp-invariant-bits) gives
-  measured examples.
+- **Across batch compositions: not guaranteed by default.** The packed shape and SM count can
+  change whether warpdrive chains pieces of a sequence, shares KDA prep or splits staged
+  summaries. A staged `run` reuses the summaries' pieces, so its results can also differ from
+  an ordinary chunk call on the same stream.
+- **Across batch compositions with `batch_invariant`: bitwise.** Set
+  `kernel_options={"backend": "warpdrive", "batch_invariant": True}`. For fixed inputs to a
+  sequence, changing its neighbors preserves output, final-state and gradient bits. This also
+  covers paged updates (including replay), staged `run` and summaries, and unchanged rank-local
+  fragments in context parallelism. It does not cover repartitioning a document across ranks.
+  A few long sequences lose parallelism; see [Batch invariance](linear.md#batch-invariance)
+  for the plan details and measurements.
 - **Across operand precisions: not guaranteed.** For BF16 KDA, `"bf16"` preserves legacy
   warpdrive bits; the default `"tf32+bf16"` changes operand rounding in both directions. Native
   FP16 KDA has a single precision ([Operand precision](linear.md#operand-precision)).

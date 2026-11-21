@@ -152,6 +152,8 @@ def chunk_kda(
             or ``"bf16"``. FP16 kernels default to ``"tf32+fp16"`` and accept no other value.
             Replay-backed ``paged_chunk_kda`` uses BF16 even for FP16 inputs. Incompatible
             choices raise on every implementation. See "Operand precision" in ``docs/linear.md``.
+            With explicit warpdrive, ``"batch_invariant": True`` keeps each sequence's outputs,
+            final state and gradients bitwise independent of its neighbors.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -191,6 +193,7 @@ def chunk_kda(
                 split_backward=options.split_backward,
                 split_forward=options.split_forward,
                 intra_chunk_dtypes=intra_chunk_dtypes,
+                batch_invariant=options.batch_invariant,
             )
         return _fused_chunk_forward(
             q,
@@ -261,9 +264,9 @@ def paged_chunk_kda(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
-        kernel_options: Backend, schedule and precision follow ``chunk_kda``. Replay casts Q/K/V
-            to BF16 before choosing operand precision. Paged execution does not support
-            ``split_forward`` or ``split_backward``. ``"autotune"`` only tunes Triton kernels.
+        kernel_options: Backend, schedule, precision and batch invariance follow ``chunk_kda``.
+            Replay casts Q/K/V to BF16 before choosing operand precision. Paged execution does
+            not support split schedules. ``"autotune"`` only tunes Triton kernels.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five
             token caches have shape ``[num_slots, 64, ...]``; every count must remain in
@@ -341,6 +344,7 @@ def paged_chunk_kda(
             scale=resolve_scale(None, q.shape[-1]),
             replay_state=replay_state,
             intra_chunk_dtypes=intra_chunk_dtypes,
+            batch_invariant=options.batch_invariant,
         )
     return _fused_paged_chunk_forward(
         q,

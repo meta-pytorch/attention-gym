@@ -89,6 +89,8 @@ def chunk_gdn(
             :class:`attn_gym.linear.types.SplitOptions`). Triton benchmarks candidate
             configurations by default; ``"autotune": False`` or deterministic algorithms pin the
             forward and backward configurations. Warpdrive selects a plan without benchmarking.
+            With explicit warpdrive, ``"batch_invariant": True`` keeps each sequence's outputs,
+            final state and gradients bitwise independent of its neighbors.
 
     Returns:
         The output in ``q.dtype`` and either the final recurrent state or ``None``.
@@ -112,6 +114,7 @@ def chunk_gdn(
                 output_final_state=output_final_state,
                 split_backward=options["split_backward"],
                 split_forward=options["split_forward"],
+                batch_invariant=options["batch_invariant"],
             )
         return fused_chunk_forward(
             q,
@@ -179,10 +182,10 @@ def paged_chunk_gdn(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence. False
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
-        kernel_options: Backend selection follows ``chunk_gdn``. Paged execution does not support
-            split schedules. Set ``"autotune": False`` or enable deterministic algorithms to pin
-            the Triton factor and output kernels. The recurrence that advances
-            ``state_cache`` never tunes; neither does warpdrive.
+        kernel_options: Backend selection and batch invariance follow ``chunk_gdn``. Paged
+            execution does not support split schedules. Triton tunes its factor and output kernels
+            unless ``"autotune": False`` or deterministic algorithms pin them. The recurrence that
+            advances ``state_cache`` never tunes; neither does warpdrive.
 
         state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
             state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
@@ -226,6 +229,7 @@ def paged_chunk_gdn(
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
             scale=scale,
+            batch_invariant=options["batch_invariant"],
         )
     return fused_paged_chunk_forward(
         q,

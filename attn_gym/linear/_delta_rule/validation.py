@@ -107,8 +107,9 @@ def resolve_chunk_kernel_options(
     """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
     ``"cudnn"``, the backend's former name, resolves to ``"warpdrive"`` here, so every later
-    check sees one spelling. Split schedules and the staged handles' ``batch_invariant`` require
-    an explicit ``backend="warpdrive"``.
+    check sees one spelling. Split schedules and ``batch_invariant`` require an explicit
+    ``backend="warpdrive"`` and exclude each other: the split work tables follow the stream's
+    shape.
 
     A staged backward inherits its saved forward's backend when the caller omits the backend
     or requests ``"auto"``. An explicit backend must match the saved one.
@@ -126,6 +127,8 @@ def resolve_chunk_kernel_options(
     for name in ("split_backward", "split_forward", "batch_invariant"):
         if options.get(name) and options["backend"] != "warpdrive":
             raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")
+    if options["batch_invariant"] and (options["split_backward"] or options["split_forward"]):
+        raise ValueError("batch_invariant excludes the split schedules")
     return options
 
 
