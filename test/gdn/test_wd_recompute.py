@@ -57,7 +57,7 @@ def _table(lens, heads, cu, warmup=None):
     return torch.tensor(rows, dtype=torch.int32, device="cuda").reshape(-1, 10)
 
 
-def _run(k, v, gate, beta, cu, lens, state, items, max_ctas=None):
+def _run(k, v, gate, beta, cu, lens, state, items, max_ctas=None, op=None):
     from attn_gym.linear._delta_rule.warpdrive import gdn_recompute, gdn_tinv
 
     heads, d_k, d_v = gate.shape[1], k.shape[2], v.shape[2]
@@ -71,7 +71,7 @@ def _run(k, v, gate, beta, cu, lens, state, items, max_ctas=None):
     ckpt.view(torch.int16).fill_(POISON)
     n_items = torch.tensor([items.shape[0]], dtype=torch.int32, device="cuda")
     gdn_recompute.gdn_recompute(
-        k, v, gate, tinv, items, n_items, ckpt, state_in=state, max_ctas=max_ctas
+        k, v, gate, tinv, items, n_items, ckpt, state_in=state, max_ctas=max_ctas, op=op
     )
     return ckpt
 
@@ -202,6 +202,25 @@ def test_gdn_recompute_checkpoint_rows_are_closed_form():
     torch.testing.assert_close(ckpt[first], state.to(torch.bfloat16), atol=0, rtol=0)
     padding = sorted(set(range(ckpt.shape[0])) - written)
     assert (ckpt[padding].view(torch.int16) == POISON).all(), "a padding row was written"
+
+
+def test_gdn_recompute_checks_a_supplied_op_against_the_state():
+    """A supplied op names its state dtype as every warpdrive constructor does (``"fp32"``): it
+    runs an FP32 entry state bit for bit like the wrapper's own op and rejects a BF16 state or
+    none."""
+    from attn_gym.linear._delta_rule.warpdrive import gdn_recompute
+
+    lens, heads = (300, 129), 2
+    k, v, gate, beta, cu, state = _inputs(lens, heads, 1, 128, 128, torch.bfloat16, torch.float32)
+    items = _table(lens, heads, cu)
+    op = gdn_recompute.GdnRecompute("bf16", 128, 128, True, state_dtype="fp32")
+    want = _run(k, v, gate, beta, cu, lens, state, items)
+    got = _run(k, v, gate, beta, cu, lens, state, items, op=op)
+    assert torch.equal(got.view(torch.int16), want.view(torch.int16))
+    with pytest.raises(ValueError, match="state_dtype"):
+        _run(k, v, gate, beta, cu, lens, state.bfloat16(), items, op=op)
+    with pytest.raises(ValueError, match="use_initial_state"):
+        _run(k, v, gate, beta, cu, lens, None, items, op=op)
 
 
 def test_gdn_recompute_reuses_one_compile_across_runtime_shapes():

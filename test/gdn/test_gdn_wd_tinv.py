@@ -92,6 +92,27 @@ def test_gdn_tinv_matches_reference(lens, heads, key_heads, d_k, dtype, beta_dty
         torch.testing.assert_close(got, ref, atol=atol, rtol=0, msg=f"tile row {row}")
 
 
+def test_gdn_tinv_switches_beta_dtype_through_the_cache():
+    """Beta's dtype is a constructor argument: FP32, BF16, then FP32 beta (K and the shape
+    fixed) each match the reference for the beta passed, from two compiles, and the second FP32
+    run repeats the first bit for bit."""
+    from attn_gym.linear._delta_rule.warpdrive import gdn_tinv
+
+    lens, heads = (300, 77), 4
+    k, gate, beta, cu = _inputs(lens, heads, 2, 128, torch.bfloat16, torch.float32)
+    gdn_tinv.compile_gdn_tinv.cache_clear()
+    results = []
+    for passed in (beta, beta.bfloat16(), beta):
+        tinv = _run(k, gate, passed, cu, lens, heads)[0]
+        for row, (ref, n) in _reference(k, gate, passed, lens, heads).items():
+            got = tinv[row, :, :n, :n].double()
+            torch.testing.assert_close(got, ref, atol=1e-2, rtol=0, msg=f"tile row {row}")
+        results.append(tinv)
+    assert torch.equal(results[0].view(torch.int16), results[2].view(torch.int16))
+    assert not torch.equal(results[0], results[1])
+    assert gdn_tinv.compile_gdn_tinv.cache_info().currsize == 2
+
+
 def test_gdn_tinv_reuses_one_compile_across_runtime_shapes():
     """Tokens, sequence count and head counts stay runtime values of one specialization."""
     from attn_gym.linear._delta_rule.warpdrive import gdn_tinv
