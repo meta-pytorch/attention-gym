@@ -170,6 +170,36 @@ def test_fastmath_false_matches_fastmath_true_bitwise_in_the_gate_range(plan: st
         torch.testing.assert_close(exact, fast, rtol=0, atol=0, msg=f"result {index}")
 
 
+def test_unsplit_summaries_match_across_fastmath_bitwise(monkeypatch) -> None:
+    """Unsplit summaries share their arithmetic in both modes within the gate range; split ones
+    compose on different walks (3xTF32 or FP32 FMA), so docs/linear.md excludes them."""
+    from attn_gym.linear._delta_rule.warpdrive.drivers import summary
+
+    monkeypatch.setattr(summary, "summary_span", lambda *args, **kwargs: 0)
+    lengths = [200, 65, 1, 127]
+    q, k, value, gate, beta = make_kda_test_inputs(
+        sum(lengths), heads=2, seed=5, normalize_qk=True, sigmoid_beta=True
+    )
+    d_output = torch.randn_like(value)
+    cu = cumulative_sequence_offsets(lengths)
+    bounds = torch.stack((cu[:-1], cu[1:]), dim=1).contiguous()
+    results = []
+    for fastmath in (True, False):
+        prepared = chunk_kda_prepare(
+            q, k, value, gate, beta,
+            cu_seqlens=cu,
+            fastmath=fastmath,
+            kernel_options=WARPDRIVE,
+        )  # fmt: skip
+        backward = chunk_kda_prepare_backward(
+            prepared.saved, d_output, None, scale=prepared.scale, fastmath=fastmath,
+            kernel_options=WARPDRIVE,
+        )  # fmt: skip
+        results.append((prepared.state_summaries(bounds), backward.state_grad_summaries(bounds)))
+    for fast, exact in zip(*results, strict=True):
+        torch.testing.assert_close(exact, fast, rtol=0, atol=0)
+
+
 PACKAGE = "attn_gym.linear._delta_rule.warpdrive"
 # (module, class, constructor arguments, compile function, its arguments after the op)
 GATE_KERNELS = [

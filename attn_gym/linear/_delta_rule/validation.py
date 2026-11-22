@@ -107,7 +107,11 @@ def warn_cudnn_backend_renamed() -> None:
 
 
 def resolve_chunk_kernel_options(
-    kernel_options: Mapping[str, object] | None, spec: KernelOptionSpec, *, op_name: str
+    kernel_options: Mapping[str, object] | None,
+    spec: KernelOptionSpec,
+    *,
+    op_name: str,
+    tape_backend: str | None = None,
 ) -> dict[str, Any]:
     """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
@@ -115,12 +119,23 @@ def resolve_chunk_kernel_options(
     ``backend="warpdrive"``. The backend's former name, ``"cudnn"``, still
     selects it and warns once per process, outside ``torch.compile`` tracing (Dynamo cannot trace
     ``warnings.warn`` in a full graph).
+
+    A staged backward passes its saved tape's backend as ``tape_backend``: the tape fixes the
+    backend, so an omitted ``"backend"`` resolves to it, an explicit one must name it, and the
+    backend-dependent options are checked against it.
     """
     if kernel_options is not None and kernel_options.get("backend") == "cudnn":
         if not torch.compiler.is_compiling():
             warn_cudnn_backend_renamed()
         kernel_options = {**kernel_options, "backend": "warpdrive"}
+    if tape_backend is not None:
+        kernel_options = {"backend": tape_backend, **(kernel_options or {})}
     options = validate_kernel_options(kernel_options, spec, op_name=op_name)
+    if tape_backend is not None and options["backend"] != tape_backend:
+        raise ValueError(
+            f"kernel_options['backend']={options['backend']!r} does not match the saved "
+            f"{tape_backend!r} tape"
+        )
     for name in ("split_backward", "split_forward", "batch_invariant"):
         if options.get(name) and options["backend"] != "warpdrive":
             raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")

@@ -367,7 +367,8 @@ def final_reference(main_rows, h, m, seed_state, transpose):
 
 @pytest.mark.parametrize(
     ("lens", "pieces", "heads", "dim_v", "dim_k"),
-    # One sequence and head: the default block of a 64 + 128-row map chain is 24 rows.
+    # One sequence and head: the default blocks of a 64 + 128-row map chain must give every FMA
+    # walk warp whole rows and start a block at the bias boundary.
     [*STATE_CASES, ([300, 64, 0, 5000], 6, 2, 128, 128), ([5000], 4, 1, 64, 128)],
 )
 @pytest.mark.parametrize("transpose", [False, True])
@@ -376,7 +377,8 @@ def test_state_chain_final_matches_fp64(lens, pieces, heads, dim_v, dim_k, trans
     """``final`` receives each sequence's seed composed through all its slots, one-slot
     sequences included, while every slot's incoming state still lands in ``X``. A map chain
     (``H`` with only the bias rows of a ``[bias; transition]`` state) seeds ``[0; I]`` itself
-    and adds no bias to the transition rows."""
+    and adds no bias to the transition rows; chained alone from the bias boundary, the
+    transition rows of ``final`` and ``X`` keep the full map's bits."""
     main_rows, h, m, seed_state, _ = state_case(
         lens, pieces, heads, dim_v, dim_k, torch.float32, False
     )
@@ -409,6 +411,39 @@ def test_state_chain_final_matches_fp64(lens, pieces, heads, dim_v, dim_k, trans
             final=final_only,
         )  # fmt: skip
         assert torch.equal(final_only.view(torch.int32), final.view(torch.int32))
+        if maps:
+            transition = torch.full_like(final, float("nan"))
+            pc().state_chain(
+                h, m, None, main_rows, transpose=transpose, rows=walk_rows, final=transition,
+                first_row=dim_v,
+            )  # fmt: skip
+            got, want = transition[:, :, dim_v:], final[:, :, dim_v:]
+            assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+            x_transition = torch.full_like(x, float("nan"))
+            pc().state_chain(
+                h, m, x_transition, main_rows, transpose=transpose, rows=walk_rows,
+                final=transition, first_row=dim_v,
+            )  # fmt: skip
+            got, want = x_transition[filled][:, :, dim_v:], x[filled][:, :, dim_v:]
+            assert torch.equal(got.view(torch.int32), want.view(torch.int32))
+
+
+def test_state_chain_rejects_a_final_buffer_short_of_the_sequences():
+    """The grid runs one CTA row per sequence of ``main_rows`` and stores ``final[seq]``, so a
+    ``final`` with fewer rows would take stores past its end."""
+    main_rows, h, m, _, _ = state_case([4096, 4096], 4, 2, 128, 128, None, False)
+    final = torch.empty(1, 2, 128, 128, device="cuda")
+    with pytest.raises(ValueError, match="final must hold 2"):
+        pc().state_chain(h, m, None, main_rows, final=final)
+
+
+def test_state_chain_rejects_a_final_buffer_of_other_states():
+    """``final`` must hold the states ``X`` holds: fewer heads would take stores past its end."""
+    main_rows, h, m, _, _ = state_case([4096, 4096], 4, 2, 128, 128, None, False)
+    x = torch.empty(8, 2, 128, 128, device="cuda")
+    for shape in ((2, 1, 128, 128), (2, 2, 64, 128)):
+        with pytest.raises(ValueError, match="final must hold 2"):
+            pc().state_chain(h, m, x, main_rows, final=torch.empty(shape, device="cuda"))
 
 
 def test_state_chain_reuses_one_compile_across_runtime_shapes():
