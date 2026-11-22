@@ -440,7 +440,8 @@ an optional measured overlay drawn as a second lane per CTA. Measured `tracks` (
 ranges) expand under a CTA when it is focused. In a measured Qwen timeline, an overlapping
 producer points into the consumer bar at the end of its recorded input poll, if one poll can be
 matched to one scheduled gate. Otherwise hover outlines the producer without claiming a handoff
-time. The endpoints are recorded timestamps, not a measurement of signal latency. Items with
+time. Both endpoints are recorded timestamps. The scheduler selected the producer: the arrow
+does not identify which CTA actually released the poll or measure signal latency. Items with
 2-D coordinates get a work-space map.
 Two examples use it:
 

@@ -192,8 +192,9 @@ def schedule_html(
     if measured:
         about.append(
             "Measured: timestamps recorded on the GPU during a real launch of this same "
-            "schedule. Overlapping dependencies point to the end of a uniquely matched input "
-            "wait. An outlined producer without an arrow means no handoff time was identified."
+            "schedule. An overlap arrow connects the scheduled producer’s measured end to the "
+            "consumer’s recorded poll end; it does not identify which CTA released the poll. "
+            "An outlined producer has no uniquely matched wait."
         )
     about.append("Each row is one CTA (thread block); each box is one work item.")
     if tracks:

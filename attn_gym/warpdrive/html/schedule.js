@@ -264,7 +264,7 @@ function timeline(parent) {
             const down = py < sy;
             waitArrow(ctx, v.x(p.end), py + v.lh / 2, v.x(D.waitEnd[i]), down ? sy : sy + v.lh);
           } else {
-            ctx.strokeStyle = palette.amber;
+            ctx.strokeStyle = palette.amber; ctx.lineWidth = 1;
             ctx.strokeRect(v.x(p.start), py, Math.max(2, v.x(p.end) - v.x(p.start)), v.lh);
           }
         }
