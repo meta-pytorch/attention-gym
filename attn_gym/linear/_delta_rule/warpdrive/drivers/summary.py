@@ -173,6 +173,10 @@ def _plan_summary_pieces(
     end = tl.load(cu + sequences)
     for tail in range(piece, capacity + 1, PIECE_BLOCK):
         tl.store(cu_pieces + tail + pieces, end, tail + pieces <= capacity)
+        # An unused piece's first work item, past the count, still limits gdn_tinv to zero
+        # chunks (_Launch.selected_chunks).
+        unused = (tail + pieces) * HEADS * FIELDS + 5
+        tl.store(work + unused, 0, tail + pieces < capacity)
     tl.store(count, item)
 
 
@@ -335,6 +339,12 @@ class _Launch:
     @property
     def split(self) -> bool:
         return self.cu_pieces is not None
+
+    @property
+    def selected_chunks(self) -> torch.Tensor:
+        """Each map row's chunk count, zero for an unselected sequence or an unselected or
+        unused piece: its first head's work item ``compute_end``."""
+        return self.work_items.view(self.map_rows, -1, WORK_ITEM_FIELDS)[:, 0, 5]
 
     @classmethod
     def prepare(
@@ -822,16 +832,32 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
     return torch.cuda.Stream(device)
 
 
+# NOTE [Summary-only chunk inverses]
+# A rank summarizes only ranges that continue on neighboring ranks. The chunk-inverse pass uses
+# the selector's per-sequence selection to list only chunks that overlap those bounds.
+# Each tile's row comes from its table entry, not its position in the table.
+# The count stays on device, and the grid depends only on shape so CUDA Graph replay can use
+# different bounds. Staged local passes read every tile and keep the full table.
+
+
 def _gdn_tinv(
-    k: torch.Tensor, gate: torch.Tensor, beta: torch.Tensor, cu_seqlens: torch.Tensor
+    k: torch.Tensor,
+    gate: torch.Tensor,
+    beta: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_limits: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """``gdn_tinv``'s chunk-inverse tiles for every sequence (or piece) of ``cu_seqlens``: both
-    GDN summaries read them."""
+    """``gdn_tinv``'s chunk-inverse tiles for the sequences (or pieces) of ``cu_seqlens``: both
+    GDN summaries read them. With ``chunk_limits`` (the selection's chunk counts), only each
+    sequence's first that many: the rest of a rank's documents would cost up to ~45% of a
+    summary launch (NOTE [Summary-only chunk inverses])."""
     tokens, heads = gate.shape
     rows = gdn_tinv.tinv_rows(tokens, cu_seqlens.shape[0] - 1)
     tinv = torch.empty(rows, heads, gdn_tinv.B_T, gdn_tinv.B_T, dtype=k.dtype, device=k.device)
     row_table = int32(rows * 4, k.device).view(rows, 4)
-    gdn_tinv.gdn_tinv(k, gate, beta, cu_seqlens, tinv, row_table, int32(1, k.device))
+    gdn_tinv.gdn_tinv(
+        k, gate, beta, cu_seqlens, tinv, row_table, int32(1, k.device), chunk_limits=chunk_limits
+    )
     return tinv
 
 
@@ -845,7 +871,8 @@ def _gdn_launch(
 ) -> tuple[_Launch, torch.Tensor]:
     """The selected work and the chunk inverses of its sequences or pieces."""
     launch = _Launch.prepare(cu_seqlens, k.shape[0], gate.shape[1], bounds, gdn_summary.B_T, cost)
-    tinv = _gdn_tinv(k, gate, beta, launch.cu_pieces if launch.split else cu_seqlens)
+    cu = launch.cu_pieces if launch.split else cu_seqlens
+    tinv = _gdn_tinv(k, gate, beta, cu, launch.selected_chunks)
     return launch, tinv
 
 

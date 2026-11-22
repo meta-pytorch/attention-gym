@@ -186,12 +186,21 @@ class GdnTinv(WarpSpecialized):
 
     Beta may be fp32 or 16-bit; its loads follow the traced tensor's element type."""
 
-    def __init__(self, dtype_name: str, d_k: int, *, beta_dtype: str | None = None):
+    def __init__(
+        self,
+        dtype_name: str,
+        d_k: int,
+        *,
+        beta_dtype: str | None = None,
+        limit_chunks: bool = False,
+    ):
         if d_k not in HEAD_DIMS:
             raise ValueError(f"the chunk-factor pass serves d_k in {HEAD_DIMS}, got {d_k}")
         self.dtype_name, self.d_k = dtype_name, d_k
         # Standalone compiles read these; a bundle's host passes its own tensors (None).
         self.beta_dtype = beta_dtype
+        # Per-sequence chunk limits trim the row table (the summaries' selection).
+        self.limit_chunks = limit_chunks
         self.io_dtype = _CUTE_DTYPES[dtype_name]
         self.smem_plan = SmemPlan()
         k_buf = self.smem_plan.buffer("K", self.io_dtype, align=1024)
@@ -643,12 +652,16 @@ class GdnTinv(WarpSpecialized):
         tinv: cute.Tensor,  # (tinv rows, heads, 64, 64)
         rows: cute.Tensor,  # (tinv rows, 4) int32
         row_count: cute.Tensor,  # (1,) int32
+        chunk_limits: cute.Tensor | None,  # (num_seqs,) int32, with limit_chunks
         workspace: cute.Tensor,
         tma_slots: cute.Tensor,  # (>= self.tma_slot_rows(heads), 16) int64
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        self.launch(k, gate, beta, cu_seqlens, tinv, rows, row_count, tma_slots, max_ctas, stream)
+        self.launch(
+            k, gate, beta, cu_seqlens, tinv, rows, row_count, tma_slots, max_ctas, stream,
+            chunk_limits=chunk_limits,
+        )  # fmt: skip
 
     @cute.jit
     def launch(
@@ -664,10 +677,12 @@ class GdnTinv(WarpSpecialized):
         max_ctas: Int32,
         stream: cuda.CUstream,
         emit_row_table: cutlass.Constexpr[bool] = True,
+        chunk_limits: cute.Tensor | None = None,
     ):
         """Launch the row-table kernel (unless the caller already built ``rows`` and
         ``row_count`` on this stream) and the T pass; callable from another ``@cute.jit``
-        host, such as a fused launch bundle."""
+        host, such as a fused launch bundle. ``chunk_limits`` caps each sequence's listed chunks
+        (``work_tables.emit_chunk_rows``); the listed tiles land at their usual rows."""
         io = self.io_dtype
         heads = Int32(gate.shape[1])
         key_group = heads // Int32(k.shape[1])
@@ -701,7 +716,7 @@ class GdnTinv(WarpSpecialized):
             cpasync.CopyBulkTensorTileS2GOp(), mTinv, box_layout, (B_T, B_T)
         )
         if cutlass.const_expr(emit_row_table):
-            emit_rows(cu_seqlens, Int32(k.shape[0]), rows, row_count).launch(
+            emit_rows(cu_seqlens, Int32(k.shape[0]), rows, row_count, chunk_limits).launch(
                 grid=(1, 1, 1), block=(32, 1, 1), stream=stream
             )
         # One CTA per SM, each owning a contiguous block of the (device-counted) tiles.
@@ -729,12 +744,18 @@ class GdnTinv(WarpSpecialized):
 
 
 @cute.kernel
-def emit_rows(cu_seqlens: cute.Tensor, tokens: Int32, rows: cute.Tensor, row_count: cute.Tensor):
+def emit_rows(
+    cu_seqlens: cute.Tensor,
+    tokens: Int32,
+    rows: cute.Tensor,
+    row_count: cute.Tensor,
+    chunk_limits: cute.Tensor | None,
+):
     """One warp: check ``cu_seqlens`` against ``tokens``, then the row table of 64-token chunks
-    (``work_tables.emit_chunk_rows``)."""
+    (``work_tables.emit_chunk_rows``), capped by ``chunk_limits`` when given."""
     lane = Int32(cute.arch.thread_idx()[0])
     check_packed_offsets(cu_seqlens, tokens, lane, 32)
-    emit_chunk_rows(B_T, cu_seqlens, rows, row_count, lane)
+    emit_chunk_rows(B_T, cu_seqlens, rows, row_count, lane, chunk_limits)
 
 
 def bundle_hook(io_dtype, d_k: int, num_sm: int, log_gate: bool) -> tuple[GdnTinv, int]:
@@ -767,6 +788,9 @@ def compile_gdn_tinv(op: GdnTinv):
         make_fake_strided_tensor(io, (rows, heads, B_T, B_T), stride_divisibility=8),
         make_fake_strided_tensor(i32, (rows, 4), contiguous_dim=None),
         make_fake_strided_tensor(i32, (1,)),
+        make_fake_strided_tensor(i32, (cute.sym_int(),), contiguous_dim=None)
+        if op.limit_chunks
+        else None,
         make_fake_strided_tensor(i32, (cute.sym_int(),)),
         fake_tma_slots(),
         Int32(1),
@@ -782,9 +806,14 @@ def gdn_tinv(
     tinv: torch.Tensor,
     rows: torch.Tensor,
     row_count: torch.Tensor,
+    *,
+    chunk_limits: torch.Tensor | None = None,
 ) -> None:
     """Fill ``tinv``, ``rows`` and ``row_count`` for packed ``k [T, HK, D]`` and ``[T, H]``
-    natural-log ``gate`` / ``beta`` (see the module docstring for the layouts)."""
+    natural-log ``gate`` / ``beta`` (see the module docstring for the layouts). With
+    ``chunk_limits`` (nonnegative ``int32 [num_seqs]`` on the device, any stride), sequence ``b``
+    computes at most its first ``chunk_limits[b]`` tiles, none at zero; the other tiles' rows
+    are left unwritten."""
     if k.dtype not in IO_DTYPE_NAMES or tinv.dtype != k.dtype:
         raise TypeError(f"k and tinv must share a 16-bit dtype, got {k.dtype}/{tinv.dtype}")
     if gate.dtype != torch.float32 or beta.dtype not in _BETA_DTYPES:
@@ -792,10 +821,17 @@ def gdn_tinv(
     heads = gate.shape[1]
     if heads % k.shape[1] or tinv.shape[1:] != (heads, B_T, B_T):
         raise ValueError("tinv must be [rows, heads, 64, 64] with heads a multiple of k heads")
+    if chunk_limits is not None and (
+        chunk_limits.dtype != torch.int32 or chunk_limits.shape != (cu_seqlens.shape[0] - 1,)
+    ):
+        raise ValueError("chunk_limits must be int32 [num_seqs], one entry per sequence")
     op = GdnTinv.get_or_build(
-        IO_DTYPE_NAMES[k.dtype], k.shape[-1], beta_dtype=_BETA_DTYPES[beta.dtype]
+        IO_DTYPE_NAMES[k.dtype],
+        k.shape[-1],
+        beta_dtype=_BETA_DTYPES[beta.dtype],
+        limit_chunks=chunk_limits is not None,
     )
     fn = compile_gdn_tinv(op)
     workspace, sms = op.work.launch_args(k.device)
     slots = new_tma_slots(op.tma_slot_rows(heads), k.device)
-    fn(k, gate, beta, cu_seqlens, tinv, rows, row_count, workspace, slots, sms)
+    fn(k, gate, beta, cu_seqlens, tinv, rows, row_count, chunk_limits, workspace, slots, sms)

@@ -1668,12 +1668,23 @@ def order_storage():
 
 
 @cute.jit
-def emit_chunk_rows(b_t: cutlass.Constexpr[int], cu_seqlens, mRows, mCount, lane_idx):
+def emit_chunk_rows(
+    b_t: cutlass.Constexpr[int], cu_seqlens, mRows, mCount, lane_idx, chunk_limits=None
+):
     """One warp: the chunk row table, one ``(chunk, batch, batch_start, batch_end)`` entry per
     chunk in sequence order, and the row count; lanes scan the chunk counts of 32 sequences at
-    a time and write their rows."""
+    a time and write their rows. With ``chunk_limits`` (nonnegative ``int32 [N]``, any stride),
+    sequence ``b`` lists at most its first ``chunk_limits[b]`` chunks, none at zero: the table
+    stays in sequence order and the count on the device."""
     n_batch = Int32(cu_seqlens.shape[0]) - Int32(1)
     carry = Int32(0)
+    # Each group's limits load during the previous group's row writes: unlike the offsets, which
+    # the packed-offset check leaves in L1, they cost an L2 round trip per group. Taking the
+    # minimum (not testing for zero, which the compiler moves up to the load) keeps the wait late.
+    limit = Int32(0)
+    if cutlass.const_expr(chunk_limits is not None):
+        if lane_idx < n_batch:
+            limit = Int32(chunk_limits[lane_idx])
     for b0 in cutlass.range(0, n_batch, 32, unroll=1):
         b = b0 + lane_idx
         n_chunks = Int32(0)
@@ -1683,6 +1694,10 @@ def emit_chunk_rows(b_t: cutlass.Constexpr[int], cu_seqlens, mRows, mCount, lane
             batch_start = cu_at(cu_seqlens, b)
             batch_end = cu_at(cu_seqlens, b + Int32(1))
             n_chunks = (batch_end - batch_start + Int32(b_t - 1)) // Int32(b_t)
+            if cutlass.const_expr(chunk_limits is not None):
+                n_chunks = cutlass.min(n_chunks, limit)
+        if cutlass.const_expr(chunk_limits is not None):
+            limit = Int32(chunk_limits[cutlass.min(b + Int32(32), n_batch - Int32(1))])
         incl = n_chunks
         for offset in [1, 2, 4, 8, 16]:
             n = cute.arch.shuffle_sync_up(incl, offset, mask_and_clamp=0)
