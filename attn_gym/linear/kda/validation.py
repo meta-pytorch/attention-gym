@@ -45,11 +45,16 @@ def resolve_kernel_options(
     *,
     op_name: str = "chunk_kda",
     staged: bool = False,
+    tape_backend: str | None = None,
 ) -> ResolvedKernelOptions:
     """Validate chunk backend options and resolve their defaults; ``staged`` also accepts the
-    staged handles' ``batch_invariant`` (:class:`attn_gym.linear.types.StageKernelOptions`)."""
+    staged handles' ``batch_invariant`` (:class:`attn_gym.linear.types.StageKernelOptions`).
+    ``tape_backend`` resolves a staged backward's options against its saved tape's backend
+    (:func:`attn_gym.linear._delta_rule.validation.resolve_chunk_kernel_options`)."""
     spec = STAGE_OPTION_SPEC if staged else KERNEL_OPTION_SPEC
-    options = resolve_chunk_kernel_options(kernel_options, spec, op_name=op_name)
+    options = resolve_chunk_kernel_options(
+        kernel_options, spec, op_name=op_name, tape_backend=tape_backend
+    )
     # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
     schedule = ScheduleRequest(options.pop("schedule"))
     return ResolvedKernelOptions(**options, schedule=schedule)

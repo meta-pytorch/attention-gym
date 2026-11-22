@@ -55,7 +55,7 @@ GDN = Variant(
 VARIANTS = [pytest.param(KDA, id="kda"), pytest.param(GDN, id="gdn")]
 
 
-def _inputs(variant: Variant, lengths: list[int], heads: int = 2, seed: int = 0):
+def _inputs(variant: Variant, lengths: list[int], heads: int = 2, seed: int = 0, dim_v: int = 128):
     """Staged operands with gates mild enough to keep every transition above rounding."""
     generator = torch.Generator(device="cuda").manual_seed(seed)
     tokens = sum(lengths)
@@ -65,7 +65,7 @@ def _inputs(variant: Variant, lengths: list[int], heads: int = 2, seed: int = 0)
         return torch.randn(size, device="cuda", generator=generator)
 
     q, k = (F.normalize(normal(*shape), dim=-1).bfloat16() for _ in range(2))
-    v, d_output = (normal(*shape).bfloat16() for _ in range(2))
+    v, d_output = (normal(*shape[:3], dim_v).bfloat16() for _ in range(2))
     gate_shape = shape if variant.channel_gate else shape[:3]
     gate = -0.004 * torch.rand(gate_shape, device="cuda", generator=generator)
     beta = torch.rand(shape[:3], device="cuda", generator=generator)
@@ -77,6 +77,18 @@ def _build(variant: Variant, direction: str, operands, cu, **kwargs) -> torch.Te
     if direction == "forward":
         return variant.forward(k, v, gate, beta, cu, **kwargs)
     return variant.reverse(q, k, v, gate, beta, d_output, cu, SCALE, **kwargs)
+
+
+@pytest.fixture(autouse=True)
+def _fitted_gpu_plan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Plan every summary as on the ``NUM_SM`` GPU the split costs were fitted on, so the kernel
+    tests split exactly where :func:`_splits` says on any SM count (a smaller GPU or MIG slice
+    leaves some of these shapes uncut). The cost-model tests pass the SM count explicitly."""
+
+    def span(tokens, num_seqs, heads, device, *, b_t, cost):
+        return plan._summary_span(tokens, num_seqs, heads, NUM_SM, b_t, cost)
+
+    monkeypatch.setattr(native_summary, "summary_span", span)
 
 
 def _splits(variant: Variant, lengths: list[int], heads: int = 2) -> bool:
@@ -218,6 +230,17 @@ def test_split_bounds_select_rows_bitwise(variant: Variant, direction: str) -> N
     assert torch.equal(poisoned[0], full[2]) and poisoned[1].isnan().all()
 
 
+@pytest.mark.parametrize("variant", VARIANTS)
+@pytest.mark.parametrize("direction", ["forward", "reverse"])
+def test_summaries_reject_strided_offsets(variant: Variant, direction: str) -> None:
+    """The work selector and planner read ``cu_seqlens`` at unit stride, so an int32 view with
+    valid values at stride two is rejected instead of summarizing other tokens."""
+    operands, _ = _inputs(variant, [2048, 2048])
+    cu = torch.tensor([0, 0, 2048, 0, 4096], dtype=torch.int32, device="cuda")[::2]
+    with pytest.raises(ValueError, match="contiguous int32"):
+        _build(variant, direction, operands, cu)
+
+
 def _staged_summaries(variant: Variant, operands, cu, bounds, options) -> tuple[torch.Tensor, ...]:
     """Forward and reverse summaries of the staged handles, the context-parallel entry."""
     q, k, v, gate, beta, d_output = operands
@@ -260,22 +283,23 @@ def test_batch_invariant_summaries_ignore_the_pack(variant: Variant) -> None:
         assert not torch.equal(results[False][name][0], results[False]["alone"][0]), name
 
 
-def _poison_free_memory() -> None:
-    """Leave a NaN-filled block in the caching allocator, so uninitialized scratch is NaN."""
-    torch.cuda.synchronize()
-    torch.cuda.empty_cache()
-    torch.full((64 << 20,), float("nan"), device="cuda")
-    torch.cuda.synchronize()
-
-
 @pytest.mark.parametrize("variant", VARIANTS)
-@pytest.mark.parametrize("direction", ["forward", "reverse"])
-def test_split_unselected_sequences_keep_the_identity(
-    variant: Variant, direction: str, monkeypatch
+@pytest.mark.parametrize("direction", ["forward", "reverse", "probe"])
+@pytest.mark.parametrize("split", [True, False], ids=["split", "uncut"])
+@pytest.mark.parametrize("dim_v", [128, 64])
+def test_unselected_sequences_keep_the_identity(
+    variant: Variant, direction: str, split: bool, dim_v: int, monkeypatch
 ) -> None:
-    """A sequence no bound selects still owns a piece; its sequence map is ``[0; I]`` rather
-    than a composition of scratch no kernel wrote (NaN here)."""
-    assert _splits(variant, LENGTHS)
+    """The kernels write every element of the maps and scratch, allocated NaN here: a selected
+    map is finite, and an empty or unselected sequence's is ``[0; I]``. Split, an unselected
+    sequence still owns a piece, whose map is the identity rather than a composition of
+    scratch no kernel wrote. ``probe`` is KDA's uncut identity-probe reverse."""
+    if direction == "probe" and (split or dim_v != 128 or not variant.channel_gate):
+        pytest.skip("the identity probe is KDA's, uncut, with V == K")
+    if split:
+        assert _splits(variant, LENGTHS)
+    else:
+        _uncut(monkeypatch)
     sequence_maps = []
     gather = native_summary._summary_rows
 
@@ -284,13 +308,21 @@ def test_split_unselected_sequences_keep_the_identity(
         return gather(maps, cu_seqlens, bounds)
 
     monkeypatch.setattr(native_summary, "_summary_rows", spy)
-    operands, cu = _inputs(variant, LENGTHS)
+    monkeypatch.setattr(
+        native_summary,
+        "_fp32",
+        lambda *shape, device: torch.full(shape, float("nan"), device=device),
+    )
+    operands, cu = _inputs(variant, LENGTHS, dim_v=dim_v)
     starts = cu.tolist()
     bounds = torch.tensor([starts[2:4]], dtype=torch.int32, device="cuda")
-    _poison_free_memory()
-    selected = _build(variant, direction, operands, cu, bounds=bounds)
+    kwargs = {"transpose_forward_transition": False} if direction == "probe" else {}
+    selected = _build(
+        variant, "forward" if direction == "forward" else "reverse", operands, cu,
+        bounds=bounds, **kwargs,
+    )  # fmt: skip
     assert torch.isfinite(selected).all()
-    identity = torch.cat((torch.zeros(128, 128), torch.eye(128))).cuda().expand(2, -1, -1)
+    identity = torch.cat((torch.zeros(dim_v, 128), torch.eye(128))).cuda().expand(2, -1, -1)
     for index in (0, 1, 3):
         assert torch.equal(sequence_maps[0][index], identity), index
 

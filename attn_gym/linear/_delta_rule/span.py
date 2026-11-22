@@ -102,6 +102,21 @@ def normalize_span(
     return q, k, v, normalize_compact_tensor(beta.float()), resolve_scale(scale, q.shape[-1])
 
 
+def normalize_backward_span(
+    v: torch.Tensor, key_dim: int, d_output: torch.Tensor | None, scale: float
+) -> tuple[torch.Tensor, float]:
+    """A staged backward's ``(d_output, scale)`` for the saved values ``v``: a compact
+    ``d_output`` of ``v``'s shape, dtype and device (zeros when None) and the validated forward
+    scale, checked before either backward route launches anything."""
+    if d_output is None:
+        d_output = torch.zeros_like(v)
+    elif d_output.shape != v.shape or d_output.device != v.device:
+        raise ValueError(f"d_output must have shape {tuple(v.shape)} on {v.device}")
+    else:
+        d_output = normalize_compact_tensor(d_output.to(v.dtype))
+    return d_output, resolve_scale(float(scale), key_dim)
+
+
 def zero_state(
     q: torch.Tensor, v: torch.Tensor, metadata: RaggedChunkMetadata | None
 ) -> torch.Tensor:

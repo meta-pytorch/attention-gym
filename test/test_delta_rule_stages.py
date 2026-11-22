@@ -255,7 +255,8 @@ def test_summary_algebra_ignores_the_float32_matmul_mode():
 @requires_kda_target
 @op_param
 def test_prepare_run_matches_chunk_op_with_packed_initial_state(op):
-    """``prepare`` + ``run`` is the public op's own kernel sequence, so results are bitwise equal."""
+    """``prepare`` + ``run`` is the public op's own kernel sequence, so results are bitwise equal
+    (no warpdrive summary splits at these lengths; test_wd_staged_pieces.py covers splits)."""
     q, k, v, gate, beta = op.make_inputs(320, seed=1)
     cu_seqlens = torch.tensor([0, 100, 320], dtype=torch.int32, device="cuda")
     initial_state = torch.randn(2, op.value_heads, HEAD_DIM, HEAD_DIM, device="cuda")
@@ -643,22 +644,40 @@ def test_warpdrive_prepare_rejects_split_schedules(op):
             op.prepare(q, k, v, gate, beta, kernel_options={**WARPDRIVE, option: True})
 
 
+TAPE_OPS = [pytest.param(KDA, id="kda"), pytest.param(GDN, id="gdn"), *WARPDRIVE_OPS[:2]]
+
+
 @requires_kda_target
-@pytest.mark.parametrize("op", [KDA, GDN], ids=["kda", "gdn"])
+@pytest.mark.parametrize("op", TAPE_OPS)
 def test_prepare_backward_rejects_split_schedules(op):
     """The backward handle takes the forward's options and would run unsplit kernels: a split
-    request raises instead of being ignored."""
+    request raises instead of being ignored. Only a warpdrive tape has split schedules."""
     q, k, v, gate, beta = op.make_inputs(128, seed=8)
     prepared = op.prepare(q, k, v, gate, beta)
+    message = "split schedules" if op.warpdrive else "requires kernel_options"
     for option in ("split_backward", "split_forward"):
-        with pytest.raises(ValueError, match="split schedules"):
+        with pytest.raises(ValueError, match=message):
             op.prepare_backward(
-                prepared.saved,
-                None,
-                None,
-                scale=prepared.scale,
-                kernel_options={**WARPDRIVE, option: True},
+                prepared.saved, None, None, scale=prepared.scale, kernel_options={option: True}
             )
+
+
+@requires_kda_target
+@pytest.mark.parametrize("op", TAPE_OPS)
+def test_prepare_backward_takes_the_backend_from_the_tape(op):
+    """The saved tape fixes the backward's backend: options may omit it, and ``batch_invariant``
+    is checked against the tape, not the default backend. An explicit backend naming the other
+    one raises rather than running the tape's kernels."""
+    q, k, v, gate, beta = op.make_inputs(128, seed=8)
+    prepared = op.prepare(q, k, v, gate, beta)
+    backward = partial(op.prepare_backward, prepared.saved, None, None, scale=prepared.scale)
+    if op.warpdrive:
+        assert backward(kernel_options={"batch_invariant": True}).batch_invariant
+        mismatch = {"backend": "fused"}
+    else:
+        mismatch = {"backend": "warpdrive", "batch_invariant": True}
+    with pytest.raises(ValueError, match="does not match the saved"):
+        backward(kernel_options=mismatch)
 
 
 @requires_kda_target
