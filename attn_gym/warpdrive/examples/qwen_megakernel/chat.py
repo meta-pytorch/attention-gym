@@ -15,11 +15,21 @@ earlier turn differently the cache is rebuilt from the start.
 import json
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import torch
 import typer
 from rich.console import Console
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 from rich.text import Text
+from tqdm.std import tqdm
 
 from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
 from attn_gym.warpdrive.examples.qwen_megakernel.bench import (
@@ -40,6 +50,45 @@ QWEN3_POSITIONS, QWEN3_PRETRAINED_CONTEXT = 40960, 32768
 
 app = typer.Typer(add_completion=False, help=__doc__.splitlines()[0])
 console = Console()
+
+
+def download(model: str) -> Path:
+    """The local checkpoint directory of ``model``, drawing any Hub download as one progress bar
+    of bytes written to disk. huggingface_hub's own tqdm bars (files fetched, network bytes and
+    bytes written) would be three interleaved lines, and one line per redraw under a rich
+    status. ``HF_HUB_DISABLE_PROGRESS_BARS`` and non-terminal output hide the bar."""
+    from huggingface_hub.utils import are_progress_bars_disabled
+
+    progress = Progress(
+        TextColumn(f"downloading [bold]{model}[/]"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=True,
+        disable=not console.is_terminal or are_progress_bars_disabled(),
+    )
+
+    class DiskBytes(tqdm):
+        """Draws the snapshot's bytes-written bar on ``progress`` and hides the others: the
+        file-count bar (unit "it") and the network-bytes bar, whose total is a guess."""
+
+        def __init__(self, *args, **kwargs):
+            kwargs.update(gui=True, disable=False)  # gui: count but print nothing
+            super().__init__(*args, **kwargs)
+            shown = self.unit == "B" and self.desc != "Downloading bytes"
+            self.task = progress.add_task("", total=self.total or None) if shown else None
+
+        def display(self, *_, **__):  # tqdm's refresh draws through here
+            if self.task is not None:
+                progress.update(self.task, completed=self.n, total=self.total or None)
+
+        def clear(self, *_, **__):  # tqdm's clear writes to the terminal
+            pass
+
+    with progress:
+        return checkpoint_dir(model, tqdm_class=DiskBytes)
 
 
 class CacheFull(typer.BadParameter):
@@ -93,7 +142,7 @@ class Chat:
 
     def __init__(
         self,
-        model: str,
+        checkpoint: Path,
         backend: str,
         engine: str,
         max_len: int,
@@ -102,10 +151,10 @@ class Chat:
     ):
         from transformers import AutoTokenizer
 
-        self.tokenizer = AutoTokenizer.from_pretrained(model)
-        self.weights = load_qwen3_weights(model)
+        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
+        self.weights = load_qwen3_weights(checkpoint)
         config = self.weights.config
-        hf_config = json.loads((checkpoint_dir(model) / "config.json").read_text())
+        hf_config = json.loads((checkpoint / "config.json").read_text())
         native = hf_config["max_position_embeddings"]
         original = QWEN3_PRETRAINED_CONTEXT if native == QWEN3_POSITIONS else native
         if yarn_factor is None:  # only past the native context, as Qwen recommends
@@ -289,8 +338,9 @@ def main(
     if backend not in BACKENDS:
         raise typer.BadParameter(f"backend must be one of {sorted(BACKENDS)}")
     label = f"the {engine} megakernel" if backend == "megakernel" else "torch.compile"
+    checkpoint = download(model)  # before the status spinner, which garbles progress bars
     with console.status(f"loading {model} and compiling {label}"):
-        chat = Chat(model, backend, engine, max_len, thinking, yarn_factor)
+        chat = Chat(checkpoint, backend, engine, max_len, thinking, yarn_factor)
     if prompt is not None:
         run_turn(chat, prompt, max_new_tokens, temperature)
         return

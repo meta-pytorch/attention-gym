@@ -8,9 +8,9 @@
 #
 # Computes the diagonal 16x16 Aqk/Akk sub-blocks of each 64-token chunk and
 # inverts each diagonal Akk block by forward substitution. The off-diagonal
-# blocks and the full 64x64 block-triangular inverse are handled by the
-# architecture-selected K3/K4 stages. ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop``
-# is consumed by the composed forward path in ``fwd.cute.chunk_kda_fwd_intra``.
+# blocks and the full 64x64 block-triangular inverse are handled by the Triton K3/K4
+# stages. ``chunk_kda_fwd_kernel_intra_sub_chunk_forloop`` is consumed by the composed
+# forward factors in ``kda/fwd/factors.py``.
 
 import torch
 import triton
@@ -227,7 +227,10 @@ def chunk_kda_fwd_kernel_intra_sub_chunk_forloop(
 #
 # For BC=16, row 0 spans 15 intervals and gives a 5.915 limit; the 8-interval midpoint
 # would give 11.09. The fused training integration enforces the bound derived in
-# ``constants.py``; custom gate producers must honor the same limit.
+# ``constants.py``; custom gate producers must honor the same limit. The limit counts
+# subnormal factors: the flush-to-zero exp2 of ``fastmath=True`` keeps only factors above
+# 2^-126, so with fastmath the last rows' within-subchunk terms vanish from a constant gate of
+# about -5.82, before the documented bound.
 def chunk_kda_fwd_intra_diagonal(
     q: torch.Tensor,
     k: torch.Tensor,

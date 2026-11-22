@@ -1,4 +1,4 @@
-"""Tests for the architecture-routed delta-rule affine-summary recurrence."""
+"""Tests for the fused delta-rule affine-summary recurrence."""
 
 from __future__ import annotations
 
@@ -10,14 +10,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("cutlass")
-
-import attn_gym.linear._delta_rule.cute.affine_summary_fwd as native_fwd
-import attn_gym.linear._delta_rule.cute.affine_summary_rev as native_rev
-import attn_gym.linear._delta_rule.triton.affine_summary_fwd as portable_fwd
-import attn_gym.linear._delta_rule.triton.affine_summary_rev as portable_rev
-from attn_gym._backends.arch import runs_sm100_kernels
-from attn_gym.linear._delta_rule.cute import build_state_grad_summaries, build_state_summaries
+import attn_gym.linear._delta_rule.triton.affine_summary_fwd as triton_fwd
+import attn_gym.linear._delta_rule.triton.affine_summary_rev as triton_rev
+from attn_gym.linear._delta_rule import summaries
+from attn_gym.linear._delta_rule.summaries import build_state_grad_summaries, build_state_summaries
 from attn_gym.linear._delta_rule.triton.work_items import compose_work_items, plan_work_items
 from attn_gym.testing.kda import assert_relative_rms_within
 
@@ -44,16 +40,6 @@ pytestmark = pytest.mark.skipif(
 )
 
 VALUE_DIM = 128
-
-
-@pytest.fixture(params=["routed", "portable"])
-def summary_backend(request, monkeypatch):
-    """Run the routed backend, or force the public wrappers onto the portable Triton path."""
-    if request.param == "portable":
-        if not runs_sm100_kernels(torch.cuda.get_device_capability()):
-            pytest.skip("the routed backend is already the portable Triton path")
-        for module in (native_fwd, native_rev):
-            monkeypatch.setattr(module, "runs_sm100_kernels", lambda _capability: False)
 
 
 def compose_summaries(first: torch.Tensor, second: torch.Tensor) -> torch.Tensor:
@@ -228,12 +214,10 @@ def test_affine_summaries_support_int64_tensor_strides():
 
 
 @pytest.mark.parametrize("budget", [1, 3])
-def test_portable_affine_summaries_support_forced_int64_offsets(budget, monkeypatch):
-    """Keep the portable single-item and split wide-address specializations executable."""
+def test_affine_summaries_support_forced_int64_offsets(budget, monkeypatch):
+    """Keep the single-item and split wide-address specializations executable."""
     plan_budget = Mock(return_value=budget)
-    for module in (native_fwd, native_rev):
-        monkeypatch.setattr(module, "runs_sm100_kernels", lambda _capability: False)
-        monkeypatch.setattr(module, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(20, tokens=640)
 
     expected_forward = build_state_summary(kg, w, u, cumulative_gate)
@@ -249,8 +233,8 @@ def test_portable_affine_summaries_support_forced_int64_offsets(budget, monkeypa
     assert plan_budget.call_count == 2
     plan_budget.reset_mock()
     wide_offsets = Mock(return_value=True)
-    monkeypatch.setattr(portable_fwd, "requires_int64_offsets", wide_offsets)
-    monkeypatch.setattr(portable_rev, "requires_int64_offsets", wide_offsets)
+    monkeypatch.setattr(triton_fwd, "requires_int64_offsets", wide_offsets)
+    monkeypatch.setattr(triton_rev, "requires_int64_offsets", wide_offsets)
 
     actual_forward = build_state_summary(kg, w, u, cumulative_gate)
     actual_reverse = build_state_grad_summary(
@@ -270,7 +254,7 @@ def test_portable_affine_summaries_support_forced_int64_offsets(budget, monkeypa
 
 
 def test_affine_summaries_accept_misaligned_contiguous_storage():
-    """Normalize ordinary storage-offset views before constructing TMA descriptors."""
+    """Accept ordinary contiguous views whose storage offset breaks 16-byte alignment."""
     qg, kg, w, u, dout, aqk, cumulative_gate = make_summary_inputs(21)
 
     expected_forward = build_state_summary(kg, w, u, cumulative_gate)
@@ -365,7 +349,6 @@ def test_affine_summary_selector_variants_and_persistent_work():
     )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_reverse_summary_cancels_exactly_like_forward(dtype):
     """Reverse must split its FP32 state hi/lo like forward so exact cancellations survive.
@@ -401,7 +384,6 @@ def test_reverse_summary_cancels_exactly_like_forward(dtype):
     )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("tokens,heads", [(256, 2), (2048, 1), (512, 16)])
 def test_reverse_transition_is_adjoint_of_forward_transition(dtype, tokens, heads):
@@ -441,69 +423,10 @@ def test_reverse_transition_is_adjoint_of_forward_transition(dtype, tokens, head
 def test_plan_work_budget_fills_one_wave_without_tiny_items(
     max_chunks, work_tiles, sm_count, expected
 ):
-    budget = native_fwd.plan_work_budget(max_chunks, work_tiles, sm_count)
+    budget = summaries.plan_work_budget(max_chunks, work_tiles, sm_count)
     assert budget == expected
     # A scan level costs more than several chunks, so no split may produce short items.
-    assert budget == 1 or max_chunks // budget >= native_fwd.MIN_CHUNKS_PER_ITEM
-
-
-@pytest.mark.parametrize(
-    ("max_chunks", "heads", "ranges", "sm_count", "expected"),
-    [
-        (127, 16, 1, 152, 32),  # The wider split must pay for planning and composition.
-        (128, 16, 1, 152, 64),
-        (129, 16, 1, 152, 64),
-        (512, 9, 1, 152, 32),  # Narrow tiles already leave room for time splitting.
-        (512, 10, 1, 152, 64),
-        (512, 19, 1, 152, 64),
-        (512, 20, 1, 152, 64),  # Narrow tiles already overflow one wave.
-        (512, 18, 1, 148, 64),
-        (512, 19, 1, 148, 64),
-        (127, 16, 2, 152, 64),  # Preserve the packed-range choice.
-        (512, 16, 2, 152, 64),
-        (512, 1, 1, 152, 32),
-    ],
-)
-def test_state_columns_leave_room_for_long_time_splits(
-    max_chunks, heads, ranges, sm_count, expected
-):
-    assert native_fwd.select_state_columns(max_chunks, heads, ranges, sm_count) == expected
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("tokens", [8128, 8193])
-def test_native_summary_tile_choice_and_layout_replay(dtype, tokens, monkeypatch):
-    """The public selector preserves tail arithmetic and replay across empty/short ranges."""
-    if not runs_sm100_kernels(torch.cuda.get_device_capability()):
-        pytest.skip("native state tile selection requires an SM100-family GPU")
-    heads = torch.cuda.get_device_properties().multi_processor_count // 8
-    _, kg, w, u, _, _, gate = make_summary_inputs(89, dtype, tokens, heads)
-    bounds = whole_stream(kg)
-    compile_summary = Mock(wraps=native_fwd._compile_affine_summary)
-    monkeypatch.setattr(native_fwd, "_compile_affine_summary", compile_summary)
-    expected_bn = 32 if tokens == 8128 else 64
-    for _ in range(2):
-        native_fwd.build_state_summaries(kg, w, u, gate, bounds)
-    assert compile_summary.call_args.args[2] == expected_bn
-    assert compile_summary.call_args.kwargs["whole_ranges"] == (expected_bn == 32)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = native_fwd.build_state_summaries(kg, w, u, gate, bounds)
-    for start, stop in ((0, tokens), (0, 0), ((tokens // 64 - 1) * 64, tokens)):
-        bounds.copy_(torch.tensor([[start, stop]], device=kg.device, dtype=torch.int32))
-        graph.replay()
-        if start == stop:
-            expected = torch.cat(
-                (
-                    torch.zeros(heads, 128, 128, device=kg.device),
-                    torch.eye(128, device=kg.device).expand(heads, -1, -1),
-                ),
-                dim=1,
-            )
-        else:
-            expected = state_summary_reference(*(t[:, start:stop] for t in (kg, w, u, gate)))
-        torch.testing.assert_close(actual[0], expected, atol=2e-4, rtol=2e-4)
+    assert budget == 1 or max_chunks // budget >= summaries.MIN_CHUNKS_PER_ITEM
 
 
 WORK_LAYOUTS = [
@@ -592,7 +515,6 @@ def test_compose_work_items_ignores_the_float32_matmul_mode():
     )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_split_summaries_match_single_item_scans(dtype, monkeypatch):
     """Splitting the chunk chain across idle SMs must only reorder FP32 composition."""
@@ -602,8 +524,7 @@ def test_split_summaries_match_single_item_scans(dtype, monkeypatch):
     reverse_summary = partial(build_state_grad_summary, scale=128**-0.5)
     # Exercise splitting even on small devices where the production budget is one.
     plan_budget = Mock(return_value=2)
-    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
-    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     split = (
         build_state_summary(kg, w, u, cumulative_gate),
         reverse_summary(qg, kg, w, dout, aqk, cumulative_gate),
@@ -624,7 +545,6 @@ def test_split_summaries_match_single_item_scans(dtype, monkeypatch):
         )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("boundaries", [(256,), (64, 320), (128, 256, 384)])
 def test_affine_summaries_are_invariant_to_shard_boundaries(dtype, boundaries):
@@ -745,7 +665,6 @@ def reference_summaries(tensors, start: int, stop: int) -> tuple[torch.Tensor, t
     )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_range_summaries_match_per_range_launches(dtype):
     """Device ``bounds`` reproduce slicing each range on the host, tails and empties included."""
@@ -798,7 +717,6 @@ def poison(neighbours: torch.Tensor) -> None:
     neighbours[:, 1::2] = torch.inf
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("corrupt", [scale_up, poison], ids=["scaled", "non-finite"])
 def test_range_tails_ignore_the_tokens_that_follow(dtype, corrupt):
@@ -842,15 +760,13 @@ def test_range_tails_ignore_the_tokens_that_follow(dtype, corrupt):
             )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_range_summaries_survive_a_tiny_work_budget(dtype, monkeypatch):
     """Three items over seven ranges: cuts inside ranges and one-chunk ranges compose."""
     tensors = make_summary_inputs(47, dtype, tokens=640, heads=2)
     qg, kg, w, u, dout, aqk, cumulative_gate = tensors
     plan_budget = Mock(return_value=3)
-    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
-    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     ranges = [*RANGE_BOUNDS, (500, 501), (0, 65)]
     bounds = torch.tensor(ranges, dtype=torch.int32, device="cuda")
 
@@ -875,15 +791,13 @@ def test_range_summaries_survive_a_tiny_work_budget(dtype, monkeypatch):
             )
 
 
-@pytest.mark.usefixtures("summary_backend")
 @pytest.mark.parametrize("budget", [1, 3])
 def test_range_summaries_replay_across_layouts_in_one_cuda_graph(budget, monkeypatch):
     """One captured graph serves changed bounds, including all-empty padded work tables."""
     tensors = make_summary_inputs(43, tokens=640, heads=2)
     qg, kg, w, u, dout, aqk, cumulative_gate = tensors
     plan_budget = Mock(return_value=budget)
-    monkeypatch.setattr(native_fwd, "plan_work_budget", plan_budget)
-    monkeypatch.setattr(native_rev, "plan_work_budget", plan_budget)
+    monkeypatch.setattr(summaries, "plan_work_budget", plan_budget)
     scale = 128**-0.5
     bounds = torch.tensor([[0, 256], [256, 640], [640, 640]], dtype=torch.int32, device="cuda")
 

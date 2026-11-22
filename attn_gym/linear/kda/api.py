@@ -23,12 +23,13 @@ import torch
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
+from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
+    require_inference_only,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
-    validate_state_checkpoints,
 )
 from attn_gym.linear.kda.constants import LOG2_E
 from attn_gym.linear.kda.impl.fused import chunk_forward as _fused_chunk_forward
@@ -38,9 +39,14 @@ from attn_gym.linear.kda.impl.warpdrive import (
     paged_chunk_forward as _warpdrive_paged_chunk_forward,
 )
 from attn_gym.linear.kda.naive import naive_chunk_kda, naive_recurrent_kda
+from attn_gym.linear.kda.ops import copy_replay_tails_op
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
-from attn_gym.linear.kda.validation import resolve_kernel_options, validate_kda_inputs
+from attn_gym.linear.kda.validation import (
+    resolve_kernel_options,
+    validate_kda_inputs,
+    validate_replay_state,
+)
 from attn_gym.linear.types import (
     RECURRENT_OPTION_SPEC,
     Impl,
@@ -94,7 +100,7 @@ def chunk_kda(
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
-            are internal. The repo-local fused implementation requires approximately
+            are internal. The Triton fused implementation requires approximately
             ``[-5.914, 0]``. warpdrive BF16 instead requires every aligned 16-token
             per-channel sum to exceed ``-126 * ln(2)`` (a uniform ``lower_bound >= -5.45``)
             for finite results. Gradients need more margin: their error grows quickly past a
@@ -102,8 +108,11 @@ def chunk_kda(
             ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
             ``docs/linear.md`` gives the measurements). warpdrive FP16 forms its in-chunk decay
             products from TF32 operands, forward and backward, and shares the BF16 gate range
-            above. These limits are not checked at runtime and do not apply to reference or
-            recurrent execution.
+            above. Backward headroom also shrinks with large output gradients and key components.
+            The FP16 backward needs state cotangents, and FP16 products of them, within the FP16
+            range, and keys decayed below the FP16 subnormals round up or to zero in the forward
+            state update and the backward (same section of ``docs/linear.md``). These limits are
+            not checked at runtime and do not apply to reference or recurrent execution.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
@@ -230,7 +239,8 @@ def paged_chunk_kda(
             conversion are internal, matching :func:`chunk_kda`.
         beta: Per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
-            Recurrence math remains FP32; BF16 affects persistent storage only.
+            Recurrence math remains FP32; BF16 affects persistent storage only. The pool base
+            and slot stride need only element alignment.
         state_indices: Contiguous ``int32`` slot indices, one per logical sequence.
             Positive, unique indices select cache slots to read and advance;
             non-positive indices produce zero output and leave the cache untouched.
@@ -245,7 +255,7 @@ def paged_chunk_kda(
             the optional warpdrive backend. ``split_backward`` and
             ``split_forward`` are not supported by this paged operation; ``schedule``
             applies as in ``chunk_kda``. ``"autotune"`` (default
-            ``True``) benchmarks candidate configurations of the repo-local fused kernels;
+            ``True``) benchmarks candidate configurations of the Triton fused kernels;
             warpdrive uses its fixed schedule.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five
@@ -267,13 +277,10 @@ def paged_chunk_kda(
             captured bucket. Graph replay may change packed offsets, slot routing, initialization
             flags, and replay counts while tensor shapes remain fixed to that bucket.
 
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
-            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
-            Requires the fused backend. With ``replay_state``, intervals start at the beginning
-            of each slot's unfinished chunk, counting replayed tokens before new input tokens.
-            A false ``has_initial_state`` entry counts no replayed tokens. Snapshots contain only
-            complete-chunk states; callers must separately preserve any replay tail needed to
-            restore a checkpoint.
+        state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
+            state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
+            semantics. Requires the fused backend. With replay, only the completed boundary
+            state is saved. The caller must separately preserve any replay tail needed to resume.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -305,43 +312,7 @@ def paged_chunk_kda(
         raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
-        if options.backend != "fused":
-            raise ValueError("paged chunk replay requires kernel_options['backend']='fused'")
-        num_slots = state_cache.shape[0]
-        layout = ReplayState.slot_layout(q.shape[2], q.shape[3], value_dim=v.shape[3])
-        for name, tensor, (slot_shape, expected_dtype) in zip(
-            ReplayState._fields[:-1], replay_state[:-1], layout[:-1], strict=True
-        ):
-            expected_shape = (num_slots, *slot_shape)
-            if tensor.shape != expected_shape:
-                raise ValueError(
-                    f"replay_state {name} tensor must have shape {expected_shape}, "
-                    f"got {tuple(tensor.shape)}"
-                )
-            if tensor.dtype != expected_dtype or tensor.device != q.device:
-                raise TypeError(
-                    f"replay_state {name} tensor must use {expected_dtype} on the input device"
-                )
-            expected_stride = 1
-            dense_inner = True
-            for size, stride in reversed(tuple(zip(tensor.shape[2:], tensor.stride()[2:]))):
-                dense_inner &= size == 1 or stride == expected_stride
-                expected_stride *= size
-            if not dense_inner or tensor.stride(1) != expected_stride:
-                raise ValueError(f"replay_state {name} tensor must have dense per-token rows")
-            if num_slots > 1 and tensor.stride(0) < _CHUNK_SIZE * expected_stride:
-                raise ValueError(f"replay_state {name} tensor slots must not overlap")
-        count_shape, count_dtype = layout[-1]
-        if replay_state.count.shape not in ((num_slots,), (num_slots, *count_shape)):
-            raise ValueError(
-                f"replay_state count tensor must have shape ({num_slots},) or "
-                f"({num_slots}, 1), got {tuple(replay_state.count.shape)}"
-            )
-        if replay_state.count.dtype != count_dtype or replay_state.count.device != q.device:
-            raise TypeError("replay_state count tensor must be int32 on the input device")
-        if num_slots > 1 and replay_state.count.stride(0) == 0:
-            raise ValueError("replay_state count tensor slots must not overlap")
-        # Invariant: callers initialize counts to zero, and replay kernels keep them in [0, 63].
+        validate_replay_state(replay_state, q, v, state_cache.shape[0])
     if options.backend == "warpdrive":
         return _warpdrive_paged_chunk_forward(
             q,
@@ -354,6 +325,7 @@ def paged_chunk_kda(
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
             scale=resolve_scale(None, q.shape[-1]),
+            replay_state=replay_state,
         )
     return _fused_paged_chunk_forward(
         q,
@@ -369,6 +341,54 @@ def paged_chunk_kda(
         schedule=options.schedule,
         replay_state=replay_state,
         state_checkpoints=state_checkpoints,
+    )
+
+
+def copy_replay_tails(
+    replay_state: ReplayState,
+    inputs: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+    *,
+    cu_seqlens: torch.Tensor,
+    state_indices: torch.Tensor,
+    checkpoint_positions: torch.Tensor,
+    checkpoint_slots: torch.Tensor,
+    has_initial_state: torch.Tensor | None = None,
+) -> None:
+    """Copy the unfinished KDA chunk for each selected prefix into its destination replay slot.
+
+    Call immediately **before** packed ``paged_chunk_kda`` on the same stream, with the same
+    Q, K, V, gate, beta inputs, replay state, packed offsets and source routing. The helper
+    reads the pre-call counts (zero for a fresh route). Pass the positions and slots used by
+    ``StateCheckpoints``; publish the destinations only after both calls complete. This op
+    copies replay data, not the recurrent boundary state.
+
+    Positions count new tokens in this call. With 19 buffered tokens and position 50, the
+    last completed boundary is at new-token position 45: copy input rows [45:50] and set the
+    count to five. At position 45, just reset the count. Inactive routes, non-positive
+    destinations and prefixes that reach no boundary in this call do not write.
+
+    The contiguous int32 position and slot vectors have one entry per sequence. Written slots
+    must be in bounds, distinct, and disjoint from **all** active source slots. The replay
+    buffers may share packed pages but their rows must not overlap one another or the inputs.
+    Mixed-dtype views of one allocation work in eager mode and CUDA graphs. For
+    ``torch.compile(fullgraph=True)``, use separate backing allocations: AOTAutograd cannot
+    functionalize mutations of differently typed views on the same storage. This inference-only
+    CUDA operation updates the destination buffers and counts in place.
+    """
+    require_inference_only((*inputs, *replay_state), "copy_replay_tails is inference-only")
+    q, k, v, gate, beta = inputs
+    copy_replay_tails_op(
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        *replay_state,
+        cu_seqlens,
+        state_indices,
+        has_initial_state,
+        checkpoint_positions,
+        checkpoint_slots,
     )
 
 
@@ -633,6 +653,7 @@ __all__ = [
     "KernelOptions",
     "ReplayState",
     "chunk_kda",
+    "copy_replay_tails",
     "paged_chunk_kda",
     "recurrent_kda",
     "recurrent_kda_decode",

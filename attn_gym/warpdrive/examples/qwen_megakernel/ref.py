@@ -198,9 +198,11 @@ class QwenWeights:
         }
 
 
-def checkpoint_dir(path_or_repo: str) -> Path:
-    """The local directory of a checkpoint: a Hub repo (downloaded if needed), a checkpoint
-    directory, or a file inside one."""
+def checkpoint_dir(path_or_repo: str | Path, tqdm_class: type | None = None) -> Path:
+    """The local directory of a checkpoint: a Hub repo (downloaded if needed, drawing progress
+    with ``tqdm_class``), a checkpoint directory, or a file inside one. A download includes the
+    tokenizer files (``*.txt`` merges, ``*.jinja`` chat templates) so the tokenizer loads from
+    it."""
     from huggingface_hub import snapshot_download  # optional: the oracle needs only torch
 
     checkpoint = Path(path_or_repo)
@@ -208,11 +210,17 @@ def checkpoint_dir(path_or_repo: str) -> Path:
         return checkpoint.parent
     if checkpoint.is_dir():
         return checkpoint
-    return Path(snapshot_download(path_or_repo, allow_patterns=["*.json", "*.safetensors"]))
+    return Path(
+        snapshot_download(
+            str(path_or_repo),
+            allow_patterns=["*.json", "*.safetensors", "*.txt", "*.jinja"],
+            tqdm_class=tqdm_class,
+        )
+    )
 
 
 def load_qwen3_weights(
-    path_or_repo: str = "Qwen/Qwen3-0.6B", device: str | torch.device = "cuda"
+    path_or_repo: str | Path = "Qwen/Qwen3-0.6B", device: str | torch.device = "cuda"
 ) -> QwenWeights:
     """Load a Qwen3 safetensors checkpoint, single-file or sharded, with its ``config.json``:
     a Hub repo, a checkpoint directory, or a file inside one."""

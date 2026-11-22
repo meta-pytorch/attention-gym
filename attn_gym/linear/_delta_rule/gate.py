@@ -16,20 +16,18 @@ to per-head ``[B, T, H]`` or per-channel ``[B, T, H, D]`` gates.
 from __future__ import annotations
 
 import importlib
-from functools import cache
 from numbers import Real
 from sys import float_info
 
 import torch
 import torch.nn.functional as F
 
-from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear.types import GateTransform, Impl, resolve_gate_transform, resolve_impl
 
 _SUPPORTED_FUSED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
-# One operator pair covers both kinds and both fused backends; ``kind`` is an argument, so the
-# backend is chosen once per call inside the CUDA implementation on real tensors.
+# One operator pair covers both kinds; ``kind`` is an argument resolved inside the CUDA
+# implementation.
 torch.library.define(
     "attn_gym::_gate_transform_fwd",
     "(Tensor raw_gate, Tensor A_log, Tensor dt_bias, str kind, float lower_bound, bool fastmath)"
@@ -42,71 +40,30 @@ torch.library.define(
 )
 
 
-def _cute_backend(module: str):
-    try:
-        return importlib.import_module(module)
-    except ImportError as error:
-        raise ImportError(
-            "gate_transform(kind='bounded', impl='fused') requires the optional CuTeDSL backend: "
-            "pip install attn-gym[linear]"
-        ) from error
-
-
 def _triton_backend():
     try:
-        return importlib.import_module("attn_gym.linear._delta_rule.triton.softplus_gate")
+        return importlib.import_module("attn_gym.linear._delta_rule.triton.gate_transform")
     except ImportError as error:
         raise ImportError(
-            "gate_transform(kind='softplus', impl='fused') requires CUDA with Triton support"
+            "gate_transform(impl='fused') requires CUDA with Triton support"
         ) from error
 
 
-@cache
-def _cute_gate_backend_available() -> bool:
-    """Whether the CuTeDSL gate kernels import; probed once, only on an eligible call."""
-    try:
-        _cute_backend("attn_gym.linear.kda.fwd.cute.gate_fwd")
-        _cute_backend("attn_gym.linear.kda.bwd.cute.gate_bwd")
-    except ImportError:
-        return False
-    return True
-
-
-# NOTE [Softplus Backend Selection]
-# The Triton softplus kernel is portable (any CUDA device, both gate shapes, any strides) but
-# instruction-bound at roughly half of HBM bandwidth. The CuTeDSL bound-gate kernels reach the
-# bf16->fp32 cast roofline and gained a softplus specialization, but they keep the bound-gate
-# contract: per-channel gates with D=128, CUDA capability 9.0+, and the optional CuTeDSL
-# dependency. Selection runs inside the registered operator on real tensors, so it is invisible
-# to torch.compile tracing; tests pin the policy through ``_softplus_uses_cute``.
-def _softplus_uses_cute(raw_gate: torch.Tensor) -> bool:
-    """Route per-channel D=128 gates on sm90+ to the CuTeDSL kernels when they are installed."""
-    return (
-        raw_gate.ndim == 4
-        and raw_gate.shape[3] == 128
-        and get_device_properties(raw_gate.device).major >= 9
-        and _cute_gate_backend_available()
-    )
-
-
+# The Triton gate kernels serve every CUDA architecture, both kinds, both gate shapes and any
+# strides. They are imported inside the registered operator, so ``impl="reference"`` callers and
+# CPU-only installs never need Triton.
 def _gate_transform_fwd_cuda(raw_gate, A_log, dt_bias, kind, lower_bound, fastmath):
-    transform = GateTransform(kind)
-    if transform is GateTransform.SOFTPLUS and not _softplus_uses_cute(raw_gate):
-        return _triton_backend()._softplus_gate_fwd_cuda(raw_gate, A_log, dt_bias, fastmath)
-    return _cute_backend("attn_gym.linear.kda.fwd.cute.gate_fwd")._gate_transform_fwd_cuda(
-        raw_gate, A_log, dt_bias, lower_bound, fastmath, transform
-    )
+    with torch.cuda.device(raw_gate.device):
+        return _triton_backend()._gate_transform_fwd_cuda(
+            raw_gate, A_log, dt_bias, lower_bound, fastmath, GateTransform(kind)
+        )
 
 
 def _gate_transform_bwd_cuda(raw_gate, A_log, dt_bias, d_gate, kind, lower_bound, fastmath):
-    transform = GateTransform(kind)
-    if transform is GateTransform.SOFTPLUS and not _softplus_uses_cute(raw_gate):
-        return _triton_backend()._softplus_gate_bwd_cuda(
-            raw_gate, A_log, dt_bias, d_gate, fastmath
+    with torch.cuda.device(raw_gate.device):
+        return _triton_backend()._gate_transform_bwd_cuda(
+            raw_gate, A_log, dt_bias, d_gate, lower_bound, fastmath, GateTransform(kind)
         )
-    return _cute_backend("attn_gym.linear.kda.bwd.cute.gate_bwd")._gate_transform_bwd_cuda(
-        raw_gate, A_log, dt_bias, d_gate, lower_bound, fastmath, transform
-    )
 
 
 torch.library.impl("attn_gym::_gate_transform_fwd", "CUDA", _gate_transform_fwd_cuda)
@@ -255,11 +212,9 @@ def gate_transform(
         fastmath: Allow approximate amplitude, sigmoid, and softplus math (default ``True``).
             ``False`` selects non-fast primitives for forward and backward. The reference
             implementation uses normal PyTorch math for either value.
-        impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses private CuTeDSL kernels
-            for per-channel ``D=128`` gates on CUDA capability 9.0+ (both kinds) and a
-            portable Triton kernel for every other ``"softplus"`` configuration. Fused paths
-            require FP16, BF16, or FP32 ``raw_gate``; per-head ``"bounded"`` gates are
-            reference-only.
+        impl: ``"reference"`` uses ordinary PyTorch. ``"fused"`` uses Triton kernels for both
+            kinds and gate shapes on every CUDA architecture and requires FP16, BF16, or FP32
+            ``raw_gate``.
 
     Raises:
         ValueError: On shape, ``lower_bound``, or unsupported fused configurations.
@@ -276,11 +231,6 @@ def gate_transform(
         raise ValueError("gate_transform(impl='fused') requires CUDA FP16, BF16, or FP32 raw_gate")
     if min(raw_gate.shape) < 1:
         raise ValueError("gate_transform(impl='fused') requires nonzero raw_gate dimensions")
-    if kind is GateTransform.BOUNDED and (raw_gate.ndim != 4 or raw_gate.shape[3] != 128):
-        raise ValueError(
-            "gate_transform(kind='bounded', impl='fused') requires raw_gate [B, T, H, 128]; "
-            "use impl='reference' for other shapes"
-        )
     return _FusedGate.apply(raw_gate, A_log, dt_bias, kind.value, lower_bound, fastmath)
 
 

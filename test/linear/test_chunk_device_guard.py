@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
-from attn_gym.linear import chunk_gdn, chunk_kda
+from attn_gym.linear import chunk_gdn, chunk_kda, gate_transform
 
 pytestmark = pytest.mark.skipif(
     torch.cuda.device_count() < 2,
@@ -78,4 +78,34 @@ def test_forward_and_backward_follow_tensor_device(
     for result, reference in zip(actual, expected, strict=True):
         assert result.device == torch.device("cuda:1")
         assert torch.isfinite(result).all()
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("head_dim", [None, 128], ids=["per-head", "per-channel"])
+@pytest.mark.parametrize("kind", ["bounded", "softplus"])
+def test_gate_transform_follows_tensor_device(kind: str, head_dim: int | None):
+    """The fused gate kernels launch on their operands' device and leave the current one."""
+    shape = (1, 64, 2) if head_dim is None else (1, 64, 2, head_dim)
+    generator = torch.Generator(device="cuda:1").manual_seed(0)
+    inputs = (
+        torch.randn(shape, device="cuda:1", generator=generator),
+        torch.randn(2, device="cuda:1", generator=generator),
+        torch.randn(shape[2:], device="cuda:1", generator=generator),
+    )
+    options = {"kind": kind, "lower_bound": -5.0 if kind == "bounded" else None}
+
+    def run():
+        leaves = tuple(tensor.detach().clone().requires_grad_() for tensor in inputs)
+        gate = gate_transform(*leaves, **options)
+        return gate, *torch.autograd.grad(gate.sum(), leaves)
+
+    with torch.cuda.device(1):
+        expected = run()
+    with torch.cuda.device(0):
+        torch.empty(1, device="cuda:0")  # Keep both devices' CUDA contexts live.
+        actual = run()
+        torch.cuda.synchronize(1)
+        assert torch.cuda.current_device() == 0
+    for result, reference in zip(actual, expected, strict=True):
+        assert result.device == torch.device("cuda:1")
         torch.testing.assert_close(result, reference, rtol=0, atol=0)

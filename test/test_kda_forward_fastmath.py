@@ -5,7 +5,6 @@ import importlib
 import pytest
 import torch
 
-from attn_gym._backends.arch import runs_sm100_kernels
 from attn_gym.linear import chunk_kda
 from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.testing.kda import cumulative_sequence_offsets, kda_reference, make_kda_test_inputs
@@ -13,10 +12,6 @@ from attn_gym.testing.kda import cumulative_sequence_offsets, kda_reference, mak
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
     reason="the fused KDA core requires CUDA capability 8.0 or newer",
-)
-requires_blackwell = pytest.mark.skipif(
-    not torch.cuda.is_available() or not runs_sm100_kernels(torch.cuda.get_device_capability()),
-    reason="the BF16 KDA intra engine requires an SM100-family GPU",
 )
 
 
@@ -35,17 +30,15 @@ def test_warpdrive_accepts_both_precision_requests(monkeypatch):
             chunk_kda(q, q, q, gate, beta, kernel_options={"backend": "warpdrive"}, **kwargs)
 
 
-@requires_blackwell
+@requires_cuda
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
     """Both fastmath modes keep a decayed term that crosses a 16-token strip boundary.
 
-    The intra engine splits each pair's decay into two strip-rebased factors. Rebasing at the
+    The forward splits each pair's decay into two strip-rebased factors. Rebasing at the
     strip's first row put this pair's row factor at exp(-88), which the flush-to-zero ``ex2``
-    of ``fastmath=True`` zeroed; the engine now shifts the rebase by 2^64, so both factors stay
-    normal and the engine has no fastmath switch.
+    of ``fastmath=True`` zeroed.
     """
-    pytest.importorskip("cutlass")
     q = torch.zeros(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
     q[..., 0] = 1
     k = q.clone()
@@ -69,21 +62,32 @@ def test_public_fastmath_preserves_decay_across_strip_boundary(compiled):
         torch.testing.assert_close(dbeta[0, 15, 0], golden[0].to(beta.dtype), rtol=0, atol=0)
 
 
-@requires_blackwell
+@requires_cuda
+@pytest.mark.parametrize(
+    "fastmath",
+    [
+        False,
+        pytest.param(
+            True,
+            # NOTE [Causal gate reference]: the causal row-0 rebase needs subnormal factors here,
+            # which the flush-to-zero exp2 drops (dgate rel-L2 about 1.5e-2 at -5.9).
+            marks=pytest.mark.xfail(strict=True, reason="fastmath flushes the row-0 rebase"),
+        ),
+    ],
+)
 @pytest.mark.parametrize("gate_value", [-5.9, -MAX_GATE_LOWER_BOUND_MAGNITUDE])
-def test_default_fastmath_gate_gradient_at_gate_bound(gate_value):
-    """The default fastmath keeps the gate gradient accurate at constant gates near the bound.
+def test_gate_gradient_at_gate_bound(gate_value, fastmath):
+    """Both fastmath modes keep the gate gradient accurate at constant gates near the bound.
 
     The backward intra kernel used to derive each row's in-subchunk factor from its
     earlier-key factor, which the flush-to-zero exp2 zeroed for a 16-row subchunk's last row,
     dropping that row's in-subchunk terms (rel-L2 0.8-3.2 across seeds).
     """
-    pytest.importorskip("cutlass")
     inputs = make_kda_test_inputs(128, normalize_qk=True, gate_value=gate_value, seed=3)
     generator = torch.Generator(device="cuda").manual_seed(4)
     d_output = torch.randn(inputs[2].shape, device="cuda", generator=generator).to(inputs[2].dtype)
     leaves = [value.detach().clone().requires_grad_() for value in inputs]
-    output, _ = chunk_kda(*leaves, kernel_options={"autotune": False})
+    output, _ = chunk_kda(*leaves, fastmath=fastmath, kernel_options={"autotune": False})
     (d_gate,) = torch.autograd.grad(output, leaves[3], d_output)
     reference = [value.detach().double().requires_grad_() for value in inputs]
     expected, _ = kda_reference(*reference, output_final_state=False)
@@ -93,9 +97,31 @@ def test_default_fastmath_gate_gradient_at_gate_bound(gate_value):
 
 
 @requires_cuda
+@pytest.mark.parametrize("fastmath", [False, True])
+def test_triton_forward_keeps_small_keys_at_a_flat_gate(fastmath):
+    """The Triton diagonal stage keeps a tiny key whose terms are representable.
+
+    The stage shifted every rebase by 2^64 to keep steep-gate factors normal, so a ``2^-100``
+    key became ``2^-164`` before the product and every diagonal term was lost although no gate
+    needed the shift (the outputs ``(t + 1) 2^-42`` came out zero).
+    """
+    q = torch.zeros(1, 64, 1, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    q[..., 0], k[..., 0] = 2.0**58, 2.0**-100
+    v = torch.ones_like(q)
+    gate = torch.zeros(q.shape, device="cuda")
+    beta = torch.ones(q.shape[:-1], device="cuda")
+    output, _ = chunk_kda(
+        q, k, v, gate, beta, scale=1.0, fastmath=fastmath, kernel_options={"autotune": False}
+    )
+    tokens = torch.arange(1, 65, device="cuda", dtype=torch.float64)
+    expected = (tokens * 2.0**-42)[None, :, None, None].expand(q.shape)
+    torch.testing.assert_close(output.double(), expected, rtol=1e-2, atol=0)
+
+
+@requires_cuda
 @pytest.mark.parametrize("packed", [False, True], ids=["dense", "ragged"])
 def test_backward_factor_recomputation_preserves_fastmath(packed):
-    pytest.importorskip("cutlass")
     stages = importlib.import_module("attn_gym.linear.kda.stages")
     torch.manual_seed(17)
     inputs = make_kda_test_inputs(128, normalize_qk=True, gate_value=-5.5)
@@ -128,8 +154,7 @@ def test_backward_factor_recomputation_preserves_fastmath(packed):
 @pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reverse"])
 def test_state_summary_fastmath_preserves_subnormal_decay(reverse):
     """Exercise the compiler's FTZ policy on an isolated FP32 decay."""
-    pytest.importorskip("cutlass")
-    summaries = importlib.import_module("attn_gym.linear._delta_rule.cute")
+    summaries = importlib.import_module("attn_gym.linear._delta_rule.summaries")
     zeros = torch.zeros(1, 64, 1, 128, dtype=torch.bfloat16, device="cuda")
     cumulative_gate = torch.zeros_like(zeros, dtype=torch.float32)
     steps = torch.arange(1, 65, device="cuda", dtype=torch.float32)

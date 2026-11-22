@@ -16,6 +16,7 @@ from attn_gym.linear.kda import (
     ReplayState,
     active_token_mask,
     chunk_kda,
+    copy_replay_tails,
     mask_inactive_token_gradients,
     mask_inactive_tokens,
     paged_chunk_kda,
@@ -45,6 +46,7 @@ if TYPE_CHECKING:
 
 KDA_OPS = [
     "chunk_kda",
+    "copy_replay_tails",
     "paged_chunk_kda",
     "recurrent_kda",
     "recurrent_kda_decode",

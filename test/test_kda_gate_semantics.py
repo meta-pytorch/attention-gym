@@ -9,15 +9,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-pytest.importorskip("cutlass")
-
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.gate import _gate_transform_bwd_op, _gate_transform_fwd_op
+from attn_gym.linear._delta_rule.triton import gate_transform as triton_gate
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
 from attn_gym.linear.kda import bound_gate, chunk_kda
-from attn_gym.linear.kda.bwd.cute import gate_bwd as cute_gate_bwd
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
-from attn_gym.linear.kda.fwd.cute import gate_fwd as cute_gate_fwd
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import cumulative_sequence_offsets
 
@@ -216,24 +213,22 @@ def test_bound_gate_supports_general_layouts(layout: str):
 
 
 def _record_gate_launches(monkeypatch) -> list[torch.Tensor]:
-    """Record the ``raw_gate`` each compiled gate kernel (forward, then backward) receives."""
+    """Record the ``raw_gate`` each gate kernel (forward, then backward) receives."""
     launched = []
-    for module, name in (
-        (cute_gate_fwd, "_compile_gate_transform_fwd"),
-        (cute_gate_bwd, "_compile_gate_transform_bwd"),
-    ):
-        compile_fn = getattr(module, name)
 
-        def compile_and_record(*args, _compile_fn=compile_fn):
-            compiled = _compile_fn(*args)
+    class RecordingKernel:
+        def __init__(self, kernel):
+            self.kernel = kernel
 
-            def launch(raw_gate, *tensors):
+        def __getitem__(self, grid):
+            def launch(raw_gate, *args, **kwargs):
                 launched.append(raw_gate)
-                return compiled(raw_gate, *tensors)
+                return self.kernel[grid](raw_gate, *args, **kwargs)
 
             return launch
 
-        monkeypatch.setattr(module, name, compile_and_record)
+    for name in ("gate_transform_fwd_kernel", "gate_transform_bwd_kernel"):
+        monkeypatch.setattr(triton_gate, name, RecordingKernel(getattr(triton_gate, name)))
     return launched
 
 

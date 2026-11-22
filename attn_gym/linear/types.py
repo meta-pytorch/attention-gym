@@ -7,7 +7,7 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, TypedDict
 
 import torch
 
@@ -16,40 +16,30 @@ from attn_gym.types import TUNING_OPTION_SPEC, Impl, KernelOptionSpec, TuningOpt
 
 
 class StateCheckpoints(NamedTuple):
-    """Caller-owned periodic FP32 snapshots for paged GDN and KDA inference.
+    """Publish one selected prefix per sequence into a caller-owned recurrent-state pool.
 
-    ``states`` is a contiguous buffer shaped ``[capacity, H, V, K]``. Sequence ``i``
-    writes its post-update states every ``every_n_tokens`` tokens, measured from that
-    sequence's start in this call. With KDA ``replay_state``, count from the start of
-    the slot's unfinished chunk instead: cached replay tokens precede the new tokens.
-    The interval must be a positive multiple of 64. A final state exactly on an interval
-    boundary is included; incomplete intervals produce no snapshot.
+    For sequence i, ``checkpoint_positions[i]`` counts new tokens in this call and
+    ``checkpoint_slots[i]`` names the destination. Both are contiguous int32 vectors of
+    shape ``[N]`` on the input device. Without replay, only positive multiples of 64
+    within the sequence are written; other positions do not round down. Non-positive slots
+    and inactive sequences do not write. An invalid position for a selected slot is a caller
+    error: debug kernels can assert, and an untouched slot must not be published.
 
-    ``cu_checkpoint_offsets`` is contiguous int32 on the input device, shaped ``[N + 1]``.
-    It starts at zero and never decreases. Each active sequence reserves
-    ``sequence_length // every_n_tokens`` rows, or
-    ``(replayed_tokens + sequence_length) // every_n_tokens`` for KDA replay. A fresh slot
-    (``has_initial_state=False``) has zero replayed tokens. Inactive sequences may reserve
-    unused rows. The final offset must not exceed ``capacity``. These values are caller
-    responsibilities: no device-to-host synchronization is performed to check them.
+    With KDA replay, the stored state is the last 64-token boundary reached by the requested
+    position, counting the slot's previously buffered tokens. No state is published before
+    the first completed chunk or past the sequence. To resume mid-chunk, the caller must also
+    preserve the trailing replay inputs and count; an exact boundary needs a zero count.
 
-    Inactive sequences (non-positive state indices) and unused capacity are not written.
-    Both tensors must be on the input device. The writable buffer must not alias any
-    input, including the state cache and checkpoint offsets. Snapshots come directly from
-    the FP32 recurrence accumulator, even when the persistent state cache uses BF16.
-    Checkpointing is inference-only and requires the repo-local fused backend:
-    ``paged_chunk_gdn``, ``paged_chunk_kda`` (including replay), or ``recurrent_gdn``
-    with ``state_indices``.
-    A replay checkpoint contains only the completed chunk's recurrent state. To resume at
-    a position within the next chunk, the caller must also preserve that position's replay
-    tokens and count; the operation does not snapshot replay buffers. The replay interval
-    origin is recomputed for each call, so intervals longer than 64 never complete during
-    one-token replay decode.
+    ``state_pool`` is an FP32 or BF16 ``[slots, H, V, K]`` tensor, contiguous within
+    disjoint slots. It may be the running state cache, but no other input. Positive destination
+    slots must be in bounds, distinct among writers and, if sharing the cache, not routed by
+    this call. Neither request vector may overlap storage the call modifies (including replay
+    counts). These are caller guarantees, not host-side checks of device values.
     """
 
-    states: torch.Tensor
-    cu_checkpoint_offsets: torch.Tensor
-    every_n_tokens: int
+    state_pool: torch.Tensor
+    checkpoint_positions: torch.Tensor
+    checkpoint_slots: torch.Tensor
 
 
 class ReplayState(NamedTuple):
@@ -93,7 +83,9 @@ class BackendOptions(TuningOptions, total=False):
     """Backend selection and tuning shared by optimized linear-attention operations."""
 
     backend: Literal["fused", "warpdrive"]
-    """Select the repo-local fused backend or the optional warpdrive backend."""
+    """Select the chunk kernels. ``"fused"`` (default) runs the portable Triton kernels on every
+    CUDA architecture; ``"warpdrive"`` runs the CuTeDSL warpdrive kernels (SM100-family GPUs,
+    ``[linear]`` extra)."""
 
 
 class SplitOptions(BackendOptions, total=False):
@@ -122,6 +114,26 @@ class KernelOptions(SplitOptions, total=False):
     always stride over the active work only."""
 
 
+class _StageOptions(TypedDict, total=False):
+    batch_invariant: bool
+    """Keep each sequence's context-parallel summary bits (``state_summaries`` and
+    ``state_grad_summaries``) independent of the rest of the packed stream: the other sequences,
+    their count and lengths. Defaults to ``False``, where a long sequence's summaries split into
+    pieces by a plan of the stream's shape. ``True`` scans every sequence uncut in both
+    directions. Only the warpdrive backend's summaries split, so the fused backend rejects it;
+    the handles' local ``run`` keeps its own shape-dependent plan."""
+
+
+class StageKernelOptions(KernelOptions, _StageOptions, total=False):
+    """``chunk_kda_prepare`` and ``chunk_kda_prepare_backward`` options: ``chunk_kda``'s and
+    ``batch_invariant``."""
+
+
+class GDNStageKernelOptions(SplitOptions, _StageOptions, total=False):
+    """``chunk_gdn_prepare`` and ``chunk_gdn_prepare_backward`` options: ``chunk_gdn``'s and
+    ``batch_invariant``."""
+
+
 class RecurrentKernelOptions(TuningOptions, total=False):
     """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
 
@@ -146,6 +158,8 @@ KERNEL_OPTION_SPEC: KernelOptionSpec = {
     "schedule": (("auto", "static", "persistent"), "auto"),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
+STAGE_OPTION_SPEC: KernelOptionSpec = {**KERNEL_OPTION_SPEC, "batch_invariant": (bool, False)}
+GDN_STAGE_OPTION_SPEC: KernelOptionSpec = {**SPLIT_OPTION_SPEC, "batch_invariant": (bool, False)}
 
 
 class GateTransform(str, Enum):
@@ -172,12 +186,14 @@ def resolve_gate_transform(kind: GateTransform | str) -> GateTransform:
 
 __all__ = [
     "BackendOptions",
+    "GDNStageKernelOptions",
     "GateTransform",
     "Impl",
     "KernelOptions",
     "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
+    "StageKernelOptions",
     "StateCheckpoints",
     "TuningOptions",
     "resolve_gate_transform",

@@ -1,11 +1,10 @@
 """Reuse a cached KDA prompt prefix with state checkpoints and replay tails.
 
-A serving engine prefills request A in a paged state slot and asks ``paged_chunk_kda`` for
-periodic FP32 state checkpoints. Request B shares A's first ``prefix`` tokens. Instead of
-recomputing them, B's slot is seeded with the checkpoint at the last full chunk before the
-prefix end, plus the prefix tokens after that chunk as B's replay tail. B then prefills only
-its own suffix, and its output matches a from-scratch prefill bit for bit.
-
+A serving engine prefills request A in a paged state slot. ``paged_chunk_kda`` writes the
+state at the last full chunk of the shared prefix into a destination slot of the same pool.
+Before prefill advances A, the engine copies the prefix's replay tail to that destination.
+Request B takes ownership of the completed slot and prefills only its suffix. The result
+matches a from-scratch prefill bit for bit.
 """
 
 from __future__ import annotations
@@ -14,13 +13,12 @@ import argparse
 
 import torch
 
-from attn_gym.linear import ReplayState, StateCheckpoints, paged_chunk_kda
+from attn_gym.linear import ReplayState, StateCheckpoints, copy_replay_tails, paged_chunk_kda
 
 CHUNK_SIZE = 64
 HEADS = 2
 HEAD_DIM = 128  # Required by fused paged_chunk_kda.
 TOKENS = 200  # Each request's prompt length.
-INTERVAL = 64  # Checkpoint every chunk.
 SLOT_A, SLOT_B, SLOT_REFERENCE = 1, 2, 3  # Slot 0 is the null slot.
 OPTIONS = {"autotune": False}  # Fixed heuristics keep kernel selection repeatable.
 
@@ -41,7 +39,7 @@ def make_prompt(seed: int, tokens: int) -> tuple[torch.Tensor, ...]:
     return q, k, v, gate, beta
 
 
-def prefill(slot: int, prompt, state_cache, replay, *, fresh: bool, checkpoints=None):
+def prefill(slot: int, prompt, state_cache, replay, *, fresh: bool):
     """Advance one slot's recurrent state and replay tail over a prompt segment."""
     return paged_chunk_kda(
         *prompt,
@@ -49,17 +47,15 @@ def prefill(slot: int, prompt, state_cache, replay, *, fresh: bool, checkpoints=
         torch.tensor([slot], device="cuda", dtype=torch.int32),
         has_initial_state=torch.tensor([not fresh], device="cuda"),
         replay_state=replay,
-        state_checkpoints=checkpoints,
         kernel_options=OPTIONS,
     )
 
 
 def restore_shared_prefix(prefix: int) -> int:
-    """Serve request B from request A's checkpoint; return the prefill tokens it skips."""
-    restored = prefix // INTERVAL * INTERVAL  # The last checkpoint inside the shared prefix.
-    tail = prefix - restored
-    if not 0 < restored or tail >= CHUNK_SIZE:
-        raise ValueError("the shared prefix must contain a checkpoint within one chunk")
+    """Serve request B from request A's checkpoint; return the restored state boundary."""
+    if not CHUNK_SIZE <= prefix < TOKENS:
+        raise ValueError(f"the shared prefix must hold a full chunk and leave a suffix: {prefix}")
+    restored = prefix // CHUNK_SIZE * CHUNK_SIZE  # The last chunk boundary of the shared prefix.
     prompt_a = make_prompt(seed=1, tokens=TOKENS)
     suffix_b = make_prompt(seed=2, tokens=TOKENS - prefix)
     prompt_b = tuple(
@@ -79,20 +75,37 @@ def restore_shared_prefix(prefix: int) -> int:
         cache[SLOT_B].normal_()
     replay.count[SLOT_B] = 37
 
-    # Request A: a fresh slot replays nothing, so it reserves TOKENS // INTERVAL rows.
+    # Both operations use the scheduler's original prefix position and slot. Copy the replay
+    # inputs first: the prefill below changes the source slot's count and tail.
     checkpoints = StateCheckpoints(
-        torch.empty(TOKENS // INTERVAL, HEADS, HEAD_DIM, HEAD_DIM, device="cuda"),
-        torch.tensor([0, TOKENS // INTERVAL], device="cuda", dtype=torch.int32),
-        INTERVAL,
+        state_cache,
+        checkpoint_positions=torch.tensor([prefix], device="cuda", dtype=torch.int32),
+        checkpoint_slots=torch.tensor([SLOT_B], device="cuda", dtype=torch.int32),
     )
-    prefill(SLOT_A, prompt_a, state_cache, replay, fresh=True, checkpoints=checkpoints)
-
-    # Request B: copy the checkpoint and the prefix tokens after it into B's slot. A prefix
-    # ending exactly on a chunk boundary copies no tokens, but must still set the count to 0.
-    state_cache[SLOT_B].copy_(checkpoints.states[restored // INTERVAL - 1])
-    for cache, tokens in zip(replay[:-1], prompt_a, strict=True):
-        cache[SLOT_B, :tail].copy_(tokens[0, restored:prefix])
-    replay.count[SLOT_B] = tail
+    cu_seqlens = torch.tensor([0, TOKENS], device="cuda", dtype=torch.int32)
+    source_slots = torch.tensor([SLOT_A], device="cuda", dtype=torch.int32)
+    resumed = torch.tensor([False], device="cuda")
+    copy_replay_tails(
+        replay,
+        prompt_a,
+        cu_seqlens=cu_seqlens,
+        state_indices=source_slots,
+        has_initial_state=resumed,
+        checkpoint_positions=checkpoints.checkpoint_positions,
+        checkpoint_slots=checkpoints.checkpoint_slots,
+    )
+    paged_chunk_kda(
+        *prompt_a,
+        state_cache,
+        source_slots,
+        cu_seqlens=cu_seqlens,
+        replay_state=replay,
+        has_initial_state=resumed,
+        state_checkpoints=checkpoints,
+        kernel_options=OPTIONS,
+    )
+    # B now owns this slot exclusively. An engine retaining a shared cache entry would fork it
+    # before advancing B, rather than mutate the shared entry.
     reused = prefill(SLOT_B, suffix_b, state_cache, replay, fresh=False)
 
     # Reference: prefill B's whole prompt from scratch in another slot.
@@ -118,9 +131,11 @@ def main() -> None:
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8:
         raise SystemExit("paged_chunk_kda requires CUDA capability 8.0 or newer")
 
-    skipped = restore_shared_prefix(args.prefix)
+    boundary = restore_shared_prefix(args.prefix)
     print("suffix output, state, and replay tail match a full prefill bitwise")
-    print(f"prefill tokens skipped for request B: {skipped} of {TOKENS}")
+    print(
+        f"state restored at token {boundary}; request B prefills only {TOKENS - args.prefix} tokens"
+    )
 
 
 if __name__ == "__main__":

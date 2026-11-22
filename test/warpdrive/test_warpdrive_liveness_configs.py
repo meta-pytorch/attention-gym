@@ -2,7 +2,6 @@
 
 import importlib
 
-import cutlass
 import pytest
 import torch
 
@@ -38,12 +37,6 @@ EXPECTED = {
     "ex_grouped_gemm": FOUND,
     "ex_qwen_megakernel": BRANCH,
     "ex_raw_interop": RAW,
-    "affine_summary_fwd": BRANCH,
-    "affine_summary_rev": BRANCH,
-    "delta_h_bwd": BRANCH,
-    "wy_dqkg": RAW,
-    "wy_dqkg_ragged": RAW,
-    "kda_intra_fwd": BRANCH,
     "indexer_score_packed": FOUND,
     "indexer_score_generic": FOUND,
 }
@@ -167,64 +160,6 @@ EXAMPLES = [
     ),
 ]
 PORTED = [
-    (
-        "affine_summary_fwd",
-        "linear._delta_rule.cute.affine_summary_fwd",
-        "_compile_affine_summary",
-        ("bf16", 2, 64, False, True),
-        {"fastmath": True},
-    ),
-    (
-        "affine_summary_rev",
-        "linear._delta_rule.cute.affine_summary_rev",
-        "_compile_affine_summary_rev",
-        ("bf16", 2, False, True, True),
-        {},
-    ),
-    (
-        "delta_h_bwd",
-        "linear.kda.bwd.cute.chunk_delta_h_bwd",
-        "_compile_delta_h_bwd",
-        (4, 32, cutlass.BFloat16, False, False, True, False),
-        {},
-    ),
-    (
-        "wy_dqkg",
-        "linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused",
-        "_compile_chunk_kda_bwd_wy_dqkg",
-        (),
-        {
-            "heads": 2,
-            "head_dim": 128,
-            "chunk_size": 64,
-            "io_dtype": torch.bfloat16,
-            "scale": 128**-0.5,
-            "fastmath": True,
-            "ragged": False,
-        },
-    ),
-    (
-        "wy_dqkg_ragged",
-        "linear.kda.bwd.cute.chunk_kda_bwd_wy_dqkg_fused",
-        "_compile_chunk_kda_bwd_wy_dqkg",
-        (),
-        {
-            "heads": 2,
-            "head_dim": 128,
-            "chunk_size": 64,
-            "io_dtype": torch.bfloat16,
-            "scale": 128**-0.5,
-            "fastmath": True,
-            "ragged": True,
-        },
-    ),
-    (
-        "kda_intra_fwd",
-        "linear.kda.fwd.cute.chunk_kda_fwd_intra_engine",
-        "_compile_intra_engine_fwd",
-        (4, 128, False, False),
-        {},
-    ),
     (
         "indexer_score_packed",
         "sparse.indexer.impl.cute",

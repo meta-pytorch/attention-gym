@@ -6,13 +6,13 @@ import torch
 
 from attn_gym._backends.autotune import should_autotune
 from attn_gym.linear._delta_rule.reference import reference_delta_rule
+from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
     validate_paged_state,
-    validate_state_checkpoints,
 )
 from attn_gym.linear.gdn.impl.reference import chunk_forward, recurrent_forward
 from attn_gym.linear.gdn.impl.warpdrive import chunk_forward as warpdrive_chunk_forward
@@ -84,7 +84,7 @@ def chunk_gdn(
             ``split_forward`` and ``split_backward`` opt into its approximate
             forgetting-horizon split schedules (see :class:`attn_gym.linear.types.SplitOptions`)
             for calls without ``initial_state`` or ``output_final_state``. ``"autotune"``
-            (default ``True``) benchmarks candidate configurations of the repo-local fused
+            (default ``True``) benchmarks candidate configurations of the Triton fused
             kernels; winners are cached and reused. When ``False``, and always under
             ``torch.use_deterministic_algorithms(True)``, the forward and backward launch
             fixed configurations, so bits repeat across processes and winner-cache states on
@@ -167,7 +167,8 @@ def paged_chunk_gdn(
         gate: Floating per-token scalar natural-log decay shaped ``[B, T, H]``.
         beta: Floating per-token write gate shaped ``[B, T, H]``.
         state_cache: Mutable FP32 or BF16 state pool shaped ``[num_slots, H, V, K]``.
-            Recurrence math remains FP32; BF16 affects persistent storage only.
+            Recurrence math remains FP32; BF16 affects persistent storage only. The pool base
+            and slot stride need only element alignment.
         state_indices: Contiguous int32 slot indices, one per logical sequence. Positive,
             unique indices select slots to advance; non-positive indices produce zero output
             and leave the cache untouched.
@@ -179,16 +180,16 @@ def paged_chunk_gdn(
             entries start from zero and overwrite the selected slot.
         scale: Query scale. Defaults to ``1 / sqrt(K)``.
         kernel_options: Backend options. The repo-local path is the default;
-            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend, which
-            requires 16-byte-aligned pool bases and slot origins. Split schedules are not
-            supported. ``"autotune"`` (default ``True``) benchmarks candidate configurations
-            of the repo-local factor and output kernels. When ``False``, and always under
-            ``torch.use_deterministic_algorithms(True)``, they launch fixed configurations.
-            The recurrence that advances ``state_cache`` and the warpdrive backend always use
-            fixed configurations.
+            ``{"backend": "warpdrive"}`` selects the optional warpdrive backend. Split schedules
+            are not supported. ``"autotune"`` (default ``True``) benchmarks candidate
+            configurations of the Triton factor and output kernels. When ``False``, and
+            always under ``torch.use_deterministic_algorithms(True)``, they launch fixed
+            configurations. The recurrence that advances ``state_cache`` and the warpdrive
+            backend always use fixed configurations.
 
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots. See
-            :class:`attn_gym.linear.StateCheckpoints` for buffer layout and boundary semantics.
+        state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
+            state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
+            semantics.
             Requires the fused backend.
 
     Returns:
@@ -300,8 +301,8 @@ def recurrent_gdn(
             autotune cache states. That config still follows the batch shape:
             ``{"batch_invariant": True}`` makes a sequence's bits independent of the rest of
             the batch.
-        state_checkpoints: Optional caller-owned periodic FP32 snapshots, written directly
-            from the recurrent accumulator before any pool-storage conversion. Requires
+        state_checkpoints: Optional per-sequence checkpoints, written directly from the FP32
+            recurrent accumulator into caller-chosen slots of a state pool. Requires
             ``state_indices`` and ``impl="fused"``. Boundaries are relative to this call;
             see :class:`attn_gym.linear.StateCheckpoints` for layout and boundary semantics.
 

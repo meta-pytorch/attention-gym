@@ -11,7 +11,8 @@ from attn_gym._backends.cute import get_device_properties
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only, state_checkpoint_op_args
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
+from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._lazy import register_lazy_cuda_impls
 from attn_gym.linear.types import StateCheckpoints
 
@@ -55,8 +56,8 @@ torch.library.define(
     "(Tensor q, Tensor k, Tensor v, Tensor cumulative_gate, Tensor beta, "
     "Tensor(a!) state_cache, Tensor state_indices, Tensor? has_initial_state, "
     "Tensor cu_seqlens, Tensor chunk_offsets, SymInt capacity, float scale, bool autotune, "
-    "Tensor(b!)? checkpoint_states=None, Tensor? cu_checkpoint_offsets=None, "
-    "int checkpoint_interval=0) "
+    "Tensor(b!)? checkpoint_states=None, Tensor? checkpoint_positions=None, "
+    "Tensor? checkpoint_slots=None) "
     "-> Tensor",
 )
 _RECURRENT_ARGS = (
@@ -70,7 +71,8 @@ torch.library.define(
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor? cu_seqlens, float scale, "
     "bool batch_invariant, Tensor(b!)? checkpoint_states=None, "
-    "Tensor? cu_checkpoint_offsets=None, int checkpoint_interval=0) -> Tensor",
+    "Tensor? checkpoint_positions=None, "
+    "Tensor? checkpoint_slots=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_recurrent_decode",
@@ -235,8 +237,8 @@ def _chunk_fwd_packed_paged_fake(
     scale: float,
     autotune: bool,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return torch.empty(v.shape, dtype=q.dtype, device=v.device)
 
@@ -353,11 +355,12 @@ def _recurrent_fwd_paged_fake(
     scale: float,
     batch_invariant: bool,
     checkpoint_states: torch.Tensor | None = None,
-    cu_checkpoint_offsets: torch.Tensor | None = None,
-    checkpoint_interval: int = 0,
+    checkpoint_positions: torch.Tensor | None = None,
+    checkpoint_slots: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del k, gate, beta, state_cache, state_indices, has_initial_state, cu_seqlens, scale
-    del batch_invariant, checkpoint_states, cu_checkpoint_offsets, checkpoint_interval
+    del batch_invariant, checkpoint_states, checkpoint_positions
+    del checkpoint_slots
     return torch.empty_like(v, dtype=q.dtype)
 
 
@@ -502,8 +505,7 @@ def _validate_fused_chunk_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor)
         raise TypeError("chunk_gdn(impl='fused') requires matching float16 or bfloat16 QKV")
     if (q.shape[-1], v.shape[-1]) not in ((64, 64), (128, 128)):
         raise ValueError("chunk_gdn(impl='fused') requires K=V in {64, 128}")
-    # Triton lowers TensorDescriptor accesses to pointer operations before Hopper. D128 on
-    # Blackwell additionally selects the CuTe backward; D64 always uses portable Triton.
+    # Triton lowers TensorDescriptor accesses to pointer operations before Hopper.
     if not torch.compiler.is_compiling() and get_device_properties(q.device).major < 8:
         raise ValueError("fused chunk GDN requires CUDA capability 8.0 or newer")
 

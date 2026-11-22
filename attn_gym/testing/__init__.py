@@ -3,6 +3,7 @@
 from .gdn import make_gdn_test_inputs
 from .kda import (
     CHECKPOINT_SENTINEL,
+    assert_checkpoints_into_cache_match,
     cumulative_sequence_offsets,
     sentinel_state_checkpoints,
     strided_state_pool,
@@ -20,6 +21,7 @@ __all__ = [
     "CHECKPOINT_SENTINEL",
     "TraceFormat",
     "annotate_kernels",
+    "assert_checkpoints_into_cache_match",
     "cumulative_sequence_offsets",
     "kernel_stage",
     "make_gdn_test_inputs",

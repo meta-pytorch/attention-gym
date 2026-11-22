@@ -1202,6 +1202,52 @@ def test_warpdrive_forward_op_registration(dtype: torch.dtype, outer_strided: bo
         rtol=2e-2,
         atol=2e-2,
     )
+    # ``nonempty`` promises no empty sequence: drop the empty middle one (lengths 65, 0, 63).
+    state = inputs[5][[0, 2]].contiguous()
+    if outer_strided:
+        state = _swap_state_head_value_storage(state)
+    cu_seqlens = inputs[6][[0, 1, 3]]
+    torch.library.opcheck(
+        chunk_warpdrive_packed_fwd_with_state_op,
+        (*inputs[:5], state, cu_seqlens, SCALE),
+        {"nonempty": True},
+        test_utils=test_utils,
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_warpdrive_dense_final_state_keeps_the_entry_state_layout_under_fullgraph() -> None:
+    """Dense batches skip seeding the final state; it must still take the entry state's layout,
+    as the fake promises, for a permuted ``[N, V, H, K]`` storage order."""
+    from attn_gym.linear import chunk_kda
+
+    q, k, value, gate, beta, _, _ = _make_inputs(requires_grad=False, heads=2)
+    batch = 2
+    q, k, value, gate, beta = (
+        tensor.reshape(batch, tensor.shape[1] // batch, *tensor.shape[2:])
+        for tensor in (q, k, value, gate, beta)
+    )
+    state = torch.randn(batch, 2, 128, 128, device="cuda")
+    state = _swap_state_head_value_storage(state)
+
+    def run(q, k, value, gate, beta, state):
+        return chunk_kda(
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            state,
+            output_final_state=True,
+            kernel_options={"backend": "warpdrive"},
+        )
+
+    expected = run(q, k, value, gate, beta, state)
+    actual = torch.compile(run, fullgraph=True)(q, k, value, gate, beta, state)
+    assert actual[1].stride() == state.stride()
+    for got, want in zip(actual, expected, strict=True):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
 
 
 def test_warpdrive_initial_state_forward_op_fullgraph() -> None:

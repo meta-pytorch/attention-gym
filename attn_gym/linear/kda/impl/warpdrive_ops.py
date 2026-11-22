@@ -32,8 +32,8 @@ torch.library.define(
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
-    "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True) "
-    "-> (Tensor, Tensor)",
+    "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True, "
+    "bool nonempty=False) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_paged",
@@ -159,7 +159,7 @@ def _packed_fwd_with_initial_state_cuda(
 
 
 def _packed_fwd_with_state_cuda(
-    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True
+    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True, nonempty=False
 ):
     template, state_template = value, initial_state
     q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
@@ -176,6 +176,7 @@ def _packed_fwd_with_state_cuda(
         scale=scale,
         output_final_state=True,
         fastmath=fastmath,
+        nonempty=nonempty,
     )
     assert final_state is not None
     return (
@@ -211,7 +212,7 @@ def _packed_fwd_paged_cuda(
         key_dim=q.shape[3],
         device=q.device,
         read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
-    ).require_alignment(16)
+    )
     output, _ = backend.run_forward(
         q,
         k,
@@ -349,9 +350,9 @@ def _packed_fwd_with_initial_state_fake(
 
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_with_state")
 def _packed_fwd_with_state_fake(
-    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True
+    q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath=True, nonempty=False
 ):
-    del q, k, gate, beta, cu_seqlens, scale, fastmath
+    del q, k, gate, beta, cu_seqlens, scale, fastmath, nonempty
     return _empty_like_token_operand(value), torch.empty_like(initial_state)
 
 

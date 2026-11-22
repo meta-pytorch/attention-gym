@@ -329,17 +329,6 @@ def test_grid_scheduler_sequence_workers_use_sequence_capacity():
     )
 
 
-def test_grid_scheduler_chunk_workers_cap_at_sm_count():
-    sm_count = torch.cuda.get_device_properties("cuda").multi_processor_count
-    metadata = RaggedChunkMetadata(None, None, capacity=1 << 20, chunk_size=64)
-    scheduler = GridScheduler(metadata)
-    assert scheduler.num_chunk_workers("cuda") == sm_count
-    # Sub-SM capacities quantize up to the next power of two to bound the
-    # TVM-FFI compile cache; extra workers idle in the stride loop.
-    assert GridScheduler(metadata._replace(capacity=3)).num_chunk_workers("cuda") == 4
-    assert GridScheduler(metadata._replace(capacity=0)).num_chunk_workers("cuda") == 0
-
-
 def test_persistent_task_count_promotes_before_multiplication():
     chunk_offsets = torch.tensor([1_500_000_000], device="cuda", dtype=torch.int32)
     output = torch.empty((), device="cuda", dtype=torch.int64)
@@ -402,29 +391,3 @@ def test_grid_scheduler_rejects_legacy_boolean_requests(monkeypatch):
 
     with pytest.raises(TypeError, match="ScheduleRequest"):
         GridScheduler(metadata).resolve_flat(True, 1, "cuda")
-
-
-@pytest.mark.parametrize(
-    ("schedule_request", "capacity", "expected_kind"),
-    (
-        (ScheduleRequest.AUTO, 256, ScheduleKind.STATIC),
-        (ScheduleRequest.AUTO, 257, ScheduleKind.PERSISTENT),
-        (ScheduleRequest.STATIC, 512, ScheduleKind.STATIC),
-        (ScheduleRequest.PERSISTENT, 512, ScheduleKind.PERSISTENT),
-        (ScheduleRequest.PERSISTENT, 0, ScheduleKind.STATIC),
-    ),
-)
-def test_grid_scheduler_chunk_plan_uses_the_same_resolved_type(
-    monkeypatch, schedule_request, capacity, expected_kind
-):
-    metadata = RaggedChunkMetadata(None, None, capacity=capacity, chunk_size=64)
-    monkeypatch.setattr(
-        GridScheduler,
-        "num_chunk_workers",
-        lambda self, device: 0 if self.metadata.capacity == 0 else 64,
-    )
-
-    resolved = GridScheduler(metadata).resolve_chunk(schedule_request, "cuda")
-
-    expected_workers = 0 if capacity == 0 else 64
-    assert resolved == ResolvedSchedule(expected_kind, expected_workers, capacity)

@@ -906,7 +906,9 @@ def main(
     ] = None,
     core_backend: Annotated[
         CoreBackendOption,
-        typer.Option(help="Chunk kernels for the fused backend: repo-local or warpdrive (SM100)."),
+        typer.Option(
+            help="Chunk kernels for the fused backend: Triton fused or warpdrive (SM100)."
+        ),
     ] = CoreBackendOption.FUSED,
     fastmath: Annotated[
         bool,

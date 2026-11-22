@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -29,19 +29,53 @@ CHECKPOINT_SENTINEL = 12345.0
 
 
 def sentinel_state_checkpoints(
-    counts: Sequence[int],
-    every_n_tokens: int,
+    positions: Sequence[int],
     state_shape: tuple[int, int, int],
     *,
     spare: int = 2,
 ) -> StateCheckpoints:
-    """Reserve ``counts[i]`` snapshot rows per sequence, plus spare rows, filled with a sentinel.
+    """Give sequence i slot i + 1 in an FP32 pool; untouched slots retain the sentinel."""
+    n = len(positions)
+    pool = torch.full((1 + n + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
+    return StateCheckpoints(
+        pool,
+        torch.tensor(positions, device="cuda", dtype=torch.int32),
+        torch.arange(1, n + 1, device="cuda", dtype=torch.int32),
+    )
 
-    Rows a kernel must not write keep ``CHECKPOINT_SENTINEL``, so whole-buffer comparisons also
-    check reserved-but-inactive rows and unused capacity.
+
+def assert_checkpoints_into_cache_match(
+    run: Callable[[torch.Tensor, StateCheckpoints], torch.Tensor],
+    cache: torch.Tensor,
+    reference: StateCheckpoints,
+    checkpoint_slots: Sequence[int],
+    produced_sequences: Sequence[int],
+) -> None:
+    """Check that checkpoints written into the state cache match a separate FP32 pool.
+
+    ``reference`` comes from :func:`sentinel_state_checkpoints`. Compare the whole backing
+    storage, not just the visible states, so writes into page padding also fail.
     """
-    states = torch.full((sum(counts) + spare, *state_shape), CHECKPOINT_SENTINEL, device="cuda")
-    return StateCheckpoints(states, cumulative_sequence_offsets(counts), every_n_tokens)
+
+    def clone(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy the whole backing storage; return the flat copy and the matching view."""
+        elements = tensor.untyped_storage().nbytes() // tensor.element_size()
+        flat = tensor.new_empty(0).set_(tensor.untyped_storage(), 0, (elements,)).clone()
+        return flat, flat.as_strided(tensor.shape, tensor.stride(), tensor.storage_offset())
+
+    reference_storage, reference_cache = clone(cache)
+    reference.state_pool.fill_(CHECKPOINT_SENTINEL)
+    expected_output = run(reference_cache, reference)
+    written = (reference.state_pool != CHECKPOINT_SENTINEL).flatten(1).any(dim=1)
+    assert written.nonzero().flatten().tolist() == sorted(i + 1 for i in produced_sequences)
+    pool_storage, pool_cache = clone(cache)
+    slots = torch.tensor(checkpoint_slots, device=cache.device, dtype=torch.int32)
+    output = run(pool_cache, reference._replace(state_pool=pool_cache, checkpoint_slots=slots))
+    for i in produced_sequences:
+        if checkpoint_slots[i] > 0:
+            reference_cache[checkpoint_slots[i]] = reference.state_pool[i + 1]
+    torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+    torch.testing.assert_close(pool_storage, reference_storage, rtol=0, atol=0, equal_nan=True)
 
 
 def packed_chunk_routes(
@@ -78,9 +112,10 @@ def strided_state_pool(
     whose slots are separated by padding, matching how serving engines carve recurrent state
     out of larger per-slot pages. Keep the storage alive while the view is in use.
 
-    The default ``prefix`` deliberately misaligns the pool base to stress the Triton paths,
-    which tolerate arbitrary element offsets. CuTe backends declare ``assumed_align=16`` on
-    the pool pointer, so their tests must pass ``prefix=0`` to keep the base 16-byte aligned.
+    The default ``prefix`` deliberately misaligns the pool base (and, for BF16, the default
+    ``suffix`` the slot stride) to exercise every backend's unaligned state rows. Pass
+    ``prefix=0`` and a suffix that keeps the slot stride a multiple of 16 bytes for 16-byte
+    aligned rows.
     """
     state_elements = heads * key_dim * value_dim
     storage = torch.randn(num_slots, prefix + state_elements + suffix, device="cuda", dtype=dtype)

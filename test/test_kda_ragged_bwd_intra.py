@@ -1,22 +1,15 @@
-"""Ragged scheduler tests for the CuTe KDA intra-chunk backward stage."""
+"""Tests for the Triton KDA intra-chunk backward stage."""
 
 from __future__ import annotations
 
 import math
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import pytest
 import torch
 
+import attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_intra as triton_intra
 from attn_gym.linear._delta_rule.triton.chunk_scheduler import prepare_ragged_chunk_metadata
-from attn_gym.linear.kda.bwd.cute.chunk_kda_bwd_intra import (
-    ChunkKdaBwdIntraConfig,
-    _compile_chunk_kda_bwd_intra,
-    chunk_kda_bwd_intra,
-)
+from attn_gym.linear.kda.bwd.triton.chunk_kda_bwd_intra import chunk_kda_bwd_intra_triton
 from attn_gym.linear.kda.constants import LOG2_E, MAX_GATE_LOWER_BOUND_MAGNITUDE
 from attn_gym.linear.kda.naive import chunk_cumsum_ref
 from attn_gym.testing.kda import (
@@ -29,28 +22,8 @@ from attn_gym.testing.kda import (
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="the CuTe KDA backward stage requires CUDA capability 8.0 or newer",
+    reason="the KDA backward stages require CUDA capability 8.0 or newer",
 )
-
-
-@pytest.mark.parametrize("architecture", ["sm_80", "sm_120"])
-def test_bwd_intra_compiles_for_portable_targets(architecture: str):
-    """Compile the portable specialization without SM100-only instructions."""
-    source = """
-import cutlass
-from attn_gym.linear.kda.bwd.cute import chunk_kda_bwd_intra as module
-
-module._compile_chunk_kda_bwd_intra(
-    heads=1,
-    ragged=False,
-    io_type=cutlass.BFloat16,
-    use_int64_offsets=False,
-)
-"""
-    environment = os.environ.copy()
-    environment["CUTE_DSL_ARCH"] = architecture
-    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
-    subprocess.run([sys.executable, "-c", source], env=environment, check=True, timeout=180)
 
 
 def _metadata(lengths: list[int]):
@@ -59,15 +32,17 @@ def _metadata(lengths: list[int]):
     return prepare_ragged_chunk_metadata(offsets, sum(lengths), 64)
 
 
-def _inputs(tokens: int, dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Tensor, ...]:
+def _inputs(
+    tokens: int, dtype: torch.dtype = torch.bfloat16, heads: int = 1
+) -> tuple[torch.Tensor, ...]:
     """Create deterministic standalone inputs for the intra backward stage."""
     torch.manual_seed(29)
-    shape = (1, tokens, 1, 128)
+    shape = (1, tokens, heads, 128)
     q = torch.randn(shape, device="cuda", dtype=dtype) / 8
     k = torch.randn_like(q) / 8
     g = -torch.rand(shape, device="cuda")
-    beta = torch.rand(1, tokens, 1, device="cuda")
-    dAqk = torch.randn(1, tokens, 1, 64, device="cuda") / 16
+    beta = torch.rand(1, tokens, heads, device="cuda")
+    dAqk = torch.randn(1, tokens, heads, 64, device="cuda") / 16
     dAkk = torch.randn_like(dAqk) / 16
     dq = torch.randn(shape, device="cuda") / 16
     dk = torch.randn_like(dq) / 16
@@ -77,11 +52,8 @@ def _inputs(tokens: int, dtype: torch.dtype = torch.bfloat16) -> tuple[torch.Ten
 
 
 def _run(inputs: tuple[torch.Tensor, ...], lengths: list[int]):
-    """Run a ragged launch with the full fixed-capacity grid exposed."""
-    metadata = _metadata(lengths)
-    return chunk_kda_bwd_intra(
-        *inputs, metadata, config=ChunkKdaBwdIntraConfig(metadata.capacity), autotune=False
-    )
+    """Run one ragged launch over ``lengths``."""
+    return chunk_kda_bwd_intra_triton(*inputs, _metadata(lengths), autotune=False)
 
 
 def _sequence_local_reference(
@@ -96,7 +68,8 @@ def _sequence_local_reference(
             continue
         end = begin + length
         local_inputs = tuple(tensor[:, begin:end].clone() for tensor in inputs)
-        for parts, output in zip(output_parts, _run(local_inputs, [length]), strict=True):
+        outputs = _run(local_inputs, [length])
+        for parts, output in zip(output_parts, outputs, strict=True):
             parts.append(output)
         begin = end
     return tuple(torch.cat(parts, dim=1) for parts in output_parts)
@@ -206,7 +179,10 @@ def _gate_bound_log2_gates(like: torch.Tensor, cu_seqlens: torch.Tensor | None) 
     ids=["bf16", "fp16", "bf16-large-qk"],
 )
 def test_bwd_intra_keeps_subchunk_decays_at_gate_bound(
-    dtype: torch.dtype, qk_scale: float, lengths: list[int] | None, fastmath: bool
+    dtype: torch.dtype,
+    qk_scale: float,
+    lengths: list[int] | None,
+    fastmath: bool,
 ) -> None:
     """Every gate falls at the documented bound, so a 16-row subchunk spans 128 log2 units.
 
@@ -224,7 +200,9 @@ def test_bwd_intra_keeps_subchunk_decays_at_gate_bound(
     inputs[6:] = tuple(torch.zeros_like(tensor) for tensor in inputs[6:])
     metadata = None if lengths is None else _metadata(lengths)
 
-    dq, dk, dg, db = chunk_kda_bwd_intra(*inputs, metadata, fastmath=fastmath, autotune=False)
+    dq, dk, dg, db = chunk_kda_bwd_intra_triton(
+        *inputs, metadata, fastmath=fastmath, autotune=False
+    )
     # The FP32 reference overflows exp2 at this gate, so bound the error by the FP64 scale.
     expected = bwd_intra_reference(
         *(tensor.double() for tensor in inputs[:6]),
@@ -267,7 +245,7 @@ def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
     dAqk[0, 16, 0, 9] = dAqk_value
     dAkk = torch.zeros_like(dAqk)
     running = [torch.zeros(shape, device="cuda") for _ in range(3)]
-    dq, dk, dg, db = chunk_kda_bwd_intra(
+    dq, dk, dg, db = chunk_kda_bwd_intra_triton(
         q, k, g, beta, dAqk, dAkk, *running[:2], torch.zeros_like(beta), running[2], None,
         fastmath=fastmath, autotune=False
     )  # fmt: skip
@@ -280,7 +258,7 @@ def test_bwd_intra_keeps_earlier_subchunk_pair_at_gate_bound(
 def test_ragged_bwd_intra_rejects_mismatched_chunk_size():
     metadata = prepare_ragged_chunk_metadata(cumulative_sequence_offsets([64]), 64, 32)
     with pytest.raises(ValueError, match="metadata chunk size"):
-        chunk_kda_bwd_intra(*_inputs(64), metadata, autotune=False)
+        chunk_kda_bwd_intra_triton(*_inputs(64), metadata, autotune=False)
 
 
 @pytest.mark.parametrize("lengths", [[65, 63], [0, 1, 64, 0, 65]])
@@ -292,31 +270,18 @@ def test_ragged_bwd_intra_matches_sequence_local_launches(lengths):
     if 0 in lengths:
         assert active_chunks < metadata.capacity
 
-    config = ChunkKdaBwdIntraConfig(metadata.capacity) if 0 in lengths else None
-    actual = chunk_kda_bwd_intra(*inputs, metadata, config=config, autotune=False)
+    actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
     expected = _sequence_local_reference(inputs, lengths)
 
     for packed, sequence_local in zip(actual, expected, strict=True):
         torch.testing.assert_close(packed, sequence_local, rtol=0, atol=0)
 
 
-def test_ragged_bwd_intra_clamps_grid_wider_than_capacity():
-    """An explicit grid past the chunk capacity runs exactly like the capacity-wide grid."""
-    lengths = [65, 63]
-    inputs = _inputs(sum(lengths))
-    metadata = _metadata(lengths)
-    wide = chunk_kda_bwd_intra(
-        *inputs, metadata, config=ChunkKdaBwdIntraConfig(4 * metadata.capacity), autotune=False
-    )
-    for actual, expected in zip(wide, _run(inputs, lengths), strict=True):
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
 @pytest.mark.parametrize("metadata", [None, "ragged"], ids=["dense", "ragged"])
 def test_bwd_intra_accepts_zero_tokens(metadata):
     inputs = _inputs(0)
     outputs = (
-        chunk_kda_bwd_intra(*inputs, None, autotune=False)
+        chunk_kda_bwd_intra_triton(*inputs, None, autotune=False)
         if metadata is None
         else _run(inputs, [0, 0])
     )
@@ -328,43 +293,20 @@ def test_bwd_intra_accepts_zero_tokens(metadata):
     torch.testing.assert_close(db, inputs[8], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("ragged", [False, True])
-def test_bwd_intra_reuses_compile_across_grid_caps_and_capacities(ragged):
-    _compile_chunk_kda_bwd_intra.cache_clear()
-    launches = 0
-    for chunks in (1, 16, 17, 33):
-        tokens = chunks * 64
-        lengths = [0, 1, tokens - 1, 0] if ragged else None
-        metadata = _metadata(lengths) if ragged else None
-        inputs = _inputs(tokens)
-        expected = chunk_kda_bwd_intra(
-            *inputs, metadata, config=ChunkKdaBwdIntraConfig(1), autotune=False
-        )
-        launches += 1
-        for cap in (1, 16, 17, 64):
-            actual = chunk_kda_bwd_intra(
-                *inputs, metadata, config=ChunkKdaBwdIntraConfig(cap), autotune=False
-            )
-            launches += 1
-            for output, reference in zip(actual, expected, strict=True):
-                torch.testing.assert_close(output, reference, rtol=0, atol=0)
-            info = _compile_chunk_kda_bwd_intra.cache_info()
-            assert info.currsize == 1
-            assert info.hits + info.misses == launches
-
-
 def test_ragged_bwd_intra_replays_aligned_to_partial():
     inputs = _inputs(128)
     cu_seqlens = torch.tensor([0, 64, 128], device="cuda", dtype=torch.int32)
-    warm_metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-    config = ChunkKdaBwdIntraConfig(warm_metadata.capacity)
-    chunk_kda_bwd_intra(*inputs, warm_metadata, config=config, autotune=False)
+
+    def launch(metadata):
+        return chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+
+    launch(prepare_ragged_chunk_metadata(cu_seqlens, 128, 64))
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
-        actual = chunk_kda_bwd_intra(*inputs, metadata, config=config, autotune=False)
+        actual = launch(metadata)
 
     cu_seqlens.copy_(torch.tensor([0, 65, 128], device="cuda", dtype=torch.int32))
     graph.replay()
@@ -374,3 +316,112 @@ def test_ragged_bwd_intra_replays_aligned_to_partial():
     assert metadata.chunk_offsets.tolist() == [0, 2, 3]
     for captured, eager in zip(actual, expected, strict=True):
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("ragged", [False, True], ids=["dense", "ragged"])
+def test_triton_bwd_intra_reuses_compile_across_lengths(triton_compiles, ragged: bool):
+    """Runtime chunk, token and document counts never compile another Triton variant."""
+    # Chunk and document counts 1, a multiple of 16, and others.
+    for count in (1, 2, 16, 17, 33):
+        tokens = count * 64
+        lengths = [64] * (count - 1) + [1] if ragged else None
+        metadata = _metadata(lengths) if ragged else None
+        chunk_kda_bwd_intra_triton(*_inputs(tokens), metadata, autotune=False)
+    assert triton_compiles["chunk_kda_bwd_intra_kernel"] == 1, triton_compiles
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("lengths", [None, [65, 0, 21, 170]], ids=["dense", "ragged"])
+def test_bwd_intra_packed_qkv_views_match_compact(
+    dtype: torch.dtype, lengths: list[int] | None
+) -> None:
+    """Q and K as unbound views of a packed QKV projection (the training layout) match their
+    compact copies exactly; only the addressing differs."""
+    views, metadata = _qkv_view_inputs(dtype, lengths)
+    assert not views[0].is_contiguous()
+    compact = (views[0].contiguous(), views[1].contiguous(), *views[2:])
+    expected = chunk_kda_bwd_intra_triton(*compact, metadata, autotune=False)
+    actual = chunk_kda_bwd_intra_triton(*views, metadata, autotune=False)
+    for name, output, reference in zip(("dq", "dk", "dg", "db"), actual, expected, strict=True):
+        torch.testing.assert_close(output, reference, rtol=0, atol=0, msg=name)
+
+
+def _qkv_view_inputs(dtype: torch.dtype, lengths: list[int] | None):
+    """Inputs with Q and K as views of a packed QKV projection and gates scaled toward the
+    bound; returns the inputs and the ragged metadata (None when dense)."""
+    tokens = 256 if lengths is None else sum(lengths)
+    inputs = list(_inputs(tokens, dtype, heads=3))
+    qkv = torch.cat((inputs[0], inputs[1], inputs[0]), dim=-1)
+    inputs[0], inputs[1] = qkv[..., :128], qkv[..., 128:256]
+    cu_seqlens = None if lengths is None else cumulative_sequence_offsets(lengths)
+    inputs[2] = chunk_cumsum_ref(inputs[2] * 4, 64, cu_seqlens=cu_seqlens)
+    return inputs, None if lengths is None else _metadata(lengths)
+
+
+@pytest.mark.parametrize("candidate", range(1, len(triton_intra._intra.configs(None, {}))))
+def test_triton_bwd_intra_every_tuning_candidate_matches_default(monkeypatch, candidate) -> None:
+    """Autotune may pick any candidate, including the single-iteration BK=128 key loop; each
+    agrees with the pinned default within eight epsilons of the largest output magnitude."""
+    inputs, metadata = _qkv_view_inputs(torch.bfloat16, [65, 0, 21, 170])
+    expected = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    config = triton_intra._intra.configs(None, {})[candidate]
+    monkeypatch.setattr(triton_intra._intra, "configs", lambda grid, args: [config])
+    monkeypatch.setattr(triton_intra._intra, "_pinned_candidates", {})
+    actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    for name, output, reference in zip(("dq", "dk", "dg", "db"), actual, expected, strict=True):
+        output, reference = output.double(), reference.double()
+        bound = torch.finfo(torch.bfloat16 if name in ("dq", "dk") else torch.float32).eps * 8
+        error = (output - reference).abs().max().item()
+        assert error <= bound * reference.abs().max().item(), f"{name}: max error {error:.3e}"
+
+
+def test_triton_bwd_intra_forced_int64_offsets_match_default(monkeypatch) -> None:
+    lengths = [65, 0, 128]
+    inputs = _inputs(sum(lengths), torch.float16, heads=2)
+    metadata = _metadata(lengths)
+    expected = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    monkeypatch.setattr(triton_intra, "requires_int64_offsets", lambda *tensors: True)
+    actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    for output, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def test_triton_bwd_intra_l2_prefetch_keeps_plain_load_bits(monkeypatch) -> None:
+    """The L2 prefetch is only a cache hint: the SM90+ path and the Ampere path (no prefetch)
+    agree exactly, including tail rows whose prefetch addresses are clamped to the sequence."""
+    inputs, metadata = _qkv_view_inputs(torch.bfloat16, [65, 0, 21, 170])
+    monkeypatch.setattr(triton_intra, "_prefetch_l2", lambda device: False)
+    expected = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    monkeypatch.setattr(triton_intra, "_prefetch_l2", lambda device: True)
+    actual = chunk_kda_bwd_intra_triton(*inputs, metadata, autotune=False)
+    for output, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def test_triton_bwd_intra_rejects_operands_shorter_than_q() -> None:
+    """Every operand must span q's tokens; a shorter one would be read and written past its end."""
+    inputs = list(_inputs(64))
+    inputs[1] = inputs[1][:, :63]
+    with pytest.raises(ValueError, match="k must have shape"):
+        chunk_kda_bwd_intra_triton(*inputs, None, autotune=False)
+
+
+def test_bwd_intra_exact_exponentials_keep_a_subnormal_decay() -> None:
+    """Without fastmath, an earlier-subchunk decay of 2^-130 (subnormal in FP32) still carries a
+    normal gradient: k = 2^8 makes dq = 2^-122. Fast exponentials flush that decay to zero."""
+    shape = (1, 64, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=torch.bfloat16)
+    k = torch.zeros_like(q)
+    q[0, 16, 0, 0] = 1
+    k[0, 0, 0, 0] = 2.0**8
+    # -8.125 log2 units per token is inside the documented gate bound; 16 tokens give -130.
+    g = torch.full(shape, -8.125, device="cuda").cumsum(dim=1)
+    beta = torch.zeros(1, 64, 1, device="cuda")
+    dAqk = torch.zeros(1, 64, 1, 64, device="cuda")
+    dAqk[0, 16, 0, 0] = 1
+    running = [torch.zeros(shape, device="cuda") for _ in range(3)]
+    dq, *_ = chunk_kda_bwd_intra_triton(
+        q, k, g, beta, dAqk, torch.zeros_like(dAqk), *running[:2], torch.zeros_like(beta),
+        running[2], None, fastmath=False, autotune=False
+    )  # fmt: skip
+    assert dq[0, 16, 0, 0].item() == 2.0**-122

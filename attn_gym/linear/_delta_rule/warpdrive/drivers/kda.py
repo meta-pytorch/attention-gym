@@ -70,6 +70,7 @@ def kda_forward(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     fastmath: bool = True,
+    nonempty: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
     ``fastmath=False`` selects the non-flushing gate exponentials.
@@ -86,8 +87,6 @@ def kda_forward(
     if paged:
         if initial_state is None or output_final_state or split:
             raise ValueError("paged KDA needs a state pool and no final state or split schedule")
-        if initial_state.data_ptr() % 16:
-            raise ValueError("the paged state pool must be 16-byte aligned")
         initial_state = initial_state.detach()
     else:
         initial_state = None if initial_state is None else aligned(initial_state.detach())
@@ -105,12 +104,16 @@ def kda_forward(
     o = torch.empty_like(v)
     final_state = None
     if output_final_state:
-        # Compacted empty sequences emit no work: seed their final state here.
-        final_state = (
-            initial_state.clone()
-            if initial_state is not None
-            else torch.zeros(num_seqs, heads_out, dim_v, dim_k, dtype=torch.float32, device=device)
-        )
+        shape = (num_seqs, heads_out, dim_v, dim_k)
+        if initial_state is None:
+            make = torch.empty if nonempty else torch.zeros
+            final_state = make(shape, dtype=torch.float32, device=device)
+        elif nonempty:
+            # Every sequence writes its whole final state; keep the entry state's layout.
+            final_state = torch.empty_like(initial_state)
+        else:
+            # Compacted empty sequences emit no work: seed their final state here.
+            final_state = initial_state.clone()
     common = {
         "q": q,
         "k": k,

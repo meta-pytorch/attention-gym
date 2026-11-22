@@ -349,7 +349,7 @@ def main(
             "compute_dtype": getattr(torch, compute_dtype.value),
             "device": device,
         }
-        # The reference keeps the repo-local core; only each rank's local pass may use warpdrive.
+        # The reference keeps the Triton core; only each rank's local pass may use warpdrive.
         make_model = partial(
             ContextParallelDeltaRuleAttention,
             **model_options,
