@@ -437,7 +437,11 @@ rows[0]  # [(0, (0, 0, 0)), (148, (18, 4, 0)), ...]: CTA 0's tiles, in order
 Items with predicted spans get a timeline instead (drag or W/S to zoom, A/D to pan, click a row
 to focus a CTA), with dependency arrows on hover, a critical path with a per-segment table, and
 an optional measured overlay drawn as a second lane per CTA. Measured `tracks` (for example each role's
-ranges) expand under a CTA when it is focused. Items with 2-D coordinates get a work-space map.
+ranges) expand under a CTA when it is focused. In a measured Qwen timeline, an overlapping
+producer points into the consumer bar at the end of its recorded input poll, if one poll can be
+matched to one scheduled gate. Otherwise hover outlines the producer without claiming a handoff
+time. The endpoints are recorded timestamps, not a measurement of signal latency. Items with
+2-D coordinates get a work-space map.
 Two examples use it:
 
 ```bash
