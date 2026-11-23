@@ -6,10 +6,11 @@ const tip = document.getElementById("tip");
 const wires = [...svg.querySelectorAll(".wire")];
 let pinned = null;
 
+// Every value from the page's JSON goes through this before it is written as markup, in text
+// or in an attribute.
+const ENTITIES = {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"};
 function escapeText(s) {
-  const d = document.createElement("div");
-  d.textContent = s;
-  return d.innerHTML;
+  return String(s).replace(/[&<>"']/g, (c) => ENTITIES[c]);
 }
 
 // Keep a selected channel's contract readable without covering the diagram.
@@ -67,11 +68,11 @@ function roleDrilldown(ref, item) {
   if (item.ctas) out.push(ctaMap(ref, item));
   if (!item.handoffs.length) return out;
   const side = (s) =>
-    `<td><b class="sig ${s.color}">${s.word}</b> ${escapeText(s.by)}<small>${escapeText(s.count)}</small></td>`;
+    `<td><b class="sig ${escapeText(s.color)}">${escapeText(s.word)}</b> ${escapeText(s.by)}<small>${escapeText(s.count)}</small></td>`;
   const rows = item.handoffs.map((row) =>
-    `<tr><td><button type="button" class="use ${row.verb} ${row.signals.color}" data-chip="${row.chip}">${row.verb}</button></td>` +
-    `<th scope="row"><button type="button" data-chip="${row.chip}">${escapeText(details[row.chip].title)}</button>` +
-    (row.slots.length ? `<small>slot ${row.slots.join(", ")}</small>` : "") + "</th>" +
+    `<tr><td><button type="button" class="use ${escapeText(row.verb)} ${escapeText(row.signals.color)}" data-chip="${escapeText(row.chip)}">${escapeText(row.verb)}</button></td>` +
+    `<th scope="row"><button type="button" data-chip="${escapeText(row.chip)}">${escapeText(details[row.chip].title)}</button>` +
+    (row.slots.length ? `<small>slot ${escapeText(row.slots.join(", "))}</small>` : "") + "</th>" +
     side(row.waits) + side(row.signals) + "</tr>");
   const table = document.createElement("div");
   table.className = "handoffs";
@@ -131,14 +132,14 @@ function handshake(h) {
     `<text x="${x}" y="${mid + 5 + (i - (list.length - 1) / 2) * 16}" text-anchor="${anchor}" class="hs-role">${escapeText(n)}</text>`).join("");
   const wire = (y, from, to, side, word, labelY, countY) => {
     const tip = to > from ? 8 : -8;
-    return `<g class="hs ${side.color}"><path class="line" d="M${from},${y} H${to - tip}"/><path class="tip" d="M${to},${y} l${-tip},-4.5 v9 z"/>` +
+    return `<g class="hs ${escapeText(side.color)}"><path class="line" d="M${from},${y} H${to - tip}"/><path class="tip" d="M${to},${y} l${-tip},-4.5 v9 z"/>` +
       `<text x="${cx}" y="${labelY}" text-anchor="middle" class="hs-label">${word} · ${escapeText(side.by)}</text></g>` +
       `<text x="${cx}" y="${countY}" text-anchor="middle" class="hs-count">${escapeText(side.count)}</text>`;
   };
-  const drawn = h.slots > 12 ? 1 : h.slots, x = cx - (drawn * 20 - 4) / 2;
+  const stages = Number(h.slots), drawn = stages > 12 ? 1 : stages, x = cx - (drawn * 20 - 4) / 2;
   let slots = Array.from({length: drawn}, (_, i) =>
-    `<rect class="hs-slot ${h.full.color}" x="${x + i * 20}" y="${mid - 8}" width="16" height="16" rx="2"/>`).join("");
-  if (drawn < h.slots) slots += `<text x="${x + 22}" y="${mid + 4}" class="hs-count">× ${h.slots}</text>`;
+    `<rect class="hs-slot ${escapeText(h.full.color)}" x="${x + i * 20}" y="${mid - 8}" width="16" height="16" rx="2"/>`).join("");
+  if (drawn < stages) slots += `<text x="${x + 22}" y="${mid + 4}" class="hs-count">× ${stages}</text>`;
   const el = document.createElement("div");
   el.className = "handshake";
   el.innerHTML = `<svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" role="img">` +
