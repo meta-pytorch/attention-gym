@@ -1,6 +1,6 @@
 ---
 name: authoring-warpdrive
-description: Authors and ports warp-specialized CuTeDSL kernels using warpdrive. Use when building a kernel from roles, channels and work streams, or adapting an existing kernel to that API.
+description: Authors and ports CuTeDSL kernels on warpdrive, warp-specialized or one uniform role. Use when writing any new CuTeDSL kernel in this repository, building one from roles, channels and work streams, or adapting an existing kernel to that API.
 ---
 
 # Authoring warpdrive kernels
@@ -9,9 +9,13 @@ This skill ships in the repository that holds the library (`attn_gym/warpdrive/`
 relative paths from this directory, using the same checkout for docs, examples and imported code. The repository docs and implementation
 are the API authority; do not substitute another checkout's newer API.
 
-Use this for a new warpdrive kernel or a port to managed roles. A standalone CuTeDSL kernel
-that doesn't use warpdrive needs the usual CuTeDSL guidance, not this workflow. Layer-internal
-changes also need the relevant topic contracts and the repository's layer validation tiers.
+Use this for every new CuTeDSL kernel in this repository and for ports to warpdrive. A kernel
+that is not warp-specialized still uses warpdrive, as one uniform role over all its warps:
+follow [kernels without warp specialization](../../../docs/warpdrive/writing-kernels.md#kernels-without-warp-specialization)
+and keep unsupported operations raw inside the role. Using the authoring interface is not the
+same as adding warp specialization; introduce separate roles and channels only when the
+algorithm hands data between warps. Layer-internal changes also need the relevant topic
+contracts and the repository's layer validation tiers.
 
 ## Read the authoring path
 

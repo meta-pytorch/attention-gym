@@ -43,6 +43,7 @@ filled slot carry ``final_dst`` and those of its first ``dstate_dst``.
 """
 
 import math
+from dataclasses import dataclass
 from typing import NamedTuple
 
 import cutlass
@@ -51,6 +52,16 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
 from cutlass._mlir.dialects import nvvm as mlir_nvvm
 
+from attn_gym.warpdrive import (
+    Local,
+    OneShot,
+    PdlWait,
+    RoleConfig,
+    SmemPlan,
+    WarpSpecialized,
+    WorkStream,
+    role,
+)
 from attn_gym.warpdrive.cache import (
     compile_tvm_ffi,
     jit_cache,
@@ -158,7 +169,7 @@ def chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, num_sm, chains=1, bias
     CTAs per (chain, sequence, head)) when that grid fits the SMs and every FMA walk warp keeps
     whole rows of the state (``rows`` a multiple of ``CHAIN_WARPS``) and of upstream's M
     product (``dim_k * rows // dim_v`` rows, kept so the geometry matches), else ``dim_v // 8``
-    (16 rows at ``dim_v = 128``: the tensor-core walk of :func:`state_chain_kernel`). A map
+    (16 rows at ``dim_v = 128``: the tensor-core walk of :class:`StateChain`). A map
     chain's blocks also divide its ``bias_rows``, so ``first_row=bias_rows`` starts a block and
     chains the transition rows with the default blocks of the full map."""
     rows = dim_v // 16
@@ -682,7 +693,7 @@ def chain_walk_fma(
     sM: cute.Tensor,
 ):
     """State rows ``[row0, row0 + rows)`` of head ``h`` chained over the ``count`` slots from
-    ``seq_base`` (see :func:`state_chain_kernel`), the state leaving the walk stored to
+    ``seq_base`` (see :class:`StateChain`), the state leaving the walk stored to
     ``mFinal[final_seq]`` when bound and the slots' incoming states to ``mX`` when bound."""
     K = cutlass.const_expr(dim_k)
     cols = cutlass.const_expr(K // CHAIN_LANES)
@@ -962,7 +973,7 @@ def chain_walk_mma(
     sM: cute.Tensor,
 ):
     """State rows ``[row0, row0 + rows)`` of head ``h`` chained over the ``count`` slots from
-    ``seq_base`` (see :func:`state_chain_kernel`) on tensor cores.
+    ``seq_base`` (see :class:`StateChain`) on tensor cores.
 
     Each step is ``X @ M_j`` (``M_j^T`` transposed) on m16n8k8 tf32 mma.sync in 3xTF32
     (``hi * hi + hi * lo + lo * hi``, fp32 accurate). Warp ``w`` owns output columns
@@ -1203,91 +1214,198 @@ def publish_state(
             st_shared_f32(sX.iterator + word, vals)
 
 
-@cute.kernel
-def state_chain_kernel(
-    dim_k: cutlass.Constexpr[int],
-    rows: cutlass.Constexpr[int],
-    transpose: cutlass.Constexpr[bool],
-    heads_out: Int32,
-    mH: cute.Tensor,
-    mM: cute.Tensor,
-    mX: cute.Tensor | None,
-    mSeed: cute.Tensor | None,
-    mMainRows: cute.Tensor,
-    mSeedIndices: cute.Tensor | None,
-    mG: cute.Tensor | None,
-    mDX: cute.Tensor | None,
-    mDSeed: cute.Tensor | None,
-    mFinal: cute.Tensor | None,
-    bias_rows: cutlass.Constexpr[int | None],
-    first_row: cutlass.Constexpr[int],
-):
-    """CTA ``(seq, h, c)`` chains state rows ``first_row + [c * rows, (c + 1) * rows)`` over the
-    sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``, writing each slot's
-    incoming state to ``X`` (when bound) and, with ``mFinal`` bound, the state leaving the walk
-    (past the last slot, the first when transposed) to ``mFinal[seq]``. With ``bias_rows`` set the
+@dataclass(frozen=True)
+class ChainParams:
+    """The tensors one chain launch reads and writes, and the walk's SMEM buffers."""
+
+    heads_out: Int32
+    mH: cute.Tensor
+    mM: cute.Tensor
+    mX: cute.Tensor | None
+    mSeed: cute.Tensor | None
+    mMainRows: cute.Tensor
+    mSeedIndices: cute.Tensor | None
+    mG: cute.Tensor | None
+    mDX: cute.Tensor | None
+    mDSeed: cute.Tensor | None
+    mFinal: cute.Tensor | None
+    walk: tuple  # (sX, sM) for the tensor-core walk, (sWalk, sPart, sM) for FMA
+
+
+class StateChain(WarpSpecialized):
+    """The state chain: CTA ``(seq, h, c)`` chains state rows ``first_row + [c * rows, (c + 1) *
+    rows)`` over the sequence's flat slots ``main_rows[seq] // HO .. main_rows[seq + 1] // HO``,
+    writing each slot's incoming state to ``X`` (when bound) and, with ``mFinal`` bound, the state
+    leaving the walk (past the last slot, the first when transposed) to ``mFinal[seq]``. With
+    ``bias_rows`` set the
     chain composes affine maps: ``H`` holds only the state's first ``bias_rows`` rows (a map's
     bias), and the ``dim_k`` rows below them take no bias and, without a seed, start at the
     identity (the map's transition). Blocks of a multiple of 16 rows run on tensor cores
-    (:func:`chain_walk_mma`, four warps); 8-row blocks, which give few-head grids twice the CTAs,
-    on FMA (:func:`chain_walk_fma`: eight warps, two row groups times four k slices, lane ``l``
-    owning ``K / 32`` columns; each ``M_j`` is staged whole in SMEM by double-buffered ``cp.async``
-    and read as 8-wide k tiles, the four slice partials added to ``H_j`` in slice order by the row
-    owner). A one-slot sequence copies its seed into ``X``.
+    (:func:``chain_walk_mma``, four warps); 8-row blocks, which give few-head grids twice the
+    CTAs, on FMA (:func:``chain_walk_fma``: eight warps, two row groups times four k slices,
+    lane ``l`` owning ``K / 32`` columns; each ``M_j`` is staged whole in SMEM by
+    double-buffered ``cp.async`` and read as 8-wide k tiles, the four slice partials added to
+    ``H_j`` in slice order by the row owner). A one-slot sequence copies its seed into ``X``.
+    With ``paired`` the grid's ``c`` extent doubles: its lower half runs this chain forward and
+    its upper half the transposed chain of ``(mG, mDX, mDSeed)`` over the same ``M``, the
+    backward's two independent chains in one launch.
 
-    With ``mG`` bound the grid's ``c`` extent doubles: its lower half runs this chain forward
-    and its upper half the transposed chain of ``(mG, mDX, mDSeed)`` over the same ``M``, the
-    backward's two independent chains in one launch."""
-    K = cutlass.const_expr(dim_k)
-    m_words = cutlass.const_expr(K * K)
+    Not warp-specialized: one role of all the CTA's warps runs the walk. warpdrive supplies the
+    kernel structure (the work item from a ``OneShot`` cursor whose ``PdlWait`` readiness is the
+    launch's ``griddepcontrol.wait``, and the walk's SMEM declared in ``smem_plan`` and bound in
+    ``begin_roles``); the walk itself stays raw. Its buffers belong to no channel, so no
+    warpdrive check covers their lifetimes: ``M`` stages arrive by ``cp.async`` groups
+    ``CHAIN_MMA_M_BUFFERS - 1`` (FMA: ``CHAIN_M_BUFFERS - 1``) steps ahead, a stage is
+    overwritten only after the CTA barrier that follows the wait for its group, and the state
+    buffers alternate (tensor cores) or are fenced by the same per-step barriers (FMA)."""
 
-    cute.arch.griddepcontrol_wait()
-    tidx = Int32(cute.arch.thread_idx()[0])
-    bid = cute.arch.block_idx()
-    seq = Int32(bid[0])
-    h = Int32(bid[1])
-    seed_seq = seq
-    if cutlass.const_expr(mSeedIndices is not None):
-        seed_seq = Int32(mSeedIndices[seq])
-    row_block = Int32(bid[2])
+    def __init__(
+        self,
+        dim_v: int,
+        dim_k: int,
+        rows: int,
+        transpose: bool,
+        paired: bool = False,
+        bias_rows: int | None = None,
+        first_row: int = 0,
+    ):
+        if paired and transpose:
+            raise ValueError("the paired launch chains forward and transposed")
+        if paired and first_row:
+            raise ValueError("the paired launch chains every state row")
+        if not 0 <= first_row < dim_v:
+            raise ValueError(f"first_row must name one of the {dim_v} state rows, got {first_row}")
+        if (rows % 16 and rows % CHAIN_WARPS) or dim_v % rows or first_row % rows:
+            raise ValueError(f"{rows}-row blocks from row {first_row} do not tile {dim_v} rows")
+        self.dim_v, self.dim_k, self.rows, self.transpose = dim_v, dim_k, rows, transpose
+        self.paired, self.bias_rows, self.first_row = paired, bias_rows, first_row
+        self.mma = rows % 16 == 0
+        if not self.mma:
+            self.roles = {"walk": RoleConfig(range(CHAIN_WARPS), raw=True)}
+        self.smem_plan = SmemPlan()
+        if self.mma:
+            self.smem_plan.buffer("X", Float32)  # the state, two alternating copies
+            self.smem_plan.buffer("M", Float32, align=128)  # CHAIN_MMA_M_BUFFERS stages
+        else:
+            self.smem_plan.buffer("Walk", Float32)
+            self.smem_plan.buffer("Part", Float32)  # the four k slices' partials
+            self.smem_plan.buffer("M", Float32, align=128)  # CHAIN_M_BUFFERS stages
+        self.work = WorkStream(schedule=OneShot(grid="3d"), ready=PdlWait())
 
-    # ---- walk bounds -------------------------------------------------------------------------
-    row_base = Int32(mMainRows[seq])
-    seq_base = row_base // heads_out
-    filled = (Int32(mMainRows[seq + 1]) - row_base) // heads_out
-    count = filled if filled > Int32(0) else Int32(1)
+    def get_name(self) -> str:
+        return (
+            f"wd_state_chain_k{self.dim_k}_r{self.rows}_t{int(self.transpose)}"
+            f"_p{int(self.paired)}_b{self.bias_rows or 0}_f{self.first_row}"
+        )
 
-    smem = SmemAllocator()
-    if cutlass.const_expr(rows % 16 == 0):
-        walk_fn = chain_walk_mma
-        sX = smem.allocate_tensor(Float32, cute.make_layout(2 * rows * K), 16)
-        sM = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_MMA_M_BUFFERS * m_words), 128)
-        walk = (sX, sM)
-    else:
-        walk_fn = chain_walk_fma
-        sWalk = smem.allocate_tensor(Float32, cute.make_layout(rows * K), 16)
-        sPart = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_K_WARPS * rows * K), 16)
-        sM = smem.allocate_tensor(Float32, cute.make_layout(CHAIN_M_BUFFERS * m_words), 128)
-        walk = (sWalk, sPart, sM)
-    walk_args = (seq_base, count, tidx, *walk)
-    if cutlass.const_expr(mG is None):
-        walk_fn(
-            K, rows, transpose, heads_out, mH, mM, mX, mSeed, seed_seq, mFinal, seq, bias_rows,
-            h, Int32(first_row) + row_block * Int32(rows), *walk_args,
-        )  # fmt: skip
-    else:
-        blocks = Int32(cute.arch.grid_dim()[2]) // Int32(2)
-        if row_block < blocks:
+    def walk_layouts(self) -> dict:
+        """Contiguous buffers with their stage (or slice) mode outermost; the walks address them
+        by word offset from the base."""
+        K, rows = self.dim_k, self.rows
+        if self.mma:
+            return {
+                "X": cute.make_layout((rows * K, 2)),
+                "M": cute.make_layout((K * K, CHAIN_MMA_M_BUFFERS)),
+            }
+        return {
+            "Walk": cute.make_layout((rows * K, 1)),
+            "Part": cute.make_layout((rows * K, CHAIN_K_WARPS)),
+            "M": cute.make_layout((K * K, CHAIN_M_BUFFERS)),
+        }
+
+    @role(warps=range(CHAIN_MMA_WARPS), raw=True)
+    @cute.jit
+    def walk(self, params: ChainParams, me: Local):
+        """Every warp: walk the CTA's row block (see the class docstring). A raw role: one item
+        per CTA from ``single_item()``, the walk's synchronization its own. The grid is exactly
+        the item space, so every CTA's item is valid."""
+        K, rows, bias_rows = self.dim_k, self.rows, self.bias_rows
+        walk_fn = chain_walk_mma if cutlass.const_expr(self.mma) else chain_walk_fma
+        _, (seq, h, row_block) = self.work.single_item()
+        seed_seq = seq
+        if cutlass.const_expr(params.mSeedIndices is not None):
+            seed_seq = Int32(params.mSeedIndices[seq])
+        row_base = Int32(params.mMainRows[seq])
+        seq_base = row_base // params.heads_out
+        filled = (Int32(params.mMainRows[seq + 1]) - row_base) // params.heads_out
+        count = filled if filled > Int32(0) else Int32(1)
+        walk_args = (seq_base, count, me.tid, *params.walk)
+        ho, mM = params.heads_out, params.mM
+        if cutlass.const_expr(not self.paired):
             walk_fn(
-                K, rows, False, heads_out, mH, mM, mX, mSeed, seed_seq, None, seq, None, h,
-                row_block * Int32(rows), *walk_args,
+                K, rows, self.transpose, ho, params.mH, mM, params.mX, params.mSeed,
+                seed_seq, params.mFinal, seq, bias_rows, h,
+                Int32(self.first_row) + row_block * Int32(rows), *walk_args,
             )  # fmt: skip
         else:
-            walk_fn(
-                K, rows, True, heads_out, mG, mM, mDX, mDSeed, seed_seq, None, seq, None, h,
-                (row_block - blocks) * Int32(rows), *walk_args,
-            )  # fmt: skip
-    cute.arch.griddepcontrol_launch_dependents()
+            blocks = Int32(self.dim_v // rows)
+            if row_block < blocks:
+                walk_fn(
+                    K, rows, False, ho, params.mH, mM, params.mX, params.mSeed, seed_seq,
+                    None, seq, None, h, row_block * Int32(rows), *walk_args,
+                )  # fmt: skip
+            else:
+                walk_fn(
+                    K, rows, True, ho, params.mG, mM, params.mDX, params.mDSeed, seed_seq,
+                    None, seq, None, h, (row_block - blocks) * Int32(rows), *walk_args,
+                )  # fmt: skip
+
+    @cute.kernel
+    def kernel(
+        self,
+        heads_out: Int32,
+        mH: cute.Tensor,
+        mM: cute.Tensor,
+        mX: cute.Tensor | None,
+        mSeed: cute.Tensor | None,
+        mMainRows: cute.Tensor,
+        mSeedIndices: cute.Tensor | None,
+        mG: cute.Tensor | None,
+        mDX: cute.Tensor | None,
+        mDSeed: cute.Tensor | None,
+        mFinal: cute.Tensor | None,
+        bound,
+    ):
+        self.begin_roles(work=bound, layouts=self.walk_layouts())
+        names = ("X", "M") if cutlass.const_expr(self.mma) else ("Walk", "Part", "M")
+        params = ChainParams(
+            heads_out, mH, mM, mX, mSeed, mMainRows, mSeedIndices, mG, mDX, mDSeed, mFinal,
+            tuple(self.buffer(name) for name in names),
+        )  # fmt: skip
+        self.run_roles(params)
+        cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def launch(
+        self,
+        heads_out: Int32,
+        num_seqs: Int32,
+        mH: cute.Tensor,
+        mM: cute.Tensor,
+        mX: cute.Tensor | None,
+        mSeed: cute.Tensor | None,
+        mMainRows: cute.Tensor,
+        mSeedIndices: cute.Tensor | None,
+        mG: cute.Tensor | None,
+        mDX: cute.Tensor | None,
+        mDSeed: cute.Tensor | None,
+        mFinal: cute.Tensor | None,
+        stream: cuda.CUstream,
+    ):
+        """Launch the chain with programmatic dependent launch; callable from a launch bundle's
+        ``@cute.jit`` host."""
+        chains = 2 if cutlass.const_expr(self.paired) else 1
+        blocks = (self.dim_v - self.first_row) // self.rows
+        bound = self.work.bind((num_seqs, heads_out, chains * blocks))
+        config = self.launch_config(bound)
+        # The chain has always launched without a cluster attribute; an explicit 1x1x1 cluster
+        # measured 0.1-0.35 us slower per small paired chain on GB300.
+        del config["cluster"]
+        self.kernel.set_name_prefix(self.get_name())
+        self.kernel(
+            heads_out, mH, mM, mX, mSeed, mMainRows, mSeedIndices, mG, mDX, mDSeed, mFinal,
+            bound,
+        ).launch(**config, stream=stream, use_pdl=True)  # fmt: skip
 
 
 @cute.jit
@@ -1319,44 +1437,21 @@ def launch_state_chain(
     K]``) receives each sequence's state leaving its walk: the composition of all its slots;
     with ``final``, ``mX`` may be None to store only it.
     ``bias_rows = dim_v - dim_k``, ``mH``'s row extent, makes it a map chain (see
-    :func:`state_chain_kernel`); from no seed, ``final`` is then each sequence's ``[bias;
+    :class:`StateChain`); from no seed, ``final`` is then each sequence's ``[bias;
     transition]`` composed over its slots. A nonzero ``first_row`` chains only the state rows from
     it on into ``final`` (and ``mX``): their other rows are left unwritten, and each chained row
     has the bits of a full launch. Callable from a launch bundle's ``@cute.jit`` host."""
-    assert rows % 16 == 0 or rows % CHAIN_WARPS == 0, "every walk warp owns whole rows"
-    assert dim_v % rows == 0, "the row blocks tile the state"
     assert mX is not None or final is not None, "the chain must store some state"
-    assert first_row % rows == 0, "first_row starts a row block"
     if cutlass.const_expr(reverse is not None):
         assert not transpose, "the paired launch chains forward and transposed"
         assert final is None and mX is not None, "the paired launch keeps no final state"
     mG, mDX, mDSeed = reverse if cutlass.const_expr(reverse is not None) else (None,) * 3
-    chains = 1 if cutlass.const_expr(reverse is None) else 2
     if cutlass.const_expr(bias_rows is not None):
         assert bias_rows == dim_v - dim_k and reverse is None, "a map chain runs alone"
-    state_chain_kernel(
-        dim_k,
-        rows,
-        transpose,
-        heads_out,
-        mH,
-        mM,
-        mX,
-        mSeed,
-        mMainRows,
-        mSeedIndices,
-        mG,
-        mDX,
-        mDSeed,
-        final,
-        bias_rows,
-        first_row,
-    ).launch(
-        grid=(num_seqs, heads_out, chains * ((dim_v - first_row) // rows)),
-        block=(CHAIN_MMA_THREADS if cutlass.const_expr(rows % 16 == 0) else CHAIN_THREADS, 1, 1),
-        stream=stream,
-        use_pdl=True,
-    )
+    StateChain(dim_v, dim_k, rows, transpose, reverse is not None, bias_rows, first_row).launch(
+        heads_out, num_seqs, mH, mM, mX, mSeed, mMainRows, mSeedIndices, mG, mDX, mDSeed, final,
+        stream,
+    )  # fmt: skip
 
 
 # ---- standalone entry points -----------------------------------------------------------------
@@ -1634,5 +1729,4 @@ def state_chain(
     )
 
 
-for _kernel in (chain_table_kernel, state_chain_kernel):
-    _kernel.set_name_prefix("wd", remove_cutlass_symbol=False)
+chain_table_kernel.set_name_prefix("wd", remove_cutlass_symbol=False)

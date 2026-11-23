@@ -455,3 +455,18 @@ def test_state_chain_reuses_one_compile_across_runtime_shapes():
     info = pc().compile_state_chain.cache_info()
     assert info.currsize == 1, info
     assert info.hits + info.misses == len(cases), info
+
+
+@pytest.mark.parametrize(
+    ("first_row", "paired", "match"),
+    [(64, False, "first_row must name"), (64, True, "every state row")],
+    ids=["past-the-state", "paired"],
+)
+def test_state_chain_rejects_row_starts_it_cannot_honor(first_row, paired, match):
+    """A start past the state would launch one block that copies its seed past the output, and a
+    paired launch from a nonzero row would hand every block to the forward chain."""
+    from attn_gym.linear._delta_rule.warpdrive.piece_chain import StateChain
+
+    with pytest.raises(ValueError, match=match):
+        StateChain(64 if not paired else 128, 64, 8 if not paired else 16, False, paired,
+                   first_row=first_row)  # fmt: skip
