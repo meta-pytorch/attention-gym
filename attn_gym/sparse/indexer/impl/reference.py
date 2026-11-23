@@ -82,7 +82,8 @@ def launch(
         dots = torch.einsum("bthd,bsd->bths", q[:, rows], k)
         dots.relu_()
         dots.mul_(weights[:, rows].unsqueeze(-1))
-        scores = dots.sum(dim=2) * scale
+        scores = dots.sum(dim=2)
+        scores.mul_(scale)
         valid = (key_positions >= starts[rows]) & (key_positions < ends[rows])
         scores.masked_fill_(~valid, float("-inf"))
         indices = scores.topk(min(topk, candidates), dim=-1).indices.to(torch.int32)
