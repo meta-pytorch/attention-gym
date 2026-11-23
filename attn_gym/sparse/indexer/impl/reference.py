@@ -52,10 +52,11 @@ def launch(
     k = k.to(accum_dtype)
     weights = weights.to(accum_dtype)
 
-    # dots: [B, T, H, S]
-    dots = torch.einsum("bthd,bsd->bths", q, k)
-    # score: [B, T, S]
-    scores = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
+    # Keep the reference usable for long contexts by materializing only a bounded
+    # query tile. The score rows are the only state needed by selection.
+    score_tile_bytes = 64 * 1024 * 1024
+    bytes_per_query = max(1, batch * (heads + 1) * candidates * accum_dtype.itemsize)
+    tile_queries = max(1, score_tile_bytes // bytes_per_query)
 
     starts = torch.zeros((queries, 1), dtype=torch.int32, device=q.device)
     if cu_seqlens is not None:
@@ -74,10 +75,18 @@ def launch(
     else:
         ends = torch.full_like(starts, candidates)
     key_positions = torch.arange(candidates, device=q.device)[None, :]
-    valid = (key_positions >= starts) & (key_positions < ends)
-    scores.masked_fill_(~valid, float("-inf"))
-
-    indices = scores.topk(min(topk, candidates), dim=-1).indices.to(torch.int32)
-    selected_valid = (indices >= starts) & (indices < ends)
-    indices = torch.where(selected_valid, indices - starts, -1)
-    return torch.nn.functional.pad(indices, (0, max(0, topk - candidates)), value=-1)
+    output = torch.full((batch, queries, topk), -1, dtype=torch.int32, device=q.device)
+    for query_start in range(0, queries, tile_queries):
+        query_end = min(query_start + tile_queries, queries)
+        rows = slice(query_start, query_end)
+        dots = torch.einsum("bthd,bsd->bths", q[:, rows], k)
+        dots.relu_()
+        dots.mul_(weights[:, rows].unsqueeze(-1))
+        scores = dots.sum(dim=2) * scale
+        valid = (key_positions >= starts[rows]) & (key_positions < ends[rows])
+        scores.masked_fill_(~valid, float("-inf"))
+        indices = scores.topk(min(topk, candidates), dim=-1).indices.to(torch.int32)
+        selected_valid = (indices >= starts[rows]) & (indices < ends[rows])
+        indices = torch.where(selected_valid, indices - starts[rows], -1)
+        output[:, rows, : indices.shape[-1]] = indices
+    return output
