@@ -31,7 +31,10 @@ assert not any(name.startswith("cutlass.experimental") for name in sys.modules)
 
 
 _DRIVER_PATHS = """
+import ast
 import sys
+from pathlib import Path
+
 import torch
 import attn_gym.linear
 from attn_gym.linear import chunk_gdn, chunk_kda
@@ -99,7 +102,29 @@ for family in ("gdn", "kda"):
     assert (family, "build_warmup_backward", False, 1) in built, (family, built)
 assert ("kda", "build_warmup_forward", True, 1) in built, built
 assert ("kda", "build_warmup_backward", True, 1) in built, built
-assert not [name for name in sys.modules if name.startswith("cutlass.experimental")]
+
+
+def imports_cutlass_experimental(path):
+    for node in ast.walk(ast.parse(Path(path).read_text())):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names = [f"{node.module}.{alias.name}" for alias in node.names]
+        else:
+            continue
+        if any(f"{name}.".startswith("cutlass.experimental.") for name in names):
+            return True
+    return False
+
+
+# CuTeDSL 4.9 itself imports cutlass.experimental while compiling a TVM-FFI function, so check
+# the attn_gym modules these paths loaded instead of sys.modules.
+sources = [
+    module.__file__
+    for name, module in sys.modules.items()
+    if name.startswith("attn_gym") and getattr(module, "__file__", None)
+]
+assert not [path for path in sources if imports_cutlass_experimental(path)]
 """
 
 
@@ -109,6 +134,6 @@ assert not [name for name in sys.modules if name.startswith("cutlass.experimenta
 )
 def test_warpdrive_driver_paths_build_every_bundle_without_cutlass_experimental() -> None:
     """Every warpdrive driver path (uncut, d_v split, chain, split tables, summaries) builds its
-    launch bundle, and none imports ``cutlass.experimental``."""
+    launch bundle, and no attn_gym module they load imports ``cutlass.experimental``."""
     pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
     subprocess.run([sys.executable, "-c", _DRIVER_PATHS], check=True)
