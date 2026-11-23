@@ -1,21 +1,29 @@
 /* describe(format="html"): the pipeline graph. */
-#graph { display: block; font-family: var(--mono); max-width: 100%; height: auto; }
+#inspector { border-block-end: 1px solid var(--rule); padding: 14px 0; }
+#inspector p { margin: 0 0 6px; }
+#inspection h2 { font-size: 17px; margin: 12px 0; }
+#inspection dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 5px 16px; }
+#inspection dt { font-weight: 600; }
+#inspection dd { margin: 0; white-space: pre-line; }
+#inspection pre { font: 12px/1.5 var(--mono); white-space: pre-wrap; padding: 10px; background: var(--panel); }
+#graph { display: block; font-family: var(--mono); width: 100%; height: clamp(300px, 52vh, 620px); }
 #graph text { fill: var(--ink); }
-.card { fill: var(--card); stroke: var(--ink); stroke-width: 1; }
+.card { fill: var(--card); stroke: var(--ink); stroke-width: 1.6; }
+.role-bar { fill: var(--ink); }
 .card.back { fill: var(--panel); stroke: var(--muted); }
 .card.raw { stroke-dasharray: 4 3; }
 .role-name { font-size: 13px; font-weight: 600; }
 #graph .role-facts { font-size: 10.5px; fill: var(--muted); }
 .warp { fill: none; stroke: var(--rule); stroke-width: 1; }
 .warp.on { fill: var(--ink); stroke: var(--ink); opacity: 0.75; }
-.chip-body { fill: var(--card); stroke: var(--muted); stroke-width: 1; }
+.chip-body { fill: var(--panel); stroke: var(--muted); stroke-width: 1; }
 .chip-name { font-size: 11px; font-weight: 600; }
 #graph .chip-kind { font-size: 9.5px; fill: var(--muted); }
-.bar.tma, .tick.tma { fill: var(--tma); }
-.bar.umma, .tick.umma { fill: var(--umma); }
-.bar.threads, .tick.threads { fill: var(--threads); }
-.bar.named, .tick.named { fill: var(--named); }
-.tick { opacity: 0.55; }
+.tick { fill: var(--card); stroke-width: 1.5; }
+.tick.tma { stroke: var(--tma); }
+.tick.umma { stroke: var(--umma); }
+.tick.threads { stroke: var(--threads); }
+.tick.named { stroke: var(--named); }
 .badge rect { fill: none; stroke: var(--muted); stroke-width: 0.8; }
 #graph .badge-t { font-size: 8.5px; fill: var(--muted); }
 .badge.pair rect { stroke: var(--ink); }
@@ -41,6 +49,7 @@
 .wire.threads .line { stroke: var(--threads); }
 .wire.named .line { stroke: var(--named); }
 .wire.stream .line { stroke: var(--green); stroke-dasharray: 5 4; }
+.wire.feedback .line { stroke-dasharray: 9 4; }
 .wire.spoke line, .spoke-key { stroke: var(--sync); stroke-width: 1.1; stroke-dasharray: 1.5 3;
   stroke-linecap: round; }
 #graph .wire-label { font-size: 9px; fill: var(--muted); }
@@ -57,3 +66,70 @@
 .node:focus-visible .card, .node:focus-visible .chip-body { stroke: var(--amber); stroke-width: 2; }
 .legend .wire .line { fill: none; }
 @media (prefers-reduced-motion: reduce) { #graph.focus .node, #graph.focus .wire { transition: none; } }
+
+.graph-tools { display:flex; align-items:center; gap:5px; margin-bottom:6px; }
+.graph-tools .figlabel { margin:0 auto 0 0; }
+#graph.zoomed { cursor:grab; touch-action:none; user-select:none; }
+#graph.zoomed:active { cursor:grabbing; }
+#inspection .signal { border-left:3px solid currentColor; padding-left:6px; }
+#inspection .tma { color:var(--tma); } #inspection .umma { color:var(--umma); }
+#inspection .threads { color:var(--threads); } #inspection .named { color:var(--named); }
+#inspection summary { color:var(--muted); cursor:pointer; }
+
+/* The selected channel's handshake. */
+.handshake svg { display: block; max-width: 100%; height: auto; font-family: var(--mono); margin: 4px 0 10px; }
+.handshake text { fill: var(--ink); stroke: none; }
+.hs-role { font-size: 13px; font-weight: 600; }
+.hs-label { font-size: 10.5px; font-weight: 600; }
+.handshake .hs-count { font-size: 9.5px; fill: var(--muted); }
+.hs .line { fill: none; stroke-width: 1.8; stroke: var(--muted); } .hs .tip { fill: var(--muted); }
+.hs.tma .line, .hs-slot.tma { stroke: var(--tma); } .hs.tma .tip, .hs.tma text { fill: var(--tma); }
+.hs.umma .line, .hs-slot.umma { stroke: var(--umma); } .hs.umma .tip, .hs.umma text { fill: var(--umma); }
+.hs.threads .line, .hs-slot.threads { stroke: var(--threads); } .hs.threads .tip, .hs.threads text { fill: var(--threads); }
+.hs.named .line, .hs-slot.named { stroke: var(--named); } .hs.named .tip, .hs.named text { fill: var(--named); }
+.hs-slot { fill: var(--card); stroke-width: 1.6; stroke: var(--muted); }
+/* Roles by channels. */
+#matrix { padding: 14px 0; border-block-end: 1px solid var(--rule); }
+.matrix-scroll { overflow-x: auto; }
+#matrix table { border-collapse: collapse; font: 12px var(--mono); }
+#matrix th, #matrix td { padding: 5px 10px; text-align: center; white-space: nowrap; }
+#matrix tbody tr { border-top: 1px solid var(--rule); }
+#matrix th[scope="row"] { text-align: left; display: flex; align-items: center; gap: 10px; }
+#matrix button { all: unset; cursor: pointer; font: inherit; font-weight: 600; }
+#matrix thead button { display: grid; justify-items: center; gap: 3px; padding: 2px 4px; border-radius: 3px; }
+#matrix th[scope="row"] button { min-width: 62px; }
+#matrix small { color: var(--muted); font-weight: 400; font-size: 10px; }
+#matrix button:focus-visible, #matrix .picked { outline: 2px solid var(--amber); outline-offset: 2px; }
+#matrix .slots i { display: inline-block; width: 11px; height: 11px; margin: 0 1.5px; border: 1.5px solid var(--muted); border-radius: 2px; }
+#matrix .strip { display: inline-flex; }
+#matrix .strip i { width: 7px; height: 9px; margin-right: 2px; border: 1px solid var(--rule); border-radius: 1px; }
+#matrix .strip i.g { margin-left: 3px; }
+#matrix .strip i.on { background: var(--ink); border-color: var(--ink); opacity: .8; }
+:is(#matrix, .handoffs) .use { font-size: 10.5px; padding: 2px 10px; border-radius: 10px; border: 1.4px solid currentColor; }
+:is(#matrix, .handoffs) .use.tma { color: var(--tma); } :is(#matrix, .handoffs) .use.umma { color: var(--umma); }
+:is(#matrix, .handoffs) .use.threads { color: var(--threads); } :is(#matrix, .handoffs) .use.named { color: var(--named); }
+:is(#matrix, .handoffs) .use.fills { color: var(--paper); border-color: transparent; }
+:is(#matrix, .handoffs) .use.fills.tma { background: var(--tma); } :is(#matrix, .handoffs) .use.fills.umma { background: var(--umma); }
+:is(#matrix, .handoffs) .use.fills.threads { background: var(--threads); } :is(#matrix, .handoffs) .use.fills.named { background: var(--named); }
+
+/* A role's drill-down. */
+.role-map { margin: 12px 0 4px; }
+.role-map svg { display: block; max-width: 100%; height: auto; font-family: var(--mono); }
+.map-cta { font-size: 11px; fill: var(--muted); }
+.map-warp { fill: none; stroke: var(--rule); }
+.map-role { fill: var(--muted); opacity: .45; }
+.map-role.me { fill: var(--amber); opacity: 1; }
+.map-role.absent { fill: none; stroke: var(--muted); stroke-dasharray: 3 3; opacity: .7; }
+text.map-name.map-role { font-size: 10px; stroke: none; fill: var(--muted); opacity: 1; }
+text.map-name.map-role.me { fill: var(--amber); font-weight: 600; }
+.handoffs { overflow-x: auto; margin: 8px 0 10px; }
+.handoffs table { border-collapse: collapse; font: 12px var(--mono); }
+.handoffs th, .handoffs td { padding: 5px 14px 5px 0; text-align: left; white-space: nowrap; vertical-align: baseline; }
+.handoffs thead th { font-weight: 400; color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; }
+.handoffs tbody tr { border-top: 1px solid var(--rule); }
+.handoffs button { all: unset; cursor: pointer; font: inherit; font-weight: 600; }
+.handoffs th button:hover { text-decoration: underline; }
+.handoffs button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+.handoffs p { margin: 4px 0 0; font-size: 11px; color: var(--muted); }
+.handoffs small { color: var(--muted); margin-left: 8px; font-size: 10px; }
+.sig.tma { color: var(--tma); } .sig.umma { color: var(--umma); } .sig.threads { color: var(--threads); } .sig.named { color: var(--named); }

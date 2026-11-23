@@ -5,6 +5,7 @@ hubs. Every example must produce a deterministic, well-formed graph.
 """
 
 import importlib
+import itertools
 import json
 import re
 import shutil
@@ -16,6 +17,7 @@ import pytest
 
 pytest.importorskip("cutlass.cute")
 
+import cutlass
 from cutlass import cute
 
 from attn_gym.warpdrive import (
@@ -28,11 +30,14 @@ from attn_gym.warpdrive import (
     NamedBarrier,
     Producer,
     Ring,
+    Sharing,
+    Slots,
     Threads,
     Tma,
     Turn,
     Turnstile,
     Umma,
+    Warps,
     WarpSpecialized,
     role,
 )
@@ -280,15 +285,16 @@ def test_unknown_format_is_rejected():
 class Page(HTMLParser):
     """A ``describe(format="html")`` page: its drawn nodes (``{id: (kind, x, y, w, h)}``,
     box from the translate and first rect), wires (``(classes, ends)``), details JSON, and
-    any reference to an outside resource."""
+    each path-drawn wire's ``d``, and any reference to an outside resource."""
 
     def __init__(self, text: str):
         super().__init__()
-        self.nodes, self.wires, self.external = {}, [], []
+        self.nodes, self.wires, self.paths, self.external = {}, [], [], []
         self._node, self._data = None, None
         self.feed(text)
         # Parsing raises unless the SVG is well formed.
-        ElementTree.fromstring(text[text.index("<svg") : text.index("</svg>") + 6])
+        start = text.rindex("<svg", 0, text.index('id="graph"'))  # not a legend sample
+        ElementTree.fromstring(text[start : text.index("</svg>", start) + 6])
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -311,6 +317,8 @@ class Page(HTMLParser):
             self.nodes[self._node][3:] = float(a["width"]), float(a["height"])
         elif tag == "g" and "data-ends" in a:  # a drawn wire (not the legend's samples)
             self.wires.append((set(classes), a["data-ends"].split()))
+        elif tag == "path" and "line" in classes and len(self.paths) < len(self.wires):
+            self.paths.append(a["d"])  # parallel to the path-drawn wires, which come last
         elif tag == "script" and a.get("id") == "data":
             self._data = []
 
@@ -359,7 +367,148 @@ def test_html_hubs_and_raw_code():
     assert g.ends(g.by_title("poll"), g.by_title("flags"))
     raw = {g.details[n]["lines"][1]: n for n, node in g.nodes.items() if node[0] == "external"}
     assert g.ends(g.by_title("out"), raw["out consumer"])
+    out = g.details[g.by_title("out")]["handshake"]
+    assert out["empty"]["by"] == "raw code" and out["readers"] == ["raw code"]
+    assert handoff(g, "worker[0]", "out", "fills")["waits"]["by"] == "raw code"
     assert g.ends(raw["inbox producer"], g.by_title("inbox"))
+
+
+class SharedEnds(WarpSpecialized):
+    """``src`` fills ``meet`` (a named-barrier ring read by ``cuda``), ``both`` (read by an MMA
+    role and a warps role) and ``raw`` (author-set empty counts); worker[0], worker[1] take turns
+    filling ``turn`` and the named-barrier ring ``sums``, and each frees its own slot of
+    ``per``."""
+
+    def __init__(self):
+        self.cluster = Cluster(2, 1, False)
+        self.meet = Ring(1, Threads, Threads, sync="named")
+        self.sums = Ring(2, Threads, Threads, sync="named", producer_sharing=Sharing.ROUND_ROBIN)
+        self.raw = Ring(2, override={"empty_counts": 1})
+        self.per = Slots(2, Threads, Threads)
+        self.both = Ring(2, Threads, {"mma": Umma, "cuda": Warps}, payload=(cutlass.Int32, (32,)))
+        self.turn = Ring(2, producer_sharing=Sharing.ROUND_ROBIN)
+
+    @role(warps=0)
+    @cute.jit
+    def src(self, meet: Producer, both: Producer, raw: Producer, per: Producer):
+        """Fill every channel the readers share.
+
+        The second paragraph is part of the docstring too."""
+
+    @role(warps=1, cta="leader")
+    @cute.jit
+    def mma(self, both: Consumer, turn: Consumer):
+        pass
+
+    @role(warps=range(2, 4))
+    @cute.jit
+    def cuda(self, both: Consumer, meet: Consumer, sums: Consumer, raw: Consumer):
+        pass
+
+    @role(warps=[range(4, 5), range(5, 6)])
+    @cute.jit
+    def worker(self, stage: Instance, turn: Producer, sums: Producer, per: Consumer[Instance]):
+        pass
+
+
+def handoff(g: Page, role: str, channel: str, verb: str) -> dict:
+    (row,) = (
+        r
+        for r in g.details[g.by_title(role)]["handoffs"]
+        if r["chip"] == g.by_title(channel) and r["verb"] == verb
+    )
+    return row
+
+
+def test_html_inspector_names_each_end_and_what_completes_each_barrier():
+    """A channel lists its writers and readers and how each barrier completes; a role lists the
+    channels it fills and frees, with the barrier it waits on first."""
+    g = Page(PairPipeline().describe(format="html"))
+    data = g.details[g.by_title("data")]["handshake"]
+    assert (data["writers"], data["readers"], data["slots"]) == (["load"], ["mma"], 2)
+    assert data["full"]["by"] == "TMA 4,096 B per CTA" and data["full"]["color"] == "tma"
+    assert data["empty"]["by"] == "UMMA commit" and data["empty"]["color"] == "umma"
+    assert g.details[g.by_title("acc")]["handshake"]["readers"] == ["sink[0]", "sink[1]"]
+    frees = handoff(g, "mma", "data", "frees")
+    assert (frees["waits"]["word"], frees["signals"]["word"]) == ("FULL", "EMPTY")
+    assert frees["waits"]["count"] == data["full"]["count"] != ""
+    fills = handoff(g, "mma", "acc", "fills")
+    assert (fills["waits"]["word"], fills["signals"]["word"]) == ("EMPTY", "FULL")
+    mma, load = (g.details[g.by_title(n)] for n in ("mma", "load"))
+    assert mma["placement"] == "leader CTA"
+    assert mma["ctas"] == [
+        {"label": "leader CTA", "here": True},
+        {"label": "peer CTA", "here": False},
+    ]
+    assert [c["here"] for c in load["ctas"]] == [True, True]
+
+
+def test_html_inspector_follows_sharing_named_barriers_and_per_role_mechanisms():
+    """The page says only what the declarations support: a named barrier needs both sides, a
+    round-robin side has one owner per epoch, author-set counts are not credited to the
+    mechanism, each reader of a per-role channel signals with its own mechanism, and
+    ``cta="leader"`` without pairs is every CTA."""
+    g = Page(SharedEnds().describe(format="html"))
+    meet = g.details[g.by_title("meet")]
+    assert meet["handshake"]["full"] == meet["handshake"]["empty"]
+    assert meet["handshake"]["full"]["by"] == "both sides arrive"
+    assert "threads" in meet["handshake"]["full"]["count"]
+    assert "reading threads have all arrived" in meet["guide"]["FULL when"]
+    sums = g.details[g.by_title("sums")]
+    assert sums["handshake"]["full"]["by"] == "both sides arrive"
+    assert (
+        "the owning instance's writing threads and the reading threads"
+        in (sums["guide"]["FULL when"])
+    )
+    raw = g.details[g.by_title("raw")]
+    assert raw["handshake"]["empty"]["by"] == "author-set count"
+    assert "author-set arrival count" in raw["guide"]["EMPTY when"]
+    assert "every writing thread arrives" in raw["guide"]["FULL when"]
+    per = g.details[g.by_title("per")]
+    assert per["guide"]["EMPTY when"].endswith("bound to one slot signals only that slot.")
+    assert "bound to one slot" not in per["guide"]["FULL when"]
+    assert [handoff(g, f"worker[{i}]", "per", "frees")["slots"] for i in range(2)] == [[0], [1]]
+    src = g.details[g.by_title("src")]
+    assert src["doc"].startswith("Fill every channel") and src["doc"].count("\n\n") == 1
+    assert "doc" not in g.details[g.by_title("cuda")]
+    turn = g.details[g.by_title("turn")]
+    assert "owner" in turn["handshake"]["full"]["by"]
+    assert "2 producer instances take turns" in turn["guide"]["FULL when"]
+    assert "every reading" in turn["guide"]["EMPTY when"]
+    both = g.details[g.by_title("both")]
+    assert both["handshake"]["empty"]["by"] == "mma: UMMA commit · cuda: one lane per warp"
+    assert both["handshake"]["empty"]["color"] == "mixed"
+    assert both["guide"]["EMPTY when"].endswith("Every role must signal.")
+    signals = {r: handoff(g, r, "both", "frees")["signals"] for r in ("mma", "cuda")}
+    assert (signals["mma"]["by"], signals["mma"]["color"]) == ("UMMA commit", "umma")
+    assert (signals["cuda"]["by"], signals["cuda"]["color"]) == ("one lane per warp", "threads")
+    mma = g.details[g.by_title("mma")]
+    assert mma["placement"] == "all 2 CTAs" and all(c["here"] for c in mma["ctas"])
+    assert [c["label"] for c in mma["ctas"]] == ["rank 0", "rank 1"]
+
+
+def test_html_scheduler_fills_and_frees_its_own_internal_channels():
+    """A role bound to both ends of a channel gets both rows, and a layer-internal TMA ring is
+    not described as a TMA copy."""
+    op = persistent_gemm.PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair())
+    g = Page(op.describe(format="html"))
+    internal = [
+        n for n, ch in op._ws_chans.items() if ch.internal and isinstance(ch.producer, Tma)
+    ]
+    assert internal
+    for name in internal:
+        chip = next(
+            d for d in g.details.values() if name in d["title"].split(", ") and "guide" in d
+        )
+        assert chip["handshake"]["full"]["by"] == "the scheduler, no TMA copy"
+        assert chip["guide"]["FULL when"].startswith("the layer's scheduler completes")
+    two_ended = [
+        (d["title"], chip)
+        for d in g.details.values()
+        for chip in {r["chip"] for r in d.get("handoffs", [])}
+        if {r["verb"] for r in d["handoffs"] if r["chip"] == chip} == {"fills", "frees"}
+    ]
+    assert two_ended, "the scheduler holds both ends of its work channels"
 
 
 def optional_example(module: str, name: str, *args):
@@ -368,6 +517,66 @@ def optional_example(module: str, name: str, *args):
         pytest.importorskip("quack")
     example = importlib.import_module(f"attn_gym.warpdrive.examples.{module}")
     return getattr(example, name)(*args)
+
+
+class Feedback(WarpSpecialized):
+    """``head`` feeds ``first`` and ``side`` (one column), both feed ``last``, and ``last`` hands
+    two channels back to ``first``: feedback from one column into a column of two roles."""
+
+    def __init__(self):
+        self.a, self.b, self.c, self.d = (Ring(1) for _ in range(4))
+        self.back0 = Ring(1)
+        self.back1 = Slots(2)
+
+    @role(warps=0)
+    @cute.jit
+    def head(self, a: Producer, b: Producer):
+        pass
+
+    @role(warps=1)
+    @cute.jit
+    def first(self, a: Consumer, c: Producer, back0: Consumer, back1: Consumer):
+        pass
+
+    @role(warps=2)
+    @cute.jit
+    def side(self, b: Consumer, d: Producer):
+        pass
+
+    @role(warps=3)
+    @cute.jit
+    def last(self, c: Consumer, d: Consumer, back0: Producer, back1: Producer):
+        pass
+
+
+def test_html_routes_feedback_handoffs_around_the_boxes():
+    """A handoff back to a node more than one column earlier runs in its own lane under every
+    box and through no box but its two ends, and keeps its arrowhead direction."""
+    g = Page(Feedback().describe(format="html"))
+    drawn = [w for w in g.wires if "spoke" not in w[0]]
+    feedback = [(ends, d) for (classes, ends), d in zip(drawn, g.paths) if "feedback" in classes]
+    assert sorted(ends for ends, _ in feedback) == sorted(
+        [g.by_title(n), g.by_title("first")] for n in ("back0", "back1")
+    )
+    floor = max(y + h for _, _, y, _, h in g.nodes.values())
+    lanes = []
+    for ends, d in feedback:
+        pts = [(float(x), float(y)) for x, y in re.findall(r"([-\d.]+),([-\d.]+)", d)]
+        lanes.append(max(y for _, y in pts))
+        assert pts[0][0] > pts[-1][0], "runs from the later column back to the earlier one"
+        for (x0, y0), (x1, y1) in itertools.pairwise(pts):
+            for nid, (_, x, y, w, h) in g.nodes.items():
+                clear = (
+                    max(x0, x1) <= x + 1
+                    or min(x0, x1) >= x + w - 1
+                    or max(y0, y1) <= y + 1
+                    or min(y0, y1) >= y + h - 1
+                )
+                assert clear, f"feedback into {ends[1]} crosses {g.details[nid]['title']}"
+    assert min(lanes) > floor and len(set(lanes)) == len(lanes)
+    op = persistent_gemm.PersistentGemm(schedule=ClusterLaunchControl(), cluster=CtaPair())
+    page = Page(op.describe(format="html"))
+    assert not any("feedback" in classes for classes, _ in page.wires), "short loops stay put"
 
 
 EXAMPLES = {
@@ -423,6 +632,25 @@ def test_every_example_draws_well_formed_graphs(make):
         subprocess.run(["dot", "-Tsvg"], input=dot, text=True, capture_output=True, check=True)
     g = Page(op.describe(format="html"))
     assert g.external == []
+    # The inspector's ends are the channels' bindings, and each binding is one row and one cell.
+    rows = 0
+    for chip in (d for d in g.details.values() if "handshake" in d):
+        ch = op._ws_chans[chip["title"].split(", ")[0]]
+        for side, ends, verb in (
+            ("producer", "writers", "fills"),
+            ("consumer", "readers", "frees"),
+        ):
+            if ch.external == side:
+                continue
+            bound = {}
+            for ri, slot in ch.bound(side):
+                bound.setdefault(ri.name, []).extend([] if slot is None else [slot])
+            assert set(chip["handshake"][ends]) == set(bound)
+            for name, slots in bound.items():
+                assert handoff(g, name, chip["title"], verb)["slots"] == slots
+            rows += len(bound)
+    html = op.describe(format="html")
+    assert html.count('class="use fills') + html.count('class="use frees') == rows
     titles = {d["title"] for d in g.details.values()}
     assert {r.name for r in op._ws_roles} <= titles
     chips = [g.details[n]["title"] for n, node in g.nodes.items() if node[0] == "chip"]

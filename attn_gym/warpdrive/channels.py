@@ -194,6 +194,7 @@ class Sharing(Enum):
 SYNC_KINDS = ("mbarrier", "named")
 WAIT_KINDS = ("suspend", "spin")
 SIDES = ("producer", "consumer")
+SIDE_COUNTS = {"producer": "full_counts", "consumer": "empty_counts"}  # each side's override key
 
 
 @dataclass
@@ -538,7 +539,7 @@ class Channel:
     @property
     def external_counts(self) -> str | None:
         """The ``override`` key that gives the external side's counts."""
-        return {"producer": "full_counts", "consumer": "empty_counts"}.get(self.external)
+        return SIDE_COUNTS.get(self.external)
 
     @property
     def checks_tma(self) -> bool:
@@ -567,11 +568,15 @@ class Channel:
         the kernel checks the traced ownership (``ownership.check``)."""
         return (self.producer_sharing, self.consumer_sharing) != (Sharing.JOIN, Sharing.JOIN)
 
+    def counts_overridden(self, side: str) -> bool:
+        """The author set ``side``'s barrier counts, so its role bodies must supply them."""
+        return SIDE_COUNTS[side] in (self.override or {})
+
     @property
     def empty_counts_overridden(self) -> bool:
         """The author set the empty counts: exclusive owners then need not contribute equally,
         and their releases must supply the counts."""
-        return "empty_counts" in (self.override or {})
+        return self.counts_overridden("consumer")
 
     def turns(self, side: str) -> int:
         """Instances taking turns on ``side``: ``k`` for a round-robin side, else 1."""
