@@ -255,7 +255,18 @@ function timeline(parent) {
         ctx.save(); ctx.beginPath(); ctx.rect(LABEL_W, v.top, v.w - LABEL_W - 6, v.h - v.top - 28); ctx.clip();
         for (const d of (D.deps && D.deps[i]) || []) {
           const p = span(d, mode);
-          if (p && v.rowByCta.has(p.cta)) arrow(ctx, v.x(p.end), v.y(p, lane) + v.lh / 2, v.x(s.start), v.y(s, lane) + v.lh / 2);
+          if (!p || !v.rowByCta.has(p.cta)) continue;
+          const py = v.y(p, lane), sy = v.y(s, lane);
+          if (mode !== "measured" || p.end <= s.start) {
+            arrow(ctx, v.x(p.end), py + v.lh / 2, v.x(s.start), sy + v.lh / 2);
+          } else if (D.waitEnd?.[i] != null) {
+            // Enter the facing edge of the consumer bar at the observed poll end.
+            const down = py < sy;
+            waitArrow(ctx, v.x(p.end), py + v.lh / 2, v.x(D.waitEnd[i]), down ? sy : sy + v.lh);
+          } else {
+            ctx.strokeStyle = palette.amber; ctx.lineWidth = 1;
+            ctx.strokeRect(v.x(p.start), py, Math.max(2, v.x(p.end) - v.x(p.start)), v.lh);
+          }
         }
         ctx.strokeStyle = palette.ink; ctx.lineWidth = 1.5;
         ctx.strokeRect(v.x(s.start) - 1, v.y(s, lane) - 1, Math.max(2, v.x(s.end) - v.x(s.start)) + 2, v.lh + 1);
@@ -412,6 +423,13 @@ function criticalPanel() {
     bar, key,
     node("div", { className: "table" }, node("table", {}, node("thead", {}, head), body)));
 }
+function waitArrow(ctx, x0, y0, x1, y1) {
+  ctx.strokeStyle = palette.amber; ctx.fillStyle = palette.amber; ctx.lineWidth = 1.2;
+  const mid = (y0 + y1) / 2, dy = Math.sign(y1 - y0) * 5;
+  ctx.beginPath(); ctx.moveTo(x0, y0);
+  ctx.bezierCurveTo(x0, mid, x1, mid, x1, y1); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - 3, y1 - dy); ctx.lineTo(x1 + 3, y1 - dy); ctx.fill();
+}
 function arrow(ctx, x0, y0, x1, y1) {
   ctx.strokeStyle = palette.amber; ctx.fillStyle = palette.amber; ctx.lineWidth = 1.2;
   ctx.beginPath(); ctx.moveTo(x0, y0);
@@ -517,6 +535,7 @@ function itemLines(i) {
   if (shown.includes("measured")) {
     if (m) lines.push(`Measured (real launch): ${m[1].toFixed(2)} → ${m[2].toFixed(2)} ${D.unit}; duration ${(m[2] - m[1]).toFixed(2)} ${D.unit}`);
     else lines.push("Measured: no captured span for this item");
+    if (D.waitEnd?.[i] != null) lines.push(`Recorded input poll ends: ${D.waitEnd[i].toFixed(2)} ${D.unit}`);
   }
   if (m && shown.length === 2) lines.push(`Measured − predicted: start shift ${signed(m[1] - D.start[i])} ${D.unit}; duration delta ${signed((m[2] - m[1]) - (D.end[i] - D.start[i]))} ${D.unit}`);
   if (critical.has(i) && shown.includes("predicted")) lines.push("On the predicted critical path (model only)");

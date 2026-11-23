@@ -63,6 +63,41 @@ class Track:
     spans: Sequence[tuple[str, float, float, int | None]]
 
 
+def _wait_ends(
+    items: Sequence[Item],
+    measured: Mapping[int, tuple[int, float, float]] | None,
+    tracks: Mapping[int, Sequence[Track]],
+    input_wait: tuple[str, str] | None,
+) -> dict[int, float]:
+    """Anchor an overlapping gate only when its completion lies in one matching input wait.
+
+    A row ID identifies a consumer, not which of several producers or repeated polls it
+    waited for. Don't manufacture a handoff time in those ambiguous cases.
+    """
+    if not input_wait or not measured:
+        return {}
+    ends = {}
+    seen = set()
+    track_name, region = input_wait
+    for cta, lanes in tracks.items():
+        for lane in lanes:
+            if lane.name != track_name:
+                continue
+            for name, start, end, i in lane.spans:
+                if name != region or i not in measured or measured[i][0] != cta:
+                    continue
+                if i in seen:
+                    ends.pop(i, None)
+                    continue
+                seen.add(i)
+                deps = items[i].deps
+                if len(deps) == 1 and deps[0] in measured:
+                    producer_end = measured[deps[0]][2]
+                    if measured[i][1] <= start <= producer_end <= end <= measured[i][2]:
+                        ends[i] = end
+    return ends
+
+
 def schedule_html(
     title: str,
     subtitle: str,
@@ -73,6 +108,7 @@ def schedule_html(
     critical: Sequence[int] = (),
     measured: Mapping[int, tuple[int, float, float]] | None = None,
     tracks: Mapping[int, Sequence[Track]] | None = None,
+    input_wait: tuple[str, str] | None = None,
     color_by: str = "kind",
     kinds: Sequence[str] = (),
     notes: Sequence[str] = (),
@@ -86,7 +122,7 @@ def schedule_html(
     source or both; spans within each CTA and timing source must not overlap. ``critical``,
     ``measured`` and ``tracks`` require all items to have predicted spans. ``tracks[cta]`` are that CTA's measured lanes, drawn on
     the timeline under its row while it is focused. ``notes`` appear below the figures for
-    provenance.
+    provenance. ``input_wait`` optionally names the (track, region) recording input polls.
     ``kinds`` sets legend/colour order; unlisted kinds follow in order of appearance.
     """
     if color_by not in COLOR_BY:
@@ -144,6 +180,7 @@ def schedule_html(
             for cta, lanes in tracks.items()
         }
         or None,
+        "waitEnd": _wait_ends(items, measured, tracks, input_wait),
         "colorBy": color_by,
     }
     about = []
@@ -155,7 +192,9 @@ def schedule_html(
     if measured:
         about.append(
             "Measured: timestamps recorded on the GPU during a real launch of this same "
-            "schedule. This is the real timing."
+            "schedule. An overlap arrow connects the scheduled producer’s measured end to the "
+            "consumer’s recorded poll end; it does not identify which CTA released the poll. "
+            "An outlined producer has no uniquely matched wait."
         )
     about.append("Each row is one CTA (thread block); each box is one work item.")
     if tracks:

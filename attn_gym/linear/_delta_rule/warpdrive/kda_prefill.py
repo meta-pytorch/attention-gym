@@ -58,7 +58,7 @@ from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 
-from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS
+from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, standalone_dtype
 from attn_gym.warpdrive import (
     AFTER_FENCE_COVERED,
     BEFORE_FENCE_COVERED,
@@ -256,6 +256,9 @@ class KdaPrefill(WarpSpecialized):
         num_ctas: int,
         fastmath: bool = True,
         state_align: int = 16,
+        *,
+        beta_dtype: str | None = None,
+        state_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA prefill serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
@@ -268,6 +271,8 @@ class KdaPrefill(WarpSpecialized):
         self.use_initial_state, self.store_final_state = use_initial_state, store_final_state
         self.paged_state, self.fastmath = paged_state, fastmath
         self.state_align = state_align
+        # Standalone compiles read these; a bundle's host passes its own tensors (None).
+        self.beta_dtype, self.state_dtype = beta_dtype, state_dtype
         self.io_dtype = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
         gate_bytes = self.gate_dtype.width // 8
@@ -1978,7 +1983,7 @@ def uncut_work_items(cu_seqlens: torch.Tensor, heads: int, tiles_per_head: int =
 
 
 @jit_cache
-def compile_kda_prefill(op: KdaPrefill, beta_name: str, state_name: str | None):
+def compile_kda_prefill(op: KdaPrefill):
     """Compile for dynamic tokens, heads, sequences and work rows."""
     io, i32 = op.io_dtype, cutlass.Int32
     tokens, hq, hk, hv, heads, rows = (cute.sym_int() for _ in range(6))
@@ -1992,7 +1997,7 @@ def compile_kda_prefill(op: KdaPrefill, beta_name: str, state_name: str | None):
     def state():
         # Separate row extents: a chain-mode prefill reads piece states and stores sequences.
         return make_fake_strided_tensor(
-            CUTE_DTYPES[state_name],
+            CUTE_DTYPES[standalone_dtype(op, "state_dtype")],
             (cute.sym_int(), heads, dv_full, op.d_k),
             stride_divisibility=4,
         )
@@ -2003,7 +2008,9 @@ def compile_kda_prefill(op: KdaPrefill, beta_name: str, state_name: str | None):
         packed(io, hk, op.d_k),
         packed(io, hv, dv_full),
         packed(op.gate_dtype, heads, op.d_k),
-        make_fake_strided_tensor(CUTE_DTYPES[beta_name], (tokens, heads), contiguous_dim=None),
+        make_fake_strided_tensor(
+            CUTE_DTYPES[standalone_dtype(op, "beta_dtype")], (tokens, heads), contiguous_dim=None
+        ),
         state() if op.use_initial_state else None,
         packed(io, heads, dv_full),
         state() if op.store_final_state else None,
@@ -2053,7 +2060,7 @@ def kda_prefill(
     for t in (initial_state, final):
         if t is not None:
             state_name = TORCH_NAMES[t.dtype]
-    op = KdaPrefill(
+    op = KdaPrefill.get_or_build(
         TORCH_NAMES[q.dtype],
         TORCH_NAMES[gate.dtype],
         d_k,
@@ -2063,9 +2070,11 @@ def kda_prefill(
         final is not None,
         0,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
+        beta_dtype=TORCH_NAMES[beta.dtype],
+        state_dtype=state_name,
     )
     table, count, scheduler = uncut_work_items(cu_seqlens, heads, tiles_per_head)
-    fn = compile_kda_prefill(op, TORCH_NAMES[beta.dtype], state_name)
+    fn = compile_kda_prefill(op)
     slots = new_tma_slots(op.tma_slot_rows(gate.shape[1]), q.device)
     fn(
         q,

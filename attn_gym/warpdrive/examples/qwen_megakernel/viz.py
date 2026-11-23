@@ -145,11 +145,12 @@ def megakernel_view(
         critical=path,
         measured=spans,
         tracks=tracks,
+        input_wait=("compute +1", "poll"),
         kinds=mk.OP_NAMES,
         notes=[
             (
-                "Colours are operations; lighter shades are later layers. Arrows on hover point "
-                "to the items it waits for."
+                "Colours are operations; lighter shades are later layers. Hover links the "
+                "scheduled producers to the item that waits for them."
             ),
             "Predicted cost per item (us): "
             + ", ".join(f"{mk.OP_NAMES[k]} {c:.1f}" for k, c in cost.items())

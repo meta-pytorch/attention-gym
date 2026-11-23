@@ -49,14 +49,14 @@ def _reference(k, gate, beta, lens, heads):
     return out
 
 
-def _run(k, gate, beta, cu, lens, heads):
+def _run(k, gate, beta, cu, lens, heads, chunk_limits=None):
     from attn_gym.linear._delta_rule.warpdrive import gdn_tinv
 
     rows = gdn_tinv.tinv_rows(sum(lens), len(lens))
     tinv = torch.full((rows, heads, B_T, B_T), float("nan"), dtype=k.dtype, device="cuda")
     table = torch.full((rows, 4), -1, dtype=torch.int32, device="cuda")
     count = torch.zeros(1, dtype=torch.int32, device="cuda")
-    gdn_tinv.gdn_tinv(k, gate, beta, cu, tinv, table, count)
+    gdn_tinv.gdn_tinv(k, gate, beta, cu, tinv, table, count, chunk_limits=chunk_limits)
     return tinv, table, count
 
 
@@ -90,6 +90,52 @@ def test_gdn_tinv_matches_reference(lens, heads, key_heads, d_k, dtype, beta_dty
     for row, (ref, n) in _reference(k, gate, beta, lens, heads).items():
         got = tinv[row, :, :n, :n].double()
         torch.testing.assert_close(got, ref, atol=atol, rtol=0, msg=f"tile row {row}")
+
+
+def test_gdn_tinv_switches_beta_dtype_through_the_cache():
+    """Beta's dtype is a constructor argument: FP32, BF16, then FP32 beta (K and the shape
+    fixed) each match the reference for the beta passed, from two compiles, and the second FP32
+    run repeats the first bit for bit."""
+    from attn_gym.linear._delta_rule.warpdrive import gdn_tinv
+
+    lens, heads = (300, 77), 4
+    k, gate, beta, cu = _inputs(lens, heads, 2, 128, torch.bfloat16, torch.float32)
+    gdn_tinv.compile_gdn_tinv.cache_clear()
+    results = []
+    for passed in (beta, beta.bfloat16(), beta):
+        tinv = _run(k, gate, passed, cu, lens, heads)[0]
+        for row, (ref, n) in _reference(k, gate, passed, lens, heads).items():
+            got = tinv[row, :, :n, :n].double()
+            torch.testing.assert_close(got, ref, atol=1e-2, rtol=0, msg=f"tile row {row}")
+        results.append(tinv)
+    assert torch.equal(results[0].view(torch.int16), results[2].view(torch.int16))
+    assert not torch.equal(results[0], results[1])
+    assert gdn_tinv.compile_gdn_tinv.cache_info().currsize == 2
+
+
+def test_gdn_tinv_chunk_limits_compute_only_the_leading_tiles():
+    """Strided chunk limits, like the summary work items' chunk column, list each sequence's
+    first ``limit`` chunks and none at zero, past the row-table warp's first 32 sequences too;
+    those tiles are bitwise the full pass's at the same rows and the other rows stay
+    unwritten."""
+    lens = (7,) * 40 + (200, 65, 0)
+    k, gate, beta, cu = _inputs(lens, 3, 1, 128, torch.bfloat16, torch.float32)
+    full_tinv, full_table, full_count = _run(k, gate, beta, cu, lens, 3)
+    limit = {3: 1, 40: 2, 41: 5, 42: 1}  # 200 tokens: 2 of 4 chunks; 65 tokens: both
+    columns = torch.zeros(len(lens), 3, dtype=torch.int32)
+    columns[list(limit), 1] = torch.tensor(list(limit.values()), dtype=torch.int32)
+    tinv, table, count = _run(k, gate, beta, cu, lens, 3, chunk_limits=columns.cuda()[:, 1])
+
+    every = full_table[: full_count.item()].tolist()
+    expected = [row for row in every if row[0] < limit.get(row[1], 0)]
+    assert count.item() == len(expected) == 5
+    assert table[: len(expected)].tolist() == expected
+    for chunk, sequence, start, _ in every:
+        row = start // B_T + sequence + chunk
+        if chunk < limit.get(sequence, 0):
+            assert torch.equal(tinv[row], full_tinv[row]), row
+        else:
+            assert tinv[row].isnan().all(), row
 
 
 def test_gdn_tinv_reuses_one_compile_across_runtime_shapes():

@@ -70,11 +70,14 @@ def gemm(a, b, out, ab_stages=4):
   different streams need kernels of their own (`Kernel(...)`).
 - `compile_fn(op)` remembers the build it served on `op`, so the next call with that kernel
   costs about 0.6 µs on a GB300 host. The key is derived from the call, never written by hand;
-  `cache_clear()`, a fork or a new compile target retire every entry.
+  `cache_clear()`, a fork or a new compile target retire every entry and remove it from the
+  memos of kernels still alive, so a kernel kept by `get_or_build` holds no build the cache
+  dropped.
 - A memo hit restores no trace record: the instance already holds the record its first call
   restored or traced, so `describe()` and the reports are unaffected.
 
-Keep the objects a kernel's settings hold (cluster, schedules, maps,
+Compile functions take only the kernel: every compile-time choice, operand dtypes included, is
+a constructor argument. Keep the objects a kernel's settings hold (cluster, schedules, maps,
 readiness) immutable, as warpdrive's own frozen dataclasses are.
 
 Any `jit_cache` argument can opt in: a first argument with a `__cute_memo__` dict attribute,
