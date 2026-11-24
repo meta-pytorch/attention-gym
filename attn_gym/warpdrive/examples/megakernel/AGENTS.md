@@ -1,8 +1,9 @@
 # Megakernel package
 
 `examples/megakernel/` holds what the warpdrive decode megakernels share; a model directory
-(`qwen_megakernel/`) composes it into that model's launches. Adding a model should mean writing
-model code (its oracle, its per-layer kernels, its chat family module) over these pieces. The
+(`qwen_megakernel/`, `inkling_megakernel/`) composes it into that model's launches. Adding a
+model should mean writing model code (its oracle, its per-layer kernels, its chat family module)
+over these pieces. The
 [`adding-megakernel-model`](../../../../.agents/skills/adding-megakernel-model/SKILL.md) skill
 is the procedure; this file holds the package's contracts.
 
@@ -10,14 +11,17 @@ is the procedure; this file holds the package's contracts.
 
 | Module | Contents |
 |---|---|
-| `constants.py` | Tile geometry (`ROWS` x `TILE_K` weight stages of `STAGE_BYTES`, `BLOCK` KV positions of a `HEAD_DIM` head), the compute role's warps, the SMEM budget and default ring depth cap (`MAX_STAGES`), `EVICT_FIRST`, `LOG2E`. Imports nothing. |
-| `tagged.py` | The cross-CTA protocol: `publish`, `fetch`, `load_words`, `pack_tagged`/`unpack_tagged`; the scratch (`scratch_offsets`, `tagged_views`) and the epoch (`advance_epoch`) |
-| `regmath.py` | `bf16_round`, `bf16x8_to_f32`, `group_sum`, `warp_transpose_reduce`, `load_vec`/`load_into`/`store_vec` |
+| `constants.py` | Tile geometry (`ROWS` x `TILE_K` weight stages of `STAGE_BYTES`, `BLOCK` KV positions of a `HEAD_DIM` head), the compute role's warps, the SMEM budget and default ring depth cap (`MAX_STAGES`), `EVICT_FIRST`, `LOG2E`, the polling backoff `BACKOFF_NS`. Imports nothing. |
+| `tagged.py` | The cross-CTA protocol: `publish`, `fetch` (warp-uniform polls with `nanosleep` backoff on request), `load_words`, `pack_tagged`/`unpack_tagged`; the scratch (`scratch_offsets`, `tagged_views`) and the epoch (`advance_epoch`) |
+| `regmath.py` | `bf16_round`, `bf16x8_to_f32`, `group_sum`, `warp_transpose_reduce`, `cta_sum` (over the compute warps through SMEM), `load_vec`/`load_into`/`store_vec`; `fp32`/`fp32_reciprocal` (constants as PyTorch rounds them) |
 | `gemv.py` | `gemv_tile`: one token against a 32-row weight tile on CUDA cores, over the input row and the weight ring; `owns_row`, `owns_pair`, `pair_value` say where its results land. Qwen wraps it in its engine protocol (`qwen_megakernel.core.CudaCoreGemv`), beside its tcgen05 engine. |
-| `attention.py` | The flash-decoding rows' helpers: `split_blocks` (a KV split's blocks and the newest split), `head_vec` and `stage_row` (a lane's slices of a head) |
-| `ring.py` | The weight ring: `ring_stages` (its depth in the SMEM budget), `weight_stages`/`kv_stages` (stage layouts), `tma_partition`, and `load_tiles` (the load warp's stages) |
+| `formats.py` | Expert weight formats (bf16, NVFP4, MXFP8), their geometry on the weight tiles, and the expert input quantizations (`ACTIVATION_FORMATS`). Imports only `constants`. |
+| `quant_gemv.py` | `quant_tile`: `gemv_tile` of a quantized expert tile, its words decoded in registers to the weights' exact block values and accumulated in `gemv_tile`'s order |
+| `act_quant.py` | Expert input quantization on the device, vLLM's SM100 NVFP4 (per-row amax, `fouroversix_mae` block scales) and MXFP8 quantizers bit for bit: `quantize_rows` replaces bf16 rows in shared memory by their exact block values; `row_scale` is the NVFP4 GEMM output scale |
+| `attention.py` | The flash-decoding rows' helpers: `split_blocks` (a KV split's blocks, sliding windows included, and the newest split), `head_vec` and `stage_row` (a lane's slices of a head) |
+| `ring.py` | The weight ring: `ring_stages` (its depth in the SMEM budget), `weight_stages`/`kv_stages` (stage layouts), `tma_atom`/`tma_partition`, and `load_tiles` (the load warp's stages). Qwen builds its atoms with its own helpers, which take the tcgen05 engine's layouts. |
 | `table.py` | `InstructionTable` (the row-table `WorkMap`) and `layout_static` (its `[slot][cta]` layout) |
-| `launch.py` | Host side: `tagged_values` (a tagged buffer's fp32 values). Torch only. |
+| `launch.py` | Host side: `Launch` (a one-launch chain's table, tagged scratch and state), `table_of`/`deal` (instruction tables dealt to CTAs), `tagged_values` |
 | `chat.py` | The chat driver; each family provides a `chat` module (`FAMILIES`) |
 
 ## Shape preconditions
@@ -70,22 +74,24 @@ constructor (Qwen's `check_model`):
 - **Residency.** CTAs that poll each other's tagged words need the whole grid resident: one CTA
   per SM, each CTA's rows in dependency order (`layout_static`), so the earliest unfinished row
   can always run. A grid that cannot be resident (an MPS or green-context SM limit) hangs. Launch
-  such grids cooperatively so the driver refuses them instead (CUDA error 720); Qwen's
-  programmatic-dependent launches assume residency.
+  such grids cooperatively so the driver refuses them instead (CUDA error 720), as Inkling's
+  visit launches do; Qwen's programmatic-dependent launches assume residency.
 - **Epochs.** Tagged words carry the epoch of their dependency chain: the launches whose words
   feed each other share one epoch and one scratch (Qwen: a step's layer launches, which overlap
-  under programmatic dependent launch; a one-launch chain is the simplest case). Every CTA reads
-  the epoch at its start; the chain's final launch advances it in its last CTA
-  (`tagged.advance_epoch`), once every CTA of that launch has read it. Retire an epoch only when
-  no launch of the chain can still poll for it: the next run of the chain must start after the
-  final launch's CTAs finished reading (stream order or a dependent-launch wait), and a launch
-  of another chain must not share the scratch while this one runs. The runner owns the chain's
-  scratch and `state` (`[epoch, finished-CTA counter per launch]`).
+  under programmatic dependent launch; Inkling: each launch alone, its next launch ordered by
+  the stream). Every CTA reads the epoch at its start; the chain's final launch advances it in
+  its last CTA (`tagged.advance_epoch`), once every CTA of that launch has read it. Retire an
+  epoch only when no launch of the chain can still poll for it: the next run of the chain must
+  start after the final launch's CTAs finished reading (stream order or a dependent-launch
+  wait), and a launch of another chain must not share the scratch while this one runs. The
+  runner owns the chain's scratch and `state` (`[epoch, finished-CTA counter per launch]`;
+  `launch.Launch` for one-launch chains).
 - **K/V stores after TMA reads.** The new K/V row lands in a cache block that attention rows
   read through TMA (the async proxy). Order its generic store after every TMA read that uses
   the row: within a CTA, after its loads completed (Qwen's writing GQA group; the other groups
   read the block but mask the row, so the race cannot reach a result); across CTAs, with
-  `fence.proxy.async` and a release/acquire handoff from the readers.
+  `fence.proxy.async` and a release/acquire handoff from the readers (the protocol in
+  `inkling_megakernel.attn_half`'s docstring).
 - **Masked rows.** Cache rows past the position or outside the window hold stale values, NaN
   included. A masked score does not stop `0 * NaN = NaN` in a product, so such rows must never
   reach a GEMV or MMA. Tests fill unused rows with NaN.
@@ -99,9 +105,54 @@ constructor (Qwen's `check_model`):
   nothing, and the captured path allocates nothing per step (outputs the runner owns or the
   caller passes), so CUDA graphs hold whole steps (a
   chat replay feeds up to `SYNC_EVERY` positions). Validate shapes once, when a runner is built.
-- **Exposed sizes.** Test every static specialization a runner or chat flag can select (a
-  constructor or `const_expr` choice: engine, batch, format, token count) against the oracle,
-  not a representative one: each is separate code. Runtime sizes (positions, cache capacity,
+- **Exposed sizes.** Each static specialization a runner or chat flag can select (a constructor
+  or `const_expr` choice: engine, batch, format, token count) is separate code and a separate
+  compile, the tests' main cost: test the shipped defaults against the oracle, keep at least one
+  oracle comparison per launch kind, and prefer configurations the checkpoint test compiles
+  anyway. Runtime sizes (positions, cache capacity,
   `--max-len`) are one code path: test representative values at their boundaries (position 0
   and 1, block and split edges, a full cache) and that changing them reuses the compiled kernel
   (`compile_fn.cache_info()`).
+
+## Quantized experts
+
+- `formats` fixes the layout: 32-row x 256-column subtiles, warp w owning rows 4w .. 4w + 3 and
+  lane l columns 8l .. 8l + 7; NVFP4 codes and e4m3 bytes as the checkpoint stores them;
+  tile-major scale bytes, so a lane reads its four rows' scales as one word.
+- `quant_gemv` decodes in registers to the weights' exact block values (NVFP4 `e2m1 x e4m3`
+  without the per-expert global scale, MXFP8 `e4m3 x 2^(s - 127)`) and accumulates in
+  `gemv_tile`'s order, so quantized dot products equal the bf16 GEMV's on the block values bit
+  for bit. Test that equality bit for bit (random codes and scale bytes), not a tolerance.
+- `quant_tile` reads a tile through the weight ring's word view `"QW"` and a per-tile stage
+  of a meta ring holding its scale words (`"S"`); `quant_gemv`'s docstring gives their
+  layouts. A launch declares those views and loads them in its load role (Inkling's
+  `mlp_half`).
+- Packing a checkpoint into the layout is the model's loader (`inkling_megakernel.quant`).
+  Move the packing here when a second quantized model reuses it.
+
+## Expert numerics
+
+A checkpoint can declare how its experts' inputs are quantized (Inkling 2 Mini's
+`hf_quant_config.json`: `required_activation_quantization`, NVFP4 for layers 0-19 and MXFP8 for
+20-23). The kernels then compute those numerics, as vLLM's SM100 MoE does, not HF's
+dequantize-to-bf16 numerics, and the model's oracle defines them
+(`inkling_megakernel.ref.ExpertQuant`, `declared_experts_out`):
+
+- each expert input row (a token's MLP input; each routed row's SwiGLU) is quantized once
+  (`act_quant.quantize_rows`) and replaced by its exact bf16 block values, so the existing bf16
+  GEMVs and MMAs run unchanged; the weights decode to their block values;
+- the fp32 dot product is multiplied by the NVFP4 row scale `(x_amax * w_amax[e]) * rcp(1536 *
+  w_den)` (`act_quant.row_scale`; MXFP8 has none) before its bf16 rounding;
+- the routing weight multiplies the SwiGLU before the down input's quantization, and a token's
+  down rows add up in fp32, rounded once.
+
+Quantization makes the numerics discontinuous: a flipped bf16 rounding upstream can move a code,
+a block scale or a row's amax, so an output can differ from the oracle's on slightly different
+inputs by far more than the rounding (Inkling: up to ~100 ulps of a visit output for a few ulps
+of residual). Test each stage on the kernel's own inputs (Inkling's `check_visit`: the
+activations against the oracle's, then the down projection and the rest against the oracle on
+the launch's activations), and bit-match the device quantizers against the oracle's
+(`test_warpdrive_megakernel_act_quant`). The NVFP4 per-row amax needs every element of the row:
+quantize where the row is complete in one CTA, after a norm (`quantize_rows`, a block a thread)
+or as a fetch holds it (`quantize_chunk`, in registers, a block over 2 or 4 lanes), one CTA
+maximum (`act_quant.cta_max`) per row set.

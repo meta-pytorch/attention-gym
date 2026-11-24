@@ -11,16 +11,20 @@ from attn_gym.warpdrive.examples.megakernel.regmath import load_vec
 
 
 @cute.jit
-def split_blocks(pos, split, splits: cutlass.Constexpr):
-    """``(blk0, blk1, newest)``: the KV blocks ``[blk0, blk1)`` of cached keys (positions
-    ``[0, pos)``) that ``split`` of ``splits`` reads, and the split of the last such block,
-    which also scores the new token at ``pos`` (split 0 when no key is cached). Later splits
-    are empty."""
+def split_blocks(pos, split, splits: cutlass.Constexpr, window: cutlass.Constexpr = None):
+    """``(blk0, blk1, newest)``: the KV blocks ``[blk0, blk1)`` of cached keys that ``split`` of
+    ``splits`` reads (positions ``[0, pos)``; with a sliding ``window``, only the last
+    ``window - 1``), and the split of the last such block, which also scores the new token at
+    ``pos`` (split 0 when no key is cached). Later splits are empty."""
+    first = 0
+    if cutlass.const_expr(window is not None):
+        first = cutlass.max(pos - (window - 1), Int32(0)) // BLOCK
     last = (pos + BLOCK - 1) // BLOCK
-    per = cutlass.max((last + splits - 1) // splits, Int32(1))
-    blk0 = split * per
+    n = last - first
+    per = cutlass.max((n + splits - 1) // splits, Int32(1))
+    blk0 = first + split * per
     blk1 = cutlass.max(cutlass.min(blk0 + per, last), blk0)
-    newest = cutlass.max(last - 1, Int32(0)) // per
+    newest = cutlass.max(n - 1, Int32(0)) // per
     return blk0, blk1, newest
 
 

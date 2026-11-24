@@ -8,7 +8,8 @@ description: Adds a model's decode to the warpdrive megakernels on the shared ex
 The package contracts (what belongs in `examples/megakernel/`, compile-key hygiene, kernel
 rules) live in [`attn_gym/warpdrive/examples/megakernel/AGENTS.md`](../../../attn_gym/warpdrive/examples/megakernel/AGENTS.md);
 read it first. Read [`authoring-warpdrive`](../authoring-warpdrive/SKILL.md) before writing
-kernels, and use the closest model directory (`qwen_megakernel/`) as the worked example.
+kernels, and use the closest model directory (`qwen_megakernel/`, `inkling_megakernel/`) as
+the worked example.
 
 Routing: a new model's decode, its chat family, or moving a piece between a model directory and
 the package uses this skill. Tuning one existing kernel (`cutedsl-performance`) or changing a
@@ -44,15 +45,23 @@ Climb in order; each rung is tested against the previous ones before the next st
    exposed sizes), with compiled-kernel reuse across runtime sizes; NaN-filled unused cache rows;
    repeated launches bit for bit; the kernels' required modules in
    `test_warpdrive_megakernel_package.py`'s `REQUIRED`.
-4. **Chat family.** `<model>/chat.py` provides `DEFAULT_BACKEND`, `OPTIONS`, `check_options`,
+4. **Quantized weights** (when the checkpoint stores them). Stream them as stored: pack them to
+   `megakernel.formats`' layout (`inkling_megakernel/quant.py` is a worked loader) and decode
+   with `quant_gemv`. When the checkpoint declares its experts' activation quantization (a
+   `hf_quant_config.json`), the oracle and the kernels compute those numerics
+   (AGENTS.md, expert numerics; `megakernel.act_quant`), oracle first, its quantizers
+   bit-matched against the reference serving stack's. Gate: every launch output equals the same
+   launch on the weights' bf16 block values bit for bit, on random weights over every supported
+   code and scale byte and on the checkpoint.
+5. **Chat family.** `<model>/chat.py` provides `DEFAULT_BACKEND`, `OPTIONS`, `check_options`,
    `checkpoint_dir` and `load_chat_model`; register its `model_type` in `megakernel/chat.py`'s
    `FAMILIES`. A new flag also goes into `ChatOptions` (default None: family-specific), into
    `main()`'s options and its `ChatOptions(...)` call, and into the family's `OPTIONS`. Gate: a
    real prompt answers coherently through `python -m
    attn_gym.warpdrive.examples.megakernel.chat --model <repo>`.
-5. **Bench.** `<model>/bench.py` on `examples/bench_support.py`: CUDA-graph replay of the
-   torch step and the megakernel at fixed contexts, with provenance. Record the bandwidth floor
-   next to the measurement.
+6. **Bench.** `<model>/bench.py` on `examples/bench_support.py` (`capture`, `time_graphs`,
+   `provenance`): CUDA-graph replay of the torch step and the megakernel at fixed contexts.
+   Record the bandwidth floor next to the measurement.
 
 ## Moving code into the package
 

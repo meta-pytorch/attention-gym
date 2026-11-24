@@ -17,9 +17,10 @@ reset.
 import cutlass
 from cutlass import Float32, Int32, Int64, cute
 from cutlass._mlir import ir
-from cutlass._mlir.dialects import arith, vector
+from cutlass._mlir.dialects import arith, llvm, vector
 from cutlass._mlir.extras import types as T
 from cutlass._mlir_helpers.arith import bitcast
+from cutlass.cutlass_dsl import dsl_user_op
 
 
 def scratch_offsets(words: dict[str, int]) -> tuple[dict[str, int], int]:
@@ -85,25 +86,54 @@ def load_words(buf, index, count: cutlass.Constexpr):
     return words
 
 
+@dsl_user_op
+def nanosleep(ns: int, *, loc=None, ip=None):
+    """Suspend the thread for about ``ns`` nanoseconds (PTX ``nanosleep``; the hardware picks a
+    duration in [0, 2 * ns])."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"nanosleep.u32 {ns};",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
-def fetch(segments, out, epoch):
+def fetch(segments, out, epoch, uniform: cutlass.Constexpr = False,
+          backoff: cutlass.Constexpr = 0):  # fmt: skip
     """Spin until every word of ``segments`` carries ``epoch``; the values fill ``out`` in order.
-    A segment is a ``(buffer, start, count)`` run aligned as ``load_words`` requires."""
-    starts = []
-    total = 0
-    for s in cutlass.range_constexpr(len(segments)):
-        starts.append(total)
-        total += segments[s][2]
+    A segment is a ``(buffer, start, count)`` run aligned as ``load_words`` requires.
+
+    ``uniform``: poll until every lane of the warp has all its words, so the lanes leave the
+    loop together (every lane of the warp must call it): lanes leaving a divergent poll loop one
+    by one and then waiting at a shuffle for the rest stalled warps a fixed ~17k cycles on
+    random SMs (GB300, Inkling MLP launch traces; 2026-11-21). ``backoff``: a failed uniform
+    poll sleeps about that many nanoseconds, so long waits issue few L2 requests while other
+    CTAs' work runs."""
     ready = Int32(0)
     while ready == 0:
-        ready = Int32(1)
+        mine = Int32(1)
+        start = 0
         for s in cutlass.range_constexpr(len(segments)):
-            buf, start, count = segments[s]
-            words = load_words(buf, start, count)
+            buf, index, count = segments[s]
+            words = load_words(buf, index, count)
             for e in cutlass.range_constexpr(count):
                 value, tag = unpack_tagged(words[e])
-                out[starts[s] + e] = value
-                ready = ready & Int32(tag == epoch)
+                out[start + e] = value
+                mine = mine & Int32(tag == epoch)
+            start += count
+        if cutlass.const_expr(uniform):
+            ready = Int32(cute.arch.vote_all_sync(mine != 0))
+            if cutlass.const_expr(backoff > 0):
+                if ready == 0:
+                    nanosleep(backoff)
+        else:
+            ready = mine
 
 
 @cute.jit

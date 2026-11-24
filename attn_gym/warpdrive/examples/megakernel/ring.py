@@ -1,6 +1,8 @@
-"""The weight ring: its depth in the shared-memory budget, its stage layouts and TMA
+"""The weight ring: its depth in the shared-memory budget, its stage layouts, TMA atoms and
 partitions, and the load warp's loads of 16 KB stages (``constants``) of weight or KV tiles
 into a ``Ring`` the compute warps consume."""
+
+import math
 
 import cutlass
 from cutlass import Int64, cute
@@ -53,6 +55,13 @@ def weight_stages(stages: int) -> cute.Layout:
 def kv_stages(stages: int) -> cute.Layout:
     """The ring's ``stages`` KV stages as row-major ``(BLOCK, HEAD_DIM, stages)`` bf16 blocks."""
     return cute.make_layout((BLOCK, HEAD_DIM, stages), stride=(HEAD_DIM, 1, BLOCK * HEAD_DIM))
+
+
+def tma_atom(src, box: tuple[int, ...]) -> tuple:
+    """TMA ``(atom, tensor)`` loading ``box`` tiles of ``src`` into row-major SMEM."""
+    stride = tuple(math.prod(box[i + 1 :]) for i in range(len(box)))
+    smem = cute.make_layout(box, stride=stride)
+    return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), src, smem, box)
 
 
 def tma_partition(atom, smem, gtensor, box: tuple[int, ...]) -> tuple:

@@ -3,11 +3,13 @@ output tokens per second.
 
     python -m attn_gym.warpdrive.examples.megakernel.chat --model Qwen/Qwen3-8B
     python -m attn_gym.warpdrive.examples.megakernel.chat --model Qwen/Qwen3-0.6B --backend compile
+    python -m attn_gym.warpdrive.examples.megakernel.chat --model thinkingmachines/Inkling-2-Mini \
+        --backend reference --prompt "Hi"
 
 The checkpoint's ``config.json`` selects the model family (``FAMILIES``): Qwen3 dense and MoE
-(``qwen_megakernel.chat``). A family builds a ``ChatModel``: its tokenizer and chat template, a
-prefill (one forward pass of the new prompt tokens into its caches) and a ``DecodeBackend`` that
-decodes one token per step.
+(``qwen_megakernel.chat``) or Inkling 2 Mini (``inkling_megakernel.chat``). A family builds a
+``ChatModel``: its tokenizer and chat template, a prefill (one forward pass of the new prompt
+tokens into its caches) and a ``DecodeBackend`` that decodes one token per step.
 
 Each turn prefills the new prompt tokens, then decodes. A backend whose step is CUDA-graph
 capturable decodes inside one graph of SYNC_EVERY steps per replay, sampling on the device;
@@ -49,6 +51,7 @@ SYNC_EVERY = 8  # decode steps between host reads of the sampled tokens
 FAMILIES = {
     "qwen3": "attn_gym.warpdrive.examples.qwen_megakernel.chat",
     "qwen3_moe": "attn_gym.warpdrive.examples.qwen_megakernel.chat",
+    "inkling2_loop": "attn_gym.warpdrive.examples.inkling_megakernel.chat",
 }
 
 app = typer.Typer(add_completion=False, help=__doc__.splitlines()[0])
@@ -98,6 +101,7 @@ class ChatOptions:
     engine: str | None = None  # Qwen megakernel GEMV engine
     thinking: bool | None = None  # Qwen3 thinking mode
     yarn_factor: float | None = None  # Qwen3 YaRN
+    reasoning_effort: str | None = None  # Inkling
 
 
 def download(model: str, checkpoint_dir) -> Path:
@@ -368,6 +372,11 @@ def main(
     ),
     temperature: float = typer.Option(0.0, help="0: greedy"),
     thinking: bool | None = typer.Option(None, help="Qwen3 thinking mode (default off)"),
+    reasoning_effort: str | None = typer.Option(
+        None,
+        help="Inkling thinking effort: none, minimal, low (default), medium, high, xhigh, max "
+        "or 0-0.99",
+    ),
     prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
 ):
     check_temperature(temperature)
@@ -379,6 +388,7 @@ def main(
         max_len=max_len,
         thinking=thinking,
         yarn_factor=yarn_factor,
+        reasoning_effort=reasoning_effort,
     )
     check_options(family, options)
     # Before the spinner (it garbles bars); the backend chooses the checkpoint files.
