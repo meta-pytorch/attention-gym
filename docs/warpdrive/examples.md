@@ -16,6 +16,7 @@ PyTorch or FA4 feature.
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
 | Run a whole Qwen3 decode step as one persistent launch per layer | [qwen_megakernel](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
+| Decode a looped MoE (Inkling 2 Mini) with one launch per layer visit | [inkling_megakernel](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/inkling_megakernel/megakernel.py) | [Inkling 2 Mini megakernel](#inkling-2-mini-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -752,12 +753,94 @@ not its cross-CTA critical path; see [raw code and opt-outs](guarantees.md#opt-o
 
 </details>
 
+## Inkling 2 Mini decode megakernel
+
+``inkling_megakernel`` decodes Thinking Machines' Inkling 2 Mini (``thinkingmachines/Inkling-2-Mini``)
+at batch one. The model runs its 24 layers as 48 *visits*: layers 0-5 once, layers 6-17 three
+times with shared weights (every pass restarts from layer 5's output and reads gated messages
+from the previous pass), layers 18-23 once. Each visit has its own KV cache and short-convolution
+rings.
+
+```bash
+python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --prompt "Hi" --reasoning-effort low
+python -m attn_gym.warpdrive.examples.inkling_megakernel.bench --context 1100
+```
+
+- **Oracle.** ``ref.py`` is a PyTorch implementation with HF's dtype boundaries; loaded with
+  ``activation_quant=False`` and given the same weights it equals HF's eager
+  ``Inkling2LoopForCausalLM`` bit for bit on the tiny test model and short real prompts (its
+  docstring states the scope). By default it computes the experts' declared numerics (below).
+  ``fast.py`` runs the same dataflow as a CUDA-graph capturable torch step.
+- **Launches.** A step is 51 launches: one per visit (its attention half, then its MLP half in
+  the same persistent grid, the halves' rows ordered so the static schedule cannot deadlock), one
+  per loop pass after the first (all 48 messages and the message half of every gate's down
+  projection, which depend only on the previous pass), and one head launch (final block residual,
+  norm, LM head, softcap). Cross-CTA dependencies are the [megakernel package](#shared-megakernel-package)'s
+  epoch-tagged words.
+- **Experts.** The checkpoint stores experts as NVFP4 (layers 0-19) and MXFP8 (layers 20-23);
+  the kernel streams them as stored and decodes their block values in registers exactly, so its
+  outputs equal those of the same kernel on the bf16 block values bit for bit
+  (``--backend megakernel-bf16`` keeps that path). Weights take 19 GB on the device.
+- **Expert numerics.** The checkpoint's ``hf_quant_config.json`` declares the quantization of
+  the experts' inputs (``required_activation_quantization``: NVFP4 with a per-token amax, 16-column
+  blocks and ``fouroversix_mae`` e4m3 scales for layers 0-19; MXFP8 with 32-column ue8m0 blocks
+  for 20-23). The oracle, the torch step and the kernels compute it as vLLM's SM100 MoE kernels
+  do (``act_quant.py``, bit for bit against vLLM's Triton quantizers): each expert input
+  quantized once (a token's MLP input, each routed row's SwiGLU), the weights' block values
+  without the NVFP4 per-expert factor, which joins the token's amax in a row scale on the fp32
+  dot product, and the routing weight applied before the down input's quantization. HF's
+  modeling code (and vLLM on Hopper) instead dequantizes the weights to bf16 with the factor
+  folded in, keeps activations bf16 and applies the routing weight after the down projection;
+  the oracle keeps that path behind ``activation_quant=False`` for its HF parity tests.
+- **Numerics.** Per visit within a few bf16 ulps of the oracle (fp32 summation order and the
+  flash-decoding merge) on the launch's own inputs; quantization amplifies rounding
+  differences, so a whole step's logits stay within a few units of the oracle's.
+
+The declared numerics against HF's, teacher-forced on the 6 DSpark chat prompts (low effort,
+each with HF's 256-token greedy continuation) and a 1328-token code prompt (64-token
+continuation); KL(hf || variant) in nats at the 1600 continuation positions. "Structure only"
+applies the declared structure (factor outside the dot, routing weight before the down
+projection) with an identity quantizer; the noise floor is the HF oracle prefilled in 64-token
+chunks:
+
+| | KL mean / median / p99 / max | top-1 agreement |
+|---|---|---:|
+| declared numerics | 0.015 / 0.0024 / 0.136 / 0.32 | 95.9% |
+| structure only | 0.0032 / 0.0004 / 0.036 / 0.08 | 97.8% |
+| noise floor | 0.0029 / 0.0004 / 0.038 / 0.13 | 98.2% |
+
+Decode step at context 1100, GB300, CUDA-graph replay (``bench --context 1100``, 2026-11-24;
+one run, all rows in the same process; declared numerics):
+
+| Step | ms per token |
+|---|---:|
+| torch step (``fast.decode_step``) | 60.2 |
+| megakernel, bf16 experts | 3.31 |
+| megakernel, quantized experts | 3.01 |
+
+The declared numerics cost the quantized-expert megakernel nothing measurable (3.02 ms per
+token with HF's numerics, same session), the bf16-expert one 2.4%, and the torch step its
+quantizers' small elementwise kernels (32.3 ms with HF's numerics).
+
+The chat (``--prompt "What is the capital of France? One sentence." --reasoning-effort low
+--max-len 2048``, a 57-token reply, megakernel default backend) decoded at 305 tok/s (GB300,
+2026-11-24). Greedy tokens equal the oracle's on the tested checkpoint decodes except where the two
+best logits nearly tie.
+
+The bf16 bandwidth floor is about 1.4 ms per token (about 0.6 ms with quantized experts). The
+step is latency-bound: the serial chain from a visit's attention output to its first expert row
+(residual, norm, router, top-8) costs about 9 us per visit, and NVFP4 decoding is compute-bound,
+so the quantized experts save less than their 3.5x fewer bytes suggest. A visit grid needs all its
+CTAs resident at once, so visit launches are cooperative: one CTA per SM, admitted only when the
+whole grid fits (otherwise the launch fails, e.g. under MPS or green-context SM limits). Callers
+keep ``0 <= pos < max_len``; positions are read on the device.
+
 ## Shared megakernel package
 
 `examples/megakernel/` holds what the decode megakernels share: the tile geometry, the epoch-tagged
-words that carry activations between CTAs, register helpers, the CUDA-core GEMV engine, the weight
-ring's TMA loads, the instruction table and the chat driver. A model directory keeps its oracle,
-kernels, runners, bench and chat family module. Its
+words that carry activations between CTAs, register helpers, the CUDA-core GEMV engine and its
+NVFP4/MXFP8 expert decode, the weight ring's TMA loads, the instruction table and the chat driver.
+A model directory keeps its oracle, kernels, runners, bench and chat family module. Its
 [`AGENTS.md`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/megakernel/AGENTS.md)
 states what belongs in the package and the rules its kernels follow (residency, K/V store ordering,
 compile-key boundaries); the `adding-megakernel-model` skill
@@ -768,6 +851,7 @@ The chat picks the model family from the checkpoint's `config.json`:
 ```bash
 python -m attn_gym.warpdrive.examples.megakernel.chat --model Qwen/Qwen3-8B
 python -m attn_gym.warpdrive.examples.qwen_megakernel.chat --backend compile --prompt "Hi"
+python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --prompt "Hi" --reasoning-effort low
 ```
 
 ## Known limits

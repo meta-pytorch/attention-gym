@@ -28,6 +28,18 @@ REQUIRED = {
         "qwen_megakernel/ref.py",
     },
     "qwen_megakernel/tc.py": {"megakernel/attention.py", "qwen_megakernel/core.py"},
+    "inkling_megakernel/visit_kernel.py": {
+        "inkling_megakernel/attn_half.py",
+        "inkling_megakernel/common.py",
+        "inkling_megakernel/mlp_half.py",
+        "megakernel/act_quant.py",
+        "megakernel/attention.py",
+        "megakernel/formats.py",
+        "megakernel/quant_gemv.py",
+        "megakernel/tagged.py",
+    },
+    "inkling_megakernel/msg_kernel.py": {"inkling_megakernel/common.py", "megakernel/gemv.py"},
+    "inkling_megakernel/head_kernel.py": {"inkling_megakernel/common.py", "megakernel/gemv.py"},
 }
 
 

@@ -1,10 +1,14 @@
-"""Register math of the megakernels: bf16 rounding and widening, warp reductions and
-vectorized loads and stores of small fragments."""
+"""Register math of the megakernels: bf16 rounding and widening, warp and CTA reductions,
+vectorized loads and stores of small fragments, and fp32 constants as PyTorch rounds them."""
+
+import struct
 
 import cutlass
 from cutlass import Float32, Int32, Uint32, cute
 from cutlass._mlir.extras import types as T
 from cutlass._mlir_helpers.arith import bitcast
+
+from attn_gym.warpdrive.examples.megakernel.constants import COMPUTE_WARPS, RED_VALUES
 
 
 @cute.jit
@@ -60,6 +64,35 @@ def group_sum(v, width: cutlass.Constexpr):
     return v
 
 
+def red_layout(slots: int) -> cute.Layout:
+    """SMEM layout of ``cta_sum``'s ``slots`` slots: fp32 ``(slots, COMPUTE_WARPS,
+    RED_VALUES)``."""
+    return cute.make_layout(
+        (slots, COMPUTE_WARPS, RED_VALUES), stride=(COMPUTE_WARPS * RED_VALUES, RED_VALUES, 1)
+    )
+
+
+@cute.jit
+def cta_sum(red, csync, vals, slot: cutlass.Constexpr, warp, lane):
+    """Sums of each of ``vals`` (at most RED_VALUES per-thread values) over the compute
+    threads, in every thread, through slot ``slot`` of ``red`` (``red_layout``) and the compute
+    warps' barrier ``csync``. Before a slot is written again, every thread must pass a barrier
+    after its last read (another ``cta_sum`` or ``csync``)."""
+    n = len(vals)
+    for i in cutlass.range_constexpr(n):
+        v = group_sum(vals[i], 32)
+        if lane == 0:
+            red[slot, warp, i] = v
+    csync.sync()
+    out = []
+    for i in cutlass.range_constexpr(n):
+        total = Float32(0.0)
+        for wi in cutlass.range_constexpr(COMPUTE_WARPS):
+            total = total + red[slot, wi, i]
+        out.append(total)
+    return out
+
+
 @cute.jit
 def load_vec(src, offset, n: cutlass.Constexpr):
     """``n`` contiguous elements of a 1-D tensor from ``offset`` (a multiple of n), as fp32."""
@@ -80,3 +113,14 @@ def store_vec(dst, offset, frag, n: cutlass.Constexpr):
     cast = cute.make_rmem_tensor((n,), dst.element_type)
     cast.store(frag.load().to(dst.element_type))
     cute.autovec_copy(cast, cute.local_tile(dst, (n,), (offset // n,)))
+
+
+def fp32(x: float) -> float:
+    """``x`` rounded to fp32, as a Python float."""
+    return struct.unpack("f", struct.pack("f", x))[0]
+
+
+def fp32_reciprocal(x: float) -> float:
+    """``1 / x`` in fp32: PyTorch divides a CUDA tensor by a Python scalar as a multiplication by
+    this reciprocal."""
+    return fp32(1.0 / fp32(x))

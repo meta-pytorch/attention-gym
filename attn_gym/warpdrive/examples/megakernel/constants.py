@@ -13,5 +13,8 @@ SMEM_HEADROOM = 1024  # for barriers and alignment
 COMPUTE_WARPS = 8
 ROWS_PER_WARP = ROWS // COMPUTE_WARPS
 COMPUTE_THREADS = 32 * COMPUTE_WARPS
+RED_VALUES = 16  # values a ``regmath.cta_sum`` slot reduces at once
+# Sleep between failed polls of a wait that spans other CTAs' work (``tagged.fetch``'s backoff).
+BACKOFF_NS = 100
 EVICT_FIRST = 0x12F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST)
 LOG2E = 1.4426950408889634

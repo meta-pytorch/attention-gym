@@ -43,10 +43,18 @@ def gemv_tile(w, xs, xrow, k_tiles, warp, lane):
                         (wv[e], wv[e + 1]), (xv[e], xv[e + 1]), (a0, a1)
                     )
                 acc[r, 0], acc[r, 1] = a0, a1
+    v, row = reduce_tile(acc, warp, lane)
+    return v, row, w
+
+
+@cute.jit
+def reduce_tile(acc, warp, lane):
+    """``(value, row)`` of a tile's per-lane ``(ROWS_PER_WARP, 2)`` even/odd-column partial
+    sums: their total over the warp, on the lane ``owns_row`` names for row ``row``."""
     for r in cutlass.range_constexpr(ROWS_PER_WARP):
         acc[r, 0] = acc[r, 0] + acc[r, 1]
     v = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
-    return v, warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP), w
+    return v, warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP)
 
 
 def owns_row(lane):
