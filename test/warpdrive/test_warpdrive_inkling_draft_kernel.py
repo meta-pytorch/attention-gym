@@ -14,6 +14,7 @@ pytest.importorskip("cutlass.cute")
 
 from attn_gym.testing.kda import assert_relative_rms_within
 from attn_gym.warpdrive.examples.inkling_megakernel.draft import DSparkMegakernel
+from attn_gym.warpdrive.examples.inkling_megakernel.draft_head_kernel import DraftHeadKernel
 from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     DSparkConfig,
     DSparkDrafter,
@@ -188,12 +189,21 @@ def test_spark_checkpoint_shape_drafts(monkeypatch):
             "attn_gym.warpdrive.examples.inkling_megakernel.draft.device_smem_bytes",
             lambda device: 99 * 1024,
         )
+        # B200 has more CTAs and therefore fewer vocabulary tiles per CTA. Reserve at
+        # least Spark's 131 slots to exercise the global BASE path with the real B200 grid.
+        build = DraftHeadKernel.get_or_build
+
+        def spark_head(*, slots, **kwargs):
+            return build(slots=max(slots, 131), **kwargs)
+
+        monkeypatch.setattr(DraftHeadKernel, "get_or_build", staticmethod(spark_head))
     c, vocab = DSparkConfig(), InklingConfig().vocab_size
     weights = random_weights(c, vocab, vocab)
     rows = features(8, 31, c)
     reference = DSparkDrafter(weights, 64)
     reference.commit(rows, torch.arange(8, device="cuda"))
     kernels = DSparkMegakernel(weights, 64, num_drafts=3)
+    assert kernels.head.op.global_base
     kernels.commit_rows(rows, 0)
     actual = kernels.propose(device_int(17), device_int(8))
     # Across three rounded decoder layers, compare each mask state at its row's bf16 scale.
