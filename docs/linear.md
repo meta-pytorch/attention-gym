@@ -94,8 +94,9 @@ and the sequence's offset in the pack may change. This covers:
 
 By default, warpdrive uses the packed shape and SM count to choose how to parallelize a scan.
 It may split a long sequence into pieces, compute each piece's state transition, then compose
-those transitions. KDA may instead share a preparation pass across two value tiles. Both can
-change rounding. With `batch_invariant` the forward and backward each scan the sequence without
+those transitions. KDA inference forwards may instead share a preparation pass across two value
+tiles ([Operand precision](#operand-precision)). Both can change rounding. With
+`batch_invariant` the forward and backward each scan the sequence without
 pieces, KDA skips shared prep, and staged summaries stay uncut. The forward may still split the
 value dimension: the two tiles update independent state rows, so their width does not change
 rounding. A staged backward inherits the forward's setting even if backward omits the flag or
@@ -782,8 +783,20 @@ Backward keeps the output scale outside the rounded query and score tiles and mu
 unscaled state cotangent by the same rounded `K_restore` used in the forward state update.
 The shared-prep forward is an exception for every choice: it folds the inverse and beta into
 records for both the output and state updates. Backward recomputes the per-tile formula and can
-round differently.
-Forward and backward may also choose their piece-chain plans independently.
+round differently. `kernel_options["exact_recompute"]` chooses between them. Omitted, it is
+inferred from grad mode: a forward that autograd records (`torch.compile` decides while
+tracing) runs per-tile, while `torch.no_grad`, `torch.inference_mode` and inputs without
+`requires_grad` keep the shared prep. Per-tile costs the small packs that would share the prep
+1.1-1.9x forward time and up to 1.3x forward + backward. `True` runs per-tile even without
+autograd; `False` keeps the shared prep under autograd, trading exact gradients for speed.
+`chunk_kda_prepare` infers the option at `prepare`. A caller that differentiates `run` inside
+its own autograd function, where grad mode is off, passes `True` to keep its staged forward
+off the shared prep; `context_parallel_kda` does.
+Forward and backward may also choose their piece-chain plans independently. The recompute
+matches the forward's states bit for bit only when both run the same piece plan: a chain
+backward after an uncut forward composes FP32 piece summaries, which round differently from
+the forward's sequential state updates. Strong decay hides that difference; with weak gates the
+last chunk's gradients differed by up to about 4e-3 relative in BF16.
 
 ² Triton uses 64-token chunks and its own factorization. It builds diagonal inverse blocks in
 FP32 and stores the assembled inverse and attention scores in the Q/K/V kernel dtype. Its

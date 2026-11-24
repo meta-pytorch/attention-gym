@@ -483,7 +483,9 @@ def gate_offset(row, dim, d_k: cutlass.Constexpr[int]):
 # recomputation, summaries and backward. Backward rebuilds the per-tile forward's unscaled
 # Q_decay and A, and pairs its rounded K_restore with dS rounded before decay. Shared prep
 # instead folds the inverse and beta into the forward's output and state updates, so those
-# products can round differently. State products use the Q/K/V kernel dtype (``io``);
+# products can round differently; a forward takes it only when
+# ``kernel_options["exact_recompute"]`` is false (by default, when autograd does not record the
+# forward). State products use the Q/K/V kernel dtype (``io``);
 # all of these matrix products accumulate in FP32.
 #
 # TF32 decay also widens the pairwise dQ/dK products. TF32 solve rounds dU to TF32 for dY

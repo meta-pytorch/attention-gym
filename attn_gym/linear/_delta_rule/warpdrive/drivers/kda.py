@@ -73,12 +73,15 @@ def kda_forward(
     intra_chunk_dtypes: str,
     nonempty: bool = False,
     batch_invariant: bool = False,
+    exact_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
     ``fastmath=False`` selects the non-flushing gate exponentials. ``intra_chunk_dtypes`` is
     the public operand-precision option (NOTE [KDA operand precision] in ``kda_common``).
     ``batch_invariant`` pins the plan (``ForwardPlan``) so a sequence's bits do not depend on
-    the rest of the pack.
+    the rest of the pack. ``exact_recompute`` keeps small packs off the shared prep, whose
+    states the backward's per-tile recompute does not reproduce: set it for a forward that
+    ``kda_backward`` will differentiate.
 
     With ``state_indices`` the call is paged: ``initial_state`` is a ``[P,H,V,K]`` pool updated in
     place through the routes (non-positive routes are null; the optional uint8
@@ -177,6 +180,7 @@ def kda_forward(
     prep = (
         plan.tiles_per_head > 1
         and not batch_invariant
+        and not exact_recompute
         and num_seqs * heads_out <= int(PREP_TILE_FRACTION * plan.num_sm)
     )
     n_tiles = num_seqs * heads_out * plan.tiles_per_head

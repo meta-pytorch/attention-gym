@@ -154,6 +154,8 @@ def chunk_kda(
             choices raise on every implementation. See "Operand precision" in ``docs/linear.md``.
             With explicit warpdrive, ``"batch_invariant": True`` keeps each sequence's outputs,
             final state and gradients bitwise independent of its neighbors.
+            ``"exact_recompute"`` (omit to infer it from grad mode) keeps a warpdrive forward
+            off the shared prep that the backward's recompute does not reproduce.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -194,6 +196,7 @@ def chunk_kda(
                 split_forward=options.split_forward,
                 intra_chunk_dtypes=intra_chunk_dtypes,
                 batch_invariant=options.batch_invariant,
+                exact_recompute=options.exact_recompute,
             )
         return _fused_chunk_forward(
             q,

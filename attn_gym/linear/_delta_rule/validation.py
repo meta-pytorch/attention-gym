@@ -75,11 +75,16 @@ def validate_delta_rule_inputs(
         raise ValueError("all inputs must be on the same device")
 
 
+def tracks_grad(tensors: Iterable[torch.Tensor | None]) -> bool:
+    """Whether autograd would record an operation on any given tensor."""
+    return torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in tensors
+    )
+
+
 def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str) -> None:
     """Raise ``RuntimeError(message)`` if autograd would track any given tensor."""
-    if torch.is_grad_enabled() and any(
-        tensor is not None and tensor.requires_grad for tensor in tensors
-    ):
+    if tracks_grad(tensors):
         raise RuntimeError(message)
 
 

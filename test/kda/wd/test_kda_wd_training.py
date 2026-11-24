@@ -657,6 +657,7 @@ def test_warpdrive_kernel_options_are_strict() -> None:
         autotune=True,
         schedule=ScheduleRequest.AUTO,
         intra_chunk_dtypes=None,
+        exact_recompute=None,
     )
     assert resolve_kernel_options(None) == default
     assert resolve_kernel_options({}) == default
