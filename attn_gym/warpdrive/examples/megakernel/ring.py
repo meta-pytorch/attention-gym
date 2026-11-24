@@ -40,10 +40,10 @@ def load_tiles(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlas
     return w
 
 
-def ring_stages(fixed: int, stages: int | None) -> int:
+def ring_stages(fixed: int, stages: int | None, *, smem_bytes: int = SMEM_BYTES) -> int:
     """Depth of a weight ring of ``STAGE_BYTES`` stages beside ``fixed`` bytes of other shared
-    memory: ``stages``, by default as many as fit up to ``MAX_STAGES``."""
-    fit = (SMEM_BYTES - fixed - SMEM_HEADROOM) // STAGE_BYTES
+    memory: ``stages``, by default as many as fit in ``smem_bytes`` up to ``MAX_STAGES``."""
+    fit = (smem_bytes - fixed - SMEM_HEADROOM) // STAGE_BYTES
     stages = min(MAX_STAGES, fit) if stages is None else stages
     if not 2 <= stages <= fit:
         raise ValueError(f"stages must be in [2, {fit}], got {stages}")

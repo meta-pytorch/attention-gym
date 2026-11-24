@@ -34,10 +34,17 @@ pytestmark = pytest.mark.usefixtures("release_cuda_memory")
 MAX_LEN = 256
 
 
+def require_decode_engine(engine: str) -> None:
+    if not cuda_runs_sm100_kernels() and not (
+        engine == "cuda_core"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (12, 1)
+    ):
+        pytest.skip("requires an SM100-family GPU or the CUDA-core engine on SM121")
+
+
 def cached_weights(repo: str):
     """Load the checkpoint from the local HF cache; skip if it is missing, never download."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
     hub = pytest.importorskip("huggingface_hub")
     pytest.importorskip("safetensors")
     path = hub.try_to_load_from_cache(repo, "config.json")
@@ -47,7 +54,13 @@ def cached_weights(repo: str):
 
 
 @pytest.fixture(scope="module")
-def weights_0_6b():
+def sm100_checkpoint_matrix():
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("the checkpoint matrix requires an SM100-family GPU")
+
+
+@pytest.fixture(scope="module")
+def weights_0_6b(sm100_checkpoint_matrix):
     return cached_weights("Qwen/Qwen3-0.6B")
 
 
@@ -65,7 +78,7 @@ LARGE = pytest.mark.xdist_group("qwen-large-checkpoints")
         pytest.param("Qwen/Qwen3-32B", marks=LARGE),
     ],
 )
-def weights(request):
+def weights(request, sm100_checkpoint_matrix):
     """Family members that each change a tiling: 1.7B doubles the hidden size; 8B runs two
     attention rows per kv head, 8-head o_proj splits and an untied LM head; 14B serves one q
     head per attention row (GQA group 5), splits the o_proj combine into partial passes and
@@ -218,6 +231,19 @@ def test_oproj_instruction(weights, engine):
 )
 @pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
 def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
+    check_decode_steps(weights, ctx, max_len, schedule, splits, engine)
+
+
+def test_sm121_checkpoint_decode_steps():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
+        pytest.skip("requires SM121")
+    weights = cached_weights("Qwen/Qwen3-0.6B")
+    check_decode_steps(
+        weights, ctx=127, max_len=256, schedule="static", splits=16, engine="cuda_core"
+    )
+
+
+def check_decode_steps(weights, ctx, max_len, schedule, splits, engine):
     """Test teacher-forced decode steps under both schedules against an fp32 oracle.
 
     Context 127 crosses a KV-block boundary at position 128. Context 1500 gives each split
@@ -267,8 +293,7 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
 def test_atomic_schedule_matches_the_static_schedule(engine):
     """The atomic schedule's per-layer launches match the default static schedule bit for bit,
     logits and new K/V rows, across repeated steps. The epoch advances once per step."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
+    require_decode_engine(engine)
     config = QwenConfig(
         hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
         intermediate_size=3072, vocab_size=4096,
@@ -293,8 +318,7 @@ def test_atomic_schedule_matches_the_static_schedule(engine):
 def test_cuda_graph_of_steps_matches_eager(engine):
     """A CUDA graph of several steps (as ``chat.py`` captures: position and token advanced on the
     device) replays to the same tokens, logits, K/V rows and step state as eager steps."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
+    require_decode_engine(engine)
     config = QwenConfig(
         hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
         intermediate_size=3072, vocab_size=4096,
@@ -340,14 +364,24 @@ def test_cuda_graph_of_steps_matches_eager(engine):
 def test_odd_gqa_group_random_weights(engine):
     """A GQA group of 3 (like Qwen3-14B's 5) serves one q head per attention row; its o_proj
     splits hold 6 heads, so the combine runs a full and a partial pass. No checkpoint needed."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
+    require_decode_engine(engine)
     config = QwenConfig(
         hidden_size=1024, num_layers=2, num_q_heads=24, num_kv_heads=8,
         intermediate_size=2048, vocab_size=4096,
     )  # fmt: skip
     weights = random_weights(config)
+    packed = torch.stack((weights.gate, weights.up), dim=-2)
+    weights = dataclasses.replace(
+        weights, packed_gate_up=packed, gate=packed.select(-2, 0), up=packed.select(-2, 1)
+    )
+    with pytest.raises(ValueError, match="smem_bytes is determined by the weights' device"):
+        mk.QwenMegakernel(weights, MAX_LEN, smem_bytes=65536)
     runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    assert runner.wgu.is_set_to(packed.view(-1, config.hidden_size))
+    # Replacing a logical weight must also change what decode reads.
+    weights = dataclasses.replace(weights, gate=-weights.gate)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    assert not runner.wgu.is_set_to(packed.view(-1, config.hidden_size))
     assert (runner.op.per_row, runner.op.heads_per_split) == (1, 6)
     caches, token, pos = make_decode_state(weights, 150, MAX_LEN, seed=3)
     ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))

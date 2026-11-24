@@ -37,7 +37,10 @@ constructor (Qwen's `check_model`):
 - **Hidden size a multiple of 256**: whole `TILE_K` stages, and the compute role's 256 threads
   each own whole elements of a hidden vector. GEMV row counts (vocabulary, projections) are
   whole 32-row tiles (`ROWS`).
-- **SM100**: the SMEM budget (`SMEM_BYTES`), TMA loads and the residency rule below.
+- **Device requirements:** TMA loads and the residency rule below. `SMEM_BYTES` is the
+  SM100 budget; Qwen's batch-one CUDA-core runner also supports SM121 and sizes its weight
+  ring against the device's opt-in per-block limit. Do not assume a fixed ring depth or
+  select the tcgen05 engine on SM121.
 
 ## What belongs here
 

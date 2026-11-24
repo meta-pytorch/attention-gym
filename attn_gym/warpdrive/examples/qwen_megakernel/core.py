@@ -40,6 +40,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     HEAD_DIM,
     LOG2E,
     ROWS,
+    SMEM_BYTES,
     STAGE_BYTES,
     TILE_K,
 )
@@ -283,9 +284,11 @@ class QwenDecodeMegakernel(WarpSpecialized):
         roles: dict[str, RoleConfig] | None = None,
         model: QwenConfig = QWEN3_0_6B,
         batch: int = 1,
+        *,
+        smem_bytes: int = SMEM_BYTES,
     ):
         """``stages``: weight/KV ring depth in 16 KB stages; by default the most that fit in
-        shared memory, up to ``MAX_STAGES``.
+        ``smem_bytes`` (the per-CTA shared-memory budget), up to ``MAX_STAGES``.
         ``splits``: KV splits per attention row group (``attention_groups``: 8 for 0.6B,
         so 8 x splits attention rows per layer); by default about ``ATTN_ROWS`` rows per layer,
         at least ``MIN_SPLITS`` (0.6B and 1.7B: 16, larger models: 8). It is static
@@ -355,7 +358,7 @@ class QwenDecodeMegakernel(WarpSpecialized):
         if not 1 <= splits <= 32:
             raise ValueError(f"splits must be in [1, 32], got {splits}")
         self.splits = splits
-        self.stages = stages = ring_stages(self.fixed_smem_bytes(), stages)
+        self.stages = stages = ring_stages(self.fixed_smem_bytes(), stages, smem_bytes=smem_bytes)
         self.scratch_layout = ScratchLayout(model, splits, batch, self.streams_inputs)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
