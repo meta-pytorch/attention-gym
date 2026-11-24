@@ -1,0 +1,4 @@
+# Modal client for the B200 test jobs (modal-tests.yml, publish-to-pypi.yml).
+# Regenerate both pin files (3-day cooldown, hashes, wheels only) with:
+#   .github/requirements/compile.sh
+modal
