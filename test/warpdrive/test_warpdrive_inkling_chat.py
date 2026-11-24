@@ -1,15 +1,18 @@
-"""Inkling chat options and history: the cache capacities a backend takes, and a parsed reply
-re-rendering to the tokens the model generated."""
+"""Inkling chat options and history: the files, cache capacities and decoding modes a backend
+takes, and a parsed reply re-rendering to the tokens the model generated."""
 
 import pytest
 import typer
 from inkling_checkpoint import MODEL
 
 from attn_gym.warpdrive.examples.inkling_megakernel.chat import (
+    SPEC_TOKENS,
     assistant_message,
     check_options,
+    checkpoint_dir,
     reasoning_effort,
     reply_parts,
+    verify_tokens,
 )
 from attn_gym.warpdrive.examples.megakernel.chat import ChatOptions
 
@@ -67,3 +70,48 @@ def test_megakernel_backends_take_kv_block_capacities():
     check_options(ChatOptions("megakernel", max_len=1024))
     with pytest.raises(typer.BadParameter, match="multiple of 64"):
         check_options(ChatOptions("megakernel-bf16", max_len=1000))
+
+
+@pytest.mark.parametrize(("backend", "drafter"), [("megakernel", False), ("spec-torch", True)])
+def test_checkpoint_download_takes_the_backends_files(monkeypatch, tmp_path, backend, drafter):
+    """A Hub download fetches the drafter with the target, in one snapshot, only for a
+    speculative backend; a local directory is used as it is, without the Hub."""
+    hub = pytest.importorskip("huggingface_hub")
+    calls = []
+
+    def snapshot_download(repo, allow_patterns, tqdm_class=None):
+        calls.append((repo, allow_patterns))
+        return str(tmp_path)
+
+    monkeypatch.setattr(hub, "snapshot_download", snapshot_download)
+    options = ChatOptions(backend)
+    assert checkpoint_dir(MODEL, options=options) == tmp_path
+    [(repo, patterns)] = calls
+    assert repo == MODEL and "model*.safetensors" in patterns
+    assert ("mtp.safetensors" in patterns) == drafter
+    assert checkpoint_dir(tmp_path, options=options) == tmp_path
+    assert len(calls) == 1
+
+
+def test_speculative_backends_reject_sampling_at_startup():
+    check_options(ChatOptions("megakernel", temperature=0.7))
+    check_options(ChatOptions("spec-torch", temperature=0.0))
+    with pytest.raises(typer.BadParameter, match="greedily"):
+        check_options(ChatOptions("spec-torch", temperature=0.7))
+
+
+@pytest.mark.parametrize(
+    ("backend", "given", "k"), [("spec-torch", None, SPEC_TOKENS), ("spec-torch", 8, 8)]
+)
+def test_verify_tokens_pick_the_block(backend, given, k):
+    options = ChatOptions(backend, verify_tokens=given)
+    check_options(options)
+    assert verify_tokens(options) == k
+
+
+@pytest.mark.parametrize(
+    ("backend", "given"), [("spec-torch", 1), ("spec-torch", 9), ("megakernel", 4)]
+)
+def test_verify_tokens_rejects_other_blocks_and_backends(backend, given):
+    with pytest.raises(typer.BadParameter, match="--verify-tokens"):
+        check_options(ChatOptions(backend, verify_tokens=given))

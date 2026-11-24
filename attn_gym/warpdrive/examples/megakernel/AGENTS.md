@@ -22,7 +22,8 @@ is the procedure; this file holds the package's contracts.
 | `ring.py` | The weight ring: `ring_stages` (its depth in the SMEM budget), `weight_stages`/`kv_stages` (stage layouts), `tma_atom`/`tma_partition`, and `load_tiles` (the load warp's stages). Qwen builds its atoms with its own helpers, which take the tcgen05 engine's layouts. |
 | `table.py` | `InstructionTable` (the row-table `WorkMap`) and `layout_static` (its `[slot][cta]` layout) |
 | `launch.py` | Host side: `Launch` (a one-launch chain's table, tagged scratch and state), `table_of`/`deal` (instruction tables dealt to CTAs), `tagged_values` |
-| `chat.py` | The chat driver; each family provides a `chat` module (`FAMILIES`) |
+| `spec.py` | `SpecStep`: greedy speculative decoding on the device over a model's `TargetBlock` and `DraftModel` |
+| `chat.py` | The chat driver; each family provides a `chat` module (`FAMILIES`), whose backends decode one token (`DecodeBackend`) or several (`MultiTokenBackend`) per step |
 
 ## Shape preconditions
 
@@ -156,3 +157,17 @@ the launch's activations), and bit-match the device quantizers against the oracl
 quantize where the row is complete in one CTA, after a norm (`quantize_rows`, a block a thread)
 or as a fetch holds it (`quantize_chunk`, in registers, a block over 2 or 4 lanes), one CTA
 maximum (`act_quant.cta_max`) per row set.
+
+## Speculative decoding
+
+- `SpecStep` drafts, verifies and accepts on the device over two protocols a model implements:
+  `TargetBlock` (the target over `k` tokens: logits and the drafter's features) and `DraftModel`
+  (commit features, propose `k - 1` drafts). It never syncs, so a CUDA graph holds whole steps;
+  the chat runs it as a `MultiTokenBackend`. It decodes greedily only.
+- Rejected rows need no undo in position-indexed caches. Other state (short-convolution rings,
+  recurrent state) bounds `k` by how far it can rewind; the model's target checks that bound
+  (Inkling's `spec.max_block_tokens`).
+- Its output is the target's greedy decode in the rounding of a `k`-token forward, which can
+  resolve a near tie differently from one-token decode. Test a model's step against a host loop
+  over the same verify forward and drafter, not against one-token decode;
+  `test_warpdrive_megakernel_spec` covers the acceptance on scripted components.

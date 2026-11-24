@@ -1,7 +1,7 @@
 """The shared chat driver with a fake model: stop tokens, incremental prefill, the cache
-rebuild after a new CUDA graph's warm-up overwrote cached positions, streaming, the rejected
-temperatures, options of another model family, and the CLI's family selection on a local
-checkpoint."""
+rebuild after a new CUDA graph's warm-up overwrote cached positions, streaming, multi-token
+steps, the rejected temperatures, options of another model family, and the CLI's family
+selection on a local checkpoint."""
 
 import importlib
 import importlib.util
@@ -117,6 +117,57 @@ def test_eager_backend_streams_each_run_before_the_next():
     assert streamed == [(1 + r * SYNC_EVERY, r * SYNC_EVERY) for r in (1, 2)] + [
         (2 * SYNC_EVERY + 4, 3 * SYNC_EVERY)
     ]
+
+
+class SpecCountingBackend(CountingBackend):
+    """``CountingBackend``'s tokens committed by a multi-token step: ``counts[i]`` tokens at
+    call ``i`` (cyclic), recording the positions each call writes (``tokens_per_step`` of them)."""
+
+    tokens_per_step = 3  # does not divide SYNC_EVERY: runs of SYNC_EVERY // 3 steps
+
+    def __init__(self, stop_at: int, counts: list[int]):
+        super().__init__(stop_at)
+        self.counts = torch.tensor(counts, device="cuda")
+        self.calls = torch.zeros((), device="cuda", dtype=torch.long)
+        self.written = torch.zeros(1024, device="cuda", dtype=torch.bool)
+
+    def decode(self, token, pos, out):
+        count = self.counts.index_select(0, (self.calls % self.counts.numel()).reshape(1))[0]
+        self.calls += 1
+        fed = pos.long() + 1 + torch.arange(self.tokens_per_step, device="cuda")
+        self.written[fed] = True
+        nxt = torch.where(fed >= self.stop_at, STOP, (fed + 1) % STOP)
+        out[0].copy_(count)
+        out[1:].copy_(nxt)
+        token.copy_(nxt.gather(0, count.reshape(1) - 1))
+        pos.add_(count)
+
+
+@needs_cuda
+def test_multi_token_steps_commit_variable_counts():
+    """A multi-token backend's variable counts reach the reply in order, stops and the token cap
+    cut inside a step's tokens, the next prefill starts after the fed tokens, and a run writes no
+    cache row SYNC_EVERY or more positions past the kept tokens."""
+    model = FakeModel(stop_at=7)
+    model.backend = backend = SpecCountingBackend(7, [1, 3, 2])
+    chat = Chat(model)
+    turn = chat.reply("hi", None, 0.0, lambda *_: None)  # stops in a run's first step
+    assert turn.text.split() == [str(t) for t in range(3, 8)]
+    assert len(chat.cached) == 8
+    assert not backend.written[len(chat.cached) + SYNC_EVERY :].any()
+
+    backend.stop_at.fill_(100)
+    backend.calls.zero_()
+    turn = chat.reply("again", 4, 0.0, lambda *_: None)  # the first run commits 1 + 3 tokens
+    assert model.prefills[-1] == (8, 3)
+    assert turn.text.split() == ["11", "12", "13", "14"]
+    chat.reply("more", 2, 0.0, lambda *_: None)
+    assert model.prefills[-1] == (15, 3), "the reply's 4 tokens were all fed"
+
+    history = list(chat.messages)
+    with pytest.raises(typer.BadParameter, match="greedily"):
+        chat.reply("hot", 3, 0.5, lambda *_: None)
+    assert chat.messages == history, "a rejected turn must leave the history unchanged"
 
 
 @needs_cuda

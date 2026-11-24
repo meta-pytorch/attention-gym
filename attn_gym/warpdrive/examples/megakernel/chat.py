@@ -9,14 +9,16 @@ output tokens per second.
 The checkpoint's ``config.json`` selects the model family (``FAMILIES``): Qwen3 dense and MoE
 (``qwen_megakernel.chat``) or Inkling 2 Mini (``inkling_megakernel.chat``). A family builds a
 ``ChatModel``: its tokenizer and chat template, a prefill (one forward pass of the new prompt
-tokens into its caches) and a ``DecodeBackend`` that decodes one token per step.
+tokens into its caches) and a ``DecodeBackend`` that decodes one token per step, or a
+``MultiTokenBackend`` that commits a variable number of tokens per step (speculative
+decoding).
 
 Each turn prefills the new prompt tokens, then decodes. A backend whose step is CUDA-graph
-capturable decodes inside one graph of SYNC_EVERY steps per replay, sampling on the device;
-the host reads the tokens once per replay and streams their text while the next replay decodes.
-Other backends run the same steps eagerly. The conversation's caches carry over between
-turns; when the chat template re-renders an earlier turn differently, the caches are rebuilt
-from the start.
+capturable decodes inside one graph of steps feeding up to SYNC_EVERY positions per replay,
+sampling on the device; the host reads the tokens (and each step's count) once per replay and
+streams their text while the next replay decodes. Other backends run the same steps eagerly.
+The conversation's caches carry over between turns; when the chat template re-renders an
+earlier turn differently, the caches are rebuilt from the start.
 """
 
 import importlib
@@ -26,7 +28,7 @@ import time
 from dataclasses import dataclass, fields
 from functools import partial
 from pathlib import Path
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import torch
 import typer
@@ -41,7 +43,7 @@ from rich.progress import (
 )
 from rich.text import Text
 
-SYNC_EVERY = 8  # decode steps between host reads of the sampled tokens
+SYNC_EVERY = 8  # positions a replay may feed between host reads of the sampled tokens
 
 # config.json model_type -> the family's module: ``DEFAULT_BACKEND``, ``OPTIONS`` (the
 # family-specific ``ChatOptions`` fields it reads), ``check_options(options)``,
@@ -69,11 +71,27 @@ class DecodeBackend(Protocol):
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor: ...
 
 
+@runtime_checkable
+class MultiTokenBackend(Protocol):
+    """A greedy step that commits ``1 .. tokens_per_step`` tokens (speculative decoding):
+    ``decode`` feeds ``token`` at position ``pos + 1`` (``pos``: the last fed position, as
+    ``DecodeBackend``'s callers keep it), then writes how many tokens it committed, ``count``,
+    into ``out[0]`` and them into ``out[1 : 1 + count]`` (``out``: ``(1 + tokens_per_step,)``
+    int64), the last one into ``token`` (not fed yet), and advances ``pos`` by ``count``. It
+    may write the caches at up to ``tokens_per_step`` positions from ``pos + 1``.
+    ``tokens_per_step`` is at most SYNC_EVERY; ``capturable`` as ``DecodeBackend``'s."""
+
+    capturable: bool
+    tokens_per_step: int
+
+    def decode(self, token: torch.Tensor, pos: torch.Tensor, out: torch.Tensor) -> None: ...
+
+
 class ChatModel(Protocol):
     """A model family's side of the chat."""
 
     tokenizer: object
-    backend: DecodeBackend
+    backend: DecodeBackend | MultiTokenBackend
     label: str  # the backend as shown to the user
     max_len: int  # cache capacity in tokens
     stops: set[int]  # token ids that end a reply (not fed)
@@ -98,10 +116,12 @@ class ChatOptions:
 
     backend: str
     max_len: int = 4096
+    temperature: float = 0.0  # 0: greedy
     engine: str | None = None  # Qwen megakernel GEMV engine
     thinking: bool | None = None  # Qwen3 thinking mode
     yarn_factor: float | None = None  # Qwen3 YaRN
     reasoning_effort: str | None = None  # Inkling
+    verify_tokens: int | None = None  # Inkling speculative verify block
 
 
 def download(model: str, checkpoint_dir) -> Path:
@@ -198,7 +218,7 @@ class Chat:
         self.messages: list[dict] = []
         self.cached: list[int] = []  # token ids whose cache entries are written
         self.pos = torch.zeros(1, device="cuda", dtype=torch.int32)
-        self.graphs: dict[float, tuple] = {}  # temperature -> (graph, token in, tokens out)
+        self.graphs: dict[float, tuple] = {}  # temperature -> (graph, token in, rows out)
 
     @torch.no_grad()
     def prefill(self, ids: list[int]) -> tuple[torch.Tensor, int]:
@@ -212,26 +232,36 @@ class Chat:
         return logits, len(new)
 
     def steps(self, token: torch.Tensor, out: torch.Tensor, temperature: float):
-        """SYNC_EVERY decode steps: each feeds ``token`` at the next position (``self.pos`` + 1,
-        on the device), samples the next token into ``token`` and records it in ``out``."""
-        for i in range(SYNC_EVERY):
+        """One run's decode steps: each feeds ``token`` at the next position (``self.pos`` + 1,
+        on the device) and puts the next token into ``token``, recording the tokens it committed
+        in its row of ``out`` (``[count, tokens ...]``; one sampled token in a one-token step,
+        whose count column stays 1)."""
+        backend = self.model.backend
+        multi = isinstance(backend, MultiTokenBackend)
+        for row in out:
+            if multi:
+                backend.decode(token, self.pos, row)
+                continue
             self.pos.add_(1)
-            logits = self.model.backend.step(token, self.pos)
+            logits = backend.step(token, self.pos)
             token.copy_(sample(logits, temperature))
-            out[i].copy_(token[0])
+            row[1].copy_(token[0])
 
     @torch.no_grad()
     def decoder(self, temperature: float):
-        """``(run, token in, tokens out)``: ``run()`` decodes SYNC_EVERY tokens from ``token``,
-        replaying one CUDA graph when the backend is capturable."""
+        """``(run, token in, rows out)``: ``run()`` decodes from ``token`` by SYNC_EVERY //
+        tokens_per_step steps (rows ``[count, tokens ...]``), so that it feeds at most
+        SYNC_EVERY positions, replaying one CUDA graph when the backend is capturable."""
         if temperature in self.graphs:
             return self.graphs[temperature]
+        backend = self.model.backend
+        per_step = self.tokens_per_step(temperature)
         token = torch.zeros(1, device="cuda", dtype=torch.long)
-        out = torch.zeros(SYNC_EVERY, device="cuda", dtype=torch.long)
+        out = torch.ones(SYNC_EVERY // per_step, 1 + per_step, device="cuda", dtype=torch.long)
         run = lambda: self.steps(token, out, temperature)
-        if self.model.backend.capturable:
-            # Warm-up and capture run real steps at positions 1 .. SYNC_EVERY: the cached prefix
-            # is gone, so the next prefill rebuilds from position 0.
+        if backend.capturable:
+            # Warm-up and capture run real steps at positions 1 .. SYNC_EVERY (at most): the
+            # cached prefix is gone, so the next prefill rebuilds from position 0.
             self.cached = []
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
@@ -246,41 +276,54 @@ class Chat:
         self.graphs[temperature] = (run, token, out)
         return self.graphs[temperature]
 
+    def tokens_per_step(self, temperature: float) -> int:
+        """The backend's tokens per step, checked against SYNC_EVERY and ``temperature``."""
+        backend = self.model.backend
+        per_step = backend.tokens_per_step if isinstance(backend, MultiTokenBackend) else 1
+        if not 1 <= per_step <= SYNC_EVERY:
+            raise ValueError(f"tokens_per_step must be in 1 .. {SYNC_EVERY}, got {per_step}")
+        if per_step > 1 and temperature > 0:
+            raise typer.BadParameter("multi-token (speculative) backends decode greedily only")
+        return per_step
+
     def reply(self, prompt: str, max_new_tokens: int | None, temperature: float, on_token) -> Turn:
         """Answer ``prompt``, streaming through ``on_token(ids, elapsed)``. ``max_new_tokens``:
         None decodes until a stop token or full caches. A rejected turn leaves the history
         unchanged."""
         model = self.model
         check_temperature(temperature)
+        self.tokens_per_step(temperature)
         self.messages.append({"role": "user", "content": prompt})
         ids = model.prompt_ids(self.messages)
-        # Steps decode whole groups of SYNC_EVERY, writing cache rows past the last kept token;
+        # A run feeds up to SYNC_EVERY positions, writing cache rows past the last kept token;
         # this much room keeps every row inside the caches.
         room = model.max_len - len(ids) - SYNC_EVERY - 1
         max_new_tokens = room if max_new_tokens is None else max_new_tokens
         if not 0 < max_new_tokens <= room:
             self.messages.pop()
             raise CacheFull(f"the conversation would pass max_len = {model.max_len}")
-        run, fed, sampled = self.decoder(temperature)  # before prefill: warm-up writes caches
+        run, fed, rows = self.decoder(temperature)  # before prefill: warm-up writes caches
         start = time.perf_counter()
         logits, prefilled = self.prefill(ids)
         token = sample(logits, temperature)
         torch.cuda.synchronize()
         prefill_s = time.perf_counter() - start
-        # One run decodes SYNC_EVERY tokens on the GPU; the host then reads them, looks for a
-        # stop token and streams text. A replayed graph decodes the next run meanwhile; an eager
-        # run blocks the host, so the text streams first. Steps past a stop are discarded (their
-        # cache rows are overwritten by the next prefill).
+        # One run decodes up to SYNC_EVERY tokens on the GPU; the host then reads them, looks for
+        # a stop token and streams text. A replayed graph decodes the next run meanwhile; an
+        # eager run blocks the host, so the text streams first. Steps past a stop are discarded
+        # (their cache rows are overwritten by the next prefill).
         stream_first = not model.backend.capturable
         fed.copy_(token)
-        self.pos.fill_(len(self.cached) - 1)  # each step adds 1 first
+        self.pos.fill_(len(self.cached) - 1)  # each step feeds at pos + 1
         out: list[int] = []
         tokens = [int(fed.item())]  # the prefill's token leads
         start = time.perf_counter()
         run()
-        runs, done = 1, False
+        fed_count, done = 0, False  # tokens the runs fed
         while not done:
-            tokens += sampled.tolist()  # waits for the run
+            for count, *committed in rows.tolist():  # waits for the run
+                tokens += committed[:count]
+                fed_count += count  # a step feeds as many tokens as it commits
             for t in tokens:
                 if t in model.stops or len(out) == max_new_tokens:
                     done = True
@@ -291,11 +334,10 @@ class Chat:
                 on_token(out, time.perf_counter() - start)
             if not done:  # its buffers were read: the next run may overwrite them
                 run()
-                runs += 1
             if not stream_first:
                 on_token(out, time.perf_counter() - start)
         decode_s = time.perf_counter() - start
-        self.cached += out[: runs * SYNC_EVERY]  # the last run's final token was not fed
+        self.cached += out[:fed_count]  # the last run's final token was not fed
         self.messages.append(model.assistant_message(out))
         return Turn(model.reply_text(out), prefilled, prefill_s, len(out), decode_s)
 
@@ -377,6 +419,9 @@ def main(
         help="Inkling thinking effort: none, minimal, low (default), medium, high, xhigh, max "
         "or 0-0.99",
     ),
+    verify_tokens: int | None = typer.Option(
+        None, help="Inkling speculative backends' verify block k (default 4)"
+    ),
     prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
 ):
     check_temperature(temperature)
@@ -386,9 +431,11 @@ def main(
         backend=backend,
         engine=engine,
         max_len=max_len,
+        temperature=temperature,
         thinking=thinking,
         yarn_factor=yarn_factor,
         reasoning_effort=reasoning_effort,
+        verify_tokens=verify_tokens,
     )
     check_options(family, options)
     # Before the spinner (it garbles bars); the backend chooses the checkpoint files.

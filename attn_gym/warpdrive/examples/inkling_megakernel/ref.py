@@ -357,9 +357,12 @@ class InklingCache:
 # Checkpoint loading -------------------------------------------------------------------------
 
 
-def checkpoint_dir(path_or_repo: str | Path, tqdm_class: type | None = None) -> Path:
+def checkpoint_dir(
+    path_or_repo: str | Path, tqdm_class: type | None = None, drafter: bool = False
+) -> Path:
     """The local directory of a checkpoint: a Hub repo (downloaded if needed), a checkpoint
-    directory, or a file inside one. Skips the DSpark drafter (``mtp.safetensors``)."""
+    directory, or a file inside one (used as they are). A download skips the DSpark drafter
+    (``mtp.safetensors``) unless ``drafter``."""
     checkpoint = Path(path_or_repo)
     if checkpoint.is_file():
         return checkpoint.parent
@@ -370,7 +373,8 @@ def checkpoint_dir(path_or_repo: str | Path, tqdm_class: type | None = None) -> 
     return Path(
         snapshot_download(
             str(path_or_repo),
-            allow_patterns=["*.json", "model*.safetensors", "*.jinja", "tiktoken/*"],
+            allow_patterns=["*.json", "model*.safetensors", "*.jinja", "tiktoken/*"]
+            + (["mtp.safetensors"] if drafter else []),
             tqdm_class=tqdm_class,
         )
     )
@@ -933,12 +937,15 @@ def hidden_states(
     cache: InklingCache,
     start: int | None,
     kernels: "Kernels | None" = None,
+    observe: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     """The final normalized bf16 (tokens, hidden) states of ``tokens`` at consecutive
     ``positions``, updating ``cache``. ``start``: the first position on the host for HF's
     attention spans and rounding, or None for static shapes (see ``attention``). ``kernels``:
     implementations of the short convolution, experts and a visit's halves (``Kernels``;
-    default: this module's, HF's numerics)."""
+    default: this module's, HF's numerics). ``observe(visit, h)``, when given, receives each
+    visit's bf16 (tokens, hidden) input (the running partial block) before the visit runs,
+    then the final normalized states as visit ``num_visits`` (the DSpark drafter's features)."""
     config = weights.config
     kernels = kernels or REFERENCE
     h = rms_norm(F.embedding(tokens, weights.embed), weights.embed_norm, config.rms_eps)
@@ -958,6 +965,8 @@ def hidden_states(
             if p > 0:
                 prev_blocks, prev_h = previous
                 messages = block_residual(weights.message_queries[core], prev_blocks, prev_h)
+        if observe is not None:
+            observe(visit, h)
         w = weights.layers[layer]
         out = decoder_layer(
             config, w, layer, visit, h, blocks, messages, cache, positions, start, kernels
@@ -966,7 +975,10 @@ def hidden_states(
             blocks = blocks + [h]
         h = out
     h = block_residual(weights.final_query[None], blocks, h)[:, 0]
-    return rms_norm(h, weights.final_norm, config.rms_eps).to(torch.bfloat16)
+    h = rms_norm(h, weights.final_norm, config.rms_eps).to(torch.bfloat16)
+    if observe is not None:
+        observe(config.num_visits, h)
+    return h
 
 
 @dataclass(frozen=True)
@@ -999,14 +1011,17 @@ def forward_tokens(
     *,
     all_logits: bool = False,
     kernels: "Kernels | None" = None,
+    observe: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     """Prefill or decode ``tokens`` at positions ``pos ..``; returns the last token's fp32
-    logits (``all_logits``: every token's, (tokens, vocab)). ``kernels``: as
+    logits (``all_logits``: every token's, (tokens, vocab)). ``kernels`` and ``observe``: as
     ``hidden_states``'."""
     tokens = tokens.reshape(-1)
     if pos + tokens.numel() > cache.max_len:
         raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
     positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
-    h = hidden_states(weights, tokens, positions, cache, start=pos, kernels=kernels)
+    h = hidden_states(
+        weights, tokens, positions, cache, start=pos, kernels=kernels, observe=observe
+    )
     logits = logits_of(weights, h if all_logits else h[-1:])
     return logits if all_logits else logits[0]
