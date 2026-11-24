@@ -38,7 +38,7 @@ Switching from Triton to warpdrive changes more than speed:
   64-token chunks on both, but the kernels round differently. Do not expect bitwise equality
   across backends. On captured BF16 KDA inputs, default warpdrive had lower output and gradient
   errors against FP64 than Triton did; [Operand precision](#operand-precision) compares all
-  three choices. Pass `{"backend": "fused"}` to keep using Triton.
+  three BF16 choices. Pass `{"backend": "fused"}` to keep using Triton.
 - **KDA gate range.** The recommended training floor for both FP16 and BF16 is about `-5.25` on
   warpdrive and `-5.914` on Triton. The default
   `bound_gate` floor of `-5` fits both ([KDA gate contract](#kimi-delta-attention)).
@@ -53,7 +53,9 @@ Switching from Triton to warpdrive changes more than speed:
   choices, see [Operand precision](#operand-precision). Across ten FP16 KDA shapes, the geometric
   mean speedups over the faster of pinned and autotuned Triton were 2.6× forward and 1.5×
   forward + backward. At 1 × 2048 tokens and eight heads, forward + backward was 2–4% slower.
-  Other shapes and GPU models can give different results.
+  These timings predate the FP16 backward scale-placement change, which made FP16 forward +
+  backward 1–6% slower on the three shapes in [Operand precision](#operand-precision). Other
+  shapes and GPU models can give different results.
 
 **Default versus Triton.** GB300, PR #907 on main 278c4f60, PyTorch `2.16.0.dev20261113+cu134`,
 CuTeDSL 4.8.1, BF16 Q/K/V, head width 128. Each cell is warm CUDA Graph replay in µs, Triton
@@ -614,11 +616,12 @@ FP16 cannot hold the inverse decay after all 16 gates at `-5.25` (about `2^121`)
 FP16 therefore uses TF32 decay operands and forms the state-gradient products from the unscaled
 cotangent and
 `K_restore`, whose factors stay at or below one; it shares the gate range of the BF16 contract
-above. On normalized inputs (one 512-token sequence, two heads, plus ragged sequences),
-FP16 relative RMS errors from a uniform
+above. In a benchmark predating the matched FP16 backward (normalized inputs, one 512-token
+sequence, two heads, plus ragged sequences), FP16 relative RMS errors from a uniform
 `-0.1` to `-5.25` and for Kimi-style gates were 0.05% on the output, 0.03-0.06% on dq, dk, dv and
 dbeta and 0.05-0.14% on dgate, against 0.08%, 0.03-0.09% and 0.11-0.20% for fused FP16; the
-forward is non-finite past the same `-126 * ln(2)` bound. Finite does not mean accurate near the
+forward is non-finite past the same `-126 * ln(2)` bound. The matched backward changed FP16
+gradient errors on captured training inputs by under 1%. Finite does not mean accurate near the
 bound, in either dtype: a decayed operand too small for its TF32 or BF16 operand rounds to zero
 before the inverse decay cancels it. With sixteen `-5.45` gates, `k = e0` and a query component
 of `2^-13` on that channel (`scale=1`, only the last token writing a unit value), the output was 0
@@ -767,33 +770,31 @@ backward on the three BF16 shapes. Dashes mean native FP16 is outside this BF16 
 
 | Choice | Operands | Match | Causal | FP64 error vs fused | Speed | Use when |
 | --- | --- | --- | --- | --- | --- | --- |
-| `"bf16"` | B/B/B | No² | Yes | Higher | Fastest | Preserve legacy warpdrive bits |
+| `"bf16"` | B/B/B | Yes¹ | Yes | Higher | Fastest | Minimize BF16 training time |
 | `"tf32+bf16"` (BF16 default) | T/B/B | Yes¹ | Yes | Lower | Second | Balance accuracy and speed |
 | `"tf32"` | T/T/B | Yes¹ | Yes | Lowest | Third | Minimize numerical error |
-| `"tf32+fp16"` (FP16 default) | T/F/F | No² | Yes | — | — | Native FP16 |
-| Triton fused | Separate kernels | No³ | Yes | Baseline | Fourth | Use the portable backend |
+| `"tf32+fp16"` (FP16 default) | T/F/F | Yes¹ | Yes | — | — | Native FP16 |
+| Triton fused | Separate kernels | No² | Yes | Baseline | Fourth | Use the portable backend |
 
-¹ On the ordinary per-tile path these two BF16 modes reconstruct the forward's rounded operands
-and differentiate with the output scale in the matching place. The shared-prep forward is an
-exception: it folds the inverse and beta into records for **both** the output and state updates;
-backward recomputes the per-tile formula and can round differently. Operand agreement is not a
-promise that forward and backward choose the same work plan: each may chain pieces independently.
+¹ On the per-tile path all four warpdrive choices reconstruct the forward's rounded operands,
+native FP16 included, although its error and speed fall outside the BF16 comparison.
+Backward keeps the output scale outside the rounded query and score tiles and multiplies the
+unscaled state cotangent by the same rounded `K_restore` used in the forward state update.
+The shared-prep forward is an exception for every choice: it folds the inverse and beta into
+records for both the output and state updates. Backward recomputes the per-tile formula and can
+round differently.
+Forward and backward may also choose their piece-chain plans independently.
 
-² Legacy BF16 and native FP16 backward apply the output scale to Q before rounding the decayed
-query and the attention scores built from it. Forward rounds both without that scale and applies
-it to the output. Legacy BF16 backward also decays the state gradient before rounding it, then
-multiplies by an inverse-decayed key; forward rounds a key already decayed to the chunk end.
-Native FP16 uses TF32 decay products because inverse decay can overflow FP16. Its solve operands
-are FP16 without per-tile range scaling.
-
-³ Triton uses 64-token chunks and its own factorization. It builds diagonal inverse blocks in
+² Triton uses 64-token chunks and its own factorization. It builds diagonal inverse blocks in
 FP32 and stores the assembled inverse and attention scores in the Q/K/V kernel dtype. Its
 backward can split decay factors around a different reference row than its forward. See
 [Fast math and precision](#fast-math-and-precision).
 
-Optimized `chunk_kda` and `paged_chunk_kda` cast mixed or FP32 Q/K/V to BF16. Paged replay uses
-BF16 even for FP16 inputs. In both cases, use a BF16 choice. The staged `chunk_kda_prepare`
-requires matching FP16 or BF16 Q/K/V; pass the same precision to its backward preparation.
+Native FP16 uses TF32 decay products because inverse decay can overflow FP16. Its solve operands
+are FP16 without per-tile range scaling. Optimized `chunk_kda` and `paged_chunk_kda` cast mixed
+or FP32 Q/K/V to BF16. Paged replay uses BF16 even for FP16 inputs. In both cases, use a BF16
+choice. The staged `chunk_kda_prepare` requires matching FP16 or BF16 Q/K/V; pass the same
+precision to its backward preparation.
 A precision choice incompatible with the kernel dtype raises
 `ValueError` before dispatch. Triton and `impl="reference"` validate but ignore the option.
 For bitwise comparisons across calls, see [Determinism](determinism.md#warpdrive-chunk-kernels).
@@ -807,12 +808,12 @@ alone gives about 1.66 in these units on the full capture.
 Each latency cell gives **forward / forward + backward**, in µs of warm CUDA Graph replay
 (median of three interleaved rounds; normalized Q/K, gates sampled uniformly in [-5, 0],
 Triton autotuning enabled). The columns are A: 1 × 8192 tokens, 16 heads; B: 8 × 2048, 16 heads;
-C: 1 × 2048, 8 heads. The unchanged legacy BF16 kernels were timed separately on the same GPU
-model. The FP16-input path is not part of this BF16 comparison.
+C: 1 × 2048, 8 heads. The `"bf16"` row was timed separately on the same GPU model. The FP16-input
+path is not part of this BF16 comparison.
 
 | Choice | Output | dq | dk | dv | dgate | dbeta | A (µs) | B (µs) | C (µs) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `"bf16"` | 3.78 | 3.27 | 3.36 | 3.26 | 4.80 | 2.89 | 193/681 | 120/713 | 68/207 |
+| `"bf16"` | 3.78 | 3.27 | 3.38 | 3.24 | 4.81 | 2.87 | 193/716 | 121/769 | 68/212 |
 | `"tf32+bf16"` | 3.45 | 2.90 | 2.99 | 2.92 | 2.72 | 2.46 | 209/774 | 146/868 | 70/220 |
 | `"tf32"` | 1.82 | 1.83 | 1.94 | 1.78 | 1.62 | 0.73 | 230/860 | 164/980 | 72/229 |
 | Triton fused | 3.60 | 2.98 | 3.03 | 2.99 | 2.87 | 2.51 | 388/1659 | 637/2355 | 77/315 |

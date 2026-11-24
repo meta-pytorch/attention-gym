@@ -137,7 +137,7 @@ class KernelOptions(SplitOptions, total=False):
     and its contribution to the output. One dtype sets both. State products still use the
     Q/K/V kernel dtype, and all matrix products accumulate in FP32.
 
-    BF16 kernels accept ``"tf32+bf16"`` (default), ``"tf32"`` or ``"bf16"`` (legacy bits).
+    BF16 kernels accept ``"tf32+bf16"`` (default), ``"tf32"`` or ``"bf16"``.
     FP16 kernels accept only ``"tf32+fp16"``, their default. Replay casts Q/K/V to BF16 before
     choosing. Triton and the reference implementation validate the option but do not use it.
     See "Operand precision" in ``docs/linear.md``."""

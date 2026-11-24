@@ -199,9 +199,9 @@ for the selection rule. Set `kernel_options={"backend": "fused"}` to use Triton 
   fragments in context parallelism. It does not cover repartitioning a document across ranks.
   A few long sequences lose parallelism; see [Batch invariance](linear.md#batch-invariance)
   for the plan details and measurements.
-- **Across operand precisions: not guaranteed.** For BF16 KDA, `"bf16"` preserves legacy
-  warpdrive bits; the default `"tf32+bf16"` changes operand rounding in both directions. Native
-  FP16 KDA has a single precision ([Operand precision](linear.md#operand-precision)).
+- **Across operand precisions: not guaranteed.** For BF16 KDA, `"bf16"` and the default `"tf32+bf16"`
+  round decay operands differently in both directions. Native FP16 KDA has a single precision
+  ([Operand precision](linear.md#operand-precision)).
 - **Across backends: not guaranteed.** Warpdrive and Triton KDA use 16- and 64-token chunks,
   respectively. GDN uses 64-token chunks on both but rounds differently in the two kernels.
 - **CUDA-graph replay: bitwise** for the same inputs. A graph captured at a larger capacity
