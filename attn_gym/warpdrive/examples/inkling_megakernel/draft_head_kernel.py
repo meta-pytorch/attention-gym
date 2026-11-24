@@ -102,7 +102,7 @@ class HeadParams:
     xs: cute.Tensor  # (TOKENS, hidden) bf16 GEMV inputs
     xr: cute.Tensor  # (1, 2 rank) bf16 the RNN's input row [state, w1[prev]], overlapping xs
     gred: cute.Tensor
-    base: cute.Tensor  # (slots or row_tiles, ROWS, TOKENS) bf16 base logits
+    base: cute.Tensor  # (slots or row_tiles, ROWS, drafts) bf16 base logits
     fbias: cute.Tensor  # (slots, ROWS) bf16 the fold bias of its rows
     rnn_state: cute.Tensor  # (rank,) fp32 the Markov state (bf16 values), RNN CTAs
     arg: cute.Tensor  # (ARG_FLOATS,) fp32 argmax reduction scratch
@@ -143,7 +143,7 @@ class DraftHeadKernel(DraftKernel):
         self.row_tiles = -(-vocab // ROWS)
         self.rnn_tiles = 3 * rank // ROWS
         other_bytes = 4 * (rank + ARG_FLOATS) + 2 * slots * ROWS  # STATE, ARG, FBIAS
-        base_bytes = 2 * slots * ROWS * TOKENS
+        base_bytes = 2 * slots * ROWS * self.drafts
         # fold_tiles needs two live weights. Spill BASE if both stages would not fit.
         self.global_base = (
             engine_bytes(hidden, 0) + other_bytes + base_bytes + 2 * STAGE_BYTES + SMEM_HEADROOM
@@ -162,7 +162,7 @@ class DraftHeadKernel(DraftKernel):
     @property
     def scratch_shapes(self) -> dict[str, int]:
         return {
-            **({"base_words": self.row_tiles * ROWS * TOKENS // 4} if self.global_base else {}),
+            **({"base_words": self.row_tiles * ROWS * self.drafts // 4} if self.global_base else {}),
             "ctxr": 2 * TOKENS * 3 * self.rank,
             "raw": self.drafts * 3 * self.rank,
             "best": self.drafts * MAX_CTAS * 2,
@@ -274,7 +274,8 @@ class DraftHeadKernel(DraftKernel):
                 value, w = self.gemv(p, w, p.xs, self.hidden // TILE_K, gbuf, tid, warp, lane)
                 gbuf = 1 - gbuf
                 base_tile = a if cutlass.const_expr(self.global_base) else b
-                p.base[base_tile, row, n] = BFloat16(value)
+                if n < self.drafts:
+                    p.base[base_tile, row, n] = BFloat16(value)
                 if n == 0:
                     v = cutlass.min(a * ROWS + row, self.vocab - 1)
                     p.fbias[b, row] = p.fold_bias[v]
@@ -501,8 +502,8 @@ class DraftHeadKernel(DraftKernel):
             "FBIAS": cute.make_layout((self.slots, ROWS), stride=(ROWS, 1)),
         }
         base_layout = cute.make_layout(
-            (self.row_tiles if self.global_base else self.slots, ROWS, TOKENS),
-            stride=(ROWS * TOKENS, TOKENS, 1),
+            (self.row_tiles if self.global_base else self.slots, ROWS, self.drafts),
+            stride=(ROWS * self.drafts, 1, ROWS),
         )
         if cutlass.const_expr(not self.global_base):
             layouts["BASE"] = base_layout
