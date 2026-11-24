@@ -179,11 +179,14 @@ def test_head_matches_torch(weights):
 
 
 @torch.no_grad()
-def test_spark_checkpoint_shape_drafts():
-    """The real vocabulary needs global base logits and the real backbone a one-stage ring
-    on Spark. Compare the head to the torch drafter on the same computed backbone states."""
+def test_spark_checkpoint_shape_drafts(monkeypatch):
+    """Check production-shape backbone states and drafts under Spark's shared-memory limit."""
     if torch.cuda.get_device_capability() != (12, 1):
-        pytest.skip("SM121 shared-memory regression")
+        # Also exercise the low-memory path in B200 CI; leave native Spark discovery intact.
+        monkeypatch.setattr(
+            "attn_gym.warpdrive.examples.inkling_megakernel.draft.device_smem_bytes",
+            lambda device: 99 * 1024,
+        )
     c, vocab = DSparkConfig(), InklingConfig().vocab_size
     weights = random_weights(c, vocab, vocab)
     rows = features(8, 31, c)
