@@ -23,9 +23,11 @@ jobs:
       with:
         python-version: "3.12"
     - name: Install build tools
-      run: python -m pip install build twine
+      run: |
+        python -m pip install --require-hashes --only-binary :all: -r .github/requirements/release.txt
+    # Build with the hash-pinned backend instead of fetching it into an isolated environment.
     - name: Build wheel and source distribution
-      run: python -m build
+      run: python -m build --no-isolation
     - name: Validate distributions
       env:
         RELEASE_TAG: ${{ github.ref_name }}
@@ -80,7 +82,8 @@ jobs:
       with:
         python-version: "3.12"
     - name: Install Modal
-      run: python -m pip install modal
+      run: |
+        python -m pip install --require-hashes --only-binary :all: -r .github/requirements/modal.txt
     - name: Download distributions
       uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
       with:
