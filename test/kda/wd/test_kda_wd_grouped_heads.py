@@ -5,11 +5,15 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     cumulative_sequence_offsets,
     kda_reference,
 )
+
+# Direct kernel calls use the same precision as public calls with BF16 Q/K/V.
+PRECISION = {"intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 pytestmark = pytest.mark.skipif(
@@ -52,7 +56,7 @@ def test_grouped_head_gradients_sum_over_groups(monkeypatch, scheme, heads):
     offsets = cumulative_sequence_offsets(lengths)
     q, k, v, gate, beta, do = _inputs(lengths, *heads, seed=7)
     grads = driver.kda_backward(
-        q, k, v, gate, beta, do, offsets, scale=DIM**-0.5, split=scheme == "split"
+        q, k, v, gate, beta, do, offsets, scale=DIM**-0.5, split=scheme == "split", **PRECISION
     )
     for got, t in zip(grads[:3], (q, k, v), strict=True):
         assert got.shape == t.shape and got.dtype == t.dtype

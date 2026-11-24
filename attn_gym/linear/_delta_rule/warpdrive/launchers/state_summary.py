@@ -28,6 +28,7 @@ def build_warpdrive_state_summaries(
     bounds: torch.Tensor | None = None,
     fastmath: bool = True,
     batch_invariant: bool = False,
+    intra_chunk_dtypes: str,
 ) -> torch.Tensor:
     """Return FP32 ``[N, H, V + K, K]`` maps packed as ``[B; A]`` for subsequences.
 
@@ -35,8 +36,9 @@ def build_warpdrive_state_summaries(
     contiguous int32 ``bounds[R, 2]`` on k.device select, reorder, or duplicate consecutive
     cu_seqlens pairs. Empty intervals yield ``[0; I]``; zero rows yield no maps. Bounds values
     stay on device and may change during CUDA Graph replay. ``fastmath=False`` selects the
-    non-flushing gate exponentials. ``batch_invariant`` scans every sequence uncut, so its bits
-    do not depend on the other sequences.
+    non-flushing gate exponentials; ``intra_chunk_dtypes`` follows ``chunk_kda``'s
+    ``kernel_options``. ``batch_invariant`` scans every sequence uncut, so its bits do not depend
+    on the other sequences.
     """
     validate_available(k)
     return summary.build_state_summaries(
@@ -48,6 +50,7 @@ def build_warpdrive_state_summaries(
         bounds=bounds,
         fastmath=fastmath,
         batch_invariant=batch_invariant,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
 
 
@@ -65,13 +68,14 @@ def build_warpdrive_state_grad_summaries(
     bounds: torch.Tensor | None = None,
     fastmath: bool = True,
     batch_invariant: bool = False,
+    intra_chunk_dtypes: str,
 ) -> torch.Tensor:
     """Return subsequence FP32 ``[N, H, V + K, K]`` maps packed as ``[C; R]``.
 
     C is the native entry cotangent with zero exit cotangent. R uses an identity exit
     cotangent and zero d_output. ``transpose_forward_transition=True`` instead uses A.T
     from the forward summary: bit for bit the forward's A transposed, the exact adjoint, but not
-    native backward rounding. Inputs, bounds, ``fastmath`` and ``batch_invariant`` follow
+    native backward rounding. Inputs, bounds and options follow
     :func:`build_warpdrive_state_summaries`.
     """
     validate_available(q)
@@ -88,6 +92,7 @@ def build_warpdrive_state_grad_summaries(
         bounds=bounds,
         fastmath=fastmath,
         batch_invariant=batch_invariant,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
 
 

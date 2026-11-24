@@ -7,7 +7,7 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple, TypedDict
+from typing import Literal, NamedTuple, TypedDict, get_args
 
 import torch
 
@@ -102,6 +102,9 @@ class SplitOptions(BackendOptions, total=False):
     """Split the forward recurrence."""
 
 
+IntraChunkDtypes = Literal["tf32+bf16", "tf32", "bf16", "tf32+fp16"]
+
+
 class KernelOptions(SplitOptions, total=False):
     """KDA backend controls and experimental scheduling options."""
 
@@ -112,6 +115,17 @@ class KernelOptions(SplitOptions, total=False):
     active. Outputs are bitwise identical. Hopper or newer for packed inputs. The warpdrive
     backend accepts and ignores every value: its persistent grids follow the SM count and
     always stride over the active work only."""
+
+    intra_chunk_dtypes: IntraChunkDtypes
+    """Operand precision inside each warpdrive KDA chunk, in forward and backward. The first
+    dtype is for products of decayed queries and keys; the second is for the triangular solve
+    and its contribution to the output. One dtype sets both. State products still use the
+    Q/K/V kernel dtype, and all matrix products accumulate in FP32.
+
+    BF16 kernels accept ``"tf32+bf16"`` (default), ``"tf32"`` or ``"bf16"`` (legacy bits).
+    FP16 kernels accept only ``"tf32+fp16"``, their default. Replay casts Q/K/V to BF16 before
+    choosing. Triton and the reference implementation validate the option but do not use it.
+    See "Operand precision" in ``docs/linear.md``."""
 
 
 class _StageOptions(TypedDict, total=False):
@@ -156,6 +170,8 @@ SPLIT_OPTION_SPEC: KernelOptionSpec = {
 KERNEL_OPTION_SPEC: KernelOptionSpec = {
     **SPLIT_OPTION_SPEC,
     "schedule": (("auto", "static", "persistent"), "auto"),
+    # ``None``: the default by input dtype (``resolve_intra_chunk_dtypes``, ``kda/validation.py``).
+    "intra_chunk_dtypes": (get_args(IntraChunkDtypes), None),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
 STAGE_OPTION_SPEC: KernelOptionSpec = {**KERNEL_OPTION_SPEC, "batch_invariant": (bool, False)}

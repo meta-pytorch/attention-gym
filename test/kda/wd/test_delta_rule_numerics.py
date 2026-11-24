@@ -10,6 +10,7 @@ pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeD
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, chunk_kda, recurrent_gdn
 from attn_gym.linear.kda.impl.warpdrive_ops import chunk_warpdrive_packed_local_bwd_op
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing import make_gdn_test_inputs
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
@@ -18,6 +19,10 @@ from attn_gym.testing.kda import (
     kda_reference,
     make_kda_test_inputs,
 )
+
+# The warpdrive ops' arguments after ``scale``: ``fastmath`` and the default operand precision
+# for BF16 inputs (``KernelOptions``).
+PRECISION = (True, DEFAULT_INTRA_CHUNK_DTYPES)
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -176,7 +181,7 @@ def test_kda_wd_delta_residual_keeps_fp32_precision(dtype: torch.dtype) -> None:
     output = chunk_kda(*inputs, scale=1.0, kernel_options={**_WARPDRIVE, "autotune": False})[0]
     cu_seqlens = torch.tensor([0, tokens], device="cuda", dtype=torch.int32)
     dq, _, _, _, dbeta = chunk_warpdrive_packed_local_bwd_op(
-        *inputs, d_output, cu_seqlens, False, 1.0
+        *inputs, d_output, cu_seqlens, False, 1.0, *PRECISION
     )
 
     leaves = clone_kda_inputs(
@@ -214,7 +219,7 @@ def test_kda_wd_backward_preserves_small_beta_gradient(
     cu_seqlens = torch.tensor([0, 2], device="cuda", dtype=torch.int32)
 
     gradients = chunk_warpdrive_packed_local_bwd_op(
-        q, k, value, gate, beta, d_output, cu_seqlens, False, 1.0
+        q, k, value, gate, beta, d_output, cu_seqlens, False, 1.0, *PRECISION
     )
     leaves = clone_kda_inputs(
         tuple(tensor.requires_grad_() for tensor in (q, k, value, gate, beta)),
@@ -269,6 +274,7 @@ def test_kda_wd_raw_backward_precision(seed: int) -> None:
         cu_seqlens,
         False,
         128**-0.5,
+        *PRECISION,
     )
     low_precision = _kda_result(inputs, d_output, precision=torch.float32)[1]
     high_precision = _kda_result(inputs, d_output, precision=torch.float64)[1]

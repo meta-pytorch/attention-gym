@@ -11,12 +11,13 @@
 
 Per work item, the gradients of one output head over the chunks ``[write_start, compute_end)``
 of one sequence (or chain piece), walked backward (``c = compute_end - 1`` down to
-``write_start``). Per chunk, with ``g`` the in-chunk cumulative log2 gate per key channel, ``S``
-the checkpoint entering the chunk and ``dS`` the state gradient carried backward in TMEM:
-cg0 builds ``K_decay = K 2^g``, ``K_inv = K 2^-g``, ``Q_decay = scale Q 2^g`` and ``2^g_last``;
-regmma ``KK = K_decay K_inv^T``, ``T = (I + beta strict(KK))^-1`` and ``dM = dY U^T``; the
-epilogue ``A = lower(Q_decay K_inv^T)`` and ``dA = lower(dO U^T)``. The MMA warp then issues,
-in upstream's order ((S) SMEM, (T) TMEM operand)::
+``write_start``). Here ``g`` is the in-chunk cumulative log2 gate per key channel, ``S`` the
+checkpoint entering the chunk and ``dS`` the state gradient carried backward in TMEM.
+The following equations show the legacy BF16 path. Both this path and native FP16 scale Q
+before rounding Q_decay; cg0 builds K_decay = K 2^g, K_inv = K 2^-g and Q_decay = scale Q 2^g.
+regmma builds ``KK = K_decay K_inv^T``, the inverse of ``T = I + beta strict_lower(KK)`` and
+``dM = dY U^T``. The epilogue forms ``A = lower(Q_decay K_inv^T)`` and ``dA = lower(dO U^T)``.
+The MMA warp then issues, in upstream's order ((S) SMEM, (T) TMEM operand)::
 
     K S         = state(S) @ K_decay^T            dQ inter     = state(T) @ dO^T
     dU          = dS(T) @ K_inv + dO^T(S) @ A      dS Q-term   += dO^T(S) @ Q_decay
@@ -26,21 +27,20 @@ in upstream's order ((S) SMEM, (T) TMEM operand)::
     dQ          = dQ inter + K_inv^T(S) @ dA^T     dK decay    = state(T) @ (beta dY)^T
                                                                 + K_inv^T(S) @ (beta strict(dM))^T
 
-fp16 stages ``dS`` itself instead (``dS16 = fp16(dS)``) and decays the key to the chunk end:
-``dU = dS16(T) @ K_restore + dO^T(S) @ A`` with ``K_restore = 2^g_last K_inv = K 2^(g_last - g)``,
-``dK restore = dS16(S) @ U^T`` scaled by ``2^(g_last - g)`` instead of ``2^-g``, and the dGate
-state term times ``2^g_last``. Shrinking ``dS`` by ``2^g_last`` before the cast can round it to
-zero before ``K_inv``'s inverse decay (which can itself overflow fp16) cancels it; no fp16 decay
-factor here exceeds one. Its KK, A and the four pairwise GEMMs (dK inv, dQ's ``K_inv^T dA^T``,
-dK decay's ``K_inv^T dM^T``) take tf32 decay tiles (tcgen05 ``.kind::tf32`` with fp32 dA / dM
-tiles, NOTE [TF32 decay operands] in ``kda_common``), and those fp32 tiles keep one stage to fit.
+With TF32 decay (including FP16 inputs), stage dS in the input dtype *before* applying decay.
+Use ``K_restore = K 2^(g_last - g)`` in the state contribution to dU instead of shrinking dS
+and multiplying by a potentially huge K_inv. KK, A and the pairwise dQ/dK products use TF32
+operands. For BF16 inputs on this path, Q_decay omits the output scale, just as in forward:
+scale the dO contribution to dU before combining it with the state contribution, and use scaled
+dO for the Q term of dS. The transposed dA tile for dK_inv also carries the scale. With a TF32
+solve, rebuild the inverse and Y with TF32 operands and stage dU in TF32 for dY. The gradient
+of the state update with respect to K_restore still reads BF16 U, as forward did.
 
 cg1 stages the TMEM operands and forms ``dV = beta dY``, dbeta (``sum_v dY (V - K S)`` plus the
 M-term) and the next chunk's ``dS`` scaled by ``2^g_last``; cg2 assembles dQ and dK from the
 parts with their per-channel ``2^(+-g)`` scales and the dA diagonal, and dGate per channel
-(reverse-cumsummed over the chunk, plus the state term at its last token),
-with upstream's instruction order, so every bf16 output matches the upstream kernel bit for bit
-(fp16 departs from upstream as above).
+(reverse-cumsummed over the chunk, plus the state term at its last token). Only the explicit
+legacy BF16 precision uses the upstream BF16 rounding throughout.
 With ``use_dstate_in`` the state gradient starts from ``dstate_in[batch, head]`` when
 ``compute_end`` is the sequence's last chunk (zero for a split item's warmup); with
 ``use_dstate0`` the final ``dS`` lands in ``dstate0[dstate_dst, head]``. dq/dk/dv/dgate/dbeta
@@ -73,9 +73,9 @@ Channels (``n`` stages; Threads arrive per thread, as upstream's barriers count)
     state    1  load (TMA checkpoint)   -> mma (Umma), cg0
     beta     4  cg0 warp 0 (external)   -> regmma, cg1
     decay    2  cg0 (K/Q decay, K inv, 2^g_last) -> mma (Umma), epilogue
-    qk_raw   4  cg0 (raw Q/K TMEM)      -> cg2
+    qk_raw  3/4 cg0 (raw Q/K TMEM)      -> cg2 (three stages for the TF32 solve, four otherwise)
     state_in 2  cg0 (state TMEM f16)    -> mma (Umma), cg2
-    tinv/a/da/dm 2 regmma/epilogue/epilogue/regmma (16 x 16 SMEM tiles) -> mma (Umma)
+    tinv/a/da/dm 1 or 2 stages: regmma/epilogue produce 16 x 16 tiles for mma (Umma)
     da_diag  4  epilogue                -> cg2
     dqk      1  mma (dQ, dK parts TMEM) -> cg2
     dstate   1  cg1 (dS f16 SMEM)       -> mma (Umma), cg2
@@ -138,9 +138,11 @@ from .kda_common import (
     CUTE_DTYPES,
     TORCH_NAMES,
     WORK_ITEM_FIELDS,
+    OperandDtypes,
     as_f32,
     as_i32,
     decay_stage_addresses,
+    invert_solve,
     ldg_v4,
     lds_f32,
     lds_v4,
@@ -148,12 +150,19 @@ from .kda_common import (
     load_rows,
     mask_pair,
     mma_decay_16x16,
+    operand_dtypes,
+    precision_suffix,
+    solve_mma,
+    solve_mma_desc,
     stg_v4,
+    store_solve_operand,
+    store_tf32_k_major,
     sts_f32,
     sts_tf32x8,
     swz32,
     swz128,
     tf32_fragment_offsets,
+    tf32_k_major_tile,
     tf32_offset,
     umma_commit,
 )
@@ -197,6 +206,7 @@ from .umma import (
     mma_ss_tf32_op,
     mma_ts_all_op,
     smem_desc,
+    tf32_k_major_desc,
 )
 
 LOG2_E = 1.4426950408889634
@@ -207,17 +217,15 @@ DECAY_STAGES = 2
 INTER_STAGES = 2
 INTER_TILES = 5  # per stage: A, T, dA, dM, -dM (16 x 16 each, 32-byte swizzle)
 TILE = B_T * B_T * 2  # bytes of one 16 x 16 16-bit tile
-# fp16 (module docstring): Inter holds A and T. ``Inter32`` stores dA and dM as tf32 twice:
-# K-major for the dQ and dK decay GEMMs, row-major for the dK inv GEMM (``_inter32_tile``,
-# ``_store_tiles_tf32``).
+# With TF32 decay, Inter holds the solve tiles. Inter32 holds dA and dM in both orientations:
+# the dQ and dK_decay products use one orientation, dK_inv uses the other.
 # One stage is safe: the MMA warp releases both tiles before the epilogue and regmma write the
 # next chunk's.
 TF32_INTER_TILES = 2
 TF32_TILE = B_T * B_T * 4  # one K-major tile
 TF32_ROWS_TILE = B_T * 128  # one row-major tile
 DA, DM = 0, TF32_TILE  # Inter32 byte offsets
-DA_ROWS, DM_ROWS = 2 * TF32_TILE, 2 * TF32_TILE + TF32_ROWS_TILE
-TF32_INTER_BYTES = 2 * (TF32_TILE + TF32_ROWS_TILE)
+DA_ROWS = 2 * TF32_TILE
 DIAG_STAGES = 4
 QK_RAW_STAGES = 4
 DV_STAGES = 2
@@ -251,6 +259,7 @@ STATE_K, DU_ACC, U_ACC, DY_ACC, DQ, DKI, DKR = 0, 1, 2, 3, 4, 5, 6
 Y_IN, DU_IN, NBDY_IN, DSTATE_ACC, DSTATE_IN = 7, 8, 9, 10, 11
 U_SMEM, DY_SMEM, DBETA_M, DSTATE0, KDI, SCALE = 12, 13, 14, 15, 16, 18
 TSIG_COUNTS = (1, 1, 1, 1, 1, 1, 1, 128, 128, 128, 1, 128, 128, 128, 32, 128, 128, 128, 128, 128)
+KRESTORE_FREE = len(TSIG_COUNTS)
 
 
 # ---- small PTX helpers ------------------------------------------------------------------------
@@ -361,6 +370,7 @@ class KdaBpropParams:
     s_g: Int32
     s_dy: Int32
     s_u: Int32
+    s_u_lo: Int32
     s_dq: Int32
     s_dk: Int32
     s_dg: Int32
@@ -368,7 +378,7 @@ class KdaBpropParams:
     s_diag: Int32
     s_red: Int32
     s_betam: Int32
-    s_kdecay32: Int32  # fp16 io only: tf32 K_decay / Q_decay, K_restore, the fp32 16 x 16 tiles
+    s_kdecay32: Int32  # TF32 decay path: K_decay and Q_decay, K_restore, 16 x 16 gradient tiles
     s_qdecay32: Int32
     s_krestore: Int32
     s_inter32: Int32
@@ -381,7 +391,7 @@ class KdaBprop(WarpSpecialized):
     zero state). ``use_dstate_in`` / ``use_dstate0``: seed dS from ``dstate_in`` / store the
     final dS to ``dstate0``.
     ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal.
-    fp16 io takes ``K_restore`` and tf32 decay tiles (module docstring)."""
+    See NOTE [KDA operand precision] in ``kda_common`` for the forward and backward dtypes."""
 
     def __init__(
         self,
@@ -395,6 +405,7 @@ class KdaBprop(WarpSpecialized):
         num_ctas: int,
         fastmath: bool = True,
         *,
+        precision: OperandDtypes | None = None,
         beta_dtype: str | None = None,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
@@ -410,9 +421,16 @@ class KdaBprop(WarpSpecialized):
         self.first_state_chunk = 0 if use_initial_state else 1
         self.io_dtype = io_t = CUTE_DTYPES[io]
         self.gate_dtype = CUTE_DTYPES[gate]
-        self.tf32_decay = io == "fp16"
+        self.precision = precision if precision is not None else operand_dtypes(io, "bf16")
+        self.tf32_decay = self.precision.decay_dtype == "tf32"
+        self.scale_output = self.tf32_decay and io == "bf16"
+        self.tf32_solve = self.precision.solve_dtype == "tf32"
         self.decay_t = Float32 if self.tf32_decay else io_t
         self.inter_tiles = TF32_INTER_TILES if self.tf32_decay else INTER_TILES
+        self.inter32_rows_bytes = TF32_TILE if self.tf32_solve else TF32_ROWS_TILE
+        self.qk_raw_stages = QK_RAW_STAGES - int(self.tf32_solve)
+        self.solve_stages = 1 if self.tf32_solve else INTER_STAGES
+        self.solve_cols = B_T if self.tf32_solve else B_T // 2
         # Using one Inter32 stage frees enough shared memory to double-buffer dO.
         tf32_stages = 1 if self.tf32_decay else INTER_STAGES
         f32 = Float32
@@ -438,6 +456,8 @@ class KdaBprop(WarpSpecialized):
             for name in ("Kdecay32", "Qdecay32", "Inter32"):
                 buf[name] = plan.buffer(name, f32, align=1024)
             buf["Krestore"] = plan.buffer("Krestore", io_t, align=1024)
+        if self.tf32_solve:
+            buf["Ulo"] = plan.buffer("Ulo", io_t, align=1024)
         self.buf = buf
 
         raw_bytes = B_T * (2 * d_k * io_b + d_v * io_b + d_k * (self.gate_dtype.width // 8))
@@ -481,14 +501,14 @@ class KdaBprop(WarpSpecialized):
             buffer={
                 k: buf[k]
                 for k in ("Kdecay", "Kinv", "Qdecay", "Scale", "Kdecay32", "Qdecay32", "Krestore")
-                if k in buf
+                if k in buf and (k != "Krestore" or not self.tf32_solve)
             },
             wait=CHANNEL_WAIT,
         )
         # cg2 only reads these TMEM stages: its releases wait for the loads (tcgen05.wait::ld)
         # before cg0 may store the next chunk over them.
         self.qk_raw = Ring(
-            QK_RAW_STAGES,
+            self.qk_raw_stages,
             Threads,
             Threads,
             commit_fence="tmem_store",
@@ -505,8 +525,8 @@ class KdaBprop(WarpSpecialized):
         )
         # The 16 x 16 tiles share upstream's interleaved ``Inter`` stage (A, T, dA, dM, -dM).
         smem = "smem_async"
-        self.tinv = Ring(INTER_STAGES, Threads, Umma, commit_fence=smem, wait=CHANNEL_WAIT)
-        self.a = Ring(INTER_STAGES, Threads, Umma, commit_fence=smem, wait=CHANNEL_WAIT)
+        self.tinv = Ring(self.solve_stages, Threads, Umma, commit_fence=smem, wait=CHANNEL_WAIT)
+        self.a = Ring(self.solve_stages, Threads, Umma, commit_fence=smem, wait=CHANNEL_WAIT)
         self.da = Ring(tf32_stages, Threads, Umma, commit_fence=smem, wait=CHANNEL_WAIT)
         self.dm = Ring(tf32_stages, Threads, Umma, commit_fence=smem, wait=CHANNEL_WAIT)
         self.da_diag = Ring(DIAG_STAGES, Threads, Threads, buffer=buf["Diag"], wait=CHANNEL_WAIT)
@@ -533,7 +553,8 @@ class KdaBprop(WarpSpecialized):
             DV_STAGES, Threads, Threads, commit_fence=smem, buffer=buf["Dv"], wait=CHANNEL_WAIT
         )
         self.sched = Ring(SCHED_STAGES, Warps, Warps, payload=(Int32, (1,)), wait=CHANNEL_WAIT)
-        self.tsig = Barriers(len(TSIG_COUNTS), counts=list(TSIG_COUNTS))
+        signal_counts = (*TSIG_COUNTS, 1) if self.tf32_solve else TSIG_COUNTS
+        self.tsig = Barriers(len(signal_counts), counts=list(signal_counts))
         self.cg0_sync = NamedBarrier(threads=128)
         self.cg1_sync = NamedBarrier(threads=128)
         self.tmem_plan = (
@@ -548,10 +569,10 @@ class KdaBprop(WarpSpecialized):
             .region("dkd", B_T)
             .region("dki", B_T)
             .region("dkr", B_T)
-            .region("yin", B_T // 2)  # Y, then -beta dY
-            .region("duin", B_T // 2)
-            .region("qraw", B_T // 2, QK_RAW_STAGES)
-            .region("kraw", B_T // 2, QK_RAW_STAGES)
+            .region("yin", self.solve_cols)  # Y, then -beta dY
+            .region("duin", self.solve_cols)  # dO, then dU with tf32 solve
+            .region("qraw", B_T // 2, self.qk_raw_stages)
+            .region("kraw", B_T // 2, self.qk_raw_stages)
         )
         self.work = WorkStream(schedule=OneShot(grid="1d"), ready=PdlWait())
 
@@ -565,6 +586,7 @@ class KdaBprop(WarpSpecialized):
         self.g_kstate = desc(d_v, B_T, d_k)  # state(S) @ K decay^T; dS input(T) @ K inv
         self.g_do_a = desc(d_v, B_T, B_T, at=True, bt=True)  # dO^T(S) @ A
         self.g_do_qd = desc(d_v, d_k, B_T, at=True, bt=True)  # dO^T(S) @ Q decay
+        self.g_solve32 = solve_mma_desc(d_v, Float32)
         self.g_t = desc(d_v, B_T, B_T)  # Y(T) @ T^-1
         self.g_t_trans = desc(d_v, B_T, B_T, bt=True)  # dU(T) @ T^-T
         self.g_dy_kd = desc(d_v, d_k, B_T, bt=True)  # -beta dY(T) @ K decay
@@ -572,13 +594,13 @@ class KdaBprop(WarpSpecialized):
         self.g_dstate_u = desc(d_k, B_T, d_v, at=True)  # dS(S) @ U^T
         self.g_kt_d = desc(d_k, B_T, B_T, at=True)  # K inv^T(S) @ dA^T / dM^T
         self.g_kt_dt = desc(d_k, B_T, B_T, at=True, bt=True)  # Q / K decay^T(S) @ dA / -dM
-        # fp16: the pairwise GEMMs as tf32 (MN-major decay tiles x K-major fp32 tiles).
+        # TF32 pairwise gradient products read MN-major decay tiles.
         tf32 = {"m": d_k, "n": B_T, "a_mn_major": True}
         self.tf32_idesc = instr_desc(f32, f32, f32, **tf32)
-        # dK inv reads the row-major (MN-major) dA / dM tiles; -dM negates B.
-        self.tf32_idesc_rows = instr_desc(f32, f32, f32, **tf32, b_mn_major=True)
+        # dK_inv needs the transposed dA/dM tiles; select their layout and the sign of dM.
+        self.tf32_idesc_rows = instr_desc(f32, f32, f32, **tf32, b_mn_major=not self.tf32_solve)
         self.tf32_idesc_rows_neg = instr_desc(
-            f32, f32, f32, **tf32, b_mn_major=True, b_negate=True
+            f32, f32, f32, **tf32, b_mn_major=not self.tf32_solve, b_negate=True
         )
 
     def tma_slot_rows(self, heads: int) -> int:
@@ -588,6 +610,7 @@ class KdaBprop(WarpSpecialized):
     def get_name(self) -> str:
         flags = f"{int(self.use_initial_state)}{int(self.use_dstate_in)}{int(self.use_dstate0)}"
         name = f"wd_kda_bprop_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}_f{flags}"
+        name += precision_suffix(self.io, self.precision)
         return name if self.fastmath else f"{name}_nofm"
 
     # ---- work decode -------------------------------------------------------------------
@@ -814,6 +837,7 @@ class KdaBprop(WarpSpecialized):
                         qk_raw,
                         state_in,
                         tsig,
+                        n,
                         chunk,
                         chunk_start,
                         seqlen,
@@ -839,6 +863,7 @@ class KdaBprop(WarpSpecialized):
         qk_raw,
         state_in,
         tsig,
+        n,
         chunk,
         chunk_start,
         seqlen,
@@ -1003,7 +1028,7 @@ class KdaBprop(WarpSpecialized):
                     + swz128(decay_row ^ f_seg, f_dim - f_seg * 32, 4)
                 )
                 exp_g += lds_v4_f32(s_ex + 4 * idx)
-        exp_last = []  # 2^g_last of this thread's columns (stored above): K_restore (fp16 io)
+        exp_last = []  # Last-token decay for K_restore on the TF32 decay path.
         if cutlass.const_expr(self.tf32_decay):
             s_last = dh.view("Scale", read=True).iterator.toint()
             for half in cutlass.range_constexpr(dk_halves):
@@ -1013,11 +1038,13 @@ class KdaBprop(WarpSpecialized):
 
         # ---- K decay = K 2^g, K inv = K 2^-g ----------------------------------------------------
         op_stage = stage * (d_k * B_T * 2)
+        if cutlass.const_expr(self.tf32_solve) and n > 0:
+            self.sig_wait("krestore_empty", tsig + KRESTORE_FREE, (n - 1) & 1, fence=False)
         for half in cutlass.range_constexpr(dk_halves):
             kd = []
             ki = []
             kr = []
-            kd32 = []  # fp32 K_decay / K_inv for the tf32 tiles (fp16 io)
+            kd32 = []  # FP32 K_decay and K_inv before rounding to TF32.
             ki32 = []
             for p in cutlass.range_constexpr(4):
                 r0 = half * 8 + 2 * p
@@ -1046,21 +1073,24 @@ class KdaBprop(WarpSpecialized):
                         d_k,
                         umma=True,
                     )
-                st_shared_v4(params.s_krestore + off, kr)
+                kr_off = off - op_stage if cutlass.const_expr(self.tf32_solve) else off
+                st_shared_v4(params.s_krestore + kr_off, kr)
             else:
                 st_shared_v4(params.s_kinv + off, ki)
             st_shared_v4(params.s_kdecay + off, kd)
         cute.arch.fence_view_async_shared()
         arrive(tsig + KDI + stage)
 
-        # ---- Q decay = (scale Q) 2^g --------------------------------------------------------------
+        # With BF16 inputs and TF32 decay, keep the same unscaled Q operand used in forward.
         scale = params.scale
         for half in cutlass.range_constexpr(dk_halves):
             qd = []
             qd32 = []
             for p in cutlass.range_constexpr(4):
                 r0 = half * 8 + 2 * p
-                q0, q1 = fmul2(raw_q[r0], raw_q[r0 + 1], scale, scale)
+                q0, q1 = raw_q[r0], raw_q[r0 + 1]
+                if cutlass.const_expr(not self.scale_output):
+                    q0, q1 = fmul2(q0, q1, scale, scale)
                 qd0, qd1 = fmul2(q0, q1, exp_g[r0], exp_g[r0 + 1])
                 qd.append(fp32_to_fp16(qd0, qd1, dtype=io))
                 qd32 += [qd0, qd1]
@@ -1188,6 +1218,7 @@ class KdaBprop(WarpSpecialized):
                         tmem,
                         base + rev,
                         n_ks,
+                        self.has_dstate(rev),
                         rev + 1 < n_chunks,
                         compute_end - 1 - rev,
                         start,
@@ -1208,7 +1239,7 @@ class KdaBprop(WarpSpecialized):
     def seed_dstate(self, params, dstate, tsig, geo, tmem, n, batch, head, seed_true):
         """dS of the item's last chunk: ``dstate_in[batch, head] 2^g_last`` (zero for a split
         item's warmup), as the fp32 accumulator, its fp16 MMA operand and the SMEM tile (under
-        fp16 io the operand and the tile hold ``dstate_in`` itself)."""
+        TF32 decay the operand and the tile hold ``dstate_in`` itself)."""
         _l, _t, _w, lane_base, _lo, _hi, value_dim, row_valid = geo
         dh = dstate.acquire(skip_fence="after", reason=AFTER_FENCE_COVERED)
         stage = n & 1
@@ -1273,6 +1304,7 @@ class KdaBprop(WarpSpecialized):
         tmem,
         n,
         n_ks,
+        has_dstate,
         capture,
         chunk,
         start,
@@ -1343,29 +1375,39 @@ class KdaBprop(WarpSpecialized):
                     y_hi[r], diff_hi[2 * r], diff_hi[2 * r + 1] = _beta_residual(
                         v_hi[r], betas[2 * (r // 2)], betas[2 * (r // 2) + 1], None, None, io
                     )
-        tmem_st("16x128b", lane_base + tmem.cols("yin"), [y_lo[i] for i in range(4)])
-        if cutlass.const_expr(wide):
-            tmem_st("16x128b", hi_lanes + tmem.cols("yin"), [y_hi[i] for i in range(4)])
+        if cutlass.const_expr(self.tf32_solve):
+            s_do = params.s_do + (n & 1) * (self.d_v * B_T * 2)
+            self.sig_wait("do_full", self.barrier_ptr("do") + (n & 1), (n >> 1) & 1)
+            self.stage_solve_inputs(diff_lo, betas, s_do + 2 * ov_lo, lane_base, tmem)
+            if cutlass.const_expr(wide):
+                self.stage_solve_inputs(diff_hi, betas, s_do + 2 * ov_hi, hi_lanes, tmem)
+        else:
+            tmem_st("16x128b", lane_base + tmem.cols("yin"), [y_lo[i] for i in range(4)])
+            if cutlass.const_expr(wide):
+                tmem_st("16x128b", hi_lanes + tmem.cols("yin"), [y_hi[i] for i in range(4)])
         cute.arch.fence_view_async_tmem_store()
         before_sync_and_arrive(tsig + Y_IN)
 
-        # ---- dU accumulator -> fp16 MMA operand ----------------------------------------------
+        # ---- Round dU to the solve dtype for the dY product. --------------------------------
         self.sig_wait("du_acc", tsig + DU_ACC, ph)
         du_lo = tmem_ld("16x256b", 2, lane_base + tmem.cols("du"))
         du_hi = [Float32(0.0)] * 8
         if cutlass.const_expr(wide):
             du_hi = tmem_ld("16x256b", 2, hi_lanes + tmem.cols("du"))
-        tmem_st(
-            "16x128b",
-            lane_base + tmem.cols("duin"),
-            [fp32_to_fp16(du_lo[2 * r], du_lo[2 * r + 1], dtype=io) for r in range(4)],
-        )
+        if cutlass.const_expr(self.scale_output):
+            du_lo = scale_du(du_lo, params.scale, lane_base + tmem.cols("dki"), has_dstate)
+            if cutlass.const_expr(wide):
+                du_hi = scale_du(du_hi, params.scale, hi_lanes + tmem.cols("dki"), has_dstate)
+            # The Q state term reads scaled dO before DY_ACC lets us reuse this tile for dY.
+            s_do = params.s_do + (n & 1) * (self.d_v * B_T * 2)
+            stage_scaled_do(s_do, params.s_dy, ov_lo, params.scale, io)
+            if cutlass.const_expr(wide):
+                stage_scaled_do(s_do, params.s_dy, ov_hi, params.scale, io)
+            cute.arch.fence_view_async_shared()
+        solve_t = Float32 if cutlass.const_expr(self.tf32_solve) else io
+        store_solve_operand(((lane_base + tmem.cols("duin"), du_lo),), solve_t)
         if cutlass.const_expr(wide):
-            tmem_st(
-                "16x128b",
-                hi_lanes + tmem.cols("duin"),
-                [fp32_to_fp16(du_hi[2 * r], du_hi[2 * r + 1], dtype=io) for r in range(4)],
-            )
+            store_solve_operand(((hi_lanes + tmem.cols("duin"), du_hi),), solve_t)
         cute.arch.fence_view_async_tmem_store()
         before_sync_and_arrive(tsig + DU_IN)
 
@@ -1375,17 +1417,9 @@ class KdaBprop(WarpSpecialized):
         u_hi = [Float32(0.0)] * 8
         if cutlass.const_expr(wide):
             u_hi = tmem_ld("16x256b", 2, hi_lanes + tmem.cols("u"))
-        stmatrix(
-            params.s_u + 2 * ov_lo,
-            [fp32_to_fp16(u_lo[2 * r], u_lo[2 * r + 1], dtype=io) for r in range(4)],
-            trans=True,
-        )
+        self.stage_u_smem(params, ov_lo, u_lo)
         if cutlass.const_expr(wide):
-            stmatrix(
-                params.s_u + 2 * ov_hi,
-                [fp32_to_fp16(u_hi[2 * r], u_hi[2 * r + 1], dtype=io) for r in range(4)],
-                trans=True,
-            )
+            self.stage_u_smem(params, ov_hi, u_hi)
         cute.arch.fence_view_async_shared()
         before_sync_and_arrive(tsig + U_SMEM)
 
@@ -1494,7 +1528,7 @@ class KdaBprop(WarpSpecialized):
         self.cg1_sync.sync(aligned=True, skip_fence="both", reason=BOTH_FENCES_COVERED)
 
         # ---- dS for the next chunk: 2^g_last(next) dS, its fp16 operand and SMEM tile -------
-        # (under fp16 io the operand and the tile hold dS itself)
+        # (with TF32 decay the operand and tile hold unscaled dS)
         # Fenced only for the dS store after the last chunk (``store_dstate0``) without the
         # scale wait of a capture.
         self.sig_wait("dstate_acc", tsig + DSTATE_ACC, ph, fence=self.use_dstate0)
@@ -1537,6 +1571,35 @@ class KdaBprop(WarpSpecialized):
                         st_shared_v4(params.s_dstate + 2 * addr, words[4 * q : 4 * q + 4])
             dsh.commit()
         return raw, beta, dv, dstate, n_ks
+
+    @cute.jit
+    def stage_u_smem(self, params, offset, frag):
+        io = self.io_dtype
+        hi = [fp32_to_fp16(frag[2 * r], frag[2 * r + 1], dtype=io) for r in range(4)]
+        stmatrix(params.s_u + 2 * offset, hi, trans=True)
+        if cutlass.const_expr(self.tf32_solve):
+            # Keep BF16 U for dK_restore. A second BF16 tile holds TF32(U) minus BF16(U)
+            # so the score gradients can accumulate both parts of the forward operand.
+            lo = []
+            for i in cutlass.range_constexpr(4):
+                a, b = f16x2_to_f32(hi[i], dtype=io)
+                u0 = as_f32(tf32_round(frag[2 * i]) & Int32(-8192))
+                u1 = as_f32(tf32_round(frag[2 * i + 1]) & Int32(-8192))
+                lo.append(fp32_to_fp16(u0 - a, u1 - b, dtype=io))
+            stmatrix(params.s_u_lo + 2 * offset, lo, trans=True)
+
+    @cute.jit
+    def stage_solve_inputs(self, diff, betas, s_do, tmem_row, tmem):
+        y = []
+        do = []
+        packed_do = ldmatrix(s_do, 4, trans=True)
+        for i in cutlass.range_constexpr(4):
+            j = 2 * (i // 2)
+            y += list(fmul2(diff[2 * i], diff[2 * i + 1], betas[j], betas[j + 1]))
+            do += list(f16x2_to_f32(packed_do[i], dtype=self.io_dtype))
+        store_solve_operand(
+            ((tmem_row + tmem.cols("yin"), y), (tmem_row + tmem.cols("duin"), do)), Float32
+        )
 
     @cute.jit
     def store_dstate0(self, params, geo, tmem, tile, batch, head, n_chunks):
@@ -1703,7 +1766,9 @@ class KdaBprop(WarpSpecialized):
                 pa1, pb1 = fadd2(hacc[1], hacc[3], hacc[5], hacc[7])
                 part_a, part_b = fadd2(pa0, pb0, pa1, pb1)
                 dgate_last = dgate_last + (part_a + part_b)
-            if cutlass.const_expr(self.tf32_decay):  # the tile holds dS itself
+            if cutlass.const_expr(self.scale_output):
+                dgate_last = _mul_rn(dgate_last, eg[B_T - 1])
+            elif cutlass.const_expr(self.tf32_decay):  # the tile holds dS itself
                 dgate_last = dgate_last * eg[B_T - 1]
             dsh.release()
         sih.release(skip_fence="before", reason=BEFORE_FENCE_COVERED)
@@ -1861,7 +1926,7 @@ class KdaBprop(WarpSpecialized):
                         s_ex + 4 * (seg * (B_T * 32) + token * 32 + swz128(token ^ seg, dim, 4))
                     )
         rh.release()
-        exp_last = []  # fp16: 2^g_last of each channel (token 15: quad 3, rep 1, m 1)
+        exp_last = []  # Last-token decay per channel (token 15: quad 3, rep 1, m 1).
         if cutlass.const_expr(self.tf32_decay):
             exp_last = [shfl_idx(eg[4 + cs * 2 + 1], quad_base + 3) for cs in range(2)]
         qh = qk_raw.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
@@ -1906,7 +1971,9 @@ class KdaBprop(WarpSpecialized):
                 )
                 part = part + shfl_bfly(part, 1)
                 part = part + shfl_bfly(part, 2)
-                if cutlass.const_expr(self.tf32_decay):  # the tile holds dS itself
+                if cutlass.const_expr(self.scale_output):
+                    part = _mul_rn(part, exp_last[cs])
+                elif cutlass.const_expr(self.tf32_decay):  # the tile holds dS itself
                     part = part * exp_last[cs]
                 last_frag[cs] = part
             dsh.release()
@@ -2112,21 +2179,30 @@ class KdaBprop(WarpSpecialized):
                         b = beta_lo if cutlass.const_expr(i % 4 < 2) else beta_hi
                         lower = kk[i] if (strict >> i) & 1 else Float32(0.0)
                         l_regs[i] = lower * b
-                    t = invert_unit_lower_16x16_fragments(l_regs, lane, io)
-                    inter = params.s_inter + th.index * (self.inter_tiles * TILE)
-                    _store_tile(inter + 1 * TILE, frag, t, io)
+                    if cutlass.const_expr(self.tf32_solve):
+                        t = invert_solve(l_regs, lane, Float32)
+                        store_tf32_k_major(params.s_inter + TF32_TILE, t, lane)
+                        store_tf32_k_major(params.s_inter + 2 * TF32_TILE, t, lane, transpose=True)
+                    else:
+                        t = invert_unit_lower_16x16_fragments(l_regs, lane, io)
+                        inter = params.s_inter + th.index * (self.inter_tiles * TILE)
+                        _store_tile(inter + TILE, frag, t, io)
                     th.commit()
                     # ---- dM = dY U^T, beta strict(dM), -beta strict(dM) ----------------------------
                     mh = dm.acquire()
                     self.sig_wait("dy_smem", tsig + DY_SMEM, n & 1)
-                    dmv = _mma_tile(params.s_dy, params.s_u, frag, self.d_v, io)
+                    dmv = self.dot_u(params.s_dy, params, frag)
                     dms = cute.make_rmem_tensor((8,), Float32)
                     for i in cutlass.range_constexpr(8):
                         b = beta_lo if cutlass.const_expr(i % 4 < 2) else beta_hi
                         dms[i] = dmv[i] * b if (strict >> i) & 1 else Float32(0.0)
+                        if cutlass.const_expr(self.scale_output and not self.tf32_solve):
+                            dms[i] = dms[i].to(io).to(Float32)
                     if cutlass.const_expr(self.tf32_decay):  # -dM is a negated-B GEMM
                         inter32 = params.s_inter32  # one stage (see ``TF32_INTER_TILES``)
-                        _store_tiles_tf32(inter32, DM, DM_ROWS, dms, lane)
+                        self.store_pair_tiles(
+                            inter32, DM, DA_ROWS + self.inter32_rows_bytes, dms, lane
+                        )
                     else:
                         inter = params.s_inter + mh.index * (INTER_TILES * TILE)
                         _store_tile(inter + 3 * TILE, frag, dms, io)
@@ -2214,15 +2290,18 @@ class KdaBprop(WarpSpecialized):
                     acc = self.decay_dot(s_qd + op, s_ki + op, offs, frag)
                     for i in cutlass.range_constexpr(8):
                         acc[i] = acc[i] if (incl >> i) & 1 else Float32(0.0)
-                    inter = params.s_inter + ah.index * (self.inter_tiles * TILE)
-                    _store_tile(inter, frag, acc, io)
+                    if cutlass.const_expr(self.tf32_solve):
+                        store_tf32_k_major(params.s_inter, acc, lane, transpose=True)
+                    else:
+                        inter = params.s_inter + ah.index * (self.inter_tiles * TILE)
+                        _store_tile(inter, frag, acc, io)
                     ah.commit()
                     dh.release()
                     # ---- dA = lower(dO U^T) ----------------------------------------------------
                     self.sig_wait("u_smem", tsig + U_SMEM, n & 1)
                     oh = do.wait()
                     s_do = params.s_do + oh.index * (self.d_v * B_T * 2)
-                    dav = _mma_tile(s_do, params.s_u, frag, self.d_v, io)
+                    dav = self.dot_u(s_do, params, frag)
                     oh.release()
                     # ---- dA diagonal -> cg2 ----------------------------------------------------
                     gh = da_diag.acquire()
@@ -2237,7 +2316,8 @@ class KdaBprop(WarpSpecialized):
                     dah = da.acquire()
                     if cutlass.const_expr(self.tf32_decay):
                         inter32 = params.s_inter32  # one stage (see ``TF32_INTER_TILES``)
-                        _store_tiles_tf32(inter32, DA, DA_ROWS, dav, lane)
+                        row_scale = params.scale if self.scale_output else None
+                        self.store_pair_tiles(inter32, DA, DA_ROWS, dav, lane, row_scale)
                     else:
                         inter = params.s_inter + dah.index * (INTER_TILES * TILE)
                         _store_tile(inter + 2 * TILE, frag, dav, io)
@@ -2373,10 +2453,15 @@ class KdaBprop(WarpSpecialized):
         d_ki0 = smem_desc(params.s_kinv, 16, 1024, sw128)
         d_do0 = smem_desc(params.s_do, 16, 1024, sw128)
         d_do_t0 = smem_desc(params.s_do, B_T * 128, 1024, sw128)
+        d_do_scaled = smem_desc(params.s_dy, B_T * 128, 1024, sw128)
         d_qd_t0 = smem_desc(params.s_qdecay, B_T * 128, 1024, sw128)
         d_kd_t0 = smem_desc(params.s_kdecay, B_T * 128, 1024, sw128)
         d_ki_t0 = smem_desc(params.s_kinv, B_T * 128, 1024, sw128)
         d_int0 = smem_desc(params.s_inter, 16, 256, SWIZZLE_32B)
+        if cutlass.const_expr(self.tf32_solve):
+            solve_a = desc_opaque(tf32_k_major_desc(params.s_inter))
+            solve_t = desc_opaque(tf32_k_major_desc(params.s_inter + TF32_TILE))
+            solve_tt = desc_opaque(tf32_k_major_desc(params.s_inter + 2 * TF32_TILE))
         d_dv0 = smem_desc(params.s_dv, 16, 1024, sw128)
         d_dstate_t0 = smem_desc(params.s_dstate, d_v * 128, 1024, sw128)
         d_u0 = smem_desc(params.s_u, 16, 1024, sw128)
@@ -2392,7 +2477,9 @@ class KdaBprop(WarpSpecialized):
                 )
             }
             d_int32 = smem_desc(params.s_inter32, 128, 512, SWIZZLE_NONE)
-            d_rows32 = smem_desc(params.s_inter32, 2048, 512, SWIZZLE_128B_BASE32B)
+            d_rows32 = d_int32
+            if cutlass.const_expr(not self.tf32_solve):
+                d_rows32 = smem_desc(params.s_inter32, 2048, 512, SWIZZLE_128B_BASE32B)
         do_seg = (B_T * d_v * 2) >> 4
         op_seg = (B_T * d_k * 2) >> 4
         inter_seg = (self.inter_tiles * TILE) >> 4
@@ -2458,32 +2545,60 @@ class KdaBprop(WarpSpecialized):
                     if has_dstate:
                         self.sig_wait("dstate_in", tsig + DSTATE_IN, n_dsin & 1)
                         n_dsin += 1
+                        state_du = (
+                            col["dki"] if cutlass.const_expr(self.scale_output) else col["du"]
+                        )
                         mma_ts_all_op(
                             self.g_kstate,
                             col["dstate_in"],
-                            d_ki0 + op_off,
-                            col["du"],
+                            d_ki0 if cutlass.const_expr(self.tf32_solve) else d_ki0 + op_off,
+                            state_du,
                             False,
                             elect,
                         )
+                    if cutlass.const_expr(self.tf32_solve):
+                        umma_commit(tsig + KRESTORE_FREE, elect)
                     ah = a.wait()
-                    mma_ss_op(self.g_do_a, d_do_t, d_int, col["du"], has_dstate, elect)
+                    if cutlass.const_expr(self.tf32_solve):
+                        self.sig_wait("y_in", tsig + Y_IN, n & 1)
+                        solve_mma(self.g_solve32, col["duin"], solve_a, col["du"], False, elect)
+                    else:
+                        accumulate = (
+                            cutlass.Boolean(False)
+                            if cutlass.const_expr(self.scale_output)
+                            else has_dstate
+                        )
+                        mma_ss_op(self.g_do_a, d_do_t, d_int, col["du"], accumulate, elect)
                     umma_commit(tsig + DU_ACC, elect)
                     ah.release()
 
                     # ---- dS Q-term += dO^T(S) @ Q decay -----------------------------------------
                     dh = decay.wait()
-                    mma_ss_op(self.g_do_qd, d_do_t, d_qd_t, col["dstate"], has_dstate, elect)
+                    if cutlass.const_expr(not self.scale_output):
+                        mma_ss_op(self.g_do_qd, d_do_t, d_qd_t, col["dstate"], has_dstate, elect)
 
                     # ---- U = Y(T) @ T^-1, dY = dU(T) @ T^-T ---------------------------------------
-                    th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
-                    self.sig_wait("y_in", tsig + Y_IN, n & 1)
-                    mma_ts_all_op(self.g_t, col["yin"], d_int + slot, col["u"], False, elect)
+                    if cutlass.const_expr(self.tf32_solve):
+                        th = tinv.wait()
+                        solve_mma(self.g_solve32, col["yin"], solve_t, col["u"], False, elect)
+                    else:
+                        th = tinv.wait(skip_fence="after", reason=AFTER_FENCE_COVERED)
+                        self.sig_wait("y_in", tsig + Y_IN, n & 1)
+                        mma_ts_all_op(self.g_t, col["yin"], d_int + slot, col["u"], False, elect)
                     umma_commit(tsig + U_ACC, elect)
                     self.sig_wait("du_in", tsig + DU_IN, n & 1)
-                    mma_ts_all_op(
-                        self.g_t_trans, col["duin"], d_int + slot, col["kstate"], False, elect
-                    )
+                    if cutlass.const_expr(self.scale_output):
+                        mma_ss_op(
+                            self.g_do_qd, d_do_scaled, d_qd_t, col["dstate"], has_dstate, elect
+                        )
+                    if cutlass.const_expr(self.tf32_solve):
+                        solve_mma(
+                            self.g_solve32, col["duin"], solve_tt, col["kstate"], False, elect
+                        )
+                    else:
+                        mma_ts_all_op(
+                            self.g_t_trans, col["duin"], d_int + slot, col["kstate"], False, elect
+                        )
                     umma_commit(tsig + DY_ACC, elect)
                     th.release()
 
@@ -2562,7 +2677,7 @@ class KdaBprop(WarpSpecialized):
                         self.tf32_gemm(
                             tf32_a["kd"] + op32,
                             d_rows32,
-                            DM_ROWS,
+                            DA_ROWS + self.inter32_rows_bytes,
                             col["dki"],
                             True,
                             elect,
@@ -2610,9 +2725,8 @@ class KdaBprop(WarpSpecialized):
 
     @cute.jit
     def decay_dot(self, s_rows, s_kinv, offs, frag):
-        """``A K_inv^T`` (16 x 16, fp32) of one decay stage, ``A`` the decayed rows at ``s_rows``
-        (K_decay for KK, Q_decay for A): tf32 tiles in the tcgen05 layout under fp16 io (``offs``
-        from ``decay_offsets``), else io tiles (``_mma_tile``, fragment geometry ``frag``)."""
+        """Multiply decayed rows (K for KK, Q for A) by K_inv.T. TF32 decay uses the tcgen05
+        layout and precomputed lane offsets; the legacy BF16 path uses 16-bit fragments."""
         if cutlass.const_expr(self.tf32_decay):
             acc = cute.make_rmem_tensor((8,), Float32)
             for i in cutlass.range_constexpr(8):
@@ -2620,6 +2734,26 @@ class KdaBprop(WarpSpecialized):
             mma_decay_16x16(acc, s_rows, s_kinv, 0, *offs, self.d_k, Float32, umma=True)
             return acc
         return _mma_tile(s_rows, s_kinv, frag, self.d_k, self.io_dtype)
+
+    @cute.jit
+    def dot_u(self, lhs, params, frag):
+        acc = _mma_tile(lhs, params.s_u, frag, self.d_v, self.io_dtype)
+        if cutlass.const_expr(self.tf32_solve):
+            acc = _mma_tile(lhs, params.s_u_lo, frag, self.d_v, self.io_dtype, acc)
+        return acc
+
+    @cute.jit
+    def store_pair_tiles(
+        self, base, tile: cutlass.Constexpr, transposed: cutlass.Constexpr, acc, lane, scale=None
+    ):
+        if cutlass.const_expr(self.tf32_solve):
+            store_tf32_k_major(base + tile, acc, lane)
+            adjoint = (
+                acc if cutlass.const_expr(scale is None) else [acc[i] * scale for i in range(8)]
+            )
+            store_tf32_k_major(base + transposed, adjoint, lane, transpose=True)
+        else:
+            _store_tiles_tf32(base, tile, transposed, acc, lane, scale)
 
     @cute.jit
     def tf32_gemm(
@@ -2634,9 +2768,8 @@ class KdaBprop(WarpSpecialized):
         rows: cutlass.Constexpr[bool] = False,
         neg: cutlass.Constexpr[bool] = False,
     ):
-        """``D[d_k, 16] (+)= decay^T @ B``, B the ``Inter32`` tile at byte ``offset``: K-major,
-        or under ``rows`` a row-major (MN-major) one, then optionally negated (``neg``). Two
-        ``.kind::tf32`` K steps over the 16 tokens of the chunk."""
+        """Accumulate decay.T @ B in two K=8 TF32 steps. ``rows`` selects the transposed
+        Inter32 tile; it is MN-major for a 16-bit solve and K-major for a TF32 solve."""
         idesc = self.tf32_idesc
         if cutlass.const_expr(rows):
             idesc = self.tf32_idesc_rows_neg if cutlass.const_expr(neg) else self.tf32_idesc_rows
@@ -2646,7 +2779,7 @@ class KdaBprop(WarpSpecialized):
             desc_tiles + (offset >> 4),
             8 * 128,  # 8 MN-major rows
             # 8 rows of 128 bytes, or 8 K-major columns (two 16-byte core-matrix columns)
-            8 * 128 if cutlass.const_expr(rows) else 8 * 32,
+            8 * 128 if cutlass.const_expr(rows and not self.tf32_solve) else 8 * 32,
             B_T // 8,
             tmem_d,
             acc,
@@ -2730,6 +2863,7 @@ class KdaBprop(WarpSpecialized):
             s_g=addr["Gate"],
             s_dy=addr["Dy"],
             s_u=addr["U"],
+            s_u_lo=addr.get("Ulo", addr["U"]),
             s_dq=addr["Dq"],
             s_dk=addr["Dk"],
             s_dg=addr["Dgate"],
@@ -2838,7 +2972,13 @@ class KdaBprop(WarpSpecialized):
         if cutlass.const_expr(self.tf32_decay):
             for name in ("Kdecay32", "Qdecay32", "Krestore"):
                 layouts[name] = cute.make_layout((d_k * B_T, DECAY_STAGES))
-            layouts["Inter32"] = cute.make_layout((TF32_INTER_BYTES // 4, 1))
+            layouts["Inter32"] = cute.make_layout(
+                ((DA_ROWS + 2 * self.inter32_rows_bytes) // 4, 1)
+            )
+        if cutlass.const_expr(self.tf32_solve):
+            layouts["Inter"] = cute.make_layout((3 * TF32_TILE // 2, 1))
+            layouts["Krestore"] = cute.make_layout((d_k * B_T, 1))
+            layouts["Ulo"] = cute.make_layout((d_v * B_T,))
         bound = self.work.bind((self.num_ctas, 1, 1))
         self.kernel.set_name_prefix(self.get_name())
         self.kernel(
@@ -2977,13 +3117,16 @@ def _tril_mask(lane, strict: cutlass.Constexpr[bool]):
 
 
 @cute.jit
-def _mma_tile(a_base, b_base, frag, depth: cutlass.Constexpr[int], dtype: cutlass.Constexpr):
+def _mma_tile(
+    a_base, b_base, frag, depth: cutlass.Constexpr[int], dtype: cutlass.Constexpr, acc=None
+):
     """``A[16, depth] @ B[16, depth]^T`` with mma.sync from two segment-major 128-byte swizzled
     ``[16 x 64]``-box SMEM tiles; returns the fp32 accumulator fragment."""
     a_row, a_col, b_row, b_col, _t = frag
-    acc = cute.make_rmem_tensor((8,), Float32)
-    for i in cutlass.range_constexpr(8):
-        acc[i] = Float32(0.0)
+    if cutlass.const_expr(acc is None):
+        acc = cute.make_rmem_tensor((8,), Float32)
+        for i in cutlass.range_constexpr(8):
+            acc[i] = Float32(0.0)
     for i in cutlass.range_constexpr(depth // 16):
         seg, col = divmod(i * 16, 64)  # a_col, b_col < 16 stay in the 16-column step's box
         af = ldmatrix(a_base + 2 * (seg * (B_T * 64) + a_row * 64 + swz128(a_row, col + a_col)), 4)
@@ -2992,14 +3135,10 @@ def _mma_tile(a_base, b_base, frag, depth: cutlass.Constexpr[int], dtype: cutlas
     return acc
 
 
-def _inter32_tile():
-    """Layout of a K-major ``Inter32`` tile in 32-bit words, indexed by ``(n, k)``: row ``n``
-    holds ``k``, in 8-row x 16-byte core matrices (LBO 128, SBO 512 bytes, unswizzled)."""
-    return cute.make_layout(((8, 2), (4, 4)), stride=((4, 128), (1, 32)))
-
-
 @cute.jit
-def _store_tiles_tf32(base, tile: cutlass.Constexpr[int], rows: cutlass.Constexpr[int], acc, lane):
+def _store_tiles_tf32(
+    base, tile: cutlass.Constexpr[int], rows: cutlass.Constexpr[int], acc, lane, row_scale=None
+):
     """One fp32 accumulator fragment, rounded to tf32, as the K-major ``Inter32`` tile at byte
     ``tile`` (row ``n`` holds ``k``) and the row-major one at ``rows`` (``tf32_offset``'s
     SWIZZLE_128B_BASE32B layout: 128-byte rows, of which the 16 columns fill half); a lane's
@@ -3008,8 +3147,10 @@ def _store_tiles_tf32(base, tile: cutlass.Constexpr[int], rows: cutlass.Constexp
     for p in cutlass.range_constexpr(4):
         r, c = _acc_rc(lane, 2 * p)
         pair = (words[2 * p], words[2 * p + 1])
-        k_major = 4 * cute.crd2idx((r, c), _inter32_tile())
+        k_major = 4 * cute.crd2idx((r, c), tf32_k_major_tile())
         _st_shared_v2(base + tile + k_major, *pair)
+        if cutlass.const_expr(row_scale is not None):
+            pair = (tf32_round(acc[2 * p] * row_scale), tf32_round(acc[2 * p + 1] * row_scale))
         _st_shared_v2(base + rows + tf32_offset(r, c, B_T, umma=True), *pair)
 
 
@@ -3107,6 +3248,7 @@ def kda_bprop(
     d_final_state: torch.Tensor | None = None,
     d_initial_state: torch.Tensor | None = None,
     work: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    intra_chunk_dtypes: str = "bf16",
 ):
     """Packed ``[T, H, D]`` KDA backward from the checkpoints entering every chunk
     (``checkpoints[checkpoint_row(cu[b], b, c), h]``, ``[rows, H, d_v, d_k]`` in the io dtype;
@@ -3134,6 +3276,7 @@ def kda_bprop(
         d_final_state is not None,
         d_initial_state is not None,
         torch.cuda.get_device_properties(q.device).multi_processor_count,
+        precision=operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes),
         beta_dtype=TORCH_NAMES[beta.dtype],
     )
     table, count, scheduler = work if work is not None else uncut_work_items(cu_seqlens, heads)
@@ -3144,6 +3287,30 @@ def kda_bprop(
         new_tma_slots(op.tma_slot_rows(heads), q.device), scale, None,
     )  # fmt: skip
     return dq, dk, dv, dgate, dbeta
+
+
+@cute.jit
+def scale_du(out_frag, scale, state_col, have_state):
+    result = cute.make_rmem_tensor((8,), Float32)
+    if have_state:
+        state = tmem_ld("16x256b", 2, state_col)
+        for i in cutlass.range_constexpr(8):
+            result[i] = _fma_rn(out_frag[i], scale, state[i])
+    else:
+        for i in cutlass.range_constexpr(8):
+            result[i] = _mul_rn(out_frag[i], scale)
+    return [result[i] for i in range(8)]
+
+
+@cute.jit
+def stage_scaled_do(src, dst, offset, scale, io: cutlass.Constexpr):
+    words = ldmatrix(src + 2 * offset, 4, trans=True)
+    packed = []
+    for i in cutlass.range_constexpr(4):
+        lo, hi = f16x2_to_f32(words[i], dtype=io)
+        lo, hi = fmul2(lo, hi, scale, scale)
+        packed.append(fp32_to_fp16(lo, hi, dtype=io))
+    stmatrix(dst + 2 * offset, packed, trans=True)
 
 
 @cute.jit

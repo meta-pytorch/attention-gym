@@ -20,11 +20,13 @@ from .ptx import (
     ldmatrix,
     mma_step,
     mma_step_k8,
+    mma_tf32,
     movmatrix_16b,
     opaque_i32_zero,
     shfl_idx,
     stmatrix,
     swizzle_xor_128b,
+    tf32_round,
 )
 
 # Segmented shuffle within 8-lane groups: c = ((32 - 8) << 8) | 31.
@@ -304,3 +306,92 @@ def invert_unit_lower_16x16_fragments(l_regs, lane, dtype: cutlass.Constexpr):
         dtype=dtype,
     )
     return tinv
+
+
+# ---- tf32: 16x16 inverse on m16n8k8 tf32 mma.sync -------------------------------------------
+# ``_rc`` maps a lane's eight FP32 accumulator registers to a 16 x 16 matrix. Reusing those
+# registers as MMA inputs gives P @ X.T without a lane shuffle: both operands visit even K
+# columns before odd ones, so their K indices still match. Keep each intermediate and its
+# transpose to get ordinary matrix products from this instruction.
+
+
+@cute.jit
+def _rc(lane, i: cutlass.Constexpr[int]):
+    return lane // 4 + 8 * ((i % 4) // 2), 8 * (i // 4) + 2 * (lane % 4) + i % 2
+
+
+@cute.jit
+def mm_t_tf32(p, x, blocks: cutlass.Constexpr):
+    """Multiply P by X.T, skipping (K block, N block) pairs known to contribute zero."""
+    acc = [cutlass.Float32(0.0)] * 8
+    for kk, nf in blocks:
+        a = [p[4 * kk], p[4 * kk + 2], p[4 * kk + 1], p[4 * kk + 3]]
+        b = [x[4 * kk + 2 * nf], x[4 * kk + 2 * nf + 1]]
+        out = mma_tf32(acc[4 * nf : 4 * nf + 4], a, b)
+        for i in cutlass.range_constexpr(4):
+            acc[4 * nf + i] = out[i]
+    return acc
+
+
+@cute.jit
+def _masked(frag, lane, keep: cutlass.Constexpr):
+    """``frag`` with the values outside ``keep(row, col)`` zeroed."""
+    zero = cutlass.Float32(0.0)
+    return [cutlass.Float32(cutlass.select_(keep(*_rc(lane, i)), frag[i], zero)) for i in range(8)]
+
+
+@cute.jit
+def _transpose(frag, lane):
+    """Transpose the fragment. The source register for (c, r) depends on the parity of r,
+    so each lane shuffles both candidates before selecting one."""
+    g = lane // 4
+    out = []
+    for i in cutlass.range_constexpr(8):
+        a, b, k = (i % 4) // 2, i // 4, i % 2  # row block, column block, column parity
+        src = 4 * (2 * (lane % 4) + k) + g // 2
+        even = shfl_idx(frag[2 * b + 4 * a], src)
+        odd = shfl_idx(frag[2 * b + 4 * a + 1], src)
+        out.append(cutlass.Float32(cutlass.select_(g % 2 == 1, odd, even)))
+    return out
+
+
+@cute.jit
+def tf32_words(frag):
+    return [tf32_round(frag[i]) for i in range(8)]
+
+
+@cute.jit
+def _sub(x, y):
+    return [x[i] - y[i] for i in range(8)]
+
+
+@cute.jit
+def invert_unit_lower_16x16_tf32(l_regs, lane):
+    """Return inv(I + L) in FP32 using TF32 matrix products. Invert the 4 x 4 diagonal
+    blocks by their finite series, then double the block size twice. For each pair of
+    diagonal blocks A and D, the inverse's lower-left block is -inv(D) @ C @ inv(A)."""
+    diag = ((0, 0), (1, 1))  # products confined to the 8x8 diagonal blocks
+    eye = _masked([cutlass.Float32(1.0)] * 8, lane, lambda r, c: r == c)
+    lt = _transpose(l_regs, lane)
+    l4 = _masked(l_regs, lane, lambda r, c: r // 4 == c // 4)
+    l4t = _masked(lt, lane, lambda r, c: r // 4 == c // 4)
+    l4w, l4tw = tf32_words(l4), tf32_words(l4t)
+    # ---- D4 = I - L4 + S - L4 S, S = L4 L4 (and the transposes) -------------------------
+    s = mm_t_tf32(l4w, l4tw, diag)
+    st = mm_t_tf32(l4tw, l4w, diag)
+    stw = tf32_words(st)
+    ls = mm_t_tf32(l4w, stw, diag)
+    lst = mm_t_tf32(stw, l4w, diag)
+    d4 = [eye[i] - l4[i] + s[i] - ls[i] for i in range(8)]
+    d4t = [eye[i] - l4t[i] + st[i] - lst[i] for i in range(8)]
+    d4w, d4tw = tf32_words(d4), tf32_words(d4t)
+    # ---- M = D4 C4, D8 = D4 - M D4 --------------------------------------------------------
+    c4tw = tf32_words(_masked(lt, lane, lambda r, c: (r // 8 == c // 8) & (c // 4 == r // 4 + 1)))
+    mw = tf32_words(mm_t_tf32(d4w, c4tw, diag))
+    d8 = _sub(d4, mm_t_tf32(mw, d4tw, diag))
+    d8t = _sub(d4t, mm_t_tf32(d4tw, mw, diag))
+    d8w, d8tw = tf32_words(d8), tf32_words(d8t)
+    # ---- M8 = D8 C8 (rows 8-15, columns 0-7), T^-1 = D8 - M8 D8 ------------------------------
+    c8tw = tf32_words(_masked(lt, lane, lambda r, c: (r < 8) & (c >= 8)))
+    m8w = tf32_words(mm_t_tf32(d8w, c8tw, ((1, 0),)))
+    return _sub(d8, mm_t_tf32(m8w, d8tw, ((0, 0),)))
