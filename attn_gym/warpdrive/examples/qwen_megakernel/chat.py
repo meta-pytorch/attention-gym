@@ -80,7 +80,9 @@ class QwenChatModel:
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        self.weights = load_qwen3_weights(checkpoint)
+        self.weights = load_qwen3_weights(
+            checkpoint, interleave_gate_up=options.backend == "megakernel"
+        )
         config = self.weights.config
         hf_config = json.loads((checkpoint / "config.json").read_text())
         native = hf_config["max_position_embeddings"]

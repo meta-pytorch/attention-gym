@@ -67,7 +67,7 @@ import math
 
 import torch
 
-from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM, SMEM_BYTES
 from attn_gym.warpdrive.examples.megakernel.launch import tagged_values
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
@@ -193,7 +193,8 @@ class QwenMegakernel:
         inputs from global memory through an activation ring (``QwenDecodeMegakernelTcStream``).
         QKV and LM-head inputs, plus dense MLP inputs, are shared across CTAs; other inputs
         use per-CTA scratch. See that class for the dataflow. ``config``: ``QwenDecodeMegakernel``
-        constructor arguments; the model shape comes from ``weights.config``."""
+        constructor arguments except the shared-memory budget, which comes from the weights'
+        device. The model shape comes from ``weights.config``."""
         kernel = kernel_class(engine, stream_inputs)
         if max_len % BLOCK:
             raise ValueError(f"max_len must be a multiple of {BLOCK}, got {max_len}")
@@ -201,6 +202,9 @@ class QwenMegakernel:
         self.max_len = max_len
         # The kernel reads RoPE from ``self.rope``: its scaling stays out of the compile key.
         model = dataclasses.replace(weights.config, rope_scaling=None)
+        smem_bytes = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
+        if smem_bytes < SMEM_BYTES:
+            config["smem_bytes"] = smem_bytes
         self.op = op = kernel(model=model, **config)
         self.max_ctas = op.work.launch_args(device)[1]
         self.wqkv = torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1).reshape(
@@ -209,7 +213,10 @@ class QwenMegakernel:
         self.wo = weights.o_proj.reshape(-1, op.q_heads * HEAD_DIM).contiguous()
         # Gate and up rows interleaved, so a 32-row tile holds 16 (gate, up) pairs; MoE weights
         # carry an expert axis after the layer axis.
-        self.wgu = torch.stack((weights.gate, weights.up), dim=-2).reshape(-1, op.hidden)
+        gate_up = weights.packed_gate_up
+        if gate_up is None:
+            gate_up = torch.stack((weights.gate, weights.up), dim=-2)
+        self.wgu = gate_up.view(-1, op.hidden)
         self.wd = weights.down.reshape(-1, weights.down.shape[-1]).contiguous()
         if op.moe:
             self.router = weights.router.reshape(-1, op.hidden).contiguous()

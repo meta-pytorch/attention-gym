@@ -34,6 +34,15 @@ pytestmark = pytest.mark.usefixtures("release_cuda_memory")
 MAX_LEN = 256
 
 
+def require_decode_engine(engine: str) -> None:
+    if not cuda_runs_sm100_kernels() and not (
+        engine == "cuda_core"
+        and torch.cuda.is_available()
+        and torch.cuda.get_device_capability() == (12, 1)
+    ):
+        pytest.skip("requires an SM100-family GPU or the CUDA-core engine on SM121")
+
+
 def cached_weights(repo: str):
     """Load the checkpoint from the local HF cache; skip if it is missing, never download."""
     if not cuda_runs_sm100_kernels():
@@ -267,8 +276,7 @@ def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
 def test_atomic_schedule_matches_the_static_schedule(engine):
     """The atomic schedule's per-layer launches match the default static schedule bit for bit,
     logits and new K/V rows, across repeated steps. The epoch advances once per step."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
+    require_decode_engine(engine)
     config = QwenConfig(
         hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
         intermediate_size=3072, vocab_size=4096,
@@ -293,8 +301,7 @@ def test_atomic_schedule_matches_the_static_schedule(engine):
 def test_cuda_graph_of_steps_matches_eager(engine):
     """A CUDA graph of several steps (as ``chat.py`` captures: position and token advanced on the
     device) replays to the same tokens, logits, K/V rows and step state as eager steps."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
+    require_decode_engine(engine)
     config = QwenConfig(
         hidden_size=1024, num_layers=3, num_q_heads=16, num_kv_heads=8,
         intermediate_size=3072, vocab_size=4096,
@@ -340,8 +347,7 @@ def test_cuda_graph_of_steps_matches_eager(engine):
 def test_odd_gqa_group_random_weights(engine):
     """A GQA group of 3 (like Qwen3-14B's 5) serves one q head per attention row; its o_proj
     splits hold 6 heads, so the combine runs a full and a partial pass. No checkpoint needed."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
+    require_decode_engine(engine)
     config = QwenConfig(
         hidden_size=1024, num_layers=2, num_q_heads=24, num_kv_heads=8,
         intermediate_size=2048, vocab_size=4096,

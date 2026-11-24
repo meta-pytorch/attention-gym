@@ -496,14 +496,14 @@ LMHEAD  4748        32 rows of the tied embedding x final RMSNorm         -> log
 |---|---|
 | Model | Qwen3 0.6B, 1.7B, 8B, 14B and 32B, and Qwen3-MoE 30B-A3B (`load_qwen3_weights` reads the shape from `config.json`; `check_model` names what a shape breaks), bf16 weights, batch 1, one token per launch |
 | Caches | Contiguous bf16 `(layers, kv_heads, max_len, 128)`, `max_len` a multiple of 64, `0 < pos < max_len`; only row `pos` is written |
-| GPU | SM100 family; one CTA per SM, a programmatic-dependent launch per layer |
+| GPU | SM100 family; also DGX Spark (SM121) with `engine="cuda_core"` at batch one. One CTA per SM, a programmatic-dependent launch per layer. |
 | Not supported | Batch > 1, prefill, paging, Qwen3-4B (hidden 2560 is not a multiple of 1024), MoE models across GPUs (235B-A22B) |
 
 The table above shows 0.6B's counts. Larger models change only the counts: an attention row
 serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj split covers a
 quarter of the q heads, the residual polls run 8 elements per thread at a time, the ring keeps
-as many 16 KB stages as fit (11 for 32B), and the default KV split count targets about 128
-attention rows per layer (16 for 0.6B and 1.7B, 8 above).
+as many 16 KB stages as fit on the device (11 for 32B on SM100), and the default KV split count targets
+about 128 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
 
 The GB200 and GB300 tables in this section were measured with the earlier single cooperative
 launch of the whole step.
