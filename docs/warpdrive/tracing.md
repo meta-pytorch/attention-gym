@@ -413,13 +413,25 @@ Path("fa4_bwd_2cta.html").write_text(op.describe(format="html"))
 
 ![FA4 2-CTA backward drawn by describe(format="html")](images/fa4_bwd_2cta_pipeline.png)
 
-Role cards show warps, registers and CTA placement; stacked cards run on every CTA. Channel
-chips show one tick per stage and badges for scope, multicast, fences, overrides, sharing
-and compile results. Overrides that differ from derived values are red. Incoming wires use
-the producer's colour; outgoing wires use the consumer's. Double wires cross CTAs.
+Role cards (square, with a bar on the left) show warps, registers and CTA placement; stacked
+cards run on more than one CTA. Channel chips (rounded) show one tick per stage and badges
+for scope, multicast, fences, overrides, sharing and compile results. Overrides that differ
+from derived values are red. Incoming wires use the producer's colour; outgoing wires use
+the consumer's. Double wires cross CTAs. A handoff back to a node more than one column
+earlier is a feedback wire: long dashes in a lane under the graph. Hold Ctrl or ⌘ and scroll
+to zoom, drag to pan, and press Fit to reset; with a node focused, the arrow keys pan.
 
-Hover or click cards, chips and synchronization hubs for full labels. Work streams, named
-barriers with unknown users and storage aliases appear below the figure.
+Select a card, chip or hub (click, or focus it and press Enter) to read it in the inspector
+below the graph:
+
+- A channel shows what completes its FULL barrier and its EMPTY barrier, drawn as one wire
+  each way between its writers and readers with the declared counts, plus its fences.
+- A role shows its docstring, where its warps sit in each CTA of a cluster of up to four,
+  and every channel it fills or frees as "waits for ... then signals ...".
+
+Under the inspector, a roles-by-channels table lists which role fills and which frees each
+channel. Work streams, named barriers with unknown users and storage aliases follow it.
+Everything on the page comes from the declarations; nothing is measured.
 
 ### See which CTA runs what
 
