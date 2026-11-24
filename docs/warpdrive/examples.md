@@ -502,8 +502,12 @@ LMHEAD  4748        32 rows of the tied embedding x final RMSNorm         -> log
 The table above shows 0.6B's counts. Larger models change only the counts: an attention row
 serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj split covers a
 quarter of the q heads, the residual polls run 8 elements per thread at a time, the ring keeps
-as many 16 KB stages as fit on the device (11 for 32B on SM100), and the default KV split count targets
-about 128 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
+as many 16 KB stages as fit beside the fixed scratch space (up to 12 by default), and the
+default KV split count targets about 128 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
+On DGX Spark, try `QwenMegakernel(weights, max_len, engine="cuda_core")`: the runner uses
+its weights' device to size the ring; no manual stage count is needed. For example, with
+0.6B at batch one, `QwenDecodeMegakernel(smem_bytes=99 * 1024).stages` is 5, versus
+12 with the default SM100 budget.
 
 The GB200 and GB300 tables in this section were measured with the earlier single cooperative
 launch of the whole step.
@@ -657,7 +661,7 @@ layer (hybrid models whose attention layers want another kernel configuration).
   launch's CTAs by their first row's predicted start; the atomic schedule gives each launch its
   own claim counter.
 - **Roles.** Eight compute warps and one TMA load warp. The load warp streams 16 KB weight
-  and KV stages through a 12-stage `Ring(Tma, Warps)` and never waits on activations, so it
+  and KV stages through a device-sized `Ring(Tma, Warps)` and never waits on activations, so it
   prefetches the next rows' weights while compute polls for inputs. The GEMV is packed FFMA2
   on CUDA cores (or tcgen05 MMAs from a tenth warp, above); weights and KV carry an L2 evict-first hint.
 - **Dependencies between CTAs** are raw code: every activation is a 64-bit word
@@ -735,8 +739,9 @@ Disabled, both emit no instructions.
 - **Materialize tensors before `run_roles`.** Argument tensors materialized lazily inside a
   role, dicts of tensors in params and Python loops in the kernel prologue fail with "operand
   does not dominate this use" at an unrelated line. Keep params flat.
-- **SMEM over-subscription fails only at launch** (`cudaErrorInvalidValue`, e.g. `stages=13`);
-  `describe()` cannot report bytes before compiling.
+- **Ring depth is checked at construction.** An explicit `stages` outside `[2, fit]` raises
+  `ValueError`; `fit` reserves room for fixed buffers, barriers and alignment. This is a budget
+  check, not a compiled resource report: CUDA still checks the actual allocation at launch.
 - **Register budgets don't help a 9-warp CTA.** Three warps share one SM sub-partition, so
   ptxas caps every thread at 168 registers whatever `RoleConfig` asks for; pushing the compute
   role past 168 spills in hot loops. Check `cuobjdump --dump-resource-usage` before timing.

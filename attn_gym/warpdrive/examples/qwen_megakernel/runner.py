@@ -202,10 +202,10 @@ class QwenMegakernel:
         self.max_len = max_len
         # The kernel reads RoPE from ``self.rope``: its scaling stays out of the compile key.
         model = dataclasses.replace(weights.config, rope_scaling=None)
+        if "smem_bytes" in config:
+            raise ValueError("smem_bytes is determined by the weights' device; set stages instead")
         smem_bytes = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
-        if smem_bytes < SMEM_BYTES:
-            config["smem_bytes"] = smem_bytes
-        self.op = op = kernel(model=model, **config)
+        self.op = op = kernel(model=model, smem_bytes=min(smem_bytes, SMEM_BYTES), **config)
         self.max_ctas = op.work.launch_args(device)[1]
         self.wqkv = torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1).reshape(
             -1, op.hidden

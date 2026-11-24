@@ -353,7 +353,14 @@ def test_odd_gqa_group_random_weights(engine):
         intermediate_size=2048, vocab_size=4096,
     )  # fmt: skip
     weights = random_weights(config)
+    packed = torch.stack((weights.gate, weights.up), dim=-2)
+    weights = dataclasses.replace(
+        weights, packed_gate_up=packed, gate=packed.select(-2, 0), up=packed.select(-2, 1)
+    )
+    with pytest.raises(ValueError, match="smem_bytes is determined by the weights' device"):
+        mk.QwenMegakernel(weights, MAX_LEN, smem_bytes=65536)
     runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    assert runner.wgu.is_set_to(packed.view(-1, config.hidden_size))
     assert (runner.op.per_row, runner.op.heads_per_split) == (1, 6)
     caches, token, pos = make_decode_state(weights, 150, MAX_LEN, seed=3)
     ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))

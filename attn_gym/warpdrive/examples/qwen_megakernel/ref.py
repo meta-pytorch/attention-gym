@@ -195,7 +195,8 @@ class QwenWeights:
         return {
             field.name: getattr(self, field.name)
             for field in fields(self)
-            if field.name != "packed_gate_up" and isinstance(getattr(self, field.name), torch.Tensor)
+            if field.name != "packed_gate_up"
+            and isinstance(getattr(self, field.name), torch.Tensor)
         }
 
 
@@ -286,7 +287,7 @@ def load_qwen3_weights(
     missing = set(keys)
     for shard in sorted(checkpoint.glob("*.safetensors")):
         with safe_open(str(shard), framework="pt", device="cpu") as source:
-            for key in source.keys():
+            for key in source.offset_keys():
                 if key not in keys:
                     continue
                 name, index = keys[key]
@@ -294,6 +295,10 @@ def load_qwen3_weights(
                 value = source.get_tensor(key)
                 if value.shape != dst.shape:
                     raise ValueError(f"unexpected shape for {key}: expected {tuple(dst.shape)}")
+                # Stage one tensor, not the shard: direct CUDA copies from the file mapping
+                # are slow on GB10, including when the file is already in the page cache.
+                if dst.is_cuda:
+                    value = value.pin_memory()
                 dst.copy_(value)
                 missing.discard(key)
     if missing:
