@@ -1,5 +1,6 @@
 """Operations share option validation; ``autotune`` belongs in ``kernel_options``."""
 
+import re
 from typing import Literal, get_args, get_origin, get_type_hints
 
 import pytest
@@ -90,7 +91,9 @@ def test_kernel_options_follow_one_contract(make_spec):
         for value in valid:
             assert resolve({name: value}) == {**defaults, name: value}
         for value in wrong:
-            with pytest.raises(error, match=rf"kernel_options\['{name}'\] must be .*{expected}"):
+            with pytest.raises(
+                error, match=rf"kernel_options\['{name}'\] must be .*{re.escape(expected)}"
+            ):
                 resolve({name: value})
 
     documented = {
