@@ -504,8 +504,15 @@ serves two q heads of one kv head (one for 14B's odd group of 5), an o_proj spli
 quarter of the q heads, the residual polls run 8 elements per thread at a time, the ring keeps
 as many 16 KB stages as fit beside the fixed scratch space (up to 12 by default), and the
 default KV split count targets about 128 attention rows per layer (16 for 0.6B and 1.7B, 8 above).
-On DGX Spark, try `QwenMegakernel(weights, max_len, engine="cuda_core")`: the runner uses
-its weights' device to size the ring; no manual stage count is needed. For example, with
+On DGX Spark, load 30B-A3B with interleaved gate/up weights so prefill and decode share
+one allocation:
+
+```python
+weights = load_qwen3_weights("Qwen/Qwen3-30B-A3B", interleave_gate_up=True)
+runner = QwenMegakernel(weights, max_len, engine="cuda_core")
+```
+
+The runner sizes the ring for the weights' device; no manual stage count is needed. With
 0.6B at batch one, `QwenDecodeMegakernel(smem_bytes=99 * 1024).stages` is 5, versus
 12 with the default SM100 budget.
 

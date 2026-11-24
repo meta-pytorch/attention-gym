@@ -45,8 +45,6 @@ def require_decode_engine(engine: str) -> None:
 
 def cached_weights(repo: str):
     """Load the checkpoint from the local HF cache; skip if it is missing, never download."""
-    if not cuda_runs_sm100_kernels():
-        pytest.skip("the megakernel requires an SM100-family GPU")
     hub = pytest.importorskip("huggingface_hub")
     pytest.importorskip("safetensors")
     path = hub.try_to_load_from_cache(repo, "config.json")
@@ -56,7 +54,13 @@ def cached_weights(repo: str):
 
 
 @pytest.fixture(scope="module")
-def weights_0_6b():
+def sm100_checkpoint_matrix():
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("the checkpoint matrix requires an SM100-family GPU")
+
+
+@pytest.fixture(scope="module")
+def weights_0_6b(sm100_checkpoint_matrix):
     return cached_weights("Qwen/Qwen3-0.6B")
 
 
@@ -74,7 +78,7 @@ LARGE = pytest.mark.xdist_group("qwen-large-checkpoints")
         pytest.param("Qwen/Qwen3-32B", marks=LARGE),
     ],
 )
-def weights(request):
+def weights(request, sm100_checkpoint_matrix):
     """Family members that each change a tiling: 1.7B doubles the hidden size; 8B runs two
     attention rows per kv head, 8-head o_proj splits and an untied LM head; 14B serves one q
     head per attention row (GQA group 5), splits the o_proj combine into partial passes and
@@ -227,6 +231,19 @@ def test_oproj_instruction(weights, engine):
 )
 @pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
 def test_decode_steps(weights, ctx, max_len, schedule, splits, engine):
+    check_decode_steps(weights, ctx, max_len, schedule, splits, engine)
+
+
+def test_sm121_checkpoint_decode_steps():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 1):
+        pytest.skip("requires SM121")
+    weights = cached_weights("Qwen/Qwen3-0.6B")
+    check_decode_steps(
+        weights, ctx=127, max_len=256, schedule="static", splits=16, engine="cuda_core"
+    )
+
+
+def check_decode_steps(weights, ctx, max_len, schedule, splits, engine):
     """Test teacher-forced decode steps under both schedules against an fp32 oracle.
 
     Context 127 crosses a KV-block boundary at position 128. Context 1500 gives each split
