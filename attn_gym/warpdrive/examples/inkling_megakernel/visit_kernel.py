@@ -252,10 +252,8 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         activation_format: str = NVFP4,
         stages: int | None = None,
     ):
-        if hidden % COMPUTE_THREADS or hidden % TILE_K:
-            raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS} and {TILE_K}")
-        self.hidden, self.conv_kernel, self.rms_eps = hidden, conv_kernel, rms_eps
-        self.hidden_k_tiles = hidden // TILE_K
+        self.init_hidden(hidden, rms_eps)
+        self.conv_kernel = conv_kernel
         # Gates 0-2 read the attention prologue's queries (full layers: one per stream), the
         # MLP gate the MLP prologue's.
         self.init_messages(messages, (0, 1, 2, 0) if full else (0, 0, 0, 0))
@@ -315,10 +313,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         ``xq_row`` (the quantized input)."""
         return max(self.streams + 2, 4)
 
-    @property
-    def xq_row(self) -> int:
-        """The X row of the quantized MLP input (``MlpHalf.quantize_input``)."""
-        return 3
+    xq_row = 3  # the X row of the quantized MLP input (``MlpHalf.quantize_input``)
 
     # Sizes of the SMEM buffers MIX, QKVS, AMAX (fp32) and ROUTE (rows of 2 * top_k fp32), and
     # any further bytes a subclass declares (``multi_kernel``).

@@ -59,8 +59,9 @@ def shared_target_tensors(path: Path):
     found = {}
     for shard in sorted(path.glob("model*.safetensors")):
         with safe_open(str(shard), "pt", device="cuda") as handle:
+            keys = set(handle.keys())
             for field, name in names.items():
-                if f"model.llm.{name}" in handle.keys():  # noqa: SIM118 (not a dict)
+                if f"model.llm.{name}" in keys:
                     found[field] = handle.get_tensor(f"model.llm.{name}").bfloat16()
     found["lm_head"] = found["lm_head"][:vocab].contiguous()
     return SimpleNamespace(**found)
@@ -70,13 +71,13 @@ def step_bytes(weights: DSparkWeights, drafts: int) -> int:
     """Bytes a draft step of ``drafts`` drafts reads at least once: every drafter matrix, the
     LM head once and the fold weight once per Markov step."""
     matrices = sum(
-        t.numel() * t.element_size()
+        t.nbytes
         for layer in weights.layers
         for t in (layer.wq, layer.wk, layer.wv, layer.wk_ctx, layer.wv_ctx, layer.wo,
                   layer.w_gate, layer.w_up, layer.w_down)
     )  # fmt: skip
-    head = weights.lm_head.numel() * 2 + weights.rnn_proj.numel() * 2
-    fold = drafts * weights.fold_weight.numel() * 2
+    head = weights.lm_head.nbytes + weights.rnn_proj.nbytes
+    fold = drafts * weights.fold_weight.nbytes
     return matrices + head + fold
 
 

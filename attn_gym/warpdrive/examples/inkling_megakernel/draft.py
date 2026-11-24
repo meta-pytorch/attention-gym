@@ -48,6 +48,19 @@ def draft_table(op, ctas: int) -> torch.Tensor:
     return table_of(op.lists(ctas), WORDS)
 
 
+def launch_args(launch: Launch) -> tuple:
+    """The arguments every draft launch takes last: its trace buffer, tagged scratch, state,
+    table, workspace and CTA bound (``draft_common.compile_draft``)."""
+    return (
+        launch.trace_buffer,
+        launch.scratch,
+        launch.state,
+        launch.table,
+        launch.workspace,
+        launch.max_ctas,
+    )
+
+
 def qkv_splits_for(hidden: int) -> int:
     """The backbone's q/k/v split-K for a ``hidden`` size: the most of ``QKV_SPLITS``, 2 and 1
     that cut it into whole ``TILE_K`` tiles."""
@@ -61,7 +74,7 @@ def rope_table(config: DSparkConfig, max_len: int, device) -> torch.Tensor:
     """fp32 ``(max_len, head_dim)``: ``[cos | sin]`` of each position's RoPE angles
     (``dspark.rope_angles``, as ``dspark.rope`` takes them)."""
     angles = rope_angles(config, torch.arange(max_len, device=device))
-    return torch.cat([angles.cos(), angles.sin()], dim=-1).contiguous()
+    return torch.cat([angles.cos(), angles.sin()], dim=-1)
 
 
 class DSparkMegakernel:
@@ -88,10 +101,10 @@ class DSparkMegakernel:
         self.taps = len(c.target_visits)
         layers = weights.layers
         self.cache = DSparkCache.empty(c, max_len, device=device)
-        self.wkv = torch.cat([torch.cat([w.wk_ctx, w.wv_ctx]) for w in layers]).contiguous()
+        self.wkv = torch.cat([torch.cat([w.wk_ctx, w.wv_ctx]) for w in layers])
         self.alpha = weights.fuse_alpha.contiguous()
-        self.dflare = torch.stack([w.dflare_norm for w in layers]).contiguous()
-        self.k_norm_ctx = torch.stack([w.k_norm_ctx for w in layers]).contiguous()
+        self.dflare = torch.stack([w.dflare_norm for w in layers])
+        self.k_norm_ctx = torch.stack([w.k_norm_ctx for w in layers])
         self.rope = rope_table(c, max_len, device)
         self.f_rnn = torch.zeros(c.hidden_size, device=device, dtype=torch.bfloat16)
         ctx = DraftCtxKernel.get_or_build(
@@ -103,18 +116,18 @@ class DSparkMegakernel:
         )
         self.ctx = Launch(ctx, draft_table, device, trace)
         # The block's layers: [wq; wk; wv], wo, gate/up interleaved by 16 rows, w_down.
-        self.wqkv = torch.cat([torch.cat([w.wq, w.wk, w.wv]) for w in layers]).contiguous()
-        self.wo = torch.cat([w.wo for w in layers]).contiguous()
+        self.wqkv = torch.cat([torch.cat([w.wq, w.wk, w.wv]) for w in layers])
+        self.wo = torch.cat([w.wo for w in layers])
         self.wgu = torch.cat([
             torch.stack([w.w_gate.view(-1, 16, c.hidden_size), w.w_up.view(-1, 16, c.hidden_size)],
                         dim=1).reshape(-1, c.hidden_size)
             for w in layers
-        ]).contiguous()  # fmt: skip
-        self.wd = torch.cat([w.w_down for w in layers]).contiguous()
-        self.input_norm = torch.stack([w.input_norm for w in layers]).contiguous()
-        self.post_norm = torch.stack([w.post_norm for w in layers]).contiguous()
-        self.q_norm = torch.stack([w.q_norm for w in layers]).contiguous()
-        self.k_norm = torch.stack([w.k_norm for w in layers]).contiguous()
+        ])  # fmt: skip
+        self.wd = torch.cat([w.w_down for w in layers])
+        self.input_norm = torch.stack([w.input_norm for w in layers])
+        self.post_norm = torch.stack([w.post_norm for w in layers])
+        self.q_norm = torch.stack([w.q_norm for w in layers])
+        self.k_norm = torch.stack([w.k_norm for w in layers])
         backbone = DraftBackboneKernel.get_or_build(
             hidden=c.hidden_size,
             layers=c.num_layers,
@@ -171,12 +184,7 @@ class DSparkMegakernel:
             self.f_rnn,
             positions,
             self.last_rows[rows - 1] if last is None else last.reshape(1),
-            launch.trace_buffer,
-            launch.scratch,
-            launch.state,
-            launch.table,
-            launch.workspace,
-            launch.max_ctas,
+            *launch_args(launch),
         )
 
     def commit_rows(self, features: torch.Tensor, start: int):
@@ -209,12 +217,7 @@ class DSparkMegakernel:
             anchor.reshape(1),
             pos.reshape(1),
             self.hidden,
-            launch.trace_buffer,
-            launch.scratch,
-            launch.state,
-            launch.table,
-            launch.workspace,
-            launch.max_ctas,
+            *launch_args(launch),
         )
         return self.hidden
 
@@ -233,12 +236,7 @@ class DSparkMegakernel:
             w.fold_bias,
             anchor.reshape(1),
             self.drafts,
-            launch.trace_buffer,
-            launch.scratch,
-            launch.state,
-            launch.table,
-            launch.workspace,
-            launch.max_ctas,
+            *launch_args(launch),
         )
         return self.drafts
 

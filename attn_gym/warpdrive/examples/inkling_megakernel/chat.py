@@ -328,29 +328,21 @@ class InklingChatModel:
         self.backend = backend.from_options(self.weights, self.cache, checkpoint, options)
         self.label = f"the {options.backend} backend"
         self.effort = reasoning_effort(options)
-        stops = [
-            self.tokenizer.eos_token_id,
-            self.tokenizer.convert_tokens_to_ids("<|endoftext|>"),
-        ]
-        self.stops = {s for s in stops if isinstance(s, int) and s >= 0}
+        self.stops = ref.stop_tokens(self.tokenizer)
 
     def prompt_ids(self, messages: list[dict]) -> list[int]:
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, reasoning_effort=self.effort
-        )
-        return self.tokenizer(text, add_special_tokens=False).input_ids
+        return ref.chat_prompt_ids(self.tokenizer, messages, self.effort)
 
     def prefill(self, ids: list[int], start: int) -> torch.Tensor:
         return self.backend.prefill(ids, start)
-
-    def parts(self, ids: list[int]) -> list[tuple[str, str, bool]]:
-        return reply_parts(self.tokenizer.decode(ids, skip_special_tokens=False))
 
     def reply_text(self, ids: list[int]) -> str:
         """Thinking between markers; the closing marker waits for the part's end, so each
         text extends the previous one (the chat streams the difference)."""
         shown = []
-        for kind, text, closed in self.parts(ids):
+        for kind, text, closed in reply_parts(
+            self.tokenizer.decode(ids, skip_special_tokens=False)
+        ):
             if kind == "thinking":
                 text = f"[thinking]{text}" + ("[/thinking]\n" if closed else "")
             shown.append(text)

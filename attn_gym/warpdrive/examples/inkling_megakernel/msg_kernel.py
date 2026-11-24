@@ -25,7 +25,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, cute
 
-from attn_gym.warpdrive import Consumer, Local, Producer, StageView, WorkCursor, role
+from attn_gym.warpdrive import Consumer, Local, StageView, WorkCursor, role
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     GATE_RANK,
@@ -52,16 +52,15 @@ class MsgParams:
     tma: tuple  # TMA atom of the down projections' message halves
     gmem: tuple  # its tile partition: (TMA, row tiles, k tiles)
     sW: StageView
-    xs: cute.Tensor  # (1, hidden) bf16: the normalized message
+    xs: cute.Tensor  # (tokens, hidden) bf16: the normalized messages
     red: cute.Tensor  # (REDUCTIONS, COMPUTE_WARPS, RED_VALUES) fp32 reductions
     block: cute.Tensor  # (hidden,) bf16 the previous pass's in12
     partial: cute.Tensor  # (hidden,) bf16 the previous pass's out17
     queries: cute.Tensor  # (messages, hidden) fp32 message queries, (layer, gate) major
     messages: cute.Tensor  # (messages, hidden) fp32 output
     mhalf: cute.Tensor  # (messages * GATE_RANK,) fp32 output (multi-token: token-minor)
-    dbuf: cute.Tensor | None = (
-        None  # multi-token: ``examples.megakernel.multi_gemv.finish``'s buffer
-    )
+    # multi-token: ``examples.megakernel.multi_gemv.finish``'s buffer
+    dbuf: cute.Tensor | None = None
 
 
 class InklingMsgKernel(MatrixRowsKernel):
@@ -77,11 +76,6 @@ class InklingMsgKernel(MatrixRowsKernel):
     def get_name(self) -> str:
         tokens = f"_t{self.tokens}" if self.tokens > 1 else ""
         return f"warpdrive_inkling_msg_h{self.hidden}{tokens}_s{self.stages}{self.trace_key()}"
-
-    @role(warps=COMPUTE_WARPS)
-    @cute.jit
-    def load(self, p: MsgParams, *, w: Producer, work: WorkCursor):
-        return self.load_matrix_rows(p, w, work)
 
     @role(warps=range(COMPUTE_WARPS))
     @cute.jit

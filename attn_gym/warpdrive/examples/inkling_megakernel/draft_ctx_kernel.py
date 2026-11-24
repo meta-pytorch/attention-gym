@@ -17,7 +17,7 @@ the device), ``f_rnn`` from row ``last`` (read on the device)::
 Rows at positions outside ``[0, capacity)`` are not stored.
 
 Roles as ``visit_kernel``: warp 8 ``load`` streams 32 x 256 weight stages (as swizzled boxes,
-``draft_common.gemv_atom``), warps 0-7 ``compute``. A head's last K quarter waits on the other
+``ring.swizzled_atom``), warps 0-7 ``compute``. A head's last K quarter waits on the other
 three's tagged words, so the launch is cooperative and the table keeps every CTA's rows in
 dependency order. The last CTA to finish advances the epoch.
 """
@@ -28,59 +28,30 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, cute
 
-from attn_gym.warpdrive import (
-    Consumer,
-    Local,
-    NamedBarrier,
-    Producer,
-    Ring,
-    SmemPlan,
-    StageView,
-    StaticPersistent,
-    Tma,
-    Warps,
-    WorkCursor,
-    WorkStream,
-    role,
-)
-from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive import Consumer, Local, Producer, StageView, WorkCursor, role
+from attn_gym.warpdrive.cache import jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.draft_common import (
-    GRED_FLOATS,
-    REDUCTIONS,
     TOKENS,
-    WORDS,
     DraftKernel,
     check_draft_sizes,
-    gemv_atom,
-    x_layout,
+    compile_draft,
 )
 from attn_gym.warpdrive.examples.megakernel.constants import (
     BOX,
     COMPUTE_THREADS,
     COMPUTE_WARPS,
     HEAD_DIM,
-    RED_VALUES,
     ROWS,
-    STAGE_BYTES,
     TILE_K,
-    X_PAD,
 )
 from attn_gym.warpdrive.examples.megakernel.regmath import (
     bf16_round,
     cta_sum,
     fp32_reciprocal,
-    group_sum,
-    red_layout,
+    load_frag,
 )
-from attn_gym.warpdrive.examples.megakernel.ring import load_boxes, ring_stages, tma_partition
-from attn_gym.warpdrive.examples.megakernel.table import InstructionTable
-from attn_gym.warpdrive.examples.megakernel.tagged import (
-    advance_epoch,
-    fetch,
-    publish,
-    scratch_offsets,
-    tagged_views,
-)
+from attn_gym.warpdrive.examples.megakernel.ring import load_boxes, swizzled_atom
+from attn_gym.warpdrive.examples.megakernel.tagged import advance_epoch, fetch, publish
 
 KV, FRNN = 0, 1  # table ops: a K/V row tile (a = layer, b = tile), the Markov head's f_rnn
 COMPUTE_REGS, LOAD_REGS = 232, 40
@@ -96,8 +67,8 @@ class CtxParams:
     gmem: tuple  # its tile partition: (TMA, row tiles, k tiles)
     sWS: StageView  # the weight ring's swizzled-box view
     xs: cute.Tensor  # (TOKENS, hidden) bf16 the mixed features of the current layer
-    red: cute.Tensor  # ``red_layout(REDUCTIONS)`` fp32
-    gred: cute.Tensor  # (GRED_FLOATS,) fp32 GEMV quarter partials
+    red: cute.Tensor  # ``red_layout(1)`` fp32: markov_context's sum
+    gred: cute.Tensor  # (DBUF_FLOATS, 2) fp32 GEMV quarter partials, double-buffered
     k_raw: cute.Tensor  # tagged (layers, kv_heads, HEAD_DIM, TOKENS) raw k projections
     features: cute.Tensor  # (rows * taps, hidden) bf16 committed rows' target features
     alpha: cute.Tensor  # (layers + 1, taps) fp32 softmax(fuse_weight), bf16-rounded
@@ -131,16 +102,7 @@ class DraftCtxKernel(DraftKernel):
         self.rms_eps = rms_eps
         self.k_tiles = kv_heads * HEAD_DIM // ROWS  # K row tiles per layer; V tiles follow
         self.layer_tiles = 2 * self.k_tiles
-        fixed = 2 * TOKENS * (hidden + X_PAD) + 4 * (REDUCTIONS * COMPUTE_WARPS * RED_VALUES)
-        self.stages = ring_stages(fixed + 4 * GRED_FLOATS, stages)
-        self.smem_plan = SmemPlan()
-        ring = self.ring_buffers()
-        self.smem_plan.buffer("X", BFloat16, align=16)
-        self.smem_plan.buffer("RED", Float32, align=16)
-        self.smem_plan.buffer("GRED", Float32, align=16)
-        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer=ring)
-        self.csync = NamedBarrier(threads=COMPUTE_THREADS)
-        self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
+        self.declare_engine(hidden, 0, stages, reductions=1)
 
     @property
     def scratch_shapes(self) -> dict[str, int]:
@@ -197,15 +159,14 @@ class DraftCtxKernel(DraftKernel):
                 value, w = self.gemv(p, w, p.xs, self.hidden // TILE_K, gbuf, tid, warp, lane)
                 gbuf = 1 - gbuf
                 v = bf16_round(value)
+                d = (b % 4) * ROWS + row
                 if b >= self.k_tiles:
                     kvh = (b - self.k_tiles) // 4
-                    d = (b % 4) * ROWS + row
                     if (n < n_new) & (pos0 + n >= 0) & (pos0 + n < max_len):
                         cache_row = (a * self.kv_heads + kvh) * max_len + pos0 + n
                         p.v_cache[cache_row, d] = BFloat16(v)
                 else:
                     kvh = b // 4
-                    d = (b % 4) * ROWS + row
                     publish(p.k_raw, ((a * self.kv_heads + kvh) * HEAD_DIM + d) * TOKENS + n,
                             v, epoch)  # fmt: skip
                     if b % 4 == 3:
@@ -226,25 +187,17 @@ class DraftCtxKernel(DraftKernel):
         h = self.hidden
         chunks = h // 128
         vals = cute.make_rmem_tensor((chunks * 4,), Float32)
-        vals.fill(0.0)
         row = cutlass.min(warp, rows - 1)  # rows past ``rows``: loaded in bounds, zeroed below
         for tap in cutlass.range_constexpr(self.taps):
             weight = p.alpha[layer, tap]
             for j in cutlass.range_constexpr(chunks):
-                frag = cute.make_rmem_tensor((4,), BFloat16)
-                src = p.features[row * self.taps + tap, None]
-                cute.autovec_copy(cute.local_tile(src, (4,), (32 * j + lane,)), frag)
+                frag = load_frag(p.features[row * self.taps + tap, None], 128 * j + 4 * lane, 4)
                 for e in cutlass.range_constexpr(4):
                     if cutlass.const_expr(tap == 0):
                         vals[4 * j + e] = Float32(frag[e]) * weight
                     else:
                         vals[4 * j + e] = vals[4 * j + e] + Float32(frag[e]) * weight
-        ss = Float32(0.0)
-        for i in cutlass.range(chunks * 4, unroll_full=True):
-            ss = ss + vals[i] * vals[i]
-        ss = group_sum(ss, 32)
-        rinv = cute.math.rsqrt(ss * fp32_reciprocal(h) + Float32(self.rms_eps))
-        rinv = cutlass.select_(warp < rows, rinv, Float32(0.0))
+        rinv = cutlass.select_(warp < rows, self.warp_rinv(vals, h), Float32(0.0))
         self.store_row(p.xs, warp, h, vals, rinv, p.dflare[layer, None], lane)
         self.csync.sync()
 
@@ -263,11 +216,7 @@ class DraftCtxKernel(DraftKernel):
             epoch,
             uniform=True,
         )
-        ss = Float32(0.0)
-        for i in cutlass.range_constexpr(4):
-            ss = ss + x[i] * x[i]
-        ss = group_sum(ss, 32)
-        rinv = cute.math.rsqrt(ss * fp32_reciprocal(HEAD_DIM) + Float32(self.rms_eps))
+        rinv = self.warp_rinv(x, HEAD_DIM)
         for i in cutlass.range_constexpr(4):
             x[i] = bf16_round(Float32(p.k_norm[layer, lane + 32 * i]) * (x[i] * rinv))
         position = pos0 + warp
@@ -308,28 +257,11 @@ class DraftCtxKernel(DraftKernel):
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
-    def kernel(self, tma, gtensor, scratch, tensors, bound):
-        layouts = self.ring_layouts() | {
-            "X": x_layout(self.hidden),
-            "RED": red_layout(REDUCTIONS),
-            "GRED": cute.make_layout((GRED_FLOATS,)),
-        }
-        self.begin_roles(work=bound, layouts=layouts)
-        tensors = {k: cute.make_tensor(t.iterator, t.layout) for k, t in zip(TENSOR_ARGS, tensors)}
-        trace_buffer = tensors.pop("trace_buffer")
-        tagged = tagged_views(scratch, self.scratch_shapes)
-        smem, gmem = tma_partition(tma, self.buffer("WS"), gtensor, (ROWS, BOX))
-        params = CtxParams(
-            tma=(tma,),
-            gmem=(gmem,),
-            sWS=StageView(smem, axis=cute.rank(smem) - 1),
-            xs=self.buffer("X"),
-            red=self.buffer("RED"),
-            gred=self.buffer("GRED"),
-            **tagged,
-            **tensors,
+    def kernel(self, tma, gtensors, scratch, tensors, bound):
+        trace_buffer, fields, _ = self.begin_draft(
+            bound, {}, TENSOR_ARGS, tensors, scratch, tma, gtensors, [("WS", (ROWS, BOX))]
         )
-        self.run_roles(params, trace_buffer=trace_buffer)
+        self.run_roles(CtxParams(**fields), trace_buffer=trace_buffer)
 
     @cute.jit
     def __call__(
@@ -354,14 +286,10 @@ class DraftCtxKernel(DraftKernel):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        atom, gtensor = gemv_atom(wkv)
-        bound = self.work.bind(table, workspace, max_ctas)
         tensors = (trace_buffer, features, alpha, dflare, markov_norm, k_norm, rope, k_cache, v_cache, f_rnn,
                    positions, last, state)  # fmt: skip
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(atom, gtensor, scratch, tensors, bound).launch(
-            **self.launch_config(bound), stream=stream, cooperative=True
-        )
+        self.launch([swizzled_atom(wkv, BFloat16)], tensors, scratch, table, workspace, max_ctas,
+                    stream)  # fmt: skip
 
 
 @jit_cache
@@ -371,7 +299,7 @@ def compile_draft_ctx_kernel(op: DraftCtxKernel):
     bf16, f32 = BFloat16, Float32
     h, layers = op.hidden, op.layers
     cache_rows = cute.sym_int()
-    return compile_tvm_ffi(
+    return compile_draft(
         op,
         make_fake_compact_tensor(bf16, (layers * 2 * op.kv_heads * HEAD_DIM, h)),  # wkv
         make_fake_compact_tensor(bf16, (cute.sym_int(), h)),  # features (rows * taps, h)
@@ -385,11 +313,4 @@ def compile_draft_ctx_kernel(op: DraftCtxKernel):
         make_fake_compact_tensor(bf16, (h,)),  # f_rnn
         make_fake_compact_tensor(cutlass.Int64, (cute.sym_int(),), assumed_align=8),  # positions
         make_fake_compact_tensor(cutlass.Int64, (1,), assumed_align=8),  # last
-        make_fake_compact_tensor(cutlass.Int64, (cute.sym_int(),)),  # trace buffer
-        make_fake_compact_tensor(cutlass.Int64, (scratch_offsets(op.scratch_shapes)[1],)),
-        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-        make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),
-        make_fake_compact_tensor(Int32, (cute.sym_int(),)),
-        Int32(1),
-        name=op.get_name(),
     )

@@ -73,6 +73,7 @@ from attn_gym.warpdrive.examples.megakernel.act_quant import (
 from attn_gym.warpdrive.examples.megakernel.constants import (
     BACKOFF_NS,
     COMPUTE_THREADS,
+    COMPUTE_WARPS,
     EVICT_FIRST,
     ROWS,
     STAGE_BYTES,
@@ -112,9 +113,8 @@ class MlpHalf:
     (``(1, 2 * top_k)`` fp32: slot s's expert at s, its weight at top_k + s), ``amax`` (fp32
     ``X_AMAX``, ``ACT_AMAX``), ``scales`` (``stage_scales``), the tagged ``logits``, ``act``,
     ``down`` and ``resid`` (the attention half's residual), ``expert_scales`` and the other
-    argument tensors of
-    ``visit_kernel.VisitParams``; quantized, the stage views ``sQW`` (weights) and ``sS``
-    (scales)."""
+    argument tensors of ``visit_kernel.VisitParams``; quantized, the stage views ``sQW``
+    (weights) and ``sS`` (scales)."""
 
     def init_mlp(
         self,
@@ -137,7 +137,7 @@ class MlpHalf:
             raise ValueError(
                 f"activation format must be one of {ACTIVATION_FORMATS}, got {activation_format!r}"
             )
-        if width % (ROWS // 2) or width % 8 or math.ceil(width / TILE_K) * TILE_K > hidden:
+        if width % (ROWS // 2) or math.ceil(width / TILE_K) * TILE_K > hidden:
             raise ValueError(f"expert width {width}: need a multiple of 16 that fits {hidden}")
         if width * WEIGHT_BITS[experts_format] % (8 * 16):  # TMA: 16-byte row strides
             raise ValueError(
@@ -155,7 +155,7 @@ class MlpHalf:
         # experts >= 32 here, so top_k <= 32 also keeps top_k <= experts.
         if per_lane > 32 or not 1 <= top_k <= 32:
             raise ValueError("need at most 1024 experts and 1 to 32 of them per token")
-        if (width + 7) // 8 + (TILE_K - width % TILE_K) % TILE_K // 8 > COMPUTE_THREADS:
+        if math.ceil(width / TILE_K) > COMPUTE_WARPS:  # a warp per down stage
             raise ValueError("the activation fetch covers at most 8 words per compute thread")
         block = BLOCK_COLUMNS[activation_format]
         if hidden % block or width % block:
@@ -273,11 +273,9 @@ class MlpHalf:
                             self.experts_format, w, h, p.xs, xbuf, self.expert_stages[kind],
                             self.expert_subtiles[kind], self.stage_subtiles, warp, lane,
                         )  # fmt: skip
-                    self.epilogue(p, op, a, b, v, row, epoch, warp, lane)
                 else:
-                    k_tiles = self.expert_subtiles[kind]
-                    v, row, w = gemv_tile(w, p.xs, xbuf, k_tiles, warp, lane)
-                    self.epilogue(p, op, a, b, v, row, epoch, warp, lane)
+                    v, row, w = gemv_tile(w, p.xs, xbuf, self.expert_subtiles[kind], warp, lane)
+                self.epilogue(p, kind, a, b, v, row, epoch, lane)
         return w, meta
 
     # ------------------------------------------------------------ compute helpers
@@ -303,7 +301,6 @@ class MlpHalf:
         weights there are TMA's zero fill), and their amax to AMAX; the caller's barrier
         orders them before the GEMV."""
         chunks = self.width // 8
-        threads = chunks + (self.down_k_tiles * TILE_K - self.width) // 8  # (whole warps)
         vals = cute.make_rmem_tensor((8,), Float32)
         vals.fill(0.0)
         if tid < chunks:
@@ -313,7 +310,7 @@ class MlpHalf:
             amax = cta_max(p.red, self.csync, [block_max(vals, 8)], AMAX_RED, warp, lane)[0]
             if tid == 0:  # after cta_max's barrier: past every read of the last slot's amax
                 p.amax[ACT_AMAX] = amax
-        if warp * 32 < threads:
+        if warp < self.down_k_tiles:  # a warp per down stage, zeros past width
             values = quantize_chunk(self.activation_format, vals, amax)
             words = cute.make_rmem_tensor((4,), Int32)
             for j in cutlass.range_constexpr(4):
@@ -324,10 +321,11 @@ class MlpHalf:
             )
 
     @cute.jit
-    def epilogue(self, p, op, a, b, v, row, epoch, warp, lane):
-        """Publish one expert tile's results; ``v`` is tile row ``row``'s dot product on the
-        lanes the engine says own it, scaled (``scaled``) and rounded to bf16."""
-        if op == GATEUP:
+    def epilogue(self, p, kind: cutlass.Constexpr, a, b, v, row, epoch, lane):
+        """Publish one GATEUP (``kind`` 0) or DOWN (1) tile's results; ``v`` is tile row
+        ``row``'s dot product on the lanes the engine says own it, scaled (``scaled``) and
+        rounded to bf16."""
+        if cutlass.const_expr(kind == 0):
             # Tile rows alternate gate, up: the owner of gate row 2j gets up row 2j + 1's.
             up = pair_value(v)
             if owns_pair(lane):

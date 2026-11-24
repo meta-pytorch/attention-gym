@@ -7,10 +7,14 @@ warp r // ROWS_PER_WARP (``owns_row``), the lanes ``owns_pair`` and ``pair_value
 row pairs (2j, 2j + 1)."""
 
 import cutlass
-from cutlass import BFloat16, Float32, cute
+from cutlass import Float32, cute
 
 from attn_gym.warpdrive.examples.megakernel.constants import ROWS_PER_WARP
-from attn_gym.warpdrive.examples.megakernel.regmath import bf16x8_to_f32, warp_transpose_reduce
+from attn_gym.warpdrive.examples.megakernel.regmath import (
+    bf16x8_to_f32,
+    load_tile,
+    warp_transpose_reduce,
+)
 
 
 @cute.jit
@@ -26,15 +30,11 @@ def gemv_tile(w, xs, xrow, k_tiles, warp, lane):
     for kt in cutlass.range(k_tiles, unroll_full=True):
         with w.consume() as h:
             sW = h.view("W")
-            wf = []
-            for r in cutlass.range_constexpr(ROWS_PER_WARP):
-                frag = cute.make_rmem_tensor((8,), BFloat16)
-                row_w = sW[warp * ROWS_PER_WARP + r, None]
-                cute.autovec_copy(cute.local_tile(row_w, (8,), (lane,)), frag)
-                wf.append(frag)
-            xh = cute.make_rmem_tensor((8,), BFloat16)
-            cute.autovec_copy(cute.local_tile(xs, (8,), (kt * 32 + lane,)), xh)
-            xv = bf16x8_to_f32(xh)
+            wf = [
+                load_tile(sW[warp * ROWS_PER_WARP + r, None], lane, 8)
+                for r in range(ROWS_PER_WARP)
+            ]
+            xv = bf16x8_to_f32(load_tile(xs, kt * 32 + lane, 8))
             for r in cutlass.range_constexpr(ROWS_PER_WARP):
                 wv = bf16x8_to_f32(wf[r])
                 a0, a1 = acc[r, 0], acc[r, 1]

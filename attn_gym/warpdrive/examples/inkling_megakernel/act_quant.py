@@ -81,10 +81,6 @@ class ActivationQuant:
 
     format: str
 
-    @property
-    def block_size(self) -> int:
-        return {NVFP4: 16, MXFP8: 32}[self.format]
-
     @classmethod
     def from_declaration(cls, declared: dict) -> "ActivationQuant":
         """The ``required_activation_quantization`` entry of ``hf_quant_config.json``; raises
@@ -203,10 +199,10 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     exponent = torch.where(raw <= 2.0**-127, 0, exponent.clamp(max=254))
     exponent = torch.where(raw.isnan(), 255, exponent)
     scale = ue8m0_scale(exponent)
-    # rcp_rn flushes the subnormal 1 / 2^127 (exponent 254, only reached by infinities) to 0.
-    inverse = torch.where(exponent == 254, 0.0, 1.0 / scale)
+    # rcp_rn flushes the subnormal 1 / 2^127 (exponent 254, only reached by infinities) to 0;
+    # NaN's exponent 255 gets 0 too.
+    inverse = torch.where(exponent >= 254, 0.0, 1.0 / scale)
     inverse = torch.where(exponent == 0, 2.0**127, inverse)
-    inverse = torch.where(exponent == 255, 0.0, inverse)
     values = groups * inverse[..., None]
     # mxfp8.py:24-26: a NaN-dropping maximum, then a NaN-propagating minimum.
     values = torch.fmax(values, torch.tensor(-E4M3_MAX)).clamp(max=E4M3_MAX)

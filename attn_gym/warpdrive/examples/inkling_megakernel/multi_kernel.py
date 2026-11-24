@@ -62,9 +62,8 @@ import math
 
 import cutlass
 from cutlass import BFloat16, Float32, Int32, Int64, cute
-from cutlass._mlir.dialects import llvm
 from cutlass._mlir_helpers.arith import bitcast
-from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass.cutlass_dsl import T
 
 from attn_gym.warpdrive import NamedBarrier
 from attn_gym.warpdrive.examples.inkling_megakernel.attn_half import (
@@ -176,28 +175,26 @@ LAST_FLAG = 383  # RED word of an ATTN item's last-split flag (``merge_if_last``
 CHOSEN_WORD = 128  # RED word of ``route``'s first chosen-expert word (``chosen_words``)
 
 
-@dsl_user_op
-def warp_max_s32(x, *, loc=None, ip=None):
-    """The maximum of ``x`` (Int32) over the warp (``redux.sync``; every lane must call it)."""
-    return Int32(
-        llvm.inline_asm(
-            T.i32(),
-            [Int32(x).ir_value(loc=loc, ip=ip)],
-            "redux.sync.max.s32 $0, $1, 0xffffffff;",
-            "=r,r",
-            has_side_effects=True,  # convergent: not to be moved across divergent code
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-            loc=loc,
-            ip=ip,
-        )
-    )
-
-
 def ordered_key(x):
     """An Int32 that orders as the fp32 ``x`` does (``x`` not NaN; -0 below +0)."""
     word = Int32(bitcast(Float32(x).ir_value(), T.i32()))
     return word ^ ((word >> 31) & Int32(0x7FFFFFFF))
+
+
+@cute.jit
+def group_max(v, width: cutlass.Constexpr):
+    """Maximum over aligned groups of ``width`` lanes (``regmath.group_sum``'s shuffles)."""
+    for step in cutlass.range_constexpr(width.bit_length() - 1):
+        v = cutlass.max(v, cute.arch.shuffle_sync_bfly(v, offset=1 << step))
+    return v
+
+
+def pick(values: list, i):
+    """``values[i]`` for a dynamic ``i`` < ``len(values)`` (a select chain)."""
+    out = values[0]
+    for j in range(1, len(values)):
+        out = cutlass.select_(i == j, values[j], out)
+    return out
 
 
 class InklingMultiVisitKernel(InklingVisitKernel):
@@ -367,7 +364,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         return shapes | {
             "o_in": nt * self.q_heads * HEAD_DIM,
             "count": self.q_heads,
-            # ``shared_prologue``: the attention's and the MLP's input rows (bf16, 4 per word),
+            # ``shared_rows``: the attention's and the MLP's input rows (bf16, 4 per word),
             # MIX (fp32, 2 per word) and each token's flags.
             "xin": self.shared_layout(MLP_GATHER + 1)[0] * h // 4,
             "xmix": nt * MIX_FLOATS,
@@ -440,7 +437,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         epoch = p.state[0] + 1
         pos = Int32(p.pos[0])
         with self.trace_region("normalize"):
-            self.attention_prologue(p, tid, warp, lane)
+            self.shared_rows(p, epoch, tid, warp, lane, ATTN_PROLOGUE)
         self.stage_scales(p, tid)
         obuf = Int32(self.tokens)
         union = Int32(-1)
@@ -450,12 +447,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
             op, a, b, item = work.item
             if (mlp == 0) & self.is_mlp_row(op, a, b):
                 with self.trace_region("mlp.prologue", payload=item):
-                    if cutlass.const_expr(self.messages):
-                        self.mlp_prologue(p, epoch, tid, warp, lane)
-                    elif op == ROUTER:  # (a router CTA's first MLP row)
-                        self.own_rows(p, b, a == 0, epoch, tid, warp, lane, MLP_PROLOGUE)
-                    else:
-                        self.mlp_prologue(p, epoch, tid, warp, lane)
+                    self.mlp_rows(p, op, a, b, epoch, tid, warp, lane, MLP_PROLOGUE)
                 mlp = Int32(1)
             if cutlass.const_expr(self.messages):
                 w, gathered = self.message_row(
@@ -479,8 +471,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
 
     @cute.jit
     def message_row(self, p, w, op, a, b, gathered, epoch, tid, warp, lane, item):
-        """``InklingVisitKernel.message_row``, except that a router CTA gathers its own
-        token's MLP stream itself (``own_rows``; ``router_kind``)."""
+        """``InklingVisitKernel.message_row`` with the gathers of ``shared_rows`` and
+        ``mlp_rows``."""
         if op == MSGDOWN:
             w = self.msgdown(p, w, a, b, epoch, warp, lane)
         elif op == GATEMIX:
@@ -491,22 +483,25 @@ class InklingMultiVisitKernel(InklingVisitKernel):
             gathered = Int32(1)
         elif (op >= ROUTER) & (gathered < 2):
             with self.trace_region("gather", payload=item):
-                if op == ROUTER:
-                    self.own_rows(p, b, a == 0, epoch, tid, warp, lane, MLP_GATHER)
-                else:
-                    self.shared_rows(p, epoch, tid, warp, lane, MLP_GATHER)
+                self.mlp_rows(p, op, a, b, epoch, tid, warp, lane, MLP_GATHER)
             gathered = Int32(2)
         return w, gathered
 
     # ------------------------------------------------------------ prologues
 
     @cute.jit
-    def attention_prologue(self, p, tid, warp, lane):
-        self.shared_rows(p, p.state[0] + 1, tid, warp, lane, ATTN_PROLOGUE)
-
-    @cute.jit
-    def mlp_prologue(self, p, epoch, tid, warp, lane):
-        self.shared_rows(p, epoch, tid, warp, lane, MLP_PROLOGUE)
+    def mlp_rows(self, p, op, a, b, epoch, tid, warp, lane, kind: cutlass.Constexpr):
+        """Before this CTA's first MLP row ``(op, a, b)``: the MLP's input rows of ``kind``
+        (``shared_rows``). The router CTAs compute the rows of ``router_kind``: each its
+        router tile's token's (tile 0's CTA also shares them), copying the other tokens' after
+        its router GEMV (``mlp_row_tokens``); the other CTAs copy them."""
+        if cutlass.const_expr(kind == self.router_kind):
+            if op == ROUTER:
+                self.own_rows(p, b, a == 0, epoch, tid, warp, lane, kind)
+            else:
+                self.copy_rows(p, epoch, tid, kind)
+        else:
+            self.shared_rows(p, epoch, tid, warp, lane, kind)
 
     def shared_layout(self, kind: int) -> tuple[int, int]:
         """``(first row in xin, rows per token)`` of a ``shared_rows`` kind: the attention
@@ -524,23 +519,18 @@ class InklingMultiVisitKernel(InklingVisitKernel):
 
     @cute.jit
     def shared_rows(self, p, epoch, tid, warp, lane, kind: cutlass.Constexpr):
-        """The tokens' GEMV input rows of ``kind`` (``shared_layout``), each computed once
-        (``own_rows``: by CTA t < tokens for token t, or for ``router_kind`` by the router
-        CTAs), then copied by every CTA (``copy_rows``)."""
-        if cutlass.const_expr(kind != self.router_kind):
-            cta = cute.arch.block_idx()[0]
-            if cta < self.tokens:
-                self.own_rows(p, cta, cutlass.Boolean(True), epoch, tid, warp, lane, kind)
+        """The tokens' GEMV input rows of ``kind`` (``shared_layout``; not ``router_kind``:
+        ``mlp_rows``), each computed once (``own_rows``: by CTA t < tokens for token t), then
+        copied by every CTA (``copy_rows``)."""
+        cta = cute.arch.block_idx()[0]
+        if cta < self.tokens:
+            self.own_rows(p, cta, cutlass.Boolean(True), epoch, tid, warp, lane, kind)
         self.copy_rows(p, epoch, tid, kind)
 
-    def rows_buffers(self, p):
-        """``xin`` as 64-bit words and ``xmix`` as fp32."""
-        xin = cute.make_tensor(p.xin.iterator, cute.make_layout((cute.size(p.xin),)))
-        xmix = cute.make_tensor(
-            cute.recast_ptr(p.xmix.iterator, dtype=Float32),
-            cute.make_layout((2 * self.tokens * MIX_FLOATS,)),
-        )
-        return xin, xmix
+    def xmix_floats(self, p):
+        """``xmix`` as fp32."""
+        ptr = cute.recast_ptr(p.xmix.iterator, dtype=Float32)
+        return cute.make_tensor(ptr, cute.make_layout((2 * self.tokens * MIX_FLOATS,)))
 
     @cute.jit
     def own_rows(self, p, t, share, epoch, tid, warp, lane, kind: cutlass.Constexpr):
@@ -555,8 +545,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         first_row, nq = self.shared_layout(kind)
         mixes = kind < ATTN_GATHER and self.messages
         quantize = kind == self.router_kind
-        chunks = h // 8  # 16-byte chunks of a row
-        xin, xmix = self.rows_buffers(p)
+        chunks = h // 8  # 16-byte chunks of a row: two words of xin
         with self.trace_region("rows.own"):
             self.token_rows(p, t, epoch, tid, warp, lane, kind)
             if share:
@@ -575,12 +564,14 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                     c = i * COMPUTE_THREADS + tid
                     if c < nq * chunks:
                         q = c // chunks
+                        chunk = c - q * chunks
                         row = cute.recast_tensor(p.xs[q * nt + source, None], Int64)
-                        index = (first_row + q * nt + t) * chunks + c - q * chunks
+                        index = (first_row + q * nt + t) * chunks + chunk
                         for k in cutlass.range_constexpr(2):
-                            xin[2 * index + k] = row[2 * (c - q * chunks) + k]
+                            p.xin[2 * index + k] = row[2 * chunk + k]
                 if cutlass.const_expr(mixes):
                     if tid < MIX_FLOATS:
+                        xmix = self.xmix_floats(p)
                         xmix[(kind * nt + t) * MIX_FLOATS + tid] = p.mix[t * MIX_FLOATS + tid]
                 self.csync.sync()
                 if tid == 0:
@@ -596,32 +587,26 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         first_row, nq = self.shared_layout(kind)
         mixes = kind < ATTN_GATHER and self.messages
         chunks = h // 8
-        xin, xmix = self.rows_buffers(p)
         if tid < 32:
             seen = cute.make_rmem_tensor((1,), Float32)
             fetch([(p.flags, kind * nt + cutlass.min(tid, nt - 1), 1)], seen, epoch, uniform=True, backoff=BACKOFF_NS)  # fmt: skip
             cute.arch.fence_acq_rel_gpu()
         self.csync.sync()
-        total = nt * nq * chunks
+        total = nt * nq * chunks  # the kind's rows are contiguous in xin
         for i in cutlass.range_constexpr(-(-total // COMPUTE_THREADS)):
             c = i * COMPUTE_THREADS + tid
             if c < total:
                 xrow = c // chunks
-                words = load_vector(
-                    xin.iterator + 2 * ((first_row + xrow) * chunks + c - xrow * chunks), 2
-                )
+                words = load_vector(p.xin.iterator + 2 * (first_row * chunks + c), 2)
                 row = cute.recast_tensor(p.xs[xrow, None], Int64)
                 for k in cutlass.range_constexpr(2):
                     row[2 * (c - xrow * chunks) + k] = words[k]
         if cutlass.const_expr(mixes):
+            xmix = self.xmix_floats(p).iterator + kind * nt * MIX_FLOATS
             for i in cutlass.range_constexpr(-(-nt * MIX_FLOATS // COMPUTE_THREADS)):
                 c = i * COMPUTE_THREADS + tid
                 if c < nt * MIX_FLOATS:
-                    word = cute.arch.load(
-                        xmix.iterator + kind * nt * MIX_FLOATS + c, Float32, sem="relaxed",
-                        scope="gpu",
-                    )  # fmt: skip
-                    p.mix[c] = word
+                    p.mix[c] = cute.arch.load(xmix + c, Float32, sem="relaxed", scope="gpu")
         if cutlass.const_expr((kind == self.router_kind) & (self.activation_format == NVFP4)):
             if tid < nt:
                 amax = cute.make_rmem_tensor((1,), Float32)
@@ -787,14 +772,19 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         return cute.make_tensor(p.att.iterator, cute.make_layout(DBUF_FLOATS))
 
     @cute.jit
+    def gemv(self, p, w, xs, rows, col0, k_tiles: cutlass.Constexpr, warp, lane, tid):
+        """``(value, w)``: thread ``tid``'s value (``examples.megakernel.multi_gemv.finish``) of
+        a bf16 weight tile against the xs ``rows`` (``gemv_bf16``)."""
+        acc, w = gemv_bf16(w, xs, rows, col0, k_tiles, warp, lane)
+        return finish(acc, self.dbuf(p), self.csync, warp, lane, tid), w
+
+    @cute.jit
     def attention_row(self, p, w, op, a, b, item, obuf, pos, epoch, tid, warp, lane):
         nt = self.tokens
         row, t = tid // MMA_N, tid % MMA_N
         if op == QKV:
-            stream = self.stream_of(b)
-            acc, w = gemv_bf16(w, p.xs, self.rows_of(stream * nt), 0, self.hidden_k_tiles, warp,
-                               lane)  # fmt: skip
-            v = finish(acc, self.dbuf(p), self.csync, warp, lane, tid)
+            rows = self.rows_of(self.stream_of(b) * nt)
+            v, w = self.gemv(p, w, p.xs, rows, 0, self.hidden_k_tiles, warp, lane, tid)
             if t < nt:
                 index = t * self.proj_size + self.proj_offset(b) + a * ROWS + row
                 publish(p.proj, index, bf16_round(v), epoch)
@@ -815,9 +805,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                 self.csync.sync()
             if a == 0:
                 self.store_kv_tokens(p, b, pos, epoch, tid)
-            acc, w = gemv_bf16(w, self.buffer("OIN"), self.rows_of(obuf), 0, self.oproj_k_tiles,
-                               warp, lane)  # fmt: skip
-            v = finish(acc, self.dbuf(p), self.csync, warp, lane, tid)
+            v, w = self.gemv(p, w, self.buffer("OIN"), self.rows_of(obuf), 0, self.oproj_k_tiles,
+                             warp, lane, tid)  # fmt: skip
             if t < nt:
                 index = (t * self.o_splits + b) * self.hidden + a * ROWS + row
                 publish(p.o_part, index, v, epoch)
@@ -846,13 +835,20 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         blocks, the first such one scores the new keys (and writes them) alone, in parallel
         with the splits reading the cache."""
         blk0, blk1, _newest = AttentionHalf.split_blocks(self, pos, split)
+        _first, n, per = self.split_span(pos)
+        newest = cutlass.min((n + per - 1) // per, Int32(self.splits - 1))
+        return blk0, blk1, newest
+
+    @cute.jit
+    def split_span(self, pos):
+        """``(first, n, per)`` of ``examples.megakernel.attention.split_blocks``: the first KV
+        block of the cached keys, their block count and the blocks per split."""
         lo = Int32(0)
         if cutlass.const_expr(not self.full):
             lo = cutlass.max(pos - (self.window - 1), Int32(0))
-        n = (pos + BLOCK - 1) // BLOCK - lo // BLOCK
-        per = cutlass.max((n + self.splits - 1) // self.splits, Int32(1))
-        newest = cutlass.min((n + per - 1) // per, Int32(self.splits - 1))
-        return blk0, blk1, newest
+        first = lo // BLOCK
+        n = (pos + BLOCK - 1) // BLOCK - first
+        return first, n, cutlass.max((n + self.splits - 1) // self.splits, Int32(1))
 
     @cute.jit
     def attn_item(self, t, hq, split):
@@ -866,20 +862,25 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         token."""
         r = 16 * mt + 8 * h + g
         rr = cutlass.min(r, Int32(self.group_rows - 1))
-        j = rr // self.tokens
-        return rr, r < self.group_rows, j, rr - j * self.tokens
+        j, t = self.head_token(rr)
+        return rr, r < self.group_rows, j, t
+
+    def head_token(self, r):
+        """``(j, t)`` of query row ``r = j * tokens + t`` (``group_rows``)."""
+        j = r // self.tokens
+        return j, r - j * self.tokens
 
     @cute.jit
     def publish_empty_group(self, p, kvh, split, epoch, tid):
         """``publish_empty_partial`` for every query row of kv head ``kvh``."""
-        nt, rows = self.tokens, self.group_rows
+        rows = self.group_rows
         for k in cutlass.range_constexpr(-(-rows * HEAD_DIM // COMPUTE_THREADS)):
             e = k * COMPUTE_THREADS + tid
             r = e // HEAD_DIM
             d = e - r * HEAD_DIM
             if r < rows:
-                j = r // nt
-                item = self.attn_item(r - j * nt, kvh * self.group + j, split)
+                j, t = self.head_token(r)
+                item = self.attn_item(t, kvh * self.group + j, split)
                 publish(p.attn_o, item * HEAD_DIM + d, Float32(0.0), epoch)
                 if d == 0:
                     publish(p.attn_ml, 2 * item, Float32(-1e30), epoch)
@@ -1086,8 +1087,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                                     dyn_word + self.conv_kernel, kvh, pos, writer, lane, t,
                                     out, False)  # fmt: skip
             elif u < (2 + group) * nt:
-                j = (u - 2 * nt) // nt
-                t = u - 2 * nt - j * nt
+                j, t = self.head_token(u - 2 * nt)
                 base = t * words + j * HEAD_DIM + d0
                 x = cute.make_rmem_tensor((4,), Float32)
                 ss = Float32(0.0)
@@ -1205,18 +1205,9 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         for mt in cutlass.range_constexpr(mts):
             for h in cutlass.range_constexpr(2):
                 _rr, active, j, t = self.lane_row(mt, h, g)
-                base = t * words + j * HEAD_DIM + 2 * c
-                for ks in cutlass.range_constexpr(HEAD_DIM // 16):
-                    for half in cutlass.range_constexpr(2):
-                        col = base + 16 * ks + 8 * half
-                        word = pack_bf16x2(qkvs[col], qkvs[col + 1])
-                        qa[mt, ks, 2 * half + h] = cutlass.select_(active, word, zero)
-                base = t * words + rel_word + j * self.d_rel + 2 * c
-                for s in cutlass.range_constexpr(ksteps):
-                    for half in cutlass.range_constexpr(2):
-                        col = base + 16 * s + 8 * half
-                        word = pack_bf16x2(qkvs[col], qkvs[col + 1])
-                        sa[mt, s, 2 * half + h] = cutlass.select_(active, word, zero)
+                first = t * words + 2 * c
+                self.a_words(qkvs, qa, mt, h, first + j * HEAD_DIM, active)
+                self.a_words(qkvs, sa, mt, h, first + rel_word + j * self.d_rel, active)
         m = cute.make_rmem_tensor((mts, 2), Float32)  # per lane row: running max and sum
         lsum = cute.make_rmem_tensor((mts, 2), Float32)
         m.fill(-1e30)
@@ -1261,8 +1252,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                                 mx = cutlass.max(mx, sc)
                                 if active:
                                     scores[buf + rr * sc_stride + key0 + 2 * c + e] = sc
-                            mx = cutlass.max(mx, cute.arch.shuffle_sync_bfly(mx, offset=1))
-                            mx = cutlass.max(mx, cute.arch.shuffle_sync_bfly(mx, offset=2))
+                            mx = group_max(mx, 4)
                             if active & (c == 0):
                                 scores[buf + maxes + warp * pitch + rr] = mx
                 self.csync.sync()
@@ -1274,7 +1264,6 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                         for i in cutlass.range_constexpr(COMPUTE_WARPS):
                             bm = cutlass.max(bm, scores[buf + maxes + i * pitch + rr])
                         m_new = cutlass.max(m[mt, hh], bm)
-                        alpha = cute.math.exp2(m[mt, hh] - m_new)
                         part = Float32(0.0)
                         for ks in cutlass.range_constexpr(BLOCK // 16):
                             for half in cutlass.range_constexpr(2):
@@ -1285,13 +1274,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                                 pa[mt, ks, 2 * half + hh] = cutlass.select_(
                                     active, pack_bf16x2(p0, p1), zero
                                 )
-                        part = part + cute.arch.shuffle_sync_bfly(part, offset=1)
-                        part = part + cute.arch.shuffle_sync_bfly(part, offset=2)
-                        m[mt, hh] = m_new
-                        lsum[mt, hh] = lsum[mt, hh] * alpha + part
-                        for n in cutlass.range_constexpr(2):
-                            for e in cutlass.range_constexpr(2):
-                                o[mt, n, 2 * hh + e] = o[mt, n, 2 * hh + e] * alpha
+                        self.rescale(m, lsum, o, mt, hh, m_new, group_sum(part, 4))
                 # Rows from pos are stale, and in sliding layers rows before the first
                 # token's window are outside every token's, maybe NaN, and 0 * NaN is NaN:
                 # their zero probabilities take V from the block's nearest visible row.
@@ -1388,26 +1371,40 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                     s = self.group_score(acc[2 * hh + e], bias)
                     sc.append(cutlass.select_((key_t <= t) & active, s, -Float32.inf))
                     mx = cutlass.max(mx, sc[e])
-                mx = cutlass.max(mx, cute.arch.shuffle_sync_bfly(mx, offset=1))
-                mx = cutlass.max(mx, cute.arch.shuffle_sync_bfly(mx, offset=2))
-                m_new = cutlass.max(m[mt, hh], mx)
-                alpha = cute.math.exp2(m[mt, hh] - m_new)
+                m_new = cutlass.max(m[mt, hh], group_max(mx, 4))
                 p0 = cute.math.exp2(sc[0] - m_new)
                 p1 = cute.math.exp2(sc[1] - m_new)
-                part = p0 + p1
-                part = part + cute.arch.shuffle_sync_bfly(part, offset=1)
-                part = part + cute.arch.shuffle_sync_bfly(part, offset=2)
                 pw[hh] = pack_bf16x2(p0, p1)
-                m[mt, hh] = m_new
-                lsum[mt, hh] = lsum[mt, hh] * alpha + part
-                for n in cutlass.range_constexpr(2):
-                    for e in cutlass.range_constexpr(2):
-                        o[mt, n, 2 * hh + e] = o[mt, n, 2 * hh + e] * alpha
+                self.rescale(m, lsum, o, mt, hh, m_new, group_sum(p0 + p1, 4))
             a = (pw[0], pw[1], zero, zero)
             for n in cutlass.range_constexpr(2):
                 out = mma_bf16([o[mt, n, e] for e in range(4)], a, vb[n])
                 for e in cutlass.range_constexpr(4):
                     o[mt, n, e] = out[e]
+
+    @cute.jit
+    def a_words(self, qkvs, words, mt: cutlass.Constexpr, h: cutlass.Constexpr, first, active):
+        """``words[mt, s, 2 half + h]`` for every k step s of ``words``: the lane's MMA A
+        words (bf16 pairs) of ``attention_group``'s row ``16 mt + 8 h + g``, from the fp32
+        vector at ``qkvs`` word ``first`` (the lane's column ``2 c`` included); zero when the
+        row is not ``active``."""
+        for s in cutlass.range_constexpr(cute.size(words, mode=[1])):
+            for half in cutlass.range_constexpr(2):
+                col = first + 16 * s + 8 * half
+                word = pack_bf16x2(qkvs[col], qkvs[col + 1])
+                words[mt, s, 2 * half + h] = cutlass.select_(active, word, Int32(0))
+
+    @cute.jit
+    def rescale(self, m, lsum, o, mt: cutlass.Constexpr, hh: cutlass.Constexpr, m_new, part):
+        """The online softmax of the lane's MMA row ``16 mt + 8 hh + g``: its running max
+        becomes ``m_new``, its sum and P V scale by ``exp2(m - m_new)`` and the sum adds
+        ``part`` (the new keys' probabilities against ``m_new``)."""
+        alpha = cute.math.exp2(m[mt, hh] - m_new)
+        m[mt, hh] = m_new
+        lsum[mt, hh] = lsum[mt, hh] * alpha + part
+        for n in cutlass.range_constexpr(2):
+            for e in cutlass.range_constexpr(2):
+                o[mt, n, 2 * hh + e] = o[mt, n, 2 * hh + e] * alpha
 
     @property
     def mergers(self) -> int:
@@ -1423,7 +1420,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         loads. The count only grows (``splits`` per launch), so in launch epoch e the last
         split sees ``e * splits - 1``. A merging item polls the splits not yet counted, so
         each must run on another CTA: with more items than CTAs only the last one merges."""
-        nt, rows = self.tokens, self.group_rows
+        rows = self.group_rows
         items = self.kv_heads * self.splits
         mergers = cutlass.select_(cute.arch.grid_dim()[0] >= items, Int32(self.mergers), Int32(1))
         flag = cute.make_tensor(p.red.iterator, cute.make_layout((cute.size(p.red),)))
@@ -1437,8 +1434,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         for rnd in cutlass.range_constexpr(-(-rows // COMPUTE_WARPS)):
             r = rank + mergers * (rnd * COMPUTE_WARPS + warp)
             if (rank >= 0) & (r < rows):
-                j = r // nt
-                self.merge_head_token(p, kvh * self.group + j, r - j * nt, epoch, lane)
+                j, t = self.head_token(r)
+                self.merge_head_token(p, kvh * self.group + j, t, epoch, lane)
         self.csync.sync()  # (RED's flag is rewritten by the next item)
 
     @cute.jit
@@ -1449,20 +1446,20 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         groups = nt * width // 4
         rounds = -(-groups // COMPUTE_THREADS)
         vals = cute.make_rmem_tensor((4 * rounds,), Float32)
-        segments = []
+        segments, cells = [], []
         for r in cutlass.range_constexpr(rounds):
+            # Threads past the groups refetch the last one.
             g = cutlass.min(r * COMPUTE_THREADS + tid, groups - 1)
             t = g // (width // 4)
             col = (g - t * (width // 4)) * 4
             index = (t * self.q_heads + split * self.heads_per_split) * HEAD_DIM + col
             segments.append((p.o_in, index, 4))
+            cells.append((t, col))
         fetch(segments, vals, epoch, uniform=True)
         oin = self.buffer("OIN")
         for r in cutlass.range_constexpr(rounds):
-            g = r * COMPUTE_THREADS + tid
-            if g < groups:
-                t = g // (width // 4)
-                col = (g - t * (width // 4)) * 4
+            if r * COMPUTE_THREADS + tid < groups:
+                t, col = cells[r]
                 for e in cutlass.range_constexpr(4):
                     oin[obuf + t, col + e] = BFloat16(vals[4 * r + e])
 
@@ -1484,10 +1481,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         vals = cute.make_rmem_tensor((2 + 4 * splits + 5,), Float32)
         fetch(segments, vals, epoch, uniform=True)
         sink = vals[2 + 4 * splits + 4] * LOG2E
-        m = cutlass.select_(mine, vals[0], -Float32.inf)
-        for step in cutlass.range_constexpr(5):
-            m = cutlass.max(m, cute.arch.shuffle_sync_bfly(m, offset=1 << step))
-        m = cutlass.max(m, sink)
+        m = cutlass.max(group_max(cutlass.select_(mine, vals[0], -Float32.inf), 32), sink)
         weight = cute.math.exp2(cutlass.select_(mine, vals[0], -Float32.inf) - m)
         den = group_sum(cutlass.select_(mine, vals[1], Float32(0.0)) * weight, 32)
         den = den + cute.math.exp2(sink - m)
@@ -1510,12 +1504,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         the ATTN items that read it released before publishing their running max."""
         heads = self.heads_per_split // self.group
         if pos % BLOCK != 0:
-            lo = Int32(0)
-            if cutlass.const_expr(not self.full):
-                lo = cutlass.max(pos - (self.window - 1), Int32(0))
-            n = (pos + BLOCK - 1) // BLOCK - lo // BLOCK
-            per = cutlass.max((n + self.splits - 1) // self.splits, Int32(1))
-            reader = (pos // BLOCK - lo // BLOCK) // per
+            first, _n, per = self.split_span(pos)
+            reader = (pos // BLOCK - first) // per
             if tid < heads:
                 hq = (split * heads + tid) * self.group
                 seen = cute.make_rmem_tensor((1,), Float32)
@@ -1544,11 +1534,16 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                 p.v_cache[kvh * max_len + pos + t, d] = BFloat16(vals[1])
 
     @cute.jit
-    def block_conv(self, ring, taps, col, q, y):
-        """``post_conv``'s bf16 ``(conv + y) / sqrt(kernel + 1)`` at position ``q`` of column
-        ``col``, every earlier input read from the ring (this CTA wrote the block's rows of
-        the column before a barrier)."""
+    def block_conv(self, ring, taps, col, pos, t, active, y):
+        """``post_conv`` over the block: the ``active`` warps write their token's bf16 ``y``
+        to the ring row of position ``pos + t`` of column ``col``, then after a barrier each
+        warp's bf16 ``(conv + y) / sqrt(kernel + 1)`` at that position, every earlier input
+        read from the ring."""
+        if active:
+            ring[(pos + t) % RING, col] = BFloat16(y)
+        self.csync.sync()
         kernel = self.conv_kernel
+        q = pos + t
         conv = Float32(0.0)
         for j in cutlass.range_constexpr(kernel - 1):
             src = q - (kernel - 1) + j
@@ -1577,12 +1572,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         acc = vals[0]
         for s in cutlass.range_constexpr(1, splits):
             acc = acc + vals[s]
-        y = bf16_round(acc)
+        z = self.block_conv(p.ring_attn, p.attn_conv, col, pos, t, active, bf16_round(acc))
         if active:
-            p.ring_attn[(pos + t) % RING, col] = BFloat16(y)
-        self.csync.sync()
-        if active:
-            z = self.block_conv(p.ring_attn, p.attn_conv, col, pos + t, y)
             publish(
                 p.resid, t * self.hidden + col, cutlass.select_(p.boundary != 0, z, h + z), epoch
             )
@@ -1596,8 +1587,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         if op == ROUTER:
             # Router tile a of token b, on the CTA's own row of it (``router_kind``); then the
             # other tokens' rows, which the CTA's later rows read.
-            acc, w = gemv_bf16(w, p.xs, [b] * MMA_N, 0, self.hidden_k_tiles, warp, lane)
-            v = finish(acc, self.dbuf(p), self.csync, warp, lane, tid)
+            v, w = self.gemv(p, w, p.xs, [b] * MMA_N, 0, self.hidden_k_tiles, warp, lane, tid)
             if tid % MMA_N == 0:
                 publish(p.logits, b * self.experts + a * ROWS + tid // MMA_N, v, epoch)
             self.copy_rows(p, epoch, tid, self.router_kind)
@@ -1623,25 +1613,24 @@ class InklingMultiVisitKernel(InklingVisitKernel):
     @cute.jit
     def slot_expert(self, slot_experts, slot):
         """Slot ``slot``'s expert from ``read_union``'s registers (every lane must call it)."""
-        expert = cute.arch.shuffle_sync(slot_experts[0], offset=slot % 32)
-        for i in cutlass.range_constexpr(1, self.slot_words // 32):
-            other = cute.arch.shuffle_sync(slot_experts[i], offset=slot % 32)
-            expert = cutlass.select_(slot // 32 == i, other, expert)
-        return expert
+        lanes = [cute.arch.shuffle_sync(slot_experts[i], offset=slot % 32)
+                 for i in range(self.slot_words // 32)]  # fmt: skip
+        return pick(lanes, slot // 32)
 
     def chosen_words(self, p):
         """``route``'s chosen experts as Int32 words in RED (free outside ATTN items and
         reductions), lane l of token t's warp at word ``t * 32 + l``: bit i set if expert
-        ``4 l + i`` is chosen, its first slot from bit 8."""
+        ``(experts // 32) l + i`` is chosen, its first slot from bit 8."""
         ptr = cute.recast_ptr(p.red.iterator + CHOSEN_WORD, dtype=Int32)
         return cute.make_tensor(ptr, cute.make_layout((self.tokens * 32,)))
 
     @cute.jit
-    def route(self, p, lane, epoch, which, token=0):
-        """``MlpHalf.route`` with the same result, each of its top-k rounds one warp maximum
+    def route(self, p, lane, epoch, token):
+        """``MlpHalf.route``'s routing weights of ``token`` into ROUTE row ``token`` (the
+        experts go to ``chosen_words`` instead), each of its top-k rounds one warp maximum
         (``redux.sync`` on keys as ordered integers) and a ballot for the lowest lane holding
         it, whose own keys put the lowest expert first among equal keys (as ``route``'s ties
-        to the lower index). Also leaves the choice in ``chosen_words``."""
+        to the lower index)."""
         n = self.experts // 32  # lane l holds experts n*l .. n*l + n - 1
         k = self.top_k
         logits = cute.make_rmem_tensor((n,), Float32)
@@ -1659,7 +1648,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                 better = keys[i] > best
                 best = cutlass.select_(better, keys[i], best)
                 index = cutlass.select_(better, Int32(i), index)
-            top = warp_max_s32(best)
+            top = cute.arch.warp_redux_sync(best, "max")
             holders = cute.arch.vote_ballot_sync(best == top)
             winner = cute.arch.popc((holders & -holders) - 1)  # the lowest lane holding it
             mine = lane == winner
@@ -1675,25 +1664,24 @@ class InklingMultiVisitKernel(InklingVisitKernel):
             up = cute.arch.shuffle_sync_up(below, offset=1 << step)
             below = below + cutlass.select_(lane >= (1 << step), up, Int32(0))
         slot = below - count
-        self.chosen_words(p)[which * 32 + lane] = taken | (slot << 8)
+        self.chosen_words(p)[token * 32 + lane] = taken | (slot << 8)
         chosen = Float32(0.0)
         for i in cutlass.range_constexpr(n):
             if (taken >> i) & 1:
-                p.route[which, slot] = Float32(n * lane + i)
-                p.route[which, k + slot] = scores[i]
+                p.route[token, k + slot] = scores[i]
                 chosen = chosen + scores[i]
                 slot = slot + 1
         total = group_sum(chosen, 32)
         cute.arch.sync_warp()
         if lane < k:
-            weight = p.route[which, k + lane] / (total + Float32(1e-20)) * self.route_scale
-            p.route[which, k + lane] = weight
+            weight = p.route[token, k + lane] / (total + Float32(1e-20)) * self.route_scale
+            p.route[token, k + lane] = weight
         cute.arch.sync_warp()
 
     @cute.jit
     def build_union(self, p, epoch, tid, warp, lane):
-        """Every CTA, before its first expert row: warp t routes token t (``route``, into
-        ROUTE row t, which REDUCE reads); then thread e counts expert e's tokens, the slots
+        """Every CTA, before its first expert row: warp t routes token t (``route``: its
+        weights into ROUTE row t, which the GATEUP rows read); then thread e counts expert e's tokens, the slots
         number the chosen experts in ascending order (a ballot scan), and the CTA builds the
         union in UNI (size, slot experts, counts, entries ``t * top_k + rank`` in token
         order; zeros elsewhere), hands it to the load warp (``union_built``) and returns its
@@ -1707,7 +1695,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
             if index < words:
                 uni[index] = Float32(0.0)
         if warp < nt:
-            self.route(p, lane, epoch, warp, token=warp)
+            self.route(p, lane, epoch, warp)
         self.csync.sync()
         # Thread e < experts: expert e's word of each token (``chosen_words``).
         n = self.experts // 32
@@ -1726,9 +1714,9 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         slot = below
         size = Int32(0)
         for i in cutlass.range_constexpr(COMPUTE_WARPS):
-            n = Int32(p.red[0, i, 0])
-            slot = slot + cutlass.select_(i < warp, n, Int32(0))
-            size = size + n
+            chosen_i = Int32(p.red[0, i, 0])  # warp i's chosen experts
+            slot = slot + cutlass.select_(i < warp, chosen_i, Int32(0))
+            size = size + chosen_i
         if chosen:
             uni[UNION_EXPERTS + slot] = Float32(tid)
             uni[UNION_EXPERTS + self.slot_words + slot] = Float32(count)
@@ -1760,9 +1748,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         entries = [Int32(p.uni[first + i]) for i in range(nt)]
         row, t = tid // MMA_N, tid % MMA_N
         expert = Int32(p.uni[UNION_EXPERTS + slot])
-        entry = entries[0]  # thread tid's token entry (``t * top_k + rank``)
-        for i in cutlass.range_constexpr(1, nt):
-            entry = cutlass.select_(t == i, entries[i], entry)
+        entry = pick(entries, t)  # thread tid's token entry (``t * top_k + rank``)
         if op == GATEUP:
             rows = [entries[min(i, nt - 1)] // k for i in range(MMA_N)]
             v, w, meta = self.expert_gemv(p, w, meta, 0, rows, warp, lane, tid)
@@ -1782,7 +1768,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
             # slower block steps). The rows' amax stay in registers (thread tid's row t's).
             with self.trace_region("down.act"):
                 amax = self.fetch_act_tokens(p, slot, count, epoch, tid, warp, lane)
-                row_amax = self.pick(amax, t)
+                row_amax = pick(amax, t)
                 self.csync.sync()
             for i in cutlass.range_constexpr(DOWN_TILES):
                 v, w, meta = self.expert_gemv(p, w, meta, 1, self.rows_of(nt), warp, lane, tid)
@@ -1808,13 +1794,6 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         v = finish(acc, self.dbuf(p), self.csync, warp, lane, tid, self.experts_format)
         return v, w, meta
 
-    def pick(self, values: list, i):
-        """``values[i]`` for a dynamic ``i`` < ``len(values)`` (a select chain)."""
-        out = values[0]
-        for j in range(1, len(values)):
-            out = cutlass.select_(i == j, values[j], out)
-        return out
-
     @cute.jit
     def fetch_act_tokens(self, p, slot, count, epoch, tid, warp, lane):
         """Slot ``slot``'s activations of its ``count`` tokens, in one poll, each row quantized
@@ -1828,42 +1807,44 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         total = nt * per
         rounds = -(-total // COMPUTE_THREADS)
         vals = cute.make_rmem_tensor((8 * rounds,), Float32)
-        segments = []
+        # Per round: the thread's chunk cc of row i, and whether it holds activations (rows i <
+        # count <= tokens); the others fetch chunk 0 and read zeros.
+        segments, cells = [], []
         for r in cutlass.range_constexpr(rounds):
             c = r * COMPUTE_THREADS + tid
             i = c // per
             cc = c - i * per
             real = (i < count) & (cc < chunks)
+            cells.append((i, cc, real))
             index = (slot * nt + cutlass.select_(real, i, Int32(0))) * self.width
             segments.append((p.act, index + cutlass.select_(real, cc, Int32(0)) * 8, 8))
         fetch(segments, vals, epoch)
         partial = [Float32(0.0)] * nt  # the thread's maximum |x| per row
         for r in cutlass.range_constexpr(rounds):
-            c = r * COMPUTE_THREADS + tid
-            i = c // per
-            live = (c < total) & (i < count) & (c - i * per < chunks)
+            i, _cc, real = cells[r]
             for e in cutlass.range_constexpr(8):
-                vals[8 * r + e] = cutlass.select_(live, vals[8 * r + e], Float32(0.0))
-            m = block_max([vals[8 * r + e] for e in range(8)], 8)
-            for j in cutlass.range_constexpr(nt):
-                partial[j] = f32_op("max", partial[j], cutlass.select_(i == j, m, Float32(0.0)))
+                vals[8 * r + e] = cutlass.select_(real, vals[8 * r + e], Float32(0.0))
+            if cutlass.const_expr(self.activation_format == NVFP4):
+                m = block_max([vals[8 * r + e] for e in range(8)], 8)
+                for j in cutlass.range_constexpr(nt):
+                    partial[j] = f32_op(
+                        "max", partial[j], cutlass.select_(i == j, m, Float32(0.0))
+                    )
         amax = [Float32(0.0)] * nt
         if cutlass.const_expr(self.activation_format == NVFP4):
             amax = cta_max(p.red, self.csync, partial, AMAX_RED, warp, lane)
         for r in cutlass.range_constexpr(rounds):
-            first = r * COMPUTE_THREADS + warp * 32  # the warp's first chunk
-            if first < count * per:
-                c = first + lane
-                i = c // per
+            if r * COMPUTE_THREADS + warp * 32 < count * per:  # (the warp's first chunk)
+                i, cc, _real = cells[r]
                 x = [vals[8 * r + e] for e in range(8)]
-                values = quantize_chunk(self.activation_format, x, self.pick(amax, i))
+                values = quantize_chunk(self.activation_format, x, pick(amax, i))
                 if i < count:
                     words = cute.make_rmem_tensor((4,), Int32)
                     for j in cutlass.range_constexpr(4):
                         words[j] = values[j]
                     cute.autovec_copy(
                         cute.recast_tensor(words, BFloat16),
-                        cute.local_tile(p.xs[nt + i, None], (8,), (c - i * per,)),
+                        cute.local_tile(p.xs[nt + i, None], (8,), (cc,)),
                     )
         return amax
 
@@ -1885,12 +1866,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         acc = Float32(0.0)
         for r in cutlass.range_constexpr(k):
             acc = acc + vals[r]
-        y = bf16_round(acc)
+        z = self.block_conv(p.ring_mlp, p.mlp_conv, col, pos, t, active, bf16_round(acc))
         if active:
-            p.ring_mlp[(pos + t) % RING, col] = BFloat16(y)
-        self.csync.sync()
-        if active:
-            z = self.block_conv(p.ring_mlp, p.mlp_conv, col, pos + t, y)
             p.out[t * self.hidden + col] = BFloat16(vals[k] + z)
 
     # ------------------------------------------------------------ message gates
@@ -1901,8 +1878,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         tid = warp * 32 + lane
         per = self.hidden // TILE_K // GATE_SPLITS
         rows = self.rows_of(self.gate_input(a // GATE_TILES) * nt)
-        acc, w = gemv_bf16(w, p.xs, rows, split * per * TILE_K, per, warp, lane)
-        v = finish(acc, self.dbuf(p), self.csync, warp, lane, tid)
+        v, w = self.gemv(p, w, p.xs, rows, split * per * TILE_K, per, warp, lane, tid)
         row, t = tid // MMA_N, tid % MMA_N
         if t < nt:
             index = (split * GATES * GATE_TILES + a) * ROWS + row
@@ -1941,20 +1917,20 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         per = -(-nt * GATE_RANK // COMPUTE_THREADS)
         stride = GATES * GATE_RANK
         hv = cute.make_rmem_tensor((per * GATE_SPLITS,), Float32)
-        segments = []
+        segments, cells = [], []
         for v in cutlass.range_constexpr(per):
+            # Threads past the entries refetch the last one.
             index = cutlass.min(v * COMPUTE_THREADS + tid, nt * GATE_RANK - 1)
             t = index // GATE_RANK
             c = index - t * GATE_RANK
+            cells.append((index, t, c))
             base = t * GATE_SPLITS * stride + s * GATE_RANK + c
             segments += [(g.h_part, base + k * stride, 1) for k in range(GATE_SPLITS)]
         fetch(segments, hv, epoch, uniform=True)
         self.csync.sync()  # ATT's last readers (a GEMV's ``finish``) are done
         for v in cutlass.range_constexpr(per):
-            index = v * COMPUTE_THREADS + tid
-            if index < nt * GATE_RANK:
-                t = index // GATE_RANK
-                c = index - t * GATE_RANK
+            if v * COMPUTE_THREADS + tid < nt * GATE_RANK:
+                index, t, c = cells[v]
                 acc = hv[GATE_SPLITS * v]
                 for k in cutlass.range_constexpr(1, GATE_SPLITS):
                     acc = acc + hv[GATE_SPLITS * v + k]
@@ -1962,10 +1938,7 @@ class InklingMultiVisitKernel(InklingVisitKernel):
         self.csync.sync()
         for stage in cutlass.range_constexpr(MIX_STAGES):
             i = (tile * MIX_STAGES + stage) * ROWS + row
-            forget = cute.make_rmem_tensor((nt,), Float32)
-            gain = cute.make_rmem_tensor((nt,), Float32)
-            forget.fill(0.0)
-            gain.fill(0.0)
+            forget, gain = [], []
             with w.consume() as h:
                 rows = cute.recast_tensor(h.view("W"), Float32)  # (ROWS, 2 * GATE_RANK)
                 fr = [rows[row, 8 * j + e] for e in range(8)]
@@ -1977,8 +1950,8 @@ class InklingMultiVisitKernel(InklingVisitKernel):
                         hval = hsm[t * GATE_RANK + 8 * j + e]
                         f = f + fr[e] * hval
                         gn = gn + gr[e] * hval
-                    forget[t] = f
-                    gain[t] = gn
+                    forget.append(f)
+                    gain.append(gn)
             for t in cutlass.range_constexpr(nt):
                 f = group_sum(forget[t], 8)
                 gn = group_sum(gain[t], 8)

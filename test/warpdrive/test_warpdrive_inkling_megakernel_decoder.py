@@ -86,13 +86,7 @@ def prompt_ids(path) -> list[int]:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(path)
-    text = tokenizer.apply_chat_template(
-        [{"role": "user", "content": PROMPT}],
-        tokenize=False,
-        add_generation_prompt=True,
-        reasoning_effort="low",
-    )
-    return tokenizer(text, add_special_tokens=False).input_ids
+    return ref.chat_prompt_ids(tokenizer, [{"role": "user", "content": PROMPT}], "low")
 
 
 @pytest.mark.xdist_group("inkling-checkpoint")

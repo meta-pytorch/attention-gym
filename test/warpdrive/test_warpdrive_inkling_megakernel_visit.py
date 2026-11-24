@@ -255,11 +255,10 @@ def check_visit(
     the launch's own residual: the oracle's experts, the activations within ``ACT_ULPS``
     (``ref.declared_activations``), and the output and the MLP ring's new row within
     ``MLP_ULPS`` of ``ref.mlp_block`` on the launch's activations, every other ring row
-    untouched. A visit with ``messages`` (the oracle's ``(1, 4, hidden)``)
-    launches with the matching ``gates`` (``megakernel.GateArgs``). The runner launches ``launch_w``
-    (default ``w``): quantized experts whose bf16 block values ``w`` holds. Returns the residual's and
-    the output's errors (``ulps`` of the post-attention output, ``scale_ulps``) and the
-    launch's residual."""
+    untouched. A visit with ``messages`` (the oracle's ``(1, 4, hidden)``) launches with the
+    matching ``gates`` (``megakernel.GateArgs``). The runner launches ``launch_w`` (default
+    ``w``): quantized experts whose bf16 block values ``w`` holds. Returns the launch's
+    residual."""
     theirs = clone(cache)
     expected, mlp_blocks = ref.attention_block(
         config, w, layer, visit, h, blocks, messages, theirs, positions, None, FAST
@@ -312,7 +311,7 @@ def check_visit(
     ring, ref_ring = cache.conv_mlp[visit], theirs.conv_mlp[visit]
     assert torch.equal(ring[others], ref_ring[others])
     assert scale_ulps(ring[slot], ref_ring[slot]).max() <= MLP_ULPS
-    return errors, out_errors, residual
+    return residual
 
 
 # MXFP8 scale bytes giving weights of a trained layer's scale (the checkpoint's are 113 .. 118).
@@ -386,13 +385,11 @@ def check_gates(config, launch, w, streams, messages, gates):
     ``h`` within one bf16 ulp of ``ref.message_gate``'s bf16 GEMM, and the gated streams equal
     to the oracle's gate evaluated on the kernel's own ``h`` up to fp32 rounding. (An ``h``
     rounding flip moves every gated element by about 1e-3 relative: the launch outputs differ
-    from the oracle's through those flips, not through the gate arithmetic.) Returns the count
-    of flipped ``h`` per gate."""
+    from the oracle's through those flips, not through the gate arithmetic.)"""
     h, rank = config.hidden_size, config.gate_rank
     h_part = launch.values("h_part").view(GATE_SPLITS, GATES, rank)
     gated = launch.values("gated").view(GATES, h)
     mhalf = gates.mhalf.view(-1, rank)
-    flips = []
     for s in range(GATES):
         gate, x, m = w.gates[s], streams[s], messages[0, s]
         inputs = torch.cat([ref.rms_norm(v, None, config.rms_eps) for v in (x, m)])
@@ -403,10 +400,8 @@ def check_gates(config, launch, w, streams, messages, gates):
         mine = (mine + mhalf[s]).bfloat16().float()
         ulp = 2.0 ** (torch.floor(torch.log2(expected.abs())) - 7)
         assert ((mine - expected).abs() <= ulp).all(), s
-        flips.append(int((mine != expected).sum()))
         out = (1 - torch.tanh(gate.forget @ mine)) * x + torch.tanh(gate.gain @ mine) * m
         torch.testing.assert_close(gated[s], out, rtol=1e-5, atol=1e-5)
-    return flips
 
 
 # (layer, blocks, positions): a sliding NVFP4 layer inside a block at position 0 (only the new
@@ -474,7 +469,7 @@ def test_message_visit_random_weights():
         positions = torch.tensor([pos], device="cuda")
         h, states = random_inputs(config, blocks, seed=100 * layer + case)
         args = gates.layer(0)
-        *_, residual = check_visit(
+        residual = check_visit(
             runner, config, dense, layer, 1, h, states, cache, positions, messages, args, quantized
         )
         streams = ref.block_residual(w.attn_query, states, h)[0]

@@ -24,7 +24,7 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, cute
 
-from attn_gym.warpdrive import Consumer, Local, Producer, StageView, WorkCursor, role
+from attn_gym.warpdrive import Consumer, Local, StageView, WorkCursor, role
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     MAX_BLOCKS,
@@ -49,7 +49,7 @@ class HeadParams:
     tma: tuple  # TMA atom of the LM head
     gmem: tuple  # its tile partition: (TMA, row tiles, k tiles)
     sW: StageView
-    xs: cute.Tensor  # (1, hidden) bf16: the final normalized state
+    xs: cute.Tensor  # (tokens, hidden) bf16: the final normalized states
     red: cute.Tensor  # (REDUCTIONS, COMPUTE_WARPS, RED_VALUES) fp32 prologue reductions
     blocks: tuple  # MAX_BLOCKS (hidden,) bf16 completed blocks; the first num_blocks are read
     num_blocks: Int32
@@ -57,10 +57,9 @@ class HeadParams:
     query: cute.Tensor  # (1, hidden) fp32 final block-residual query
     norms: cute.Tensor  # (1, hidden) bf16 final RMSNorm weight
     logits: cute.Tensor  # (vocab,) fp32 output ((tokens, vocab) multi-token)
-    normed: cute.Tensor | None = None  # multi-token: (tokens * hidden,) bf16 final states
-    dbuf: cute.Tensor | None = (
-        None  # multi-token: ``examples.megakernel.multi_gemv.finish``'s buffer
-    )
+    normed: cute.Tensor  # (tokens * hidden,) bf16 final states (written by multi-token launches)
+    # multi-token: ``examples.megakernel.multi_gemv.finish``'s buffer
+    dbuf: cute.Tensor | None = None
 
 
 class InklingHeadKernel(MatrixRowsKernel):
@@ -90,50 +89,38 @@ class InklingHeadKernel(MatrixRowsKernel):
             f"{self.trace_key()}"
         )
 
-    @role(warps=COMPUTE_WARPS)
-    @cute.jit
-    def load(self, p: HeadParams, *, w: Producer, work: WorkCursor):
-        return self.load_matrix_rows(p, w, work)
-
     @role(warps=range(COMPUTE_WARPS))
     @cute.jit
     def compute(self, p: HeadParams, *, w: Consumer, work: WorkCursor, me: Local):
         tid, warp, lane = me.tid, me.warp, me.lane
-        if cutlass.const_expr(self.tokens == 1):
-            x = self.load_states(p, p.num_blocks, p.h, tid)
+        cap = self.softcap
+        nt = self.tokens
+        for t in cutlass.range(nt, unroll=1):
+            x = self.load_states(p, p.num_blocks, p.h, tid, token=t)
             self.normalize_states(
-                p, x, p.num_blocks, p.query, p.norms, 1, Int32(1), tid, warp, lane
+                p, x, p.num_blocks, p.query, p.norms, 1, Int32(1), tid, warp, lane, token=t
             )
-        else:
-            for t in cutlass.range(self.tokens, unroll=1):
-                x = self.load_states(p, p.num_blocks, p.h, tid, token=t)
-                self.normalize_states(
-                    p, x, p.num_blocks, p.query, p.norms, 1, Int32(1), tid, warp, lane, token=t
-                )
+            if cutlass.const_expr(nt > 1):
                 if cute.arch.block_idx()[0] == 0:  # export the final states (DSpark features)
                     for r in cutlass.range_constexpr(self.hidden // COMPUTE_THREADS):
                         k = r * COMPUTE_THREADS + tid
                         p.normed[t * self.hidden + k] = p.xs[t, k]
-        cap = self.softcap
-        nt = self.tokens
         while work.valid:
             _op, tile, _b, _row = work.item
-            # ref.logits_of: the bf16 LM-head output, softcapped in fp32.
+            # v: the dot product of token t with LM-head row index, valid on its owner.
             if cutlass.const_expr(nt == 1):
                 v, row, w = gemv_tile(w, p.xs, 0, self.hidden_k_tiles, warp, lane)
-                index = tile * ROWS + row
-                if owns_row(lane) & (index < self.vocab):
-                    logit = bf16_round(v) * fp32_reciprocal(cap)
-                    p.logits[index] = cute.math.tanh(logit) * cap
+                t, index, owner = 0, tile * ROWS + row, owns_row(lane)
             else:
                 rows = [min(t, nt - 1) for t in range(MMA_N)]
                 acc, w = gemv_bf16(w, p.xs, rows, 0, self.hidden_k_tiles, warp, lane)
                 v = finish(acc, p.dbuf, self.csync, warp, lane, tid)
-                t = tid % MMA_N
-                index = tile * ROWS + tid // MMA_N
-                if (t < nt) & (index < self.vocab):
-                    logit = bf16_round(v) * fp32_reciprocal(cap)
-                    p.logits[t * self.vocab + index] = cute.math.tanh(logit) * cap
+                t, index = tid % MMA_N, tile * ROWS + tid // MMA_N
+                owner = t < nt
+            # ref.logits_of: the bf16 LM-head output, softcapped in fp32.
+            if owner & (index < self.vocab):
+                logit = bf16_round(v) * fp32_reciprocal(cap)
+                p.logits[t * self.vocab + index] = cute.math.tanh(logit) * cap
             work.advance()
         return w, work
 

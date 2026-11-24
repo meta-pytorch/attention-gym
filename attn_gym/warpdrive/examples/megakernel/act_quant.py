@@ -27,16 +27,24 @@ CuTeDSL's own arithmetic emits ``mul.f32``/``add.f32``, which ptxas may contract
 are).
 """
 
+from functools import partial
+
 import cutlass
 from cutlass import BFloat16, Float32, Int32, cute
-from cutlass._mlir.extras import types as T_
-from cutlass._mlir_helpers.arith import bitcast
 from cutlass.cutlass_dsl import T, dsl_user_op
 
-from attn_gym.warpdrive.examples.megakernel.constants import COMPUTE_THREADS, COMPUTE_WARPS
+from attn_gym.warpdrive.examples.megakernel.constants import COMPUTE_THREADS
 from attn_gym.warpdrive.examples.megakernel.formats import BLOCK_COLUMNS, NVFP4
-from attn_gym.warpdrive.examples.megakernel.quant_gemv import inline_asm
-from attn_gym.warpdrive.examples.megakernel.regmath import bf16x8_to_f32, fp32
+from attn_gym.warpdrive.examples.megakernel.regmath import (
+    as_bits,
+    as_float,
+    bf16x8_to_f32,
+    cta_reduce,
+    fp32,
+    group_reduce,
+    inline_asm,
+    load_tile,
+)
 
 FP32_MAX = 3.4028234663852886e38
 E4M3_MAX = 448.0
@@ -59,37 +67,19 @@ def abs_f32(a, *, loc=None, ip=None) -> Float32:
 
 
 @dsl_user_op
-def e2m1x2(even, odd, *, loc=None, ip=None) -> tuple:
-    """``(values, codes)`` of two fp32 values rounded to E2M1 (``cvt.rn.satfinite``): their
-    values as a bf16x2 word and their codes as a byte, ``even`` in the low half and nibble."""
-    out = inline_asm(
-        [T.i32(), T.i32()],
-        [Float32(even), Float32(odd)],
-        "{\n"
-        ".reg .b8 c;\n"
-        "cvt.rn.satfinite.e2m1x2.f32 c, $3, $2;\n"  # the first operand fills the high nibble
-        "cvt.rn.bf16x2.e2m1x2 $0, c;\n"
-        "cvt.u32.u8 $1, c;\n"
-        "}",
-        "=r,=r,f,f",
-        loc,
-        ip,
-    )
-    return Int32(out[0]), Int32(out[1])
-
-
-@dsl_user_op
-def e4m3x2(lo, hi, *, loc=None, ip=None) -> tuple:
-    """``(values, bytes)`` of two fp32 values rounded to e4m3 (``cvt.rn.satfinite``): their
-    values as a bf16x2 word (exact) and their two bytes, ``lo`` in the low half and byte."""
+def round_pair(fmt: str, lo, hi, *, loc=None, ip=None) -> tuple:
+    """``(values, codes)`` of two fp32 values rounded to ``fmt`` (``e2m1`` or ``e4m3``,
+    ``cvt.rn.satfinite``): their values as a bf16x2 word (exact) and their codes (an E2M1 code
+    byte or two e4m3 bytes), ``lo`` in the low half and nibble or byte."""
+    bits = {"e2m1": 8, "e4m3": 16}[fmt]
     out = inline_asm(
         [T.i32(), T.i32()],
         [Float32(lo), Float32(hi)],
         "{\n"
-        ".reg .b16 h;\n"
-        "cvt.rn.satfinite.e4m3x2.f32 h, $3, $2;\n"
-        "cvt.rn.bf16x2.e4m3x2 $0, h;\n"
-        "cvt.u32.u16 $1, h;\n"
+        f".reg .b{bits} c;\n"
+        f"cvt.rn.satfinite.{fmt}x2.f32 c, $3, $2;\n"  # the first operand fills the high part
+        f"cvt.rn.bf16x2.{fmt}x2 $0, c;\n"
+        f"cvt.u32.u{bits} $1, c;\n"
         "}",
         "=r,=r,f,f",
         loc,
@@ -114,14 +104,6 @@ def pack_bf16x2(lo, hi, *, loc=None, ip=None) -> Int32:
     return Int32(out[0])
 
 
-def as_float(bits) -> Float32:
-    return Float32(bitcast(Int32(bits).ir_value(), T_.f32()))
-
-
-def as_bits(x) -> Int32:
-    return Int32(bitcast(Float32(x).ir_value(), T_.i32()))
-
-
 def halves(word):
     """The fp32 values of a bf16x2 word's low and high halves."""
     return as_float(word << 16), as_float(word & Int32(-65536))
@@ -133,16 +115,7 @@ def block_max(x, n: int, lanes: int = 1) -> Float32:
     m = Float32(float("nan"))
     for i in range(n):
         m = f32_op("max", m, abs_f32(x[i]))
-    return across_lanes("max", m, lanes)
-
-
-def across_lanes(op: str, v, lanes: int) -> Float32:
-    """``op`` (``max``, ``add.rn``) of ``v`` over an aligned group of ``lanes`` lanes, as a
-    butterfly: for ``add.rn`` the pairwise tree over the lanes in order (fp32 addition
-    commutes, so every lane gets the same sum). Every lane of the warp must call it."""
-    for step in range(lanes.bit_length() - 1):
-        v = f32_op(op, v, cute.arch.shuffle_sync_bfly(v, offset=1 << step))
-    return v
+    return group_reduce(partial(f32_op, "max"), m, lanes)
 
 
 def nvfp4_globals(amax) -> tuple:
@@ -175,13 +148,13 @@ def nvfp4_candidate(x, n: int, lanes: int, scale, decoder, outer) -> tuple:
     words, codes, errors = [], [], []
     for j in range(n // 2):
         a, b = x[2 * j], x[2 * j + 1]
-        word, code = e2m1x2(f32_op("mul.rn", a, inverse), f32_op("mul.rn", b, inverse))
+        word, code = round_pair("e2m1", f32_op("mul.rn", a, inverse), f32_op("mul.rn", b, inverse))
         words.append(word)
         codes.append(code)
         for q, v in zip(halves(word), (a, b)):
             back = f32_op("mul.rn", f32_op("mul.rn", q, scale), outer)
             errors.append(abs_f32(f32_op("sub.rn", back, v)))
-    return words, codes, across_lanes("add.rn", pairwise_sum(errors), lanes)
+    return words, codes, group_reduce(partial(f32_op, "add.rn"), pairwise_sum(errors), lanes)
 
 
 def nvfp4_block(x, globals_, lanes: int = 1) -> tuple:
@@ -196,7 +169,7 @@ def nvfp4_block(x, globals_, lanes: int = 1) -> tuple:
     m = block_max(x, n, lanes)
     c6 = f32_op("min", f32_op("mul.rn", m, enc6), Float32(E4M3_MAX))
     c4 = f32_op("min", f32_op("mul.rn", m, enc4), Float32(E4M3_MAX))
-    scale_word, scale_bytes = e4m3x2(c6, c4)
+    scale_word, scale_bytes = round_pair("e4m3", c6, c4)
     s6, s4 = halves(scale_word)
     words6, codes6, error6 = nvfp4_candidate(x, n, lanes, s6, decoder, outer)
     words4, codes4, error4 = nvfp4_candidate(x, n, lanes, s4, decoder, outer)
@@ -232,33 +205,18 @@ def mxfp8_block(x, lanes: int = 1) -> tuple:
         for i in range(2):
             v = f32_op("max", f32_op("mul.rn", x[2 * j + i], inverse), Float32(-E4M3_MAX))
             pair.append(f32_op("min", v, Float32(E4M3_MAX)))  # (after max: no NaN left)
-        word, code = e4m3x2(pair[0], pair[1])
+        word, code = round_pair("e4m3", pair[0], pair[1])
         lo, hi = halves(word)
         values.append(pack_bf16x2(f32_op("mul.rn", lo, scale), f32_op("mul.rn", hi, scale)))
         codes.append(code)
     return values, codes, exponent
 
 
-@cute.jit
-def cta_max(red, csync, vals, slot: cutlass.Constexpr, warp, lane):
+def cta_max(red, csync, vals, slot: int, warp, lane):
     """Maxima of each of ``vals`` (at most RED_VALUES per-thread fp32 values, NaNs dropped)
     over the compute threads, in every thread: ``regmath.cta_sum``'s protocol (slot ``slot``
     of ``red``, the barrier ``csync``) with ``max.f32``."""
-    n = len(vals)
-    for i in cutlass.range_constexpr(n):
-        v = vals[i]
-        for step in cutlass.range_constexpr(5):
-            v = f32_op("max", v, cute.arch.shuffle_sync_bfly(v, offset=1 << step))
-        if lane == 0:
-            red[slot, warp, i] = v
-    csync.sync()
-    out = []
-    for i in cutlass.range_constexpr(n):
-        m = red[slot, 0, i]
-        for wi in cutlass.range_constexpr(1, COMPUTE_WARPS):
-            m = f32_op("max", m, red[slot, wi, i])
-        out.append(m)
-    return out
+    return cta_reduce(partial(f32_op, "max"), red, csync, vals, slot, warp, lane)
 
 
 def quantize_chunk(fmt: str, x, amax) -> list:
@@ -294,10 +252,7 @@ def quantize_rows(fmt: cutlass.Constexpr, xs, src, dst, rows: cutlass.Constexpr,
         block = i * COMPUTE_THREADS + tid
         r = block // per_row
         if r < count:
-            raw = cute.make_rmem_tensor((n,), BFloat16)
-            cute.autovec_copy(
-                cute.local_tile(xs[src + r, None], (n,), (block - r * per_row,)), raw
-            )
+            raw = load_tile(xs[src + r, None], block - r * per_row, n)
             for k in cutlass.range_constexpr(n // 8):
                 part = bf16x8_to_f32(cute.local_tile(raw, (8,), (k,)))
                 for e in cutlass.range_constexpr(8):

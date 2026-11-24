@@ -42,7 +42,7 @@ def test_kernels_compile_from_kernel_modules_only():
     the benches or the chat recompiles nothing (``test_warpdrive_megakernel_package`` checks they
     hash no other model either)."""
     package = Path(ref.__file__).parent
-    host = {"ref", "quant", "megakernel", "fast", "bench", "chat"}
+    host = {"ref", "act_quant", "quant", "megakernel", "fast", "bench", "chat"}
     host |= {"dspark", "spec", "draft", "draft_bench"}
     host = {package / f"{name}.py" for name in host}
     kernels = ("visit_kernel", "msg_kernel", "head_kernel", "multi_kernel")
