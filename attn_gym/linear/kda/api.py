@@ -149,7 +149,7 @@ def chunk_kda(
             configurations. Warpdrive chooses a plan without benchmarking.
             ``"intra_chunk_dtypes"`` sets warpdrive operand precision in forward and backward.
             BF16 kernels accept ``"tf32+bf16"`` (TF32 decay, BF16 solve; default), ``"tf32"``
-            or ``"bf16"``. FP16 kernels default to ``"tf32+fp16"`` and accept no other value.
+            or ``"bf16"``. FP16 kernels have one fixed set and reject the option.
             Replay-backed ``paged_chunk_kda`` uses BF16 even for FP16 inputs. Incompatible
             choices raise on every implementation. See "Operand precision" in ``docs/linear.md``.
             With explicit warpdrive, ``"batch_invariant": True`` keeps each sequence's outputs,

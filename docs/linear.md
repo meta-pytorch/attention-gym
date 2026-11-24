@@ -773,7 +773,7 @@ backward on the three BF16 shapes. Dashes mean native FP16 is outside this BF16 
 | `"bf16"` | B/B/B | Yes¹ | Yes | Higher | Fastest | Minimize BF16 training time |
 | `"tf32+bf16"` (BF16 default) | T/B/B | Yes¹ | Yes | Lower | Second | Balance accuracy and speed |
 | `"tf32"` | T/T/B | Yes¹ | Yes | Lowest | Third | Minimize numerical error |
-| `"tf32+fp16"` (FP16 default) | T/F/F | Yes¹ | Yes | — | — | Native FP16 |
+| FP16 inputs (fixed, no option) | T/F/F | Yes¹ | Yes | — | — | Native FP16 |
 | Triton fused | Separate kernels | No² | Yes | Baseline | Fourth | Use the portable backend |
 
 ¹ On the per-tile path all four warpdrive choices reconstruct the forward's rounded operands,
@@ -790,8 +790,9 @@ FP32 and stores the assembled inverse and attention scores in the Q/K/V kernel d
 backward can split decay factors around a different reference row than its forward. See
 [Fast math and precision](#fast-math-and-precision).
 
-Native FP16 uses TF32 decay products because inverse decay can overflow FP16. Its solve operands
-are FP16 without per-tile range scaling. Optimized `chunk_kda` and `paged_chunk_kda` cast mixed
+Native FP16 has one fixed kernel set and rejects an explicit `intra_chunk_dtypes`. It uses TF32
+decay products because inverse decay can overflow FP16; its solve operands are FP16 without
+per-tile range scaling. Optimized `chunk_kda` and `paged_chunk_kda` cast mixed
 or FP32 Q/K/V to BF16. Paged replay uses BF16 even for FP16 inputs. In both cases, use a BF16
 choice. The staged `chunk_kda_prepare` requires matching FP16 or BF16 Q/K/V; pass the same
 precision to its backward preparation.

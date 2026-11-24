@@ -29,8 +29,16 @@ pytestmark = pytest.mark.skipif(
 
 VALUES = ("tf32+bf16", "tf32", "bf16")  # BF16 inputs
 TF32 = "tf32"  # the widest operands
-FP16_VALUE = "tf32+fp16"  # FP16 inputs' one kernel set
+FP16_VALUE = None  # FP16 inputs take no option: they have one kernel set
 WARPDRIVE = {"backend": "warpdrive"}
+
+
+def _options(value: str | None, **extra) -> dict:
+    """Warpdrive kernel options; ``None`` omits ``intra_chunk_dtypes`` (FP16 inputs)."""
+    choice = {} if value is None else {"intra_chunk_dtypes": value}
+    return {**WARPDRIVE, **extra, **choice}
+
+
 # Output relative RMS error limits against the independent FP64 recurrence on _inputs.
 BUDGETS = {"tf32": 2.5e-3, "tf32+bf16": 4.5e-3, "bf16": 5.5e-3}
 # One shape per forward plan: (tokens, heads, PREP_TILE_FRACTION override); "split" forces the
@@ -83,7 +91,7 @@ def _reference(q, k, v, gate, beta, state=None):
 
 def _warpdrive(inputs, value, **kwargs):
     with torch.no_grad():
-        options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+        options = _options(value)
         return chunk_kda(*inputs, kernel_options=options, **kwargs)
 
 
@@ -93,27 +101,19 @@ def test_intra_chunk_dtypes_validation() -> None:
         assert resolve_kernel_options({"intra_chunk_dtypes": value}).intra_chunk_dtypes == value
     with pytest.raises(ValueError, match="intra_chunk_dtypes"):
         resolve_kernel_options({"intra_chunk_dtypes": "fp16"})
-    for removed in ("bf16+fp16",):
-        with pytest.raises(ValueError, match="intra_chunk_dtypes"):
-            resolve_kernel_options({"intra_chunk_dtypes": removed})
+    with pytest.raises(ValueError, match="intra_chunk_dtypes"):
+        resolve_kernel_options({"intra_chunk_dtypes": "bf16+fp16"})
+    # The FP16 kernel set's old name points FP16 callers at omitting the option, not at the
+    # BF16 choices they cannot use.
+    with pytest.raises(ValueError, match="FP16 q/k/v have one fixed kernel set, so omit"):
+        resolve_kernel_options({"intra_chunk_dtypes": "tf32+fp16"})
 
 
-def test_bf16_inputs_reject_the_fp16_kernel_set() -> None:
-    """Only native FP16 kernels accept FP16 solve operands."""
-    inputs = _inputs(64, 2)
-    with pytest.raises(ValueError, match="FP16 q/k/v kernel set"):
-        chunk_kda(*inputs, kernel_options={**WARPDRIVE, "intra_chunk_dtypes": FP16_VALUE})
-
-
-@pytest.mark.parametrize(
-    "dtype, expected",
-    [(torch.bfloat16, "tf32+bf16"), (torch.float16, FP16_VALUE)],
-    ids=["bf16", "fp16"],
-)
-def test_omitted_option_runs_the_default_of_the_input_dtype(dtype, expected) -> None:
-    """Omitting the option matches the dtype-specific default bit for bit, including gradients
-    and the staged API."""
-    inputs = _inputs(1000, 4, dtype)
+def test_omitted_option_runs_the_bf16_default() -> None:
+    """Omitting the option matches ``"tf32+bf16"`` bit for bit, including gradients and the
+    staged API."""
+    expected = "tf32+bf16"
+    inputs = _inputs(1000, 4, torch.bfloat16)
     cu = cumulative_sequence_offsets([1000])
     state = torch.randn(1, 4, 128, 128, device="cuda") * 0.1
     d_output = torch.randn_like(inputs[2])
@@ -135,13 +135,14 @@ def test_omitted_option_runs_the_default_of_the_input_dtype(dtype, expected) -> 
 
 
 @pytest.mark.parametrize("backend", ["fused", "warpdrive"])
-def test_fp16_inputs_reject_other_values_before_any_launch(backend) -> None:
-    """Reject a BF16-only precision before dispatch, including during full-graph tracing."""
+def test_fp16_inputs_reject_every_explicit_value_before_any_launch(backend) -> None:
+    """FP16 Q/K/V have one fixed kernel set: any explicit choice raises before dispatch,
+    including during full-graph tracing."""
     q, k, v, gate, beta = _inputs(64, 2, torch.float16)
     pool = torch.zeros(2, 2, 128, 128, device="cuda")
     slots = torch.ones(1, dtype=torch.int32, device="cuda")
     cu = cumulative_sequence_offsets([64])
-    message = r"FP16 q/k/v take only .*'tf32\+fp16'"
+    message = "FP16 q/k/v have one fixed kernel set"
     for value in VALUES:
         options = {"backend": backend, "intra_chunk_dtypes": value}
         with pytest.raises(ValueError, match=message):
@@ -189,7 +190,7 @@ def test_fp16_replay_resolves_the_option_as_its_bf16_cast() -> None:
     beta = torch.full(shape[:3], 2.0**-26, device="cuda")
     zero = torch.zeros(1, 1, 128, 128, device="cuda")
     for value in (None, *VALUES):
-        options = WARPDRIVE if value is None else {**WARPDRIVE, "intra_chunk_dtypes": value}
+        options = _options(value)
         output = _replay(q.half(), q.half(), v.half(), gate, beta, options)
         cast = (t.bfloat16() for t in (q, q, v))
         with torch.no_grad():
@@ -230,7 +231,7 @@ def test_pre_option_op_calls_run_the_pre_option_kernels(name, dtype) -> None:
     """An old positional call, with or without fastmath, still selects the legacy precision."""
     op = getattr(torch.ops.attn_gym, f"kda_chunk_cudnn_packed_{name}").default
     args = _pre_option_args(name, 1000, 4, dtype)
-    kernels = "bf16" if dtype == torch.bfloat16 else FP16_VALUE
+    kernels = "bf16" if dtype == torch.bfloat16 else "tf32+fp16"
     expected = op(*args, intra_chunk_dtypes=kernels)
     for old_graph in (op(*args), op(*args[:-1])):
         torch.testing.assert_close(old_graph, expected, rtol=0, atol=0)
@@ -256,7 +257,7 @@ def test_each_value_compiles_its_own_kernels_once_across_shapes() -> None:
     for value in VALUES:
         for tokens, heads in ((16, 80), (1000, 80), (2048, 80)):  # uncut: B * H fills the GPU
             inputs = _inputs(tokens, heads)
-            chunk_kda(*inputs, kernel_options={**WARPDRIVE, "intra_chunk_dtypes": value})
+            chunk_kda(*inputs, kernel_options=_options(value))
     assert compile_fn.cache_info().currsize == len(VALUES), compile_fn.cache_info()
 
 
@@ -272,7 +273,7 @@ def test_chain_bundles_compile_one_kernel_set_per_value() -> None:
         compile_fn.cache_clear()
     for value in VALUES:
         leaves = [t.requires_grad_() for t in _inputs(4096, 8)]  # the chain plan
-        output, _ = chunk_kda(*leaves, kernel_options={**WARPDRIVE, "intra_chunk_dtypes": value})
+        output, _ = chunk_kda(*leaves, kernel_options=_options(value))
         torch.autograd.grad(output.float().square().sum(), leaves)
     for compile_fn in compile_fns:
         assert compile_fn.cache_info().currsize == len(VALUES), compile_fn.cache_info()
@@ -420,7 +421,7 @@ def test_batch_invariant_bits_follow_the_document_not_the_pack(value) -> None:
     q, v = q.bfloat16(), v.bfloat16()
     gate = torch.zeros(1, 1, heads, 128, device="cuda")
     beta = torch.ones(1, 1, heads, device="cuda")
-    options = {**WARPDRIVE, "batch_invariant": True, "intra_chunk_dtypes": value}
+    options = _options(value, batch_invariant=True)
     with torch.no_grad():
         alone, _ = chunk_kda(
             q, q, v, gate, beta, scale=1.0, kernel_options=options,
@@ -451,7 +452,7 @@ def test_backward_differentiates_a_split_forward(value, batch_invariant) -> None
     beta[0, 0] = 1
     d_output = torch.zeros(1, tokens, 1, 128, device="cuda", dtype=torch.bfloat16)
     d_output[0, 64, 0, 0] = 1
-    options = {**WARPDRIVE, "intra_chunk_dtypes": value, "batch_invariant": batch_invariant}
+    options = _options(value, batch_invariant=batch_invariant)
     leaves = [t.bfloat16().requires_grad_() for t in (q, k, v)]
     output, _ = chunk_kda(
         *leaves, gate, beta, scale=1.0, kernel_options=options,
@@ -495,7 +496,7 @@ def test_paged_and_replay_calls_take_the_option() -> None:
         with torch.no_grad():
             output = paged_chunk_kda(
                 q, k, v, gate, beta, advanced, slots, cu_seqlens=cu,
-                kernel_options={**WARPDRIVE, "intra_chunk_dtypes": value},
+                kernel_options=_options(value),
             )  # fmt: skip
         assert torch.equal(output[:, :192], expected[:, :192]), value  # slot 0 is null
         assert torch.equal(advanced[[1, 3, 2]], final[:3]), value
@@ -507,7 +508,7 @@ def test_paged_and_replay_calls_take_the_option() -> None:
     slots = torch.tensor([1, 2], dtype=torch.int32, device="cuda")
     results = {}
     for value in ("bf16", TF32):
-        options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+        options = _options(value)
         expected = _warpdrive((q, k, v, gate, beta), value)[0]
         state_cache = torch.zeros(3, 2, 128, 128, device="cuda")
         replay = ReplayState(
@@ -566,7 +567,7 @@ def test_staged_calls_take_the_option(lengths) -> None:
 
     results = {}
     for value in ("bf16", TF32):
-        options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+        options = _options(value)
         prepared = chunk_kda_prepare(q, k, v, gate, beta, cu_seqlens=cu, kernel_options=options)
         backward = chunk_kda_prepare_backward(
             prepared.saved, d_output, initial, scale=prepared.scale, kernel_options=options
@@ -605,7 +606,7 @@ def test_backward_operand_precision_matches_fp64(value) -> None:
         output, _ = chunk_kda(*leaves, kernel_options=options)
         return torch.autograd.grad(output, leaves, d_output)
 
-    actual = gradients({**WARPDRIVE, "intra_chunk_dtypes": value})
+    actual = gradients(_options(value))
     fused = gradients({"backend": "fused", "autotune": False})
     names = ("dq", "dk", "dv", "dgate", "dbeta")
     errors = {
@@ -680,7 +681,7 @@ def test_backward_applies_scale_outside_the_forward_tiles(dtype, value) -> None:
     gate = torch.zeros(q.shape, device="cuda")
     beta = torch.ones(1, 1, 1, device="cuda")
     d_output = (torch.arange(1, 129, device="cuda") * 1.37).to(dtype).view(q.shape)
-    options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+    options = _options(value)
     initial = torch.zeros(1, 1, 128, 128, device="cuda", requires_grad=True)
     leaves = [t.clone().requires_grad_() for t in (q, q, v)]
     output, _ = chunk_kda(*leaves, gate, beta, initial_state=initial, kernel_options=options)
@@ -720,9 +721,7 @@ def test_key_gradient_scales_the_score_cotangent(dtype, value) -> None:
     gate = torch.zeros(shape, device="cuda")
     beta = torch.ones(shape[:3], device="cuda")
     leaves = [t.clone().requires_grad_() for t in (q, k, v)]
-    output, _ = chunk_kda(
-        *leaves, gate, beta, kernel_options={**WARPDRIVE, "intra_chunk_dtypes": value}
-    )
+    output, _ = chunk_kda(*leaves, gate, beta, kernel_options=_options(value))
     dq, dk = torch.autograd.grad(output, leaves[:2], d_output)
     product = x.float() * y.float()
     operand = product * scale
@@ -753,7 +752,7 @@ def test_state_cotangent_meets_the_forward_restore_key(dtype, value) -> None:
     beta = torch.ones(shape[:3], device="cuda")
     d_output = torch.zeros_like(q)
     d_output[0, 16, 0] = (torch.arange(1, 129, device="cuda") * 1.37).to(dtype)
-    options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+    options = _options(value)
     initial = torch.zeros(1, 1, 128, 128, device="cuda", requires_grad=True)
     leaves = [t.clone().requires_grad_() for t in (q, k, v)]
     output, _ = chunk_kda(
