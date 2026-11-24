@@ -203,13 +203,13 @@ def checkpoint_dir(path_or_repo: str | Path, tqdm_class: type | None = None) -> 
     with ``tqdm_class``), a checkpoint directory, or a file inside one. A download includes the
     tokenizer files (``*.txt`` merges, ``*.jinja`` chat templates) so the tokenizer loads from
     it."""
-    from huggingface_hub import snapshot_download  # optional: the oracle needs only torch
-
     checkpoint = Path(path_or_repo)
     if checkpoint.is_file():
         return checkpoint.parent
     if checkpoint.is_dir():
         return checkpoint
+    from huggingface_hub import snapshot_download  # optional: the oracle needs only torch
+
     return Path(
         snapshot_download(
             str(path_or_repo),

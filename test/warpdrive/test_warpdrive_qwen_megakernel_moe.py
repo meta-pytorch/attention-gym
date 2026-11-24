@@ -11,6 +11,7 @@ pytest.importorskip("cutlass.cute")
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK
 from attn_gym.warpdrive.examples.qwen_megakernel import ref as ref_module
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
@@ -23,16 +24,9 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     rms_norm,
 )
 
+pytestmark = pytest.mark.usefixtures("release_cuda_memory")
+
 MAX_LEN = 256
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    """Return each test's runners (packed weight copies, up to 64 GB for Qwen3-32B) to the
-    device before the next test, which may load another checkpoint on this worker."""
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def require_sm100():
@@ -122,7 +116,7 @@ def test_moe_checkpoint_decode_steps(monkeypatch, engine):
     torch.cuda.empty_cache()
     weights = load_qwen3_weights(path)
     for ctx in (127, 1500):
-        max_len = (ctx // mk.BLOCK + 1) * mk.BLOCK
+        max_len = (ctx // BLOCK + 1) * BLOCK
         runner = mk.QwenMegakernel(weights, max_len, engine=engine)
         state = make_decode_state(weights, ctx, max_len, seed=ctx)
         # The deep-model gate (as in check_moe_batch): the budget scales the eager bf16 reference's

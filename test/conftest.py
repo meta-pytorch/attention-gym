@@ -1,5 +1,6 @@
 """Shared pytest fixtures."""
 
+import gc
 import importlib
 import importlib.util
 import os
@@ -117,6 +118,15 @@ def requires_blackwell() -> None:
         pytest.skip("CUDA not available")
     if not cuda_runs_sm100_kernels():
         pytest.skip(f"warpdrive tests require {SM100_KERNELS_REQUIREMENT}")
+
+
+@pytest.fixture
+def release_cuda_memory() -> Iterator[None]:
+    """Return the test's device memory (runners, checkpoints) to the device before the next
+    test, which may load another checkpoint on this worker."""
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture

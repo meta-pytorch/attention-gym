@@ -67,15 +67,14 @@ import math
 
 import torch
 
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM
+from attn_gym.warpdrive.examples.megakernel.launch import tagged_values
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
     ATTN,
     ATTN_SCALE,
-    BLOCK,
-    COMPUTE_WARPS,
     DOWN,
     GATEUP,
-    HEAD_DIM,
     LMHEAD,
     NORM,
     OP_NAMES,
@@ -84,7 +83,6 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     QWEN3_0_6B,
     REDUCE,
     ROUTER,
-    ROWS,
     TRACE_EVENTS,
     TRACE_EVENTS_PER_ROW,
     QwenDecodeMegakernel,
@@ -117,13 +115,10 @@ __all__ = [
     "ALL_OPS",
     "ATTN",
     "ATTN_SCALE",
-    "BLOCK",
-    "COMPUTE_WARPS",
     "CONTEXT",
     "DEPENDENCY_LATENCY",
     "DOWN",
     "GATEUP",
-    "HEAD_DIM",
     "LMHEAD",
     "NORM",
     "OPROJ",
@@ -133,7 +128,6 @@ __all__ = [
     "REDUCE",
     "REUSED_INPUT",
     "ROUTER",
-    "ROWS",
     "ROW_COST_MODELS",
     "TRACE_EVENTS",
     "TRACE_EVENTS_PER_ROW",
@@ -267,7 +261,7 @@ class QwenMegakernel:
 
     def values(self, name: str) -> torch.Tensor:
         """A tagged buffer's fp32 values, ignoring the tags."""
-        return self.tagged(name).view(torch.int32)[..., 0::2].view(torch.float32)
+        return tagged_values(self.tagged(name))
 
     def routed_experts(self) -> torch.Tensor:
         """MoE: the (layers, batch, experts_per_token) experts the last launch routed to, by rank:
