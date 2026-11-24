@@ -22,6 +22,8 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     random_weights,
 )
 
+pytestmark = pytest.mark.usefixtures("release_cuda_memory")
+
 MAX_LEN = 512
 SMALL = QwenConfig(
     hidden_size=1024, num_layers=2, num_q_heads=16, num_kv_heads=8, intermediate_size=3072,
@@ -32,13 +34,6 @@ SMALL_MOE = QwenConfig(
     hidden_size=1024, num_layers=2, num_q_heads=32, num_kv_heads=4, intermediate_size=1024,
     vocab_size=4096, num_experts=128, experts_per_token=8, moe_intermediate_size=256,
 )  # fmt: skip
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def require_sm100():

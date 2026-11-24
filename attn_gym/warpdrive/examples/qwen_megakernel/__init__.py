@@ -1,13 +1,14 @@
 """The Qwen3 decode megakernel (see ``runner``). Modules:
 
-- ``core``: scratch layout, tagged words, the CUDA-core GEMV engine, ``QwenDecodeMegakernel`` and its
-  compile function;
+- ``core``: scratch layout, ``QwenDecodeMegakernel`` and its compile function, on the shared
+  megakernel package (``examples.megakernel``: tagged words, the CUDA-core GEMV engine);
 - ``tc``: the tcgen05 engine and streamed inputs;
 - ``schedule``: the host's instruction table, row-cost model and CTA assignment;
 - ``runner``: the ``QwenMegakernel`` runner;
 - ``ref``: the PyTorch reference and checkpoint loading;
 - ``trace``, ``viz``: globaltimer decoding and the schedule page;
-- ``bench``, ``bench_batch``, ``chat``: benchmarks and a streaming chat demo.
+- ``bench``, ``bench_batch``: benchmarks; ``chat``: the Qwen3 family of the megakernel chat
+  (``examples.megakernel.chat``).
 
 The runner's public names are re-exported here, loaded on first use: importing one module (say
 ``ref``) does not load the runner and every kernel.

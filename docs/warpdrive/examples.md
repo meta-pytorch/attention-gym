@@ -15,7 +15,7 @@ PyTorch or FA4 feature.
 | Study attention backward and overlapping lifetimes | [fa4_bwd.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_bwd.py) | [Backward](#attention-backward) |
 | Consume a device-built work list | [packed_work.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/packed_work.py) | [Scheduling](scheduling.md) |
 | Decode one token with split KV | [fa4_decode_swapab.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/fa4_decode_swapab.py) | [Decode](#single-token-decode), [shared KV](#shared-kv-ring) |
-| Run a whole Qwen3 decode step as one persistent launch per layer | [qwen_megakernel.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
+| Run a whole Qwen3 decode step as one persistent launch per layer | [qwen_megakernel](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/qwen_megakernel/runner.py) | [Qwen3 megakernel](#qwen3-decode-megakernel) |
 | Mix managed and raw synchronization | [raw_interop.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/raw_interop.py) | [Dropping down](dropping-down.md) |
 | Reuse CUTLASS or FA4 tile orders | [external_maps.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/external_maps.py) | [External tile orders](scheduling.md#external-tile-orders-subclass-workmap) |
 | Visualize which CTA runs each item | [schedule_views.py](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/schedule_views.py) | [Tracing](tracing.md#see-which-cta-runs-what) |
@@ -639,8 +639,8 @@ layer (hybrid models whose attention layers want another kernel configuration).
 <details markdown="1">
 <summary>How the megakernel runs the model</summary>
 
-- **Code.** The `qwen_megakernel` package: `core.py` holds the base kernel and the CUDA-core engine,
-  `tc.py` the tcgen05 engine and streamed inputs, `schedule.py` the host's instruction
+- **Code.** The `qwen_megakernel` package over the shared [megakernel package](#shared-megakernel-package):
+  `core.py` holds the base kernel, `tc.py` the tcgen05 engine and streamed inputs, `schedule.py` the host's instruction
   table and CTA assignment, and `runner.py` the `QwenMegakernel` runner. One prologue builds every GEMV input: a group of
   `8 // min(batch, 8)` warps per token, so batch one uses all eight warps per token and a batch
   of eight or more one warp each.
@@ -751,6 +751,24 @@ The tagged-word protocol crosses clusters and uses raw code, not the layer's
 not its cross-CTA critical path; see [raw code and opt-outs](guarantees.md#opt-outs).
 
 </details>
+
+## Shared megakernel package
+
+`examples/megakernel/` holds what the decode megakernels share: the tile geometry, the epoch-tagged
+words that carry activations between CTAs, register helpers, the CUDA-core GEMV engine, the weight
+ring's TMA loads, the instruction table and the chat driver. A model directory keeps its oracle,
+kernels, runners, bench and chat family module. Its
+[`AGENTS.md`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/megakernel/AGENTS.md)
+states what belongs in the package and the rules its kernels follow (residency, K/V store ordering,
+compile-key boundaries); the `adding-megakernel-model` skill
+(`.agents/skills/adding-megakernel-model`) walks through adding a model.
+
+The chat picks the model family from the checkpoint's `config.json`:
+
+```bash
+python -m attn_gym.warpdrive.examples.megakernel.chat --model Qwen/Qwen3-8B
+python -m attn_gym.warpdrive.examples.qwen_megakernel.chat --backend compile --prompt "Hi"
+```
 
 ## Known limits
 

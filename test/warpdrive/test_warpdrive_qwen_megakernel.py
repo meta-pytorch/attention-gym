@@ -1,7 +1,6 @@
 """Qwen3 decode megakernel: each instruction alone, then whole decode steps."""
 
 import dataclasses
-import gc
 
 import pytest
 import torch
@@ -13,6 +12,7 @@ from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.testing.perfetto_trace import read_slices
 from attn_gym.warpdrive import ProtocolError, RoleConfig
 from attn_gym.warpdrive.examples import qwen_megakernel as mk
+from attn_gym.warpdrive.examples.megakernel.constants import COMPUTE_WARPS, HEAD_DIM, ROWS
 from attn_gym.warpdrive.examples.qwen_megakernel import trace as mk_trace
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     QwenConfig,
@@ -29,16 +29,9 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
 from attn_gym.warpdrive.profiler import Range
 from attn_gym.warpdrive.trace_session import _roles, work_item_ranges
 
+pytestmark = pytest.mark.usefixtures("release_cuda_memory")
+
 MAX_LEN = 256
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    """Return each test's runners (packed weight copies, up to 64 GB for Qwen3-32B) to the
-    device before the next test, which may load another checkpoint on this worker."""
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def cached_weights(repo: str):
@@ -129,7 +122,7 @@ def test_single_instruction(weights, op, engine):
         elif op == "attn":
             qkv = inputs["qkv"][layer].bfloat16()
             cos, sin = rope_at(pos)
-            q, k, v = qkv.view(-1, mk.HEAD_DIM).split((q_heads, kv_heads, kv_heads))
+            q, k, v = qkv.view(-1, HEAD_DIM).split((q_heads, kv_heads, kv_heads))
             q = rope(rms_norm(q, w.q_norm[layer], eps), cos, sin)
             k = rope(rms_norm(k, w.k_norm[layer], eps), cos, sin)
             torch.testing.assert_close(caches[0][layer, :, pos], k)
@@ -367,6 +360,22 @@ def test_odd_gqa_group_random_weights(engine):
         torch.testing.assert_close(mine[:, :, pos], oracle[:, :, pos], atol=0.05, rtol=0.02)
 
 
+def test_cache_capacity_reuses_the_kernel():
+    """The cache capacity is a runtime size (``compile_megakernel``): runners of another
+    capacity reuse the compiled kernel."""
+    if not cuda_runs_sm100_kernels():
+        pytest.skip("the megakernel requires an SM100-family GPU")
+    config = QwenConfig(
+        hidden_size=1024, num_layers=2, num_q_heads=16, num_kv_heads=8,
+        intermediate_size=2048, vocab_size=4096,
+    )  # fmt: skip
+    weights = random_weights(config)
+    mk.QwenMegakernel(weights, MAX_LEN)
+    compiled = mk.compile_megakernel.cache_info().currsize
+    mk.QwenMegakernel(weights, 6 * MAX_LEN)
+    assert mk.compile_megakernel.cache_info().currsize == compiled
+
+
 def test_yarn_rope_random_weights():
     """A YaRN config past its original context: the runner's RoPE table follows the config's
     scaling, so the step matches the reference, and it reuses the plain config's kernel."""
@@ -399,7 +408,7 @@ def test_moved_roles_match_defaults(weights_0_6b, engine):
     """The roles index their own threads: moving compute off warp 0 changes no bit. With the
     tcgen05 engine the TMEM loads then run on other hardware warps, whose subpartitions (warp
     index % 4) are rotated."""
-    moved = {"load": RoleConfig(0), "compute": RoleConfig(range(1, 1 + mk.COMPUTE_WARPS))}
+    moved = {"load": RoleConfig(0), "compute": RoleConfig(range(1, 1 + COMPUTE_WARPS))}
     caches, token, pos = make_decode_state(weights_0_6b, 100, MAX_LEN, seed=0)
     ours, theirs = [c.clone() for c in caches], [c.clone() for c in caches]
     runner = mk.QwenMegakernel(weights_0_6b, MAX_LEN, roles=moved, engine=engine)
@@ -453,7 +462,7 @@ def test_globaltimer_trace(weights_0_6b, tmp_path, engine):
     slices = read_slices(tmp_path / "step.pftrace")
     flows = [flow for item in slices for flow in item.flows_out]
     # Layer 0's QKV rows wait on nothing.
-    assert len(flows) >= len(rows) - runner.op.qkv_rows // mk.ROWS
+    assert len(flows) >= len(rows) - runner.op.qkv_rows // ROWS
     assert {item.name for item in slices if item.track == "compute"} >= ops
 
 

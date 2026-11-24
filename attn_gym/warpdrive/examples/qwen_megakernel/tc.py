@@ -22,10 +22,12 @@ from attn_gym.warpdrive import (
     WorkCursor,
     role,
 )
+from attn_gym.warpdrive.examples.megakernel.attention import split_blocks
+from attn_gym.warpdrive.examples.megakernel.constants import COMPUTE_WARPS, STAGE_BYTES
+from attn_gym.warpdrive.examples.megakernel.tagged import fetch, publish
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ATTN,
     COMPUTE_TMEM_FENCED,
-    COMPUTE_WARPS,
     DOWN,
     DOWN_SPLITS,
     GATEUP,
@@ -35,13 +37,10 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     QWEN3_0_6B,
     REDUCE,
     SHARED_CHUNK,
-    STAGE_BYTES,
     MegakernelParams,
     QwenDecodeMegakernel,
-    fetch,
     make_tma_atoms,
     mlp_width,
-    publish,
     qkv_rows,
     tma_partitions,
 )
@@ -256,7 +255,7 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
             op, layer, a, b, _row = work.item
             if op == ATTN:
                 t, split = self.attn_token(b)
-                blk0, blk1 = self.split_blocks(p.step[t, 1], split)
+                blk0, blk1, _newest = split_blocks(p.step[t, 1], split, self.splits)
                 for _ in cutlass.range(2 * (blk1 - blk0), unroll=1):
                     with w.consume():
                         pass
