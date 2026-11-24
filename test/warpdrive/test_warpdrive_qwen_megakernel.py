@@ -361,6 +361,10 @@ def test_odd_gqa_group_random_weights(engine):
         mk.QwenMegakernel(weights, MAX_LEN, smem_bytes=65536)
     runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
     assert runner.wgu.is_set_to(packed.view(-1, config.hidden_size))
+    # Replacing a logical weight must also change what decode reads.
+    weights = dataclasses.replace(weights, gate=-weights.gate)
+    runner = mk.QwenMegakernel(weights, MAX_LEN, engine=engine)
+    assert not runner.wgu.is_set_to(packed.view(-1, config.hidden_size))
     assert (runner.op.per_row, runner.op.heads_per_split) == (1, 6)
     caches, token, pos = make_decode_state(weights, 150, MAX_LEN, seed=3)
     ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))

@@ -287,7 +287,9 @@ def load_qwen3_weights(
     missing = set(keys)
     for shard in sorted(checkpoint.glob("*.safetensors")):
         with safe_open(str(shard), framework="pt", device="cpu") as source:
-            for key in source.offset_keys():
+            # Older safetensors releases expose keys() but not offset_keys().
+            shard_keys = getattr(source, "offset_keys", source.keys)()
+            for key in shard_keys:
                 if key not in keys:
                     continue
                 name, index = keys[key]

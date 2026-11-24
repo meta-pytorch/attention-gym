@@ -214,7 +214,11 @@ class QwenMegakernel:
         # Gate and up rows interleaved, so a 32-row tile holds 16 (gate, up) pairs; MoE weights
         # carry an expert axis after the layer axis.
         gate_up = weights.packed_gate_up
-        if gate_up is None:
+        if (
+            gate_up is None
+            or not gate_up.select(-2, 0).is_set_to(weights.gate)
+            or not gate_up.select(-2, 1).is_set_to(weights.up)
+        ):
             gate_up = torch.stack((weights.gate, weights.up), dim=-2)
         self.wgu = gate_up.view(-1, op.hidden)
         self.wd = weights.down.reshape(-1, weights.down.shape[-1]).contiguous()
