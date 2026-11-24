@@ -222,20 +222,19 @@ def dense_layer(w: ref.LayerWeights, experts: torch.Tensor | None = None) -> ref
     if given, with their ``ExpertQuant``), dense ones as they are."""
     if isinstance(w.w13, torch.Tensor):
         return w
-    w13, w2 = (w.w13, w.w2) if experts is None else (w.w13.select(experts), w.w2.select(experts))
+
+    def chosen(per_expert):  # QuantExperts or ExpertQuant
+        return per_expert if experts is None else per_expert.select(experts)
+
+    w13, w2 = chosen(w.w13), chosen(w.w2)
     if not w.declared_experts:
         return dataclasses.replace(w, w13=w13.dequantize(deinterleave=True), w2=w2.dequantize())
-    w13_quant, w2_quant = (
-        (w.w13_quant, w.w2_quant)
-        if experts is None
-        else (w.w13_quant.select(experts), w.w2_quant.select(experts))
-    )
     return dataclasses.replace(
         w,
         w13=w13.block_values(deinterleave=True),
         w2=w2.block_values(),
-        w13_quant=w13_quant,
-        w2_quant=w2_quant,
+        w13_quant=chosen(w.w13_quant),
+        w2_quant=chosen(w.w2_quant),
     )
 
 

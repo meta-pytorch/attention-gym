@@ -28,8 +28,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingWeights,
     Kernels,
     LayerWeights,
-    hidden_states,
-    logits_of,
+    forward_tokens,
     require_dense_experts,
     swiglu,
 )
@@ -92,6 +91,4 @@ def decode_step(
     """One decode step of the one-element ``token`` at the one-element device position ``pos``;
     writes the caches there and returns fp32 logits ``(vocab,)``. No host sync as long as
     ``kernels`` sync nothing (``FAST``'s do not)."""
-    positions = pos.reshape(1).long()
-    h = hidden_states(weights, token.reshape(1), positions, cache, None, kernels)
-    return logits_of(weights, h)[0]
+    return forward_tokens(weights, token, pos, cache, kernels=kernels)

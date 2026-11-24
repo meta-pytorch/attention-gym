@@ -57,11 +57,13 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingCache,
     InklingWeights,
     Kernels,
+    chat_prompt_ids,
     checkpoint_dir,
     experts_out,
     forward_tokens,
     load_inkling_weights,
     rms_norm,
+    stop_tokens,
 )
 
 
@@ -558,14 +560,15 @@ class DSparkDrafter:
 def target_forward(
     target: InklingWeights,
     tokens: torch.Tensor,
-    pos: int,
+    pos: int | torch.Tensor,
     cache: InklingCache,
     visits: Iterable[int],
     all_logits: bool,
     kernels: Kernels | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """``ref.forward_tokens``' logits and the bf16 (tokens, len(visits), hidden) inputs of
-    ``visits`` (``target.config.num_visits``: the final normalized states)."""
+    """``ref.forward_tokens``' logits (a host or device ``pos``) and the bf16 (tokens,
+    len(visits), hidden) inputs of ``visits`` (``target.config.num_visits``: the final
+    normalized states)."""
     visits = tuple(visits)
     captured: dict[int, torch.Tensor] = {}
 
@@ -619,26 +622,24 @@ def speculative_generate(
     max_new: int,
     stops: Iterable[int] = (),
     visits: Iterable[int] = DSparkConfig.target_visits,
-    verify_chunk: int | None = None,
     kernels: Kernels | None = None,
     verify: Verify | None = None,
     prefill: Prefill | None = None,
 ) -> SpecResult:
     """Greedy decode of up to ``max_new`` tokens after ``prompt`` (ending at a token of
-    ``stops``), verifying each of ``drafter``'s proposals with target forwards of
-    ``verify_chunk`` tokens (None: the whole block in one forward). The drafter is fresh; the
-    target's cache holds ``spec_max_len(prompt.numel(), max_new, drafter.num_drafts + 1)``
-    positions and a ``DSparkDrafter``'s needs ``spec_max_len(..., block_size)``.
+    ``stops``), verifying each of ``drafter``'s proposals with one target forward of the block.
+    The drafter is fresh; the target's cache holds ``spec_max_len(prompt.numel(), max_new,
+    drafter.num_drafts + 1)`` positions and a ``DSparkDrafter``'s needs ``spec_max_len(...,
+    block_size)``.
 
-    The tokens are the target's greedy decode in the verify's rounding: ``verify_chunk=1``
-    rounds as a one-token decode (``ref.forward_tokens``), so its tokens equal that greedy
-    decode bit for bit; a block forward rounds differently (as HF's does) and may resolve a
-    near tie the other way, after which the two decodes diverge. ``kernels``: the target's, as
+    The tokens are the target's greedy decode in the verify's rounding: a block forward rounds
+    differently from a one-token decode (as HF's does) and may resolve a near tie the other way,
+    after which the two decodes diverge. ``kernels``: the target's, as
     ``ref.forward_tokens``'. ``verify``: the verify forward (default: ``target_forward`` of
     ``visits`` with ``kernels``); ``prefill``: the prompt's (default: ``target_forward``'s
     into a cache of ``spec_max_len`` positions, its features committed to ``drafter``)."""
-    if max_new < 1 or (verify_chunk is not None and verify_chunk < 1):
-        raise ValueError(f"need max_new >= 1 and verify_chunk >= 1, got {max_new}, {verify_chunk}")
+    if max_new < 1:
+        raise ValueError(f"need max_new >= 1, got {max_new}")
     stops, visits = set(stops), tuple(visits)
     if verify is None:
 
@@ -661,11 +662,7 @@ def speculative_generate(
     while len(result.tokens) < max_new and anchor not in stops:
         drafts = drafter.propose(anchor, pos)
         block = torch.cat([prompt.new_tensor([anchor]), drafts.to(prompt.dtype)])
-        chunk = verify_chunk or block.numel()
-        parts = [
-            verify(block[i : i + chunk], pos + i, cache) for i in range(0, block.numel(), chunk)
-        ]
-        logits, features = map(torch.cat, zip(*parts))
+        logits, features = verify(block, pos, cache)
         verified = logits.argmax(-1)
         matches = (drafts == verified[:-1]).tolist()
         accepted = next((i for i, match in enumerate(matches) if not match), len(matches))
@@ -741,8 +738,7 @@ def main(
     target = load_inkling_weights(path)
     draft = load_dspark_weights(target, path)
     tokenizer = AutoTokenizer.from_pretrained(path)
-    stops = {tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|endoftext|>")}
-    stops = {s for s in stops if isinstance(s, int) and s >= 0}
+    stops = stop_tokens(tokenizer)
     unions: list[list[int]] = []  # per verify MLP visit, of its first 1 .. block tokens
     block = draft.config.block_size
     no_union = [[float("nan")] * block]  # no verify step (max_new 1, or a stop first): NaNs
@@ -756,13 +752,8 @@ def main(
     runs, results = [], {}
     for effort in efforts.split(","):
         for name, content in PROMPTS.items():
-            text = tokenizer.apply_chat_template(
-                [{"role": "user", "content": content}],
-                tokenize=False,
-                add_generation_prompt=True,
-                reasoning_effort=effort,
-            )
-            prompt = torch.tensor(tokenizer(text, add_special_tokens=False).input_ids).cuda()
+            messages = [{"role": "user", "content": content}]
+            prompt = torch.tensor(chat_prompt_ids(tokenizer, messages, effort), device="cuda")
             max_len = spec_max_len(prompt.numel(), max_new, draft.config.block_size)
             start = len(unions)
             result = speculative_generate(

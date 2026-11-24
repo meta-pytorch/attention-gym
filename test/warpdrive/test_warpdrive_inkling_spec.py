@@ -22,7 +22,7 @@ from test_warpdrive_inkling_dspark import (  # noqa: F401
 )
 from test_warpdrive_megakernel_spec import step_runner
 
-from attn_gym.warpdrive.examples.inkling_megakernel import quant
+from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
 from attn_gym.warpdrive.examples.inkling_megakernel.chat import (
     SPEC_TOKENS,
     MegakernelSpec,
@@ -35,11 +35,11 @@ from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     speculative_generate,
     target_forward,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import InklingCache, load_inkling_weights
 from attn_gym.warpdrive.examples.inkling_megakernel.spec import (
     DecoderTargetBlock,
     TorchTargetBlock,
-    block_forward,
 )
 from attn_gym.warpdrive.examples.megakernel.chat import SYNC_EVERY, Chat
 from attn_gym.warpdrive.examples.megakernel.spec import SpecStep, prefill_blocks
@@ -83,8 +83,9 @@ def device_decode(weights, prompt, drafter, max_len: int, tokens: int, max_new: 
 def test_spec_step_decodes_the_host_loop(tiny_target, tiny_drafter_dir):  # noqa: F811
     """On the random tiny target and drafter, the device step at the chat's default ``k``, eager
     and replayed from a CUDA graph, commits the tokens and accepted counts of
-    ``speculative_generate``'s host loop with the same verify forward (``spec.block_forward``)
-    and drafter, and writes the same caches."""
+    ``speculative_generate``'s host loop with the same verify forward (``TorchTargetBlock``'s:
+    ``target_forward`` at a device position on ``fast.FAST``) and drafter, and writes the same
+    caches."""
     weights, prompt = tiny_target
     tokens = SPEC_TOKENS
     max_new = 24
@@ -96,8 +97,8 @@ def test_spec_step_decodes_the_host_loop(tiny_target, tiny_drafter_dir):  # noqa
         return DSparkDrafter(draft, draft_len, tokens - 1, static=True)
 
     def verify(block, pos, cache):
-        positions = torch.arange(pos, pos + block.numel(), device="cuda")
-        return block_forward(weights, block, positions, cache, TINY_VISITS)
+        pos = torch.tensor([pos], device="cuda")
+        return target_forward(weights, block, pos, cache, TINY_VISITS, True, FAST)
 
     expected = speculative_generate(
         weights, drafter(), prompt, max_new, visits=TINY_VISITS, verify=verify
@@ -137,6 +138,19 @@ class StubChatModel:
         return {"role": "assistant", "ids": list(ids)}
 
 
+def assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop):
+    """The chat's reply over ``backend`` is ``host_loop(prompt, max_new)``'s tokens (for the same
+    target cache length) cut as ``reply_of``, and the drafter is accepted (a broken feature,
+    commit or accept wiring drafts ~nothing)."""
+    chat = Chat(StubChatModel(backend, ids, stops, max_len))
+    chat.reply("", None, 0.0, lambda *_: None)
+    max_new = max_len - len(ids) - (backend.tokens_per_step - 1)
+    expected = host_loop(torch.tensor(ids, device="cuda"), max_new)
+    room = max_len - len(ids) - SYNC_EVERY - 1
+    assert chat.messages[-1]["ids"] == reply_of(expected.tokens, stops, room)
+    assert expected.tokens_per_step > 1.6, expected.accepted
+
+
 @pytest.fixture(scope="module")
 def checkpoint():
     """The checkpoint directory, a chat prompt (low reasoning effort) and the stop tokens. Each
@@ -146,13 +160,8 @@ def checkpoint():
 
     tokenizer = AutoTokenizer.from_pretrained(path)
     messages = [{"role": "user", "content": "Write a Python function that reverses a string."}]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True, reasoning_effort="low"
-    )
-    stops = {tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|endoftext|>")}
-    stops = {s for s in stops if isinstance(s, int) and s >= 0}
-    ids = tokenizer(text, add_special_tokens=False).input_ids
-    return Path(path), ids, stops
+    ids = ref.chat_prompt_ids(tokenizer, messages, "low")
+    return Path(path), ids, ref.stop_tokens(tokenizer)
 
 
 @pytest.mark.xdist_group("inkling-checkpoint")
@@ -161,28 +170,22 @@ def test_checkpoint_spec_chat_decodes_the_host_loop(checkpoint):
     """The chat's ``spec-torch`` backend (k = 4, CUDA graphs of two steps per replay) replies
     with ``speculative_generate``'s tokens for the same verify forward and drafter, cut before
     the first stop token (the chat never shows one) or at the caches' room, and the shipped
-    drafter is accepted (a broken feature, commit or accept wiring drafts ~nothing)."""
+    drafter is accepted."""
     path, ids, stops = checkpoint
     target = load_inkling_weights(path)
     max_len = len(ids) + 64
     backend = SpecTorch(target, InklingCache.empty(target.config, max_len), path)
-    tokens = backend.tokens_per_step
-    chat = Chat(StubChatModel(backend, ids, stops, max_len))
-    chat.reply("", None, 0.0, lambda *_: None)
-    reply = chat.messages[-1]["ids"]
 
     def verify(block, pos, cache):
-        positions = torch.arange(pos, pos + block.numel(), device="cuda")
-        return block_forward(target, block, positions, cache)
+        pos = torch.tensor([pos], device="cuda")
+        return target_forward(target, block, pos, cache, backend.visits, True, FAST)
 
-    drafter = DSparkDrafter(
-        backend.drafter.weights, backend.drafter.cache.max_len, tokens - 1, static=True
-    )
-    prompt = torch.tensor(ids, device="cuda")
-    max_new = max_len - len(ids) - (tokens - 1)  # the same target cache length
-    expected = speculative_generate(target, drafter, prompt, max_new, stops, verify=verify)
-    assert reply == reply_of(expected.tokens, stops, max_len - len(ids) - SYNC_EVERY - 1)
-    assert expected.tokens_per_step > 1.6, expected.accepted
+    def host_loop(prompt, max_new):
+        draft = backend.drafter
+        drafter = DSparkDrafter(draft.weights, draft.cache.max_len, draft.num_drafts, static=True)
+        return speculative_generate(target, drafter, prompt, max_new, stops, verify=verify)
+
+    assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop)
 
 
 @pytest.mark.xdist_group("inkling-checkpoint")
@@ -203,13 +206,8 @@ def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint):
     max_len = -(-(len(ids) + 96) // 64) * 64
     backend = MegakernelSpec(target, InklingCache.empty(target.config, max_len), path)
     tokens = backend.tokens_per_step
-    chat = Chat(StubChatModel(backend, ids, stops, max_len))
-    chat.reply("", None, 0.0, lambda *_: None)
-    reply = chat.messages[-1]["ids"]
-
     decoder = InklingDecoder(target, block_tokens=tokens)
-    draft = backend.drafter.weights
-    drafter = MegakernelDrafter(draft, backend.drafter.max_len, tokens - 1)
+    drafter = MegakernelDrafter(backend.drafter.weights, backend.drafter.max_len, tokens - 1)
 
     def verify(block, pos, cache):
         return decoder.decode_block(block, torch.tensor([pos], device="cuda"), cache, True)
@@ -228,10 +226,9 @@ def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint):
         assert torch.equal(changed_features[:-1], features[:-1])
         return cache, prefill_blocks(block, drafter.kernels, prompt, 0)
 
-    prompt = torch.tensor(ids, device="cuda")
-    max_new = max_len - len(ids) - (tokens - 1)  # the same target cache length
-    expected = speculative_generate(
-        target, drafter, prompt, max_new, stops, verify=verify, prefill=prefill
-    )
-    assert reply == reply_of(expected.tokens, stops, max_len - len(ids) - SYNC_EVERY - 1)
-    assert expected.tokens_per_step > 1.6, expected.accepted
+    def host_loop(prompt, max_new):
+        return speculative_generate(
+            target, drafter, prompt, max_new, stops, verify=verify, prefill=prefill
+        )
+
+    assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop)

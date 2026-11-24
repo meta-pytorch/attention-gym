@@ -16,7 +16,7 @@ from collections.abc import Iterable
 
 import torch
 
-from attn_gym.warpdrive.examples.inkling_megakernel.dspark import DSparkConfig
+from attn_gym.warpdrive.examples.inkling_megakernel.dspark import DSparkConfig, target_forward
 from attn_gym.warpdrive.examples.inkling_megakernel.fast import FAST
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     CONV_RING,
@@ -24,8 +24,6 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingConfig,
     InklingWeights,
     Kernels,
-    hidden_states,
-    logits_of,
 )
 
 # The blocks ``megakernel.InklingDecoder`` (``DecoderTargetBlock``) runs; the chat's default (4)
@@ -40,32 +38,10 @@ def max_block_tokens(config: InklingConfig) -> int:
     return CONV_RING - config.conv_kernel + 1
 
 
-def block_forward(
-    weights: InklingWeights,
-    tokens: torch.Tensor,
-    positions: torch.Tensor,
-    cache: InklingCache,
-    visits: Iterable[int] = DSparkConfig.target_visits,
-    kernels: Kernels = FAST,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """``examples.megakernel.spec.TargetBlock``'s result for ``tokens`` at device ``positions``:
-    ``ref.hidden_states`` with ``start=None`` (static shapes) on ``kernels`` and the inputs of
-    ``visits`` (``config.num_visits``: the final normalized states)."""
-    visits = tuple(visits)
-    captured: dict[int, torch.Tensor] = {}
-
-    def observe(visit: int, h: torch.Tensor):
-        if visit in visits:
-            captured[visit] = h
-
-    h = hidden_states(weights, tokens, positions, cache, None, kernels, observe)
-    return logits_of(weights, h), torch.stack([captured[v] for v in visits], dim=1)
-
-
 class TorchTargetBlock:
-    """``block_forward`` as a ``examples.megakernel.spec.TargetBlock`` of ``tokens`` tokens into
-    ``cache``: the capturable torch step (``fast.decode_step``'s kernels by default) over a
-    block."""
+    """An ``examples.megakernel.spec.TargetBlock`` of ``tokens`` tokens into ``cache``: the
+    capturable torch step (``fast.decode_step``'s kernels by default) over a block, logits and
+    the inputs of ``visits`` (``dspark.target_forward`` at a device position)."""
 
     def __init__(
         self,
@@ -82,14 +58,12 @@ class TorchTargetBlock:
             )
         self.weights, self.cache, self.tokens = weights, cache, tokens
         self.visits, self.kernels = tuple(visits), kernels
-        self.offsets = torch.arange(tokens, device=cache.k.device)
 
     def __call__(
         self, tokens: torch.Tensor, pos: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        positions = pos.reshape(1).long() + self.offsets
-        return block_forward(
-            self.weights, tokens, positions, self.cache, self.visits, self.kernels
+        return target_forward(
+            self.weights, tokens, pos, self.cache, self.visits, True, self.kernels
         )
 
 

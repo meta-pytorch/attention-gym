@@ -32,6 +32,7 @@ from cutlass import BFloat16, Float32, Int32, cute
 
 from attn_gym.warpdrive import (
     NamedBarrier,
+    Producer,
     Ring,
     SmemPlan,
     StageView,
@@ -39,7 +40,9 @@ from attn_gym.warpdrive import (
     Tma,
     Warps,
     WarpSpecialized,
+    WorkCursor,
     WorkStream,
+    role,
 )
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
 from attn_gym.warpdrive.examples.megakernel.constants import (
@@ -95,12 +98,6 @@ GATE_SPLITS = 3  # MSGDOWN split-K: k tiles of the x half per item = hidden / 25
 MIX_STAGES = 2  # GATEMIX: 32-row stages of [F | G] per item
 # MIX: the prologue's state scale factors (STATES), then each query's state weights (STATES).
 MIX_FLOATS = STATES * 4
-
-
-def add_offset(index, base):
-    """``index + base``, leaving ``index`` itself when ``base`` is the Python int 0 (a token
-    offset of the one-token kernels, which must keep their IR)."""
-    return index if isinstance(base, int) and base == 0 else index + base
 
 
 @cute.jit
@@ -166,7 +163,7 @@ class GateParams:
 
 
 class InklingKernel(WarpSpecialized):
-    """Device helpers of the Inkling launches. Subclasses set ``hidden``, ``rms_eps``,
+    """Device helpers of the Inkling launches. Subclasses call ``init_hidden``, set
     ``stages`` (``ring_stages``) and ``csync`` (the compute warps' barrier), and define
     ``scratch_shapes`` (tagged words by buffer, for ``examples.megakernel.launch.Launch``)
     when they publish any; launches with message gates call ``init_messages`` and implement
@@ -177,6 +174,13 @@ class InklingKernel(WarpSpecialized):
     messages = False
     tokens = 1  # consecutive tokens of one sequence per launch
     x_pad = 0  # bf16 elements after each row of X (multi-token launches skew rows' banks)
+
+    def init_hidden(self, hidden: int, rms_eps: float):
+        """The hidden size (whole compute-thread strides and GEMV k tiles) and RMSNorm eps."""
+        if hidden % COMPUTE_THREADS or hidden % TILE_K:
+            raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS} and {TILE_K}")
+        self.hidden, self.rms_eps = hidden, rms_eps
+        self.hidden_k_tiles = hidden // TILE_K
 
     def init_messages(self, messages: bool, gate_query: tuple[int, ...]):
         """All GATES message gates when ``messages``; ``gate_query[s]`` is the prologue query
@@ -249,13 +253,11 @@ class InklingKernel(WarpSpecialized):
         for n in cutlass.range_constexpr(MAX_BLOCKS):
             if n < num_blocks:
                 for r in cutlass.range_constexpr(per):
-                    x[n, r] = Float32(p.blocks[n][add_offset(r * COMPUTE_THREADS + tid, base)])
+                    x[n, r] = Float32(p.blocks[n][base + r * COMPUTE_THREADS + tid])
         if cutlass.const_expr(partial is not None):
             if load_partial:
                 for r in cutlass.range_constexpr(per):
-                    x[MAX_BLOCKS, r] = Float32(
-                        partial[add_offset(r * COMPUTE_THREADS + tid, base)]
-                    )
+                    x[MAX_BLOCKS, r] = Float32(partial[base + r * COMPUTE_THREADS + tid])
         return x
 
     @cute.jit
@@ -344,11 +346,11 @@ class InklingKernel(WarpSpecialized):
                 if cutlass.const_expr(self.messages):
                     if tid == 0:
                         for n in cutlass.range_constexpr(STATES):
-                            p.mix[add_offset(STATES * (q + 1) + n, mix0)] = probs[n]
+                            p.mix[mix0 + STATES * (q + 1) + n] = probs[n]
             if cutlass.const_expr(self.messages):
                 if tid == 0:
                     for n in cutlass.range_constexpr(STATES):
-                        p.mix[add_offset(n, mix0)] = rinvs[n]
+                        p.mix[mix0 + n] = rinvs[n]
         squares = []
         for q in cutlass.range_constexpr(nq):
             ss = Float32(0.0)
@@ -358,7 +360,7 @@ class InklingKernel(WarpSpecialized):
         squares = cta_sum(p.red, self.csync, squares, 2, warp, lane)
         for q in cutlass.range_constexpr(nq):
             rinv = cute.math.rsqrt(squares[q] * inv_h + Float32(self.rms_eps))
-            row = add_offset(q * self.tokens, token)
+            row = q * self.tokens + token
             for r in cutlass.range_constexpr(per):
                 k = r * COMPUTE_THREADS + tid
                 if cutlass.const_expr(weighted):
@@ -373,15 +375,13 @@ class InklingKernel(WarpSpecialized):
         blocks and the partial block's element ``partial``, recomputed from the states and MIX
         in its operation order (the same fp32 value); ``token`` as ``normalize_states``'."""
         mix0 = token * MIX_FLOATS
-        weights = add_offset(STATES * (query + 1), mix0)
-        i = add_offset(i, token * self.hidden)
+        weights = mix0 + STATES * (query + 1)
+        i = token * self.hidden + i
         acc = Float32(0.0)
         for n in cutlass.range_constexpr(MAX_BLOCKS):
             if n < num_blocks:
-                acc = acc + p.mix[weights + n] * (
-                    Float32(p.blocks[n][i]) * p.mix[add_offset(n, mix0)]
-                )
-        return acc + p.mix[weights + MAX_BLOCKS] * (partial * p.mix[add_offset(MAX_BLOCKS, mix0)])
+                acc = acc + p.mix[weights + n] * (Float32(p.blocks[n][i]) * p.mix[mix0 + n])
+        return acc + p.mix[weights + MAX_BLOCKS] * (partial * p.mix[mix0 + MAX_BLOCKS])
 
     # ------------------------------------------------------------ message gates
 
@@ -436,7 +436,7 @@ class InklingKernel(WarpSpecialized):
         # One branch per split: the GEMV input starts at a constant (aligned) column.
         for k in cutlass.range_constexpr(GATE_SPLITS):
             if split == k:
-                xs = cute.make_tensor(p.xs.iterator + k * per * TILE_K, p.xs.layout)
+                xs = cute.domain_offset((0, k * per * TILE_K), p.xs)
                 value, row, w = gemv_tile(w, xs, xbuf, per, warp, lane)
         if owns_row(lane):
             index = (split * GATES * GATE_TILES + a) * ROWS + row
@@ -522,16 +522,14 @@ class MatrixRowsKernel(InklingKernel):
     """A launch whose items are 32-row tiles (table word ``a``) of one bf16 ``(rows, hidden)``
     matrix against the GEMV input ``xs[0]``: ``msg_kernel`` and ``head_kernel``. Items depend
     on nothing outside the CTA, so the load warp streams every item's stages at once
-    (``load_matrix_rows``). Their params carry ``tma``/``gmem`` (the matrix's atom and tile
-    partition), ``sW``, ``xs`` (``(1, hidden)``) and ``red`` (``matrix_params``)."""
+    (its ``load`` role). Their params carry ``tma``/``gmem`` (the matrix's atom and tile
+    partition), ``sW``, ``xs`` (a row per token) and ``red`` (``matrix_params``)."""
 
     def init_matrix_rows(self, hidden: int, rms_eps: float, stages: int | None, tokens: int = 1):
         """``stages``: weight ring depth in 16 KB stages; ``tokens``: GEMV input rows (one per
         token of a multi-token launch)."""
-        if hidden % COMPUTE_THREADS or hidden % TILE_K:
-            raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS} and {TILE_K}")
-        self.hidden, self.rms_eps, self.tokens = hidden, rms_eps, tokens
-        self.hidden_k_tiles = hidden // TILE_K
+        self.init_hidden(hidden, rms_eps)
+        self.tokens = tokens
         if tokens > 1:  # tensor-core GEMVs (``examples.megakernel.multi_gemv``)
             self.x_pad = X_PAD
         fixed = 2 * tokens * (hidden + self.x_pad) + 4 * REDUCTIONS * COMPUTE_WARPS * RED_VALUES
@@ -551,9 +549,10 @@ class MatrixRowsKernel(InklingKernel):
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
         self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
 
+    @role(warps=COMPUTE_WARPS)
     @cute.jit
-    def load_matrix_rows(self, p, w, work):
-        """The load role: every item's weight stages (multi-token: swizzled boxes)."""
+    def load(self, p, *, w: Producer, work: WorkCursor):
+        """Every item's weight stages (multi-token: swizzled boxes)."""
         if cutlass.const_expr(self.tokens > 1):
             w = w.views(WS=p.sW)
         else:

@@ -27,7 +27,7 @@ The fold rows (rank 256: one stage per tile) run on CUDA cores, as
 back to back.
 
 Roles as ``visit_kernel``: warp 8 ``load`` streams 32 x 256 weight stages (the GEMVs' as
-swizzled boxes, ``draft_common.gemv_atom``; fold rows linear, with an evict-last L2 policy:
+swizzled boxes, ``ring.swizzled_atom``; fold rows linear, with an evict-last L2 policy:
 every step rereads them), warps 0-7 ``compute`` (``DraftKernel.gemv``).
 The launch is cooperative and every CTA's table rows are in dependency order.
 """
@@ -39,31 +39,13 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, Int64, cute
 
-from attn_gym.warpdrive import (
-    Consumer,
-    Local,
-    NamedBarrier,
-    Producer,
-    Ring,
-    SmemPlan,
-    StageView,
-    StaticPersistent,
-    Tma,
-    Warps,
-    WorkCursor,
-    WorkStream,
-    role,
-)
-from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive import Consumer, Local, Producer, StageView, WorkCursor, role
+from attn_gym.warpdrive.cache import jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.draft_common import (
-    GRED_FLOATS,
-    REDUCTIONS,
     TOKENS,
-    WORDS,
     DraftKernel,
     check_draft_sizes,
-    gemv_atom,
-    x_layout,
+    compile_draft,
 )
 from attn_gym.warpdrive.examples.megakernel.constants import (
     BACKOFF_NS,
@@ -71,36 +53,24 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     COMPUTE_THREADS,
     COMPUTE_WARPS,
     EVICT_LAST,
-    RED_VALUES,
     ROWS,
     ROWS_PER_WARP,
-    STAGE_BYTES,
     TILE_K,
-    X_PAD,
 )
+from attn_gym.warpdrive.examples.megakernel.gemv import owns_row, reduce_tile
 from attn_gym.warpdrive.examples.megakernel.quant_gemv import fma_bf16x2
 from attn_gym.warpdrive.examples.megakernel.regmath import (
     bf16_round,
     fp32_reciprocal,
     load_words16,
-    red_layout,
-    warp_transpose_reduce,
 )
 from attn_gym.warpdrive.examples.megakernel.ring import (
     load_boxes,
     load_tiles,
-    ring_stages,
+    swizzled_atom,
     tma_atom,
-    tma_partition,
 )
-from attn_gym.warpdrive.examples.megakernel.table import InstructionTable
-from attn_gym.warpdrive.examples.megakernel.tagged import (
-    advance_epoch,
-    fetch,
-    publish,
-    scratch_offsets,
-    tagged_views,
-)
+from attn_gym.warpdrive.examples.megakernel.tagged import advance_epoch, fetch, publish
 
 CTXR, RNN, LMHEAD, FOLD, ARGMAX, FINAL = range(6)
 MAX_CTAS = 256  # bound of the grid whose per-CTA bests the argmax reads
@@ -113,6 +83,11 @@ TENSOR_ARGS = (
 X_HIDDEN, X_FRNN, X_RNN = 0, 1, 16
 
 
+def no_best() -> tuple:
+    """The running best before any row: ``(value, index, largest logit before the softcap)``."""
+    return Float32(-math.inf), Int32(0), Float32(-math.inf)
+
+
 @dataclass(frozen=True)
 class HeadParams:
     tma: tuple  # TMA atoms: rnn_proj, LM head, fold weight
@@ -121,7 +96,6 @@ class HeadParams:
     sW: StageView  # its linear view (fold rows)
     xs: cute.Tensor  # (TOKENS, hidden) bf16 GEMV inputs
     xr: cute.Tensor  # (1, 2 rank) bf16 the RNN's input row [state, w1[prev]], overlapping xs
-    red: cute.Tensor
     gred: cute.Tensor
     base: cute.Tensor  # (slots, ROWS, TOKENS) bf16 this CTA's base logits
     fbias: cute.Tensor  # (slots, ROWS) bf16 the fold bias of its rows
@@ -162,23 +136,14 @@ class DraftHeadKernel(DraftKernel):
         self.softcap, self.slots = softcap, slots
         self.row_tiles = -(-vocab // ROWS)
         self.rnn_tiles = 3 * rank // ROWS
-        fixed = (
-            2 * TOKENS * (hidden + X_PAD)
-            + 4 * (REDUCTIONS * COMPUTE_WARPS * RED_VALUES + GRED_FLOATS + rank + ARG_FLOATS)
-            + 2 * slots * ROWS * (TOKENS + 1)
-        )
-        self.stages = ring_stages(fixed, stages)
-        self.smem_plan = SmemPlan()
-        ring = self.ring_buffers()
-        x = self.smem_plan.buffer("X", BFloat16, align=16)
-        self.smem_plan.buffer("XR", BFloat16, align=16, overlaps=x)
-        for name in ("RED", "GRED", "STATE", "ARG"):
+        # STATE and ARG (fp32), BASE and FBIAS (bf16)
+        other_bytes = 4 * (rank + ARG_FLOATS) + 2 * slots * ROWS * (TOKENS + 1)
+        self.declare_engine(hidden, other_bytes, stages, reductions=0)
+        self.smem_plan.buffer("XR", BFloat16, align=16, overlaps="X")
+        for name in ("STATE", "ARG"):
             self.smem_plan.buffer(name, Float32, align=16)
         self.smem_plan.buffer("BASE", BFloat16, align=16)
         self.smem_plan.buffer("FBIAS", BFloat16, align=16)
-        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer=ring)
-        self.csync = NamedBarrier(threads=COMPUTE_THREADS)
-        self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
 
     @property
     def scratch_shapes(self) -> dict[str, int]:
@@ -255,9 +220,8 @@ class DraftHeadKernel(DraftKernel):
         gbuf = Int32(0)
         row = tid // TOKENS
         n = tid % TOKENS
-        best_v = Float32(-math.inf)
-        best_i = Int32(0)
-        best_raw = Float32(-math.inf)  # the largest logit before the softcap so far
+        # Step 0's running best over the CTA's LMHEAD rows, which all precede its ARGMAX row.
+        best_v, best_i, best_raw = no_best()
         xf = cute.make_rmem_tensor((4,), Int32)  # this lane's fold input columns, bf16x2
         fold_step = Int32(-1)  # the step whose fold input xf holds (LMH rows: step 0)
         while work.valid:
@@ -309,18 +273,10 @@ class DraftHeadKernel(DraftKernel):
                 )
             elif op == FOLD:
                 self.fold_x(p, b, xf, epoch, lane)
-                w, best_v, best_i, best_raw = self.fold_tiles(
-                    p, w, a, b, xf, best_v, best_i, best_raw, warp, lane
-                )
+                w, step_v, step_i = self.fold_tiles(p, w, a, b, xf, warp, lane)
+                self.publish_best(p, b, step_v, step_i, epoch, tid, warp, lane)
+            elif op == ARGMAX:  # after the CTA's LMHEAD rows
                 self.publish_best(p, b, best_v, best_i, epoch, tid, warp, lane)
-                best_v = Float32(-math.inf)
-                best_i = Int32(0)
-                best_raw = Float32(-math.inf)
-            elif op == ARGMAX:
-                self.publish_best(p, b, best_v, best_i, epoch, tid, warp, lane)
-                best_v = Float32(-math.inf)
-                best_i = Int32(0)
-                best_raw = Float32(-math.inf)
             else:
                 prev = self.global_best(p, b, epoch, warp, lane)
                 if tid == 0:
@@ -367,15 +323,13 @@ class DraftHeadKernel(DraftKernel):
     def fold_dot(self, sW, xf, warp, lane):
         """One fold stage's dots against the lane's input columns (``xf``: 4 bf16x2 words):
         warp w's rows ``4w ..``, lane l's columns ``8l ..``, exact bf16 products summed in fp32
-        (``fma.rn.f32.bf16``); ``fold_update`` reduces them."""
+        (``fma.rn.f32.bf16``), even and odd columns apart; ``fold_update`` reduces them."""
         acc = cute.make_rmem_tensor((ROWS_PER_WARP, 2), Float32)
         acc.fill(0.0)
         for r in cutlass.range_constexpr(ROWS_PER_WARP):
             words = load_words16(sW[warp * ROWS_PER_WARP + r, None], 8 * lane)
             for j in cutlass.range_constexpr(4):
                 acc[r, 0], acc[r, 1] = fma_bf16x2(acc[r, 0], acc[r, 1], words[j], xf[j])
-        for r in cutlass.range_constexpr(ROWS_PER_WARP):
-            acc[r, 0] = acc[r, 0] + acc[r, 1]
         return acc
 
     @cute.jit
@@ -385,10 +339,9 @@ class DraftHeadKernel(DraftKernel):
         ``fold_dot``'s accumulators: the owner lanes update their running best (a larger
         value, or the first index: rows ascend per lane) and the largest logit before the
         softcap."""
-        value = warp_transpose_reduce(acc[None, 0], lane, ROWS_PER_WARP)
-        row = warp * ROWS_PER_WARP + lane // (32 // ROWS_PER_WARP)
+        value, row = reduce_tile(acc, warp, lane)
         v = tile * ROWS + row
-        if (lane % (32 // ROWS_PER_WARP) == 0) & (v < self.vocab):
+        if owns_row(lane) & (v < self.vocab):
             bias = bf16_round(value + Float32(p.fbias[slot, row]))
             logit = bf16_round(Float32(p.base[slot, row, step]) + bias)
             # The softcap is monotone and a later row must beat the best strictly, so only a
@@ -404,12 +357,13 @@ class DraftHeadKernel(DraftKernel):
         return best_v, best_i, best_raw
 
     @cute.jit
-    def fold_tiles(self, p: HeadParams, w, first, step, xf, best_v, best_i, best_raw, warp,
-                   lane):  # fmt: skip
-        """Step ``step``'s fold rows of this CTA's tiles ``first, first + grid, ..``, two
-        stages at a time: their dots and reductions are independent chains."""
+    def fold_tiles(self, p: HeadParams, w, first, step, xf, warp, lane):
+        """``(w, value, index)``: the lane's best fold logit of step ``step`` over the rows of
+        this CTA's tiles ``first, first + grid, ..``, two stages at a time: their dots and
+        reductions are independent chains."""
         ctas = cute.arch.grid_dim()[0]
         slot = Int32(0)
+        best_v, best_i, best_raw = no_best()
         for tile in cutlass.range(first, self.row_tiles, 2 * ctas, unroll=1):
             if tile + ctas < self.row_tiles:
                 h0 = w.wait()
@@ -431,7 +385,7 @@ class DraftHeadKernel(DraftKernel):
                     p, acc0, tile, slot, step, best_v, best_i, best_raw, warp, lane
                 )
             slot = slot + 2
-        return w, best_v, best_i, best_raw
+        return w, best_v, best_i
 
     @cute.jit
     def rnn_input(self, p: HeadParams, tile, step, epoch, tid, warp, lane):
@@ -460,9 +414,11 @@ class DraftHeadKernel(DraftKernel):
         self.csync.sync()
 
     @cute.jit
-    def better(self, v, i, ov, oi):
-        """Whether ``(ov, oi)`` beats ``(v, i)``: a larger value, or the lower index on a tie."""
-        return (ov > v) | ((ov == v) & (oi < i))
+    def better_of(self, v, i, ov, oi):
+        """The better of ``(v, i)`` and ``(ov, oi)``: the larger value, or the lower index on a
+        tie."""
+        take = (ov > v) | ((ov == v) & (oi < i))
+        return Float32(cutlass.select_(take, ov, v)), Int32(cutlass.select_(take, oi, i))
 
     @cute.jit
     def warp_best(self, v, i):
@@ -470,9 +426,7 @@ class DraftHeadKernel(DraftKernel):
         for k in cutlass.range_constexpr(5):
             ov = Float32(cute.arch.shuffle_sync_bfly(v, offset=1 << k))
             oi = Int32(cute.arch.shuffle_sync_bfly(i, offset=1 << k))
-            take = self.better(v, i, ov, oi)
-            v = Float32(cutlass.select_(take, ov, v))
-            i = Int32(cutlass.select_(take, oi, i))
+            v, i = self.better_of(v, i, ov, oi)
         return v, i
 
     @cute.jit
@@ -487,11 +441,7 @@ class DraftHeadKernel(DraftKernel):
             bv = p.arg[0]
             bi = Int32(p.arg[COMPUTE_WARPS])
             for k in cutlass.range_constexpr(1, COMPUTE_WARPS):
-                ov = p.arg[k]
-                oi = Int32(p.arg[COMPUTE_WARPS + k])
-                take = self.better(bv, bi, ov, oi)
-                bv = Float32(cutlass.select_(take, ov, bv))
-                bi = Int32(cutlass.select_(take, oi, bi))
+                bv, bi = self.better_of(bv, bi, p.arg[k], Int32(p.arg[COMPUTE_WARPS + k]))
             cta = cute.arch.block_idx()[0]
             slot = (step * MAX_CTAS + cta) * 2
             publish(p.best, slot, bv, epoch)
@@ -514,11 +464,7 @@ class DraftHeadKernel(DraftKernel):
             v = vals[0]
             i = Int32(vals[1])
             for k in cutlass.range_constexpr(1, rounds):
-                ov = vals[2 * k]
-                oi = Int32(vals[2 * k + 1])
-                take = self.better(v, i, ov, oi)
-                v = Float32(cutlass.select_(take, ov, v))
-                i = Int32(cutlass.select_(take, oi, i))
+                v, i = self.better_of(v, i, vals[2 * k], Int32(vals[2 * k + 1]))
             v, i = self.warp_best(v, i)
             if lane == 0:
                 p.arg[2 * COMPUTE_WARPS] = Float32(i)
@@ -529,13 +475,10 @@ class DraftHeadKernel(DraftKernel):
 
     @cute.kernel
     def kernel(self, tma, gtensors, scratch, tensors, bound):
-        layouts = self.ring_layouts() | {
-            "X": x_layout(self.hidden),
+        layouts = {
             # One row read for every token (their columns are discarded): any hidden size
             # holds it.
             "XR": cute.make_layout((1, 2 * self.rank), stride=(2 * self.rank, 1)),
-            "RED": red_layout(REDUCTIONS),
-            "GRED": cute.make_layout((GRED_FLOATS,)),
             "STATE": cute.make_layout((self.rank,)),
             "ARG": cute.make_layout((ARG_FLOATS,)),
             "BASE": cute.make_layout(
@@ -543,28 +486,18 @@ class DraftHeadKernel(DraftKernel):
             ),
             "FBIAS": cute.make_layout((self.slots, ROWS), stride=(ROWS, 1)),
         }
-        self.begin_roles(work=bound, layouts=layouts)
-        tensors = {k: cute.make_tensor(t.iterator, t.layout) for k, t in zip(TENSOR_ARGS, tensors)}
-        trace_buffer = tensors.pop("trace_buffer")
-        tagged = tagged_views(scratch, self.scratch_shapes)
         boxes = [("WS", (ROWS, BOX))] * 2 + [("W", (ROWS, TILE_K))]
-        parts = [tma_partition(a, self.buffer(name), g, box)
-                 for a, g, (name, box) in zip(tma, gtensors, boxes)]  # fmt: skip
+        trace_buffer, fields, smem = self.begin_draft(
+            bound, layouts, TENSOR_ARGS, tensors, scratch, tma, gtensors, boxes
+        )
         params = HeadParams(
-            tma=tuple(tma),
-            gmem=tuple(part[1] for part in parts),
-            sWS=StageView(parts[0][0], axis=cute.rank(parts[0][0]) - 1),
-            sW=StageView(parts[2][0], axis=1),
-            xs=self.buffer("X"),
+            sW=StageView(smem[2], axis=1),
             xr=self.buffer("XR"),
-            red=self.buffer("RED"),
-            gred=self.buffer("GRED"),
             base=self.buffer("BASE"),
             fbias=self.buffer("FBIAS"),
             rnn_state=self.buffer("STATE"),
             arg=self.buffer("ARG"),
-            **tagged,
-            **tensors,
+            **fields,
         )
         self.run_roles(params, trace_buffer=trace_buffer)
 
@@ -589,23 +522,11 @@ class DraftHeadKernel(DraftKernel):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        pairs = [gemv_atom(rnn_proj), gemv_atom(lm_head), tma_atom(fold_weight, (ROWS, TILE_K))]
-        bound = self.work.bind(table, workspace, max_ctas)
-        tensors = (
-            trace_buffer,
-            hidden,
-            f_rnn,
-            rnn_bias,
-            markov_w1,
-            fold_bias,
-            token,
-            drafts,
-            state,
-        )
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(
-            tuple(a for a, _ in pairs), tuple(g for _, g in pairs), scratch, tensors, bound
-        ).launch(**self.launch_config(bound), stream=stream, cooperative=True)
+        pairs = [swizzled_atom(src, BFloat16) for src in (rnn_proj, lm_head)]
+        pairs.append(tma_atom(fold_weight, (ROWS, TILE_K)))
+        tensors = (trace_buffer, hidden, f_rnn, rnn_bias, markov_w1, fold_bias, token, drafts,
+                   state)  # fmt: skip
+        self.launch(pairs, tensors, scratch, table, workspace, max_ctas, stream)
 
 
 @jit_cache
@@ -613,7 +534,7 @@ def compile_draft_head_kernel(op: DraftHeadKernel):
     """One compile serves every step: weights, states and the anchor are arguments."""
     bf16, f32 = BFloat16, Float32
     h, r = op.hidden, op.rank
-    return compile_tvm_ffi(
+    return compile_draft(
         op,
         make_fake_compact_tensor(bf16, (3 * r, 2 * r + 2 * h)),  # rnn_proj
         make_fake_compact_tensor(bf16, (op.vocab, h)),  # LM head
@@ -625,11 +546,4 @@ def compile_draft_head_kernel(op: DraftHeadKernel):
         make_fake_compact_tensor(bf16, (op.vocab,), assumed_align=2),  # fold bias
         make_fake_compact_tensor(Int64, (1,), assumed_align=8),  # anchor
         make_fake_compact_tensor(Int64, (op.drafts,), assumed_align=8),  # drafts
-        make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer (globaltimer)
-        make_fake_compact_tensor(Int64, (scratch_offsets(op.scratch_shapes)[1],)),
-        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-        make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),
-        make_fake_compact_tensor(Int32, (cute.sym_int(),)),
-        Int32(1),
-        name=op.get_name(),
     )

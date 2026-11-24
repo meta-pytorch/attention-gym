@@ -41,12 +41,8 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 
 from attn_gym.warpdrive.examples.megakernel.constants import MMA_N
 from attn_gym.warpdrive.examples.megakernel.formats import BF16, BLOCKS, MXFP8, NVFP4
-from attn_gym.warpdrive.examples.megakernel.quant_gemv import (
-    inline_asm,
-    mxfp8_bf16x8,
-    nvfp4_bf16x8,
-)
-from attn_gym.warpdrive.examples.megakernel.regmath import load_frag, load_words16
+from attn_gym.warpdrive.examples.megakernel.quant_gemv import mx_scale, mxfp8_bf16x8, nvfp4_bf16x8
+from attn_gym.warpdrive.examples.megakernel.regmath import inline_asm, load_frag, load_words16
 
 # The tile row of MMA row g (of each 8-row half) per weight format, as the ``(shape, stride)``
 # of a layout of g (see the module docstring): bf16 0, 1, .. 7; NVFP4 0, 2, 4, 6, 1, 3, 5, 7;
@@ -176,7 +172,7 @@ def gemv_quant(fmt: cutlass.Constexpr, w, meta_stage, xs, xrows, stages: cutlass
                             # A 32-column unit pair is 4 words: subtile j spans boxes 2 j, 2 j + 1.
                             box = boxes[r, None, 2 * j + units[0] // 16]
                             raw = load_frag(box, 2 * (units[0] % 16), 4)
-                            scale = byte * Int32(0x00800080)
+                            scale = mx_scale(byte)
                             for i in cutlass.range_constexpr(2):
                                 a[i].append(mxfp8_bf16x8(raw[2 * i], raw[2 * i + 1], scale))
                         else:

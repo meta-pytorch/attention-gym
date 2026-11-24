@@ -6,6 +6,8 @@ against the dense layer. The device quantizers are tested in
 ``test_warpdrive_megakernel_act_quant``, the visit launch on quantized experts in
 ``test_warpdrive_inkling_megakernel_visit``."""
 
+import dataclasses
+
 import pytest
 import torch
 
@@ -151,10 +153,11 @@ def test_quantized_layer_matches_dense_declared_layer():
     experts decoded to block values, their weight scales selected) equals ``ref.experts_out``
     on the dense layer bit for bit."""
     w, tensors = random_layer(NVFP4, seed=3)
-    q = ref.LayerWeights(
-        **vars(w) | {"w13": quant.QuantExperts.from_checkpoint(*tensors[0]),
-                     "w2": quant.QuantExperts.from_checkpoint(*tensors[1])}
-    )  # fmt: skip
+    q = dataclasses.replace(
+        w,
+        w13=quant.QuantExperts.from_checkpoint(*tensors[0]),
+        w2=quant.QuantExperts.from_checkpoint(*tensors[1]),
+    )
     config = ref.InklingConfig(hidden_size=256, num_experts=16, experts_per_token=4)
     gen = torch.Generator(device="cuda").manual_seed(4)
     x = torch.randn(5, 256, device="cuda", generator=gen).bfloat16()

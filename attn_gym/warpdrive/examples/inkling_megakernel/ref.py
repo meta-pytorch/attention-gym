@@ -63,11 +63,12 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym.warpdrive.examples.inkling_megakernel.act_quant import (
+    E2M1_MAGNITUDES,
     NVFP4_GLOBAL,
     ActivationQuant,
     declared_activation_quant,
+    mxfp8_block_values,
     quantize_dequantize,
-    ue8m0_scale,
 )
 from attn_gym.warpdrive.examples.megakernel.formats import NVFP4
 
@@ -75,25 +76,6 @@ from attn_gym.warpdrive.examples.megakernel.formats import NVFP4
 # convolution reads plus the decode steps a CUDA graph may run past a stop token (chat's
 # SYNC_EVERY), so those over-run steps never overwrite a position the next prefill reads.
 CONV_RING = 16
-
-E2M1_VALUES = (
-    0.0,
-    0.5,
-    1.0,
-    1.5,
-    2.0,
-    3.0,
-    4.0,
-    6.0,
-    -0.0,
-    -0.5,
-    -1.0,
-    -1.5,
-    -2.0,
-    -3.0,
-    -4.0,
-    -6.0,
-)
 
 
 @dataclass(frozen=True)
@@ -380,6 +362,21 @@ def checkpoint_dir(
     )
 
 
+def chat_prompt_ids(tokenizer, messages: list[dict], reasoning_effort: str | float) -> list[int]:
+    """The token ids of ``messages`` in the checkpoint's chat template, ending where the
+    model's reply starts."""
+    text = tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True, reasoning_effort=reasoning_effort
+    )
+    return tokenizer(text, add_special_tokens=False).input_ids
+
+
+def stop_tokens(tokenizer) -> set[int]:
+    """The ids that end a reply: the tokenizer's end of sequence and ``<|endoftext|>``."""
+    stops = {tokenizer.eos_token_id, tokenizer.convert_tokens_to_ids("<|endoftext|>")}
+    return {s for s in stops if isinstance(s, int) and s >= 0}
+
+
 def dequantize_experts(
     weight: torch.Tensor,
     scale: torch.Tensor | None,
@@ -400,21 +397,21 @@ def dequantize_experts(
     columns = weight.shape[2] * 2 if amax is not None else weight.shape[2]
     out = torch.empty(experts, rows, columns, dtype=torch.bfloat16, device=weight.device)
     if amax is not None:
-        e2m1 = torch.tensor(E2M1_VALUES, device=weight.device)
+        magnitudes = torch.tensor(E2M1_MAGNITUDES, device=weight.device)
+        e2m1 = torch.cat((magnitudes, -magnitudes))  # by code: the sign is bit 3
         byte = torch.arange(256, device=weight.device)
         byte_values = torch.stack((e2m1[byte & 0xF], e2m1[byte >> 4]), dim=-1)
         factor = amax.float() / denominator.float()
     for start in range(0, experts, 8):  # chunks bound the fp32 temporaries
         chunk = slice(start, start + 8)
-        block_scale = scale[chunk].float()
         if amax is None:
-            values = weight[chunk].float().view(*block_scale.shape, 32)
-            values = values * ue8m0_scale(scale[chunk])[..., None]
-        else:
-            codes = weight[chunk].view(torch.uint8).long()
-            values = byte_values[codes].view(*block_scale.shape, 16) * block_scale[..., None]
-            if global_scale:
-                values = values * factor[chunk, None, None, None]
+            out[chunk] = mxfp8_block_values(weight[chunk], scale[chunk])
+            continue
+        block_scale = scale[chunk].float()
+        codes = weight[chunk].view(torch.uint8).long()
+        values = byte_values[codes].view(*block_scale.shape, 16) * block_scale[..., None]
+        if global_scale:
+            values = values * factor[chunk, None, None, None]
         out[chunk] = values.reshape(-1, rows, columns).to(torch.bfloat16)
     return out
 
@@ -879,24 +876,16 @@ def attention_block(
     fp32 post-attention residual and the blocks the MLP half reads (``blocks`` plus ``h`` at a
     block boundary, where the residual restarts from the attention output)."""
     eps, full = config.rms_eps, config.is_full(layer)
-    if full:
+    if full:  # a block residual and a norm per stream
         streams = list(block_residual(w.attn_query, blocks, h).unbind(1))
-        if messages is not None:
-            streams = [message_gate(g, s, messages[:, i], eps) for i, (g, s) in
-                       enumerate(zip(w.gates[:3], streams))]  # fmt: skip
         norms = (w.q_norm, w.k_norm, w.v_norm)
-        q_in, k_in, v_in = (rms_norm(s, n, eps).to(torch.bfloat16) for s, n in zip(streams, norms))
-    else:
+    else:  # one input, one norm
         x = h if w.attn_query is None else block_residual(w.attn_query, blocks, h)[:, 0]
-        if messages is None:
-            q_in = k_in = v_in = rms_norm(x, w.input_norm, eps).to(torch.bfloat16)
-        else:
-            q_in, k_in, v_in = (
-                rms_norm(message_gate(g, x, messages[:, i], eps), w.input_norm, eps).to(
-                    torch.bfloat16
-                )
-                for i, g in enumerate(w.gates[:3])
-            )
+        streams, norms = [x] * 3, [w.input_norm] * 3
+    if messages is not None:
+        streams = [message_gate(g, s, messages[:, i], eps) for i, (g, s) in
+                   enumerate(zip(w.gates[:3], streams))]  # fmt: skip
+    q_in, k_in, v_in = (rms_norm(s, n, eps).to(torch.bfloat16) for s, n in zip(streams, norms))
     attn = attention(config, w, cache, visit, full, q_in, k_in, v_in, positions, start, kernels)
     conv = kernels.short_conv
     residual = conv(cache.conv_attn[visit], attn, w.attn_conv, positions, config.conv_kernel)
@@ -1006,7 +995,7 @@ def logits_of(weights: InklingWeights, h: torch.Tensor) -> torch.Tensor:
 def forward_tokens(
     weights: InklingWeights,
     tokens: torch.Tensor,
-    pos: int,
+    pos: int | torch.Tensor,
     cache: InklingCache,
     *,
     all_logits: bool = False,
@@ -1014,14 +1003,21 @@ def forward_tokens(
     observe: Callable[[int, torch.Tensor], None] | None = None,
 ) -> torch.Tensor:
     """Prefill or decode ``tokens`` at positions ``pos ..``; returns the last token's fp32
-    logits (``all_logits``: every token's, (tokens, vocab)). ``kernels`` and ``observe``: as
+    logits (``all_logits``: every token's, (tokens, vocab)). A host ``pos`` takes HF's
+    attention spans and rounding (``hidden_states``' ``start``); a one-element device ``pos``
+    reads whole caches behind masks: static shapes, no host sync (CUDA-graph capturable), and
+    no check that the positions fit the cache. ``kernels`` and ``observe``: as
     ``hidden_states``'."""
     tokens = tokens.reshape(-1)
-    if pos + tokens.numel() > cache.max_len:
+    offsets = torch.arange(tokens.numel(), device=tokens.device)
+    if isinstance(pos, torch.Tensor):
+        start, positions = None, pos.reshape(1).long() + offsets
+    elif pos + tokens.numel() > cache.max_len:
         raise ValueError(f"positions up to {pos + tokens.numel()} exceed max_len {cache.max_len}")
-    positions = torch.arange(pos, pos + tokens.numel(), device=tokens.device)
+    else:
+        start, positions = pos, pos + offsets
     h = hidden_states(
-        weights, tokens, positions, cache, start=pos, kernels=kernels, observe=observe
+        weights, tokens, positions, cache, start=start, kernels=kernels, observe=observe
     )
     logits = logits_of(weights, h if all_logits else h[-1:])
     return logits if all_logits else logits[0]

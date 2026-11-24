@@ -47,44 +47,24 @@ import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import BFloat16, Float32, Int32, Int64, cute
 
-from attn_gym.warpdrive import (
-    Consumer,
-    Local,
-    NamedBarrier,
-    Producer,
-    Ring,
-    SmemPlan,
-    StageView,
-    StaticPersistent,
-    Tma,
-    Warps,
-    WorkCursor,
-    WorkStream,
-    role,
-)
-from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
+from attn_gym.warpdrive import Consumer, Local, Producer, StageView, WorkCursor, role
+from attn_gym.warpdrive.cache import jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.examples.inkling_megakernel.draft_common import (
-    GRED_FLOATS,
-    REDUCTIONS,
     TOKENS,
-    WORDS,
     DraftKernel,
     check_draft_sizes,
-    gemv_atom,
-    x_layout,
+    compile_draft,
 )
 from attn_gym.warpdrive.examples.megakernel.constants import (
+    BACKOFF_NS,
     BLOCK,
     BOX,
     COMPUTE_THREADS,
     COMPUTE_WARPS,
     HEAD_DIM,
     LOG2E,
-    RED_VALUES,
     ROWS,
-    STAGE_BYTES,
     TILE_K,
-    X_PAD,
 )
 from attn_gym.warpdrive.examples.megakernel.multi_gemv import mma_bf16
 from attn_gym.warpdrive.examples.megakernel.regmath import (
@@ -93,25 +73,17 @@ from attn_gym.warpdrive.examples.megakernel.regmath import (
     fp32,
     fp32_reciprocal,
     group_sum,
+    load_frag,
     load_words16,
-    red_layout,
 )
 from attn_gym.warpdrive.examples.megakernel.ring import (
     kv_stages,
     load_boxes,
     load_tiles,
-    ring_stages,
+    swizzled_atom,
     tma_atom,
-    tma_partition,
 )
-from attn_gym.warpdrive.examples.megakernel.table import InstructionTable
-from attn_gym.warpdrive.examples.megakernel.tagged import (
-    advance_epoch,
-    fetch,
-    publish,
-    scratch_offsets,
-    tagged_views,
-)
+from attn_gym.warpdrive.examples.megakernel.tagged import advance_epoch, fetch, publish
 
 QKV, ATTN, MERGE, OPROJ, GATEUP, DOWN, FINAL = range(7)
 COMPUTE_REGS, LOAD_REGS = 232, 40
@@ -128,6 +100,12 @@ TENSOR_ARGS = (
 X_PRE, X_ATT, X_POST, X_ACT = 1, 2, 3, 4
 
 
+def last_token_word(row, width, col):
+    """Word ``col`` of the last token of ``row`` in a tagged ``(rows, TOKENS, width)`` buffer:
+    ``wait_items``' first word, one of a producer item's (the next items' at a fixed stride)."""
+    return (row * TOKENS + TOKENS - 1) * width + col
+
+
 @dataclass(frozen=True)
 class BackboneParams:
     tma: tuple  # TMA atoms: wqkv, wo, wgu, w_down, k cache, v cache
@@ -135,7 +113,7 @@ class BackboneParams:
     sWS: StageView  # the weight ring's swizzled-box view
     sKV: StageView
     xs: cute.Tensor  # (TOKENS, x_width) bf16 GEMV inputs
-    red: cute.Tensor
+    red: cute.Tensor  # ``red_layout(2)`` fp32: the prologue's sums
     gred: cute.Tensor
     qs: cute.Tensor  # (ATTN_ROWS, HEAD_DIM) bf16 an ATTN item's roped q rows (head-major;
     # rows past attn_rows stay zero)
@@ -212,28 +190,17 @@ class DraftBackboneKernel(DraftKernel):
         self.q_dim = q_heads * HEAD_DIM
         self.qkv_rows = (q_heads + 2 * kv_heads) * HEAD_DIM
         self.down_width = intermediate // down_splits
-        self.x_width = max(hidden, self.q_dim, self.down_width)
         self.attn_rows = group * TOKENS  # (head, token) rows per kv head
-        fixed = (
-            2 * TOKENS * (self.x_width + X_PAD)
-            + 4 * (REDUCTIONS * COMPUTE_WARPS * RED_VALUES + GRED_FLOATS)
-            + 2 * ATTN_ROWS * (HEAD_DIM + QPAD + BLOCK + QPAD)
-            + 2 * 4 * TOKENS * HEAD_DIM
-            + 4 * ATTN_ROWS * COMPUTE_WARPS
+        attention_bytes = (
+            2 * ATTN_ROWS * (HEAD_DIM + QPAD + BLOCK + QPAD)  # Q, P
+            + 2 * 4 * TOKENS * HEAD_DIM  # KB, VB
+            + 4 * ATTN_ROWS * COMPUTE_WARPS  # RMAX
         )
-        self.stages = ring_stages(fixed, stages)
-        self.smem_plan = SmemPlan()
-        ring = self.ring_buffers()
-        ring["KV"] = self.smem_plan.buffer("KV", BFloat16, align=1024, overlaps=ring["W"])
-        self.smem_plan.buffer("X", BFloat16, align=16)
-        self.smem_plan.buffer("RED", Float32, align=16)
-        self.smem_plan.buffer("GRED", Float32, align=16)
+        x_width = max(hidden, self.q_dim, self.down_width)
+        self.declare_engine(x_width, attention_bytes, stages, reductions=2, ring_views=("KV",))
         for name in ("Q", "KB", "VB", "P"):
             self.smem_plan.buffer(name, BFloat16, align=16)
         self.smem_plan.buffer("RMAX", Float32, align=16)
-        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer=ring)
-        self.csync = NamedBarrier(threads=COMPUTE_THREADS)
-        self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
 
     @property
     def scratch_shapes(self) -> dict[str, int]:
@@ -278,14 +245,8 @@ class DraftBackboneKernel(DraftKernel):
         if min(len(g) for g in groups) == 0:
             raise ValueError(f"{ctas} CTAs cannot hold {self.down_splits} DOWN groups")
         for layer in range(self.layers):
-            tiles = self.qkv_rows // ROWS
-            deal(
-                [
-                    [QKV, layer, t * self.qkv_splits + k]
-                    for t in range(tiles)
-                    for k in range(self.qkv_splits)
-                ]
-            )
+            # Item b: row tile b // qkv_splits, K split b % qkv_splits.
+            deal([[QKV, layer, b] for b in range(self.qkv_rows // ROWS * self.qkv_splits)])
             deal([[ATTN, layer, b] for b in range(self.kv_heads * self.splits)])
             deal([[MERGE, layer, hq] for hq in range(self.q_heads)])
             deal([[OPROJ, layer, t] for t in range(h_tiles)])
@@ -353,8 +314,8 @@ class DraftBackboneKernel(DraftKernel):
             op, a, b, _row = work.item
             if op == QKV:
                 if xkey != self.xkey(X_PRE, a):
-                    self.wait_items(p.h_pre, self.sentinel(a, ROWS - 1), h_tiles, ROWS, epoch,
-                                    warp, lane)  # fmt: skip
+                    self.wait_items(p.h_pre, last_token_word(a, h, ROWS - 1), h_tiles, ROWS,
+                                    epoch, warp, lane)  # fmt: skip
                     self.fill_norm(p, p.h_pre, a * TOKENS * h, p.input_norm[a, None], epoch,
                                    warp, lane)  # fmt: skip
                     xkey = self.xkey(X_PRE, a)
@@ -376,7 +337,7 @@ class DraftBackboneKernel(DraftKernel):
                 self.merge(p, a, b, epoch, warp, lane)
             elif op == OPROJ:
                 if xkey != self.xkey(X_ATT, a):
-                    first = (a * TOKENS + TOKENS - 1) * self.q_dim + HEAD_DIM - 1
+                    first = last_token_word(a, self.q_dim, HEAD_DIM - 1)
                     self.wait_items(p.attn_out, first, self.q_heads, HEAD_DIM, epoch, warp, lane)
                     self.fill_raw(p, p.attn_out, a * TOKENS * self.q_dim, self.q_dim,
                                   self.q_dim, epoch, warp, lane)  # fmt: skip
@@ -388,11 +349,13 @@ class DraftBackboneKernel(DraftKernel):
                 if a == 0:
                     residual = self.residual0(p, n, col, rinv_e)
                 else:
-                    residual = bf16_round(self.fetch1(p.h_pre, (a * TOKENS + n) * h + col, epoch))
+                    word = cute.make_rmem_tensor((1,), Float32)
+                    fetch([(p.h_pre, (a * TOKENS + n) * h + col, 1)], word, epoch, uniform=True)
+                    residual = bf16_round(word[0])
                 publish(p.h_mid, (a * TOKENS + n) * h + col, bf16_round(value) + residual, epoch)
             elif op == GATEUP:
                 if xkey != self.xkey(X_POST, a):
-                    first = (a * TOKENS + TOKENS - 1) * h + ROWS - 1
+                    first = last_token_word(a, h, ROWS - 1)
                     self.wait_items(p.h_mid, first, h_tiles, ROWS, epoch, warp, lane)
                     self.fill_norm(p, p.h_mid, a * TOKENS * h, p.post_norm[a, None], epoch,
                                    warp, lane)  # fmt: skip
@@ -409,9 +372,8 @@ class DraftBackboneKernel(DraftKernel):
                 t = b // self.down_splits
                 s = b % self.down_splits
                 if xkey != self.xkey(X_ACT, a, s):
-                    tiles = self.down_width // 16
-                    first = (a * TOKENS + TOKENS - 1) * self.intermediate + s * self.down_width
-                    self.wait_items(p.act, first + 15, tiles, 16, epoch, warp, lane)
+                    first = last_token_word(a, self.intermediate, s * self.down_width + 15)
+                    self.wait_items(p.act, first, self.down_width // 16, 16, epoch, warp, lane)
                     self.fill_raw(p, p.act, a * TOKENS * self.intermediate + s * self.down_width,
                                   self.intermediate, self.down_width, epoch, warp, lane)  # fmt: skip
                     xkey = self.xkey(X_ACT, a, s)
@@ -432,21 +394,24 @@ class DraftBackboneKernel(DraftKernel):
     # ------------------------------------------------------------ helpers
 
     @cute.jit
-    def fetch1(self, buf, index, epoch):
-        """One tagged word, polled (every lane of the warp must call it)."""
-        out = cute.make_rmem_tensor((1,), Float32)
-        fetch([(buf, index, 1)], out, epoch, uniform=True)
-        return out[0]
+    def wait_items(self, buf, first, count: cutlass.Constexpr, stride, epoch, warp, lane):
+        """Warp 0 polls one word (``first + i * stride``) of each of ``count`` producer items,
+        with backoff, so the CTA's full fetch that follows finds its words ready without the
+        whole CTA spinning on them; then the compute warps synchronize."""
+        if warp == 0:
+            rounds = -(-count // 32)
+            seen = cute.make_rmem_tensor((rounds,), Float32)
+            segments = [
+                (buf, first + cutlass.min(lane + 32 * i, count - 1) * stride, 1)
+                for i in range(rounds)
+            ]
+            fetch(segments, seen, epoch, uniform=True, backoff=BACKOFF_NS)
+        self.csync.sync()
 
     def xkey(self, kind, layer, split=0):
         """The key of X holding input ``kind`` (``X_PRE`` ..) of ``layer`` (DOWN: of act
         share ``split``), distinct for every kind, layer and split."""
         return (kind * self.down_splits + split) * self.layers + layer
-
-    def sentinel(self, layer, last):
-        """The h_pre word of layer input ``layer``'s first DOWN reducer that its last token's
-        thread ``last`` publishes: one word per reducer item, ``ROWS`` apart."""
-        return (layer * TOKENS + TOKENS - 1) * self.hidden + last
 
     # ------------------------------------------------------------- X fills
 
@@ -505,19 +470,18 @@ class DraftBackboneKernel(DraftKernel):
         return cutlass.select_(n == 0, e, Float32(p.mask_embed[col]))
 
     @cute.jit
-    def fill_norm(self, p: BackboneParams, buf, base, weights, epoch, warp, lane):
-        """X row n = bf16(weights * RMSNorm(row n of the fp32 stream at ``buf[base ..]``)),
-        warp n polling row n (``fetch_rows``' layout)."""
+    def norm_row(self, buf, base, weights, out, n, epoch, lane):
+        """``out[n]`` = bf16(weights * RMSNorm(the fp32 stream row at ``buf[base ..]``)), the
+        warp polling the row (``fetch_rows``' layout)."""
         h = self.hidden
-        chunks = h // 128
-        vals = cute.make_rmem_tensor((4 * chunks,), Float32)
-        self.fetch_rows(buf, base + warp * h, h, vals, epoch, lane)
-        ss = Float32(0.0)
-        for i in cutlass.range(4 * chunks, unroll_full=True):
-            ss = ss + vals[i] * vals[i]
-        ss = group_sum(ss, 32)
-        rinv = cute.math.rsqrt(ss * fp32_reciprocal(h) + Float32(self.rms_eps))
-        self.store_row(p.xs, warp, h, vals, rinv, weights, lane)
+        vals = cute.make_rmem_tensor((h // 32,), Float32)
+        self.fetch_rows(buf, base, h, vals, epoch, lane)
+        self.store_row(out, n, h, vals, self.warp_rinv(vals, h), weights, lane)
+
+    @cute.jit
+    def fill_norm(self, p: BackboneParams, buf, base, weights, epoch, warp, lane):
+        """X row n = ``norm_row`` of row n of the stream at ``buf[base ..]``, warp n's."""
+        self.norm_row(buf, base + warp * self.hidden, weights, p.xs, warp, epoch, lane)
         self.csync.sync()
 
     @cute.jit
@@ -540,15 +504,21 @@ class DraftBackboneKernel(DraftKernel):
     # ------------------------------------------------------------- attention
 
     @cute.jit
-    def split_blocks(self, layer, pos, split):
-        """``[blk0, blk1)``: the 64-key context blocks of KV split ``split``, an even share of
-        the blocks holding the cached positions before ``pos`` (local layers: the last
-        ``window`` of them)."""
+    def context_start(self, layer, pos):
+        """The first context position ``layer``'s queries see: 0, or the ``window``
+        positions before ``pos`` in a local layer."""
         lo = Int32(0)
         for li in self.local:
             if layer == li:
                 lo = cutlass.max(pos - self.window, Int32(0))
-        first = lo // BLOCK
+        return lo
+
+    @cute.jit
+    def split_blocks(self, layer, pos, split):
+        """``[blk0, blk1)``: the 64-key context blocks of KV split ``split``, an even share of
+        the blocks holding the cached positions before ``pos`` (local layers: the last
+        ``window`` of them)."""
+        first = self.context_start(layer, pos) // BLOCK
         count = (pos + BLOCK - 1) // BLOCK - first
         blk0 = first + split * count // self.splits
         blk1 = first + (split + 1) * count // self.splits
@@ -565,15 +535,14 @@ class DraftBackboneKernel(DraftKernel):
         return rope
 
     @cute.jit
-    def norm_rope4(self, x, weights, rope, lane):
+    def norm_rope4(self, src, i, weights, rope, lane):
         """Lane l's dims 4 (l % 16) + e of the head (first half for l < 16, second for l >= 16,
-        partners 16 lanes apart): per-head RMSNorm rounded to bf16, then RoPE (``rope_of``)
-        rounded to bf16 (``dspark.head_norm_rope``). ``x``: 4 fp32 in place."""
-        ss = Float32(0.0)
+        partners 16 lanes apart), ``src[4 i + e]``: per-head RMSNorm rounded to bf16, then RoPE
+        (``rope_of``) rounded to bf16 (``dspark.head_norm_rope``); returns 4 fp32."""
+        x = cute.make_rmem_tensor((4,), Float32)
         for e in cutlass.range_constexpr(4):
-            ss = ss + x[e] * x[e]
-        ss = group_sum(ss, 32)
-        rinv = cute.math.rsqrt(ss * fp32_reciprocal(HEAD_DIM) + Float32(self.rms_eps))
+            x[e] = src[4 * i + e]
+        rinv = self.warp_rinv(x, HEAD_DIM)
         first = lane < 16
         for e in cutlass.range_constexpr(4):
             x[e] = bf16_round(Float32(weights[4 * lane + e]) * (x[e] * rinv))
@@ -595,23 +564,17 @@ class DraftBackboneKernel(DraftKernel):
         rows = self.attn_rows
         item = (layer * self.kv_heads + kvh) * self.splits + split
         if (blk0 == blk1) & (not last):
-            if tid < rows * 2:
-                r = tid // 2
-                if tid % 2 == 0:
-                    publish(p.attn_ml, (item * rows + r) * 2, Float32(-1e30), epoch)
-                else:
-                    publish(p.attn_ml, (item * rows + r) * 2 + 1, Float32(0.0), epoch)
+            if tid < rows * 2:  # (m, l) = (-1e30, 0) of row tid // 2
+                ml = cutlass.select_(tid % 2 == 0, Float32(-1e30), Float32(0.0))
+                publish(p.attn_ml, item * rows * 2 + tid, ml, epoch)
             for i in cutlass.range_constexpr(rows * HEAD_DIM // COMPUTE_THREADS):
                 publish(p.attn_o, item * rows * HEAD_DIM + i * COMPUTE_THREADS + tid,
                         Float32(0.0), epoch)  # fmt: skip
         else:
             with self.trace_region("attn.wait"):
                 for k in cutlass.range_constexpr(self.qkv_splits):
-                    last_token = (
-                        (layer * self.qkv_splits + k) * TOKENS + TOKENS - 1
-                    ) * self.qkv_rows
-                    self.wait_items(p.qkv, last_token + ROWS - 1, self.qkv_rows // ROWS, ROWS,
-                                    epoch, warp, lane)  # fmt: skip
+                    first = last_token_word(layer * self.qkv_splits + k, self.qkv_rows, ROWS - 1)
+                    self.wait_items(p.qkv, first, self.qkv_rows // ROWS, ROWS, epoch, warp, lane)
             w = self.attend(p, w, layer, kvh, blk0, blk1, last, item, pos, epoch, warp, lane)
         return w
 
@@ -628,11 +591,8 @@ class DraftBackboneKernel(DraftKernel):
         t = lane % 4
         with self.trace_region("attn.setup"):
             qa = self.attention_setup(p, layer, kvh, pos, epoch, warp, lane)
-        lo = Int32(0)
-        for li in self.local:
-            if layer == li:
-                lo = pos - self.window
-        m = cute.make_rmem_tensor((4,), Float32)  # rows g, g + 8, 16 + g, 24 + g
+        lo = self.context_start(layer, pos)
+        m = cute.make_rmem_tensor((4,), Float32)  # rows 8 i + g: g, g + 8 of each m16 tile
         lsum = cute.make_rmem_tensor((4,), Float32)
         o = cute.make_rmem_tensor((2, 2, 4), Float32)  # m16 tile, n8 tile, fragment
         m.fill(-1e30)
@@ -662,11 +622,11 @@ class DraftBackboneKernel(DraftKernel):
         for i in cutlass.range_constexpr(4):
             lsum[i] = group_sum(lsum[i], 4)
             if t == 0:
-                p.rmax[16 * (i // 2) + 8 * (i % 2) + g, warp] = lsum[i]
+                p.rmax[8 * i + g, warp] = lsum[i]
         self.csync.sync()
         rows = self.attn_rows
         for i in cutlass.range_constexpr(4):
-            r = 16 * (i // 2) + 8 * (i % 2) + g
+            r = 8 * i + g
             peers = cute.make_rmem_tensor((COMPUTE_WARPS,), Float32)
             cute.autovec_copy(p.rmax[r, None], peers)
             total = Float32(0.0)
@@ -708,34 +668,20 @@ class DraftBackboneKernel(DraftKernel):
         ]
         parts = cute.make_rmem_tensor((self.qkv_splits * per,), Float32)
         fetch(segments, parts, epoch, uniform=True)
-        qv = cute.make_rmem_tensor((4 * g_n,), Float32)
-        kv = cute.make_rmem_tensor((8,), Float32)
-        for e in cutlass.range_constexpr(4 * g_n):
-            qv[e] = parts[e]
+        proj = cute.make_rmem_tensor((per,), Float32)  # 4 words per q head, then k's and v's
+        for e in cutlass.range_constexpr(per):
+            proj[e] = parts[e]
             for k in cutlass.range_constexpr(1, self.qkv_splits):
-                qv[e] = qv[e] + parts[k * per + e]
-        for e in cutlass.range_constexpr(8):
-            kv[e] = parts[4 * g_n + e]
-            for k in cutlass.range_constexpr(1, self.qkv_splits):
-                kv[e] = kv[e] + parts[k * per + 4 * g_n + e]
-        for e in cutlass.range_constexpr(4 * g_n):
-            qv[e] = bf16_round(qv[e])
-        for e in cutlass.range_constexpr(8):
-            kv[e] = bf16_round(kv[e])
+                proj[e] = proj[e] + parts[k * per + e]
+            proj[e] = bf16_round(proj[e])
         for hl in cutlass.range_constexpr(g_n):
-            x = cute.make_rmem_tensor((4,), Float32)
-            for e in cutlass.range_constexpr(4):
-                x[e] = qv[4 * hl + e]
-            x = self.norm_rope4(x, p.q_norm[layer, None], rope, lane)
+            x = self.norm_rope4(proj, hl, p.q_norm[layer, None], rope, lane)
             for e in cutlass.range_constexpr(4):
                 p.qs[hl * TOKENS + n, 4 * lane + e] = BFloat16(x[e])
-        x = cute.make_rmem_tensor((4,), Float32)
-        for e in cutlass.range_constexpr(4):
-            x[e] = kv[e]
-        x = self.norm_rope4(x, p.k_norm[layer, None], rope, lane)
+        x = self.norm_rope4(proj, g_n, p.k_norm[layer, None], rope, lane)
         for e in cutlass.range_constexpr(4):
             p.kb[n, 4 * lane + e] = BFloat16(x[e])
-            p.vb[n, 4 * lane + e] = BFloat16(kv[4 + e])
+            p.vb[n, 4 * lane + e] = BFloat16(proj[4 * g_n + 4 + e])
         self.csync.sync()
         g = lane // 4
         t = lane % 4
@@ -787,10 +733,10 @@ class DraftBackboneKernel(DraftKernel):
             bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=1))
             bm = cutlass.max(bm, cute.arch.shuffle_sync_bfly(bm, offset=2))
             if t == 0:
-                p.rmax[16 * (i // 2) + 8 * (i % 2) + g, warp] = bm
+                p.rmax[8 * i + g, warp] = bm
         self.csync.sync()
         for i in cutlass.range_constexpr(4):
-            r = 16 * (i // 2) + 8 * (i % 2) + g
+            r = 8 * i + g
             peers = cute.make_rmem_tensor((COMPUTE_WARPS,), Float32)
             cute.autovec_copy(p.rmax[r, None], peers)
             bm = peers[0]
@@ -828,9 +774,7 @@ class DraftBackboneKernel(DraftKernel):
             for mt in cutlass.range_constexpr(2):
                 for half in cutlass.range_constexpr(2):
                     for kk in cutlass.range_constexpr(2):
-                        pair = cute.make_rmem_tensor((2,), BFloat16)
-                        src = p.probs[16 * mt + 8 * half + g, None]
-                        cute.autovec_copy(cute.local_tile(src, (2,), ((k0 + 8 * kk) // 2,)), pair)
+                        pair = load_frag(p.probs[16 * mt + 8 * half + g, None], k0 + 8 * kk, 2)
                         a[mt, 2 * kk + half] = cute.recast_tensor(pair, Int32)[0]
             for nt in cutlass.range_constexpr(2):
                 d = 16 * warp + 8 * nt + g
@@ -912,57 +856,36 @@ class DraftBackboneKernel(DraftKernel):
     def final(self, p: BackboneParams, epoch, warp, lane):
         """The mask rows' final norm: warp n (n >= 1) -> ``hidden[n - 1]``."""
         h = self.hidden
-        h_tiles = h // ROWS
-        self.wait_items(p.h_pre, self.sentinel(self.layers, ROWS - 1), h_tiles, ROWS, epoch,
-                        warp, lane)  # fmt: skip
+        first = last_token_word(self.layers, h, ROWS - 1)
+        self.wait_items(p.h_pre, first, h // ROWS, ROWS, epoch, warp, lane)
         if warp > 0:
-            chunks = h // 128
-            vals = cute.make_rmem_tensor((4 * chunks,), Float32)
-            self.fetch_rows(p.h_pre, (self.layers * TOKENS + warp) * h, h, vals, epoch, lane)
-            ss = Float32(0.0)
-            for i in cutlass.range(4 * chunks, unroll_full=True):
-                ss = ss + vals[i] * vals[i]
-            ss = group_sum(ss, 32)
-            rinv = cute.math.rsqrt(ss * fp32_reciprocal(h) + Float32(self.rms_eps))
-            self.store_row(p.hidden, warp - 1, h, vals, rinv, p.final_norm, lane)
+            base = (self.layers * TOKENS + warp) * h
+            self.norm_row(p.h_pre, base, p.final_norm, p.hidden, warp - 1, epoch, lane)
 
     # ----------------------------------------------------------------- kernel
 
     @cute.kernel
     def kernel(self, tma, gtensors, scratch, tensors, bound):
-        layouts = self.ring_layouts() | {
+        layouts = {
             "KV": kv_stages(self.stages),
-            "X": x_layout(self.x_width),
-            "RED": red_layout(REDUCTIONS),
-            "GRED": cute.make_layout((GRED_FLOATS,)),
             "Q": cute.make_layout((ATTN_ROWS, HEAD_DIM), stride=(HEAD_DIM + QPAD, 1)),
             "KB": cute.make_layout((2 * TOKENS, HEAD_DIM), stride=(HEAD_DIM, 1)),
             "VB": cute.make_layout((2 * TOKENS, HEAD_DIM), stride=(HEAD_DIM, 1)),
             "P": cute.make_layout((ATTN_ROWS, BLOCK), stride=(BLOCK + QPAD, 1)),
             "RMAX": cute.make_layout((ATTN_ROWS, COMPUTE_WARPS), stride=(COMPUTE_WARPS, 1)),
         }
-        self.begin_roles(work=bound, layouts=layouts)
-        tensors = {k: cute.make_tensor(t.iterator, t.layout) for k, t in zip(TENSOR_ARGS, tensors)}
-        trace_buffer = tensors.pop("trace_buffer")
-        tagged = tagged_views(scratch, self.scratch_shapes)
         boxes = [("WS", (ROWS, BOX))] * 4 + [("KV", (BLOCK, HEAD_DIM))] * 2
-        parts = [tma_partition(a, self.buffer(name), g, box)
-                 for a, g, (name, box) in zip(tma, gtensors, boxes)]  # fmt: skip
+        trace_buffer, fields, smem = self.begin_draft(
+            bound, layouts, TENSOR_ARGS, tensors, scratch, tma, gtensors, boxes
+        )
         params = BackboneParams(
-            tma=tuple(tma),
-            gmem=tuple(part[1] for part in parts),
-            sWS=StageView(parts[0][0], axis=cute.rank(parts[0][0]) - 1),
-            sKV=StageView(parts[4][0], axis=1),
-            xs=self.buffer("X"),
-            red=self.buffer("RED"),
-            gred=self.buffer("GRED"),
+            sKV=StageView(smem[4], axis=1),
             qs=self.buffer("Q"),
             kb=self.buffer("KB"),
             vb=self.buffer("VB"),
             probs=self.buffer("P"),
             rmax=self.buffer("RMAX"),
-            **tagged,
-            **tensors,
+            **fields,
         )
         self.run_roles(params, trace_buffer=trace_buffer)
 
@@ -995,15 +918,11 @@ class DraftBackboneKernel(DraftKernel):
         max_ctas: Int32,
         stream: cuda.CUstream,
     ):
-        pairs = [gemv_atom(src) for src in (wqkv, wo, wgu, wd)]
+        pairs = [swizzled_atom(src, BFloat16) for src in (wqkv, wo, wgu, wd)]
         pairs += [tma_atom(src, (BLOCK, HEAD_DIM)) for src in (k_cache, v_cache)]
-        bound = self.work.bind(table, workspace, max_ctas)
         tensors = (trace_buffer, embed, embed_norm, mask_embed, input_norm, post_norm, q_norm, k_norm,
                    final_norm, rope, token, pos, hidden, state)  # fmt: skip
-        self.kernel.set_name_prefix(self.get_name())
-        self.kernel(
-            tuple(a for a, _ in pairs), tuple(g for _, g in pairs), scratch, tensors, bound
-        ).launch(**self.launch_config(bound), stream=stream, cooperative=True)
+        self.launch(pairs, tensors, scratch, table, workspace, max_ctas, stream)
 
 
 @jit_cache
@@ -1013,7 +932,7 @@ def compile_draft_backbone_kernel(op: DraftBackboneKernel):
     bf16, f32 = BFloat16, Float32
     h, layers = op.hidden, op.layers
     cache_rows = cute.sym_int(divisibility=BLOCK)
-    return compile_tvm_ffi(
+    return compile_draft(
         op,
         make_fake_compact_tensor(bf16, (layers * op.qkv_rows, h)),  # wqkv
         make_fake_compact_tensor(bf16, (layers * h, op.q_dim)),  # wo
@@ -1033,11 +952,4 @@ def compile_draft_backbone_kernel(op: DraftBackboneKernel):
         make_fake_compact_tensor(Int64, (1,), assumed_align=8),  # anchor
         make_fake_compact_tensor(Int64, (1,), assumed_align=8),  # pos
         make_fake_compact_tensor(bf16, (TOKENS, h)),  # hidden out
-        make_fake_compact_tensor(Int64, (cute.sym_int(),)),  # trace buffer (globaltimer)
-        make_fake_compact_tensor(Int64, (scratch_offsets(op.scratch_shapes)[1],)),
-        make_fake_compact_tensor(Int32, (2,), assumed_align=4),
-        make_fake_compact_tensor(Int32, (cute.sym_int(), WORDS)),
-        make_fake_compact_tensor(Int32, (cute.sym_int(),)),
-        Int32(1),
-        name=op.get_name(),
     )

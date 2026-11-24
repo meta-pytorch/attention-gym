@@ -90,12 +90,6 @@ def prefill_blocks(
     return logits[rows - 1]
 
 
-def accepted_drafts(drafts: torch.Tensor, verified: torch.Tensor) -> torch.Tensor:
-    """The length (a 0-dim int64 device tensor) of the longest prefix of ``drafts`` equal to the
-    target's argmaxes ``verified[:-1]`` (row ``i`` predicts the token after row ``i``)."""
-    return (drafts == verified[:-1]).long().cumprod(0).sum()
-
-
 class SpecStep:
     """One greedy speculative step over ``target`` and ``drafter`` (see the module docstring),
     with ``chat.MultiTokenBackend.decode``'s contract: ``step(token, pos, out)`` feeds the
@@ -103,7 +97,7 @@ class SpecStep:
     (``(1 + tokens_per_step,)`` int64; entries past ``count`` are the rejected rows' argmaxes),
     the new anchor into ``token`` and advances ``pos`` by ``count``. No host sync."""
 
-    def __init__(self, target: TargetBlock, drafter: DraftModel, device="cuda"):
+    def __init__(self, target: TargetBlock, drafter: DraftModel):
         if target.tokens < 2 or drafter.num_drafts != target.tokens - 1:
             raise ValueError(
                 f"a block of {target.tokens} tokens needs >= 2 tokens and {target.tokens - 1} "
@@ -111,7 +105,7 @@ class SpecStep:
             )
         self.target, self.drafter = target, drafter
         self.tokens_per_step = target.tokens
-        self.offsets = torch.arange(target.tokens, device=device)
+        self.offsets = torch.arange(target.tokens, device="cuda")
 
     def __call__(self, token: torch.Tensor, pos: torch.Tensor, out: torch.Tensor) -> None:
         anchor_pos = pos.reshape(1).long() + 1
@@ -119,7 +113,9 @@ class SpecStep:
         drafts = self.drafter.propose(token, anchor_pos)
         logits, features = self.target(torch.cat([token.reshape(1), drafts]), anchor_pos)
         verified = logits.argmax(-1)
-        accepted = accepted_drafts(drafts, verified)
+        # The longest prefix of drafts equal to the argmaxes (row i predicts the token after
+        # row i), as a 0-dim device tensor.
+        accepted = (drafts == verified[:-1]).long().cumprod(0).sum()
         self.drafter.commit(features, positions, last=accepted)
         out[0].copy_(accepted + 1)
         out[1:].copy_(verified)

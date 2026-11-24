@@ -1,23 +1,55 @@
 """Register math of the megakernels: bf16 rounding and widening, warp and CTA reductions,
-vectorized loads and stores of small fragments, and fp32 constants as PyTorch rounds them."""
+vectorized loads and stores of small fragments, fp32 bit reinterpretation and inline PTX, and
+fp32 constants as PyTorch rounds them."""
 
+import operator
 import struct
 
 import cutlass
 from cutlass import Float32, Int32, Uint32, cute
-from cutlass._mlir.extras import types as T
+from cutlass._mlir.dialects import llvm
 from cutlass._mlir_helpers.arith import bitcast
+from cutlass.cutlass_dsl import T
 
 from attn_gym.warpdrive.examples.megakernel.constants import COMPUTE_WARPS, RED_VALUES
+
+
+def as_bits(x) -> Int32:
+    """The bits of fp32 ``x``."""
+    return Int32(bitcast(Float32(x).ir_value(), T.i32()))
+
+
+def as_float(bits) -> Float32:
+    """The fp32 value of ``bits``."""
+    return Float32(bitcast(Int32(bits).ir_value(), T.f32()))
+
+
+def inline_asm(result_types: list, operands: list, body: str, constraints: str, loc, ip):
+    """Pure inline PTX with one or more results."""
+    values = [v.ir_value(loc=loc, ip=ip) for v in operands]
+    single = len(result_types) == 1
+    result = llvm.inline_asm(
+        result_types[0] if single else llvm.StructType.get_literal(result_types),
+        values,
+        body,
+        constraints,
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+    if single:
+        return [result]
+    return [llvm.extractvalue(t, result, [i], loc=loc, ip=ip) for i, t in enumerate(result_types)]
 
 
 @cute.jit
 def bf16_round(x):
     """Round to the nearest bf16 (ties to even), kept in fp32. Integer ops instead of F2F: the
     conversion is quarter-rate and the norms round every element."""
-    bits = Int32(bitcast(Float32(x).ir_value(), T.i32()))
-    bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & Int32(-65536)
-    return Float32(bitcast(bits.ir_value(), T.f32()))
+    bits = as_bits(x)
+    return as_float((bits + 0x7FFF + ((bits >> 16) & 1)) & Int32(-65536))
 
 
 @cute.jit
@@ -56,12 +88,18 @@ def bf16x8_to_f32(frag):
     return cute.recast_tensor(bits, Float32)
 
 
-@cute.jit
-def group_sum(v, width: cutlass.Constexpr):
-    """Sum over aligned groups of ``width`` lanes."""
-    for step in cutlass.range_constexpr(width.bit_length() - 1):
-        v = v + cute.arch.shuffle_sync_bfly(v, offset=1 << step)
+def group_reduce(op, v, width: int):
+    """``op`` (a binary function) of ``v`` over aligned groups of ``width`` lanes, as a
+    butterfly of ascending offsets: for a sum, the pairwise tree over the lanes in order (fp32
+    addition commutes, so every lane gets the same sum). Every lane of the warp must call it."""
+    for step in range(width.bit_length() - 1):
+        v = op(v, cute.arch.shuffle_sync_bfly(v, offset=1 << step))
     return v
+
+
+def group_sum(v, width: int):
+    """Sum over aligned groups of ``width`` lanes."""
+    return group_reduce(operator.add, v, width)
 
 
 def red_layout(slots: int) -> cute.Layout:
@@ -72,23 +110,32 @@ def red_layout(slots: int) -> cute.Layout:
     )
 
 
-@cute.jit
-def cta_sum(red, csync, vals, slot: cutlass.Constexpr, warp, lane):
+def cta_sum(red, csync, vals, slot: int, warp, lane):
     """Sums of each of ``vals`` (at most RED_VALUES per-thread values) over the compute
     threads, in every thread, through slot ``slot`` of ``red`` (``red_layout``) and the compute
     warps' barrier ``csync``. Before a slot is written again, every thread must pass a barrier
     after its last read (another ``cta_sum`` or ``csync``)."""
+    return cta_reduce(operator.add, red, csync, vals, slot, warp, lane, init=0.0)
+
+
+@cute.jit
+def cta_reduce(op, red, csync, vals, slot: cutlass.Constexpr, warp, lane,
+               init: cutlass.Constexpr = None):  # fmt: skip
+    """``cta_sum`` with the binary function ``op``: each warp's ``group_reduce``, then the
+    warps' values in warp order, folded into ``init`` (None: from the first warp's)."""
     n = len(vals)
     for i in cutlass.range_constexpr(n):
-        v = group_sum(vals[i], 32)
+        v = group_reduce(op, vals[i], 32)
         if lane == 0:
             red[slot, warp, i] = v
     csync.sync()
     out = []
     for i in cutlass.range_constexpr(n):
-        total = Float32(0.0)
-        for wi in cutlass.range_constexpr(COMPUTE_WARPS):
-            total = total + red[slot, wi, i]
+        total = red[slot, 0, i]
+        if cutlass.const_expr(init is not None):
+            total = op(Float32(init), total)
+        for wi in cutlass.range_constexpr(1, COMPUTE_WARPS):
+            total = op(total, red[slot, wi, i])
         out.append(total)
     return out
 
@@ -97,21 +144,23 @@ def cta_sum(red, csync, vals, slot: cutlass.Constexpr, warp, lane):
 def load_vec(src, offset, n: cutlass.Constexpr):
     """``n`` contiguous elements of a 1-D tensor from ``offset`` (a multiple of n), as fp32."""
     out = cute.make_rmem_tensor((n,), Float32)
-    load_into(out, src, offset, n)
-    return out
-
-
-@cute.jit
-def load_into(out, src, offset, n: cutlass.Constexpr):
     out.store(load_frag(src, offset, n).load().to(Float32))
+    return out
 
 
 @cute.jit
 def load_frag(src, offset, n: cutlass.Constexpr):
     """``n`` contiguous elements of a 1-D tensor from ``offset`` (a multiple of n) in one vector
     load, in their type."""
+    return load_tile(src, offset // n, n)
+
+
+@cute.jit
+def load_tile(src, tile, n: cutlass.Constexpr):
+    """Elements ``n * tile .. n * tile + n - 1`` of a 1-D tensor in one vector load, in their
+    type."""
     frag = cute.make_rmem_tensor((n,), src.element_type)
-    cute.autovec_copy(cute.local_tile(src, (n,), (offset // n,)), frag)
+    cute.autovec_copy(cute.local_tile(src, (n,), (tile,)), frag)
     return frag
 
 

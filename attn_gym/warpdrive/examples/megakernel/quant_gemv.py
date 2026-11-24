@@ -42,34 +42,14 @@ earlier HF-numerics decode).
 
 import cutlass
 from cutlass import Float32, Int32, cute
-from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import T, dsl_user_op
 
 from attn_gym.warpdrive.examples.megakernel.constants import ROWS_PER_WARP
 from attn_gym.warpdrive.examples.megakernel.formats import BLOCKS, LANE_WORDS, MXFP8, SUBTILE_WORDS
 from attn_gym.warpdrive.examples.megakernel.gemv import reduce_tile
+from attn_gym.warpdrive.examples.megakernel.regmath import inline_asm, load_tile
 
 # ------------------------------------------------------------------ register decode
-
-
-def inline_asm(result_types: list, operands: list, body: str, constraints: str, loc, ip):
-    """Pure inline PTX with one or more results."""
-    values = [v.ir_value(loc=loc, ip=ip) for v in operands]
-    single = len(result_types) == 1
-    result = llvm.inline_asm(
-        result_types[0] if single else llvm.StructType.get_literal(result_types),
-        values,
-        body,
-        constraints,
-        has_side_effects=False,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-        loc=loc,
-        ip=ip,
-    )
-    if single:
-        return [result]
-    return [llvm.extractvalue(t, result, [i], loc=loc, ip=ip) for i, t in enumerate(result_types)]
 
 
 @dsl_user_op
@@ -189,10 +169,10 @@ def nvfp4_scale(scales, r: int, *, loc=None, ip=None) -> Int32:
     return Int32(out[0])
 
 
-@cute.jit
-def mx_scale(scales, r: cutlass.Constexpr) -> Int32:
-    """bf16x2 ``2 ** (s - 127)`` twice for byte ``r`` of a lane's scale word (s >= 1)."""
-    return scale_byte(scales, r) * Int32(0x00800080)
+def mx_scale(byte) -> Int32:
+    """bf16x2 ``2 ** (s - 127)`` twice for the MXFP8 scale byte ``byte`` = s (s >= 1): s in
+    each half's exponent field."""
+    return byte * Int32(0x00800080)
 
 
 @cute.jit
@@ -203,10 +183,9 @@ def accumulate_subtile(fmt: cutlass.Constexpr, acc, sW, row0, word0, xw, scales,
     words; ``scales``: the lane's tile-major scale word (its 4 rows' bytes)."""
     n = LANE_WORDS[fmt]
     for r in cutlass.range_constexpr(ROWS_PER_WARP):
-        wq = cute.make_rmem_tensor((n,), Int32)
-        cute.autovec_copy(cute.local_tile(sW[row0 + r, None], (n,), (word0 // n + lane,)), wq)
+        wq = load_tile(sW[row0 + r, None], word0 // n + lane, n)
         if cutlass.const_expr(fmt == MXFP8):
-            words = mxfp8_bf16x8(wq[0], wq[1], mx_scale(scales, r))
+            words = mxfp8_bf16x8(wq[0], wq[1], mx_scale(scale_byte(scales, r)))
         else:
             words = nvfp4_bf16x8(wq[0], nvfp4_scale(scales, r))
         a0, a1 = acc[r, 0], acc[r, 1]
@@ -236,8 +215,7 @@ def quant_tile(fmt: cutlass.Constexpr, w, meta_stage, xs, xrow, stages: cutlass.
             for j in cutlass.range_constexpr(stage_subtiles):
                 kt = st * stage_subtiles + j
                 if cutlass.const_expr(kt < subtiles):
-                    xw = cute.make_rmem_tensor((4,), Int32)
-                    cute.autovec_copy(cute.local_tile(xwords, (4,), (kt * 32 + lane,)), xw)
+                    xw = load_tile(xwords, kt * 32 + lane, 4)
                     word = scales[0, kt, warp * blocks + lane // (32 // blocks)]
                     acc = accumulate_subtile(
                         fmt, acc, stage, warp * ROWS_PER_WARP, j * SUBTILE_WORDS[fmt], xw,

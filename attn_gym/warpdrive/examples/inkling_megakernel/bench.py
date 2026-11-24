@@ -22,6 +22,7 @@ Every launch of a visit occupies the whole GPU (a cooperative grid of one CTA pe
 benchmark alone on its GPU.
 """
 
+import dataclasses
 import json
 from functools import partial
 from pathlib import Path
@@ -89,16 +90,13 @@ def launch_kinds(weights: ref.InklingWeights) -> dict[str, tuple[str, int, int]]
     return kinds
 
 
-def record_calls(decoder: InklingDecoder, token, pos, cache, block=False) -> dict[str, list]:
-    """Every launch of one ``decoder`` step, by runner (``visit``, ``msg``, ``head``), ready to
-    replay; ``block``: of a ``decode_block`` step of the ``token`` block."""
-    prefix = "block_" if block else ""
+def record_calls(decoder: InklingDecoder, tokens, pos, cache, block=False) -> dict[str, list]:
+    """Every launch of one ``decoder`` step of ``tokens`` (``block``: a ``decode_block`` step),
+    by runner (``visit``, ``msg``, ``head``), ready to replay."""
+    runners = decoder.block_runners if block else decoder.token_runners
     calls = {name: [] for name in ("visit", "msg", "head")}
-    for name, recorded in calls.items():
-        setattr(decoder, prefix + name, Recorder(getattr(decoder, prefix + name), recorded))
-    (decoder.decode_block if block else decoder)(token, pos, cache)
-    for name in calls:
-        setattr(decoder, prefix + name, getattr(decoder, prefix + name).runner)
+    recorders = {name: Recorder(getattr(runners, name), calls[name]) for name in calls}
+    decoder.step(dataclasses.replace(runners, **recorders), tokens.reshape(-1), pos, cache)
     return calls
 
 
@@ -106,18 +104,14 @@ def union_sizes(decoder: InklingDecoder, tokens, pos, cache) -> list[int]:
     """The expert union's size at each visit of one ``decode_block`` step of ``tokens``
     (eager, synchronizing after every visit)."""
     sizes = []
-    runner = decoder.block_visit
+    runner = decoder.block_runners.visit
 
     def visit(*args, **kwargs):
         out = runner(*args, **kwargs)
         sizes.append(int(runner.union_size().item()))
         return out
 
-    decoder.block_visit = visit
-    try:
-        decoder.decode_block(tokens, pos, cache)
-    finally:
-        decoder.block_visit = runner
+    decoder.step(dataclasses.replace(decoder.block_runners, visit=visit), tokens, pos, cache)
     return sizes
 
 

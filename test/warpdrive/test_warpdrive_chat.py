@@ -50,7 +50,7 @@ class CountingBackend:
 class FakeModel:
     def __init__(self, stop_at: int):
         self.backend = CountingBackend(stop_at)
-        self.tokenizer, self.label, self.max_len, self.stops = None, "fake", 1024, {STOP}
+        self.label, self.max_len, self.stops = "fake", 1024, {STOP}
         self.prefills: list[tuple[int, int]] = []  # (start, count)
 
     def prompt_ids(self, messages):

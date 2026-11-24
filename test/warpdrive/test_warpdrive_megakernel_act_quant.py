@@ -10,9 +10,10 @@ import torch
 pytest.importorskip("cutlass.cute")
 
 import cutlass
-from cutlass import BFloat16, Float32, cute
-from cutlass.cute.runtime import from_dlpack
+from cuda.bindings import driver as cuda
+from cutlass import BFloat16, Float32, Int32, cute
 
+from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.compat import SmemAllocator
 from attn_gym.warpdrive.examples.inkling_megakernel.act_quant import (
     E2M1_MAGNITUDES,
@@ -119,9 +120,11 @@ def blocks_kernel(fmt: cutlass.Constexpr, x: cute.Tensor, values: cute.Tensor,
 
 @cute.jit
 def run_blocks(fmt: cutlass.Constexpr, x: cute.Tensor, values: cute.Tensor, codes: cute.Tensor,
-               scales: cute.Tensor, amax: cute.Tensor):  # fmt: skip
+               scales: cute.Tensor, amax: cute.Tensor, stream: cuda.CUstream):  # fmt: skip
     grid = (-(-cute.size(values, mode=[0]) // THREADS), 1, 1)
-    blocks_kernel(fmt, x, values, codes, scales, amax).launch(grid=grid, block=(THREADS, 1, 1))
+    blocks_kernel(fmt, x, values, codes, scales, amax).launch(
+        grid=grid, block=(THREADS, 1, 1), stream=stream
+    )
 
 
 @cute.kernel
@@ -145,9 +148,9 @@ def chunks_kernel(fmt: cutlass.Constexpr, x: cute.Tensor, out: cute.Tensor):
 
 
 @cute.jit
-def run_chunks(fmt: cutlass.Constexpr, x: cute.Tensor, out: cute.Tensor):
+def run_chunks(fmt: cutlass.Constexpr, x: cute.Tensor, out: cute.Tensor, stream: cuda.CUstream):
     grid = (-(-cute.size(out, mode=[0]) // THREADS), 1, 1)
-    chunks_kernel(fmt, x, out).launch(grid=grid, block=(THREADS, 1, 1))
+    chunks_kernel(fmt, x, out).launch(grid=grid, block=(THREADS, 1, 1), stream=stream)
 
 
 class CtaBarrier:
@@ -185,9 +188,24 @@ def rows_kernel(fmt: cutlass.Constexpr, x: cute.Tensor, out: cute.Tensor):
 
 
 @cute.jit
-def run_rows(fmt: cutlass.Constexpr, x: cute.Tensor, out: cute.Tensor):
+def run_rows(fmt: cutlass.Constexpr, x: cute.Tensor, out: cute.Tensor, stream: cuda.CUstream):
     grid = (-(-cute.size(x, mode=[0]) // ROWS_AT_ONCE), 1, 1)
-    rows_kernel(fmt, x, out).launch(grid=grid, block=(COMPUTE_THREADS, 1, 1))
+    rows_kernel(fmt, x, out).launch(grid=grid, block=(COMPUTE_THREADS, 1, 1), stream=stream)
+
+
+CUTE_DTYPES = {torch.bfloat16: BFloat16, torch.float32: Float32, torch.int32: Int32}
+
+
+@jit_cache
+def compile_run(entry, fmt: str, operands: tuple):
+    """``entry`` (``run_blocks``, ``run_rows``, ``run_chunks``) for ``fmt`` over compact
+    operands of these ``(dtype, shape)``s."""
+    fakes = [make_fake_compact_tensor(CUTE_DTYPES[dtype], shape) for dtype, shape in operands]
+    return compile_tvm_ffi(entry, fmt, *fakes, name=f"{entry.__name__}_{fmt}")
+
+
+def run(entry, fmt: str, *tensors: torch.Tensor) -> None:
+    compile_run(entry, fmt, tuple((t.dtype, tuple(t.shape)) for t in tensors))(*tensors)
 
 
 def device_blocks(fmt: str, x: torch.Tensor) -> tuple:
@@ -201,8 +219,7 @@ def device_blocks(fmt: str, x: torch.Tensor) -> tuple:
     )
     scales = torch.empty(count, device="cuda", dtype=torch.int32)
     amax = torch.empty(rows, device="cuda")
-    args = [from_dlpack(t) for t in (x, values, codes, scales, amax)]
-    cute.compile(run_blocks, fmt, *args)(*args)
+    run(run_blocks, fmt, x, values, codes, scales, amax)
     values = values.view(torch.bfloat16).view(rows, columns)
     return values, codes.view(torch.uint8).view(rows, -1), scales.view(rows, -1), amax
 
@@ -225,11 +242,9 @@ def test_device_quantizers_match_the_oracle(fmt):
     assert torch.equal(scales.to(torch.uint8), expected[2])
     assert torch.equal(values.view(torch.int16), expected[0].view(torch.int16))
     out = torch.full_like(x, float("nan"))
-    args = [from_dlpack(t) for t in (x, out)]
-    cute.compile(run_rows, fmt, *args)(*args)
+    run(run_rows, fmt, x, out)
     assert torch.equal(out.view(torch.int16), expected[0].view(torch.int16))
     out = torch.empty(x.numel() // 8, 4, device="cuda", dtype=torch.int32)
-    args = [from_dlpack(t) for t in (x, out)]
-    cute.compile(run_chunks, fmt, *args)(*args)
+    run(run_chunks, fmt, x, out)
     out = out.view(torch.bfloat16).view_as(x)
     assert torch.equal(out.view(torch.int16), expected[0].view(torch.int16))

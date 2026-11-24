@@ -59,7 +59,6 @@ from cutlass import BFloat16, Float32, Int32, cute
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     MAX_BLOCKS,
     RING,
-    add_offset,
     conv_inputs,
     post_conv,
 )
@@ -170,7 +169,6 @@ class AttentionHalf:
         if full:
             rows.update({KDYN: kv_heads * conv_kernel, VDYN: kv_heads * conv_kernel})
         self.matrices = tuple(sorted(rows))
-        self.proj_rows = rows
         self.proj_tiles = {m: -(-r // ROWS) for m, r in rows.items()}
         offsets, offset = {}, 0
         for m in self.matrices:
@@ -303,7 +301,7 @@ class AttentionHalf:
             x[slot, r] = Float32(v)
             if cutlass.const_expr(store):
                 if first:
-                    p.h[add_offset(k, token * self.hidden)] = v
+                    p.h[token * self.hidden + k] = v
         # The prologue's reductions reuse RED slot 0.
         self.csync.sync()
 
@@ -526,7 +524,7 @@ class AttentionHalf:
 
         Warp w scores positions 8w + 4i + g (i = 0, 1) of each 64-position block: lane group
         g = lane // 8 holds a position, lane j = lane % 8 its dims 8j..8j+7 and 64+8j..64+8j+7
-        and relative-state entries 2j, 2j + 1. Each warp keeps its own online-softmax state; the
+        (the relative bias comes from BIAS). Each warp keeps its own online-softmax state; the
         warps, plus the new token in the newest split, merge through ATT at the end."""
         g = lane // 8
         j = lane % 8
@@ -703,12 +701,13 @@ class AttentionHalf:
         segments.append((p.proj, self.proj_offsets[SINK] + hq, 1))
         vals = cute.make_rmem_tensor((2 + 4 * splits + 5,), Float32)
         fetch(segments, vals, epoch, uniform=True)
-        m = vals[2 + 4 * splits + 4] * LOG2E  # the sink
+        sink = vals[2 + 4 * splits + 4] * LOG2E
+        m = sink
         ms = cute.make_rmem_tensor((splits,), Float32)
         for sp in cutlass.range_constexpr(splits):
             ms[sp] = cute.arch.shuffle_sync(vals[0], offset=sp)
             m = cutlass.max(m, ms[sp])
-        den = cute.math.exp2(vals[2 + 4 * splits + 4] * LOG2E - m)
+        den = cute.math.exp2(sink - m)
         for sp in cutlass.range_constexpr(splits):
             ms[sp] = cute.math.exp2(ms[sp] - m)  # split sp's scale
             den = den + cute.arch.shuffle_sync(vals[1], offset=sp) * ms[sp]

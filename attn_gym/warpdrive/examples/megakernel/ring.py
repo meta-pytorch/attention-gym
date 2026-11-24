@@ -2,8 +2,6 @@
 partitions, and the load warp's loads of 16 KB stages (``constants``) of weight or KV tiles,
 whole or as ``multi_gemv``'s swizzled boxes, into a ``Ring`` the compute warps consume."""
 
-import math
-
 import cutlass
 from cutlass import BFloat16, Int64, cute
 from cutlass.cute.nvgpu import cpasync
@@ -52,18 +50,17 @@ def ring_stages(fixed: int, stages: int | None, *, smem_bytes: int = SMEM_BYTES)
 
 def weight_stages(stages: int) -> cute.Layout:
     """The ring's ``stages`` weight stages as row-major ``(ROWS, TILE_K, stages)`` bf16 tiles."""
-    return cute.make_layout((ROWS, TILE_K, stages), stride=(TILE_K, 1, ROWS * TILE_K))
+    return cute.make_ordered_layout((ROWS, TILE_K, stages), order=(1, 0, 2))
 
 
 def kv_stages(stages: int) -> cute.Layout:
     """The ring's ``stages`` KV stages as row-major ``(BLOCK, HEAD_DIM, stages)`` bf16 blocks."""
-    return cute.make_layout((BLOCK, HEAD_DIM, stages), stride=(HEAD_DIM, 1, BLOCK * HEAD_DIM))
+    return cute.make_ordered_layout((BLOCK, HEAD_DIM, stages), order=(1, 0, 2))
 
 
 def tma_atom(src, box: tuple[int, ...]) -> tuple:
     """TMA ``(atom, tensor)`` loading ``box`` tiles of ``src`` into row-major SMEM."""
-    stride = tuple(math.prod(box[i + 1 :]) for i in range(len(box)))
-    smem = cute.make_layout(box, stride=stride)
+    smem = cute.make_ordered_layout(box, order=tuple(reversed(range(len(box)))))
     return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), src, smem, box)
 
 

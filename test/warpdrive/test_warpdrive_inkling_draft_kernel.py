@@ -74,15 +74,16 @@ def assert_sum_close(actual, gemv, residual, layer):
     ).all(), layer
 
 
-def committed_pair(weights, count: int, seed: int = 0):
-    """The torch drafter and the launches after committing the same ``count`` rows."""
-    rows = features(count, seed)
+def committed_pair(weights, count: int, num_drafts: int | None = None):
+    """The torch drafter and the launches (drafting ``num_drafts``) after committing the same
+    ``count`` rows."""
+    rows = features(count, seed=0)
     positions = torch.arange(count, device="cuda")
     reference = DSparkDrafter(weights, MAX_LEN)
     reference.commit(rows, positions)
-    kernels = DSparkMegakernel(weights, MAX_LEN)
+    kernels = DSparkMegakernel(weights, MAX_LEN, num_drafts=num_drafts)
     kernels.commit_rows(rows, 0)
-    return reference, kernels, rows
+    return reference, kernels
 
 
 @torch.no_grad()
@@ -91,7 +92,7 @@ def test_commit_matches_torch(weights):
     and the Markov head's f_rnn within bf16 rounding of ``DSparkDrafter.commit`` (a key's
     normalized, roped dims within 2 ulps of the head's largest), other positions untouched."""
     start, count = 61, 5
-    reference, kernels, _ = committed_pair(weights, start)
+    reference, kernels = committed_pair(weights, start)
     rows = features(count, seed=start + 1)
     positions = torch.arange(start, start + count, device="cuda")
     reference.commit(rows, positions)
@@ -114,7 +115,7 @@ def test_backbone_stages_match_torch(weights):
     rounded to bf16 against another running max) within a bf16 ulp of its output scale, at a
     position past the local layers' window."""
     pos = 200
-    reference, kernels, _ = committed_pair(weights, pos)
+    reference, kernels = committed_pair(weights, pos)
     c, w = CONFIG, weights
     anchor = 17
     hidden = kernels.block_states(device_int(anchor), device_int(pos))
@@ -164,9 +165,7 @@ def test_head_matches_torch(weights):
     ``num_drafts`` tokens (3: the chat's default block of 4) from the same mask states (the
     vocabulary's last tile is ragged)."""
     num_drafts = 3
-    reference, _, rows = committed_pair(weights, 24)
-    kernels = DSparkMegakernel(weights, MAX_LEN, num_drafts=num_drafts)
-    kernels.commit_rows(rows, 0)
+    reference, kernels = committed_pair(weights, 24, num_drafts)
     generator = torch.Generator().manual_seed(5)
     for trial in range(8):
         hidden = (2 * torch.randn(7, CONFIG.hidden_size, generator=generator)).cuda().bfloat16()

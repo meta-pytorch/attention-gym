@@ -8,10 +8,9 @@ output tokens per second.
 
 The checkpoint's ``config.json`` selects the model family (``FAMILIES``): Qwen3 dense and MoE
 (``qwen_megakernel.chat``) or Inkling 2 Mini (``inkling_megakernel.chat``). A family builds a
-``ChatModel``: its tokenizer and chat template, a prefill (one forward pass of the new prompt
-tokens into its caches) and a ``DecodeBackend`` that decodes one token per step, or a
-``MultiTokenBackend`` that commits a variable number of tokens per step (speculative
-decoding).
+``ChatModel``: its chat template, a prefill (one forward pass of the new prompt tokens into its
+caches) and a ``DecodeBackend`` that decodes one token per step, or a ``MultiTokenBackend`` that
+commits a variable number of tokens per step (speculative decoding).
 
 Each turn prefills the new prompt tokens, then decodes. A backend whose step is CUDA-graph
 capturable decodes inside one graph of steps feeding up to SYNC_EVERY positions per replay,
@@ -90,7 +89,6 @@ class MultiTokenBackend(Protocol):
 class ChatModel(Protocol):
     """A model family's side of the chat."""
 
-    tokenizer: object
     backend: DecodeBackend | MultiTokenBackend
     label: str  # the backend as shown to the user
     max_len: int  # cache capacity in tokens

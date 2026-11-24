@@ -61,16 +61,15 @@ def block_inputs(config, tokens: int, blocks: int, seed: int):
 
 
 def check_block_visit(
-    runner, config, w, layer, visit, h, blocks, cache, pos, messages=None, gates=None,
-    cache_ulps=CACHE_ULPS, launch_w=None,
+    runner, config, w, layer, visit, h, blocks, cache, pos, messages=None, gates=None, *,
+    launch_w, cache_ulps=CACHE_ULPS,
 ):  # fmt: skip
     """``test_warpdrive_inkling_megakernel_visit.check_visit`` for a block of tokens at
     positions ``pos ..``: the residual, every block row of the caches and rings within their
     budgets and every other row untouched; each token's experts, the union's size, and on the
     launch's own residual the activations of every routed row, then the MLP output and ring
-    rows on the launch's activations. The runner launches ``launch_w`` (default ``w``). Returns
-    the residual's and output's errors."""
-    launch_w = w if launch_w is None else launch_w
+    rows on the launch's activations. The runner launches ``launch_w`` (quantized experts),
+    the oracle ``w`` (their block values). Returns the residual's and output's errors."""
     tokens = h.shape[0]
     positions = torch.arange(pos, pos + tokens, device="cuda")
     theirs = clone(cache)
@@ -178,7 +177,7 @@ def test_block_message_visit_random_weights():
     h, states = block_inputs(config, tokens, 2, seed=layer)
     check_block_visit(
         runner, config, dense, layer, 1, h, states, cache, pos, messages, gates.layer(0),
-        cache_ulps=MESSAGE_CACHE_ULPS, launch_w=quantized,
+        launch_w=quantized, cache_ulps=MESSAGE_CACHE_ULPS,
     )  # fmt: skip
 
 

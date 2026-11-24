@@ -227,12 +227,7 @@ def mlp_lists(op: InklingVisitKernel, ctas: int) -> list[list[list[int]]]:
     launch, GB300, Inkling 2 Mini; 2026-11-21)."""
     gate_up = [[GATEUP, t, s] for s in range(op.top_k) for t in range(op.gate_tiles)]
     down_rows = [[DOWN, t, s] for s in range(op.top_k) for t in range(op.row_tiles)]
-    lists = [[] for _ in range(ctas)]
-    for j, row in enumerate(gate_up):
-        lists[j % ctas].append(row)
-    shift = len(gate_up) % ctas
-    for j, row in enumerate(down_rows):
-        lists[(j + shift) % ctas].append(row)
+    lists = deal(gate_up + down_rows, ctas)
     cost = {GATEUP: op.hidden_k_tiles, DOWN: op.down_k_tiles}
     load = [sum(cost[row[0]] for row in rows) for rows in lists]
     for tile in range(op.experts // ROWS):
@@ -263,15 +258,8 @@ def mlp_lists_tokens(op: InklingMultiVisitKernel, ctas: int) -> list[list[list[i
         )
     pairs = op.row_tiles // DOWN_TILES
     down_rows = [[DOWN, t, s] for s in range(op.slots) for t in range(pairs)]
-    lists = [[] for _ in range(ctas)]
-    for j, row in enumerate(gate_up):
-        lists[j % ctas].append(row)
-    shift = len(gate_up) % ctas
-    for j, row in enumerate(down_rows):
-        lists[(j + shift) % ctas].append(row)
-    shift = (shift + len(down_rows)) % ctas
-    for a in range(op.row_tiles):
-        lists[(a + shift) % ctas].append([REDUCE, a, 0])
+    reduce_rows = [[REDUCE, a, 0] for a in range(op.row_tiles)]
+    lists = deal(gate_up + down_rows + reduce_rows, ctas)
     cost = {GATEUP: op.hidden_k_tiles, DOWN: DOWN_TILES * op.down_k_tiles, REDUCE: 1}
     load = [sum(cost[row[0]] for row in rows) for rows in lists]
     routers = set()
@@ -777,6 +765,20 @@ def check_feature_visits(config: InklingConfig):
         raise ValueError(f"feature visits {FEATURE_VISITS} must not restart a core pass")
 
 
+@dataclass
+class StepRunners:
+    """What one decoder step over a fixed token count launches and writes: the visit, message
+    and head runners, the message gates whose buffers they share, and the per-visit states
+    (bf16 ``(visits + 1, tokens, hidden)``: [0] the tokens' normalized embedding, [v + 1] visit
+    v's output, which later block residuals read)."""
+
+    visit: InklingVisitMegakernel
+    msg: InklingMsgMegakernel
+    head: InklingHeadMegakernel
+    gates: MessageGates
+    states: torch.Tensor
+
+
 class InklingDecoder:
     """The batch-one decode step of ``weights`` as megakernel launches only: ``ref.hidden_states``
     and ``ref.logits_of`` of one token at a device position, ``start=None``. With
@@ -797,32 +799,29 @@ class InklingDecoder:
         if config.num_layers > blocks * MAX_BLOCKS:
             raise ValueError(f"the kernels' block residuals read at most {MAX_BLOCKS} blocks")
         self.weights, self.config = weights, config
-        self.gates = MessageGates(
-            weights.layers[config.loop_start : config.loop_end], weights.message_queries
-        )
-        self.visit = InklingVisitMegakernel(config, weights.layers, device=device)
-        self.msg = InklingMsgMegakernel(config, self.gates, device)
-        self.head = InklingHeadMegakernel(weights, device=device)
         hidden = config.hidden_size
-        # [0]: the token's normalized embedding; [v + 1]: visit v's output.
-        self.states = torch.zeros(
-            config.num_visits + 1, hidden, device=device, dtype=torch.bfloat16
-        )
+
+        def zeros(*shape) -> torch.Tensor:
+            return torch.zeros(shape, device=device, dtype=torch.bfloat16)
+
+        def runners(tokens: int, gates: MessageGates, args: dict | None = None) -> StepRunners:
+            return StepRunners(
+                InklingVisitMegakernel(
+                    config, weights.layers, device=device, tokens=tokens, args=args
+                ),
+                InklingMsgMegakernel(config, gates, device),
+                InklingHeadMegakernel(weights, device=device, tokens=tokens),
+                gates,
+                zeros(config.num_visits + 1, tokens, hidden),
+            )
+
+        core = weights.layers[config.loop_start : config.loop_end]
+        self.token_runners = runners(1, MessageGates(core, weights.message_queries))
         self.block_tokens = block_tokens
         if block_tokens is not None:
-            t = block_tokens
-            self.block_gates = self.gates.for_tokens(t)
-            self.block_visit = InklingVisitMegakernel(
-                config, weights.layers, device=device, tokens=t, args=self.visit.args
-            )
-            self.block_msg = InklingMsgMegakernel(config, self.block_gates, device)
-            self.block_head = InklingHeadMegakernel(weights, device=device, tokens=t)
-            self.block_states = torch.zeros(
-                config.num_visits + 1, t, hidden, device=device, dtype=torch.bfloat16
-            )
-            self.block_features = torch.zeros(
-                t, len(FEATURE_VISITS) + 1, hidden, device=device, dtype=torch.bfloat16
-            )
+            gates, args = self.token_runners.gates, self.token_runners.visit.args
+            self.block_runners = runners(block_tokens, gates.for_tokens(block_tokens), args)
+            self.block_features = zeros(block_tokens, len(FEATURE_VISITS) + 1, hidden)
 
     def __call__(
         self, token: torch.Tensor, pos: torch.Tensor, cache: InklingCache
@@ -831,8 +830,7 @@ class InklingDecoder:
         position ``pos`` (int32 avoids a cast); writes the caches there and returns fp32 logits
         ``(vocab,)`` (a buffer the next step overwrites). Syncs nothing, so ``pos`` is not
         checked: the caller keeps ``0 <= pos < cache.max_len``."""
-        runners = (self.visit, self.msg, self.head, self.gates, self.states)
-        return self.step(runners, token.reshape(1), pos, cache)
+        return self.step(self.token_runners, token.reshape(1), pos, cache)
 
     def decode_block(
         self, tokens: torch.Tensor, pos: torch.Tensor, cache: InklingCache, features=False
@@ -853,24 +851,24 @@ class InklingDecoder:
         tokens = tokens.reshape(-1)
         if tokens.numel() != self.block_tokens:
             raise ValueError(f"need {self.block_tokens} tokens, got {tokens.numel()}")
-        runners = (self.block_visit, self.block_msg, self.block_head, self.block_gates,
-                   self.block_states)  # fmt: skip
+        runners = self.block_runners
         logits = self.step(runners, tokens, pos, cache)
         if not features:
             return logits
         for i, visit in enumerate(FEATURE_VISITS):
-            self.block_features[:, i].copy_(self.block_states[visit])
-        self.block_features[:, -1].copy_(self.block_head.normed)
+            self.block_features[:, i].copy_(runners.states[visit])
+        self.block_features[:, -1].copy_(runners.head.normed)
         return logits, self.block_features
 
-    def step(self, runners, tokens, pos, cache) -> torch.Tensor:
-        """The launches of one step on ``runners`` (visit, message and head runners, message
-        gates, per-visit states)."""
-        visit_runner, msg, head, message_gates, states = runners
+    def step(
+        self, runners: StepRunners, tokens: torch.Tensor, pos: torch.Tensor, cache: InklingCache
+    ) -> torch.Tensor:
+        """The launches of one step of ``tokens`` (as many as ``runners`` take) on
+        ``runners``; the head's logits."""
         config, weights = self.config, self.weights
         positions = device_position(pos)
         embed = EmbedArgs(weights.embed, weights.embed_norm, tokens)
-        h = states[0]
+        h = runners.states[0]
         blocks: list[torch.Tensor] = []
         pre_loop = None  # the prelude's output and blocks, where every core pass restarts
         for visit, layer, p in config.visits():
@@ -882,16 +880,16 @@ class InklingDecoder:
                 elif core == 0:
                     # The finished pass's messages: its core's second block input and output.
                     (block,) = blocks[len(pre_loop[1]) + 1 :]
-                    msg(block, h)
+                    runners.msg(block, h)
                     h, blocks = pre_loop
                 if p > 0:
-                    gates = message_gates.layer(core)
-            out = states[visit + 1]
-            visit_runner(
+                    gates = runners.gates.layer(core)
+            out = runners.states[visit + 1]
+            runners.visit(
                 weights.layers[layer], layer, visit, h, blocks, cache, positions, out, gates,
                 embed if visit == 0 else None,
             )  # fmt: skip
             if layer % config.block_layers == 0:  # h completes a block
                 blocks = blocks + [h]
             h = out
-        return head(blocks, h)
+        return runners.head(blocks, h)
