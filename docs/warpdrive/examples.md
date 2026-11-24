@@ -842,8 +842,15 @@ best logits nearly tie.
 **Speculative decoding.** ``--backend megakernel-spec`` drafts with the checkpoint's DSpark
 drafter (``draft.py``: three launches) and verifies a block of ``k`` = 4 tokens per step on the
 multi-token decoder (``InklingDecoder.decode_block``), accepting on the device, so a CUDA graph
-holds whole steps (``megakernel.spec``); ``--verify-tokens 2`` or ``8`` picks another ``k``. A step is the
-block's 51 model launches and the drafter's three, plus about 15 small torch kernels that accept
+holds whole steps (``megakernel.spec``); ``--verify-tokens 2`` or ``8`` picks another ``k``.
+On DGX Spark, keep the default ``k = 4``: at ``k = 8`` the full-attention input tiles alone
+exceed GB10's 99 KiB per-block shared-memory limit. To try the quantized checkpoint on Spark:
+
+```bash
+python -m attn_gym.warpdrive.examples.megakernel.chat --model thinkingmachines/Inkling-2-Mini --backend megakernel-spec
+```
+
+A step is the block's 51 model launches and the drafter's three, plus about 15 small torch kernels that accept
 on the device (argmax, prefix match) and update the step's state (count, tokens, anchor,
 position). It decodes greedily only, and its replies are the greedy decode in the block's
 rounding, which can resolve a near tie differently from the one-token step. Chat replies on a

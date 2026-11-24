@@ -42,6 +42,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     COMPUTE_WARPS,
     HEAD_DIM,
     ROWS,
+    SMEM_BYTES,
     TILE_K,
 )
 from attn_gym.warpdrive.examples.megakernel.regmath import (
@@ -96,13 +97,14 @@ class DraftCtxKernel(DraftKernel):
         taps: int,
         rms_eps: float,
         stages: int | None = None,
+        smem_bytes: int = SMEM_BYTES,
     ):
         check_draft_sizes(hidden)
         self.hidden, self.layers, self.kv_heads, self.taps = hidden, layers, kv_heads, taps
         self.rms_eps = rms_eps
         self.k_tiles = kv_heads * HEAD_DIM // ROWS  # K row tiles per layer; V tiles follow
         self.layer_tiles = 2 * self.k_tiles
-        self.declare_engine(hidden, 0, stages, reductions=1)
+        self.declare_engine(hidden, 0, stages, reductions=1, smem_bytes=smem_bytes)
 
     @property
     def scratch_shapes(self) -> dict[str, int]:

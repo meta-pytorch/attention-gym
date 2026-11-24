@@ -387,7 +387,7 @@ def test_streamed_inputs_free_the_ring():
     """Streaming admits a batch-64 configuration that resident inputs cannot fit while retaining
     at least eight weight-ring stages; it requires the tcgen05 engine."""
     model = dataclasses.replace(SMALL, hidden_size=5120, num_q_heads=40, num_kv_heads=8)
-    with pytest.raises(ValueError, match="stages must be in"):
+    with pytest.raises(ValueError, match="bytes of shared memory"):
         mk.QwenDecodeMegakernelTc(model=model, batch=64)
     op = mk.QwenDecodeMegakernelTcStream(model=model, batch=64)
     assert op.stages >= 8

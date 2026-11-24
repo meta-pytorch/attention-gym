@@ -39,6 +39,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     MMA_N,
     RED_VALUES,
     ROWS,
+    SMEM_BYTES,
 )
 from attn_gym.warpdrive.examples.megakernel.gemv import gemv_tile, owns_row
 from attn_gym.warpdrive.examples.megakernel.multi_gemv import finish, gemv_bf16
@@ -68,10 +69,17 @@ class InklingMsgKernel(MatrixRowsKernel):
     arguments are the hidden size and the gates' RMSNorm epsilon; ``stages``: weight ring depth
     in 16 KB stages."""
 
-    def __init__(self, hidden: int, rms_eps: float, stages: int | None = None, tokens: int = 1):
+    def __init__(
+        self,
+        hidden: int,
+        rms_eps: float,
+        stages: int | None = None,
+        tokens: int = 1,
+        smem_bytes: int = SMEM_BYTES,
+    ):
         if not 1 <= tokens <= RED_VALUES // 2:
             raise ValueError(f"tokens must be in [1, {RED_VALUES // 2}], got {tokens}")
-        self.init_matrix_rows(hidden, rms_eps, stages, tokens)
+        self.init_matrix_rows(hidden, rms_eps, stages, tokens, smem_bytes)
 
     def get_name(self) -> str:
         tokens = f"_t{self.tokens}" if self.tokens > 1 else ""

@@ -47,7 +47,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
 )
 from attn_gym.warpdrive.examples.megakernel.formats import NVFP4
 
-pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
+pytestmark = pytest.mark.usefixtures(
+    "requires_sm100_or_sm121", "fp32_bf16_matmul_reductions", "release_cuda_memory"
+)
 
 
 def block_inputs(config, tokens: int, blocks: int, seed: int):
@@ -133,12 +135,18 @@ def check_block_visit(
 # edge and past the sliding window; a full MXFP8 block-boundary layer at 8 tokens (two 16-row MMA
 # tiles of query rows, o_proj split in quarters) reading 4 blocks, also past
 # ``log_scaling_floor`` (each token's own log scale).
-CASES = [(4, 1, 1, (0, 60, 1100)), (8, 23, 4, (130, 8990))]
+CASES = [
+    (4, 1, 1, (0, 60, 1100)),
+    (4, 23, 4, (130, 8990)),
+    (8, 23, 4, (130, 8990)),
+]
 
 
 @pytest.mark.parametrize("tokens,layer,blocks,positions", CASES)
 @torch.no_grad()
 def test_block_visit_random_weights(tokens, layer, blocks, positions):
+    if tokens == 8 and torch.cuda.get_device_capability() == (12, 1):
+        pytest.skip("8 tokens' input rows exceed GB10 shared memory on full layers")
     w = random_layer(CONFIG, layer, seed=layer)
     quantized, dense = with_quantized_experts(w, activation_format(layer), seed=10)
     runner = InklingVisitMegakernel(CONFIG, (quantized,), tokens=tokens)

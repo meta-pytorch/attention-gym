@@ -189,7 +189,7 @@ def test_checkpoint_spec_chat_decodes_the_host_loop(checkpoint):
 
 
 @pytest.mark.xdist_group("inkling-checkpoint")
-@pytest.mark.usefixtures("requires_blackwell")
+@pytest.mark.usefixtures("requires_sm100_or_sm121")
 @torch.no_grad()
 def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint):
     """The chat's ``megakernel-spec`` backend (k = 4, CUDA graphs of two steps per replay)

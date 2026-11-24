@@ -20,8 +20,8 @@ from the same kernels as the reply. Backends:
 - ``megakernel`` (default): the step as warpdrive megakernel launches only
   (``megakernel.InklingDecoder``: one per visit, one per core pass's messages, one for the LM
   head), in CUDA graphs, streaming the checkpoint's experts as stored (NVFP4 and MXFP8,
-  ``quant.load_quantized_inkling_weights``: 19 GB of weights). It needs an SM100-family GPU
-  and CuTeDSL; elsewhere use ``torch``;
+  ``quant.load_quantized_inkling_weights``: 19 GB of weights). It needs CuTeDSL and an
+  SM100-family GPU or DGX Spark (SM121); elsewhere use ``torch``;
 - ``megakernel-bf16``: the same launches on the experts' bf16 block values (49 GB), with the
   same tokens bit for bit;
 - ``spec-torch``: greedy speculative decoding with the checkpoint's DSpark drafter
@@ -34,7 +34,8 @@ from the same kernels as the reply. Backends:
   ``megakernel``) and the drafter's launches (``draft.DSparkMegakernel``); its prefill runs the
   verify block over the prompt, so its replies are the greedy decode in the ``k``-token block's
   rounding, which resolves near ties unlike ``megakernel``'s one-token step.
-  ``--verify-tokens`` picks ``k`` among 2, 4 and 8 (``spec.BLOCK_TOKENS``);
+  ``--verify-tokens`` picks ``k`` among 2, 4 and 8 (``spec.BLOCK_TOKENS``). On DGX Spark
+  (SM121), use the default 4; 8 exceeds the per-block shared-memory limit;
   ``megakernel-spec-bf16`` takes bf16 experts.
 
 The other backends load bf16 experts. Every backend computes the experts' numerics the

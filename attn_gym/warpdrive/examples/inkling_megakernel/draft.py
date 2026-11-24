@@ -38,7 +38,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     rope_angles,
 )
 from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM, ROWS, TILE_K
-from attn_gym.warpdrive.examples.megakernel.launch import Launch, table_of
+from attn_gym.warpdrive.examples.megakernel.launch import Launch, device_smem_bytes, table_of
 
 __all__ = ["DSparkMegakernel", "MegakernelDrafter", "rope_table"]
 
@@ -107,11 +107,13 @@ class DSparkMegakernel:
         self.k_norm_ctx = torch.stack([w.k_norm_ctx for w in layers])
         self.rope = rope_table(c, max_len, device)
         self.f_rnn = torch.zeros(c.hidden_size, device=device, dtype=torch.bfloat16)
+        smem_bytes = device_smem_bytes(device)
         ctx = DraftCtxKernel.get_or_build(
             hidden=c.hidden_size,
             layers=c.num_layers,
             kv_heads=c.num_kv_heads,
             taps=self.taps,
+            smem_bytes=smem_bytes,
             rms_eps=c.rms_eps,
         )
         self.ctx = Launch(ctx, draft_table, device, trace)
@@ -136,6 +138,7 @@ class DSparkMegakernel:
             intermediate=c.intermediate_size,
             rms_eps=c.rms_eps,
             local=c.local_layers,
+            smem_bytes=smem_bytes,
             window=c.sliding_window,
             qkv_splits=qkv_splits_for(c.hidden_size),
         )
@@ -148,6 +151,7 @@ class DSparkMegakernel:
             rank=c.markov_rank,
             drafts=self.num_drafts,
             softcap=c.logit_softcap,
+            smem_bytes=smem_bytes,
             slots=-(-vocab // ROWS // sms),
         )
         self.head = Launch(head, draft_table, device, trace)

@@ -26,7 +26,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 from attn_gym.warpdrive.examples.megakernel.formats import MXFP8, NVFP4
 
-pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
+pytestmark = pytest.mark.usefixtures(
+    "requires_sm100_or_sm121", "fp32_bf16_matmul_reductions", "release_cuda_memory"
+)
 
 CONFIG = ref.InklingConfig()
 # The residual differs from the oracle mainly through the flash merge: the oracle rounds the
@@ -227,6 +229,8 @@ def check_activations(runner, config, w, layer, x, experts, weights, message, la
         gated = runner.launch_of(w if launch_w is None else launch_w, layer, True).values("gated")
         gated = gated.view(-1, GATES, config.hidden_size)[:, MLP_GATE]
         x = ref.rms_norm(gated, w.post_norm, config.rms_eps).to(torch.bfloat16)
+        # The routing weights multiplying the activations must use this same gated input.
+        experts, weights = ref.route(config, w, x)
     routed, acts = ref.declared_activations(config, w, x, experts, weights)
     mine = runner.activations()
     errors = ulps(mine, acts)
