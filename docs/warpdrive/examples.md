@@ -898,6 +898,13 @@ python -m attn_gym.warpdrive.examples.qwen_megakernel.chat --backend compile --p
 python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --prompt "Hi" --reasoning-effort low
 ```
 
+Before the first prompt, the chat compiles the backend's kernels that are missing from the
+[compile cache](cache.md) (all of them after a code change) with a progress bar, several in
+parallel worker processes and a single one in the chat's own process, then captures its decode
+step; with a warm cache it starts without a word. Cold, Inkling's `megakernel-spec` (11 kernels)
+took 71 s to its first reply against 307 s compiled one at a time on the first turn, and
+`megakernel` (8 kernels) 24 s against 71 s (GB300, 2026-11-24).
+
 ## Known limits
 
 Both decode variants are OneShot-only. See the [safety contract](guarantees.md) for layer

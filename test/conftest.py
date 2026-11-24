@@ -153,6 +153,29 @@ def traced_compiles(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
+def record_compiles(monkeypatch: pytest.MonkeyPatch) -> Callable[..., set[tuple]]:
+    """``record(*modules)``: a set that, for the rest of the test, collects the calls each module
+    makes to its ``jit_cache`` compile functions as ``(compile_fn, *args)``, the items of the
+    chat backends' ``kernels()``. The modules then name recording wrappers: take a ``kernels()``
+    list to compare with before recording."""
+
+    def record(*modules) -> set[tuple]:
+        calls = set()
+        for module in modules:
+            for name, fn in list(vars(module).items()):
+                if callable(getattr(fn, "is_cached", None)):
+
+                    def recorded(*args, fn=fn):
+                        calls.add((fn, *args))
+                        return fn(*args)
+
+                    monkeypatch.setattr(module, name, recorded)
+        return calls
+
+    return record
+
+
+@pytest.fixture
 def fresh_compile_cache() -> Iterator[None]:
     """Keep independent compile tests from sharing a function's recompilation budget."""
     torch.compiler.reset()

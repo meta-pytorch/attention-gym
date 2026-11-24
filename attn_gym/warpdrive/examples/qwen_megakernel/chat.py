@@ -43,7 +43,9 @@ class Megakernel:
 
     def __init__(self, weights, max_len: int, caches, engine: str):
         self.runner, self.caches = QwenMegakernel(weights, max_len, engine=engine), caches
-        self.runner(weights, 0, 1, *caches)  # compile
+
+    def kernels(self) -> list[tuple]:
+        return self.runner.kernels()
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         self.runner.step_info[0].copy_(token[0])
@@ -62,8 +64,10 @@ class Compiled:
         self.packed = prepare_fast_weights(weights, max_len)
         layers = weights.config.num_layers
         self.views = [tuple(c[layer][None] for layer in range(layers)) for c in caches]
-        self.fn = torch.compile(decode_step_fast_batch)
-        self.step(torch.zeros(1, device="cuda", dtype=torch.long), torch.ones(1, device="cuda"))
+        self.fn = torch.compile(decode_step_fast_batch)  # compiles in the chat's warm-up
+
+    def kernels(self) -> list[tuple]:
+        return []
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         return self.fn(self.packed, token, pos.long(), *self.views)[0]

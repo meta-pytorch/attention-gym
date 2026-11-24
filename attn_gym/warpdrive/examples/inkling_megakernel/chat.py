@@ -99,6 +99,10 @@ class Backend:
         """The backend for the chat's ``options``."""
         return cls(weights, cache, checkpoint)
 
+    def kernels(self) -> list[tuple]:
+        """``chat.DecodeBackend.kernels``: none outside the megakernel backends."""
+        return []
+
     def prefill(self, ids: list[int], start: int) -> torch.Tensor:
         """Feed ``ids`` at positions ``start ..`` into the caches with one oracle forward pass
         (``quant.forward_tokens``); the last token's logits."""
@@ -146,6 +150,9 @@ class Megakernel(Backend):
 
         super().__init__(weights, cache, checkpoint)
         self.decoder = InklingDecoder(weights)
+
+    def kernels(self) -> list[tuple]:
+        return self.decoder.kernels()
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         return self.decoder(token, pos, self.cache)
@@ -264,6 +271,9 @@ class MegakernelSpec(Speculative):
         self.target = DecoderTargetBlock(decoder, cache)
         self.drafter = DSparkMegakernel(draft, self.drafter_max_len(cache, draft), k - 1)
         self.spec = SpecStep(self.target, self.drafter)
+
+    def kernels(self) -> list[tuple]:
+        return self.target.decoder.kernels(block=True) + self.drafter.kernels()
 
     def prefill(self, ids: list[int], start: int) -> torch.Tensor:
         """``examples.megakernel.spec.prefill_blocks`` of ``ids`` at ``start ..``: the last

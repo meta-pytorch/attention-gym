@@ -823,6 +823,24 @@ class InklingDecoder:
             self.block_runners = runners(block_tokens, gates.for_tokens(block_tokens), args)
             self.block_features = zeros(block_tokens, len(FEATURE_VISITS) + 1, hidden)
 
+    def kernels(self, block: bool = False) -> list[tuple]:
+        """The compile calls ``(compile_fn, kernel)`` of the launches of ``__call__`` or, with
+        ``block``, of ``decode_block`` (``attn_gym.warpdrive.cache.precompile_calls``' items):
+        the visit kinds ``step`` launches, the messages between core passes, the head."""
+        if block and self.block_tokens is None:
+            raise ValueError("this decoder was built without block_tokens")
+        runners = self.block_runners if block else self.token_runners
+        config, layers = self.config, self.weights.layers
+        # Core passes after the first read message gates (``step``).
+        visits = dict.fromkeys(
+            runners.visit.launch_of(layers[layer], layer, config.is_loop(layer) and p > 0).op
+            for _, layer, p in config.visits()
+        )
+        calls = [(compile_visit_kernel, op) for op in visits]
+        if config.num_passes > 1:
+            calls.append((compile_msg_kernel, runners.msg.launch.op))
+        return calls + [(compile_head_kernel, runners.head.launch.op)]
+
     def __call__(
         self, token: torch.Tensor, pos: torch.Tensor, cache: InklingCache
     ) -> torch.Tensor:

@@ -841,7 +841,7 @@ def test_fresh_compile_driver_forks_parallel_workers(tmp_path, monkeypatch):
 
     compile_test_variant.cache_clear()
     benchmark_order.clear()
-    monkeypatch.setattr(cute_compile.subprocess, "run", unexpected_driver)
+    monkeypatch.setattr(cute_compile.subprocess, "Popen", unexpected_driver)
     assert (
         tune(
             configs + (shared,),

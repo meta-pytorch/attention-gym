@@ -12,6 +12,10 @@ The checkpoint's ``config.json`` selects the model family (``FAMILIES``): Qwen3 
 caches) and a ``DecodeBackend`` that decodes one token per step, or a ``MultiTokenBackend`` that
 commits a variable number of tokens per step (speculative decoding).
 
+Before the first prompt, the chat compiles the backend's kernels that are not in the compile
+cache (``kernels()``; after a code change, all of them), several in parallel worker processes,
+then warms up and captures its decode step, so the first turn starts decoding at once.
+
 Each turn prefills the new prompt tokens, then decodes. A backend whose step is CUDA-graph
 capturable decodes inside one graph of steps feeding up to SYNC_EVERY positions per replay,
 sampling on the device; the host reads the tokens (and each step's count) once per replay and
@@ -23,6 +27,7 @@ earlier turn differently, the caches are rebuilt from the start.
 import importlib
 import json
 import math
+import os
 import time
 from dataclasses import dataclass, fields
 from functools import partial
@@ -35,12 +40,16 @@ from rich.console import Console
 from rich.progress import (
     BarColumn,
     DownloadColumn,
+    MofNCompleteColumn,
     Progress,
     TextColumn,
+    TimeElapsedColumn,
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
 from rich.text import Text
+
+from attn_gym.warpdrive.cache import CacheStorageError, get_cache_path, precompile_calls
 
 SYNC_EVERY = 8  # positions a replay may feed between host reads of the sampled tokens
 
@@ -54,6 +63,10 @@ FAMILIES = {
     "qwen3_moe": "attn_gym.warpdrive.examples.qwen_megakernel.chat",
     "inkling2_loop": "attn_gym.warpdrive.examples.inkling_megakernel.chat",
 }
+SUPPORTED_MODELS = (
+    "Qwen3 dense and MoE (e.g. Qwen/Qwen3-0.6B, Qwen/Qwen3-30B-A3B) or Inkling 2 Mini "
+    "(thinkingmachines/Inkling-2-Mini), as a Hub repo or a local checkpoint directory"
+)
 
 app = typer.Typer(add_completion=False, help=__doc__.splitlines()[0])
 console = Console()
@@ -66,6 +79,10 @@ class DecodeBackend(Protocol):
     CUDA graph."""
 
     capturable: bool
+
+    def kernels(self) -> list[tuple]:
+        """The ``jit_cache`` compile calls ``(compile_fn, *args)`` its steps and prefill launch
+        (``attn_gym.warpdrive.cache.precompile_calls``' items); empty without CuTeDSL kernels."""
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor: ...
 
@@ -82,6 +99,9 @@ class MultiTokenBackend(Protocol):
 
     capturable: bool
     tokens_per_step: int
+
+    def kernels(self) -> list[tuple]:
+        """As ``DecodeBackend.kernels``."""
 
     def decode(self, token: torch.Tensor, pos: torch.Tensor, out: torch.Tensor) -> None: ...
 
@@ -167,7 +187,14 @@ def download(model: str, checkpoint_dir) -> Path:
 
 def family_module(model: str):
     """The family module of a Hub repo or checkpoint directory, read from its ``config.json``
-    (fetched alone, before any weights)."""
+    (fetched alone, before any weights). A repo or directory without a readable one, and an
+    unsupported ``model_type``, raise ``typer.BadParameter`` naming the supported models."""
+
+    def unsupported(reason: str) -> typer.BadParameter:
+        return typer.BadParameter(
+            f"{reason}. Supported: {SUPPORTED_MODELS}.", param_hint="--model"
+        )
+
     path = Path(model)
     if path.is_file():
         path = path.parent
@@ -175,14 +202,37 @@ def family_module(model: str):
         config = path / "config.json"
     else:
         from huggingface_hub import hf_hub_download
-
-        config = Path(hf_hub_download(model, "config.json"))
-    model_type = json.loads(config.read_text()).get("model_type")
-    if model_type not in FAMILIES:
-        raise typer.BadParameter(
-            f"unsupported model_type {model_type!r}; known: {sorted(FAMILIES)}"
+        from huggingface_hub.errors import (
+            EntryNotFoundError,
+            GatedRepoError,
+            HFValidationError,
+            RemoteEntryNotFoundError,
+            RepositoryNotFoundError,
         )
-    return importlib.import_module(FAMILIES[model_type])
+
+        try:
+            config = Path(hf_hub_download(model, "config.json"))
+        except (RepositoryNotFoundError, RemoteEntryNotFoundError, HFValidationError) as error:
+            if isinstance(error, GatedRepoError):  # exists: keep the Hub's access instructions
+                raise unsupported(f"could not fetch {model!r}'s config.json: {error}") from error
+            reason = (
+                f"{model!r} is neither a checkpoint directory nor a Hub repo with a config.json"
+            )
+            raise unsupported(f"{reason} ({type(error).__name__})") from error
+        except (OSError, EntryNotFoundError) as error:  # offline, network, auth
+            raise unsupported(f"could not fetch {model!r}'s config.json: {error}") from error
+    try:
+        loaded = json.loads(config.read_text())
+    except (OSError, ValueError) as error:
+        raise unsupported(f"{model!r} has no readable config.json ({error})") from error
+    match loaded:
+        case {"model_type": str(model_type)} if model_type in FAMILIES:
+            return importlib.import_module(FAMILIES[model_type])
+        case {"model_type": str(model_type)}:
+            known = sorted(FAMILIES)
+            raise unsupported(f"unsupported model_type {model_type!r} (known: {known})")
+        case _:
+            raise unsupported(f"{model!r}'s config.json names no model_type")
 
 
 def check_options(family, options: ChatOptions):
@@ -212,6 +262,8 @@ class Chat:
     """A conversation whose caches hold every token fed so far (positions 0 .. len - 1)."""
 
     def __init__(self, model: ChatModel):
+        if model.max_len <= SYNC_EVERY:  # a warm-up run writes positions 1 .. SYNC_EVERY
+            raise CacheFull(f"max_len = {model.max_len} cannot hold a decode run from position 0")
         self.model = model
         self.messages: list[dict] = []
         self.cached: list[int] = []  # token ids whose cache entries are written
@@ -367,6 +419,62 @@ def stats_line(tokens: int, seconds: float, prompt_tokens: int, prefill_s: float
     return line
 
 
+def compile_kernels(calls: list[tuple]):
+    """Compile those of ``calls`` (``DecodeBackend.kernels``) missing from the disk cache,
+    drawing their progress; says nothing when all are cached. Several compile in parallel worker
+    processes (``precompile_calls``). A single one, and those the disk cache cannot hold
+    (``CUTE_DSL_NO_CACHE``, a cache directory it cannot lock or write), compile here one at a
+    time, as their first launch would."""
+    disk = all(fn.disk_cache_enabled() for fn, *_ in calls)
+    cold = [(fn, *args) for fn, *args in calls if not (disk and fn.is_cached(*args))]
+    if not cold:
+        return
+    cache = str(get_cache_path()).replace(str(Path.home()), "~", 1)
+    note = f"first run after a code change; cached in {cache} afterwards"
+    progress = Progress(
+        TextColumn("compiling kernels"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TextColumn(f"[dim]({note if disk else 'the disk cache is off'})"),
+        console=console,
+        transient=True,
+    )
+    start = time.perf_counter()
+    with progress:
+        task = progress.add_task("", total=len(cold))
+
+        def compile_here(calls: list[tuple]):
+            for fn, *args in calls:
+                fn(*args)  # the launch's own lookup, which compiles without a usable disk cache
+                progress.advance(task)
+
+        if not disk or len(cold) == 1:  # one kernel: skip the compiler process's startup
+            compile_here(cold)
+        else:
+            try:
+                precompile_calls(
+                    cold,
+                    workers=min(len(cold), os.cpu_count() or 1),
+                    progress=lambda done, _: progress.update(task, completed=done),
+                )
+            except CacheStorageError as error:
+                console.print(Text(f"{error}\ncompiling the rest in this process", "yellow"))
+                compile_here([(fn, *args) for fn, *args in cold if not fn.is_cached(*args)])
+    kernels = f"{len(cold)} kernel" + "s" * (len(cold) > 1)
+    where = f" ({cache})" if disk else ""
+    console.print(f"[dim]compiled {kernels} in {time.perf_counter() - start:.0f} s{where}[/]")
+
+
+def prepare(chat: Chat, temperature: float):
+    """Everything the first turn would otherwise wait for: the backend's cold kernels, then the
+    decode warm-up and CUDA-graph capture at ``temperature`` (``Chat.decoder``)."""
+    compile_kernels(chat.model.backend.kernels())
+    with console.status("warming up the decode step"):
+        chat.decoder(temperature)
+        torch.cuda.synchronize()
+
+
 def run_turn(chat: Chat, prompt: str, max_new_tokens: int | None, temperature: float):
     """Stream the reply as plain text (appended, so replies taller than the terminal keep
     scrolling), then its stats."""
@@ -391,7 +499,7 @@ def run_turn(chat: Chat, prompt: str, max_new_tokens: int | None, temperature: f
 
 @app.command()
 def main(
-    model: str = typer.Option("Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory"),
+    model: str = typer.Option("Qwen/Qwen3-0.6B", help=f"the model: {SUPPORTED_MODELS}"),
     backend: str | None = typer.Option(
         None,
         help="decode backend of the model's family (an unknown name lists them). Default: the "
@@ -438,10 +546,11 @@ def main(
     check_options(family, options)
     # Before the spinner (it garbles bars); the backend chooses the checkpoint files.
     checkpoint = download(model, partial(family.checkpoint_dir, options=options))
-    with console.status(f"loading {model} and preparing the {backend} backend"):
+    with console.status(f"loading {model} for the {backend} backend"):
         chat_model = family.load_chat_model(checkpoint, options)
         torch.cuda.synchronize()
     chat = Chat(chat_model)
+    prepare(chat, temperature)
     if prompt is not None:
         run_turn(chat, prompt, max_new_tokens, temperature)
         return

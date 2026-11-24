@@ -17,13 +17,14 @@ import pytest
 
 from attn_gym.warpdrive.cache import _key as cute_key
 from attn_gym.warpdrive.cache import compile as cute_compile
-from attn_gym.warpdrive.cache import compile_many, compile_tvm_ffi
+from attn_gym.warpdrive.cache import compile_many, compile_tvm_ffi, precompile_calls
 from attn_gym.warpdrive.cache import jit as cute_cache
 from attn_gym.warpdrive.cache import target as cute_target
 
 _DRIVER_LOG_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_LOG"
 _DRIVER_READY_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_READY"
 _DRIVER_EXPECTED_ENV = "ATTN_GYM_TEST_CUTE_DRIVER_EXPECTED"
+_HANG_ENV = "ATTN_GYM_TEST_CUTE_HANG"
 
 
 class CompileConfig(NamedTuple):
@@ -76,6 +77,47 @@ def compile_test_variant(config: CompileConfig) -> FakeCompiled:
                 f"{os.getpid()},{os.getppid()},{config.variant},{os.getenv('CUTE_DSL_ARCH', '')}\n"
             )
     return FakeCompiled(config.variant)
+
+
+@cute_cache.jit_cache
+def compile_other_variant(config: CompileConfig) -> FakeCompiled:
+    """A second importable fake compiler, for batches that mix compile functions."""
+    return compile_test_variant.__wrapped__(config._replace(variant=f"other-{config.variant}"))
+
+
+@cute_cache.jit_cache(lock_timeout=1.0)
+def compile_hanging_variant(config: CompileConfig) -> FakeCompiled:
+    """With ``_HANG_ENV`` naming a directory, adds a file named by its pid there and never
+    returns, holding its entry's lock; else compiles at once."""
+    if hang := os.getenv(_HANG_ENV):
+        (Path(hang) / str(os.getpid())).touch()
+        while True:
+            time.sleep(1)
+    return FakeCompiled(config.variant)
+
+
+@cute_cache.jit_cache
+def compile_broken_variant(config: CompileConfig) -> FakeCompiled:
+    raise ValueError(f"cannot compile {config.variant}")
+
+
+def wait_until(condition, timeout: float = 60.0):
+    """``condition()``'s first true value, polled until ``timeout`` seconds pass."""
+    deadline = time.monotonic() + timeout
+    while not (value := condition()):
+        if time.monotonic() >= deadline:
+            raise AssertionError(f"{condition} still false after {timeout} s")
+        time.sleep(0.05)
+    return value
+
+
+def alive(pid: int) -> bool:
+    """Whether process ``pid`` runs (a zombie has exited)."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except FileNotFoundError:
+        return False
+    return stat.rpartition(")")[2].split()[0] != "Z"
 
 
 def wait_for_processes(processes, timeout: float = 15.0) -> None:
@@ -648,9 +690,124 @@ def test_compile_many_forks_parallel_workers_once_per_cold_variant(tmp_path, mon
         raise AssertionError("a fully warm batch started a compiler process")
 
     compile_test_variant.cache_clear()
-    monkeypatch.setattr(cute_compile.subprocess, "run", unexpected_driver)
+    monkeypatch.setattr(cute_compile.subprocess, "Popen", unexpected_driver)
     compiled = compile_many(compile_test_variant, calls, workers=len(configs), target=target)
     assert [fn() for fn in compiled] == [config.variant for config in configs]
+
+
+@pytest.fixture
+def driver_cache(tmp_path, monkeypatch) -> cute_target.CompileTarget:
+    """An empty disk cache for compiler processes to fill; the target (sm_100a) they compile
+    for."""
+    pytest.importorskip("cutlass")
+    pytest.importorskip("tvm_ffi")
+    monkeypatch.setattr(cute_cache, "_cache_path", None)  # restored after the test
+    cute_cache.set_cache_path(tmp_path / "cache")
+    monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
+    return cute_target.CompileTarget(
+        device_type="cuda", capability=(10, 0), name="test-gpu", sm_count=100
+    )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork is required")
+def test_precompile_calls_mixes_compile_functions_in_one_driver(
+    tmp_path, monkeypatch, driver_cache
+):
+    """Calls to two compile functions compile concurrently in one driver's workers; progress
+    counts the cold calls up to all of them, and a warm batch reports nothing."""
+    log_path = tmp_path / "compiles.log"
+    monkeypatch.setenv(_DRIVER_LOG_ENV, str(log_path))
+    monkeypatch.setenv(_DRIVER_READY_ENV, str(tmp_path / "ready"))
+    monkeypatch.setenv(_DRIVER_EXPECTED_ENV, "2")
+    config = CompileConfig("a", 1.0)
+    calls = [(compile_test_variant, config), (compile_other_variant, config)]
+    reports = []
+
+    precompile_calls(calls, workers=2, target=driver_cache, progress=lambda *r: reports.append(r))
+
+    records = [line.split(",") for line in log_path.read_text().splitlines()]
+    assert sorted(record[2] for record in records) == ["a", "other-a"]
+    assert len({record[1] for record in records}) == 1, "one driver"
+    assert reports == sorted(reports) and reports[-1] == (2, 2)
+    assert all(fn.is_cached(*args) for fn, *args in calls)
+    reports.clear()
+    precompile_calls(calls, target=driver_cache, progress=lambda *r: reports.append(r))
+    assert reports == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork is required")
+def test_precompile_calls_compiles_a_single_call_for_the_requested_target(
+    tmp_path, monkeypatch, driver_cache
+):
+    """One cold call compiles in a compiler process too, for the batch's target, not the
+    caller's CuTeDSL architecture, so it lands under the target's key."""
+    log_path = tmp_path / "compiles.log"
+    monkeypatch.setenv(_DRIVER_LOG_ENV, str(log_path))
+    monkeypatch.setenv("CUTE_DSL_ARCH", "sm_90a")
+    config = CompileConfig("single", 1.0)
+    precompile_calls([(compile_test_variant, config)], target=driver_cache)
+    ((pid, _, variant, arch),) = (line.split(",") for line in log_path.read_text().splitlines())
+    assert (variant, arch) == ("single", "sm_100a") and int(pid) != os.getpid()
+    assert compile_test_variant.is_cached(config)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded.*:DeprecationWarning")
+@pytest.mark.parametrize("stop", ["timeout", "interrupt", "caller killed"])
+def test_a_stopped_batch_leaves_no_worker_or_lock(tmp_path, monkeypatch, driver_cache, stop):
+    """A batch stopped while its worker compiles, by its timeout, Ctrl-C between progress
+    reports or its caller's death, kills the worker, which frees the entry's lock."""
+    hang = tmp_path / "hang"
+    hang.mkdir()
+    monkeypatch.setenv(_HANG_ENV, str(hang))
+    config = CompileConfig("hang", 1.0)
+    calls = [(compile_hanging_variant, config)]
+    started = lambda: [int(path.name) for path in hang.iterdir()]
+
+    def progress(done, total):
+        wait_until(started)  # the worker holds the entry's lock
+        if stop == "interrupt":
+            raise KeyboardInterrupt
+
+    if stop == "caller killed":
+        caller = multiprocessing.get_context("fork").Process(
+            target=precompile_calls, args=(calls,), kwargs={"target": driver_cache}
+        )
+        caller.start()
+        wait_until(started)
+        caller.kill()
+        caller.join()
+    else:
+        error = KeyboardInterrupt if stop == "interrupt" else RuntimeError
+        with pytest.raises(error, match=None if stop == "interrupt" else "timed out"):
+            precompile_calls(calls, target=driver_cache, timeout=0.1, progress=progress)
+    (worker,) = started()
+    wait_until(lambda: not alive(worker), timeout=10)
+
+    monkeypatch.delenv(_HANG_ENV)
+    cute_target.set_compile_target(driver_cache)
+    compile_hanging_variant.precompile(config)  # CacheLockError if a worker still held the lock
+    assert compile_hanging_variant.is_cached(config)
+
+
+CONFIGS = [CompileConfig("x", 1.0), CompileConfig("y", 1.0)]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork is required")
+def test_a_batch_the_disk_cache_cannot_hold_raises_a_storage_error(tmp_path, driver_cache):
+    """Calls that cannot lock or write their entries (the cache directory is a file) raise
+    ``CacheStorageError``, which callers recover from by compiling without the cache."""
+    (tmp_path / "file").touch()
+    cute_cache.set_cache_path(tmp_path / "file")
+    with pytest.raises(cute_cache.CacheStorageError, match="could not open cache lock"):
+        precompile_calls([(compile_test_variant, c) for c in CONFIGS], target=driver_cache)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="fork is required")
+def test_a_batch_that_fails_to_compile_raises_the_compiler_error(driver_cache):
+    with pytest.raises(RuntimeError, match="cannot compile x") as raised:
+        precompile_calls([(compile_broken_variant, c) for c in CONFIGS], target=driver_cache)
+    assert not isinstance(raised.value, cute_cache.CacheStorageError)
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="fcntl.flock and fork are required")
