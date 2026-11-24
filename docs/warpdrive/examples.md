@@ -835,12 +835,19 @@ CTAs resident at once, so visit launches are cooperative: one CTA per SM, admitt
 whole grid fits (otherwise the launch fails, e.g. under MPS or green-context SM limits). Callers
 keep ``0 <= pos < max_len``; positions are read on the device.
 
+``--backend spec-torch`` runs the same greedy speculative step on the torch decode step
+(``fast.py``'s kernels) and the torch drafter, ``--verify-tokens`` 2 to 8 (default 4). It is a
+reference for the megakernel backends, not a fast path: the eager activation quantizers make
+the torch step launch-bound, so at ``k`` = 4 it decodes at 26-30 tok/s against 17 tok/s for
+``--backend torch`` (GB300, low effort, 128 tokens, two prompts, 2026-11-24).
+
 ## Shared megakernel package
 
 `examples/megakernel/` holds what the decode megakernels share: the tile geometry, the epoch-tagged
 words that carry activations between CTAs, register helpers, the CUDA-core GEMV engine and its
-NVFP4/MXFP8 expert decode, the weight ring's TMA loads, the instruction table and the chat driver.
-A model directory keeps its oracle, kernels, runners, bench and chat family module. Its
+NVFP4/MXFP8 expert decode, the weight ring's TMA loads, the instruction table, the speculative step
+and the chat driver. A model directory keeps its oracle, kernels, runners, bench and chat family
+module. Its
 [`AGENTS.md`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/megakernel/AGENTS.md)
 states what belongs in the package and the rules its kernels follow (residency, K/V store ordering,
 compile-key boundaries); the `adding-megakernel-model` skill

@@ -16,7 +16,7 @@ MODULES = [path for model in MODELS for path in sorted(model.glob("*.py"))]
 # Modules that define compiled kernels.
 KERNELS = [path for path in MODULES if "@jit_cache" in path.read_text()]
 DRIVER = PACKAGE / "chat.py"  # names every family's chat module (``FAMILIES``)
-HOST = {DRIVER, PACKAGE / "launch.py"}  # the package's host-only modules
+HOST = {DRIVER, PACKAGE / "launch.py", PACKAGE / "spec.py"}  # the package's host-only modules
 # Modules each kernel's key must hash: a computed import would drop them silently.
 REQUIRED = {
     "qwen_megakernel/core.py": {

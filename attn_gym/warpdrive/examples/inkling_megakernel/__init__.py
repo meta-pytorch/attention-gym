@@ -13,6 +13,9 @@ the shared megakernel package (``examples.megakernel``). Modules:
   expert GEMV decode (``examples.megakernel.formats``, ``examples.megakernel.quant_gemv``), their
   exact bf16 block values and dequantization, and the oracle on such a model;
 - ``megakernel``: the host side: the whole decode step as launches (``InklingDecoder``);
+- ``dspark``: the checkpoint's DSpark drafter and greedy speculative decoding over the
+  oracle; ``spec``: the targets of the package's capturable speculative step
+  (``examples.megakernel.spec``);
 - ``bench``: CUDA-graph timings of each launch kind and of the decode step;
 - ``chat``: the model in the megakernel chat (``attn_gym.warpdrive.examples.megakernel.chat``).
 """

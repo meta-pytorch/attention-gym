@@ -62,6 +62,11 @@ Climb in order; each rung is tested against the previous ones before the next st
 6. **Bench.** `<model>/bench.py` on `examples/bench_support.py` (`capture`, `time_graphs`,
    `provenance`): CUDA-graph replay of the torch step and the megakernel at fixed contexts.
    Record the bandwidth floor next to the measurement.
+7. **Speculative decoding** (when the checkpoint ships a drafter). Implement
+   `megakernel.spec`'s `TargetBlock` and `DraftModel` for the model and run `SpecStep` as a chat
+   `MultiTokenBackend`. Gates: the drafter against its reference implementation; the step,
+   eager and replayed from a CUDA graph, equal to a host loop over the same verify forward and
+   drafter; acceptance rates measured on varied prompts before claiming a speedup.
 
 ## Moving code into the package
 
