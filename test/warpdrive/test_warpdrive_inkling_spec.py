@@ -1,8 +1,9 @@
 """Inkling 2 Mini's device-side speculative step (``examples.megakernel.spec.SpecStep``) and its
-chat backend: the random tiny target and drafter check that the step, eager and replayed from a
+chat backends: the random tiny target and drafter check that the step, eager and replayed from a
 CUDA graph, decodes what ``dspark.speculative_generate``'s host loop decodes with the same
-components; the checkpoint test (skipped unless cached) runs the chat's ``spec-torch`` backend.
-``test_warpdrive_megakernel_spec`` tests the step's acceptance on scripted components.
+components; the checkpoint tests (skipped unless cached) run the chat's ``spec-torch`` and
+``megakernel-spec`` backends against the host loop. ``test_warpdrive_megakernel_spec`` tests the
+step's acceptance on scripted components.
 """
 
 from pathlib import Path
@@ -21,7 +22,12 @@ from test_warpdrive_inkling_dspark import (  # noqa: F401
 )
 from test_warpdrive_megakernel_spec import step_runner
 
-from attn_gym.warpdrive.examples.inkling_megakernel.chat import SPEC_TOKENS, SpecTorch
+from attn_gym.warpdrive.examples.inkling_megakernel import quant
+from attn_gym.warpdrive.examples.inkling_megakernel.chat import (
+    SPEC_TOKENS,
+    MegakernelSpec,
+    SpecTorch,
+)
 from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     DSparkDrafter,
     load_dspark_weights,
@@ -30,9 +36,13 @@ from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     target_forward,
 )
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import InklingCache, load_inkling_weights
-from attn_gym.warpdrive.examples.inkling_megakernel.spec import TorchTargetBlock, block_forward
+from attn_gym.warpdrive.examples.inkling_megakernel.spec import (
+    DecoderTargetBlock,
+    TorchTargetBlock,
+    block_forward,
+)
 from attn_gym.warpdrive.examples.megakernel.chat import SYNC_EVERY, Chat
-from attn_gym.warpdrive.examples.megakernel.spec import SpecStep
+from attn_gym.warpdrive.examples.megakernel.spec import SpecStep, prefill_blocks
 
 pytestmark = [
     pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA"),
@@ -171,5 +181,57 @@ def test_checkpoint_spec_chat_decodes_the_host_loop(checkpoint):
     prompt = torch.tensor(ids, device="cuda")
     max_new = max_len - len(ids) - (tokens - 1)  # the same target cache length
     expected = speculative_generate(target, drafter, prompt, max_new, stops, verify=verify)
+    assert reply == reply_of(expected.tokens, stops, max_len - len(ids) - SYNC_EVERY - 1)
+    assert expected.tokens_per_step > 1.6, expected.accepted
+
+
+@pytest.mark.xdist_group("inkling-checkpoint")
+@pytest.mark.usefixtures("requires_blackwell")
+@torch.no_grad()
+def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint):
+    """The chat's ``megakernel-spec`` backend (k = 4, CUDA graphs of two steps per replay)
+    replies with ``speculative_generate``'s tokens for the same prefill (``prefill_blocks``),
+    verify block (``InklingDecoder.decode_block``) and draft launches, run eagerly, cut as
+    ``reply_of``; its block rows are causal (the prefill's padding moves no earlier row) and
+    the drafter is accepted."""
+    pytest.importorskip("cutlass")
+    from attn_gym.warpdrive.examples.inkling_megakernel.draft import MegakernelDrafter
+    from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingDecoder
+
+    path, ids, stops = checkpoint
+    target = quant.load_quantized_inkling_weights(path)
+    max_len = -(-(len(ids) + 96) // 64) * 64
+    backend = MegakernelSpec(target, InklingCache.empty(target.config, max_len), path)
+    tokens = backend.tokens_per_step
+    chat = Chat(StubChatModel(backend, ids, stops, max_len))
+    chat.reply("", None, 0.0, lambda *_: None)
+    reply = chat.messages[-1]["ids"]
+
+    decoder = InklingDecoder(target, block_tokens=tokens)
+    draft = backend.drafter.weights
+    drafter = MegakernelDrafter(draft, backend.drafter.max_len, tokens - 1)
+
+    def verify(block, pos, cache):
+        return decoder.decode_block(block, torch.tensor([pos], device="cuda"), cache, True)
+
+    def prefill(prompt, length):
+        assert length == max_len
+        cache = InklingCache.empty(target.config, length)
+        block = DecoderTargetBlock(decoder, cache)
+        # Causal block rows: the last token's row and features ignore the tokens after it.
+        first = torch.tensor([0], device="cuda")
+        logits, features = (t.clone() for t in block(prompt[:tokens], first))
+        other = prompt[:tokens].clone()
+        other[-1] += 1
+        changed, changed_features = block(other, first)
+        assert torch.equal(changed[:-1], logits[:-1])
+        assert torch.equal(changed_features[:-1], features[:-1])
+        return cache, prefill_blocks(block, drafter.kernels, prompt, 0)
+
+    prompt = torch.tensor(ids, device="cuda")
+    max_new = max_len - len(ids) - (tokens - 1)  # the same target cache length
+    expected = speculative_generate(
+        target, drafter, prompt, max_new, stops, verify=verify, prefill=prefill
+    )
     assert reply == reply_of(expected.tokens, stops, max_len - len(ids) - SYNC_EVERY - 1)
     assert expected.tokens_per_step > 1.6, expected.accepted

@@ -214,6 +214,67 @@ def fold_markov_head(
     return weight, bias
 
 
+def random_weights(
+    config: DSparkConfig, vocab: int, padded_vocab: int, seed: int = 0
+) -> DSparkWeights:
+    """Random drafter weights on the GPU (seeded on the CPU, so the same on every device), the
+    target's shared embedding (``padded_vocab`` rows) and LM head (``vocab`` rows) included."""
+    generator = torch.Generator().manual_seed(seed)
+    h, d = config.hidden_size, config.head_dim
+
+    def matrix(rows, cols):
+        return (torch.randn(rows, cols, generator=generator) * cols**-0.5).cuda().bfloat16()
+
+    def norm(dim):
+        return (1 + 0.2 * torch.randn(dim, generator=generator)).cuda().bfloat16()
+
+    def vector(dim, scale=1.0):
+        return (scale * torch.randn(dim, generator=generator)).cuda()
+
+    q_dim, kv_dim = config.num_q_heads * d, config.num_kv_heads * d
+    layers = tuple(
+        DSparkLayerWeights(
+            input_norm=norm(h),
+            post_norm=norm(h),
+            dflare_norm=norm(h),
+            wq=matrix(q_dim, h),
+            wk=matrix(kv_dim, h),
+            wv=matrix(kv_dim, h),
+            wk_ctx=matrix(kv_dim, h),
+            wv_ctx=matrix(kv_dim, h),
+            wo=matrix(h, q_dim),
+            q_norm=norm(d),
+            k_norm=norm(d),
+            k_norm_ctx=norm(d),
+            w_gate=matrix(config.intermediate_size, h),
+            w_up=matrix(config.intermediate_size, h),
+            w_down=matrix(h, config.intermediate_size),
+        )
+        for _ in range(config.num_layers)
+    )
+    rank = config.markov_rank
+    lm_head = matrix(vocab, h)
+    fold_weight, fold_bias = fold_markov_head(lm_head, matrix(h, rank), vector(h, 0.1).bfloat16())
+    taps = len(config.target_visits)
+    fuse = torch.randn(config.num_layers + 1, taps, generator=generator).softmax(-1)
+    return DSparkWeights(
+        layers=layers,
+        norm=norm(h),
+        mask_embed=vector(h).bfloat16(),
+        fuse_alpha=fuse.bfloat16().float().cuda(),
+        markov_norm=norm(h),
+        markov_w1=torch.randn(padded_vocab, rank, generator=generator).cuda().bfloat16(),
+        rnn_proj=matrix(3 * rank, 2 * rank + 2 * h),
+        rnn_bias=vector(3 * rank, 0.1),
+        fold_weight=fold_weight,
+        fold_bias=fold_bias,
+        embed=vector(padded_vocab * h).bfloat16().view(padded_vocab, h),
+        embed_norm=norm(h),
+        lm_head=lm_head,
+        config=config,
+    )
+
+
 def load_dspark_weights(
     target: InklingWeights,
     path_or_repo: str | Path = "thinkingmachines/Inkling-2-Mini",
@@ -521,6 +582,9 @@ def target_forward(
 # The target's forward of tokens at host position pos into a cache: fp32 (tokens, vocab) logits
 # and bf16 (tokens, taps, hidden) drafter features (``target_forward``'s).
 Verify = Callable[[torch.Tensor, int, InklingCache], tuple[torch.Tensor, torch.Tensor]]
+# The prompt's prefill into a fresh target cache of at least max_len positions, committing the
+# drafter's context: (cache, the last token's fp32 logits).
+Prefill = Callable[[torch.Tensor, int], tuple[InklingCache, torch.Tensor]]
 
 
 @dataclass
@@ -558,6 +622,7 @@ def speculative_generate(
     verify_chunk: int | None = None,
     kernels: Kernels | None = None,
     verify: Verify | None = None,
+    prefill: Prefill | None = None,
 ) -> SpecResult:
     """Greedy decode of up to ``max_new`` tokens after ``prompt`` (ending at a token of
     ``stops``), verifying each of ``drafter``'s proposals with target forwards of
@@ -570,7 +635,8 @@ def speculative_generate(
     decode bit for bit; a block forward rounds differently (as HF's does) and may resolve a
     near tie the other way, after which the two decodes diverge. ``kernels``: the target's, as
     ``ref.forward_tokens``'. ``verify``: the verify forward (default: ``target_forward`` of
-    ``visits`` with ``kernels``); the prompt's prefill is always ``target_forward``'s."""
+    ``visits`` with ``kernels``); ``prefill``: the prompt's (default: ``target_forward``'s
+    into a cache of ``spec_max_len`` positions, its features committed to ``drafter``)."""
     if max_new < 1 or (verify_chunk is not None and verify_chunk < 1):
         raise ValueError(f"need max_new >= 1 and verify_chunk >= 1, got {max_new}, {verify_chunk}")
     stops, visits = set(stops), tuple(visits)
@@ -579,11 +645,16 @@ def speculative_generate(
         def verify(tokens: torch.Tensor, pos: int, cache: InklingCache):
             return target_forward(target, tokens, pos, cache, visits, True, kernels)
 
+    if prefill is None:
+
+        def prefill(prompt: torch.Tensor, max_len: int):
+            cache = InklingCache.empty(target.config, max_len, device=prompt.device)
+            logits, features = target_forward(target, prompt, 0, cache, visits, False, kernels)
+            drafter.commit(features, torch.arange(prompt.numel(), device=prompt.device))
+            return cache, logits
+
     prompt_len = prompt.numel()
-    max_len = spec_max_len(prompt_len, max_new, drafter.num_drafts + 1)
-    cache = InklingCache.empty(target.config, max_len, device=prompt.device)
-    logits, features = target_forward(target, prompt, 0, cache, visits, False, kernels)
-    drafter.commit(features, torch.arange(prompt_len, device=prompt.device))
+    cache, logits = prefill(prompt, spec_max_len(prompt_len, max_new, drafter.num_drafts + 1))
     anchor = int(logits.argmax())
     result = SpecResult(tokens=[anchor])
     pos = prompt_len  # the anchor's position

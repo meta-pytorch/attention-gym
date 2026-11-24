@@ -1,12 +1,12 @@
 """The speculative step (``megakernel.spec.SpecStep``) on a scripted target and drafter: the
 device acceptance against a host reference for every accepted count, eager and replayed from a
-CUDA graph."""
+CUDA graph, and ``prefill_blocks`` committing each prompt position."""
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_gym.warpdrive.examples.megakernel.spec import SpecStep
+from attn_gym.warpdrive.examples.megakernel.spec import SpecStep, prefill_blocks
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 
@@ -54,6 +54,7 @@ class ScriptedDrafter:
         return torch.cat(drafts)
 
     def commit(self, features, positions, last=None):
+        last = torch.tensor(positions.numel() - 1, device="cuda") if last is None else last
         rows = torch.arange(positions.numel(), device="cuda") <= last
         self.committed.index_add_(0, positions, rows.long())
         self.last.copy_(features.index_select(0, last.reshape(1))[0, 0, 0])
@@ -123,3 +124,20 @@ def test_device_accept_matches_host_reference(graph):
     committed = drafter.committed.nonzero().flatten().tolist()
     assert committed == list(fed) and drafter.committed.max().item() == 1
     assert drafter.last.item() == fed[-1]
+
+
+@pytest.mark.parametrize("prompt", [3, 9])
+@torch.no_grad()
+def test_prefill_blocks_commits_each_prompt_position(prompt):
+    """Blocks of 4 over prompts shorter than and past a block (padded last block):
+    the last token's logits, each prompt position committed once and none past it, and the last
+    one as the drafter's context."""
+    start, tokens = 30, 4
+    drafter = ScriptedDrafter(tokens, [0], max_len=64)
+    ids = torch.arange(7, 7 + prompt, device="cuda")
+    logits = prefill_blocks(ScriptedTarget(tokens), drafter, ids, start)
+    last = start + prompt - 1
+    assert logits.argmax().item() == target_next(ids[-1], torch.tensor(last)).item()
+    committed = drafter.committed.nonzero().flatten().tolist()
+    assert committed == list(range(start, last + 1)) and drafter.committed.max().item() == 1
+    assert drafter.last.item() == last

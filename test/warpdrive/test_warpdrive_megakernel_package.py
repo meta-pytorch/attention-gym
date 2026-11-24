@@ -40,6 +40,27 @@ REQUIRED = {
     },
     "inkling_megakernel/msg_kernel.py": {"inkling_megakernel/common.py", "megakernel/gemv.py"},
     "inkling_megakernel/head_kernel.py": {"inkling_megakernel/common.py", "megakernel/gemv.py"},
+    "inkling_megakernel/multi_kernel.py": {
+        "inkling_megakernel/visit_kernel.py",
+        "megakernel/multi_gemv.py",
+    },
+    "inkling_megakernel/draft_ctx_kernel.py": {
+        "inkling_megakernel/draft_common.py",
+        "megakernel/multi_gemv.py",
+    },
+    "inkling_megakernel/draft_backbone_kernel.py": {
+        "inkling_megakernel/draft_common.py",
+        "megakernel/multi_gemv.py",
+    },
+    "inkling_megakernel/draft_head_kernel.py": {
+        "inkling_megakernel/draft_common.py",
+        "megakernel/multi_gemv.py",
+    },
+}
+# Modules a kernel must not hash: the drafter's launches share none of the target's device code.
+EXCLUDED = {
+    f"inkling_megakernel/{kernel}.py": {"inkling_megakernel/common.py"}
+    for kernel in ("draft_ctx_kernel", "draft_backbone_kernel", "draft_head_kernel")
 }
 
 
@@ -76,6 +97,7 @@ def test_kernels_hash_no_host_module(module):
 def test_kernels_hash_what_they_trace(module):
     closure = relative(module_closure(EXAMPLES / module))
     assert REQUIRED[module] <= closure, sorted(REQUIRED[module] - closure)
+    assert not EXCLUDED.get(module, set()) & closure
 
 
 # The chat driver names every family module (``FAMILIES``).

@@ -1,18 +1,20 @@
 """The weight ring: its depth in the shared-memory budget, its stage layouts, TMA atoms and
-partitions, and the load warp's loads of 16 KB stages (``constants``) of weight or KV tiles
-into a ``Ring`` the compute warps consume."""
+partitions, and the load warp's loads of 16 KB stages (``constants``) of weight or KV tiles,
+whole or as ``multi_gemv``'s swizzled boxes, into a ``Ring`` the compute warps consume."""
 
 import math
 
 import cutlass
-from cutlass import Int64, cute
+from cutlass import BFloat16, Int64, cute
 from cutlass.cute.nvgpu import cpasync
 
 from attn_gym.warpdrive.examples.megakernel.constants import (
     BLOCK,
+    BOX,
     EVICT_FIRST,
     HEAD_DIM,
     MAX_STAGES,
+    QBOX,
     ROWS,
     SMEM_BYTES,
     SMEM_HEADROOM,
@@ -22,9 +24,10 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
 
 
 @cute.jit
-def load_tiles(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr):
-    """``count`` stages of tiles ``(row, k0 + k)`` into the ring's ``buffer`` view. Weights and
-    KV rows are read once per launch, hence evict-first in L2."""
+def load_tiles(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr,
+               policy: cutlass.Constexpr = EVICT_FIRST):  # fmt: skip
+    """``count`` stages of tiles ``(row, k0 + k)`` into the ring's ``buffer`` view with the L2
+    cache ``policy``: weights and KV rows are read once per launch, hence evict-first."""
     for k in cutlass.range_constexpr(count):
         with w.produce() as h:
             cute.copy(
@@ -32,7 +35,7 @@ def load_tiles(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlas
                 tiles[None, row, k0 + k],
                 h.view(buffer),
                 tma_bar_ptr=h.barrier,
-                cache_policy=Int64(EVICT_FIRST),
+                cache_policy=Int64(policy),
             )
     return w
 
@@ -62,6 +65,43 @@ def tma_atom(src, box: tuple[int, ...]) -> tuple:
     stride = tuple(math.prod(box[i + 1 :]) for i in range(len(box)))
     smem = cute.make_layout(box, stride=stride)
     return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), src, smem, box)
+
+
+@cute.jit
+def load_boxes(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr):
+    """``load_tiles`` of ``count`` 16 KB stages, each as ``TILE_K // BOX`` swizzled TMA boxes
+    (``multi_gemv``) into the ring's view ``buffer``: box ``i`` of stage ``k`` is tile ``(row,
+    (k0 + k) * boxes + i)``."""
+    boxes = TILE_K // BOX
+    for k in cutlass.range_constexpr(count):
+        with w.produce() as h:
+            stage = h.view(buffer)
+            for i in cutlass.range_constexpr(boxes):
+                cute.copy(
+                    atom,
+                    tiles[None, row, (k0 + k) * boxes + i],
+                    stage[None, i],
+                    tma_bar_ptr=h.barrier,
+                    cache_policy=Int64(EVICT_FIRST),
+                )
+    return w
+
+
+def box_layout(dtype, stages: int | None = None):
+    """``multi_gemv``'s swizzled TMA box of ``dtype`` (bf16 or 32-bit words): ``(ROWS, box)``
+    of 128-byte rows whose 16-byte chunks XOR with the row (``S<3, 4, 3>`` on byte addresses);
+    with ``stages``, the weight ring's ``stages`` 16 KB stages as ``(ROWS, box, boxes,
+    stages)`` of them."""
+    box = BOX if dtype is BFloat16 else QBOX
+    shape = (ROWS, box) if stages is None else (ROWS, box, TILE_K // BOX, stages)
+    layout = cute.make_ordered_layout(shape, order=(1, 0, 2, 3)[: len(shape)])
+    return cute.make_composed_layout(cute.make_swizzle(3, 4, 3), 0, layout)
+
+
+def swizzled_atom(src, dtype) -> tuple:
+    """TMA ``(atom, tensor)`` loading ``src``'s tiles into ``box_layout(dtype)`` boxes."""
+    smem = box_layout(dtype)
+    return cpasync.make_tiled_tma_atom(cpasync.CopyBulkTensorTileG2SOp(), src, smem, smem.shape)
 
 
 def tma_partition(atom, smem, gtensor, box: tuple[int, ...]) -> tuple:

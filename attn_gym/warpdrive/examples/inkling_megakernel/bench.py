@@ -36,8 +36,10 @@ from attn_gym.warpdrive.examples.inkling_megakernel.fast import decode_step
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     GateArgs,
     InklingDecoder,
+    check_block_tokens,
     experts_format,
 )
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK
 
 
 def snapshot(value):
@@ -87,16 +89,36 @@ def launch_kinds(weights: ref.InklingWeights) -> dict[str, tuple[str, int, int]]
     return kinds
 
 
-def record_calls(decoder: InklingDecoder, token, pos, cache) -> dict[str, list]:
+def record_calls(decoder: InklingDecoder, token, pos, cache, block=False) -> dict[str, list]:
     """Every launch of one ``decoder`` step, by runner (``visit``, ``msg``, ``head``), ready to
-    replay."""
+    replay; ``block``: of a ``decode_block`` step of the ``token`` block."""
+    prefix = "block_" if block else ""
     calls = {name: [] for name in ("visit", "msg", "head")}
     for name, recorded in calls.items():
-        setattr(decoder, name, Recorder(getattr(decoder, name), recorded))
-    decoder(token, pos, cache)
+        setattr(decoder, prefix + name, Recorder(getattr(decoder, prefix + name), recorded))
+    (decoder.decode_block if block else decoder)(token, pos, cache)
     for name in calls:
-        setattr(decoder, name, getattr(decoder, name).runner)
+        setattr(decoder, prefix + name, getattr(decoder, prefix + name).runner)
     return calls
+
+
+def union_sizes(decoder: InklingDecoder, tokens, pos, cache) -> list[int]:
+    """The expert union's size at each visit of one ``decode_block`` step of ``tokens``
+    (eager, synchronizing after every visit)."""
+    sizes = []
+    runner = decoder.block_visit
+
+    def visit(*args, **kwargs):
+        out = runner(*args, **kwargs)
+        sizes.append(int(runner.union_size().item()))
+        return out
+
+    decoder.block_visit = visit
+    try:
+        decoder.decode_block(tokens, pos, cache)
+    finally:
+        decoder.block_visit = runner
+    return sizes
 
 
 @torch.no_grad()
@@ -107,11 +129,22 @@ def main(
     rounds: Annotated[int, typer.Option(help="interleaved timing rounds (odd)")] = 5,
     iters: Annotated[int, typer.Option(help="replays per graph per round")] = 50,
     bf16: Annotated[bool, typer.Option(help="also time bf16 experts and the torch step")] = True,
+    block_tokens: Annotated[
+        int, typer.Option(help="also time decode_block steps of this many tokens (0: none)")
+    ] = 8,
     checkpoint: str = "thinkingmachines/Inkling-2-Mini",
     json_out: Annotated[Path | None, typer.Option(help="write results, provenance")] = None,
 ):
-    if not 0 < context < max_len:
-        raise typer.BadParameter(f"need 0 < context < max_len, got {context} and {max_len}")
+    # Checked before the weights load: the capacity, the block size and the positions written.
+    if max_len % BLOCK:
+        raise typer.BadParameter(f"--max-len must be a multiple of {BLOCK}, got {max_len}")
+    if block_tokens:
+        check_block_tokens(block_tokens)
+    if not 0 < context <= max_len - max(block_tokens, 1):
+        raise typer.BadParameter(
+            f"need 0 < context and context + max(block_tokens, 1) <= max_len, got {context}, "
+            f"{block_tokens} and {max_len}"
+        )
     torch.cuda.synchronize()
     before = torch.cuda.memory_allocated()
     weights = quant.load_quantized_inkling_weights(checkpoint)
@@ -122,6 +155,18 @@ def main(
     prompt = torch.randint(1000, 100000, (context,), device="cuda", generator=gen)
     token = quant.forward_tokens(weights, prompt, 0, cache).argmax().reshape(1)
     pos = torch.tensor([context], device="cuda", dtype=torch.int32)
+    block = None
+    if block_tokens:
+        # The block: the megakernel's greedy continuation (a fully accepted verify block),
+        # decoded on a scratch copy of the cache.
+        scratch = ref.InklingCache(**{k: v.clone() for k, v in vars(cache).items()})
+        greedy = InklingDecoder(weights)
+        block, step_pos = [token], pos.clone()
+        for _ in range(block_tokens - 1):
+            block.append(greedy(block[-1], step_pos, scratch).argmax().reshape(1))
+            step_pos += 1
+        block = torch.cat(block)
+        del scratch, greedy  # untimed: their memory goes to the bf16 model
     models = {"quantized": weights}
     if bf16:
         allocated = torch.cuda.memory_allocated()
@@ -132,42 +177,69 @@ def main(
 
     kinds = {name: launch_kinds(model) for name, model in models.items()}
     graphs = {}
+    unions = {}
     for name, model in models.items():
-        decoder = InklingDecoder(model)
+        decoder = InklingDecoder(model, block_tokens=block_tokens or None)
         calls = record_calls(decoder, token, pos, cache)
         for kind, (runner, call, _) in kinds[name].items():
             graphs[f"{name}: {kind}"] = capture(calls[runner][call], reps)
         graphs[f"decode step: megakernel, {name}"] = capture(
             partial(decoder, token, pos, cache), 1
         )
+        if block_tokens:
+            calls = record_calls(decoder, block, pos, cache, block=True)
+            for kind, (runner, call, _) in kinds[name].items():
+                graphs[f"{name}, T={block_tokens}: {kind}"] = capture(calls[runner][call], reps)
+            graphs[f"block step: megakernel, {name}"] = capture(
+                partial(decoder.decode_block, block, pos, cache), 1
+            )
+            unions[name] = union_sizes(decoder, block, pos, cache)
     if bf16:
         graphs["decode step: torch, bf16"] = capture(
             partial(decode_step, dense, token, pos, cache), 1
         )
     results = time_graphs(graphs, rounds, iters)
     for name in models:
-        print(f"{name + ' experts: launch kind':40s} {'us/launch':>10s} {'per step':>9s} "
-              f"{'us/step':>9s}")  # fmt: skip
-        launches = 0.0
+        header = f"{name + ' experts: launch kind':40s} {'us/launch':>10s} {'per step':>9s}"
+        if block_tokens:
+            header += f" {'T=' + str(block_tokens):>10s} {'ratio':>6s}"
+        print(header)
+        launches = blocks = 0.0
         for kind, (_, _, count) in kinds[name].items():
             us = results[f"{name}: {kind}"]
             launches += count * us
-            print(f"{kind:40s} {us:10.1f} {count:9d} {count * us:9.1f}")
+            line = f"{kind:40s} {us:10.1f} {count:9d}"
+            if block_tokens:
+                block_us = results[f"{name}, T={block_tokens}: {kind}"]
+                blocks += count * block_us
+                line += f" {block_us:10.1f} {block_us / us:6.2f}"
+            print(line)
         step = results[f"decode step: megakernel, {name}"]
-        print(f"{'launches (sum)':40s} {'':10s} {'':9s} {launches:9.1f}")
-        print(f"{'residual (step - sum)':40s} {'':10s} {'':9s} {step - launches:9.1f}")
+        print(f"{'launches (sum, us/step)':40s} {launches:10.1f} {'':9s} {blocks:10.1f}")
+        if block_tokens:
+            block_step = results[f"block step: megakernel, {name}"]
+            print(f"{'step (us)':40s} {step:10.1f} {'':9s} {block_step:10.1f} "
+                  f"{block_step / step:6.2f}")  # fmt: skip
+            sizes = unions[name]
+            print(f"{'expert union per visit':40s} mean {sum(sizes) / len(sizes):.1f}, min "
+                  f"{min(sizes)}, max {max(sizes)} of {block_tokens} x top-k: {sizes}")  # fmt: skip
         print(f"{'model weights (GB)':40s} {memory[name] / 1e9:10.1f}")
     for name, us in results.items():
-        if name.startswith("decode step"):
+        if name.startswith(("decode step", "block step")):
             print(f"{name:40s} {us:10.1f} us")
     if json_out is not None:
         here = Path(__file__).parent
         sources = {p.stem: p for p in sorted(here.glob("*.py"))}
         arguments = {"context": context, "max_len": max_len, "reps": reps, "rounds": rounds,
-                     "iters": iters, "bf16": bf16}  # fmt: skip
+                     "iters": iters, "bf16": bf16, "block_tokens": block_tokens}  # fmt: skip
         json_out.write_text(
             json.dumps(
-                {"results_us": results, "weight_bytes": memory, **provenance(sources, arguments)},
+                {
+                    "results_us": results,
+                    "weight_bytes": memory,
+                    "union_sizes": unions,
+                    **provenance(sources, arguments),
+                },
                 indent=2,
             )
         )

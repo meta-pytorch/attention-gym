@@ -103,9 +103,16 @@ def load_vec(src, offset, n: cutlass.Constexpr):
 
 @cute.jit
 def load_into(out, src, offset, n: cutlass.Constexpr):
+    out.store(load_frag(src, offset, n).load().to(Float32))
+
+
+@cute.jit
+def load_frag(src, offset, n: cutlass.Constexpr):
+    """``n`` contiguous elements of a 1-D tensor from ``offset`` (a multiple of n) in one vector
+    load, in their type."""
     frag = cute.make_rmem_tensor((n,), src.element_type)
     cute.autovec_copy(cute.local_tile(src, (n,), (offset // n,)), frag)
-    out.store(frag.load().to(Float32))
+    return frag
 
 
 @cute.jit
@@ -124,3 +131,9 @@ def fp32_reciprocal(x: float) -> float:
     """``1 / x`` in fp32: PyTorch divides a CUDA tensor by a Python scalar as a multiplication by
     this reciprocal."""
     return fp32(1.0 / fp32(x))
+
+
+@cute.jit
+def load_words16(row, col):
+    """The 4 bf16x2 words of 8 bf16 at ``row[col .. col + 7]`` (``col`` a multiple of 8)."""
+    return cute.recast_tensor(load_frag(row, col, 8), Int32)
