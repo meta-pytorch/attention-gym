@@ -11,18 +11,19 @@ is the procedure; this file holds the package's contracts.
 
 | Module | Contents |
 |---|---|
-| `constants.py` | Tile geometry (`ROWS` x `TILE_K` weight stages of `STAGE_BYTES`, `BLOCK` KV positions of a `HEAD_DIM` head), the compute role's warps, the SMEM budget and default ring depth cap (`MAX_STAGES`), `EVICT_FIRST`, `LOG2E`, the polling backoff `BACKOFF_NS`. Imports nothing. |
+| `constants.py` | Tile geometry (`ROWS` x `TILE_K` weight stages of `STAGE_BYTES`, `BLOCK` KV positions of a `HEAD_DIM` head), the compute role's warps, the SMEM budget and default ring depth cap (`MAX_STAGES`), `EVICT_FIRST`/`EVICT_LAST`, `LOG2E`, the polling backoff `BACKOFF_NS`, and `multi_gemv`'s geometry (`MMA_N`, `BOX`, `QBOX`, `X_PAD`, `DBUF_FLOATS`). Imports nothing. |
 | `tagged.py` | The cross-CTA protocol: `publish`, `fetch` (warp-uniform polls with `nanosleep` backoff on request), `load_words`, `pack_tagged`/`unpack_tagged`; the scratch (`scratch_offsets`, `tagged_views`) and the epoch (`advance_epoch`) |
-| `regmath.py` | `bf16_round`, `bf16x8_to_f32`, `group_sum`, `warp_transpose_reduce`, `cta_sum` (over the compute warps through SMEM), `load_vec`/`load_into`/`store_vec`; `fp32`/`fp32_reciprocal` (constants as PyTorch rounds them) |
+| `regmath.py` | `bf16_round`, `bf16x8_to_f32`, `group_sum`, `warp_transpose_reduce`, `cta_sum` (over the compute warps through SMEM), `load_vec`/`load_into`/`store_vec`/`load_words16`; `fp32`/`fp32_reciprocal` (constants as PyTorch rounds them) |
 | `gemv.py` | `gemv_tile`: one token against a 32-row weight tile on CUDA cores, over the input row and the weight ring; `owns_row`, `owns_pair`, `pair_value` say where its results land. Qwen wraps it in its engine protocol (`qwen_megakernel.core.CudaCoreGemv`), beside its tcgen05 engine. |
 | `formats.py` | Expert weight formats (bf16, NVFP4, MXFP8), their geometry on the weight tiles, and the expert input quantizations (`ACTIVATION_FORMATS`). Imports only `constants`. |
 | `quant_gemv.py` | `quant_tile`: `gemv_tile` of a quantized expert tile, its words decoded in registers to the weights' exact block values and accumulated in `gemv_tile`'s order |
 | `act_quant.py` | Expert input quantization on the device, vLLM's SM100 NVFP4 (per-row amax, `fouroversix_mae` block scales) and MXFP8 quantizers bit for bit: `quantize_rows` replaces bf16 rows in shared memory by their exact block values; `row_scale` is the NVFP4 GEMM output scale |
+| `multi_gemv.py` | The tensor-core GEMV: a 32-row tile against up to 8 tokens per `mma.sync.m16n8k16`, bf16 (`gemv_bf16`) or quantized weights (`gemv_quant`, `quant_tile`'s stages) |
 | `attention.py` | The flash-decoding rows' helpers: `split_blocks` (a KV split's blocks, sliding windows included, and the newest split), `head_vec` and `stage_row` (a lane's slices of a head) |
-| `ring.py` | The weight ring: `ring_stages` (its depth in the SMEM budget), `weight_stages`/`kv_stages` (stage layouts), `tma_atom`/`tma_partition`, and `load_tiles` (the load warp's stages). Qwen builds its atoms with its own helpers, which take the tcgen05 engine's layouts. |
+| `ring.py` | The weight ring: `ring_stages` (its depth in the SMEM budget), `weight_stages`/`kv_stages` (stage layouts), `tma_atom`/`tma_partition`, and the load warp's stages, whole (`load_tiles`) or as `multi_gemv`'s swizzled boxes (`load_boxes`, `box_layout`, `swizzled_atom`). Qwen builds its atoms with its own helpers, which take the tcgen05 engine's layouts. |
 | `table.py` | `InstructionTable` (the row-table `WorkMap`) and `layout_static` (its `[slot][cta]` layout) |
 | `launch.py` | Host side: `Launch` (a one-launch chain's table, tagged scratch and state), `table_of`/`deal` (instruction tables dealt to CTAs), `tagged_values` |
-| `spec.py` | `SpecStep`: greedy speculative decoding on the device over a model's `TargetBlock` and `DraftModel` |
+| `spec.py` | `SpecStep`: greedy speculative decoding on the device over a model's `TargetBlock` and `DraftModel`; `prefill_blocks`: a prompt through the same block step |
 | `chat.py` | The chat driver; each family provides a `chat` module (`FAMILIES`), whose backends decode one token (`DecodeBackend`) or several (`MultiTokenBackend`) per step |
 
 ## Shape preconditions
@@ -171,3 +172,40 @@ maximum (`act_quant.cta_max`) per row set.
   resolve a near tie differently from one-token decode. Test a model's step against a host loop
   over the same verify forward and drafter, not against one-token decode;
   `test_warpdrive_megakernel_spec` covers the acceptance on scripted components.
+
+## Multi-token verify
+
+- `multi_gemv` runs a 32-row tile against up to 8 tokens per `mma.sync.m16n8k16` from 128-byte
+  swizzled TMA boxes (`ring.load_boxes`); bf16 and quantized weights give bit-identical dot
+  products. Its geometry lives in `constants`, so a launch whose module does not import
+  `multi_gemv` keeps it out of its compile key: Inkling's one-token visit (its host test checks);
+  the message and head modules, which hold both forms, hash it.
+- Share code between the one-token and block forms behind `const_expr` token counts, and check
+  that the one-token kernels' PTX is unchanged.
+- A block's rows are causal, so `spec.prefill_blocks` can feed a prompt through the verify block
+  (padding the last one) and the caches come from the same kernels as the reply.
+- In a block, the masked-row rule covers future positions within the block and keys before the
+  window: Inkling's block kernel clamps V rows to the visible range, its draft kernel zeroes
+  masked rows; the block kernel's test fills those rows with NaN.
+- Keep the accepted block sizes in one place and test the default and one other against the
+  oracle:
+  `InklingDecoder` and the chat's `megakernel-spec` take `inkling_megakernel.spec.BLOCK_TOKENS`
+  (2, 4 and 8), `spec-torch` 2..8.
+- Inkling's block form quantizes a token's MLP input once, in the CTA that shares it, and each
+  DOWN item quantizes its slot's activation rows itself as it fetches them. Electing one item
+  per slot to quantize for the others (the slot's last GATEUP item, or its first DOWN item)
+  made the others wait for it: 1.3-1.4x slower block steps. Per-item quantization is amortized
+  over `DOWN_TILES` = 6 row tiles (2 before the quantization: 6.8-8.4% slower launches).
+
+## Not shared yet
+
+Pieces a third model would copy today, each with two or more variants whose shapes differ;
+move one when that model fixes the shape it needs:
+
+- the flash-decoding partial loop, merge and empty partial (Qwen, Inkling one-token and block,
+  DSpark's even-share splits);
+- a launch of row tiles of one matrix (Inkling's `MatrixRowsKernel`, the LM head);
+- router top-k and the expert union (different semantics in Qwen and Inkling);
+- prefill by one-token decode steps (Inkling's chat) beside `spec.prefill_blocks`;
+- the tests' error-budget helpers (Qwen's `compare_logits`, Inkling's ulp bounds);
+- chat options declared by their family instead of `ChatOptions`.

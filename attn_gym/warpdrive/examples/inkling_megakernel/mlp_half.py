@@ -96,7 +96,7 @@ from attn_gym.warpdrive.examples.megakernel.regmath import (
     fp32_reciprocal,
     group_sum,
 )
-from attn_gym.warpdrive.examples.megakernel.ring import load_tiles, tma_atom
+from attn_gym.warpdrive.examples.megakernel.ring import tma_atom
 from attn_gym.warpdrive.examples.megakernel.tagged import fetch, publish
 
 ROUTER, GATEUP, DOWN = 3, 4, 5  # after the attention half's ops 0-2
@@ -197,7 +197,7 @@ class MlpHalf:
         routing: the first one waits for the router's logits (``routed`` then 1). Returns the
         weight and ``meta`` rings' producers and ``routed``."""
         if op == ROUTER:
-            w = load_tiles(w, p.tma_mlp[0], p.gmem_mlp[0], a, 0, self.hidden_k_tiles, "W")
+            w = self.load_stages(w, p.tma_mlp[0], p.gmem_mlp[0], a, 0, self.hidden_k_tiles, "W")
         else:
             if routed == 0:
                 with self.trace_region("route"):
@@ -225,7 +225,7 @@ class MlpHalf:
                             tma_bar_ptr=h.barrier,
                             cache_policy=Int64(EVICT_FIRST),
                         )
-                w = load_tiles(
+                w = self.load_stages(
                     w, p.tma_mlp[1 + kind], p.gmem_mlp[1 + kind], tile, 0,
                     self.expert_stages[kind], buffer,
                 )  # fmt: skip
@@ -345,7 +345,8 @@ class MlpHalf:
     def stage_scales(self, p, tid):
         """NVFP4 activations: ``expert_scales`` into SMEM ``scales`` at the launch's start, so
         that no epilogue waits on a global load (measured 1.9 us of a 58 us visit on bf16
-        weights); every epilogue follows a later barrier (``quantize_input``'s, a fetch's)."""
+        weights); every epilogue follows a later barrier (``quantize_input``'s, a fetch's; in
+        block launches ``multi_gemv.finish``'s)."""
         if cutlass.const_expr(self.activation_format == NVFP4):
             for i in range(tid, 2 * (self.experts + 1), COMPUTE_THREADS):
                 matrix, expert = i // (self.experts + 1), i % (self.experts + 1)
@@ -472,7 +473,12 @@ class MlpHalf:
             sources[1] = cute.make_tensor(w13.iterator, layout)
             layout = cute.make_layout((e * h, width), stride=(width, 1))
             sources[2] = cute.make_tensor(w2.iterator, layout)
-        return [tma_atom(src, box) for src, (_, box) in zip(sources, self.mlp_targets())]
+        targets = self.mlp_targets()
+        return [self.target_atom(name, src, box) for src, (name, box) in zip(sources, targets)]
+
+    def target_atom(self, name: str, src, box: tuple[int, ...]) -> tuple:
+        """TMA ``(atom, tensor)`` of ``box`` tiles of ``src`` into SMEM buffer ``name``."""
+        return tma_atom(src, box)
 
 
 def fake_expert_args(op: MlpHalf) -> list:

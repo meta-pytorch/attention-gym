@@ -827,6 +827,31 @@ The chat (``--prompt "What is the capital of France? One sentence." --reasoning-
 2026-11-24). Greedy tokens equal the oracle's on the tested checkpoint decodes except where the two
 best logits nearly tie.
 
+**Speculative decoding.** ``--backend megakernel-spec`` drafts with the checkpoint's DSpark
+drafter (``draft.py``: three launches) and verifies a block of ``k`` = 4 tokens per step on the
+multi-token decoder (``InklingDecoder.decode_block``), accepting on the device, so a CUDA graph
+holds whole steps (``megakernel.spec``); ``--verify-tokens 2`` or ``8`` picks another ``k``. A step is the
+block's 51 model launches and the drafter's three, plus about 15 small torch kernels that accept
+on the device (argmax, prefix match) and update the step's state (count, tokens, anchor,
+position). It decodes greedily only, and its replies are the greedy decode in the block's
+rounding, which can resolve a near tie differently from the one-token step. Chat replies on a
+GB300 (5 prompts x low/high reasoning effort, up to 256 tokens, 2026-11-24). tok/s pools a
+backend's replies (their tokens over their decode time); the speedup is the geometric mean of
+each reply's tok/s ratio to megakernel's on the same prompt:
+
+| Backend | tokens per step | tok/s, context ~40 / ~1100 | speedup, context ~40 / ~1100 |
+|---|---:|---:|---:|
+| megakernel | 1 | 342 / 330 | 1 |
+| megakernel-spec, k = 2 | 1.65-1.66 | 397 / 400 | 1.16x / 1.21x |
+| megakernel-spec, k = 4 | 2.35-2.36 | 428 / 438 | 1.28x / 1.34x |
+| megakernel-spec, k = 8 | 2.59-2.78 | 326 / 362 | 0.98x / 1.12x |
+
+A ``k``-token verify costs 3.59 / 4.72 / 6.45 ms at ``k`` = 2 / 4 / 8 against 3.01 ms for the
+one-token step (context 1100), drafting 0.35-0.47 ms: at ``k`` = 4 a step pays off above
+about 1.7 tokens per step ((4.72 + 0.35 .. 0.47) / 3.01 = 1.68 .. 1.72). Code and
+step-by-step reasoning replies gain most (1.54-1.74x at ``k`` = 4), prose (story, explanation,
+email) least (0.96-1.35x).
+
 The bf16 bandwidth floor is about 1.4 ms per token (about 0.6 ms with quantized experts). The
 step is latency-bound: the serial chain from a visit's attention output to its first expert row
 (residual, norm, router, top-8) costs about 9 us per visit, and NVFP4 decoding is compute-bound,
@@ -845,9 +870,9 @@ the torch step launch-bound, so at ``k`` = 4 it decodes at 26-30 tok/s against 1
 
 `examples/megakernel/` holds what the decode megakernels share: the tile geometry, the epoch-tagged
 words that carry activations between CTAs, register helpers, the CUDA-core GEMV engine and its
-NVFP4/MXFP8 expert decode, the weight ring's TMA loads, the instruction table, the speculative step
-and the chat driver. A model directory keeps its oracle, kernels, runners, bench and chat family
-module. Its
+NVFP4/MXFP8 expert decode, the weight ring's TMA loads, the instruction table, the tensor-core
+multi-token GEMV, the speculative step and the chat driver. A model directory keeps its oracle,
+kernels, runners, bench and chat family module. Its
 [`AGENTS.md`](https://github.com/meta-pytorch/attention-gym/blob/main/attn_gym/warpdrive/examples/megakernel/AGENTS.md)
 states what belongs in the package and the rules its kernels follow (residency, K/V store ordering,
 compile-key boundaries); the `adding-megakernel-model` skill

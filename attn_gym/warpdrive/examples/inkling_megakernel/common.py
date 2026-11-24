@@ -43,13 +43,16 @@ from attn_gym.warpdrive import (
 )
 from attn_gym.warpdrive.cache import make_fake_compact_tensor
 from attn_gym.warpdrive.examples.megakernel.constants import (
+    BOX,
     COMPUTE_THREADS,
     COMPUTE_WARPS,
+    DBUF_FLOATS,
     RED_VALUES,
     ROWS,
     ROWS_PER_WARP,
     STAGE_BYTES,
     TILE_K,
+    X_PAD,
 )
 from attn_gym.warpdrive.examples.megakernel.gemv import gemv_tile, owns_row
 from attn_gym.warpdrive.examples.megakernel.regmath import (
@@ -61,8 +64,11 @@ from attn_gym.warpdrive.examples.megakernel.regmath import (
     red_layout,
 )
 from attn_gym.warpdrive.examples.megakernel.ring import (
+    box_layout,
+    load_boxes,
     load_tiles,
     ring_stages,
+    swizzled_atom,
     tma_atom,
     tma_partition,
     weight_stages,
@@ -89,6 +95,12 @@ GATE_SPLITS = 3  # MSGDOWN split-K: k tiles of the x half per item = hidden / 25
 MIX_STAGES = 2  # GATEMIX: 32-row stages of [F | G] per item
 # MIX: the prologue's state scale factors (STATES), then each query's state weights (STATES).
 MIX_FLOATS = STATES * 4
+
+
+def add_offset(index, base):
+    """``index + base``, leaving ``index`` itself when ``base`` is the Python int 0 (a token
+    offset of the one-token kernels, which must keep their IR)."""
+    return index if isinstance(base, int) and base == 0 else index + base
 
 
 @cute.jit
@@ -119,24 +131,26 @@ def post_conv(ring, weights, past, col, pos, y, kernel: cutlass.Constexpr):
     return bf16_round((conv + y) * fp32_reciprocal(math.sqrt(kernel + 1)))
 
 
-def fake_gate_args(hidden: int) -> tuple:
+def fake_gate_args(hidden: int, tokens: int = 1) -> tuple:
     """Fake compile arguments of a core layer's message gates (``gate_atoms``, ``GateParams``):
     the down projections ``(GATES * GATE_RANK, 2 * hidden)`` bf16, the fp32 ``(GATES, hidden,
     2 * GATE_RANK)`` ``[F | G]`` rows viewed as bf16 ``(GATES * hidden, 4 * GATE_RANK)``, the
-    message halves and the messages."""
+    message halves ``(GATES * GATE_RANK * tokens,)`` (row-major, token minor) and the messages
+    ``(GATES, tokens * hidden)`` (token-major within a gate)."""
     return (
         make_fake_compact_tensor(BFloat16, (GATES * GATE_RANK, 2 * hidden)),
         make_fake_compact_tensor(BFloat16, (GATES * hidden, 4 * GATE_RANK)),
-        make_fake_compact_tensor(Float32, (GATES * GATE_RANK,), assumed_align=4),
-        make_fake_compact_tensor(Float32, (GATES, hidden), assumed_align=4),
+        make_fake_compact_tensor(Float32, (GATES * GATE_RANK * tokens,), assumed_align=4),
+        make_fake_compact_tensor(Float32, (GATES, tokens * hidden), assumed_align=4),
     )
 
 
-def gate_atoms(down, fg, hidden: int) -> list:
-    """TMA ``(atom, tensor)`` pairs of 32 x 256 bf16 tiles of the down projections' x halves
-    (their first ``hidden`` columns) and of the ``[F | G]`` rows (one tile: 32 rows)."""
+def gate_atoms(down, fg, hidden: int, x_atom) -> list:
+    """TMA ``(atom, tensor)`` pairs of the down projections' x halves (their first ``hidden``
+    columns) as ``x_atom(src)`` loads them (the launch's weight atoms: MSGDOWN streams them as
+    GEMV weights) and of 32 x 256 bf16 tiles of the ``[F | G]`` rows (one tile: 32 rows)."""
     x_half = cute.local_tile(down, (GATES * GATE_RANK, hidden), (0, 0))
-    return [tma_atom(src, (ROWS, TILE_K)) for src in (x_half, fg)]
+    return [x_atom(x_half), tma_atom(fg, (ROWS, TILE_K))]
 
 
 @dataclass(frozen=True)
@@ -161,6 +175,8 @@ class InklingKernel(WarpSpecialized):
     (``GateParams`` or None)."""
 
     messages = False
+    tokens = 1  # consecutive tokens of one sequence per launch
+    x_pad = 0  # bf16 elements after each row of X (multi-token launches skew rows' banks)
 
     def init_messages(self, messages: bool, gate_query: tuple[int, ...]):
         """All GATES message gates when ``messages``; ``gate_query[s]`` is the prologue query
@@ -181,7 +197,7 @@ class InklingKernel(WarpSpecialized):
         the reductions ``RED``."""
         return {
             "W": weight_stages(self.stages),
-            "X": cute.make_layout((x_rows, self.hidden), stride=(self.hidden, 1)),
+            "X": cute.make_layout((x_rows, self.hidden), stride=(self.hidden + self.x_pad, 1)),
             "RED": red_layout(REDUCTIONS),
         }
 
@@ -214,37 +230,60 @@ class InklingKernel(WarpSpecialized):
         raise NotImplementedError
 
     @cute.jit
-    def load_states(self, p, num_blocks, partial, tid, load_partial=True):
+    def load_stages(self, w, atom, tiles, row, k0, count: cutlass.Constexpr,
+                    buffer: cutlass.Constexpr):  # fmt: skip
+        """The load warp's ``count`` GEMV weight stages (``load_tiles``)."""
+        return load_tiles(w, atom, tiles, row, k0, count, buffer)
+
+    @cute.jit
+    def load_states(self, p, num_blocks, partial, tid, load_partial=True, token=0):
         """``(STATES, hidden // COMPUTE_THREADS)`` fp32 registers: the first ``num_blocks``
         completed blocks (zeros past them), then ``partial`` (a ``(hidden,)`` tensor; zeros if
         None or ``load_partial`` is false: the caller fills it). Thread t holds elements
-        ``r * 256 + t``."""
+        ``r * 256 + t``. ``token``: of a multi-token launch, whose states are ``(tokens *
+        hidden,)``, token-major."""
         per = self.hidden // COMPUTE_THREADS
+        base = token * self.hidden
         x = cute.make_rmem_tensor((STATES, per), Float32)
         x.fill(0.0)
         for n in cutlass.range_constexpr(MAX_BLOCKS):
             if n < num_blocks:
                 for r in cutlass.range_constexpr(per):
-                    x[n, r] = Float32(p.blocks[n][r * COMPUTE_THREADS + tid])
+                    x[n, r] = Float32(p.blocks[n][add_offset(r * COMPUTE_THREADS + tid, base)])
         if cutlass.const_expr(partial is not None):
             if load_partial:
                 for r in cutlass.range_constexpr(per):
-                    x[MAX_BLOCKS, r] = Float32(partial[r * COMPUTE_THREADS + tid])
+                    x[MAX_BLOCKS, r] = Float32(
+                        partial[add_offset(r * COMPUTE_THREADS + tid, base)]
+                    )
         return x
 
     @cute.jit
     def normalize_states(
-        self, p, x, num_blocks, query, norms, nq: cutlass.Constexpr, queries, tid, warp, lane
+        self,
+        p,
+        x,
+        num_blocks,
+        query,
+        norms,
+        nq: cutlass.Constexpr,
+        queries,
+        tid,
+        warp,
+        lane,
+        token=0,
     ):
         """``xs[q]`` for each of the ``nq`` queries: the block residual ``y_q`` of fp32 ``query[q]``
         over ``load_states``'s ``x`` (``ref.block_residual`` over ``num_blocks`` blocks;
         ``queries == 0``: the partial block itself), then ``bf16(norms[q] * rms_norm(y_q))``
         (the half's input norm) or, in a launch with message gates, ``bf16(rms_norm(y_q))``
         (the x half of the gates' down inputs); the state scales and weights go to MIX for
-        ``mixed_state``."""
+        ``mixed_state``. ``token``: of a multi-token launch (``tokens`` > 1): query q's input
+        goes to xs row ``q * tokens + token`` and the MIX values to the token's MIX_FLOATS."""
         h = self.hidden
         per = h // COMPUTE_THREADS
         weighted = not self.messages
+        mix0 = token * MIX_FLOATS
         # Every load first, so their latencies overlap: the queries and norm weights.
         qv = cute.make_rmem_tensor((nq, per), Float32)
         weights = cute.make_rmem_tensor((nq, per), BFloat16)
@@ -305,11 +344,11 @@ class InklingKernel(WarpSpecialized):
                 if cutlass.const_expr(self.messages):
                     if tid == 0:
                         for n in cutlass.range_constexpr(STATES):
-                            p.mix[STATES * (q + 1) + n] = probs[n]
+                            p.mix[add_offset(STATES * (q + 1) + n, mix0)] = probs[n]
             if cutlass.const_expr(self.messages):
                 if tid == 0:
                     for n in cutlass.range_constexpr(STATES):
-                        p.mix[n] = rinvs[n]
+                        p.mix[add_offset(n, mix0)] = rinvs[n]
         squares = []
         for q in cutlass.range_constexpr(nq):
             ss = Float32(0.0)
@@ -319,25 +358,30 @@ class InklingKernel(WarpSpecialized):
         squares = cta_sum(p.red, self.csync, squares, 2, warp, lane)
         for q in cutlass.range_constexpr(nq):
             rinv = cute.math.rsqrt(squares[q] * inv_h + Float32(self.rms_eps))
+            row = add_offset(q * self.tokens, token)
             for r in cutlass.range_constexpr(per):
                 k = r * COMPUTE_THREADS + tid
                 if cutlass.const_expr(weighted):
-                    p.xs[q, k] = BFloat16(Float32(weights[q, r]) * (y[q, r] * rinv))
+                    p.xs[row, k] = BFloat16(Float32(weights[q, r]) * (y[q, r] * rinv))
                 else:
-                    p.xs[q, k] = BFloat16(y[q, r] * rinv)
+                    p.xs[row, k] = BFloat16(y[q, r] * rinv)
         self.csync.sync()
 
     @cute.jit
-    def mixed_state(self, p, query, num_blocks, partial, i):
+    def mixed_state(self, p, query, num_blocks, partial, i, token=0):
         """Element ``i`` of ``normalize_states``' block residual of ``query`` over ``num_blocks``
         blocks and the partial block's element ``partial``, recomputed from the states and MIX
-        in its operation order (the same fp32 value)."""
-        weights = STATES * (query + 1)
+        in its operation order (the same fp32 value); ``token`` as ``normalize_states``'."""
+        mix0 = token * MIX_FLOATS
+        weights = add_offset(STATES * (query + 1), mix0)
+        i = add_offset(i, token * self.hidden)
         acc = Float32(0.0)
         for n in cutlass.range_constexpr(MAX_BLOCKS):
             if n < num_blocks:
-                acc = acc + p.mix[weights + n] * (Float32(p.blocks[n][i]) * p.mix[n])
-        return acc + p.mix[weights + MAX_BLOCKS] * (partial * p.mix[MAX_BLOCKS])
+                acc = acc + p.mix[weights + n] * (
+                    Float32(p.blocks[n][i]) * p.mix[add_offset(n, mix0)]
+                )
+        return acc + p.mix[weights + MAX_BLOCKS] * (partial * p.mix[add_offset(MAX_BLOCKS, mix0)])
 
     # ------------------------------------------------------------ message gates
 
@@ -373,7 +417,7 @@ class InklingKernel(WarpSpecialized):
         g = p.gate
         if op == MSGDOWN:
             per = self.hidden // TILE_K // GATE_SPLITS
-            w = load_tiles(w, g.tma[0], g.gmem[0], a, b * per, per, "W")
+            w = self.load_stages(w, g.tma[0], g.gmem[0], a, b * per, per, "W")
         else:
             for stage in cutlass.range_constexpr(MIX_STAGES):
                 row = b * (self.hidden // ROWS) + a * MIX_STAGES + stage
@@ -481,41 +525,77 @@ class MatrixRowsKernel(InklingKernel):
     (``load_matrix_rows``). Their params carry ``tma``/``gmem`` (the matrix's atom and tile
     partition), ``sW``, ``xs`` (``(1, hidden)``) and ``red`` (``matrix_params``)."""
 
-    def init_matrix_rows(self, hidden: int, rms_eps: float, stages: int | None):
-        """``stages``: weight ring depth in 16 KB stages."""
+    def init_matrix_rows(self, hidden: int, rms_eps: float, stages: int | None, tokens: int = 1):
+        """``stages``: weight ring depth in 16 KB stages; ``tokens``: GEMV input rows (one per
+        token of a multi-token launch)."""
         if hidden % COMPUTE_THREADS or hidden % TILE_K:
             raise ValueError(f"hidden size must be a multiple of {COMPUTE_THREADS} and {TILE_K}")
-        self.hidden, self.rms_eps = hidden, rms_eps
+        self.hidden, self.rms_eps, self.tokens = hidden, rms_eps, tokens
         self.hidden_k_tiles = hidden // TILE_K
-        self.stages = ring_stages(2 * hidden + 4 * REDUCTIONS * COMPUTE_WARPS * RED_VALUES, stages)
+        if tokens > 1:  # tensor-core GEMVs (``examples.megakernel.multi_gemv``)
+            self.x_pad = X_PAD
+        fixed = 2 * tokens * (hidden + self.x_pad) + 4 * REDUCTIONS * COMPUTE_WARPS * RED_VALUES
+        fixed += 4 * DBUF_FLOATS if tokens > 1 else 0
+        self.stages = ring_stages(fixed, stages)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
+        stage_buffers = {"W": w}
+        if tokens > 1:
+            stage_buffers["WS"] = self.smem_plan.buffer("WS", BFloat16, align=1024, overlaps=w)
+            self.smem_plan.buffer("DBUF", Float32, align=16)
         self.smem_plan.buffer("X", BFloat16, align=16)
         self.smem_plan.buffer("RED", Float32, align=16)
         # Compute reads stages with generic loads before TMA refills them; the layer emits the
         # fence.proxy.async on a Warps release of a Tma-filled ring.
-        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer={"W": w})
+        self.w = Ring(self.stages, Tma(STAGE_BYTES), Warps, buffer=stage_buffers)
         self.csync = NamedBarrier(threads=COMPUTE_THREADS)
         self.work = WorkStream(mapping=InstructionTable(words=WORDS), schedule=StaticPersistent())
 
     @cute.jit
     def load_matrix_rows(self, p, w, work):
-        """The load role: every item's weight stages."""
-        w = w.views(W=p.sW)
+        """The load role: every item's weight stages (multi-token: swizzled boxes)."""
+        if cutlass.const_expr(self.tokens > 1):
+            w = w.views(WS=p.sW)
+        else:
+            w = w.views(W=p.sW)
         while work.valid:
             _op, tile, _b, _row = work.item
-            w = load_tiles(w, p.tma[0], p.gmem[0], tile, 0, self.hidden_k_tiles, "W")
+            if cutlass.const_expr(self.tokens > 1):
+                w = load_boxes(w, p.tma[0], p.gmem[0], tile, 0, self.hidden_k_tiles, "WS")
+            else:
+                w = load_tiles(w, p.tma[0], p.gmem[0], tile, 0, self.hidden_k_tiles, "W")
             work.advance()
         return w, work
 
+    def matrix_atom(self, src) -> tuple:
+        """TMA ``(atom, tensor)`` of the matrix's stages (multi-token: swizzled boxes)."""
+        if self.tokens > 1:
+            return swizzled_atom(src, BFloat16)
+        return tma_atom(src, (ROWS, TILE_K))
+
+    def matrix_layouts(self) -> dict:
+        """The SMEM layouts for ``begin_roles``."""
+        layouts = self.core_layouts(self.tokens)
+        if self.tokens > 1:
+            layouts |= {
+                "WS": box_layout(BFloat16, self.stages),
+                "DBUF": cute.make_layout((DBUF_FLOATS,)),
+            }
+        return layouts
+
     def matrix_params(self, atom, gtensor) -> dict:
-        """The params fields of the matrix (TMA ``atom`` over ``gtensor``) and the SMEM
-        buffers, after ``begin_roles(layouts=self.core_layouts(1))``."""
-        smem, gmem = tma_partition(atom, self.buffer("W"), gtensor, (ROWS, TILE_K))
+        """The params fields of the matrix (TMA ``atom`` over ``gtensor``, ``matrix_atom``) and
+        the SMEM buffers, after ``begin_roles(layouts=self.matrix_layouts())``; ``dbuf`` is
+        ``examples.megakernel.multi_gemv.finish``'s buffer of multi-token launches."""
+        if self.tokens > 1:
+            smem, gmem = tma_partition(atom, self.buffer("WS"), gtensor, (ROWS, BOX))
+        else:
+            smem, gmem = tma_partition(atom, self.buffer("W"), gtensor, (ROWS, TILE_K))
         return {
             "tma": (atom,),
             "gmem": (gmem,),
-            "sW": StageView(smem, axis=1),
+            "sW": StageView(smem, axis=cute.rank(smem) - 1),
             "xs": self.buffer("X"),
             "red": self.buffer("RED"),
+            "dbuf": self.buffer("DBUF") if self.tokens > 1 else None,
         }

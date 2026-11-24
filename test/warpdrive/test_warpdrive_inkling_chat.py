@@ -68,8 +68,9 @@ def test_reasoning_effort_rejects_other_values(given):
 def test_megakernel_backends_take_kv_block_capacities():
     check_options(ChatOptions("reference", max_len=1000))
     check_options(ChatOptions("megakernel", max_len=1024))
-    with pytest.raises(typer.BadParameter, match="multiple of 64"):
-        check_options(ChatOptions("megakernel-bf16", max_len=1000))
+    for backend in ("megakernel-bf16", "megakernel-spec"):
+        with pytest.raises(typer.BadParameter, match="multiple of 64"):
+            check_options(ChatOptions(backend, max_len=1000))
 
 
 @pytest.mark.parametrize(("backend", "drafter"), [("megakernel", False), ("spec-torch", True)])
@@ -101,7 +102,8 @@ def test_speculative_backends_reject_sampling_at_startup():
 
 
 @pytest.mark.parametrize(
-    ("backend", "given", "k"), [("spec-torch", None, SPEC_TOKENS), ("spec-torch", 8, 8)]
+    ("backend", "given", "k"),
+    [("spec-torch", None, SPEC_TOKENS), ("spec-torch", 8, 8), ("megakernel-spec", 2, 2)],
 )
 def test_verify_tokens_pick_the_block(backend, given, k):
     options = ChatOptions(backend, verify_tokens=given)
@@ -110,7 +112,8 @@ def test_verify_tokens_pick_the_block(backend, given, k):
 
 
 @pytest.mark.parametrize(
-    ("backend", "given"), [("spec-torch", 1), ("spec-torch", 9), ("megakernel", 4)]
+    ("backend", "given"),
+    [("spec-torch", 1), ("spec-torch", 9), ("megakernel-spec", 5), ("megakernel", 4)],
 )
 def test_verify_tokens_rejects_other_blocks_and_backends(backend, given):
     with pytest.raises(typer.BadParameter, match="--verify-tokens"):

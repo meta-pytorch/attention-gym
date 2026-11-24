@@ -12,10 +12,15 @@ the shared megakernel package (``examples.megakernel``). Modules:
 - ``quant``: the checkpoint's NVFP4/MXFP8 experts kept quantized in the layout of the package's
   expert GEMV decode (``examples.megakernel.formats``, ``examples.megakernel.quant_gemv``), their
   exact bf16 block values and dequantization, and the oracle on such a model;
-- ``megakernel``: the host side: the whole decode step as launches (``InklingDecoder``);
+- ``megakernel``: the host side: the whole decode step as launches (``InklingDecoder``), and
+  the same step over a block of tokens (``decode_block``) on ``multi_kernel``'s visits, whose
+  GEMVs run on tensor cores (``examples.megakernel.multi_gemv``);
 - ``dspark``: the checkpoint's DSpark drafter and greedy speculative decoding over the
   oracle; ``spec``: the targets of the package's capturable speculative step
-  (``examples.megakernel.spec``);
-- ``bench``: CUDA-graph timings of each launch kind and of the decode step;
+  (``examples.megakernel.spec``); ``draft``: the drafter as three launches (``draft_ctx_kernel``,
+  ``draft_backbone_kernel``, ``draft_head_kernel``; their shared device code
+  ``draft_common``);
+- ``bench``: CUDA-graph timings of each launch kind and of the decode step; ``draft_bench``:
+  of the draft step;
 - ``chat``: the model in the megakernel chat (``attn_gym.warpdrive.examples.megakernel.chat``).
 """

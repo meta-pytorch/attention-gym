@@ -1,7 +1,9 @@
 """Inkling 2 Mini's targets of the speculative step (``examples.megakernel.spec.SpecStep``):
-``TorchTargetBlock``, the capturable torch step (``fast.py``'s dataflow over ``k`` tokens). With
-``dspark.DSparkDrafter(static=True)`` the step's output is ``dspark.speculative_generate``'s for
-the same verify forward and drafter (its host loop).
+``TorchTargetBlock`` (the capturable torch step, ``fast.py``'s dataflow over ``k`` tokens) or
+``DecoderTargetBlock`` (the multi-token megakernel decoder's block step), with the drafter
+``dspark.DSparkDrafter(static=True)`` or the draft launches (``draft.DSparkMegakernel``). The
+step's output is ``dspark.speculative_generate``'s for the same verify forward and drafter (its
+host loop).
 
 Torch only; no CuTeDSL. Rejected positions need no undo: caches are indexed by position, so the
 next block rewrites them, and the target's convolution rings, which keep ``CONV_RING``
@@ -25,6 +27,10 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     hidden_states,
     logits_of,
 )
+
+# The blocks ``megakernel.InklingDecoder`` (``DecoderTargetBlock``) runs; the chat's default (4)
+# and 8 are tested against the oracle (test_warpdrive_inkling_megakernel_multi.py).
+BLOCK_TOKENS = (2, 4, 8)
 
 
 def max_block_tokens(config: InklingConfig) -> int:
@@ -85,3 +91,21 @@ class TorchTargetBlock:
         return block_forward(
             self.weights, tokens, positions, self.cache, self.visits, self.kernels
         )
+
+
+class DecoderTargetBlock:
+    """``megakernel.InklingDecoder.decode_block`` as a ``TargetBlock`` into ``cache``:
+    ``decoder``, built with ``block_tokens``, gives the block's logits and features (its
+    ``FEATURE_VISITS`` inputs and final normalized states, ``DSparkConfig.target_visits``).
+    Its kernels keep the blocks within ``max_block_tokens`` (their rings must hold a block and
+    the convolution history)."""
+
+    def __init__(self, decoder, cache: InklingCache):
+        if decoder.block_tokens is None:
+            raise ValueError("the decoder was built without block_tokens")
+        self.decoder, self.cache, self.tokens = decoder, cache, decoder.block_tokens
+
+    def __call__(
+        self, tokens: torch.Tensor, pos: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.decoder.decode_block(tokens, pos, self.cache, features=True)

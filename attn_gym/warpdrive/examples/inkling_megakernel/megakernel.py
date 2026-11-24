@@ -8,6 +8,10 @@ warpdrive launches (``InklingDecoder``), and runners of each launch kind:
 - ``InklingHeadMegakernel``: the final block residual, norm, LM head and softcap
   (``head_kernel``).
 
+``InklingDecoder.decode_block`` runs the same step over a block of consecutive tokens (the
+speculative-decoding verify block, a prefill chunk) through the multi-token kernels
+(``multi_kernel``; the message and head kernels take a token count).
+
 A step is one launch per visit (48), one per core pass after the first (2) and the head; each
 visit's output stays in a per-visit buffer that later block residuals read. Launches read
 every input from device memory (token and position too) and sync nothing, so a step is
@@ -36,6 +40,7 @@ Kernels compile from the kernel modules and their imports, so host-side edits he
 nothing.
 """
 
+import copy
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -68,12 +73,20 @@ from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import (
     InklingMsgKernel,
     compile_msg_kernel,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.multi_kernel import (
+    DOWN_TILES,
+    REDUCE,
+    UNION_EXPERTS,
+    InklingMultiVisitKernel,
+    multi_visit_kernel_class,
+)
 from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     InklingCache,
     InklingConfig,
     InklingWeights,
     LayerWeights,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.spec import BLOCK_TOKENS
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import (
     InklingVisitKernel,
     compile_visit_kernel,
@@ -93,14 +106,21 @@ __all__ = [
     "InklingVisitMegakernel",
     "MessageGates",
     "build_visit_table",
+    "check_block_tokens",
+    "check_feature_visits",
     "expert_numerics",
     "experts_format",
     "visit_kernel_for",
 ]
 
+# Visits whose inputs (with the final normalized state) feed the DSpark drafter.
+FEATURE_VISITS = (5, 23, 41)
 # Default KV splits per q head. A sliding layer reads at most window / 64 + 1 = 17 blocks, so 4
 # splits keep an item at 5 blocks or fewer; full layers read every cached block.
 SLIDING_SPLITS, FULL_SPLITS = 4, 8
+# Multi-token launches: an ATTN item scores a kv head's q heads for every token, so 18 splits
+# (144 items for 8 kv heads) keep one item per CTA with a sliding window's block or two each.
+BLOCK_SPLITS = 18
 
 
 def visit_kernel_for(
@@ -109,15 +129,22 @@ def visit_kernel_for(
     messages: bool = False,
     experts_format: str = BF16,
     activation_format: str = NVFP4,
+    tokens: int = 1,
 ) -> InklingVisitKernel:
     """The visit kernel for ``config``'s full (``full``) or sliding layers, with message gates
     (``messages``) or without, streaming experts in ``experts_format`` and quantizing their
-    inputs to ``activation_format``."""
+    inputs to ``activation_format``, over ``tokens`` consecutive tokens (``multi_kernel`` when
+    more than one)."""
     if config.conv_kernel > RING or ref.CONV_RING != RING:
         raise ValueError(f"the kernels' convolution rings hold {RING} positions")
     if config.head_dim != HEAD_DIM:
         raise ValueError(f"head dim must be {HEAD_DIM}, got {config.head_dim}")
-    return visit_kernel_class(experts_format).get_or_build(
+    if tokens == 1:
+        cls, extra = visit_kernel_class(experts_format), {}
+    else:
+        cls, extra = multi_visit_kernel_class(experts_format), {"tokens": tokens}
+    return cls.get_or_build(
+        **extra,
         hidden=config.hidden_size,
         q_heads=config.num_q_heads,
         kv_heads=config.num_kv_heads,
@@ -128,7 +155,7 @@ def visit_kernel_for(
         rms_eps=config.rms_eps,
         qk_clip=config.qk_clip,
         rel_clip=config.rel_clip,
-        splits=FULL_SPLITS if full else SLIDING_SPLITS,
+        splits=(FULL_SPLITS if full else SLIDING_SPLITS) if tokens == 1 else BLOCK_SPLITS,
         full=full,
         width=config.moe_intermediate_size,
         experts=config.num_experts,
@@ -215,16 +242,60 @@ def mlp_lists(op: InklingVisitKernel, ctas: int) -> list[list[list[int]]]:
     return lists
 
 
+def mlp_lists_tokens(op: InklingMultiVisitKernel, ctas: int) -> list[list[list[int]]]:
+    """``mlp_lists`` of a multi-token launch: GATEUP and DOWN rows of every union slot (those
+    past the union's size are skipped at run time; the active ones are each list's first rows,
+    so they spread evenly), each token's ROUTER tiles (one per CTA: a router CTA computes its
+    token's router input itself) to the least loaded CTAs, and the REDUCE row tiles last."""
+    gate_up = [[GATEUP, t, s] for s in range(op.slots) for t in range(op.gate_tiles)]
+    # Every CTA builds the union at its first expert row (the load warp waits for it there), so
+    # each CTA takes a GATEUP row; the router CTAs take one ROUTER tile each.
+    if len(gate_up) < ctas:
+        raise ValueError(
+            f"a multi-token launch gives each of its {ctas} CTAs a gate/up row (each builds the "
+            f"expert union at its first): {op.slots} union slots x {op.gate_tiles} gate/up "
+            f"tiles are {len(gate_up)}"
+        )
+    if op.tokens * (op.experts // ROWS) > ctas:
+        raise ValueError(
+            f"a multi-token launch gives each token's router tiles CTAs of their own: "
+            f"{op.tokens} tokens x {op.experts // ROWS} tiles exceed {ctas} CTAs"
+        )
+    pairs = op.row_tiles // DOWN_TILES
+    down_rows = [[DOWN, t, s] for s in range(op.slots) for t in range(pairs)]
+    lists = [[] for _ in range(ctas)]
+    for j, row in enumerate(gate_up):
+        lists[j % ctas].append(row)
+    shift = len(gate_up) % ctas
+    for j, row in enumerate(down_rows):
+        lists[(j + shift) % ctas].append(row)
+    shift = (shift + len(down_rows)) % ctas
+    for a in range(op.row_tiles):
+        lists[(a + shift) % ctas].append([REDUCE, a, 0])
+    cost = {GATEUP: op.hidden_k_tiles, DOWN: DOWN_TILES * op.down_k_tiles, REDUCE: 1}
+    load = [sum(cost[row[0]] for row in rows) for rows in lists]
+    routers = set()
+    for token in range(op.tokens):
+        for tile in range(op.experts // ROWS):
+            cta = min((c for c in range(ctas) if c not in routers), key=lambda c: (load[c], c))
+            lists[cta].insert(0, [ROUTER, tile, token])
+            load[cta] += op.hidden_k_tiles
+            routers.add(cta)
+    return lists
+
+
 def build_visit_table(op: InklingVisitKernel, ctas: int) -> torch.Tensor:
     """The visit launch's table for ``StaticPersistent``: every CTA's attention rows, then its
     MLP rows, each half's message-gate rows first. The attention's rows (``attention_rows``)
-    and its gates' are dealt round-robin, the MLP's as ``mlp_lists``. Every CTA's rows stay in
-    the global dependency order (attention before any MLP row), so with all CTAs resident the
-    earliest unfinished row has its producers finished."""
+    and its gates' are dealt round-robin, the MLP's as ``mlp_lists`` (``mlp_lists_tokens`` for
+    a multi-token launch). Every CTA's rows stay in the global dependency order (attention
+    before any MLP row), so with all CTAs resident the earliest unfinished row has its
+    producers finished."""
     attention = deal(op.gate_rows(range(MLP_GATE)), ctas)
     attention = [g + rows for g, rows in zip(attention, deal(op.attention_rows(), ctas))]
     mlp = deal(op.gate_rows(range(MLP_GATE, GATES)), ctas)
-    mlp = [g + rows for g, rows in zip(mlp, mlp_lists(op, ctas))]
+    own = mlp_lists_tokens(op, ctas) if op.tokens > 1 else mlp_lists(op, ctas)
+    mlp = [g + rows for g, rows in zip(mlp, own)]
     return table_of([a + m for a, m in zip(attention, mlp)], WORDS)
 
 
@@ -239,31 +310,35 @@ def bf16_router(router: torch.Tensor) -> torch.Tensor:
 
 class GateArgs(NamedTuple):
     """One core layer's message gates in the kernels' form (``common.fake_gate_args``) and the
-    current pass's message halves and messages of that layer."""
+    current pass's message halves and messages of that layer (of each token of a multi-token
+    launch: halves token-minor, messages token-major within a gate)."""
 
     down: torch.Tensor  # (GATES * GATE_RANK, 2 * hidden) bf16
     fg: torch.Tensor  # (GATES * hidden, 4 * GATE_RANK) bf16 view of the fp32 [F | G] rows
-    mhalf: torch.Tensor  # (GATES * GATE_RANK,) fp32
-    messages: torch.Tensor  # (GATES, hidden) fp32
+    mhalf: torch.Tensor  # (GATES * GATE_RANK * tokens,) fp32
+    messages: torch.Tensor  # (GATES, tokens * hidden) fp32
 
     @classmethod
-    def placeholder(cls, hidden: int, device) -> "GateArgs":
+    def placeholder(cls, hidden: int, device, tokens: int = 1) -> "GateArgs":
         """Operands of the right shapes for launches without message gates (never read)."""
         rows = GATES * GATE_RANK
         return cls(
             torch.zeros(rows, 2 * hidden, device=device, dtype=torch.bfloat16),
             torch.zeros(GATES * hidden, 4 * GATE_RANK, device=device, dtype=torch.bfloat16),
-            torch.zeros(rows, device=device),
-            torch.zeros(GATES, hidden, device=device),
+            torch.zeros(rows * tokens, device=device),
+            torch.zeros(GATES, tokens * hidden, device=device),
         )
 
 
 class MessageGates:
     """The message gates of the core layers ``core`` (in order) in the kernels' form and one
-    pass's message buffers, which ``InklingMsgMegakernel`` fills from ``message_queries``
-    (``(layers, GATES, hidden)`` fp32) and the pass's launches read (``layer``)."""
+    pass's message buffers for ``tokens`` tokens, which ``InklingMsgMegakernel`` fills from
+    ``message_queries`` (``(layers, GATES, hidden)`` fp32) and the pass's launches read
+    (``layer``)."""
 
-    def __init__(self, core: tuple[LayerWeights, ...], message_queries: torch.Tensor):
+    def __init__(
+        self, core: tuple[LayerWeights, ...], message_queries: torch.Tensor, tokens: int = 1
+    ):
         down = torch.stack([torch.stack([g.down for g in w.gates]) for w in core])
         if down.shape[2] != GATE_RANK:
             raise ValueError(f"the kernels' message gates have rank {GATE_RANK}")
@@ -274,14 +349,27 @@ class MessageGates:
         )  # (layers, GATES, hidden, 2 * GATE_RANK) fp32
         self.fg = fg.contiguous().view(torch.bfloat16).reshape(layers, GATES * hidden, -1)
         self.queries = message_queries.reshape(layers * GATES, hidden).contiguous()
-        self.messages = torch.zeros_like(self.queries)
-        self.mhalf = torch.zeros(layers * GATES * GATE_RANK, device=self.queries.device)
+        self.with_buffers(tokens)
+
+    def with_buffers(self, tokens: int):
+        """Allocates the message buffers of ``tokens`` tokens."""
+        self.tokens = tokens
+        rows, hidden = self.queries.shape
+        self.messages = torch.zeros(rows, tokens * hidden, device=self.queries.device)
+        self.mhalf = torch.zeros(rows * GATE_RANK * tokens, device=self.queries.device)
+
+    def for_tokens(self, tokens: int) -> "MessageGates":
+        """These gates (weights shared) with message buffers of ``tokens`` tokens."""
+        other = copy.copy(self)
+        other.with_buffers(tokens)
+        return other
 
     def layer(self, core: int) -> GateArgs:
         """Core layer ``core``'s gates and the current pass's message state."""
         rows = slice(core * GATES * GATE_RANK, (core + 1) * GATES * GATE_RANK)
+        halves = slice(rows.start * self.tokens, rows.stop * self.tokens)
         messages = self.messages[core * GATES : (core + 1) * GATES]
-        return GateArgs(self.down[rows], self.fg[core], self.mhalf[rows], messages)
+        return GateArgs(self.down[rows], self.fg[core], self.mhalf[halves], messages)
 
 
 def device_position(positions: torch.Tensor) -> torch.Tensor:
@@ -347,11 +435,11 @@ class VisitLayer:
 
 
 class EmbedArgs(NamedTuple):
-    """The token's embedding, read by layer 0's visit launch."""
+    """The token's (tokens') embedding, read by layer 0's visit launch."""
 
     table: torch.Tensor  # (vocab rows, hidden) bf16
     norm: torch.Tensor  # (hidden,) bf16
-    token: torch.Tensor  # (1,) int64
+    token: torch.Tensor  # (tokens,) int64
 
 
 class InklingVisitMegakernel:
@@ -363,7 +451,9 @@ class InklingVisitMegakernel:
     occupies every SM until it finishes and fails (CUDA error 720) where its one-CTA-per-SM
     grid cannot be resident at once (see the module docstring). ``trace``: compile with ranges
     for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (``traced``) or
-    ``"iket"``; ``trace_events``: per-role capacity (see ``Launch``; raise it for long contexts)."""
+    ``"iket"``; ``trace_events``: per-role capacity (see ``Launch``; raise it for long contexts).
+    ``tokens``: consecutive tokens of one sequence per launch (``multi_kernel`` when more than
+    one); ``args``: another runner's kernel-form layer arguments to share (same layers)."""
 
     def __init__(
         self,
@@ -372,14 +462,16 @@ class InklingVisitMegakernel:
         device="cuda",
         trace: str | None = None,
         trace_events: int | None = None,
+        tokens: int = 1,
+        args: dict | None = None,
     ):
-        self.config = config
-        self.args = {id(w): VisitLayer.of(config, w) for w in layers}
+        self.config, self.tokens = config, tokens
+        self.args = args or {id(w): VisitLayer.of(config, w) for w in layers}
         self.layers = layers  # keeps the ids of ``args`` valid
         formats = sorted({(a.experts_format, a.activation_format) for a in self.args.values()})
         self.launches = {
             (full, messages, *fmt): Launch(
-                visit_kernel_for(config, full, messages, *fmt),
+                visit_kernel_for(config, full, messages, *fmt, tokens),
                 build_visit_table,
                 device,
                 trace,
@@ -391,11 +483,11 @@ class InklingVisitMegakernel:
         }
         self.last: Launch | None = None  # the launch state of the last call
         hidden = config.hidden_size
-        self.no_gates = GateArgs.placeholder(hidden, device)
+        self.no_gates = GateArgs.placeholder(hidden, device, tokens)
         self.no_embed = EmbedArgs(
             torch.zeros(1, hidden, device=device, dtype=torch.bfloat16),
             torch.zeros(hidden, device=device, dtype=torch.bfloat16),
-            torch.zeros(1, device=device, dtype=torch.int64),
+            torch.zeros(tokens, device=device, dtype=torch.int64),
         )
 
     def launch_of(self, w: LayerWeights, layer: int, messages: bool) -> Launch:
@@ -430,7 +522,9 @@ class InklingVisitMegakernel:
         input). With ``embed`` (layer 0 only), the launch computes ``h`` itself,
         ``ref.hidden_states``' normalized embedding of the token, and stores it into ``h``.
         Returns the bf16 ``(hidden,)`` visit output (into ``out`` if given); ``residual()``
-        holds the post-attention residual.
+        holds the post-attention residual. A ``tokens``-token runner takes ``(tokens, hidden)``
+        states (token t at position ``positions + t``) and returns ``(tokens, hidden)``; then
+        ``pos + tokens <= cache.max_len`` is the contract.
 
         The position must satisfy ``0 <= pos < cache.max_len``: the caller owns it and the
         launch reads it on the device, so it is not checked here. Only ``pos >= max_len`` is
@@ -446,13 +540,17 @@ class InklingVisitMegakernel:
         if gates is not None and w.attn_query is None:
             raise ValueError("message gates need a layer with a block-residual query")
         boundary = layer % config.block_layers == 0
-        h = h.reshape(hidden)
-        states = [b.reshape(hidden) for b in blocks] + ([h] if boundary else [])
+        if not h.is_contiguous() or (out is not None and not out.is_contiguous()):
+            raise ValueError("the launch writes h and out in place: they must be contiguous")
+        size = self.tokens * hidden
+        h = h.view(size)
+        states = [b.reshape(size) for b in blocks] + ([h] if boundary else [])
         if len(states) > MAX_BLOCKS:
             raise ValueError(f"the MLP half reads at most {MAX_BLOCKS} blocks")
         states += [h] * (MAX_BLOCKS - len(states))  # unread
         if out is None:
-            out = torch.empty(hidden, device=h.device, dtype=torch.bfloat16)
+            shape = (hidden,) if self.tokens == 1 else (self.tokens, hidden)
+            out = torch.empty(shape, device=h.device, dtype=torch.bfloat16)
         self.last = launch
         table, norm, token = embed or self.no_embed
         compile_visit_kernel(launch.op)(
@@ -495,9 +593,9 @@ class InklingVisitMegakernel:
             cache.conv_v[visit],
             cache.conv_attn[visit],
             cache.conv_mlp[visit],
-            token.reshape(1),
+            token.reshape(self.tokens),
             device_position(positions),
-            out,
+            out.view(size),
             launch.trace_buffer,
             launch.scratch,
             launch.state,
@@ -527,15 +625,35 @@ class InklingVisitMegakernel:
                     launch.trace_buffer = placeholder
 
     def residual(self) -> torch.Tensor:
-        """The fp32 ``(hidden,)`` post-attention residual of the last launch, from its tagged
-        words (valid until the next launch)."""
-        return self.last.values("resid")
+        """The fp32 ``(hidden,)`` (``(tokens, hidden)``) post-attention residual of the last
+        launch, from its tagged words (valid until the next launch)."""
+        resid = self.last.values("resid")
+        return resid if self.tokens == 1 else resid.view(self.tokens, -1)
+
+    def union_size(self) -> torch.Tensor:
+        """A multi-token runner's last launch: the number of distinct experts its tokens
+        routed to, as a one-element fp32 device tensor (valid until the next launch)."""
+        return self.last.values("union")[:1]
 
     def activations(self) -> torch.Tensor:
-        """The bf16 ``(experts_per_token, width)`` down inputs of the last launch (``bf16(swiglu
-        * routing weight)`` per slot, the experts ascending), from its tagged words (valid
-        until the next launch)."""
-        return self.last.values("act").view(self.last.op.top_k, -1).to(torch.bfloat16)
+        """The bf16 ``(rows, width)`` down inputs of the last launch, ``bf16(swiglu * routing
+        weight)`` per routed (token, expert) row, the experts ascending and each expert's
+        tokens in order (``ref.declared_activations``' rows), from its tagged words (valid
+        until the next launch; a multi-token runner syncs to read the union)."""
+        act = self.last.values("act").to(torch.bfloat16)
+        if self.tokens == 1:
+            return act.view(self.last.op.top_k, -1)
+        act = act.view(self.last.op.slots, self.tokens, -1)
+        return torch.cat([act[s, :rows] for s, (_, rows) in enumerate(self.routed_rows())])
+
+    def routed_rows(self) -> list[tuple[int, int]]:
+        """``(expert, rows)`` of each expert the last multi-token launch routed to, in its union
+        order (ascending), from its tagged words (syncs)."""
+        op, union = self.last.op, self.last.values("union").int()
+        size = int(union[0])
+        experts = union[UNION_EXPERTS:][:size].tolist()
+        counts = union[UNION_EXPERTS + op.slot_words :][:size].tolist()
+        return list(zip(experts, counts))
 
     def routed_experts(self, w: LayerWeights) -> torch.Tensor:
         """The ``(experts_per_token,)`` experts the last launch (which must be of layer weights
@@ -544,17 +662,23 @@ class InklingVisitMegakernel:
         expert index; ``torch.topk`` does not promise an order among ties). A diagnostic of the
         published logits, not the IDs the kernel dispatched: each CTA selects those in shared
         memory and publishes none."""
-        keys = torch.sigmoid(self.last.values("logits")) + w.router_bias
+        logits = self.last.values("logits")
+        if self.tokens > 1:  # (tokens, experts)
+            logits = logits.view(self.tokens, -1)
+        keys = torch.sigmoid(logits) + w.router_bias
         order = torch.sort(keys, descending=True, stable=True).indices
-        return order[: self.last.op.top_k].sort().values
+        return order[..., : self.last.op.top_k].sort().values
 
 
 class InklingMsgMegakernel:
     """Launch state of the message kernel over ``gates``' core layers: each call fills
-    ``gates.messages`` and ``gates.mhalf`` for the next pass."""
+    ``gates.messages`` and ``gates.mhalf`` for the next pass (of ``gates.tokens`` tokens)."""
 
     def __init__(self, config: InklingConfig, gates: MessageGates, device="cuda"):
-        op = InklingMsgKernel.get_or_build(hidden=config.hidden_size, rms_eps=config.rms_eps)
+        extra = {} if gates.tokens == 1 else {"tokens": gates.tokens}
+        op = InklingMsgKernel.get_or_build(
+            hidden=config.hidden_size, rms_eps=config.rms_eps, **extra
+        )
         tiles = gates.queries.shape[0] * GATE_TILES
 
         def build(op, ctas):
@@ -582,15 +706,17 @@ class InklingMsgMegakernel:
 
 class InklingHeadMegakernel:
     """Launch state of the head kernel (final block residual, norm, LM head, softcap) for
-    ``weights``."""
+    ``weights``, over ``tokens`` tokens."""
 
-    def __init__(self, weights: InklingWeights, device="cuda"):
+    def __init__(self, weights: InklingWeights, device="cuda", tokens: int = 1):
         config = weights.config
+        self.tokens = tokens
         op = InklingHeadKernel.get_or_build(
             hidden=config.hidden_size,
             vocab=config.vocab_size,
             rms_eps=config.rms_eps,
             softcap=config.logit_softcap,
+            **({} if tokens == 1 else {"tokens": tokens}),
         )
 
         def build(op, ctas):
@@ -600,13 +726,17 @@ class InklingHeadMegakernel:
         self.weights = weights
         self.query = weights.final_query[None].contiguous()
         self.norm = weights.final_norm[None].contiguous()
-        self.logits = torch.empty(config.vocab_size, device=device)
+        shape = (config.vocab_size,) if tokens == 1 else (tokens, config.vocab_size)
+        self.logits = torch.empty(shape, device=device)
+        # Multi-token heads also export the final normalized states (DSpark's features).
+        self.normed = torch.zeros(tokens, config.hidden_size, device=device, dtype=torch.bfloat16)
 
     def __call__(self, blocks: list[torch.Tensor], h: torch.Tensor) -> torch.Tensor:
         """``ref.logits_of`` of ``ref.hidden_states``' last block residual and norm over bf16
         ``blocks`` (1 to MAX_BLOCKS) and the last visit's output ``h``: fp32 ``(vocab,)``
-        logits (a buffer the next call overwrites)."""
-        hidden = self.weights.config.hidden_size
+        logits (a buffer the next call overwrites); ``(tokens, vocab)`` from ``(tokens,
+        hidden)`` states for a multi-token head."""
+        hidden = self.tokens * self.weights.config.hidden_size
         if not 1 <= len(blocks) <= MAX_BLOCKS:
             raise ValueError(f"need 1 to {MAX_BLOCKS} blocks, got {len(blocks)}")
         states = [b.reshape(hidden) for b in blocks]
@@ -619,7 +749,8 @@ class InklingHeadMegakernel:
             h.reshape(hidden),
             *states,
             len(blocks),
-            self.logits,
+            self.logits.view(-1),
+            self.normed.view(-1),
             launch.table,
             launch.workspace,
             launch.max_ctas,
@@ -627,12 +758,36 @@ class InklingHeadMegakernel:
         return self.logits
 
 
+def check_block_tokens(block_tokens: int):
+    """``InklingDecoder``'s block sizes: ``spec.BLOCK_TOKENS``."""
+    if block_tokens not in BLOCK_TOKENS:
+        raise ValueError(f"block_tokens must be one of {BLOCK_TOKENS}, got {block_tokens}")
+
+
+def check_feature_visits(config: InklingConfig):
+    """``InklingDecoder.decode_block``'s features read the input of each visit in
+    ``FEATURE_VISITS`` as the previous visit's output (``block_states``): the visits must exist,
+    and none may restart a core pass (whose input is the prelude's output)."""
+    if max(FEATURE_VISITS) >= config.num_visits:
+        raise ValueError(
+            f"feature visits {FEATURE_VISITS} need more than {config.num_visits} visits"
+        )
+    restarts = {v for v, layer, p in config.visits() if layer == config.loop_start and p}
+    if restarts & set(FEATURE_VISITS):
+        raise ValueError(f"feature visits {FEATURE_VISITS} must not restart a core pass")
+
+
 class InklingDecoder:
     """The batch-one decode step of ``weights`` as megakernel launches only: ``ref.hidden_states``
-    and ``ref.logits_of`` of one token at a device position, ``start=None``. Calls must run
-    one at a time in stream order (they share the runners' state and the step buffers)."""
+    and ``ref.logits_of`` of one token at a device position, ``start=None``. With
+    ``block_tokens``, ``decode_block`` runs the same step over that many consecutive tokens
+    (``multi_kernel``; the speculative-decoding verify block and a chunked prefill), with
+    runners of its own sharing the layers' kernel-form arguments and gate weights. Calls must
+    run one at a time in stream order (they share the runners' state and the step buffers)."""
 
-    def __init__(self, weights: InklingWeights, device="cuda"):
+    def __init__(self, weights: InklingWeights, device="cuda", block_tokens: int | None = None):
+        if block_tokens is not None:
+            check_block_tokens(block_tokens)
         config = weights.config
         blocks = config.block_layers
         # A pass's messages read two states (the core's second block input and its output), and
@@ -653,6 +808,21 @@ class InklingDecoder:
         self.states = torch.zeros(
             config.num_visits + 1, hidden, device=device, dtype=torch.bfloat16
         )
+        self.block_tokens = block_tokens
+        if block_tokens is not None:
+            t = block_tokens
+            self.block_gates = self.gates.for_tokens(t)
+            self.block_visit = InklingVisitMegakernel(
+                config, weights.layers, device=device, tokens=t, args=self.visit.args
+            )
+            self.block_msg = InklingMsgMegakernel(config, self.block_gates, device)
+            self.block_head = InklingHeadMegakernel(weights, device=device, tokens=t)
+            self.block_states = torch.zeros(
+                config.num_visits + 1, t, hidden, device=device, dtype=torch.bfloat16
+            )
+            self.block_features = torch.zeros(
+                t, len(FEATURE_VISITS) + 1, hidden, device=device, dtype=torch.bfloat16
+            )
 
     def __call__(
         self, token: torch.Tensor, pos: torch.Tensor, cache: InklingCache
@@ -661,10 +831,46 @@ class InklingDecoder:
         position ``pos`` (int32 avoids a cast); writes the caches there and returns fp32 logits
         ``(vocab,)`` (a buffer the next step overwrites). Syncs nothing, so ``pos`` is not
         checked: the caller keeps ``0 <= pos < cache.max_len``."""
+        runners = (self.visit, self.msg, self.head, self.gates, self.states)
+        return self.step(runners, token.reshape(1), pos, cache)
+
+    def decode_block(
+        self, tokens: torch.Tensor, pos: torch.Tensor, cache: InklingCache, features=False
+    ):
+        """The step over ``block_tokens`` consecutive int64 ``tokens`` at positions ``pos ..
+        pos + block_tokens - 1`` (``pos`` a one-element device position): writes the caches
+        there and returns fp32 logits ``(block_tokens, vocab)``, token t's at row t (a buffer
+        the next call overwrites), as ``ref.forward_tokens(..., all_logits=True)`` with
+        ``start=None``. Syncs nothing: the caller keeps ``0 <= pos`` and ``pos +
+        block_tokens <= cache.max_len``. With ``features``, returns ``(logits, features)``:
+        bf16 ``(block_tokens, 4, hidden)`` of each token's inputs to visits ``FEATURE_VISITS``
+        and its final normalized state (the DSpark drafter's target features; a buffer the
+        next call overwrites), which needs ``check_feature_visits``' model shape."""
+        if self.block_tokens is None:
+            raise ValueError("this decoder was built without block_tokens")
+        if features:
+            check_feature_visits(self.config)
+        tokens = tokens.reshape(-1)
+        if tokens.numel() != self.block_tokens:
+            raise ValueError(f"need {self.block_tokens} tokens, got {tokens.numel()}")
+        runners = (self.block_visit, self.block_msg, self.block_head, self.block_gates,
+                   self.block_states)  # fmt: skip
+        logits = self.step(runners, tokens, pos, cache)
+        if not features:
+            return logits
+        for i, visit in enumerate(FEATURE_VISITS):
+            self.block_features[:, i].copy_(self.block_states[visit])
+        self.block_features[:, -1].copy_(self.block_head.normed)
+        return logits, self.block_features
+
+    def step(self, runners, tokens, pos, cache) -> torch.Tensor:
+        """The launches of one step on ``runners`` (visit, message and head runners, message
+        gates, per-visit states)."""
+        visit_runner, msg, head, message_gates, states = runners
         config, weights = self.config, self.weights
         positions = device_position(pos)
-        embed = EmbedArgs(weights.embed, weights.embed_norm, token.reshape(1))
-        h = self.states[0]
+        embed = EmbedArgs(weights.embed, weights.embed_norm, tokens)
+        h = states[0]
         blocks: list[torch.Tensor] = []
         pre_loop = None  # the prelude's output and blocks, where every core pass restarts
         for visit, layer, p in config.visits():
@@ -676,16 +882,16 @@ class InklingDecoder:
                 elif core == 0:
                     # The finished pass's messages: its core's second block input and output.
                     (block,) = blocks[len(pre_loop[1]) + 1 :]
-                    self.msg(block, h)
+                    msg(block, h)
                     h, blocks = pre_loop
                 if p > 0:
-                    gates = self.gates.layer(core)
-            out = self.states[visit + 1]
-            self.visit(
+                    gates = message_gates.layer(core)
+            out = states[visit + 1]
+            visit_runner(
                 weights.layers[layer], layer, visit, h, blocks, cache, positions, out, gates,
                 embed if visit == 0 else None,
             )  # fmt: skip
             if layer % config.block_layers == 0:  # h completes a block
                 blocks = blocks + [h]
             h = out
-        return self.head(blocks, h)
+        return head(blocks, h)

@@ -59,6 +59,7 @@ from cutlass import BFloat16, Float32, Int32, cute
 from attn_gym.warpdrive.examples.inkling_megakernel.common import (
     MAX_BLOCKS,
     RING,
+    add_offset,
     conv_inputs,
     post_conv,
 )
@@ -211,7 +212,7 @@ class AttentionHalf:
         if op == QKV:
             for i in cutlass.range_constexpr(count):
                 if b == self.matrices[i]:
-                    w = load_tiles(
+                    w = self.load_stages(
                         w, p.tma_attn[i], p.gmem_attn[i], a, 0, self.hidden_k_tiles, "W"
                     )
         elif op == ATTN:
@@ -223,7 +224,9 @@ class AttentionHalf:
                 w = load_tiles(w, p.tma_kv[1], p.gmem_kv[1], row0 + blk, 0, 1, "KV")
         else:
             k_tiles = self.oproj_k_tiles
-            w = load_tiles(w, p.tma_attn[count], p.gmem_attn[count], a, b * k_tiles, k_tiles, "W")
+            w = self.load_stages(
+                w, p.tma_attn[count], p.gmem_attn[count], a, b * k_tiles, k_tiles, "W"
+            )
         return w
 
     @cute.jit
@@ -279,13 +282,13 @@ class AttentionHalf:
 
     @cute.jit
     def embed_token(self, p, x, slot: cutlass.Constexpr, store: cutlass.Constexpr, tid, warp,
-                    lane):  # fmt: skip
+                    lane, token=0):  # fmt: skip
         """State ``x[slot]`` (``load_states`` left it zero) becomes the token's
         embedding row through the weighted RMSNorm (``ref.hidden_states``' first ``h``); with
         ``store``, CTA 0 also stores it to ``h`` for the launches after this one (CTAs of this
-        launch recompute it rather than read it)."""
+        launch recompute it rather than read it). ``token``: of a multi-token launch."""
         per = self.hidden // COMPUTE_THREADS
-        row = Int32(p.token[0])
+        row = Int32(p.token[token])
         ss = Float32(0.0)
         for r in cutlass.range_constexpr(per):
             v = Float32(p.embed[row, r * COMPUTE_THREADS + tid])
@@ -300,7 +303,7 @@ class AttentionHalf:
             x[slot, r] = Float32(v)
             if cutlass.const_expr(store):
                 if first:
-                    p.h[k] = v
+                    p.h[add_offset(k, token * self.hidden)] = v
         # The prologue's reductions reuse RED slot 0.
         self.csync.sync()
 
@@ -739,12 +742,16 @@ class AttentionHalf:
 
     # ------------------------------------------------------------- TMA atoms
 
+    def weight_atom(self, src):
+        """TMA ``(atom, tensor)`` of a weight matrix's GEMV stages: 32 x 256 tiles."""
+        return tma_atom(src, (ROWS, TILE_K))
+
     @cute.jit
     def attention_atoms(self, by_matrix: dict, wo, k_cache, v_cache):
         """TMA ``(atom, tensor)`` pairs: 32 x 256 weight tiles of the projection matrices in
         ``matrices`` order (sliding layers have no dynamic taps) and of wo, then 64 x 128 KV
         blocks of the caches."""
         sources = [by_matrix[m] for m in self.matrices] + [wo]
-        weights = [tma_atom(src, (ROWS, TILE_K)) for src in sources]
+        weights = [self.weight_atom(src) for src in sources]
         caches = [tma_atom(src, (BLOCK, HEAD_DIM)) for src in (k_cache, v_cache)]
         return weights, caches

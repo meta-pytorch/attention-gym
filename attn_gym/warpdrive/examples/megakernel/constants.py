@@ -17,4 +17,13 @@ RED_VALUES = 16  # values a ``regmath.cta_sum`` slot reduces at once
 # Sleep between failed polls of a wait that spans other CTAs' work (``tagged.fetch``'s backoff).
 BACKOFF_NS = 100
 EVICT_FIRST = 0x12F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_FIRST)
+EVICT_LAST = 0x14F0000000000000  # TMA L2 cache hint (CUTLASS CacheHintSm90::EVICT_LAST)
 LOG2E = 1.4426950408889634
+# The multi-token GEMVs' geometry (``multi_gemv``), which TMA boxes and shared-memory plans take:
+# defined here so that a launch whose module does not import ``multi_gemv`` (Inkling's one-token
+# visit) keeps it out of its compile key.
+MMA_N = 8  # tokens per MMA
+BOX = 64  # bf16 columns per swizzled box (128 bytes)
+QBOX = 32  # quantized words per swizzled box
+X_PAD = 8  # bf16 elements after each GEMV input row: rows 4 mod 32 words apart
+DBUF_FLOATS = 4 * 32 * MMA_N  # ``multi_gemv.finish``'s partial tiles: quarter, row, token

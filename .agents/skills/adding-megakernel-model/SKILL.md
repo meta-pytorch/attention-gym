@@ -9,7 +9,8 @@ The package contracts (what belongs in `examples/megakernel/`, compile-key hygie
 rules) live in [`attn_gym/warpdrive/examples/megakernel/AGENTS.md`](../../../attn_gym/warpdrive/examples/megakernel/AGENTS.md);
 read it first. Read [`authoring-warpdrive`](../authoring-warpdrive/SKILL.md) before writing
 kernels, and use the closest model directory (`qwen_megakernel/`, `inkling_megakernel/`) as
-the worked example.
+the worked example; for a dense sliding-window GQA layer the closest is the DSpark drafter's
+`inkling_megakernel/draft_backbone_kernel.py`.
 
 Routing: a new model's decode, its chat family, or moving a piece between a model directory and
 the package uses this skill. Tuning one existing kernel (`cutedsl-performance`) or changing a
@@ -67,6 +68,11 @@ Climb in order; each rung is tested against the previous ones before the next st
    `MultiTokenBackend`. Gates: the drafter against its reference implementation; the step,
    eager and replayed from a CUDA graph, equal to a host loop over the same verify forward and
    drafter; acceptance rates measured on varied prompts before claiming a speedup.
+8. **Multi-token verify.** A block form of the per-layer kernels on `megakernel.multi_gemv` as
+   the `TargetBlock`, and the drafter as launches, so draft and verify are megakernel launches
+   (acceptance stays a few torch kernels); prefill through `spec.prefill_blocks`. Gates: every
+   exposed block size against the oracle, NaN-filled masked rows, the one-token kernels' PTX
+   unchanged, and the verify cost per `k` measured against the one-token step.
 
 ## Moving code into the package
 

@@ -19,6 +19,7 @@ is the target's greedy decode in the rounding of a ``k``-token forward, whatever
 Rejected positions need no undo when the target's caches are indexed by position: the next
 block rewrites them. A target with state that is not (short-convolution rings, recurrent state)
 bounds ``k`` by how far that state can rewind; ``inkling_megakernel.spec`` is the example.
+``prefill_blocks`` feeds a prompt through the same block step, committing the drafter's context.
 """
 
 from typing import Protocol
@@ -27,7 +28,8 @@ import torch
 
 
 class DraftModel(Protocol):
-    """A drafter on the device (``inkling_megakernel.dspark.DSparkDrafter(static=True)``).
+    """A drafter on the device (``inkling_megakernel.dspark.DSparkDrafter(static=True)``,
+    ``inkling_megakernel.draft.DSparkMegakernel``).
 
     ``num_drafts``: the drafts ``propose`` returns, ``k - 1`` for blocks of ``k`` tokens.
     ``commit`` stores the target's ``features`` (one row per position, in whatever form the
@@ -50,17 +52,42 @@ class DraftModel(Protocol):
 
 class TargetBlock(Protocol):
     """The target over a block of ``tokens`` consecutive tokens
-    (``inkling_megakernel.spec.TorchTargetBlock``): ``block(tokens, pos)`` feeds int64
-    ``(tokens,)`` at ``pos .. pos + tokens - 1`` (``pos`` a one-element int64 or int32 device
-    position), writes the caches there, and returns fp32 ``(tokens, vocab)`` logits and the
-    drafter's features (``DraftModel.commit``'s; ``SpecStep`` passes them on unread), row ``t``
-    token ``t``'s, causal within the block. No host sync."""
+    (``inkling_megakernel.spec.TorchTargetBlock``, ``DecoderTargetBlock``): ``block(tokens,
+    pos)`` feeds int64 ``(tokens,)`` at ``pos .. pos + tokens - 1`` (``pos`` a one-element
+    int64 or int32 device position), writes the caches there, and returns fp32 ``(tokens,
+    vocab)`` logits and the drafter's features (``DraftModel.commit``'s; ``SpecStep`` passes
+    them on unread), row ``t`` token ``t``'s, causal within the block. No host sync."""
 
     tokens: int
 
     def __call__(
         self, tokens: torch.Tensor, pos: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+def prefill_blocks(
+    target: TargetBlock, drafter: DraftModel, tokens: torch.Tensor, start: int
+) -> torch.Tensor:
+    """Feed int64 ``tokens`` at positions ``start ..`` through ``target`` in blocks of
+    ``target.tokens``, committing each block's features to ``drafter``; returns the last
+    token's fp32 ``(vocab,)`` logits (a view of the target's buffer). The last block is padded
+    with copies of the last token: like a speculative step's rejected rows, the padding's
+    positions are written (the caches need ``target.tokens - 1`` positions past the prompt)
+    and rewritten by the next block before anything reads them, and its features are committed
+    with ``last`` at the last token. Block rows must be causal, so the padding changes no
+    earlier row."""
+    k, n = target.tokens, tokens.numel()
+    padded = torch.cat([tokens.reshape(-1), tokens.reshape(-1)[-1:].expand(-n % k)])
+    # Device positions and row indices built once: no host-to-device copy (a stream sync) per
+    # block.
+    positions = torch.arange(start, start + padded.numel(), device=tokens.device)
+    rows_of = torch.arange(k, device=tokens.device)
+    for first in range(0, n, k):
+        block = positions[first : first + k]
+        logits, features = target(padded[first : first + k], block[:1])
+        rows = min(k, n - first)
+        drafter.commit(features, block, None if rows == k else rows_of[rows - 1 : rows])
+    return logits[rows - 1]
 
 
 def accepted_drafts(drafts: torch.Tensor, verified: torch.Tensor) -> torch.Tensor:

@@ -2,12 +2,17 @@
 
     python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --backend reference --prompt "Hi"
 
-Prefill runs the PyTorch oracle (``quant.forward_tokens``: ``ref.forward_tokens``, one forward
-pass into the caches, dequantizing only the routed experts of a quantized model), except on the
+Prefill runs the PyTorch oracle (``quant.forward_tokens``: ``ref.forward_tokens``, one forward pass
+into the caches, dequantizing only the routed experts of a quantized model), except on the
 megakernel backends, which feed prompts of up to ``ORACLE_PREFILL`` tokens through their decode
 step one token at a time, so that the caches come from the same kernels as the reply. The oracle
 prefill is host-bound: about 2.1 s plus 0.9 ms per token, against 3.4 ms per decode step (GB300,
-quantized experts, 2026-11-23), so it wins only past about 850 tokens. Backends:
+quantized experts, 2026-11-23), so it wins only past about 850 tokens. The speculative megakernel
+backends feed every prompt through their verify block instead
+(``examples.megakernel.spec.prefill_blocks``): about 1.1 ms per token at ``k`` = 4, 0.57 s for 500
+tokens and 2.3 s for 2000 against the oracle's 3.6 and 4.0 s. The oracle's fixed 2.1 s would pay
+off only past roughly 8-10k tokens; the block path is kept at every length so that the caches come
+from the same kernels as the reply. Backends:
 
 - ``reference``: the oracle, one eager step at a time (a host sync per step: no CUDA graph);
 - ``torch``: ``fast.decode_step`` (the oracle's dataflow on capturable kernels) in CUDA graphs;
@@ -23,7 +28,14 @@ quantized experts, 2026-11-23), so it wins only past about 850 tokens. Backends:
   (``examples.megakernel.spec.SpecStep``: draft, a ``k``-token verify through ``fast.py``'s kernels
   and acceptance on the device), in CUDA graphs; ``--verify-tokens`` picks the verify block ``k``
   (2 to 8, default ``SPEC_TOKENS``). Greedy only; its prefill (the oracle's) also records the
-  drafter's context.
+  drafter's context;
+- ``megakernel-spec``: the same speculative step on megakernel launches only: the verify block
+  on the multi-token decoder (``megakernel.InklingDecoder.decode_block``, quantized experts as
+  ``megakernel``) and the drafter's launches (``draft.DSparkMegakernel``); its prefill runs the
+  verify block over the prompt, so its replies are the greedy decode in the ``k``-token block's
+  rounding, which resolves near ties unlike ``megakernel``'s one-token step.
+  ``--verify-tokens`` picks ``k`` among 2, 4 and 8 (``spec.BLOCK_TOKENS``);
+  ``megakernel-spec-bf16`` takes bf16 experts.
 
 The other backends load bf16 experts. Every backend computes the experts' numerics the
 checkpoint declares (``ref.ExpertQuant``: quantized inputs, as vLLM's SM100 kernels), not HF's.
@@ -52,10 +64,14 @@ from attn_gym.warpdrive.examples.inkling_megakernel.ref import (
     forward_tokens,
     load_inkling_weights,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.spec import TorchTargetBlock
+from attn_gym.warpdrive.examples.inkling_megakernel.spec import (
+    BLOCK_TOKENS,
+    DecoderTargetBlock,
+    TorchTargetBlock,
+)
 from attn_gym.warpdrive.examples.megakernel.chat import SYNC_EVERY, ChatOptions, run
 from attn_gym.warpdrive.examples.megakernel.constants import BLOCK
-from attn_gym.warpdrive.examples.megakernel.spec import SpecStep
+from attn_gym.warpdrive.examples.megakernel.spec import SpecStep, prefill_blocks
 
 __all__ = ["DEFAULT_BACKEND", "OPTIONS", "check_options", "checkpoint_dir", "load_chat_model"]
 
@@ -160,7 +176,10 @@ class Compile(Torch):
     compiled = True
 
 
-SPEC_TOKENS = 4  # the default verify block k
+# The default verify block k. GB300 chat replies (5 prompts x low/high effort, 256 tokens), the
+# geometric mean of each reply's tok/s ratio to megakernel's at context ~40 / ~1100: k=2 1.19x /
+# 1.22x, k=4 1.24x / 1.36x, k=8 0.99x / 1.10x (2026-11-22; docs/warpdrive/examples.md).
+SPEC_TOKENS = 4
 
 
 class Speculative(Backend):
@@ -217,6 +236,47 @@ class SpecTorch(Speculative):
         return logits
 
 
+class MegakernelSpec(Speculative):
+    """``Speculative`` on megakernel launches: ``spec.DecoderTargetBlock`` (the multi-token
+    decoder) and ``draft.DSparkMegakernel``."""
+
+    quantized = True
+    max_len_multiple = BLOCK  # the KV block
+    verify_tokens = BLOCK_TOKENS
+
+    def __init__(
+        self, weights, cache: InklingCache, checkpoint: Path, tokens_per_step: int = SPEC_TOKENS
+    ):
+        from attn_gym.warpdrive.examples.inkling_megakernel.draft import DSparkMegakernel
+        from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
+            FEATURE_VISITS,
+            InklingDecoder,
+        )
+
+        super().__init__(weights, cache, checkpoint, tokens_per_step)
+        draft = load_dspark_weights(weights, checkpoint)
+        if draft.config.target_visits != (*FEATURE_VISITS, weights.config.num_visits):
+            raise ValueError(
+                f"the decoder exports features of {FEATURE_VISITS} and the final state"
+            )
+        k = self.tokens_per_step
+        decoder = InklingDecoder(weights, block_tokens=k)
+        self.target = DecoderTargetBlock(decoder, cache)
+        self.drafter = DSparkMegakernel(draft, self.drafter_max_len(cache, draft), k - 1)
+        self.spec = SpecStep(self.target, self.drafter)
+
+    def prefill(self, ids: list[int], start: int) -> torch.Tensor:
+        """``examples.megakernel.spec.prefill_blocks`` of ``ids`` at ``start ..``: the last
+        token's logits."""
+        return prefill_blocks(self.target, self.drafter, torch.tensor(ids, device="cuda"), start)
+
+
+class MegakernelSpecBf16(MegakernelSpec):
+    """``MegakernelSpec`` on the experts dequantized to bf16."""
+
+    quantized = False
+
+
 BACKENDS = {
     "reference": Reference,
     "torch": Torch,
@@ -224,6 +284,8 @@ BACKENDS = {
     "megakernel": Megakernel,
     "megakernel-bf16": MegakernelBf16,
     "spec-torch": SpecTorch,
+    "megakernel-spec": MegakernelSpec,
+    "megakernel-spec-bf16": MegakernelSpecBf16,
 }
 DEFAULT_BACKEND = "megakernel"
 OPTIONS = frozenset({"reasoning_effort", "verify_tokens"})
