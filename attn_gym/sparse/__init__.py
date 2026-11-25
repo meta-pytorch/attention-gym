@@ -8,7 +8,7 @@ from .gather_attn import (
     RopePair,
     gather_attn,
 )
-from .indexer import IndexerKernelOptions, lightning_indexer
+from .indexer import IndexerKernelOptions, lightning_indexer, paged_indexer_key_update
 from .paged_decode import PagedKV, PagedSparseDecodeAux, paged_sparse_decode
 
 __all__ = [
@@ -22,5 +22,6 @@ __all__ = [
     "RopePair",
     "gather_attn",
     "lightning_indexer",
+    "paged_indexer_key_update",
     "paged_sparse_decode",
 ]
