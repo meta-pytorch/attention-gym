@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 
+@torch.no_grad()
 def launch(
     q: Tensor,
     k: Tensor,
@@ -52,8 +53,7 @@ def launch(
     k = k.to(accum_dtype)
     weights = weights.to(accum_dtype)
 
-    # Keep the reference usable for long contexts by materializing only a bounded
-    # query tile. The score rows are the only state needed by selection.
+    # Budget the dot products and reduced scores together. One query row is the minimum.
     score_tile_bytes = 64 * 1024 * 1024
     bytes_per_query = max(1, batch * (heads + 1) * candidates * accum_dtype.itemsize)
     tile_queries = max(1, score_tile_bytes // bytes_per_query)
@@ -83,10 +83,12 @@ def launch(
         dots.relu_()
         dots.mul_(weights[:, rows].unsqueeze(-1))
         scores = dots.sum(dim=2)
+        del dots
         scores.mul_(scale)
         valid = (key_positions >= starts[rows]) & (key_positions < ends[rows])
         scores.masked_fill_(~valid, float("-inf"))
         indices = scores.topk(min(topk, candidates), dim=-1).indices.to(torch.int32)
+        del scores
         selected_valid = (indices >= starts[rows]) & (indices < ends[rows])
         indices = torch.where(selected_valid, indices - starts[rows], -1)
         output[:, rows, : indices.shape[-1]] = indices
