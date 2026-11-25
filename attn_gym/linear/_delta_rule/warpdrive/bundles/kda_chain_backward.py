@@ -27,7 +27,9 @@
 """One compiled launch for the KDA chain backward at ``--opt-level 2``, the level of every KDA
 module: the chain tables (``piece_chain``), the fused H and M summary (``kda_summary``), the G
 summary (``kda_bprop_summary``), the forward and reverse state chains in one launch, the seeded
-series recompute (``kda_recompute``) and the bprop (``kda_bprop``)."""
+series recompute (``kda_recompute``) and the bprop (``kda_bprop``). A ``seeded`` launch takes
+the pieces' entry states from the forward (``state_x``), so its summary computes only M and
+only the reverse chain runs."""
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -57,6 +59,7 @@ def chain_backward_host(
     dim_v: cutlass.Constexpr[int],
     dim_k: cutlass.Constexpr[int],
     chain_rows: cutlass.Constexpr[int],
+    seeded: cutlass.Constexpr[bool],
     pieces: cutlass.Int32,
     heads_out: cutlass.Int32,
     num_seqs: cutlass.Int32,
@@ -85,7 +88,7 @@ def chain_backward_host(
     dv: cute.Tensor,
     dgate: cute.Tensor,
     dbeta: cute.Tensor,
-    state_h: cute.Tensor,
+    state_h: cute.Tensor | None,
     state_m: cute.Tensor,
     state_x: cute.Tensor,
     seed: cute.Tensor | None,
@@ -140,22 +143,40 @@ def chain_backward_host(
         scale,
         stream,
     )
-    piece_chain.launch_state_chain(
-        dim_v,
-        dim_k,
-        chain_rows,
-        False,
-        heads_out,
-        num_seqs,
-        state_h,
-        state_m,
-        state_x,
-        seed,
-        main_rows,
-        None,
-        stream,
-        reverse=(state_g, state_dx_end, dseed),
-    )
+    if cutlass.const_expr(seeded):
+        # The reverse half of the paired launch below, with the same blocks and bits.
+        piece_chain.launch_state_chain(
+            dim_v,
+            dim_k,
+            chain_rows,
+            True,
+            heads_out,
+            num_seqs,
+            state_g,
+            state_m,
+            state_dx_end,
+            dseed,
+            main_rows,
+            None,
+            stream,
+        )
+    else:
+        piece_chain.launch_state_chain(
+            dim_v,
+            dim_k,
+            chain_rows,
+            False,
+            heads_out,
+            num_seqs,
+            state_h,
+            state_m,
+            state_x,
+            seed,
+            main_rows,
+            None,
+            stream,
+            reverse=(state_g, state_dx_end, dseed),
+        )
     series_op.launch(
         k,
         v,
@@ -212,10 +233,13 @@ def _compile_chain_backward(
     use_int64_offsets: bool,
     precision: OperandDtypes,
     fastmath: bool = True,
+    seeded: bool = False,
 ):
     """Compile the chain backward host over fake tensors with dynamic extents, int64 outer strides
     under ``use_int64_offsets`` and the last mode contiguous. Use the forward's operand dtypes
-    for piece summaries, checkpoint recomputation and gradient kernels."""
+    for piece summaries, checkpoint recomputation and gradient kernels. ``seeded`` reads the
+    pieces' entry states from ``state_x`` (the forward's, NOTE [Entry state layout] in
+    ``kda_prefill``) instead of chaining them."""
     sym_int = cute.sym_int
 
     def strided(dtype, rank, align):
@@ -233,13 +257,13 @@ def _compile_chain_backward(
 
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
     summary_op = kda_summary.KdaSummary(
-        io, gate_name, d_k, d_v, num_sm, fastmath, precision=precision
+        io, gate_name, d_k, d_v, num_sm, fastmath, precision=precision, transition_only=seeded
     )
     bwd_summary_op = kda_bprop_summary.bundle_hook(
         io_dtype, gate_dtype, d_k, d_o, True, fastmath, precision=precision
     )
     series_op = kda_recompute.KdaRecompute(
-        io, gate_name, d_k, d_v, True, num_sm, fastmath, precision=precision
+        io, gate_name, d_k, d_v, True, num_sm, fastmath, precision=precision, entry_states=seeded
     )
     bprop_op = kda_bprop.KdaBprop(
         io, gate_name, d_k, d_v, True, True, has_dstate0, num_sm, fastmath, precision=precision
@@ -263,6 +287,7 @@ def _compile_chain_backward(
         + "_".join(str(int(flag)) for flag in static)
         + f"_{dtype_names}_{seed_name}_{dseed_name}"
         + ("" if fastmath else "_nofm")
+        + ("_seeded" if seeded else "")
     )
     return compile_tvm_ffi(
         chain_backward_host,
@@ -273,6 +298,7 @@ def _compile_chain_backward(
         d_v,
         d_k,
         chain_rows,
+        seeded,
         *(cutlass.Int32(0) for _ in range(3)),
         cutlass.Float32(0),
         strided(io_dtype, 3, 16),  # q
@@ -296,9 +322,9 @@ def _compile_chain_backward(
         strided(io_dtype, 3, 16),  # dv
         strided(gate_dtype, 3, 16),  # dgate
         strided(beta_dtype, 2, 4),  # dbeta
-        state(),  # state_h
+        None if seeded else state(),  # state_h
         state(),  # state_m
-        state(),  # state_x
+        strided(cutlass.Float32, 5, 16) if seeded else state(),  # state_x
         strided(get_dtype(seed_name), 4, 4) if has_seed else None,  # seed
         state(),  # state_g
         state(),  # state_dx_end
@@ -357,16 +383,20 @@ def build_chain_backward(
     num_sm,
     intra_chunk_dtypes,
     fastmath=True,
+    seeded=False,
 ):
     """Compile (persisted per static config) the chain backward launch over the buffers of one
     plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments. ``fastmath=False``
-    selects the non-flushing gate exponentials. Pass the forward's ``intra_chunk_dtypes``."""
+    selects the non-flushing gate exponentials. Pass the forward's ``intra_chunk_dtypes``.
+    ``seeded``: ``state_x`` holds the forward's piece entry states."""
     if not log_gate or b_t != B_T:
         raise ValueError(
             "the warpdrive KDA chain backward serves 16-token chunks of natural-log gates"
         )
-    if state_m.dtype != state_h.dtype:
-        raise ValueError("the piece states are fp32")
+    if (state_h is None) != bool(seeded) or state_m.dtype != state_x.dtype:
+        raise ValueError("the piece states are fp32, without H when seeded")
+    if seeded and seed is not None:
+        raise ValueError("a seeded chain backward reads its entry states, not the seed")
     tensors = (
         q,
         k,
@@ -419,6 +449,7 @@ def build_chain_backward(
         requires_int64_abi(*(t for t in tensors if t is not None)),
         operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes),
         bool(fastmath),
+        bool(seeded),
     )
 
 

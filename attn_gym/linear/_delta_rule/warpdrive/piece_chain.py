@@ -218,6 +218,29 @@ def piece_span(b_t: cutlass.Constexpr[int], length, span_chunks):
 
 
 @cute.jit
+def sequence_pieces(b_t: cutlass.Constexpr[int], pieces: Int32, mCu: cute.Tensor, b):
+    """``(first slot, chunks per piece)`` of sequence ``b`` in :func:`piece_table_body`'s table
+    of a ``pieces``-piece chain over ``mCu``, from one thread (the same integer steps, serially).
+    Its pieces start every ``span`` chunks; a one-slot sequence's span covers it."""
+    num_seqs = Int32(mCu.shape[0]) - Int32(1)
+    total_chunks = (Int32(mCu[num_seqs]) - Int32(mCu[0]) + Int32(b_t - 1)) // Int32(b_t)
+    wave = num_seqs * pieces
+    span_chunks = chunks_per_slot(total_chunks, wave)
+    if num_seqs > Int32(1):
+        taken = Int32(0)
+        for s in cutlass.range(num_seqs, unroll=1):
+            taken = taken + piece_count(b_t, Int32(mCu[s + 1]) - Int32(mCu[s]), span_chunks)
+        if taken > wave:
+            span_chunks = chunks_per_slot(total_chunks, wave - num_seqs + Int32(1))
+    slot0 = Int32(0)
+    for s in cutlass.range(b, unroll=1):
+        _span, last = piece_span(b_t, Int32(mCu[s + 1]) - Int32(mCu[s]), span_chunks)
+        slot0 = slot0 + last + Int32(1)
+    span_tokens, _last = piece_span(b_t, Int32(mCu[b + 1]) - Int32(mCu[b]), span_chunks)
+    return slot0, span_tokens.to(Int32) // Int32(b_t)
+
+
+@cute.jit
 def piece_table_body(
     pieces: Int32,
     b_t: cutlass.Constexpr[int],

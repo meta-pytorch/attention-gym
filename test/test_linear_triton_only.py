@@ -116,11 +116,41 @@ _SCRIPT = textwrap.dedent(
 )
 
 
-def test_fused_training_runs_without_cutedsl():
+# Fake (meta) implementations size their outputs without importing CuTeDSL kernels.
+_META_SCRIPT = textwrap.dedent(
+    """
+    import sys
+
+    for name in ("cutlass", "tvm_ffi"):
+        sys.modules[name] = None
+
+    import torch
+
+    from attn_gym.linear.kda.impl import warpdrive_ops as ops
+
+    tokens, heads, rows = 64, 2, 3
+    q = torch.empty(1, tokens, heads, 128, device="meta", dtype=torch.bfloat16)
+    gate = torch.empty(1, tokens, heads, 128, device="meta")
+    beta = torch.empty(1, tokens, heads, device="meta")
+    cu_seqlens = torch.empty(2, device="meta", dtype=torch.int32)
+    state = torch.empty(1, heads, 128, 128, device="meta")
+    for initial_state, final in ((None, False), (state, True)):
+        output, final_state, entry_states = ops.chunk_warpdrive_packed_fwd_entry_states_op(
+            q, q, q, gate, beta, initial_state, cu_seqlens, 0.1, True, False, final, "bf16", rows
+        )
+        assert output.shape == q.shape
+        assert final_state.shape == (state.shape if final else (0,))
+        assert entry_states.shape == (rows, heads, 32, 128, 4)
+    print("ok")
+    """
+)
+
+
+def _run_without_cutedsl(script: str) -> None:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[1])
     result = subprocess.run(
-        [sys.executable, "-c", _SCRIPT],
+        [sys.executable, "-c", script],
         check=False,
         env=environment,
         capture_output=True,
@@ -129,3 +159,11 @@ def test_fused_training_runs_without_cutedsl():
     )
     assert result.returncode == 0, result.stderr[-4000:]
     assert result.stdout.strip().endswith("ok")
+
+
+def test_fused_training_runs_without_cutedsl():
+    _run_without_cutedsl(_SCRIPT)
+
+
+def test_warpdrive_fake_impls_run_without_cutedsl():
+    _run_without_cutedsl(_META_SCRIPT)
