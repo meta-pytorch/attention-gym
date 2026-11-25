@@ -4,22 +4,26 @@ Uses ``describe_graph``'s collected model: role cards show warps, registers and 
 placement; channel chips show stages and signal mechanisms. Wire colours match each
 side's mechanism, and double wires cross CTAs. Badges show scope, fences, overrides,
 sharing and compile results. Non-handoff synchronization uses dotted hub spokes; raw
-code uses dashed nodes. The side panel lists streams, aliases and hover/click details.
+code uses dashed nodes. Below the graph, the inspector explains the selected role or
+channel (what completes FULL and EMPTY, who waits for what), a table lists which role
+fills and frees each channel, and a panel lists streams and aliases.
 
 Layout runs here: cycle breaking, longest-path ranks, virtual nodes for long edges,
 barycenter ordering and constrained vertical placement. The page needs no layout library
-or network; its script handles interaction only.
+or network. Every relation the page states is computed here and shipped as JSON; its
+script only renders and handles interaction.
 """
 
 from __future__ import annotations
 
 import html
+import inspect
 import itertools
 import statistics
 from dataclasses import dataclass, field
 
-from attn_gym.warpdrive.channels import SIDES, Tma
-from attn_gym.warpdrive.describe import _overrides, is_pair
+from attn_gym.warpdrive.channels import SIDES, Channel, Sharing, Tma, Umma, Warps
+from attn_gym.warpdrive.describe import _overrides, channel_barriers, is_pair, rank_label
 from attn_gym.warpdrive.describe_graph import (
     Graph,
     _warps,
@@ -35,6 +39,7 @@ _HUB_KINDS = ("named", "turnstile", "barriers")
 COL_GAP = 48  # between rank columns: wires curve only here
 ROW_GAP = 22  # between boxes of one column
 MARGIN = 24
+LANE_GAP = 18  # between the graph's lowest box and each feedback lane under it
 
 
 def describe_html(kernel) -> str:
@@ -66,6 +71,7 @@ class _Box:
     rank: int = 0
     x: float = 0.0  # centre
     y: float = 0.0
+    chan: Channel | None = None  # a chip's channel (the first, when it groups several alike)
 
 
 @dataclass
@@ -77,18 +83,34 @@ class _Wire:
     pair: bool = False
     label: str = ""
     chip: str = ""  # the chip whose details the wire shows
+    feedback: bool = False  # runs back to an earlier column, in a lane under the graph
 
 
 def to_html(graph: Graph, kernel) -> str:
     boxes, wires, panel = _items(graph, kernel)
     links = [w for w in wires if w.kind != "spoke"]
     spokes = [w for w in wires if w.kind == "spoke"]
-    routes = _layout(boxes, [(w.src, w.dst) for w in links], [(w.src, w.dst) for w in spokes])
+    routes, feedback = _layout(
+        boxes, [(w.src, w.dst) for w in links], [(w.src, w.dst) for w in spokes]
+    )
+    for i in feedback:
+        links[i].feedback = True
     svg = _svg(boxes, links, routes, spokes)
+    _handoffs(boxes, links)
     details = {b.id: b.details for b in boxes.values() if b.details}
+    matrix = _matrix(boxes)
     body = f"""<div class="legend">{_LEGEND}</div>
-<div class="figure"><p class="figlabel">roles &#8594; channels &#8594; roles · hover or click
-for details</p>{svg}</div>
+<div class="figure"><div class="graph-tools">
+<span class="figlabel">Ctrl/⌘ + scroll to zoom · drag to pan</span>
+<button type="button" id="zoom-out" aria-label="Zoom out">−</button>
+<button type="button" id="zoom-in" aria-label="Zoom in">+</button>
+<button type="button" id="zoom-fit">Fit</button></div>{svg}</div>
+<section id="inspector" aria-label="Pipeline inspector">
+<p class="figlabel">Read a handoff</p>
+<p id="inspector-intro">Select a role or channel.</p>
+<div id="inspection" aria-live="polite"></div>
+</section>
+{matrix}
 <div class="notes">{panel}</div>
 <div id="tip" role="status" hidden></div>
 <footer>Drawn by <code>describe(format="html")</code> from the kernel's declarations
@@ -183,20 +205,22 @@ def _role_box(n, r, kernel) -> _Box:
     cluster = kernel.cluster
     facts = _warps(r.warps) + ("" if r.regs is None else f" · {r.regs} regs")
     strip_w = kernel.num_warps * 8.5 + (kernel.num_warps - 1) // 4 * 3
+    ranks = cluster.ctas(r.cta)
+    placement, where = _placement(cluster, r.cta)
     badges = []
     if cluster.size > 1:
-        badges.append((f"cta {r.cta}", "place"))
+        badges.append((placement, "place"))
     if r.raw:
         badges.append(("raw", "warn"))
     badge_w = sum(_tw(t, 8.5) + 12 for t, _ in badges)
     w = max(_tw(r.name, 13) + badge_w + 24, _tw(facts, 10.5) + 20, strip_w + 20, 132)
     h = 60
-    stacked = cluster.size > 1 and r.cta == "all"
     parts = []
-    if stacked:
+    if len(ranks) > 1:  # a stacked card: the role runs on more than one CTA
         parts.append(f'<rect class="card back" x="4" y="-4" width="{w:.1f}" height="{h}" rx="3"/>')
     dash = " raw" if r.raw else ""
-    parts.append(f'<rect class="card{dash}" width="{w:.1f}" height="{h}" rx="3"/>')
+    parts.append(f'<rect class="card{dash}" width="{w:.1f}" height="{h}" rx="2"/>')
+    parts.append(f'<rect class="role-bar" width="4" height="{h}" rx="1"/>')  # roles execute
     parts.append(_text(10, 19, r.name, "role-name"))
     parts.append(_text(10, 34, facts, "role-facts"))
     x = w - 8
@@ -211,18 +235,40 @@ def _role_box(n, r, kernel) -> _Box:
         cls = "warp on" if warp in r.warps else "warp"
         parts.append(f'<rect class="{cls}" x="{x:.1f}" y="43" width="7" height="8" rx="1"/>')
         x += 8.5
-    where = f"{_warps(r.warps)} of the CTA's {kernel.num_warps}"
-    lines = [where, *n.lines[1:]]
+    lines = [f"{_warps(r.warps)} of the CTA's {kernel.num_warps}", *n.lines[1:]]
+    size = f"{len(r.warps)} warp{'s' * (len(r.warps) > 1)} · {r.num_threads} threads"
+    details = {
+        "title": r.name,
+        "lines": lines,
+        "warps": list(r.warps),
+        "num_warps": kernel.num_warps,
+        "size": size + ("" if r.regs is None else f" · {r.regs} regs"),
+        "handoffs": [],  # filled by _handoffs
+    }
     if cluster.size > 1:
-        lines.append(f"cta {r.cta}: " + _PLACEMENT.get(r.cta, r.cta))
-    return _Box(n.id, "role", w, h, "".join(parts), {"title": r.name, "lines": lines})
+        lines.append(f"cta {r.cta}: {where}")
+        details["placement"] = placement
+        details["where"] = where[0].upper() + where[1:] + "."
+        if cluster.size <= 4:  # few enough thread blocks to draw each one's warps
+            pair = is_pair(cluster)
+            details["ctas"] = [
+                {"label": rank_label(k, pair) + " CTA" * pair, "here": k in ranks}
+                for k in range(cluster.size)
+            ]
+    # Only the role body's own docstring says what it does; the declarations cannot.
+    doc = inspect.getdoc(inspect.unwrap(r.fn))
+    if doc:
+        details["doc"] = "\n\n".join(" ".join(p.split()) for p in doc.split("\n\n"))
+    return _Box(n.id, "role", w, h, "".join(parts), details)
 
 
-_PLACEMENT = {
-    "all": "runs on every CTA of the cluster",
-    "leader": "runs on the leader CTA of each MMA pair",
-    "rank0": "runs on cluster rank 0 only",
-}
+def _placement(cluster, cta: str) -> tuple[str, str]:
+    """Badge and sentence for a ``cta=`` placement, from the ranks it resolves to."""
+    if len(cluster.ctas(cta)) == cluster.size:  # includes cta="leader" without pairs
+        return f"all {cluster.size} CTAs", "runs on every CTA of the cluster"
+    if cta == "leader":
+        return "leader CTA", "runs on the leader CTA of each MMA pair"
+    return "rank 0", "runs on cluster rank 0 only"
 
 
 def _chip_badges(names: list[str], kernel, ch) -> list[tuple[str, str]]:
@@ -255,25 +301,20 @@ def _chip_badges(names: list[str], kernel, ch) -> list[tuple[str, str]]:
 
 
 def _chip_box(cid: str, names: list[str], lines, kernel) -> _Box:
+    """A channel is a handoff between roles: a capsule holding its slots, not another card."""
     ch = kernel._ws_chans[names[0]]
     prod = mechanism(ch.producer, ch.named)
-    # A per-role consumer side splits its half of the bar between its mechanisms.
-    cons = list(dict.fromkeys(mechanism(m, ch.named) for m in ch.mechanisms("consumer")))
     label = ", ".join(names)
     kind = ("slots" if ch.fixed else "ring") + (" each" if len(names) > 1 else "")
     ticks_w = ch.n * 9
     badges = _chip_badges(names, kernel, ch)
     badges_w = sum(_tw(t, 8.5) + 11 for t, _ in badges)
-    w = max(_tw(label, 11) + 16, ticks_w + _tw(kind, 9.5) + 22, badges_w + 12, 56)
+    pad = 7  # keeps the text clear of the rounded ends
+    w = max(_tw(label, 11) + 16, ticks_w + _tw(kind, 9.5) + 22, badges_w + 12, 56) + 2 * pad
     h = 34 + (15 if badges else 0)
-    seg = (w / 2 - 1) / len(cons)
     parts = [
-        f'<rect class="chip-body" width="{w:.1f}" height="{h}" rx="3"/>',
-        f'<rect class="bar {prod}" x="1" y="1" width="{w / 2 - 1:.1f}" height="3"/>',
-        *(
-            f'<rect class="bar {c}" x="{w / 2 + k * seg:.1f}" y="1" width="{seg:.1f}" height="3"/>'
-            for k, c in enumerate(cons)
-        ),
+        f'<rect class="chip-body" width="{w:.1f}" height="{h}" rx="{min(h / 2, 15):.0f}"/>',
+        f'<g transform="translate({pad},0)">',
         _text(8, 16, label, "chip-name"),
     ]
     for s in range(ch.n):
@@ -284,7 +325,214 @@ def _chip_box(cid: str, names: list[str], lines, kernel) -> _Box:
         pill, bw = _pill(x, 33, text, cls)
         parts.append(pill)
         x += bw + 3
-    return _Box(cid, "chip", w, h, "".join(parts), {"title": label, "lines": list(lines)})
+    parts.append("</g>")
+    counts = dict(channel_barriers(ch, kernel.cluster))
+    handshake = {"slots": ch.n, "kind": kind, "writers": [], "readers": []}  # ends: _handoffs
+    for side, word in (("producer", "full"), ("consumer", "empty")):
+        handshake[word] = _side(ch, side, counts["named"] if ch.named else counts[word])
+    details = {
+        "title": label,
+        "lines": list(lines),
+        "guide": _chip_guide(ch, kernel.cluster, len(names) > 1),
+        "handshake": handshake,
+    }
+    return _Box(cid, "chip", w, h, "".join(parts), details, chan=ch)
+
+
+def _chip_guide(ch, cluster, grouped: bool) -> dict[str, str]:
+    """The inspector's sentences: what the channel is and what completes each barrier."""
+    stage = f"{ch.n} independently addressed slots" if ch.fixed else f"{ch.n}-stage ring"
+    guide = {"Channel": stage + " per channel" * grouped}
+    for side, heading in (("producer", "FULL when"), ("consumer", "EMPTY when")):
+        if ch.external == side:
+            guide[heading] = "raw code signals it."
+            continue
+        if side == "consumer" and ch.per_role and not ch.counts_overridden(side):
+            said = [
+                f"{role}: {_signal_description(ch, side, m)}" for role, m in ch.consumer.items()
+            ]
+            guide[heading] = " ".join(said) + " Every role must signal."
+        else:
+            guide[heading] = _signal_description(ch, side, ch.mechanisms(side)[0])
+        if any(slot is not None for _, slot in ch.bound(side)):
+            guide[heading] += " An instance bound to one slot signals only that slot."
+    if ch.commit_fence:
+        guide["Before commit"] = " ".join(_FENCE_REASON[f] for f in ch.commit_fence)
+    if ch.release_fence:
+        guide["Before release"] = " ".join(_FENCE_REASON[f] for f in ch.release_fence)
+        if ch.per_role and Umma in ch.consumer.values():
+            guide["Before release"] += " Thread roles only: UMMA readers emit no fence."
+    if any("differs" in entry for entry in _overrides(ch, cluster)):
+        guide["Review the override"] = "Non-default ordering or counts. Check the role body."
+    return guide
+
+
+_FENCE_REASON = {
+    "tmem_load": "Finish TMEM reads before a later writer can overwrite those columns.",
+    "tmem_store": "Finish TMEM stores before the next user accesses those columns.",
+    "smem_async": (
+        "Order shared-memory accesses across the generic and async proxies before signalling."
+    ),
+}
+
+
+def _side(ch, side: str, count: str) -> dict[str, str]:
+    """How ``side`` completes its barrier: a short label, the colour key and the counts."""
+    if ch.external == side:
+        return {"by": "raw code", "color": "raw", "count": count}
+    mechs = ch.mechanisms(side)
+    if side == "consumer" and ch.per_role and not ch.counts_overridden(side):
+        named = [f"{role}: {_signal_name(ch, side, m)}" for role, m in ch.consumer.items()]
+        by = " · ".join(named)
+    else:
+        by = _signal_name(ch, side, mechs[0])
+    colors = {mechanism(m, ch.named) for m in mechs}
+    return {"by": by, "color": colors.pop() if len(colors) == 1 else "mixed", "count": count}
+
+
+def _joins(ch, side: str) -> bool:
+    return ch.sharing(side) is Sharing.JOIN
+
+
+def _signal_name(ch, side: str, mech) -> str:
+    if ch.counts_overridden(side):
+        return "author-set count"
+    if ch.named:
+        return "both sides arrive"
+    if isinstance(mech, Tma):
+        return "the scheduler, no TMA copy" if ch.internal else f"TMA {mech.tx_bytes:,} B per CTA"
+    name = "UMMA commit" if mech is Umma else "one lane per warp" if mech is Warps else "threads"
+    return name + ("" if _joins(ch, side) else " of the epoch's owner")
+
+
+def _signal_description(ch, side: str, mech) -> str:
+    """Finish the sentence "FULL when ..." (producer) or "EMPTY when ..." (consumer)."""
+    doing = "writing" if side == "producer" else "reading"
+    if ch.counts_overridden(side):
+        return (
+            "the author-set arrival count is reached. The role bodies must supply it; "
+            "the declared mechanism does not say who arrives."
+        )
+    if ch.named:
+        writers, readers = (
+            f"the {verb} threads" if _joins(ch, s) else f"the owning instance's {verb} threads"
+            for s, verb in (("producer", "writing"), ("consumer", "reading"))
+        )
+        said = f"{writers} and {readers} have all arrived at the slot's named barrier."
+        return said + "".join(_sharing_note(ch, s) for s in ("producer", "consumer"))
+    if isinstance(mech, Tma):
+        if ch.internal:
+            return "the layer's scheduler completes the barrier. No TMA copy lands here."
+        tx = ch.scope.tx
+        total = f"; {tx:,} B expected at the barrier" if tx and tx != mech.tx_bytes else ""
+        return f"the TMA copies land ({mech.tx_bytes:,} B per CTA{total})."
+    join = _joins(ch, side)
+    if mech is Umma:
+        said = f"the MMAs {doing} it finish. One elected lane issues tcgen05.commit."
+    elif mech is Warps:
+        done = f"every {doing} warp is" if join else f"the owning instance's {doing} warps are"
+        said = f"{done} done. One elected lane per warp arrives."
+    elif join:
+        said = f"every {doing} thread arrives."
+    else:
+        said = f"the owning instance's {doing} threads arrive."
+    return said + _sharing_note(ch, side)
+
+
+def _sharing_note(ch, side: str) -> str:
+    match ch.sharing(side):
+        case Sharing.ROUND_ROBIN:
+            return f" {ch.turns(side)} {side} instances take turns: one owns each epoch."
+        case Sharing.EXCLUSIVE:
+            return " One consumer owns each epoch; the others skip it."
+    return ""
+
+
+def _handoffs(boxes: dict[str, _Box], links: list[_Wire]) -> None:
+    """Record each channel's ends once: the chip's writers and readers, and each role's rows.
+
+    The inspector, the role drill-down and the roles-by-channels table all read these.
+    """
+    for w in links:
+        if not w.chip or w.kind not in ("into", "flow"):
+            continue
+        chip = boxes[w.chip]
+        handshake = chip.details["handshake"]
+        fills = w.kind == "into"
+        end = boxes[w.src if fills else w.dst]
+        names = handshake["writers" if fills else "readers"]
+        if end.details["title"] not in names:
+            names.append(end.details["title"])
+        if end.kind != "role":
+            continue
+        side, mine, theirs = (
+            ("producer", "full", "empty") if fills else ("consumer", "empty", "full")
+        )
+        ch = chip.chan
+        bound = [(ri.role, slot) for ri, slot in ch.bound(side) if ri.name == end.details["title"]]
+        row = {
+            "chip": w.chip,
+            "verb": "fills" if fills else "frees",
+            "slots": [slot for _, slot in bound if slot is not None],  # empty: every slot
+            "waits": {"word": theirs.upper(), **handshake[theirs]},
+            "signals": {
+                "word": mine.upper(),
+                "by": _signal_name(ch, side, ch.mechanism(side, bound[0][0])),
+                "color": w.color,
+                "count": handshake[mine]["count"],
+            },
+        }
+        if row not in end.details["handoffs"]:
+            end.details["handoffs"].append(row)
+
+
+def _matrix(boxes: dict[str, _Box]) -> str:
+    """Roles by channels: which role fills each channel and which frees it.
+
+    Rows follow warp order; columns follow the graph left to right. Cells pick the channel.
+    """
+    roles = sorted(
+        (b for b in boxes.values() if b.kind == "role"), key=lambda b: b.details["warps"][0]
+    )
+    chips = sorted((b for b in boxes.values() if b.kind == "chip"), key=lambda b: (b.x, b.y))
+    if not roles or not chips:
+        return ""
+    head = "".join(
+        f'<th scope="col"><button type="button" data-pick="{c.id}">{_esc(c.details["title"])}'
+        f'<span class="slots">{"<i></i>" * c.details["handshake"]["slots"]}</span>'
+        f"<small>{_esc(c.details['handshake']['kind'])}</small></button></th>"
+        for c in chips
+    )
+    body = []
+    for r in roles:
+        d = r.details
+        strip = "".join(
+            f'<i class="{"on" if w in d["warps"] else ""}{" g" if w and w % 4 == 0 else ""}"></i>'
+            for w in range(d["num_warps"])
+        )
+        cells = "".join(
+            "<td>"
+            + "".join(
+                f'<button type="button" class="use {row["verb"]} {row["signals"]["color"]}" '
+                f'data-pick="{c.id}">{row["verb"]}</button>'
+                for row in d["handoffs"]
+                if row["chip"] == c.id
+            )
+            + "</td>"
+            for c in chips
+        )
+        span = f"w{d['warps'][0]}" + (f"-{d['warps'][-1]}" if len(d["warps"]) > 1 else "")
+        facts = " · ".join(filter(None, [span, d.get("placement")]))
+        body.append(
+            f'<tr><th scope="row"><button type="button" data-pick="{r.id}">'
+            f'{_esc(d["title"])}</button><span class="strip">{strip}</span>'
+            f"<small>{_esc(facts)}</small></th>{cells}</tr>"
+        )
+    return (
+        '<section id="matrix"><p class="figlabel">Roles × channels · who fills, who frees</p>'
+        f'<div class="matrix-scroll"><table><thead><tr><td></td>{head}</tr></thead>'
+        f"<tbody>{''.join(body)}</tbody></table></div></section>"
+    )
 
 
 def _hub_box(n) -> _Box:
@@ -334,10 +582,13 @@ def _stream_box(n) -> _Box:
 # Layered layout
 
 
-def _layout(boxes: dict[str, _Box], links, spokes) -> list[list[tuple[float, float]]]:
-    """Set box rank/x/y and return a port-to-port route for each link.
+def _layout(boxes: dict[str, _Box], links, spokes):
+    """Set box rank/x/y; return a port-to-port route for each link and the feedback links.
 
     Long links pass through virtual nodes. Undirected spokes only pull hubs toward users.
+    A link back to a node more than one column earlier (a feedback handoff) leaves the
+    columns alone: it runs through the gaps beside them and a lane under the graph. The
+    returned set holds the indices of those links.
     """
     ids = list(boxes)
     succ: dict[str, list[str]] = {n: [] for n in ids}
@@ -402,6 +653,9 @@ def _layout(boxes: dict[str, _Box], links, spokes) -> list[list[tuple[float, flo
     first = {n: float(i) for i, n in enumerate(found)}  # initial order: discovery
     chains = []
     for i, (a, b) in enumerate(dag):
+        if links[i] in back and boxes[b].rank - boxes[a].rank > 1:
+            chains.append(None)  # feedback: routed under the graph by _routes
+            continue
         chain = [a]
         for r in range(boxes[a].rank + 1, boxes[b].rank):
             d = f"_d{i}_{r}"
@@ -411,7 +665,7 @@ def _layout(boxes: dict[str, _Box], links, spokes) -> list[list[tuple[float, flo
         chains.append([*chain, b])
     up: dict[str, list[str]] = {n: [] for n in boxes}
     down: dict[str, list[str]] = {n: [] for n in boxes}
-    for chain in chains:
+    for chain in filter(None, chains):
         for a, b in itertools.pairwise(chain):
             down[a].append(b)
             up[b].append(a)
@@ -451,7 +705,7 @@ def _layout(boxes: dict[str, _Box], links, spokes) -> list[list[tuple[float, flo
     top = min(boxes[n].y - boxes[n].h / 2 for n in boxes)
     for b in boxes.values():
         b.y += MARGIN + 6 - top
-    return _routes(boxes, links, chains, col_w)
+    return _routes(boxes, links, chains, col_w), {i for i, c in enumerate(chains) if c is None}
 
 
 def _order(layers, up, down, users) -> list[list[str]]:
@@ -520,6 +774,8 @@ def _routes(boxes, links, chains, col_w):
     out_ports: dict[str, list[tuple[float, int]]] = {}
     in_ports: dict[str, list[tuple[float, int]]] = {}
     for i, chain in enumerate(chains):
+        if chain is None:
+            continue
         out_ports.setdefault(chain[0], []).append((boxes[chain[1]].y, i))
         in_ports.setdefault(chain[-1], []).append((boxes[chain[-2]].y, i))
     start, end = {}, {}
@@ -531,7 +787,31 @@ def _routes(boxes, links, chains, col_w):
                 frac = 0.5 if len(items) == 1 else k / (len(items) - 1)
                 at[i] = boxes[n].y + (frac - 0.5) * span
     routes = []
+    floor = max(b.y + b.h / 2 for b in boxes.values())
+    lanes = 0
     for i, ((a, b), chain) in enumerate(zip(links, chains)):
+        if chain is None:
+            # Out of the source's right side, down the gap beside its column, along a lane
+            # under every box, up the gap before the target's column, into its left side.
+            src, dst = boxes[a], boxes[b]
+            spread = 5 * lanes  # keeps several feedback wires apart
+            down = src.x + col_w[src.rank] / 2 + 8 + spread
+            rise = max(4, dst.x - col_w[dst.rank] / 2 - 8 - spread)
+            leave = src.y + src.h * (0.2 + 0.1 * (lanes % 3))
+            enter = dst.y + dst.h * (0.2 + 0.1 * (lanes % 3))
+            lanes += 1
+            lane = floor + LANE_GAP * lanes
+            routes.append(
+                [
+                    (src.x + src.w / 2, leave),
+                    (down, leave),
+                    (down, lane),
+                    (rise, lane),
+                    (rise, enter),
+                    (dst.x - dst.w / 2, enter),
+                ]
+            )
+            continue
         pts = []
         for k, n in enumerate(chain):
             box = boxes[n]
@@ -561,6 +841,19 @@ def _path(pts) -> str:
     return " ".join(d)
 
 
+def _elbow_path(pts, r: float = 12) -> str:
+    """Axis-aligned segments joined by rounded corners."""
+    d = [f"M{pts[0][0]:.1f},{pts[0][1]:.1f}"]
+    for (x0, y0), (x1, y1), (x2, y2) in zip(pts, pts[1:], pts[2:]):
+        ax, ay = (x1 - x0, y1 - y0), (x2 - x1, y2 - y1)
+        la, lb = abs(ax[0]) + abs(ax[1]), abs(ay[0]) + abs(ay[1])
+        k = min(r, la / 2, lb / 2)
+        d.append(f"L{x1 - ax[0] / la * k:.1f},{y1 - ax[1] / la * k:.1f}")
+        d.append(f"Q{x1:.1f},{y1:.1f} {x1 + ay[0] / lb * k:.1f},{y1 + ay[1] / lb * k:.1f}")
+    d.append(f"L{pts[-1][0]:.1f},{pts[-1][1]:.1f}")
+    return " ".join(d)
+
+
 def _clip(box: _Box, toward: tuple[float, float]) -> tuple[float, float]:
     """Where the segment from ``box``'s centre toward a point leaves the box."""
     dx, dy = toward[0] - box.x, toward[1] - box.y
@@ -574,8 +867,10 @@ def _clip(box: _Box, toward: tuple[float, float]) -> tuple[float, float]:
 
 
 def _svg(boxes, links, routes, spokes) -> str:
-    width = max(b.x + b.w / 2 for b in boxes.values()) + MARGIN + 8
-    height = max(b.y + b.h / 2 for b in boxes.values()) + MARGIN
+    reach = max((x for pts in routes for x, _ in pts), default=0)
+    width = max(reach, max(b.x + b.w / 2 for b in boxes.values())) + MARGIN + 8
+    lowest = max((y for pts in routes for _, y in pts), default=0)
+    height = max(lowest, max(b.y + b.h / 2 for b in boxes.values())) + MARGIN
     out = [
         (
             f'<svg xmlns="http://www.w3.org/2000/svg" id="graph" width="{width:.0f}" '
@@ -584,7 +879,7 @@ def _svg(boxes, links, routes, spokes) -> str:
         "<defs>",
         *(
             f'<marker id="arrow-{c}" class="arrow {c}" viewBox="0 0 8 8" refX="7" refY="4" '
-            'markerWidth="9" markerHeight="9" markerUnits="userSpaceOnUse" '
+            'markerWidth="12" markerHeight="12" markerUnits="userSpaceOnUse" '
             'orient="auto-start-reverse">'
             '<path d="M0,0 L8,4 L0,8 z"/></marker>'
             for c in ("tma", "umma", "threads", "named", "stream")
@@ -601,14 +896,19 @@ def _svg(boxes, links, routes, spokes) -> str:
             + "</g>"
         )
     for w, pts in zip(links, routes):
-        d = _path(pts)
-        arrow = "" if w.kind == "into" else f' marker-end="url(#arrow-{w.color})"'
-        cls = f"wire {w.kind} {w.color}" + (" pair" if w.pair else "")
+        d = _elbow_path(pts) if w.feedback else _path(pts)
+        # A chip sits right after its writer, so only a feedback "into" wire needs a direction.
+        headless = w.kind == "into" and not w.feedback
+        arrow = "" if headless else f' marker-end="url(#arrow-{w.color})"'
+        cls = f"wire {w.kind} {w.color}" + " pair" * w.pair + " feedback" * w.feedback
         ends = f"{w.src} {w.dst}"
         layers = [f'<path class="line" d="{d}"{arrow}/>']
         if w.pair:  # a double wire: the gap is drawn over the thick line
             layers.append(f'<path class="gap" d="{d}"/>')
         label = ""
+        if w.feedback:
+            (x0, lane), (x1, _) = pts[2:4]
+            label += _text((x0 + x1) / 2, lane - 5, "feedback", "wire-label", "middle")
         if w.label:
             lx, ly = pts[-1] if w.kind == "flow" else pts[0]
             anchor = "end" if w.kind == "flow" else "start"
@@ -640,11 +940,22 @@ def _legend_wire(cls: str, label: str, pair: bool = False) -> str:
 
 _LEGEND = "".join(
     [
+        (
+            '<span><svg width="28" height="14"><rect class="card" x="1" y="1" width="26" '
+            'height="12" rx="2"/><rect class="role-bar" x="1" y="1" width="3" height="12"/>'
+            "</svg>role: warps that run</span>"
+        ),
+        (
+            '<span><svg width="36" height="14"><rect class="chip-body" x="1" y="1" width="34" '
+            'height="12" rx="6"/><rect class="tick tma" x="14" y="3.5" width="7" height="7"/>'
+            "</svg>channel: a handoff and its stages</span>"
+        ),
         _legend_wire("tma", "TMA"),
         _legend_wire("umma", "UMMA (tcgen05)"),
         _legend_wire("threads", "threads / warps"),
         _legend_wire("named", "named barrier"),
         _legend_wire("threads", "cross-CTA (pair)", pair=True),
+        _legend_wire("threads feedback", "feedback"),
         (
             '<span><svg width="30" height="14"><rect class="tick tma" x="2" y="3" width="7" '
             'height="7"/><rect class="tick tma" x="11" y="3" width="7" height="7"/><rect '

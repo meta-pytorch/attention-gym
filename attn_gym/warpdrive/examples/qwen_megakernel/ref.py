@@ -166,7 +166,7 @@ EXPERT_TENSORS = {
 class QwenWeights:
     """Contiguous bf16 checkpoint tensors; layer tensors have a leading layer axis. For a MoE
     model ``gate``/``up``/``down`` have an expert axis after it and ``router`` is (layers, experts,
-    hidden)."""
+    hidden). With interleaved loading, gate/up are strided views of alternating rows."""
 
     embed: torch.Tensor
     input_ln: torch.Tensor
@@ -184,6 +184,7 @@ class QwenWeights:
     untied_lm_head: torch.Tensor | None = None  # None: the LM head is the embedding
     router: torch.Tensor | None = None  # MoE only
     config: QwenConfig = QwenConfig()
+    packed_gate_up: torch.Tensor | None = None
 
     @property
     def lm_head(self) -> torch.Tensor:
@@ -194,7 +195,8 @@ class QwenWeights:
         return {
             field.name: getattr(self, field.name)
             for field in fields(self)
-            if isinstance(getattr(self, field.name), torch.Tensor)
+            if field.name != "packed_gate_up"
+            and isinstance(getattr(self, field.name), torch.Tensor)
         }
 
 
@@ -203,13 +205,13 @@ def checkpoint_dir(path_or_repo: str | Path, tqdm_class: type | None = None) -> 
     with ``tqdm_class``), a checkpoint directory, or a file inside one. A download includes the
     tokenizer files (``*.txt`` merges, ``*.jinja`` chat templates) so the tokenizer loads from
     it."""
-    from huggingface_hub import snapshot_download  # optional: the oracle needs only torch
-
     checkpoint = Path(path_or_repo)
     if checkpoint.is_file():
         return checkpoint.parent
     if checkpoint.is_dir():
         return checkpoint
+    from huggingface_hub import snapshot_download  # optional: the oracle needs only torch
+
     return Path(
         snapshot_download(
             str(path_or_repo),
@@ -219,65 +221,7 @@ def checkpoint_dir(path_or_repo: str | Path, tqdm_class: type | None = None) -> 
     )
 
 
-def load_qwen3_weights(
-    path_or_repo: str | Path = "Qwen/Qwen3-0.6B", device: str | torch.device = "cuda"
-) -> QwenWeights:
-    """Load a Qwen3 safetensors checkpoint, single-file or sharded, with its ``config.json``:
-    a Hub repo, a checkpoint directory, or a file inside one."""
-    from safetensors.torch import load_file  # optional: the oracle needs only torch
-
-    checkpoint = checkpoint_dir(path_or_repo)
-    tensors = {}
-    for shard in sorted(checkpoint.glob("*.safetensors")):
-        tensors.update(load_file(str(shard), device=str(device)))
-    hf_config = json.loads((checkpoint / "config.json").read_text())
-    config = QwenConfig.from_hf(hf_config)
-
-    # Pop each layer's tensor as it is stacked: loading peaks near one model, not two.
-    def stack(suffix: str) -> torch.Tensor:
-        return torch.stack(
-            [
-                tensors.pop(f"model.layers.{layer}.{suffix}.weight")
-                for layer in range(config.num_layers)
-            ]
-        ).to(torch.bfloat16)
-
-    def stack_experts(suffix: str) -> torch.Tensor:
-        experts = range(config.num_experts)
-        return torch.stack(
-            [
-                torch.stack(
-                    [
-                        tensors.pop(f"model.layers.{layer}.{suffix.format(e=e)}.weight")
-                        for e in experts
-                    ]
-                )
-                for layer in range(config.num_layers)
-            ]
-        ).to(torch.bfloat16)
-
-    stacked = {
-        name: stack_experts(EXPERT_TENSORS[name])
-        if config.is_moe and name in EXPERT_TENSORS
-        else stack(suffix)
-        for name, suffix in LAYER_TENSORS.items()
-    }
-    if config.is_moe:
-        stacked["router"] = stack("mlp.gate")
-    tied = hf_config.get("tie_word_embeddings", False)
-    return QwenWeights(
-        embed=tensors["model.embed_tokens.weight"].to(torch.bfloat16),
-        final_norm=tensors["model.norm.weight"].to(torch.bfloat16),
-        untied_lm_head=None if tied else tensors["lm_head.weight"].to(torch.bfloat16),
-        config=config,
-        **stacked,
-    )
-
-
-def random_weights(config: QwenConfig, seed: int = 0, device="cuda") -> QwenWeights:
-    """bf16 weights of ``config``'s shapes: N(0, 1/fan_in) projections, norms near 1. MoE
-    configs get per-expert MLPs, a router and an untied LM head."""
-    generator = torch.Generator(device=device).manual_seed(seed)
+def _layer_shapes(config: QwenConfig) -> dict[str, tuple[int, ...]]:
     q, kv, d = config.num_q_heads, config.num_kv_heads, config.head_dim
     h, inter = config.hidden_size, config.intermediate_size
     experts = (config.num_experts,) if config.is_moe else ()
@@ -291,6 +235,85 @@ def random_weights(config: QwenConfig, seed: int = 0, device="cuda") -> QwenWeig
     assert set(shapes) == set(LAYER_TENSORS)
     if config.is_moe:
         shapes["router"] = (config.num_experts, h)
+    return shapes
+
+
+def load_qwen3_weights(
+    path_or_repo: str | Path = "Qwen/Qwen3-0.6B",
+    device: str | torch.device = "cuda",
+    *,
+    interleave_gate_up: bool = False,
+) -> QwenWeights:
+    """Load a Qwen3 safetensors checkpoint, single-file or sharded, with its ``config.json``:
+    a Hub repo, a checkpoint directory, or a file inside one."""
+    from safetensors import safe_open  # optional: the oracle needs only torch
+
+    checkpoint = checkpoint_dir(path_or_repo)
+    hf_config = json.loads((checkpoint / "config.json").read_text())
+    config = QwenConfig.from_hf(hf_config)
+
+    shapes = {name: (config.num_layers, *shape) for name, shape in _layer_shapes(config).items()}
+    shapes.update(embed=(config.vocab_size, config.hidden_size), final_norm=(config.hidden_size,))
+    keys = {"model.embed_tokens.weight": ("embed", ()), "model.norm.weight": ("final_norm", ())}
+    if not hf_config.get("tie_word_embeddings", False):
+        shapes["untied_lm_head"] = shapes["embed"]
+        keys["lm_head.weight"] = ("untied_lm_head", ())
+
+    for layer in range(config.num_layers):
+        prefix = f"model.layers.{layer}."
+        for name, suffix in LAYER_TENSORS.items():
+            if config.is_moe and name in EXPERT_TENSORS:
+                for e in range(config.num_experts):
+                    expert = EXPERT_TENSORS[name].format(e=e)
+                    keys[prefix + expert + ".weight"] = (name, (layer, e))
+            else:
+                keys[prefix + suffix + ".weight"] = (name, (layer,))
+        if config.is_moe:
+            keys[prefix + "mlp.gate.weight"] = ("router", (layer,))
+
+    def allocate(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.empty(shape, device=device, dtype=torch.bfloat16)
+
+    tensors = {}
+    packed = None
+    if interleave_gate_up:
+        *rows, hidden = shapes.pop("gate")
+        shapes.pop("up")
+        packed = allocate((*rows, 2, hidden))
+        tensors["gate"], tensors["up"] = packed.unbind(-2)
+    tensors.update((name, allocate(shape)) for name, shape in shapes.items())
+
+    # Map one shard on CPU and copy each needed tensor directly into its final slice.
+    missing = set(keys)
+    for shard in sorted(checkpoint.glob("*.safetensors")):
+        with safe_open(str(shard), framework="pt", device="cpu") as source:
+            # Older safetensors releases expose keys() but not offset_keys().
+            shard_keys = getattr(source, "offset_keys", source.keys)()
+            for key in shard_keys:
+                if key not in keys:
+                    continue
+                name, index = keys[key]
+                dst = tensors[name][index]
+                value = source.get_tensor(key)
+                if value.shape != dst.shape:
+                    raise ValueError(f"unexpected shape for {key}: expected {tuple(dst.shape)}")
+                # Stage one tensor, not the shard: direct CUDA copies from the file mapping
+                # are slow on GB10, including when the file is already in the page cache.
+                if dst.is_cuda:
+                    value = value.pin_memory()
+                dst.copy_(value)
+                missing.discard(key)
+    if missing:
+        raise KeyError(min(missing))
+    return QwenWeights(config=config, packed_gate_up=packed, **tensors)
+
+
+def random_weights(config: QwenConfig, seed: int = 0, device="cuda") -> QwenWeights:
+    """bf16 weights of ``config``'s shapes: N(0, 1/fan_in) projections, norms near 1. MoE
+    configs get per-expert MLPs, a router and an untied LM head."""
+    generator = torch.Generator(device=device).manual_seed(seed)
+    shapes = _layer_shapes(config)
+    h = config.hidden_size
 
     def tensor(*shape, norm=False):
         x = torch.randn(shape, device=device, generator=generator)

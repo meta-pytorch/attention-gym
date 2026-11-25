@@ -401,7 +401,7 @@ def main() -> None:
             {
                 "bench": Path(__file__),
                 "reference": Path(__file__).with_name("ref.py"),
-                "megakernel": Path(__file__).with_name("qwen_megakernel.py"),
+                "megakernel": Path(__file__).with_name("core.py"),
             },
             vars(args),
         ),

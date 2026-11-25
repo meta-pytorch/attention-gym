@@ -35,7 +35,8 @@ jobs:
           python-version: "3.12"
 
       - name: Install Modal
-        run: python -m pip install modal
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r .github/requirements/modal.txt
 
       - name: Run pytest on a B200
         run: exec modal run --timestamps -m tools.modal_tests

@@ -9,7 +9,11 @@ from functools import partial
 import torch
 
 from attn_gym.linear._delta_rule.span import pack_dense_batch
-from attn_gym.linear._delta_rule.validation import require_inference_only, resolve_scale
+from attn_gym.linear._delta_rule.validation import (
+    require_inference_only,
+    resolve_scale,
+    tracks_grad,
+)
 from attn_gym.linear.kda.impl.replay import replay_paged_chunk_forward
 from attn_gym.linear.kda.impl.warpdrive_ops import (
     chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
@@ -33,10 +37,13 @@ def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) ->
 class ChunkKdaWarpdrive(torch.autograd.Function):
     """Attach warpdrive's BT16 backward to the warpdrive forward.
 
-    The kernel choice depends only on which states the call carries, never on the span length,
-    so a document's bits do not depend on the span it is packed into. With an entry
-    state the backward carries the state cotangent in FP32 across chunks, chain pieces and work
-    items (``test/linear/test_delta_rule_state_precision.py``).
+    Optional entry and exit states determine which operator is called. Forward and backward
+    normally choose their own plans from the packed shape. When the forward pins its plan with
+    ``batch_invariant``, the backward also runs unchained. ``exact_recompute`` keeps the forward
+    off the shared prep, so a backward that runs the forward's piece plan recomputes the forward's
+    states bit for bit. A chain backward after an uncut forward composes FP32 piece summaries
+    instead and can round those states differently. With an entry state the backward carries the
+    state cotangent in FP32 across chunks, pieces and work items.
     """
 
     @staticmethod
@@ -54,10 +61,16 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
         split_forward: bool,
         output_final_state: bool,
         fastmath: bool,
+        intra_chunk_dtypes: str,
         nonempty: bool,
+        batch_invariant: bool,
+        exact_recompute: bool,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        # Rebuild the forward's operands at the same precision during backward.
         ctx.split_backward = split_backward
+        ctx.intra_chunk_dtypes = intra_chunk_dtypes
         ctx.scale, ctx.fastmath = scale, fastmath
+        ctx.batch_invariant = batch_invariant
         if output_final_state:
             # A zero entry state has no cotangent: the backward then skips every state access.
             entry_state = initial_state
@@ -71,15 +84,49 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                     device=q.device,
                 )
             output, final_state = chunk_warpdrive_packed_fwd_with_state_op(
-                q, k, value, gate, beta, entry_state, cu_seqlens, scale, fastmath, nonempty
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                entry_state,
+                cu_seqlens,
+                scale,
+                fastmath,
+                nonempty,
+                intra_chunk_dtypes,
+                batch_invariant,
+                exact_recompute,
             )
         elif initial_state is None:
             output = chunk_warpdrive_packed_fwd_op(
-                q, k, value, gate, beta, cu_seqlens, split_forward, scale, fastmath
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                cu_seqlens,
+                split_forward,
+                scale,
+                fastmath,
+                intra_chunk_dtypes,
+                batch_invariant,
+                exact_recompute,
             )
         else:
             output = chunk_warpdrive_packed_fwd_with_initial_state_op(
-                q, k, value, gate, beta, initial_state, cu_seqlens, scale, fastmath
+                q,
+                k,
+                value,
+                gate,
+                beta,
+                initial_state,
+                cu_seqlens,
+                scale,
+                fastmath,
+                intra_chunk_dtypes,
+                batch_invariant,
+                exact_recompute,
             )
         ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
         ctx.set_materialize_grads(False)
@@ -104,6 +151,8 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 ctx.split_backward,
                 ctx.scale,
                 ctx.fastmath,
+                ctx.intra_chunk_dtypes,
+                ctx.batch_invariant,
             )
             gradients = (*gradients, None)
         elif initial_state is None:
@@ -118,6 +167,8 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 d_final_state,
                 ctx.scale,
                 ctx.fastmath,
+                ctx.intra_chunk_dtypes,
+                ctx.batch_invariant,
             )
             gradients = (*gradients, None)
         else:
@@ -133,8 +184,10 @@ class ChunkKdaWarpdrive(torch.autograd.Function):
                 d_final_state,
                 ctx.scale,
                 ctx.fastmath,
+                ctx.intra_chunk_dtypes,
+                ctx.batch_invariant,
             )
-        return *gradients, *(None,) * 7
+        return *gradients, *(None,) * 10
 
 
 def validate_warpdrive_constraints(q: torch.Tensor, value: torch.Tensor) -> None:
@@ -163,8 +216,14 @@ def chunk_forward(
     fastmath: bool = True,
     split_backward: bool = False,
     split_forward: bool = False,
+    intra_chunk_dtypes: str,
+    batch_invariant: bool,
+    exact_recompute: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Run the optional warpdrive implementation behind the shared ``chunk_kda`` contract."""
+    """Run the optional warpdrive implementation behind the shared ``chunk_kda`` contract.
+
+    ``exact_recompute=None`` (the option omitted) infers it from grad mode (``KernelOptions``).
+    """
     scale = resolve_scale(scale, q.shape[-1])
     if split_backward and (initial_state is not None or output_final_state):
         raise ValueError("split_backward currently requires a no-state call")
@@ -174,6 +233,9 @@ def chunk_forward(
         validate_warpdrive_available(q)
     validate_warpdrive_constraints(q, value)
 
+    # Inferred while tracing under torch.compile; inference and no_grad keep the shared prep.
+    if exact_recompute is None:
+        exact_recompute = tracks_grad((q, k, value, gate, beta, initial_state))
     output_dtype, output_shape = q.dtype, value.shape
     q, k, value, gate, beta = cast_to_kernel_dtypes(q, k, value, gate, beta)
     # Dense batches with tokens have no empty sequences, so the final state needs no seeding.
@@ -197,7 +259,10 @@ def chunk_forward(
         split_forward,
         output_final_state,
         fastmath,
+        intra_chunk_dtypes,
         nonempty,
+        batch_invariant,
+        exact_recompute,
     )
     output, final_state = result if output_final_state else (result, None)
     return output.reshape(output_shape).to(output_dtype), final_state
@@ -216,9 +281,11 @@ def paged_chunk_forward(
     has_initial_state: torch.Tensor | None,
     scale: float,
     replay_state: ReplayState | None = None,
+    intra_chunk_dtypes: str,
+    batch_invariant: bool,
 ) -> torch.Tensor:
     """Advance selected state-cache slots with the warpdrive KDA kernels, optionally through
-    replay-backed decode and prefill."""
+    replay-backed decode and prefill; ``batch_invariant`` pins the plans of both."""
     require_inference_only(
         (q, k, value, gate, beta, state_cache, *(replay_state or ())),
         "paged_chunk_kda is inference-only; call under torch.no_grad() or torch.inference_mode()",
@@ -226,7 +293,8 @@ def paged_chunk_forward(
     if not torch.compiler.is_compiling():
         validate_warpdrive_available(q)
     validate_warpdrive_constraints(q, value)
-    paged_forward = partial(_paged_chunk_state_forward, scale=scale)
+    options = {"intra_chunk_dtypes": intra_chunk_dtypes, "batch_invariant": batch_invariant}
+    paged_forward = partial(_paged_chunk_state_forward, scale=scale, **options)
     if replay_state is None:
         return paged_forward(
             q,
@@ -250,7 +318,7 @@ def paged_chunk_forward(
         replay_state,
         cu_seqlens=cu_seqlens,
         has_initial_state=has_initial_state,
-        chunk_forward=partial(chunk_forward, scale=scale),
+        chunk_forward=partial(chunk_forward, scale=scale, **options),
         paged_forward=paged_forward,
     )
 
@@ -267,6 +335,8 @@ def _paged_chunk_state_forward(
     cu_seqlens: torch.Tensor | None,
     has_initial_state: torch.Tensor | None,
     scale: float,
+    intra_chunk_dtypes: str,
+    batch_invariant: bool,
     state_checkpoints: None = None,
 ) -> torch.Tensor:
     """Advance selected state-cache slots with the paged warpdrive KDA forward.
@@ -290,6 +360,8 @@ def _paged_chunk_state_forward(
         has_initial_state,
         cu_seqlens,
         scale,
+        intra_chunk_dtypes,
+        batch_invariant,
     )
     return output.reshape(output_shape).to(output_dtype)
 

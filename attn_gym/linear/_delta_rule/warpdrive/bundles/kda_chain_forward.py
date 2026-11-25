@@ -52,7 +52,7 @@ from ..contract import (
     validate_seqlens,
     validate_tensor,
 )
-from ..kda_common import B_T
+from ..kda_common import B_T, TORCH_NAMES, OperandDtypes, operand_dtypes
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -196,15 +196,29 @@ def _compile_chain_forward(
     chain_rows: int,
     num_sm: int,
     use_int64_offsets: bool,
+    precision: OperandDtypes,
     fastmath: bool = True,
 ):
     """Compile the chain forward host for one static config over fake tensors that repeat the
-    standalone builds' placeholders.  Absent tensors have a None dtype."""
+    standalone builds' placeholders.  Absent tensors have a None dtype. ``precision`` holds the
+    resolved operand dtypes (``kda_common.operand_dtypes``)."""
     i64 = use_int64_offsets
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
-    summary_op = kda_summary.KdaSummary(io, gate_name, d_k, d_v, num_sm, fastmath)
+    summary_op = kda_summary.KdaSummary(
+        io, gate_name, d_k, d_v, num_sm, fastmath, precision=precision
+    )
     prefill_op = kda_prefill.KdaPrefill(
-        io, gate_name, d_k, d_v, 1, True, final_state_dtype is not None, 0, num_sm, fastmath
+        io,
+        gate_name,
+        d_k,
+        d_v,
+        1,
+        True,
+        final_state_dtype is not None,
+        0,
+        num_sm,
+        fastmath,
+        precision=precision,
     )
     static = (
         final_state_dtype is not None,
@@ -229,7 +243,7 @@ def _compile_chain_forward(
         )
     )
     name = "kda_chain_forward_" + "_".join(str(int(flag)) for flag in static) + f"_{dtype_names}"
-    name += "" if fastmath else "_nofm"
+    name += f"_{precision.decay_dtype}_{precision.solve_dtype}" + ("" if fastmath else "_nofm")
 
     def f32_state():
         return _dynamic(cutlass.Float32, 4, 16, i64)
@@ -428,13 +442,13 @@ def build_chain_forward(
     scale,
     chain_rows,
     num_sm,
+    intra_chunk_dtypes,
     fastmath=True,
 ):
-    """Compile (persisted per static config: dtypes, dims, final-state
-    presence, seed dtype, chain rows, SM count, the int64 ABI, fastmath) the chain forward launch
-    over the buffers of one plan; ``pieces``, ``heads_out`` and ``num_seqs`` are launch arguments. The
-    launch runs on the current Torch stream. The warpdrive KDA prefill takes no ``final_indices``
-    and writes no checkpoints."""
+    """Validate the buffers and return the compiled bundle used by ``run_chain_forward``.
+    Dtypes, feature dimensions, state options, chain rows, SM count, offset width, operand
+    precision and fastmath select the build. Piece, head and sequence counts are runtime values.
+    This prefill accepts no ``final_indices`` and writes no checkpoints."""
     if not log_gate:
         raise ValueError("the warpdrive KDA chain forward takes natural-log gates")
     if final_indices is not None:
@@ -518,6 +532,7 @@ def build_chain_forward(
         int(chain_rows),
         int(num_sm),
         requires_int64_abi(*tensors),
+        operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes),
         bool(fastmath),
     )
 

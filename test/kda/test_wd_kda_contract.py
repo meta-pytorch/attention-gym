@@ -22,6 +22,7 @@ from attn_gym.linear._delta_rule.warpdrive.bundles import (
     kda_warmup_forward,
 )
 from attn_gym.linear._delta_rule.warpdrive.drivers import kda
+from attn_gym.linear._delta_rule.warpdrive.kda_common import OperandDtypes
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA tensors")
 TOKENS, HEADS, DIM = 128, 2, 128
@@ -35,14 +36,19 @@ def reached_compiler(*args, **kwargs):
 reached_compiler.by_args = reached_compiler
 reached_compiler.by_static_key = reached_compiler
 
+PRECISION = {"precision": OperandDtypes("tf32", "tf32")}
 OPS = {
-    "prefill": lambda io, gate, d: kda_prefill.KdaPrefill(io, gate, d, d, 1, True, True, 0, 148),
-    "prep": lambda io, gate, d: kda_prep.KdaPrep(io, gate, d, 148),
-    "prep_prefill": lambda io, gate, d: kda_prep_prefill.KdaPrepPrefill(
-        io, d, 2, True, True, 0, 1
+    "prefill": lambda io, gate, d: kda_prefill.KdaPrefill(
+        io, gate, d, d, 1, True, True, 0, 148, **PRECISION
     ),
-    "summary": lambda io, gate, d: kda_summary.KdaSummary(io, gate, d, d, 148),
-    "recompute": lambda io, gate, d: kda_recompute.KdaRecompute(io, gate, d, d, True, 148),
+    "prep": lambda io, gate, d: kda_prep.KdaPrep(io, gate, d, 148, **PRECISION),
+    "prep_prefill": lambda io, gate, d: kda_prep_prefill.KdaPrepPrefill(
+        io, d, 2, True, True, 0, 1, solve_dtype="tf32"
+    ),
+    "summary": lambda io, gate, d: kda_summary.KdaSummary(io, gate, d, d, 148, **PRECISION),
+    "recompute": lambda io, gate, d: kda_recompute.KdaRecompute(
+        io, gate, d, d, True, 148, **PRECISION
+    ),
     "bprop": lambda io, gate, d: kda_bprop.KdaBprop(io, gate, d, d, True, True, True, 148),
 }
 
@@ -78,7 +84,7 @@ def run_kda_forward(tokens):
     gate = packed(tokens, HEADS, DIM, dtype=torch.float32)
     beta = packed(tokens, HEADS, dtype=torch.float32)
     cu = torch.tensor([0, tokens], dtype=torch.int32, device="cuda")
-    kda.kda_forward(q, k, v, gate, beta, cu, scale=DIM**-0.5)
+    kda.kda_forward(q, k, v, gate, beta, cu, scale=DIM**-0.5, intra_chunk_dtypes="tf32")
 
 
 @needs_cuda

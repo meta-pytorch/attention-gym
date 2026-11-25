@@ -1,13 +1,15 @@
-"""Replay, timing statistics and provenance shared by the examples' CUDA-graph benchmarks."""
+"""Capture, replay, timing statistics and provenance shared by the examples' CUDA-graph
+benchmarks."""
 
 import hashlib
 import importlib.metadata
 import os
 import subprocess
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -179,3 +181,42 @@ def benchmark_cuda_graph_stats(
         torch.cuda.synchronize()
         samples_us.append(start.elapsed_time(end) * 1e3)
     return CudaBenchmarkStats.from_samples(samples_us)
+
+
+class Captured(NamedTuple):
+    """A graph of ``reps`` calls of ``fn``. ``fn`` stays referenced: its closure owns buffers
+    the graph's kernels read and write (runners, caches, inputs)."""
+
+    graph: torch.cuda.CUDAGraph
+    reps: int
+    fn: Callable[[], object]
+
+
+def capture(fn: Callable[[], object], reps: int, warmup: int = 3) -> Captured:
+    """A graph of ``reps`` back-to-back calls of ``fn``, after ``warmup`` eager calls on the
+    capture stream (compiles and allocator pools)."""
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(warmup):
+            fn()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(reps):
+                fn()
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    return Captured(graph, reps, fn)
+
+
+def time_graphs(graphs: dict[str, Captured], rounds: int, iters: int) -> dict[str, float]:
+    """Median over ``rounds`` interleaved rounds (each in a rotated order) of each graph's
+    median replay time, divided by its calls per replay: microseconds per call."""
+    settle([c.graph for c in graphs.values()], 1.0)
+    names = list(graphs)
+    medians = {name: [] for name in names}
+    for r in range(rounds):
+        for name in names[r % len(names) :] + names[: r % len(names)]:
+            stats = benchmark_cuda_graph_stats(graphs[name].graph, num_iters=iters, warmup_iters=5)
+            medians[name].append(stats.median_us / graphs[name].reps)
+    return {name: sorted(m)[len(m) // 2] for name, m in medians.items()}

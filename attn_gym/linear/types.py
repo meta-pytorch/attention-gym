@@ -7,7 +7,7 @@
 """Types shared by public linear-attention operations."""
 
 from enum import Enum
-from typing import Literal, NamedTuple, TypedDict
+from typing import Literal, NamedTuple, get_args
 
 import torch
 
@@ -35,6 +35,9 @@ class StateCheckpoints(NamedTuple):
     slots must be in bounds, distinct among writers and, if sharing the cache, not routed by
     this call. Neither request vector may overlap storage the call modifies (including replay
     counts). These are caller guarantees, not host-side checks of device values.
+
+    Runs on the fused backend; the default ``backend="auto"`` selects it for checkpointed
+    chunk calls, and an explicit ``"warpdrive"`` raises.
     """
 
     state_pool: torch.Tensor
@@ -82,17 +85,20 @@ class ReplayState(NamedTuple):
 class BackendOptions(TuningOptions, total=False):
     """Backend selection and tuning shared by optimized linear-attention operations."""
 
-    backend: Literal["fused", "warpdrive"]
-    """Select the chunk kernels. ``"fused"`` (default) runs the portable Triton kernels on every
-    CUDA architecture; ``"warpdrive"`` runs the CuTeDSL warpdrive kernels (SM100-family GPUs,
-    ``[linear]`` extra)."""
+    backend: Literal["auto", "fused", "warpdrive", "cudnn"]
+    """Choose the optimized chunk backend. With CuTeDSL installed, ``"auto"`` prefers warpdrive on
+    SM100 and SM103, and on SM107 with CuTeDSL 4.8+. Paged checkpoint writes use Triton.
+    Set ``"warpdrive"`` or ``"fused"`` (Triton) to require that backend; ``"cudnn"``,
+    warpdrive's former name, is an alias of ``"warpdrive"``.
+    See "Chunk backend selection" in ``docs/linear.md``."""
 
 
 class SplitOptions(BackendOptions, total=False):
-    """Approximate warpdrive forgetting-horizon split schedules for chunk KDA and chunk GDN.
+    """warpdrive plan options of chunk KDA and chunk GDN (``chunk_gdn``'s ``KernelOptions``).
 
-    Both default to ``False``, require ``backend="warpdrive"``, and reject calls with recurrent
-    state. They help only when ``B * H`` does not fill the GPU and every head forgets quickly.
+    All default to ``False`` and require an explicit ``backend="warpdrive"``. The approximate
+    forgetting-horizon split schedules reject calls with recurrent state; they help only when
+    ``B * H`` does not fill the GPU and every head forgets quickly.
     """
 
     split_backward: bool
@@ -100,6 +106,18 @@ class SplitOptions(BackendOptions, total=False):
 
     split_forward: bool
     """Split the forward recurrence."""
+
+    batch_invariant: bool
+    """Keep a sequence's results bitwise independent of its neighbors on the same hardware and
+    software. Covers outputs, final states and gradients; paged updates (including KDA replay);
+    and staged summaries and ``run``. The default is ``False``: plans follow the packed shape
+    and SM count. With ``True``, both directions scan whole sequences. This can be slower for
+    a few long sequences. For forward calls, set ``"backend": "warpdrive"`` explicitly. Do not
+    combine this option with split schedules.
+    See "Batch invariance" in ``docs/linear.md``."""
+
+
+IntraChunkDtypes = Literal["tf32+bf16", "tf32", "bf16"]
 
 
 class KernelOptions(SplitOptions, total=False):
@@ -113,25 +131,33 @@ class KernelOptions(SplitOptions, total=False):
     backend accepts and ignores every value: its persistent grids follow the SM count and
     always stride over the active work only."""
 
+    intra_chunk_dtypes: IntraChunkDtypes
+    """Operand precision inside each warpdrive KDA chunk, in forward and backward. The first
+    dtype is for products of decayed queries and keys; the second is for the triangular solve
+    and its contribution to the output. One dtype sets both. State products still use the
+    Q/K/V kernel dtype, and all matrix products accumulate in FP32.
 
-class _StageOptions(TypedDict, total=False):
-    batch_invariant: bool
-    """Keep each sequence's context-parallel summary bits (``state_summaries`` and
-    ``state_grad_summaries``) independent of the rest of the packed stream: the other sequences,
-    their count and lengths. Defaults to ``False``, where a long sequence's summaries split into
-    pieces by a plan of the stream's shape. ``True`` scans every sequence uncut in both
-    directions. Only the warpdrive backend's summaries split, so the fused backend rejects it;
-    the handles' local ``run`` keeps its own shape-dependent plan."""
+    BF16 kernels accept ``"tf32+bf16"`` (default), ``"tf32"`` or ``"bf16"``. FP16 kernels
+    have one fixed set (TF32 decay products, FP16 solve and state operands) and reject the
+    option. Replay casts Q/K/V to BF16 before choosing. Triton and the reference
+    implementation validate the option but do not use it.
+    See "Operand precision" in ``docs/linear.md``."""
 
+    exact_recompute: bool
+    """Keep the forward off the shared-prep plan, whose states the backward's recompute does not
+    reproduce. Omit to infer from grad mode: ``True`` when autograd records the forward (under
+    ``torch.compile``, while tracing).
 
-class StageKernelOptions(KernelOptions, _StageOptions, total=False):
-    """``chunk_kda_prepare`` and ``chunk_kda_prepare_backward`` options: ``chunk_kda``'s and
-    ``batch_invariant``."""
-
-
-class GDNStageKernelOptions(SplitOptions, _StageOptions, total=False):
-    """``chunk_gdn_prepare`` and ``chunk_gdn_prepare_backward`` options: ``chunk_gdn``'s and
-    ``batch_invariant``."""
+    With ``True`` the warpdrive KDA forward runs the per-tile kernels its backward recomputes.
+    The recomputed states match the forward's bit for bit only when the backward runs the
+    forward's piece plan: a chain backward after an uncut forward composes FP32 piece summaries
+    and can round them differently.
+    With ``False`` a small pack may share one prep pass between its two value tiles even under
+    autograd: faster, but that forward rounds its chunk states apart from the recompute, so its
+    gradients are not exactly those of its output. ``chunk_kda_prepare`` infers the option at
+    ``prepare``; a caller that differentiates ``run`` inside its own autograd function, where
+    grad mode is off, passes ``True`` (as ``context_parallel_kda`` does). Paged KDA has no
+    backward, and other backends ignore it. See "Operand precision" in ``docs/linear.md``."""
 
 
 class RecurrentKernelOptions(TuningOptions, total=False):
@@ -149,17 +175,20 @@ class RecurrentKernelOptions(TuningOptions, total=False):
 # Accepted values and defaults of the option dicts above; see ``KernelOptionSpec``.
 SPLIT_OPTION_SPEC: KernelOptionSpec = {
     **TUNING_OPTION_SPEC,
-    "backend": (("fused", "warpdrive"), "fused"),
+    "backend": (("auto", "fused", "warpdrive", "cudnn"), "auto"),
     "split_backward": (bool, False),
     "split_forward": (bool, False),
+    "batch_invariant": (bool, False),
 }
 KERNEL_OPTION_SPEC: KernelOptionSpec = {
     **SPLIT_OPTION_SPEC,
     "schedule": (("auto", "static", "persistent"), "auto"),
+    # ``None``: the default by input dtype (``resolve_intra_chunk_dtypes``, ``kda/validation.py``).
+    "intra_chunk_dtypes": (get_args(IntraChunkDtypes), None),
+    # ``None``: inferred from grad mode at the call (``chunk_forward``, ``chunk_kda_prepare``).
+    "exact_recompute": (bool, None),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
-STAGE_OPTION_SPEC: KernelOptionSpec = {**KERNEL_OPTION_SPEC, "batch_invariant": (bool, False)}
-GDN_STAGE_OPTION_SPEC: KernelOptionSpec = {**SPLIT_OPTION_SPEC, "batch_invariant": (bool, False)}
 
 
 class GateTransform(str, Enum):
@@ -186,14 +215,12 @@ def resolve_gate_transform(kind: GateTransform | str) -> GateTransform:
 
 __all__ = [
     "BackendOptions",
-    "GDNStageKernelOptions",
     "GateTransform",
     "Impl",
     "KernelOptions",
     "RecurrentKernelOptions",
     "ReplayState",
     "SplitOptions",
-    "StageKernelOptions",
     "StateCheckpoints",
     "TuningOptions",
     "resolve_gate_transform",

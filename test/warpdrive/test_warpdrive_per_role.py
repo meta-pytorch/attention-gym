@@ -147,8 +147,8 @@ def test_describe_shows_an_overridden_thread_release_fence():
 def test_graph_formats_render_per_role_signals(fmt):
     text = JointRing().describe(format=fmt)
     assert "{mma: Umma, cuda: Threads}" in text
-    if fmt == "html":  # the junction's consumer bar splits between the two mechanisms
-        assert 'class="bar umma"' in text and 'class="bar threads"' in text
+    if fmt == "html":  # each consumer role frees the junction with its own mechanism
+        assert 'class="use frees umma"' in text and 'class="use frees threads"' in text
 
 
 @pytest.mark.parametrize(

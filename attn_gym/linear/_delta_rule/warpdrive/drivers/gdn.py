@@ -80,8 +80,11 @@ def gdn_forward(
     split: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``.
+    ``batch_invariant`` pins the plan (``ForwardPlan``) so a sequence's bits do not depend on
+    the rest of the pack.
 
     ``state_indices`` switches to paged state: ``initial_state`` is a ``[slots, HO, V, K]`` pool
     that sequence ``b`` reads from and writes back to slot ``state_indices[b]`` in place (see
@@ -107,7 +110,10 @@ def gdn_forward(
     heads_out = gate.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    if batch_invariant:
+        plan = ForwardPlan.invariant(num_seqs, heads_out, dim_v, device)
+    else:
+        plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         # The approximate forgetting-horizon split replaces the exact schemes.
         plan = replace(plan, pieces=0, tiles_per_head=1)
@@ -253,8 +259,10 @@ def gdn_backward(
     initial_state: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
     split: bool = False,
+    batch_invariant: bool = False,
 ):
     """Packed scalar-GDN backward: recompute the checkpoint series, then bprop.
+    ``batch_invariant`` pins the plan as in ``gdn_forward``.
 
     Returns ``(dq, dk, dv, dgate, dbeta, d_initial_state)`` with dq/dk at the q/k head count
     (grouped heads are reduced in a fixed order) and fp32 dgate/dbeta.
@@ -269,7 +277,10 @@ def gdn_backward(
     heads_out = gate.shape[1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    if batch_invariant:
+        plan = BackwardPlan.invariant(device)
+    else:
+        plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs

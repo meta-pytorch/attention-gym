@@ -248,7 +248,8 @@ class GroupedGemm(WarpSpecialized):
         b = self.smem_plan.buffer("B", self.dtype, align=1024)
         self.smem_plan.buffer("C", self.dtype, align=128)
         self.ab = Ring(ab_stages, Tma(stage_bytes), Umma, buffer={"A": a, "B": b})
-        self.acc = Ring(acc_stages, Umma, Threads)
+        # The epilogue's loads complete before the MMA role overwrites the stage for the next tile.
+        self.acc = Ring(acc_stages, Umma, Threads, release_fence="tmem_load")
         # The 4 epilogue warps meet before warp 0 stores a staged subtile and before any warp
         # rewrites it.
         self.epi_sync = NamedBarrier(threads=128)

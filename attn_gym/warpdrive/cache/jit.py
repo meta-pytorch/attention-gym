@@ -82,7 +82,11 @@ class _CacheEntry:
         return self.object_path.with_suffix(".trace")
 
 
-class CacheLockError(RuntimeError):
+class CacheStorageError(RuntimeError):
+    """Raised when the disk cache cannot be locked or written."""
+
+
+class CacheLockError(CacheStorageError):
     """Raised when a persistent cache entry cannot be locked."""
 
 
@@ -370,7 +374,8 @@ def jit_cache(
     Args:
         persistent: False keeps only the process-local cache.
         lock_timeout: Seconds to wait for another process's lock on an entry before compiling
-            without the disk cache (``precompile`` raises ``CacheLockError`` instead).
+            without the disk cache. ``precompile`` raises ``CacheLockError`` instead, and
+            its base ``CacheStorageError`` for any failure to lock or write the entry.
         extra_sources: Inputs import analysis cannot see, such as files read while tracing or
             code outside the package.
         cache_key: Explicit structural key computed from the arguments, used instead of them.
@@ -460,7 +465,9 @@ def jit_cache(
             if built[1] is not None:
                 _publish_records(built[1], entry.trace_path)
             _publish_compiled(built[0], entry.object_path)
-        except Exception:
+        except Exception as error:
+            if strict and isinstance(error, OSError):
+                raise CacheStorageError(f"could not write {entry.object_path}") from error
             if strict:
                 raise
             logger.warning(

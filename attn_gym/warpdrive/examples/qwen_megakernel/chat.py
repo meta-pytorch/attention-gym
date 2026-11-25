@@ -1,116 +1,51 @@
-"""Chat with a Qwen3 checkpoint decoded by the megakernel (or torch.compile), showing output
-tokens per second.
+"""Qwen3 in the megakernel chat (``attn_gym.warpdrive.examples.megakernel.chat``), decoded by
+the megakernel (``--engine`` cuda_core or tcgen05) or torch.compile.
 
     python -m attn_gym.warpdrive.examples.qwen_megakernel.chat --model Qwen/Qwen3-8B
     python -m attn_gym.warpdrive.examples.qwen_megakernel.chat --backend compile --prompt "Hi"
 
-Each turn prefills the new prompt tokens with the PyTorch reference (one forward pass into the
-KV cache), then decodes on the GPU with the chosen backend: ``megakernel`` (``--engine`` cuda_core or
-tcgen05) or ``compile`` (torch.compile of the batched PyTorch step, ``bench.decode_step_fast_batch``,
-at batch one). Either runs inside the same CUDA graph of SYNC_EVERY decode steps.
-The conversation's KV cache carries over between turns; when the chat template re-renders an
-earlier turn differently the cache is rebuilt from the start.
+Prefill runs the PyTorch reference (one forward pass into the KV cache). The ``compile`` backend
+is torch.compile of the batched PyTorch step (``bench.decode_step_fast_batch``) at batch one.
+Both backends are CUDA-graph capturable.
 """
 
 import json
-import time
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import torch
 import typer
-from rich.console import Console
-from rich.progress import (
-    BarColumn,
-    DownloadColumn,
-    Progress,
-    TextColumn,
-    TimeRemainingColumn,
-    TransferSpeedColumn,
-)
-from rich.text import Text
-from tqdm.std import tqdm
 
-from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel
+from attn_gym.warpdrive.examples.megakernel.chat import ChatOptions, run
+from attn_gym.warpdrive.examples.qwen_megakernel import QwenMegakernel, ref
 from attn_gym.warpdrive.examples.qwen_megakernel.bench import (
     decode_step_fast_batch,
     prepare_fast_weights,
 )
 from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     YarnScaling,
-    checkpoint_dir,
     forward_tokens,
     load_qwen3_weights,
 )
 
-SYNC_EVERY = 8  # decode steps between host reads of the sampled tokens
+__all__ = ["DEFAULT_BACKEND", "OPTIONS", "check_options", "checkpoint_dir", "load_chat_model"]
+
 # Qwen3's 40,960-position checkpoints were pretrained on 32,768 tokens: Qwen's YaRN setup
 # scales from there. Checkpoints with longer native contexts (Qwen3-2507) scale from theirs.
 QWEN3_POSITIONS, QWEN3_PRETRAINED_CONTEXT = 40960, 32768
-
-app = typer.Typer(add_completion=False, help=__doc__.splitlines()[0])
-console = Console()
-
-
-def download(model: str) -> Path:
-    """The local checkpoint directory of ``model``, drawing any Hub download as one progress bar
-    of bytes written to disk. huggingface_hub's own tqdm bars (files fetched, network bytes and
-    bytes written) would be three interleaved lines, and one line per redraw under a rich
-    status. ``HF_HUB_DISABLE_PROGRESS_BARS`` and non-terminal output hide the bar."""
-    from huggingface_hub.utils import are_progress_bars_disabled
-
-    progress = Progress(
-        TextColumn(f"downloading [bold]{model}[/]"),
-        BarColumn(),
-        DownloadColumn(),
-        TransferSpeedColumn(),
-        TimeRemainingColumn(),
-        console=console,
-        transient=True,
-        disable=not console.is_terminal or are_progress_bars_disabled(),
-    )
-
-    class DiskBytes(tqdm):
-        """Draws the snapshot's bytes-written bar on ``progress`` and hides the others: the
-        file-count bar (unit "it") and the network-bytes bar, whose total is a guess."""
-
-        def __init__(self, *args, **kwargs):
-            kwargs.update(gui=True, disable=False)  # gui: count but print nothing
-            super().__init__(*args, **kwargs)
-            shown = self.unit == "B" and self.desc != "Downloading bytes"
-            self.task = progress.add_task("", total=self.total or None) if shown else None
-
-        def display(self, *_, **__):  # tqdm's refresh draws through here
-            if self.task is not None:
-                progress.update(self.task, completed=self.n, total=self.total or None)
-
-        def clear(self, *_, **__):  # tqdm's clear writes to the terminal
-            pass
-
-    with progress:
-        return checkpoint_dir(model, tqdm_class=DiskBytes)
-
-
-class CacheFull(typer.BadParameter):
-    """A turn whose prompt and reply would not fit the KV cache."""
-
-
-@dataclass
-class Turn:
-    text: str
-    prompt_tokens: int
-    prefill_s: float
-    tokens: int
-    decode_s: float
 
 
 class Megakernel:
     """One decode step on ``QwenMegakernel``: ``step`` reads the token and position from device
     buffers, writes K/V at the position and returns the logits."""
 
+    capturable = True
+
     def __init__(self, weights, max_len: int, caches, engine: str):
         self.runner, self.caches = QwenMegakernel(weights, max_len, engine=engine), caches
-        self.runner(weights, 0, 1, *caches)  # compile
+
+    def kernels(self) -> list[tuple]:
+        return self.runner.kernels()
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         self.runner.step_info[0].copy_(token[0])
@@ -123,48 +58,44 @@ class Compiled:
     """One decode step of ``torch.compile(decode_step_fast_batch)`` at batch one: static shapes
     (SDPA over the whole cache with a length mask), so it compiles once and graph-captures."""
 
+    capturable = True
+
     def __init__(self, weights, max_len: int, caches, engine: str):
         self.packed = prepare_fast_weights(weights, max_len)
         layers = weights.config.num_layers
         self.views = [tuple(c[layer][None] for layer in range(layers)) for c in caches]
-        self.fn = torch.compile(decode_step_fast_batch)
-        self.step(torch.zeros(1, device="cuda", dtype=torch.long), torch.ones(1, device="cuda"))
+        self.fn = torch.compile(decode_step_fast_batch)  # compiles in the chat's warm-up
+
+    def kernels(self) -> list[tuple]:
+        return []
 
     def step(self, token: torch.Tensor, pos: torch.Tensor) -> torch.Tensor:
         return self.fn(self.packed, token, pos.long(), *self.views)[0]
 
 
 BACKENDS = {"megakernel": Megakernel, "compile": Compiled}
+DEFAULT_BACKEND = "megakernel"
+OPTIONS = frozenset({"engine", "thinking", "yarn_factor"})
+DEFAULT_ENGINE = "cuda_core"
 
 
-class Chat:
-    """A conversation whose KV cache holds every token fed so far (positions 0 .. len - 1)."""
-
-    def __init__(
-        self,
-        checkpoint: Path,
-        backend: str,
-        engine: str,
-        max_len: int,
-        thinking: bool,
-        yarn_factor: float | None = None,
-    ):
+class QwenChatModel:
+    def __init__(self, checkpoint: Path, options: ChatOptions):
         from transformers import AutoTokenizer
 
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint)
-        self.weights = load_qwen3_weights(checkpoint)
+        self.weights = load_qwen3_weights(
+            checkpoint, interleave_gate_up=options.backend == "megakernel"
+        )
         config = self.weights.config
         hf_config = json.loads((checkpoint / "config.json").read_text())
         native = hf_config["max_position_embeddings"]
         original = QWEN3_PRETRAINED_CONTEXT if native == QWEN3_POSITIONS else native
+        max_len, yarn_factor = options.max_len, options.yarn_factor
         if yarn_factor is None:  # only past the native context, as Qwen recommends
             long = max_len > native and config.rope_scaling is None
             yarn_factor = max_len / original if long else None
         if yarn_factor is not None:
-            if yarn_factor and yarn_factor < 1:
-                raise typer.BadParameter(
-                    f"--yarn-factor must be 0 or at least 1, got {yarn_factor}"
-                )
             params = {"factor": yarn_factor, "original_max_position_embeddings": original}
             yarn = YarnScaling.from_hf(params, original) if yarn_factor else None
             config = replace(config, rope_scaling=yarn)
@@ -172,202 +103,52 @@ class Chat:
         shape = (config.num_layers, config.num_kv_heads, max_len, config.head_dim)
         # Zeroed: the compiled step's masked SDPA reads rows past the position (0 * NaN is NaN).
         self.caches = [torch.zeros(shape, device="cuda", dtype=torch.bfloat16) for _ in "kv"]
-        self.backend = BACKENDS[backend](self.weights, max_len, self.caches, engine)
-        self.max_len, self.thinking = max_len, thinking
-        self.messages: list[dict] = []
-        self.cached: list[int] = []  # token ids whose K/V are in the caches
+        engine = DEFAULT_ENGINE if options.engine is None else options.engine
+        self.backend = BACKENDS[options.backend](self.weights, max_len, self.caches, engine)
+        self.max_len, self.thinking = max_len, bool(options.thinking)
         stops = [self.tokenizer.eos_token_id]
         stops += [self.tokenizer.convert_tokens_to_ids(t) for t in ("<|im_end|>", "<|endoftext|>")]
         self.stops = {s for s in stops if isinstance(s, int) and s >= 0}
-        self.pos = torch.zeros(1, device="cuda", dtype=torch.int32)
-        self.graphs: dict[float, tuple] = {}  # temperature -> (graph, token in, tokens out)
-        torch.cuda.synchronize()
+        self.label = (
+            f"the {engine} megakernel" if options.backend == "megakernel" else "torch.compile"
+        )
+        if config.rope_scaling:
+            self.label += f", YaRN x{config.rope_scaling.factor:g}"
 
-    def prompt_ids(self) -> list[int]:
+    def prompt_ids(self, messages: list[dict]) -> list[int]:
         text = self.tokenizer.apply_chat_template(
-            self.messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=self.thinking,
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=self.thinking
         )
         return self.tokenizer(text, add_special_tokens=False).input_ids
 
-    @torch.no_grad()
-    def prefill(self, ids: list[int]) -> torch.Tensor:
-        """Feed the tokens past the cached prefix; returns the last one's logits."""
-        if ids[: len(self.cached)] != self.cached or len(ids) == len(self.cached):
-            self.cached = []  # the template re-rendered history: start over
-        new = ids[len(self.cached) :]
-        tokens = torch.tensor(new, device="cuda")
-        logits = forward_tokens(
-            self.weights, tokens, len(self.cached), *self.caches, dtype=torch.bfloat16
+    def prefill(self, ids: list[int], start: int) -> torch.Tensor:
+        tokens = torch.tensor(ids, device="cuda")
+        return forward_tokens(self.weights, tokens, start, *self.caches, dtype=torch.bfloat16)
+
+    def reply_text(self, ids: list[int]) -> str:
+        return self.tokenizer.decode(ids, skip_special_tokens=True)
+
+    def assistant_message(self, ids: list[int]) -> dict:
+        return {"role": "assistant", "content": self.reply_text(ids)}
+
+
+def checkpoint_dir(path_or_repo: str | Path, tqdm_class=None, *, options: ChatOptions) -> Path:
+    """``ref.checkpoint_dir``: every backend reads the same files."""
+    return ref.checkpoint_dir(path_or_repo, tqdm_class)
+
+
+def check_options(options: ChatOptions):
+    if options.backend not in BACKENDS:
+        raise typer.BadParameter(f"Qwen backends: {sorted(BACKENDS)}, got {options.backend!r}")
+    if options.yarn_factor and options.yarn_factor < 1:
+        raise typer.BadParameter(
+            f"--yarn-factor must be 0 or at least 1, got {options.yarn_factor}"
         )
-        self.cached = list(ids)
-        return logits
-
-    def decode_graph(self, temperature: float):
-        """A CUDA graph of SYNC_EVERY decode steps: each feeds the token in ``token`` at the next
-        position (``self.pos`` + 1, on the device), runs the backend's step, samples the next token
-        into ``token`` and records it in ``out``. One replay decodes SYNC_EVERY tokens."""
-        if temperature not in self.graphs:
-            token = torch.zeros(1, device="cuda", dtype=torch.long)
-            out = torch.zeros(SYNC_EVERY, device="cuda", dtype=torch.long)
-
-            def steps():
-                for i in range(SYNC_EVERY):
-                    self.pos.add_(1)
-                    logits = self.backend.step(token, self.pos)
-                    token.copy_(self.sample(logits, temperature))
-                    out[i].copy_(token[0])
-
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):  # warm up outside the capture
-                self.pos.fill_(0)
-                steps()
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
-                steps()
-            self.graphs[temperature] = (graph, token, out)
-        return self.graphs[temperature]
-
-    def sample(self, logits: torch.Tensor, temperature: float) -> torch.Tensor:
-        """The next token as a one-element device tensor: no host sync."""
-        if temperature <= 0:
-            return logits.argmax().reshape(1)
-        return torch.multinomial(torch.softmax(logits / temperature, dim=-1), 1)
-
-    def reply(self, prompt: str, max_new_tokens: int | None, temperature: float, on_token) -> Turn:
-        """Answer ``prompt``, streaming through ``on_token``. ``max_new_tokens``: None decodes until a
-        stop token or a full KV cache."""
-        self.messages.append({"role": "user", "content": prompt})
-        ids = self.prompt_ids()
-        # Replays decode whole groups of SYNC_EVERY steps, writing K/V rows past the last kept
-        # token; this much room keeps every row inside the cache.
-        room = self.max_len - len(ids) - SYNC_EVERY - 1
-        max_new_tokens = room if max_new_tokens is None else max_new_tokens
-        if not 0 < max_new_tokens <= room:
-            self.messages.pop()
-            raise CacheFull(f"the conversation would pass max_len = {self.max_len}")
-        graph, fed, sampled = self.decode_graph(temperature)  # before prefill: warm-up writes K/V
-        start = time.perf_counter()
-        token = self.sample(self.prefill(ids), temperature)
-        torch.cuda.synchronize()
-        prefill_s = time.perf_counter() - start
-        # One graph replay decodes SYNC_EVERY tokens on the GPU; the host then reads them to
-        # stream text and look for a stop token. Steps past a stop are discarded (their K/V rows
-        # are overwritten by the next prefill).
-        pos = len(self.cached)
-        fed.copy_(token)
-        self.pos.fill_(pos - 1)  # the graph adds 1 before each step
-        out: list[int] = []
-        replays = 0
-        done = False
-        start = time.perf_counter()
-        while not done:
-            first = int(fed.item()) if not replays else None  # the prefill's token leads
-            graph.replay()
-            replays += 1
-            tokens = ([first] if first is not None else []) + sampled.tolist()
-            for t in tokens:
-                if t in self.stops or len(out) == max_new_tokens:
-                    done = True
-                    break
-                out.append(t)
-            on_token(out, time.perf_counter() - start)
-        decode_s = time.perf_counter() - start
-        self.cached += out[: replays * SYNC_EVERY]  # the last replay's final token was not fed
-        text = self.tokenizer.decode(out, skip_special_tokens=True)
-        self.messages.append({"role": "assistant", "content": text})
-        return Turn(text, len(ids), prefill_s, len(out), decode_s)
 
 
-def stats_line(tokens: int, seconds: float, prompt_tokens: int, prefill_s: float) -> Text:
-    rate = tokens / seconds if seconds > 0 else 0.0
-    line = Text()
-    line.append(f"{rate:,.0f} tok/s", style="bold green")
-    line.append(f"  {tokens} tokens in {seconds:.2f} s", style="dim")
-    if tokens:
-        line.append(f"  {1e3 * seconds / tokens:.2f} ms/token", style="dim")
-    line.append(f"  prefill {prompt_tokens} tokens in {1e3 * prefill_s:.0f} ms", style="dim")
-    return line
-
-
-def run_turn(chat: Chat, prompt: str, max_new_tokens: int | None, temperature: float):
-    """Stream the reply as plain text (appended, so replies taller than the terminal keep
-    scrolling), then its stats."""
-    shown = 0  # characters of the reply already written
-
-    def write(text: str):
-        nonlocal shown
-        console.out(text[shown:], end="", highlight=False)
-        console.file.flush()
-        shown = len(text)
-
-    def on_token(out, elapsed):
-        text = chat.tokenizer.decode(out, skip_special_tokens=True)
-        if not text.endswith("\ufffd"):  # wait for the rest of a multi-byte character
-            write(text)
-
-    turn = chat.reply(prompt, max_new_tokens, temperature, on_token)
-    write(turn.text)
-    console.print()
-    console.print(stats_line(turn.tokens, turn.decode_s, turn.prompt_tokens, turn.prefill_s))
-
-
-@app.command()
-def main(
-    model: str = typer.Option("Qwen/Qwen3-0.6B", help="HF repo or checkpoint directory"),
-    backend: str = typer.Option("megakernel", help="megakernel or compile (torch.compile)"),
-    engine: str = typer.Option("cuda_core", help="megakernel engine: cuda_core or tcgen05"),
-    max_len: int = typer.Option(4096, help="KV cache capacity (tokens)"),
-    yarn_factor: float | None = typer.Option(
-        None,
-        help="YaRN RoPE factor over the pretraining context (32K for Qwen3; 4 gives 128K, as "
-        "Qwen documents). Default: max_len / 32K when max_len passes the checkpoint's "
-        "max_position_embeddings and it has no RoPE scaling of its own; 0 turns YaRN off.",
-    ),
-    max_new_tokens: int | None = typer.Option(
-        None, help="cap on tokens per reply; default: until a stop token or a full KV cache"
-    ),
-    temperature: float = typer.Option(0.0, help="0: greedy"),
-    thinking: bool = typer.Option(False, help="Qwen3 thinking mode"),
-    prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
-):
-    if backend not in BACKENDS:
-        raise typer.BadParameter(f"backend must be one of {sorted(BACKENDS)}")
-    label = f"the {engine} megakernel" if backend == "megakernel" else "torch.compile"
-    checkpoint = download(model)  # before the status spinner, which garbles progress bars
-    with console.status(f"loading {model} and compiling {label}"):
-        chat = Chat(checkpoint, backend, engine, max_len, thinking, yarn_factor)
-    if prompt is not None:
-        run_turn(chat, prompt, max_new_tokens, temperature)
-        return
-    yarn = chat.weights.config.rope_scaling
-    rope = f", YaRN x{yarn.factor:g}" if yarn else ""
-    console.print(
-        f"[bold]{model}[/] on {label}, {max_len} tokens{rope}. Empty line or Ctrl-D to quit."
-    )
-    while True:
-        try:
-            text = console.input("[bold cyan]you>[/] ")
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not text.strip():
-            break
-        try:
-            run_turn(chat, text, max_new_tokens, temperature)
-        except CacheFull:
-            console.print(
-                f"[yellow]The conversation filled max_len = {max_len}: starting over.[/]"
-            )
-            chat.messages, chat.cached = [], []
-            try:
-                run_turn(chat, text, max_new_tokens, temperature)
-            except CacheFull as error:
-                console.print(f"[red]{error}[/]")
+def load_chat_model(checkpoint: Path, options: ChatOptions) -> QwenChatModel:
+    return QwenChatModel(checkpoint, options)
 
 
 if __name__ == "__main__":
-    app()
+    run("Qwen/Qwen3-0.6B")

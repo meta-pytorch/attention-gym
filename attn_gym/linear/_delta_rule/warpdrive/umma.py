@@ -361,3 +361,29 @@ def mma_ss_tf32_op(
                 Int32(idesc).ir_value(),
                 cutlass.Boolean(acc).ir_value(),
             )
+
+
+@cute.jit
+def mma_ts_tf32_op(idesc: cutlass.Constexpr[int], tmem_a, desc_b, tmem_d, accumulate, issue):
+    """Issue two K=8 TF32 MMA steps. A occupies one TMEM column per K; B is a 16 x 16
+    K-major tile in shared memory, with its second K block 256 bytes after the first.
+    ``accumulate`` controls whether the first step adds to D; the second always does."""
+    for k in cutlass.range_constexpr(2):
+        acc = accumulate if cutlass.const_expr(k == 0) else cutlass.Boolean(True)
+        if issue:
+            nvvm.tcgen05_mma(
+                nvvm.Tcgen05MMAKind.TF32,
+                nvvm.CTAGroupKind.CTA_1,
+                _tmem_ptr(tmem_d),
+                _tmem_ptr(tmem_a + 8 * k),
+                Int64(desc_b + ((256 * k) >> 4)).ir_value(),
+                Int32(idesc).ir_value(),
+                cutlass.Boolean(acc).ir_value(),
+            )
+
+
+@cute.jit
+def tf32_k_major_desc(addr):
+    """Shared-memory descriptor of a K-major fp32 16 x 16 tile at ``addr``
+    (``kda_common.tf32_k_major_tile``: unswizzled, leading byte offset 128, stride 512)."""
+    return smem_desc(addr, 128, 512, SWIZZLE_NONE)

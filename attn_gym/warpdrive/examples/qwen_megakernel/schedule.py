@@ -9,15 +9,16 @@ from typing import NamedTuple
 import torch
 
 from attn_gym.warpdrive import StaticPersistent
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM
+from attn_gym.warpdrive.examples.megakernel.launch import index_rows
+from attn_gym.warpdrive.examples.megakernel.table import layout_static
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
     ATTN,
-    BLOCK,
     DOWN,
     DOWN_SPLITS,
     EXPERT_GROUPS,
     GATEUP,
-    HEAD_DIM,
     LM_TILES,
     LMHEAD,
     NORM,
@@ -254,17 +255,17 @@ def build_tables(
             # give the lowest blockIdx to the CTA whose first row is due first.
             first = [items[0][0] if items else math.inf for items in part]
             cta_of[launch] = sorted(range(ctas), key=first.__getitem__)
-            per_launch[launch] = layout_static([[w for _, w in part[c]] for c in cta_of[launch]])
+            per_launch[launch] = layout_static(
+                [[w for _, w in part[c]] for c in cta_of[launch]], WORDS
+            )
     else:
         for words, _, _ in rows:
             per_launch[words[1]].append(words)
     tables, first = [], 0
     for words in per_launch:
         if not words:  # an ops subset can leave a launch nothing to run
-            words = layout_static([[] for _ in range(ctas)])
-        tables.append(
-            torch.tensor([w + [first + i] for i, w in enumerate(words)], dtype=torch.int32)
-        )
+            words = layout_static([[] for _ in range(ctas)], WORDS)
+        tables.append(index_rows(words, first))
         first += len(words)
     return StepTables(tables, cta_of)
 
@@ -356,15 +357,3 @@ def list_schedule(op: QwenDecodeMegakernel, rows: list[Row], ctas: int) -> list[
         if group not in last or spans[i].end >= spans[last[group]].end:
             last[group] = i
     return spans
-
-
-def layout_static(lists: list[list[list[int]]]) -> list[list[int]]:
-    """Per-CTA row lists laid out ``[slot][cta]`` for ``StaticPersistent`` (CTA b runs rows b,
-    b + ctas, ...); short lists are padded with dropped rows."""
-    slots = max(1, max(len(rows) for rows in lists))
-    padding = [-1] * (WORDS - 1)
-    return [
-        lists[cta][slot] if slot < len(lists[cta]) else padding
-        for slot in range(slots)
-        for cta in range(len(lists))
-    ]

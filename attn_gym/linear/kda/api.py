@@ -26,6 +26,7 @@ from attn_gym.linear._delta_rule.reference import reference_delta_rule
 from attn_gym.linear._delta_rule.state_checkpoints import validate_state_checkpoints
 from attn_gym.linear._delta_rule.validation import (
     require_inference_only,
+    resolve_chunk_backend,
     resolve_decode_out,
     resolve_scale,
     validate_decode_inputs,
@@ -43,6 +44,8 @@ from attn_gym.linear.kda.ops import copy_replay_tails_op
 from attn_gym.linear.kda.ops import recurrent_decode_forward as _fused_recurrent_decode_forward
 from attn_gym.linear.kda.ops import recurrent_forward as _fused_recurrent_forward
 from attn_gym.linear.kda.validation import (
+    kernel_dtype,
+    resolve_intra_chunk_dtypes,
     resolve_kernel_options,
     validate_kda_inputs,
     validate_replay_state,
@@ -93,26 +96,21 @@ def chunk_kda(
 
     Args:
         q: Queries shaped ``[B, T, H, K]``, scaled by ``scale`` internally. Use
-            L2-normalized Q/K with fused FP16: unnormalized values can overflow the FP16
-            intermediates passed between FP32-accumulating GEMMs.
-        k: Keys shaped like ``q`` and subject to the same fused FP16 range limitation.
+            L2-normalized Q/K with FP16: the products accumulate in FP32, but unscaled
+            attention scores can exceed the largest finite FP16 value (65504) when staged for
+            the next multiply. BF16 kernels do not have this FP16 range limit.
+        k: Keys shaped like ``q`` and subject to the same FP16 range limitation.
         v: Values shaped ``[B, T, H, V]``.
         gate: Finite, nonpositive per-token natural-log decay shaped like ``q``. At
             each token the previous state is multiplied channelwise by ``exp(gate)``.
             Pass per-token values, not cumulative gates; chunking and log-base conversion
-            are internal. The Triton fused implementation requires approximately
-            ``[-5.914, 0]``. warpdrive BF16 instead requires every aligned 16-token
-            per-channel sum to exceed ``-126 * ln(2)`` (a uniform ``lower_bound >= -5.45``)
-            for finite results. Gradients need more margin: their error grows quickly past a
-            uniform gate of about ``-5.25``, an empirical training guideline, while the common
-            ``-5`` bound stays comparable to the fused backend (the KDA gate contract in
-            ``docs/linear.md`` gives the measurements). warpdrive FP16 forms its in-chunk decay
-            products from TF32 operands, forward and backward, and shares the BF16 gate range
-            above. Backward headroom also shrinks with large output gradients and key components.
-            The FP16 backward needs state cotangents, and FP16 products of them, within the FP16
-            range, and keys decayed below the FP16 subnormals round up or to zero in the forward
-            state update and the backward (same section of ``docs/linear.md``). These limits are
-            not checked at runtime and do not apply to reference or recurrent execution.
+            are internal. For training with warpdrive, keep gates in about ``[-5.25, 0]``
+            (``WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE``). More negative uniform gates can
+            rapidly degrade gradients; large output gradients or key components reduce the margin.
+            Triton supports about ``[-5.914, 0]`` (``MAX_GATE_LOWER_BOUND_MAGNITUDE``).
+            The common floor of ``-5`` fits both. These limits are not checked at runtime and do
+            not apply to reference or recurrent execution. See the KDA gate contract in
+            ``docs/linear.md`` for the 16-token decay limit and FP16 state-gradient range.
         beta: Per-token write gate shaped ``[B, T, H]``.
         initial_state: Starting recurrent state, with one ``[H, V, K]`` entry per
             logical sequence.
@@ -137,15 +135,27 @@ def chunk_kda(
             for either value. Configure gate production separately with ``bound_gate`` or
             ``gate_transform``.
         impl: ``"fused"`` uses optimized kernels and ``"reference"`` uses
-            differentiable eager PyTorch in FP32. There is no automatic fallback.
+            differentiable eager PyTorch in FP32. There is no automatic fallback between
+            the two.
         kernel_options: Backend-specific options. This is a sneaky BC trick.
             It is annoying to have a bunch of kwargs that its hard to know when they apply
             but, this trick allows us to add new options without breaking the API. I will
             do my best to add new options by providing a nice typed dict and hopefully
             your agent will now how to use this and be able to find the right option to wiggle.
-            See :class:`attn_gym.linear.types.KernelOptions`. ``"autotune"`` (default
-            ``True``) benchmarks candidate fused-kernel configurations; warpdrive accepts the
-            option but uses its fixed schedule.
+            See :class:`attn_gym.linear.types.KernelOptions`. With ``"backend": "auto"`` (default),
+            both FP16 and BF16 use warpdrive on supported SM100-family GPUs with CuTeDSL
+            installed; other devices use Triton (see "Chunk backend selection" in
+            ``docs/linear.md``). ``"autotune"`` (default ``True``) tunes Triton
+            configurations. Warpdrive chooses a plan without benchmarking.
+            ``"intra_chunk_dtypes"`` sets warpdrive operand precision in forward and backward.
+            BF16 kernels accept ``"tf32+bf16"`` (TF32 decay, BF16 solve; default), ``"tf32"``
+            or ``"bf16"``. FP16 kernels have one fixed set and reject the option.
+            Replay-backed ``paged_chunk_kda`` uses BF16 even for FP16 inputs. Incompatible
+            choices raise on every implementation. See "Operand precision" in ``docs/linear.md``.
+            With explicit warpdrive, ``"batch_invariant": True`` keeps each sequence's outputs,
+            final state and gradients bitwise independent of its neighbors.
+            ``"exact_recompute"`` (omit to infer it from grad mode) keeps a warpdrive forward
+            off the shared prep that the backward's recompute does not reproduce.
 
     Returns:
         The output in ``q.dtype`` and either an FP32 final state with one entry
@@ -165,9 +175,12 @@ def chunk_kda(
         op_name="chunk_kda",
         gate_name="gate",
     )
+    intra_chunk_dtypes = resolve_intra_chunk_dtypes(
+        options.intra_chunk_dtypes, kernel_dtype(q, k, v), op_name="chunk_kda"
+    )
     scale = resolve_scale(scale, q.shape[-1])
     if selected_impl is Impl.FUSED:
-        if options.backend == "warpdrive":
+        if resolve_chunk_backend(options.backend, q) == "warpdrive":
             return _warpdrive_chunk_forward(
                 q,
                 k,
@@ -181,6 +194,9 @@ def chunk_kda(
                 fastmath=fastmath,
                 split_backward=options.split_backward,
                 split_forward=options.split_forward,
+                intra_chunk_dtypes=intra_chunk_dtypes,
+                batch_invariant=options.batch_invariant,
+                exact_recompute=options.exact_recompute,
             )
         return _fused_chunk_forward(
             q,
@@ -251,12 +267,9 @@ def paged_chunk_kda(
         has_initial_state: Optional contiguous boolean mask, one per logical sequence.
             False entries ignore the selected cache contents and start from zero before
             advancing that slot. This is useful when a slot has just been assigned.
-        kernel_options: Backend-specific options. ``{"backend": "warpdrive"}`` selects
-            the optional warpdrive backend. ``split_backward`` and
-            ``split_forward`` are not supported by this paged operation; ``schedule``
-            applies as in ``chunk_kda``. ``"autotune"`` (default
-            ``True``) benchmarks candidate configurations of the Triton fused kernels;
-            warpdrive uses its fixed schedule.
+        kernel_options: Backend, schedule, precision and batch invariance follow ``chunk_kda``.
+            Replay casts Q/K/V to BF16 before choosing operand precision. Paged execution does
+            not support split schedules. ``"autotune"`` only tunes Triton kernels.
         replay_state: Optional :class:`ReplayState` persistent cache.
             Q, K, and V use BF16, gate and beta use FP32, and count uses int32. The five
             token caches have shape ``[num_slots, 64, ...]``; every count must remain in
@@ -279,8 +292,9 @@ def paged_chunk_kda(
 
         state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
             state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
-            semantics. Requires the fused backend. With replay, only the completed boundary
-            state is saved. The caller must separately preserve any replay tail needed to resume.
+            semantics. Runs on the fused backend: ``"auto"`` selects it, and ``"warpdrive"``
+            raises. With replay, only the completed boundary state is saved. The caller must
+            separately preserve any replay tail needed to resume.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -305,15 +319,21 @@ def paged_chunk_kda(
         has_initial_state=has_initial_state,
     )
     options = resolve_kernel_options(kernel_options, op_name="paged_chunk_kda")
+    # Replay runs Q/K/V in BF16, so FP16 replay calls resolve the option as their BF16 cast.
+    compute_dtype = kernel_dtype(q, k, v) if replay_state is None else torch.bfloat16
+    intra_chunk_dtypes = resolve_intra_chunk_dtypes(
+        options.intra_chunk_dtypes, compute_dtype, op_name="paged_chunk_kda"
+    )
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    if state_checkpoints is not None and options.backend != "fused":
+    backend = resolve_chunk_backend(options.backend, q, fused_only=state_checkpoints is not None)
+    if state_checkpoints is not None and backend != "fused":
         raise ValueError("state_checkpoints requires the fused backend")
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
         validate_replay_state(replay_state, q, v, state_cache.shape[0])
-    if options.backend == "warpdrive":
+    if backend == "warpdrive":
         return _warpdrive_paged_chunk_forward(
             q,
             k,
@@ -326,6 +346,8 @@ def paged_chunk_kda(
             has_initial_state=has_initial_state,
             scale=resolve_scale(None, q.shape[-1]),
             replay_state=replay_state,
+            intra_chunk_dtypes=intra_chunk_dtypes,
+            batch_invariant=options.batch_invariant,
         )
     return _fused_paged_chunk_forward(
         q,

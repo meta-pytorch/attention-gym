@@ -73,7 +73,9 @@ def _run(k, v, gate, beta, cu, state, items):
     ckpt = torch.empty(rows, heads, d_v, d_k, dtype=k.dtype, device="cuda")
     ckpt.view(torch.int16).fill_(POISON)
     n_items = torch.tensor([items.shape[0]], dtype=torch.int32, device="cuda")
-    kda_recompute.kda_recompute(k, v, gate, beta, items, n_items, ckpt, initial_state=state)
+    kda_recompute.kda_recompute(
+        k, v, gate, beta, items, n_items, ckpt, initial_state=state, intra_chunk_dtypes="tf32"
+    )
     return ckpt
 
 

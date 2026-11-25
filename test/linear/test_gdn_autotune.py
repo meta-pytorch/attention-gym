@@ -8,7 +8,11 @@ import torch
 from attn_gym.linear import TuningOptions, chunk_gdn, paged_chunk_gdn
 from attn_gym.testing import make_gdn_test_inputs
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    # Exercise the Triton kernels even where auto would select warpdrive.
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 TOKENS = 192
 

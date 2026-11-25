@@ -23,41 +23,82 @@ from attn_gym.linear._delta_rule.validation import (
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
-from attn_gym.linear.types import KERNEL_OPTION_SPEC, STAGE_OPTION_SPEC, ReplayState
+from attn_gym.linear.types import KERNEL_OPTION_SPEC, IntraChunkDtypes, ReplayState
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# ``intra_chunk_dtypes`` when the option is omitted.
+DEFAULT_INTRA_CHUNK_DTYPES: IntraChunkDtypes = "tf32+bf16"
+# The one kernel set of FP16 Q/K/V; internal, not a public option value.
+FP16_INTRA_CHUNK_DTYPES = "tf32+fp16"
 
 
 class ResolvedKernelOptions(NamedTuple):
     """Validated ``chunk_kda`` backend selection, warpdrive switches, tuning request, and ragged
     launch schedule."""
 
-    backend: Literal["fused", "warpdrive"]
+    backend: Literal["auto", "fused", "warpdrive"]
     split_backward: bool
     split_forward: bool
+    batch_invariant: bool
     autotune: bool
-    schedule: ScheduleRequest = ScheduleRequest.AUTO
-    batch_invariant: bool = False  # staged handles only
+    schedule: ScheduleRequest
+    # ``None`` when omitted; ``resolve_intra_chunk_dtypes`` picks the default by input dtype.
+    intra_chunk_dtypes: IntraChunkDtypes | None
+    # ``None`` when omitted: inferred from grad mode where the forward runs.
+    exact_recompute: bool | None
 
 
 def resolve_kernel_options(
     kernel_options: Mapping[str, object] | None,
     *,
     op_name: str = "chunk_kda",
-    staged: bool = False,
     tape_backend: str | None = None,
 ) -> ResolvedKernelOptions:
-    """Validate chunk backend options and resolve their defaults; ``staged`` also accepts the
-    staged handles' ``batch_invariant`` (:class:`attn_gym.linear.types.StageKernelOptions`).
-    ``tape_backend`` resolves a staged backward's options against its saved tape's backend
-    (:func:`attn_gym.linear._delta_rule.validation.resolve_chunk_kernel_options`)."""
-    spec = STAGE_OPTION_SPEC if staged else KERNEL_OPTION_SPEC
+    """Validate chunk options, using the saved forward backend for a staged backward."""
+    if kernel_options is not None and (
+        kernel_options.get("intra_chunk_dtypes") == FP16_INTRA_CHUNK_DTYPES
+    ):
+        raise ValueError(
+            f"{op_name}: kernel_options['intra_chunk_dtypes']={FP16_INTRA_CHUNK_DTYPES!r} is no "
+            "longer an option value: FP16 q/k/v have one fixed kernel set, so omit the option; "
+            "BF16 (or FP32 or mixed) q/k/v take 'tf32+bf16' (default), 'tf32' or 'bf16'"
+        )
     options = resolve_chunk_kernel_options(
-        kernel_options, spec, op_name=op_name, tape_backend=tape_backend
+        kernel_options, KERNEL_OPTION_SPEC, op_name=op_name, tape_backend=tape_backend
     )
     # warpdrive accepts every schedule and ignores it: its grids already stride over active work.
-    schedule = ScheduleRequest(options.pop("schedule"))
-    return ResolvedKernelOptions(**options, schedule=schedule)
+    options["schedule"] = ScheduleRequest(options["schedule"])
+    return ResolvedKernelOptions(**options)
+
+
+def resolve_intra_chunk_dtypes(
+    intra_chunk_dtypes: IntraChunkDtypes | None, compute_dtype: torch.dtype, *, op_name: str
+) -> str:
+    """Choose intra-chunk operand dtypes from the Q/K/V kernel dtype, not the caller's dtype.
+
+    Replay uses BF16 even for FP16 inputs. Validate before dispatch so invalid combinations
+    fail on every backend, including during ``torch.compile`` tracing.
+    """
+    if compute_dtype == torch.float16:
+        if intra_chunk_dtypes is not None:
+            raise ValueError(
+                f"{op_name}: FP16 q/k/v have one fixed kernel set and take no "
+                f"kernel_options['intra_chunk_dtypes'], got {intra_chunk_dtypes!r}: their decay "
+                "products need TF32 (the in-chunk decay factors 2^-g overflow FP16) and their "
+                "solve operands are FP16"
+            )
+        return FP16_INTRA_CHUNK_DTYPES
+    return DEFAULT_INTRA_CHUNK_DTYPES if intra_chunk_dtypes is None else intra_chunk_dtypes
+
+
+def kernel_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.dtype:
+    """Return the Q/K/V dtype the KDA chunk kernels compute in.
+
+    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16.
+    """
+    if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype:
+        return q.dtype
+    return torch.bfloat16
 
 
 def cast_to_kernel_dtypes(
@@ -65,20 +106,12 @@ def cast_to_kernel_dtypes(
 ) -> tuple[torch.Tensor, ...]:
     """Cast chunk operands to the dtypes the KDA chunk kernels compute in.
 
-    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16. Gate and beta
-    run in FP32. Callers return the output in the original ``q.dtype``. Each cast is an autograd
-    op, so gradients come back in the caller's dtypes.
+    Q/K/V follow ``kernel_dtype``; gate and beta run in FP32. Callers return the output in the
+    original ``q.dtype``. Each cast is an autograd op, so gradients come back in the caller's
+    dtypes.
     """
-    kernel_dtype = (
-        q.dtype
-        if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype
-        else torch.bfloat16
-    )
-    return (
-        *(tensor.to(kernel_dtype) for tensor in (q, k, v)),
-        gate.float(),
-        beta.float(),
-    )
+    dtype = kernel_dtype(q, k, v)
+    return (*(tensor.to(dtype) for tensor in (q, k, v)), gate.float(), beta.float())
 
 
 def validate_kda_inputs(
@@ -163,8 +196,12 @@ def validate_replay_state(
 
 
 __all__ = [
+    "DEFAULT_INTRA_CHUNK_DTYPES",
+    "FP16_INTRA_CHUNK_DTYPES",
     "SUPPORTED_INPUT_DTYPES",
     "cast_to_kernel_dtypes",
+    "kernel_dtype",
+    "resolve_intra_chunk_dtypes",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_replay_state",

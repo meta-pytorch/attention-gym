@@ -1285,7 +1285,7 @@ class WarpSpecialized(metaclass=_KernelType):
         ``format="mermaid"`` or ``"dot"`` draws the declarations as a graph
         (``describe_graph.py``): roles as nodes, channels as producer -> consumer edges,
         barriers and storage aliases. ``format="html"`` renders that graph as a self-contained
-        page with details on hover (``describe_html.py``)."""
+        page with an inspector for the selected role or channel (``describe_html.py``)."""
         self._collect()
         if format == "text":
             return describe_kernel(self)

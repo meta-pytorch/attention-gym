@@ -160,6 +160,15 @@ Launch paths run on every step and under CUDA Graph capture:
 
 ## Adding CuTeDSL Kernels
 
+Write every new CuTeDSL kernel on warpdrive (a `WarpSpecialized` subclass), warp-specialized or
+not: a kernel whose warps all run the same loop is one uniform role. warpdrive supplies the
+standard kernel interface (constructor-keyed compiles, `describe()`, work streams, declared SMEM
+via `smem_plan`, tracing); it does not require inventing producer and consumer roles, and
+operations it does not manage (`cp.async`, `mma.sync`, raw barriers) stay raw inside the role.
+See [kernels without warp specialization](docs/warpdrive/writing-kernels.md#kernels-without-warp-specialization)
+and load the `authoring-warpdrive` skill. A few older kernels (the work-table and chain-table
+builders, short convolution, top-k) predate this rule.
+
 Compile every CuTeDSL kernel through a module-level function decorated with `@jit_cache` from
 `attn_gym.warpdrive.cache`; see [`docs/warpdrive/cache.md`](docs/warpdrive/cache.md) for the
 full contract and the `cutedsl-tunable-kernel-template` skill for the tuning adapter. Entries
@@ -238,7 +247,9 @@ before changing the covered subsystem:
 - [`cutedsl-tunable-kernel-template`](.agents/skills/cutedsl-tunable-kernel-template/SKILL.md) —
   typed config generation, cached TVM-FFI compilation, parallel compile, and sequential tuning.
 - [`authoring-warpdrive`](.agents/skills/authoring-warpdrive/SKILL.md) —
-  warp-specialized CuTeDSL kernels from roles, channels and work streams, or ports to that API.
+  every new CuTeDSL kernel, warp-specialized or one uniform role, and ports to warpdrive.
+- [`adding-megakernel-model`](.agents/skills/adding-megakernel-model/SKILL.md) —
+  a new model on the shared decode megakernel package (`attn_gym/warpdrive/examples/megakernel/`).
 
 ## Agent Scratch Space
 

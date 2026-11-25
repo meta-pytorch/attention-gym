@@ -61,6 +61,7 @@ def _run(q, k, v, gate, beta, cu, state=None, final=False, tiles_per_head=1):
         initial_state=state,
         output_final_state=final,
         tiles_per_head=tiles_per_head,
+        intra_chunk_dtypes="tf32",
     )
 
 
