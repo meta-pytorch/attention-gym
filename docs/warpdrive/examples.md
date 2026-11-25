@@ -850,6 +850,21 @@ exceed GB10's 99 KiB per-block shared-memory limit. To try the quantized checkpo
 python -m attn_gym.warpdrive.examples.megakernel.chat --model thinkingmachines/Inkling-2-Mini --backend megakernel-spec
 ```
 
+To inspect a single `megakernel-spec` round offline, capture one warm CUDA graph replay with
+`torch.profiler` (CPU and CUDA activities) and `export_chrome_trace`. Add model tracks to the
+original GPU timeline, then open `annotated.json` in [Perfetto](https://ui.perfetto.dev/):
+
+```bash
+python -m attn_gym.warpdrive.examples.inkling_megakernel.schedule_trace round.json annotated.json
+```
+
+The replay must contain exactly one complete step on one stream; a multi-step chat graph is not
+an input to this exporter. It matches kernel names against `InklingConfig.visits()` (default:
+Inkling 2 Mini; `--config /path/to/config.json` selects a checkpoint config). The tracks show
+drafting, target verification, each core pass and layer visit, and acceptance from target argmax
+through the final device updates. Timestamps do not reveal how many drafts matched. Supply
+`--emitted-tokens N` only if you recorded that replay's output count (accepted drafts plus one).
+
 A step is the block's 51 model launches and the drafter's three, plus about 15 small torch kernels that accept
 on the device (argmax, prefix match) and update the step's state (count, tokens, anchor,
 position). It decodes greedily only, and its replies are the greedy decode in the block's
