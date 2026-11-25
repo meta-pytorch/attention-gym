@@ -167,7 +167,12 @@ per sequence is limited to `2**22`.
 
 Scoring uses a bounded grid whose workers loop over visible candidates on the GPU.
 Rows with zero head weights return the first visible IDs without reading queries,
-keys, or scores. The portable Triton selector detects an exact zero cutoff during its sign pass
+keys, or scores. The CuTe selector uses 1024 threads per decode query and stops
+refining a boundary bucket when its ordered-key minimum and maximum match, or
+when every member is needed. Exact ties larger than the shrink buffer can finish
+without further radix passes. Deterministic mode still chooses the lowest IDs
+among ties and returns ascending IDs.
+The portable Triton selector detects an exact zero cutoff during its sign pass
 and stops refinement as soon as a prefix contains exactly `topk` candidates.
 
 Reserved capacity still determines the score stride and query slab size: large
