@@ -26,9 +26,10 @@ from attn_gym.linear._delta_rule.validation import (
 from attn_gym.linear.types import KERNEL_OPTION_SPEC, IntraChunkDtypes, ReplayState
 
 SUPPORTED_INPUT_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
-# ``intra_chunk_dtypes`` when the option is omitted, and the one kernel set of FP16 Q/K/V.
+# ``intra_chunk_dtypes`` when the option is omitted.
 DEFAULT_INTRA_CHUNK_DTYPES: IntraChunkDtypes = "tf32+bf16"
-FP16_INTRA_CHUNK_DTYPES: IntraChunkDtypes = "tf32+fp16"
+# The one kernel set of FP16 Q/K/V; internal, not a public option value.
+FP16_INTRA_CHUNK_DTYPES = "tf32+fp16"
 
 
 class ResolvedKernelOptions(NamedTuple):
@@ -52,6 +53,14 @@ def resolve_kernel_options(
     tape_backend: str | None = None,
 ) -> ResolvedKernelOptions:
     """Validate chunk options, using the saved forward backend for a staged backward."""
+    if kernel_options is not None and (
+        kernel_options.get("intra_chunk_dtypes") == FP16_INTRA_CHUNK_DTYPES
+    ):
+        raise ValueError(
+            f"{op_name}: kernel_options['intra_chunk_dtypes']={FP16_INTRA_CHUNK_DTYPES!r} is no "
+            "longer an option value: FP16 q/k/v have one fixed kernel set, so omit the option; "
+            "BF16 (or FP32 or mixed) q/k/v take 'tf32+bf16' (default), 'tf32' or 'bf16'"
+        )
     options = resolve_chunk_kernel_options(
         kernel_options, KERNEL_OPTION_SPEC, op_name=op_name, tape_backend=tape_backend
     )
@@ -62,27 +71,21 @@ def resolve_kernel_options(
 
 def resolve_intra_chunk_dtypes(
     intra_chunk_dtypes: IntraChunkDtypes | None, compute_dtype: torch.dtype, *, op_name: str
-) -> IntraChunkDtypes:
+) -> str:
     """Choose intra-chunk operand dtypes from the Q/K/V kernel dtype, not the caller's dtype.
 
     Replay uses BF16 even for FP16 inputs. Validate before dispatch so invalid combinations
     fail on every backend, including during ``torch.compile`` tracing.
     """
     if compute_dtype == torch.float16:
-        if intra_chunk_dtypes not in (None, FP16_INTRA_CHUNK_DTYPES):
+        if intra_chunk_dtypes is not None:
             raise ValueError(
-                f"{op_name}: FP16 q/k/v take only "
-                f"kernel_options['intra_chunk_dtypes']={FP16_INTRA_CHUNK_DTYPES!r}, got "
-                f"{intra_chunk_dtypes!r}: their decay products need TF32 (the in-chunk decay "
-                "factors 2^-g overflow FP16) and their solve operands are FP16"
+                f"{op_name}: FP16 q/k/v have one fixed kernel set and take no "
+                f"kernel_options['intra_chunk_dtypes'], got {intra_chunk_dtypes!r}: their decay "
+                "products need TF32 (the in-chunk decay factors 2^-g overflow FP16) and their "
+                "solve operands are FP16"
             )
         return FP16_INTRA_CHUNK_DTYPES
-    if intra_chunk_dtypes == FP16_INTRA_CHUNK_DTYPES:
-        raise ValueError(
-            f"{op_name}: kernel_options['intra_chunk_dtypes']={FP16_INTRA_CHUNK_DTYPES!r} is the "
-            "FP16 q/k/v kernel set; BF16 (or FP32 or mixed) q/k/v take 'tf32+bf16' (default), "
-            "'tf32' or 'bf16'"
-        )
     return DEFAULT_INTRA_CHUNK_DTYPES if intra_chunk_dtypes is None else intra_chunk_dtypes
 
 

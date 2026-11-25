@@ -117,7 +117,7 @@ class SplitOptions(BackendOptions, total=False):
     See "Batch invariance" in ``docs/linear.md``."""
 
 
-IntraChunkDtypes = Literal["tf32+bf16", "tf32", "bf16", "tf32+fp16"]
+IntraChunkDtypes = Literal["tf32+bf16", "tf32", "bf16"]
 
 
 class KernelOptions(SplitOptions, total=False):
@@ -137,9 +137,10 @@ class KernelOptions(SplitOptions, total=False):
     and its contribution to the output. One dtype sets both. State products still use the
     Q/K/V kernel dtype, and all matrix products accumulate in FP32.
 
-    BF16 kernels accept ``"tf32+bf16"`` (default), ``"tf32"`` or ``"bf16"``.
-    FP16 kernels accept only ``"tf32+fp16"``, their default. Replay casts Q/K/V to BF16 before
-    choosing. Triton and the reference implementation validate the option but do not use it.
+    BF16 kernels accept ``"tf32+bf16"`` (default), ``"tf32"`` or ``"bf16"``. FP16 kernels
+    have one fixed set (TF32 decay products, FP16 solve and state operands) and reject the
+    option. Replay casts Q/K/V to BF16 before choosing. Triton and the reference
+    implementation validate the option but do not use it.
     See "Operand precision" in ``docs/linear.md``."""
 
 
