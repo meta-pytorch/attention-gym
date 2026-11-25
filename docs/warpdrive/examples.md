@@ -778,6 +778,17 @@ python -m attn_gym.warpdrive.examples.inkling_megakernel.chat --prompt "Hi" --re
 python -m attn_gym.warpdrive.examples.inkling_megakernel.bench --context 1100
 ```
 
+The same chat family accepts [`thinkingmachines/TML-d24-varloop-research`](https://huggingface.co/thinkingmachines/TML-d24-varloop-research).
+Set `--loops N` on a target-only backend to change the number of passes through layers 6–17.
+Omit it to use the checkpoint default. Varloop was trained with 1–5 passes; higher values are
+experiments, not a quality setting. Compute and KV cache size grow with the visit count
+(`12 + 12 × N`); reduce `--max-len` when exploring large values. DSpark uses fixed feature visits
+and does not accept the override.
+
+```bash
+python -m attn_gym.warpdrive.examples.megakernel.chat --model thinkingmachines/TML-d24-varloop-research --backend megakernel --loops 5
+```
+
 - **Oracle.** ``ref.py`` is a PyTorch implementation with HF's dtype boundaries; loaded with
   ``activation_quant=False`` and given the same weights it equals HF's eager
   ``Inkling2LoopForCausalLM`` bit for bit on the tiny test model and short real prompts (its

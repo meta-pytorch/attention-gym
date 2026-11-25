@@ -42,11 +42,12 @@ The other backends load bf16 experts. Every backend computes the experts' numeri
 checkpoint declares (``ref.ExpertQuant``: quantized inputs, as vLLM's SM100 kernels), not HF's.
 
 Replies are sequences of ``<|message_model|><|content_X|>...<|end_message|>`` parts, ``X`` being
-``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; the reply shows thinking
-parts between ``[thinking]`` markers and keeps both for the next turn's history.
+``thinking`` or ``text``, closed by ``<|content_model_end_sampling|>``; ``--show-thinking`` displays the
+thinking parts between ``[thinking]`` markers. Both parts remain in the next turn's history.
 """
 
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -78,8 +79,8 @@ __all__ = ["DEFAULT_BACKEND", "OPTIONS", "check_options", "checkpoint_dir", "loa
 
 DEFAULT_EFFORT = "low"
 EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
-PART = re.compile(
-    r"(?:<\|message_model\|>)?<\|content_(thinking|text)\|>(.*?)(<\|end_message\|>|$)", re.DOTALL
+PART_BOUNDARY = re.compile(
+    r"<\|(?:content_(thinking|text)|end_message|content_model_end_sampling)\|>"
 )
 
 
@@ -299,20 +300,31 @@ BACKENDS = {
     "megakernel-spec-bf16": MegakernelSpecBf16,
 }
 DEFAULT_BACKEND = "megakernel"
-OPTIONS = frozenset({"reasoning_effort", "verify_tokens"})
+OPTIONS = frozenset({"reasoning_effort", "verify_tokens", "loops", "show_thinking"})
 
 
 def reply_parts(text: str) -> list[tuple[str, str, bool]]:
     """``(kind, text, closed)`` parts of a reply decoded with its special tokens, kind
     ``thinking`` or ``text``; only the last part may be unclosed (still streaming)."""
-    return [(match[1], match[2], bool(match[3])) for match in PART.finditer(text)]
+    text = text.replace("<|message_model|>", "")
+    parts = []
+    kind = None  # Outside a tagged part, ordinary text is an answer.
+    start = 0
+    for boundary in PART_BOUNDARY.finditer(text):
+        if kind or start < boundary.start():
+            parts.append((kind or "text", text[start : boundary.start()], True))
+        kind = boundary[1]
+        start = boundary.end()
+    if kind or start < len(text):
+        parts.append((kind or "text", text[start:], False))
+    return parts
 
 
 def assistant_message(text: str) -> dict:
     """The chat-template message of a reply decoded with its special tokens. The template keeps
     one thinking and one text part per message, so a reply with several parts of a kind
-    re-renders them joined (and thinking first); the chat then rebuilds its caches. Otherwise the
-    rendering reproduces the reply's tokens and the next turn reuses their cache entries."""
+    re-renders them joined (and thinking first). Unmarked text re-renders as a tagged text part.
+    The next turn reuses the cache when the rendered tokens match, and rebuilds it otherwise."""
     parts = reply_parts(text)
     message = {"role": "assistant", "content": "".join(t for k, t, _ in parts if k == "text")}
     thinking = "".join(t for k, t, _ in parts if k == "thinking")
@@ -329,6 +341,11 @@ class InklingChatModel:
         backend = BACKENDS[options.backend]
         load = quant.load_quantized_inkling_weights if backend.quantized else load_inkling_weights
         self.weights = load(checkpoint)
+        if options.loops is not None:
+            check_loops(options)
+            self.weights = replace(
+                self.weights, config=replace(self.weights.config, num_passes=options.loops)
+            )
         # The chat feeds up to SYNC_EVERY positions past a stop token (a speculative step's
         # rejected ones included), then resumes at the stop token's position: its convolutions
         # read the kernel - 1 earlier ring rows, which that over-run must not have overwritten.
@@ -339,6 +356,7 @@ class InklingChatModel:
         self.backend = backend.from_options(self.weights, self.cache, checkpoint, options)
         self.label = f"the {options.backend} backend"
         self.effort = reasoning_effort(options)
+        self.show_thinking = options.show_thinking
         self.stops = ref.stop_tokens(self.tokenizer)
 
     def prompt_ids(self, messages: list[dict]) -> list[int]:
@@ -348,15 +366,14 @@ class InklingChatModel:
         return self.backend.prefill(ids, start)
 
     def reply_text(self, ids: list[int]) -> str:
-        """Thinking between markers; the closing marker waits for the part's end, so each
-        text extends the previous one (the chat streams the difference)."""
+        """Stream unmarked text as an answer, switching visibility at each content token."""
+        decoded = self.tokenizer.decode(ids, skip_special_tokens=False)
         shown = []
-        for kind, text, closed in reply_parts(
-            self.tokenizer.decode(ids, skip_special_tokens=False)
-        ):
-            if kind == "thinking":
-                text = f"[thinking]{text}" + ("[/thinking]\n" if closed else "")
-            shown.append(text)
+        for kind, text, closed in reply_parts(decoded):
+            if kind == "text":
+                shown.append(text)
+            elif self.show_thinking:
+                shown.append(f"[thinking]{text}" + ("[/thinking]\n" if closed else ""))
         return "".join(shown)
 
     def assistant_message(self, ids: list[int]) -> dict:
@@ -373,6 +390,7 @@ def checkpoint_dir(path_or_repo: str | Path, tqdm_class=None, *, options: ChatOp
 def check_options(options: ChatOptions):
     if options.backend not in BACKENDS:
         raise typer.BadParameter(f"Inkling backends: {sorted(BACKENDS)}, got {options.backend!r}")
+    check_loops(options)
     backend = BACKENDS[options.backend]
     if issubclass(backend, Speculative):
         if options.temperature > 0:
@@ -385,6 +403,16 @@ def check_options(options: ChatOptions):
             f"--max-len must be a multiple of {backend.max_len_multiple} on {options.backend}"
         )
     reasoning_effort(options)
+
+
+def check_loops(options: ChatOptions):
+    if options.loops is not None:
+        if options.loops < 1:
+            raise typer.BadParameter("--loops must be positive")
+        if issubclass(BACKENDS[options.backend], Speculative):
+            raise typer.BadParameter(
+                "--loops requires a target-only backend: DSpark uses fixed feature visits"
+            )
 
 
 def verify_tokens(options: ChatOptions) -> int:
