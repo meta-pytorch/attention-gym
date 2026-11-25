@@ -35,6 +35,9 @@ class TestCausalBlockMask:
         assert actual.shape == (batch, heads, q_len, kv_len)
         assert torch.equal(actual.to_dense(), expected.to_dense())
         assert actual.sparsity() == expected.sparsity()
+        if kv_len == 1:
+            assert (actual.full_kv_num_blocks == 1).all()
+            assert (actual.kv_num_blocks == 0).all()
 
     @pytest.mark.parametrize("device", ["cuda"])
     @pytest.mark.parametrize("seq_len", [256, 232])

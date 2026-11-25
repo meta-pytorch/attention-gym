@@ -48,8 +48,8 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 
 TC_MIN_N = 16  # MMA N >= 16 at M = 128; batch one uses column 0 (the others: shifted x)
 TC_ROWS, TC_TILE_K = 128, 64  # a stage: one 128 x 64 SW128 K-major MMA operand (16 KB)
-# Limit the MMA accumulator chain: on long dots small contributions can be lost before
-# the final bf16 rounding. Add one fp32 partial per 1024 input columns on the CUDA cores.
+# Long MMA chains can lose contributions that affect bf16 rounding. Combine 1024-column
+# partials in fp32 on the CUDA cores; shorter dots still have a single MMA accumulator.
 ACC_PART_TILES = 1024 // TC_TILE_K
 COMPUTE_TMEM_DRAINED = (
     "the compute warps issue no tcgen05.st and complete each acc load at its release"

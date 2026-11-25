@@ -171,7 +171,7 @@ def test_single_instruction(weights, op, engine):
         torch.testing.assert_close(runner.logits, expected, atol=2e-2, rtol=1e-2)
 
 
-def test_tcgen05_qkv_retains_small_terms_past_a_bf16_midpoint():
+def test_tcgen05_qkv_combines_k_partials_before_bf16_rounding():
     require_decode_engine("tcgen05")
     config = QwenConfig(
         hidden_size=2048, num_layers=1, num_q_heads=8, num_kv_heads=8,
