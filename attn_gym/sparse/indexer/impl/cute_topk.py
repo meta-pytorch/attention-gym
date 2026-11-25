@@ -24,13 +24,15 @@ at most K candidates require no score reads at all. The monotonic key supports
 signed finite FP32 scores.
 """
 
+from dataclasses import dataclass
+
 import cutlass
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, Uint32, cute
 from cutlass._mlir.dialects import llvm
 from cutlass.cutlass_dsl import dsl_user_op
 
-from attn_gym.warpdrive.compat import SmemAllocator
+from attn_gym.warpdrive import Local, OneShot, SmemPlan, WarpSpecialized, WorkStream, role
 
 from .cute_kernel_base import IndexerKernelBase
 
@@ -88,7 +90,75 @@ def _block_scan_inclusive(
     return value
 
 
-class IndexerTopKKernel(IndexerKernelBase):
+@dataclass(frozen=True)
+class SelectionParams:
+    scores: cute.Tensor
+    output: cute.Tensor
+    pair_start: Int32 | Int64
+    candidate_bounds: cute.Tensor | None
+
+
+class IndexerRadixPrimitives(IndexerKernelBase):
+    """Single-CTA launch and radix primitives shared by exact selectors."""
+
+    def row_launch_config(self, rows, min_blocks_per_mp: int | None = None):
+        if self.cluster.size != 1:
+            raise ValueError("Top-K selection requires one CTA per row, not a multi-CTA cluster")
+        bound = self.work.bind((rows, 1, 1))
+        config = self.launch_config(bound, min_blocks_per_mp=min_blocks_per_mp)
+        del config["cluster"]  # Preserve the non-clustered launch.
+        return bound, config
+
+    @cute.jit
+    def append(self, idx: Int32, counters: cute.Tensor, row_output: cute.Tensor):
+        """Write one index to the next output slot claimed from the shared counter."""
+        dst = cute.arch.atomic_add(counters.iterator, Int32(1), sem="relaxed", scope="cta")
+        row_output[dst] = idx
+
+    @cute.jit
+    def find_threshold(
+        self,
+        histogram: cute.Tensor,
+        bins: cutlass.Constexpr,
+        need: Int32,
+        warp_sums: cute.Tensor,
+        threshold: cute.Tensor,
+        tidx: Int32,
+        publish_count: cutlass.Constexpr = False,
+    ):
+        """Find the descending cumulative-count boundary and clear the histogram.
+
+        Exactly one bin crosses positive ``need``. Its owner publishes the bin
+        ID and the number still needed from that bin for the next radix pass;
+        the third result is that bin's size with ``publish_count``, else zero.
+        """
+        items = cutlass.const_expr(bins // self.block_threads)
+        counts = [Int32(0) for _ in range(items)]
+        local_sum = Int32(0)
+        for i in cutlass.range_constexpr(items):
+            bin_id = bins - 1 - (tidx * items + i)
+            counts[i] = histogram[bin_id]
+            histogram[bin_id] = Int32(0)
+            local_sum += counts[i]
+
+        inclusive = _block_scan_inclusive(local_sum, warp_sums, tidx, self.block_threads)
+        running = inclusive - local_sum
+        for i in cutlass.range_constexpr(items):
+            count = counts[i]
+            if count > 0 and running < need and running + count >= need:
+                threshold[0] = Int32(bins - 1 - (tidx * items + i))
+                threshold[1] = need - running
+                if cutlass.const_expr(publish_count):
+                    threshold[2] = count
+            running += count
+        cute.arch.barrier()
+        count = Int32(0)
+        if cutlass.const_expr(publish_count):
+            count = threshold[2]
+        return threshold[0], threshold[1], count
+
+
+class IndexerTopKKernel(IndexerRadixPrimitives, WarpSpecialized):
     """Select static K indices per row from a contiguous symbolic [P, 2, S] slab.
 
     ``pair_start`` locates the slab in flattened (batch, query-pair) order; odd
@@ -115,6 +185,21 @@ class IndexerTopKKernel(IndexerKernelBase):
         self.causal = causal
         self.compress_ratio = compress_ratio
         self.use_int64_offsets = use_int64_offsets
+        self.work = WorkStream(schedule=OneShot(grid="3d"))
+        self.smem_plan = SmemPlan()
+        for name, dtype, _ in self.scratch():
+            self.smem_plan.buffer(name, dtype, align=128)
+
+    def scratch(self) -> tuple:
+        buffers = (
+            ("histogram", Int32, _NUM_BINS_11),
+            ("warp_sums", Int32, self.block_threads // 32),
+            ("threshold", Int32, 3),
+            ("counters", Int32, 3),  # emitted winners, accepted ties, boundary-bin size
+            ("shrink_keys", Uint32, _SHRINK_MAX),
+            ("shrink_indices", Int32, _SHRINK_MAX),
+        )
+        return buffers + (("selected", Int32, _NUM_BINS_11),) if self.deterministic else buffers
 
     def get_name(self) -> str:
         """Return a stable artifact name including all static specialization fields."""
@@ -198,12 +283,6 @@ class IndexerTopKKernel(IndexerKernelBase):
                 self.append(idx, counters, row_output)
         else:
             self.append(idx, counters, row_output)
-
-    @cute.jit
-    def append(self, idx: Int32, counters: cute.Tensor, row_output: cute.Tensor):
-        """Write one index to the next output slot claimed from the shared counter."""
-        dst = cute.arch.atomic_add(counters.iterator, Int32(1), sem="relaxed", scope="cta")
-        row_output[dst] = idx
 
     @cute.jit
     def compact_bitmap(
@@ -298,89 +377,31 @@ class IndexerTopKKernel(IndexerKernelBase):
                 bitmap[i] = Int32(0)
             cute.arch.barrier()  # Protect warp_sums and the bitmap before the next window.
 
+    @role(warps=range(block_threads // 32), raw=True)
     @cute.jit
-    def find_threshold(
-        self,
-        histogram: cute.Tensor,
-        bins: cutlass.Constexpr,
-        need: Int32,
-        warp_sums: cute.Tensor,
-        threshold: cute.Tensor,
-        tidx: Int32,
-        publish_count: cutlass.Constexpr = False,
-    ):
-        """Find the descending cumulative-count boundary and clear the histogram.
-
-        Exactly one bin crosses positive ``need``. Its owner publishes the bin
-        ID and the number still needed from that bin for the next radix pass;
-        the third result is that bin's size with ``publish_count``, else zero.
-        """
-        items = cutlass.const_expr(bins // self.block_threads)
-        counts = [Int32(0) for _ in range(items)]
-        local_sum = Int32(0)
-        for i in cutlass.range_constexpr(items):
-            bin_id = bins - 1 - (tidx * items + i)
-            counts[i] = histogram[bin_id]
-            histogram[bin_id] = Int32(0)
-            local_sum += counts[i]
-
-        inclusive = _block_scan_inclusive(local_sum, warp_sums, tidx, self.block_threads)
-        running = inclusive - local_sum
-        for i in cutlass.range_constexpr(items):
-            count = counts[i]
-            if count > 0 and running < need and running + count >= need:
-                threshold[0] = Int32(bins - 1 - (tidx * items + i))
-                threshold[1] = need - running
-                if cutlass.const_expr(publish_count):
-                    threshold[2] = count
-            running += count
-        cute.arch.barrier()
-        count = Int32(0)
-        if cutlass.const_expr(publish_count):
-            count = threshold[2]
-        return threshold[0], threshold[1], count
-
-    @cute.kernel
-    def kernel(
-        self,
-        scores: cute.Tensor,
-        output: cute.Tensor,
-        pair_start: Int32 | Int64,
-        candidate_bounds: cute.Tensor | None,
-    ):
-        """Run the four-pass selection with CTA-uniform row and short-row guards."""
-        tidx = cute.arch.thread_idx()[0]
-        block_id = self.upcast_offset(cute.arch.block_idx()[0])
+    def select(self, params: SelectionParams, me: Local):
+        """All warps own one row. CTA barriers separate histogram and scratch reuse phases."""
+        scores, output = params.scores, params.output
+        candidate_bounds = params.candidate_bounds
+        tidx = me.tid
+        _, (row_id, _, _) = self.work.single_item()
+        block_id = self.upcast_offset(row_id)
         slab_pair = block_id // 2
         qi = block_id % 2
         num_queries = self.upcast_offset(output.shape[1])
         num_candidates = self.upcast_offset(scores.shape[2])
         pairs_per_batch = cute.ceil_div(num_queries, 2)
-        global_pair = self.upcast_offset(pair_start) + slab_pair
+        global_pair = self.upcast_offset(params.pair_start) + slab_pair
         batch = global_pair // pairs_per_batch
         q = (global_pair % pairs_per_batch) * 2 + qi
 
-        smem = SmemAllocator()
-        histogram = smem.allocate_tensor(
-            Int32, cute.make_layout((_NUM_BINS_11,)), byte_alignment=128
-        )
-        warp_sums = smem.allocate_tensor(
-            Int32, cute.make_layout((self.block_threads // 32,)), byte_alignment=128
-        )
-        threshold = smem.allocate_tensor(Int32, cute.make_layout((3,)), byte_alignment=128)
-        # Counters: emitted winners, accepted exact ties, boundary-bin size.
-        counters = smem.allocate_tensor(Int32, cute.make_layout((3,)), byte_alignment=128)
-        shrink_keys = smem.allocate_tensor(
-            Uint32, cute.make_layout((_SHRINK_MAX,)), byte_alignment=128
-        )
-        shrink_indices = smem.allocate_tensor(
-            Int32, cute.make_layout((_SHRINK_MAX,)), byte_alignment=128
-        )
-        selected = None
-        if cutlass.const_expr(self.deterministic):
-            selected = smem.allocate_tensor(
-                Int32, cute.make_layout((_NUM_BINS_11,)), byte_alignment=128
-            )
+        histogram = self.buffer("histogram")
+        warp_sums = self.buffer("warp_sums")
+        threshold = self.buffer("threshold")
+        counters = self.buffer("counters")
+        shrink_keys = self.buffer("shrink_keys")
+        shrink_indices = self.buffer("shrink_indices")
+        selected = self.buffer("selected") if cutlass.const_expr(self.deterministic) else None
 
         if batch < output.shape[0] and q < num_queries:
             row_output = output[batch, q, None]
@@ -599,6 +620,19 @@ class IndexerTopKKernel(IndexerKernelBase):
         else:
             self.sort_selected(row, row_output, histogram, warp_sums, seg_len, tidx)
 
+    @cute.kernel
+    def kernel(
+        self,
+        scores: cute.Tensor,
+        output: cute.Tensor,
+        pair_start: Int32 | Int64,
+        candidate_bounds: cute.Tensor | None,
+        bound,
+    ):
+        layouts = {name: cute.make_layout((count,)) for name, _, count in self.scratch()}
+        self.begin_roles(work=bound, layouts=layouts)
+        self.run_roles(SelectionParams(scores, output, pair_start, candidate_bounds))
+
     @cute.jit
     def __call__(
         self,
@@ -615,8 +649,7 @@ class IndexerTopKKernel(IndexerKernelBase):
         """
         packed = "_packed" if cutlass.const_expr(candidate_bounds is not None) else ""
         self.kernel.set_name_prefix(f"{self.get_name()}{packed}")
-        self.kernel(scores, output, pair_start, candidate_bounds).launch(
-            grid=(scores.shape[0] * 2, 1, 1),
-            block=(self.block_threads, 1, 1),
-            stream=stream,
+        bound, config = self.row_launch_config(scores.shape[0] * 2)
+        self.kernel(scores, output, pair_start, candidate_bounds, bound).launch(
+            **config, stream=stream
         )
