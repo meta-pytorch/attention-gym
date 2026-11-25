@@ -85,7 +85,7 @@ the epilogue can return TMEM as soon as its final read completes:
 
 ```text
 early_release=True:   last tcgen05.ld -> wait::ld -> release TMEM -> SMEM/TMA store
- early_release=False: last tcgen05.ld -> wait::ld -> SMEM/TMA store -> release TMEM
+ early_release=False: last tcgen05.ld -> SMEM/TMA store -> wait::ld -> release TMEM
 ```
 
 `early_release=True` is the default. It changes **when TMEM is reusable**, not when the

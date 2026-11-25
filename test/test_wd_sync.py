@@ -30,7 +30,12 @@ import cutlass
 from attn_gym.linear._delta_rule.warpdrive.kda_common import OperandDtypes
 from attn_gym.warpdrive.fences import FENCE_KINDS
 from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
-from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
+from attn_gym.warpdrive.ptx_check import (
+    capture_ptx,
+    check_bulk_copies,
+    check_tcgen05_sync,
+    read_ptx,
+)
 
 PACKAGE = "attn_gym.linear._delta_rule.warpdrive"
 COMPILE = {
@@ -745,7 +750,9 @@ def _check(tmp_path, build, *args, **kwargs):
     with capture_ptx(tmp_path) as out:
         build.__wrapped__(*args, **kwargs)  # uncached: a cached kernel has no PTX
     (path,) = out.glob("*.ptx")
-    findings = check_tcgen05_sync(read_ptx(path), teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
+    ptx = read_ptx(path)
+    findings = check_tcgen05_sync(ptx, teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
+    findings += check_bulk_copies(ptx)
     assert not findings, "\n".join(f.describe() for f in findings)
 
 
