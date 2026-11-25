@@ -230,7 +230,7 @@ def gather_attn_oracle(
             lse = torch.logsumexp(normalized, dim=1)
             probabilities = torch.exp(logits - lse[:, None]).reshape(kv_heads, group, -1)
             output = torch.einsum("kgn,knd->kgd", probabilities, values)
-            batch_outputs.append(output.reshape(heads, head_dim))
+            batch_outputs.append(output.reshape(heads, values.shape[-1]))
             batch_lses.append(lse)
         outputs.append(torch.stack(batch_outputs, dim=1))
         lses.append(torch.stack(batch_lses, dim=1))

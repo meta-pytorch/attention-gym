@@ -64,7 +64,7 @@ def gather_attn(
     Query head h reads KV head h // (heads // kv_heads). ``local_v``/``sparse_v`` supply
     separate values for the same slots; without them the keys are also the values.
     """
-    batch, heads, tokens, dim = query.shape
+    batch, heads, tokens, _ = query.shape
     positions = torch.arange(tokens, device=query.device)
     window = min(sliding_window_size, tokens)
     local_indices = positions[:, None] - window + 1 + torch.arange(window, device=query.device)
@@ -126,5 +126,5 @@ def gather_attn(
     )
     values = slots if sparse_v is None else gather_slots(local_v, sparse_v)
     output = torch.matmul(grouped_probabilities.to(accumulation_dtype), values)
-    output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, dim)
+    output = output.permute(0, 1, 3, 2, 4).reshape(batch, heads, tokens, values.shape[-1])
     return output.to(query.dtype), lse

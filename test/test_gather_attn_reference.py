@@ -63,7 +63,9 @@ def test_batch_invariance(share_kv, num_topk_blocks):
         )
 
 
-def _assert_matches_oracle(inputs, *, sliding_window_size, cu_seqlens=None, cu_seqlens_k=None):
+def _assert_matches_oracle(
+    inputs, *, sliding_window_size, cu_seqlens=None, cu_seqlens_k=None, split_dims=None
+):
     """Compare reference outputs, LSE, and every input gradient against the FP64 oracle."""
     leaves = {
         name: tensor
@@ -72,8 +74,13 @@ def _assert_matches_oracle(inputs, *, sliding_window_size, cu_seqlens=None, cu_s
     }
     for tensor in leaves.values():
         tensor.requires_grad_()
+    args = inputs.copy()
+    if split_dims is not None:
+        for name in ("query", "local_kv", "sparse_kv"):
+            args[name] = inputs[name].split(split_dims, dim=-1)
+        args["scale"] = inputs["query"].shape[-1] ** -0.5
     actual, aux = gather_attn(
-        **inputs,
+        **args,
         sliding_window_size=sliding_window_size,
         cu_seqlens=cu_seqlens,
         cu_seqlens_k=cu_seqlens_k,
@@ -113,6 +120,9 @@ def test_grouped_heads_and_separate_values_match_oracle(heads, kv_heads, separat
         batch=1 if packed else 2,
         device="cpu",
     )
+    if separate_values:
+        for name in ("local_v", "sparse_v"):
+            inputs[name] = inputs[name][..., :6]
     offsets = {}
     if packed:
         offsets = {
@@ -122,7 +132,8 @@ def test_grouped_heads_and_separate_values_match_oracle(heads, kv_heads, separat
     _assert_matches_oracle(inputs, sliding_window_size=3, **offsets)
 
 
-def test_qsa_block_selection_matches_oracle():
+@pytest.mark.parametrize("split_dims", [None, (192, 64)])
+def test_qsa_block_selection_matches_oracle(split_dims):
     """QSA usage: raw-token pools, separate K/V, GQA, and expanded 4-token blocks plus tail."""
     heads, kv_heads, head_dim, block_size, budget_blocks = 24, 2, 256, 4, 2
     document_lengths = [21, 16]
@@ -155,4 +166,10 @@ def test_qsa_block_selection_matches_oracle():
         "local_v": values,
         "sparse_v": values,
     }
-    _assert_matches_oracle(inputs, sliding_window_size=0, cu_seqlens=offsets, cu_seqlens_k=offsets)
+    _assert_matches_oracle(
+        inputs,
+        sliding_window_size=0,
+        cu_seqlens=offsets,
+        cu_seqlens_k=offsets,
+        split_dims=split_dims,
+    )
