@@ -425,11 +425,12 @@ class QwenDecodeMegakernelTcStream(QwenDecodeMegakernelTc):
             p.xshared.iterator + self.norm_offset(slot),
             cute.make_layout((self.hidden * self.x_rows,)),
         )
-        op, norm_weight = GATEUP, p.ln_post[layer, None]
-        if layer == self.layers:
-            op, norm_weight = LMHEAD, p.final_norm
-        elif phase == 0:
-            op, norm_weight = QKV, p.ln_in[layer, None]
+        op, norm_weight = LMHEAD, p.final_norm
+        if layer != self.layers:
+            if phase == 0:
+                op, norm_weight = QKV, p.ln_in[layer, None]
+            else:
+                op, norm_weight = GATEUP, p.ln_post[layer, None]
         self.normalize(
             p, op, layer, 0, t, True, xs, norm_weight, tid, COMPUTE_WARPS, warp, lane, epoch, row
         )

@@ -45,6 +45,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingVisitMegakernel,
     MessageGates,
 )
+from attn_gym.warpdrive.examples.inkling_megakernel.multi_kernel import (
+    InklingMultiQuantVisitKernel,
+)
 from attn_gym.warpdrive.examples.megakernel.formats import NVFP4
 
 pytestmark = pytest.mark.usefixtures(
@@ -144,7 +147,9 @@ CASES = [
 
 @pytest.mark.parametrize("tokens,layer,blocks,positions", CASES)
 @torch.no_grad()
-def test_block_visit_random_weights(tokens, layer, blocks, positions):
+def test_block_visit_random_weights(tokens, layer, blocks, positions, monkeypatch):
+    # Check both packed weight widths against the existing block oracle, including TMA tails.
+    monkeypatch.setattr(InklingMultiQuantVisitKernel, "checked", True)
     if tokens == 8 and torch.cuda.get_device_capability() == (12, 1):
         pytest.skip("8 tokens' input rows exceed GB10 shared memory on full layers")
     w = random_layer(CONFIG, layer, seed=layer)

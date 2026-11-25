@@ -6,6 +6,7 @@ import cutlass
 from cutlass import BFloat16, Int64, cute
 from cutlass.cute.nvgpu import cpasync
 
+from attn_gym.warpdrive import unchecked
 from attn_gym.warpdrive.examples.megakernel.constants import (
     BLOCK,
     BOX,
@@ -72,18 +73,30 @@ def tma_atom(src, box: tuple[int, ...]) -> tuple:
 
 
 @cute.jit
-def load_boxes(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr):
+def load_boxes(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlass.Constexpr,
+               *, pad_k: cutlass.Constexpr = False):  # fmt: skip
     """``load_tiles`` of ``count`` 16 KB stages, each as ``TILE_K // BOX`` swizzled TMA boxes
     (``multi_gemv``) into the ring's view ``buffer``: box ``i`` of stage ``k`` is tile ``(row,
-    (k0 + k) * boxes + i)``."""
+    (k0 + k) * boxes + i)``. With ``pad_k``, load the whole row from K=0, rounding its last
+    stage up with TMA zero fill."""
     boxes = TILE_K // BOX
+    if cutlass.const_expr(pad_k):
+        assert k0 == 0 and count == -(-tiles.shape[2] // boxes)
+        row_tiles = tiles[None, row, None]
     for k in cutlass.range_constexpr(count):
         with w.produce() as h:
             stage = h.view(buffer)
             for i in cutlass.range_constexpr(boxes):
+                if cutlass.const_expr(pad_k and k * boxes + i >= tiles.shape[2]):
+                    with unchecked(
+                        "bounds", reason="TMA zero-fills the last weight stage's K tail"
+                    ):
+                        src = row_tiles[None, k * boxes + i]
+                else:
+                    src = tiles[None, row, (k0 + k) * boxes + i]
                 cute.copy(
                     atom,
-                    tiles[None, row, (k0 + k) * boxes + i],
+                    src,
                     stage[None, i],
                     tma_bar_ptr=h.barrier,
                     cache_policy=Int64(EVICT_FIRST),

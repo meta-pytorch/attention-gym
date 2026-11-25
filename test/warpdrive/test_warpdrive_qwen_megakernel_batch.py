@@ -348,12 +348,18 @@ def test_input_waits_count_reduce_rows():
     assert mk_trace.input_waits(events, table) == {"REDUCE": 0.06}
 
 
-def streamed_matches_batch_one(weights, batch):
+def streamed_matches_batch_one(weights, batch, *, checked=False):
     """Check that streamed logits and K/V cache prefixes are bit-identical to separate batch-one
     tcgen05 runs, using one KV split for both."""
     k, v, tokens, positions = batch_state(weights, batch)
     streamed = mk.QwenMegakernel(
-        weights, MAX_LEN, engine="tcgen05", batch=batch, splits=1, stream_inputs=True
+        weights,
+        MAX_LEN,
+        engine="tcgen05",
+        batch=batch,
+        splits=1,
+        stream_inputs=True,
+        checked=checked,
     )
     ours_k, ours_v = k.clone(), v.clone()
     if batch == 1:  # the single-sequence call
@@ -369,11 +375,13 @@ def streamed_matches_batch_one(weights, batch):
         assert torch.equal(ours_v[b][:, :, : pos + 1], theirs_v[:, :, : pos + 1])
 
 
-@pytest.mark.parametrize("batch", [1, 17])
-def test_streamed_inputs_match_batch_one(batch):
+@pytest.mark.parametrize(
+    ("batch", "checked"), [(1, False), (17, False), pytest.param(1, True, id="checked-final-norm")]
+)
+def test_streamed_inputs_match_batch_one(batch, checked):
     """Streamed dense decoding matches batch-one tcgen05 logits and K/V cache prefixes bitwise."""
     require_sm100()
-    streamed_matches_batch_one(random_weights(SMALL), batch)
+    streamed_matches_batch_one(random_weights(SMALL), batch, checked=checked)
 
 
 def test_streamed_inputs_moe():
