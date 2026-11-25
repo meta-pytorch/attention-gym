@@ -26,8 +26,10 @@ earlier turn differently, the caches are rebuilt from the start.
 
 import importlib
 import json
+import logging
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass, fields
 from functools import partial
@@ -42,6 +44,7 @@ from rich.progress import (
     DownloadColumn,
     MofNCompleteColumn,
     Progress,
+    SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -140,6 +143,22 @@ class ChatOptions:
     yarn_factor: float | None = None  # Qwen3 YaRN
     reasoning_effort: str | None = None  # Inkling
     verify_tokens: int | None = None  # Inkling speculative verify block
+
+
+def quiet_libraries():
+    """Hide library chatter the chat cannot act on: the Hub's server-sent advice (an
+    unauthenticated-requests notice on every run) and transformers' config warnings (loading the
+    tokenizer of a composite checkpoint such as Inkling 2's warns that its ``model_type`` is not
+    the tokenizer config's). Errors still print; ``HF_HUB_VERBOSITY`` and
+    ``TRANSFORMERS_VERBOSITY`` set by the user win."""
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    for name, var in (
+        ("huggingface_hub", "HF_HUB_VERBOSITY"),
+        ("transformers", "TRANSFORMERS_VERBOSITY"),
+    ):
+        if name in sys.modules:  # already configured its logger from the environment
+            logging.getLogger(name).setLevel(os.environ[var].upper())
 
 
 def download(model: str, checkpoint_dir) -> Path:
@@ -431,12 +450,14 @@ def compile_kernels(calls: list[tuple]):
         return
     cache = str(get_cache_path()).replace(str(Path.home()), "~", 1)
     note = f"first run after a code change; cached in {cache} afterwards"
+    console.print(f"[dim]compiling {len(cold)} kernels ({note if disk else 'disk cache off'})[/]")
+    # A narrow line: rich drops the bar and counts when the columns overflow the terminal.
     progress = Progress(
+        SpinnerColumn(),
         TextColumn("compiling kernels"),
-        BarColumn(),
+        BarColumn(bar_width=24),
         MofNCompleteColumn(),
         TimeElapsedColumn(),
-        TextColumn(f"[dim]({note if disk else 'the disk cache is off'})"),
         console=console,
         transient=True,
     )
@@ -531,6 +552,7 @@ def main(
     prompt: str | None = typer.Option(None, help="answer one prompt and exit"),
 ):
     check_temperature(temperature)
+    quiet_libraries()
     family = family_module(model)
     backend = family.DEFAULT_BACKEND if backend is None else backend
     options = ChatOptions(
