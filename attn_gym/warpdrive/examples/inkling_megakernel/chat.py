@@ -47,6 +47,7 @@ parts between ``[thinking]`` markers and keeps both for the next turn's history.
 """
 
 import re
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -299,7 +300,7 @@ BACKENDS = {
     "megakernel-spec-bf16": MegakernelSpecBf16,
 }
 DEFAULT_BACKEND = "megakernel"
-OPTIONS = frozenset({"reasoning_effort", "verify_tokens"})
+OPTIONS = frozenset({"reasoning_effort", "verify_tokens", "loops"})
 
 
 def reply_parts(text: str) -> list[tuple[str, str, bool]]:
@@ -329,6 +330,11 @@ class InklingChatModel:
         backend = BACKENDS[options.backend]
         load = quant.load_quantized_inkling_weights if backend.quantized else load_inkling_weights
         self.weights = load(checkpoint)
+        if options.loops is not None:
+            check_loops(options)
+            self.weights = replace(
+                self.weights, config=replace(self.weights.config, num_passes=options.loops)
+            )
         # The chat feeds up to SYNC_EVERY positions past a stop token (a speculative step's
         # rejected ones included), then resumes at the stop token's position: its convolutions
         # read the kernel - 1 earlier ring rows, which that over-run must not have overwritten.
@@ -373,6 +379,7 @@ def checkpoint_dir(path_or_repo: str | Path, tqdm_class=None, *, options: ChatOp
 def check_options(options: ChatOptions):
     if options.backend not in BACKENDS:
         raise typer.BadParameter(f"Inkling backends: {sorted(BACKENDS)}, got {options.backend!r}")
+    check_loops(options)
     backend = BACKENDS[options.backend]
     if issubclass(backend, Speculative):
         if options.temperature > 0:
@@ -385,6 +392,16 @@ def check_options(options: ChatOptions):
             f"--max-len must be a multiple of {backend.max_len_multiple} on {options.backend}"
         )
     reasoning_effort(options)
+
+
+def check_loops(options: ChatOptions):
+    if options.loops is not None:
+        if options.loops < 1:
+            raise typer.BadParameter("--loops must be positive")
+        if issubclass(BACKENDS[options.backend], Speculative):
+            raise typer.BadParameter(
+                "--loops requires a target-only backend: DSpark uses fixed feature visits"
+            )
 
 
 def verify_tokens(options: ChatOptions) -> int:
