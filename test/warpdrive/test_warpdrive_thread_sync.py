@@ -413,6 +413,29 @@ def test_persistent_gemm_ptx_is_fenced(requires_blackwell, tmp_path, pair):
     assert not found, "\n".join(f.describe() for f in found)
 
 
+@pytest.mark.parametrize("kernel", ["grouped", "persistent", "persistent_late"])
+def test_gemm_epilogue_completes_its_loads_before_releasing_the_accumulator(
+    requires_blackwell, tmp_path, kernel
+):
+    """The MMA role overwrites a released accumulator stage for the next tile, so the epilogue's
+    release follows ``tcgen05.wait::ld`` (ISA 9.7.18.6.4.4): its registers holding the loaded
+    values do not order the memory (9.7.18.6.4.5), and the teardown's wait comes too late."""
+    if kernel == "grouped":
+        from attn_gym.warpdrive.examples.grouped_gemm import GroupedGemm, compile_grouped_gemm
+
+        build, op = compile_grouped_gemm, GroupedGemm()
+    else:
+        from attn_gym.warpdrive.examples.persistent_gemm import (
+            PersistentGemm,
+            compile_persistent_gemm,
+        )
+
+        build, op = compile_persistent_gemm, PersistentGemm(early_release=kernel == "persistent")
+    text, found = _ptx_findings(build, op, tmp_path)
+    assert not found, "\n".join(f.describe() for f in found)
+    assert re.search(r"tcgen05\.wait::ld[^;]*;(?:[^;]*;){0,3}?[^;]*mbarrier\.arrive", text)
+
+
 @pytest.mark.parametrize("pair", [False, True], ids=["cta", "pair"])
 def test_fa4_bwd_ptx_is_fenced(requires_blackwell, tmp_path, pair):
     """The pair's raw dS arrival (``signal_ds``) follows the compute role's tcgen05.ld of S,

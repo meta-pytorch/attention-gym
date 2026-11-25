@@ -182,7 +182,8 @@ class PersistentGemm(WarpSpecialized):
         self.ab = Ring(
             ab_stages, Tma(stage_bytes, multicast=multicast), Umma, buffer={"A": a, "B": b}
         )
-        self.acc = Ring(acc_stages, Umma, Threads)
+        # The epilogue's loads complete before the MMA role overwrites the stage for the next tile.
+        self.acc = Ring(acc_stages, Umma, Threads, release_fence="tmem_load")
         # The 4 epilogue warps meet before warp 0 stores a staged subtile and before any warp
         # rewrites it.
         self.epi_sync = NamedBarrier(threads=128)
@@ -265,9 +266,9 @@ class PersistentGemm(WarpSpecialized):
     ):
         """Store output through registers, swizzled SMEM and TMA, which clips ragged edges.
 
-        ``c_stages`` buffers hold one ``epi_tile`` each. With ``early_release``,
-        ``tcgen05.wait::ld`` completes the last subtile's loads before releasing TMEM.
-        The next MMA can then overlap that subtile's staging and store.
+        ``c_stages`` buffers hold one ``epi_tile`` each. Releasing the accumulator completes
+        the loads (``tcgen05.wait::ld``). With ``early_release`` that follows the last subtile's
+        load, so the next MMA can overlap that subtile's staging and store.
         """
         if cutlass.const_expr(me.warps != 4):
             raise ProtocolError(
@@ -311,9 +312,6 @@ class PersistentGemm(WarpSpecialized):
                 buf = (first + i) % self.c_stages if rotate else i % self.c_stages
                 cute.copy(t2r, tTR_tAcc[None, None, None, i, a.index], tTR_rAcc)
                 if cutlass.const_expr(self.early_release and i == subtiles - 1):
-                    # Every thread finishes its tcgen05.ld before arriving. Only then may
-                    # the next MMA overwrite this TMEM stage.
-                    cute.arch.fence_view_async_tmem_load()
                     a.release()
                 tRS_rC.store(r2s.retile(tTR_rAcc).load().to(self.dtype))
                 cute.copy(r2s, tRS_rC, tRS_sC[None, None, None, buf])
