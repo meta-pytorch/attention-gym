@@ -19,8 +19,8 @@ from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tenso
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
 # and exported programs that reference them still load. Append new arguments so old positional
-# calls still bind. Their defaults preserve the old computation: "bf16" selects the original
-# precision for the Q/K/V dtype, and batch_invariant=False keeps shape-dependent plans.
+# calls still bind. Defaults keep the original operand precision for the Q/K/V dtype and the
+# shape-dependent work plans, not the historical rounding of backward intermediates.
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "

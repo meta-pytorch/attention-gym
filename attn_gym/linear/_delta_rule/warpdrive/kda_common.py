@@ -480,12 +480,13 @@ def gate_offset(row, dim, d_k: cutlass.Constexpr[int]):
 # A = lower(Q_decay @ K_inv.T). ``decay_dtype`` controls the operands of these two products.
 # ``solve_dtype`` controls the inverse of T = I + L and the operands of U = inv(T) @ Y and
 # A @ U, where Y is the gated value residual. Both choices apply to forward, checkpoint
-# recomputation, summaries and backward. Legacy BF16 and FP16 backward keep their older scale
-# placement (see ``kda_bprop``). State products use the Q/K/V kernel dtype (``io``);
+# recomputation, summaries and backward. Backward rebuilds the per-tile forward's unscaled
+# Q_decay and A, and pairs its rounded K_restore with dS rounded before decay. Shared prep
+# instead folds the inverse and beta into the forward's output and state updates, so those
+# products can round differently. State products use the Q/K/V kernel dtype (``io``);
 # all of these matrix products accumulate in FP32.
 #
-# TF32 decay also widens the pairwise dQ/dK products. In state gradients it pairs K_restore
-# with unscaled dS rather than rounding dS after decay. TF32 solve rounds dU to TF32 for dY
+# TF32 decay also widens the pairwise dQ/dK products. TF32 solve rounds dU to TF32 for dY
 # and keeps TF32 U as a BF16 high part plus a residual for dA/dM. With a BF16 solve, beta*dM
 # must round to BF16 before the TF32 pairwise multiply to match the rounded solve contribution.
 #

@@ -613,7 +613,7 @@ def test_backward_operand_precision_matches_fp64(value) -> None:
         for name, result, baseline, ref in zip(names, actual, fused, reference, strict=True)
     }
     if value == "bf16":
-        # The legacy path deliberately keeps its less accurate gate-gradient rounding.
+        # BF16 decay operands have a separate error budget, especially for dgate.
         assert all(error <= 8.5e-3 for error, _ in errors.values()), errors
     else:
         assert all(error <= baseline + 4e-4 for error, baseline in errors.values()), errors
@@ -658,3 +658,177 @@ def test_backward_recompute_repeats_the_forward_states(value, tokens, cut, monke
         joined = torch.cat((head_grads[index], tail_grads[index]), 1)
         assert torch.equal(joined, expected[index]), index
     assert torch.equal(head_grads[5], expected[5])
+
+
+SCALE_CASES = pytest.mark.parametrize(
+    "dtype, value",
+    [(torch.bfloat16, "bf16"), (torch.bfloat16, "tf32+bf16"), (torch.float16, FP16_VALUE)],
+    ids=["bf16", "tf32+bf16", "fp16"],
+)
+
+
+@SCALE_CASES
+def test_backward_applies_scale_outside_the_forward_tiles(dtype, value) -> None:
+    """The forward rounds ``Q 2^g`` and A unscaled and applies the 2^-3.5 scale to the output,
+    so the backward scales the cotangent: one token with q = k = e0, beta 1 has dv =
+    io(scale dO) (not ``dO`` times the rounded ``scale``), and its entry-state cotangent ``scale dO
+    q - dY k`` cancels exactly, from the bprop kernel and from the reverse summary."""
+    scale = 128**-0.5
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=dtype)
+    q[..., 0] = 1
+    v = torch.randn(q.shape, device="cuda").to(dtype)
+    gate = torch.zeros(q.shape, device="cuda")
+    beta = torch.ones(1, 1, 1, device="cuda")
+    d_output = (torch.arange(1, 129, device="cuda") * 1.37).to(dtype).view(q.shape)
+    options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+    initial = torch.zeros(1, 1, 128, 128, device="cuda", requires_grad=True)
+    leaves = [t.clone().requires_grad_() for t in (q, q, v)]
+    output, _ = chunk_kda(*leaves, gate, beta, initial_state=initial, kernel_options=options)
+    dv, d_initial = torch.autograd.grad(output, (leaves[2], initial), d_output)
+    expected = (d_output.float() * scale).to(dtype)
+    assert torch.equal(dv, expected), (dv - expected).abs().max()
+    assert not torch.equal(expected, (d_output.float() * torch.tensor(scale).to(dtype)).to(dtype))
+    assert torch.count_nonzero(d_initial) == 0, d_initial.abs().max()
+
+    cu = cumulative_sequence_offsets([1])
+    prepared = chunk_kda_prepare(q, q, v, gate, beta, cu_seqlens=cu, kernel_options=options)
+    backward = chunk_kda_prepare_backward(
+        prepared.saved, d_output, initial.detach(), scale=prepared.scale, kernel_options=options
+    )
+    bounds = torch.stack((cu[:-1], cu[1:]), dim=1).contiguous()
+    summary = backward.state_grad_summaries(bounds)[:, :, :128]
+    assert torch.count_nonzero(summary) == 0, summary.abs().max()
+
+
+@SCALE_CASES
+def test_key_gradient_scales_the_score_cotangent(dtype, value) -> None:
+    """dK's score term pairs the forward's unscaled ``Q 2^g`` with the scaled score cotangent:
+    two tokens per head (q1 = k0 = e0, k1 = e1, q0 = 0, v0 = x e0, dO1 = y e0) give
+    dk0[0] = io(scale x y) (TF32-rounded first for TF32 decay), not io(x y) times
+    io(scale). Except under "tf32+bf16", dQ's score term reads the same rounded tile: dq1[0]
+    equals dk0[0]."""
+    heads, scale = 64, 128**-0.5
+    shape = (1, 2, heads, 128)
+    q = torch.zeros(shape, device="cuda", dtype=dtype)
+    k = torch.zeros_like(q)
+    v = torch.zeros_like(q)
+    d_output = torch.zeros_like(q)
+    q[0, 1, :, 0] = k[0, 0, :, 0] = k[0, 1, :, 1] = 1
+    x = (1 + torch.arange(heads, device="cuda") / 8).to(dtype)
+    y = torch.tensor(1.37, device="cuda").to(dtype)
+    v[0, 0, :, 0], d_output[0, 1, :, 0] = x, y
+    gate = torch.zeros(shape, device="cuda")
+    beta = torch.ones(shape[:3], device="cuda")
+    leaves = [t.clone().requires_grad_() for t in (q, k, v)]
+    output, _ = chunk_kda(
+        *leaves, gate, beta, kernel_options={**WARPDRIVE, "intra_chunk_dtypes": value}
+    )
+    dq, dk = torch.autograd.grad(output, leaves[:2], d_output)
+    product = x.float() * y.float()
+    operand = product * scale
+    if value != "bf16":  # a TF32 score-cotangent tile: half an ulp, then the MMA truncates
+        operand = ((operand.view(torch.int32) + 0x1000) & ~0x1FFF).view(torch.float32)
+    expected = operand.to(dtype)
+    assert torch.equal(dk[0, 0, :, 0], expected), dk[0, 0, :, 0] - expected
+    rounded = (product.to(dtype).float() * torch.tensor(scale).to(dtype).float()).to(dtype)
+    assert not torch.equal(expected, rounded)
+    if value != "tf32+bf16":
+        assert torch.equal(dq[0, 1, :, 0], expected), dq[0, 1, :, 0] - expected
+
+
+@SCALE_CASES
+def test_state_cotangent_meets_the_forward_restore_key(dtype, value) -> None:
+    """The forward updates the state with ``K_restore = io(K 2^(g_last - g))``, so the
+    backward pairs that tile with the unscaled state cotangent: with k0 = e0, a 2^g = 0.7 step on
+    token 1 and q16 = e0 reading the state (scale 1), dv0 = io(dO16 io(0.7)), not io(dO16 0.7)
+    from io(2^g_last dS) times K 2^-g. The reverse summary meets the same tiles, so its entry
+    cotangent equals the bprop kernel's."""
+    shape = (1, 17, 1, 128)
+    q = torch.zeros(shape, device="cuda", dtype=dtype)
+    k = torch.zeros_like(q)
+    q[0, 16, 0, 0] = k[0, 0, 0, 0] = 1
+    v = torch.randn(shape, device="cuda").to(dtype)
+    gate = torch.zeros(shape, device="cuda")
+    gate[0, 1, 0, 0] = math.log(0.7)
+    beta = torch.ones(shape[:3], device="cuda")
+    d_output = torch.zeros_like(q)
+    d_output[0, 16, 0] = (torch.arange(1, 129, device="cuda") * 1.37).to(dtype)
+    options = {**WARPDRIVE, "intra_chunk_dtypes": value}
+    initial = torch.zeros(1, 1, 128, 128, device="cuda", requires_grad=True)
+    leaves = [t.clone().requires_grad_() for t in (q, k, v)]
+    output, _ = chunk_kda(
+        *leaves, gate, beta, scale=1.0, initial_state=initial, kernel_options=options
+    )
+    dv, d_initial = torch.autograd.grad(output, (leaves[2], initial), d_output)
+    restore = torch.tensor(0.7).to(dtype).float()
+    expected = (d_output[0, 16, 0].float() * restore).to(dtype)
+    assert torch.equal(dv[0, 0, 0], expected), dv[0, 0, 0] - expected
+    assert not torch.equal(expected, (d_output[0, 16, 0].float() * 0.7).to(dtype))
+
+    cu = cumulative_sequence_offsets([17])
+    prepared = chunk_kda_prepare(
+        q, k, v, gate, beta, scale=1.0, cu_seqlens=cu, kernel_options=options
+    )
+    backward = chunk_kda_prepare_backward(
+        prepared.saved, d_output, initial.detach(), scale=prepared.scale, kernel_options=options
+    )
+    bounds = torch.stack((cu[:-1], cu[1:]), dim=1).contiguous()
+    summary = backward.state_grad_summaries(bounds)[:, :, :128]
+    assert torch.equal(summary, d_initial), (summary - d_initial).abs().max()
+
+
+def test_fp16_key_gradient_keeps_the_cancelling_score_terms_finite() -> None:
+    """``dA`` and ``beta dM`` of an FP16 call can exceed FP16's range and still cancel in dK:
+    two tokens with k0 = e0 / 4, q1 = k1 = e1, v0 = 512 e0 and dO1 = 256 e0 (scale and beta 1)
+    give both 131072 at (1, 0). The FP64 recurrence has dk0 = 0 and dk1 = -32768 e0, which an
+    FP16 cast of ``beta dM`` before its TF32 multiply turns into infinities."""
+    shape = (1, 2, 1, 128)
+    q, k, v, d_output = (torch.zeros(shape, device="cuda", dtype=torch.float16) for _ in range(4))
+    k[0, 0, 0, 0] = 0.25
+    q[0, 1, 0, 1] = k[0, 1, 0, 1] = 1
+    v[0, 0, 0, 0], d_output[0, 1, 0, 0] = 512, 256
+    gate = torch.zeros(shape, device="cuda")
+    beta = torch.ones(shape[:3], device="cuda")
+    leaves = [t.clone().requires_grad_() for t in (q, k, v)]
+    output, _ = chunk_kda(*leaves, gate, beta, scale=1.0, kernel_options=WARPDRIVE)
+    dk = torch.autograd.grad(output, leaves[1], d_output)[0]
+    expected = torch.zeros_like(dk)
+    expected[0, 1, 0, 0] = -32768
+    assert torch.equal(dk, expected), dk[0, :, 0, :2]
+
+
+def test_fp16_query_state_term_keeps_a_scaled_cotangent_finite() -> None:
+    """With ``scale`` above 1, ``scale dO`` can exceed FP16's range although the entry-state
+    gradient does not: q = e0 / 2, scale 2 and dO = 32768 e0 give d_initial[0, 0] = 32768.
+    The Q state term moves the scale's power of two onto Q_decay, so one token with
+    q = k = e0, beta 1 and scale 3 still cancels its entry-state cotangent exactly, from the bprop
+    kernel and from the reverse summary."""
+    shape = (1, 1, 1, 128)
+    gate = torch.zeros(shape, device="cuda")
+    cu = cumulative_sequence_offsets([1])
+    bounds = torch.stack((cu[:-1], cu[1:]), dim=1).contiguous()
+    unit = torch.zeros(shape, device="cuda", dtype=torch.float16)
+    unit[..., 0] = 1
+    large = unit * 32768
+    ramp = (torch.arange(1, 129, device="cuda") * 1.37).half().view(shape)
+    cases = [  # q, k, beta, scale, dO, expected d_initial[0, 0, 0]
+        (unit / 2, torch.zeros_like(unit), 0.0, 2.0, large, large[0, 0, 0].float()),
+        (unit, unit, 1.0, 3.0, ramp, torch.zeros(128, device="cuda")),
+    ]
+    for q, k, beta_value, scale, d_output, expected in cases:
+        beta = torch.full(shape[:3], beta_value, device="cuda")
+        v = torch.randn(shape, device="cuda").half()
+        initial = torch.zeros(1, 1, 128, 128, device="cuda", requires_grad=True)
+        output, _ = chunk_kda(q, k, v, gate, beta, initial, scale=scale, kernel_options=WARPDRIVE)
+        (d_initial,) = torch.autograd.grad(output, initial, d_output)
+        assert torch.equal(d_initial[0, 0, :, 0], expected), d_initial[0, 0, :, 0]
+        assert torch.count_nonzero(d_initial[0, 0, :, 1:]) == 0
+
+        prepared = chunk_kda_prepare(
+            q, k, v, gate, beta, scale=scale, cu_seqlens=cu, kernel_options=WARPDRIVE
+        )
+        backward = chunk_kda_prepare_backward(
+            prepared.saved, d_output, initial.detach(), scale=scale, kernel_options=WARPDRIVE
+        )
+        summary = backward.state_grad_summaries(bounds)[:, :, :128]
+        assert torch.equal(summary, d_initial), (summary - d_initial).abs().max()
