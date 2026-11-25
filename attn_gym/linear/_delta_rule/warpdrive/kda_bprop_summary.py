@@ -30,7 +30,7 @@ All precisions use the per-tile forward's unscaled Q_decay and A. The state cont
 dU uses the forward's rounded K_restore and D16 cast before decay, so a small decay cannot
 round the state gradient to zero before a large inverse decay cancels it. With TF32 decay,
 KK and A use TF32 operands. With a TF32 solve, stage dU in TF32 for the multiply by the inverse.
-FP16 splits the Q term's scale as in ``kda_bprop`` (``q_state_scales``).
+FP16 stages the same operands, so its ``scale > 1`` range limit matches ``kda_bprop``'s.
 
 A seeded item starts with ``D16 = io(dS_end)`` and ``D = exp2(g_last) dS_end``. Items are the first
 ``work_count[0]`` rows of a split-K work table, ``(sequence, head, write_start, -, -,
@@ -97,7 +97,7 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_strided_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
 
-from .kda_bprop import q_state_scales, scale_du, scale_packed, stage_scaled_do
+from .kda_bprop import scale_du, stage_scaled_do
 from .kda_common import (
     B_T,
     TF32_TILE_BYTES,
@@ -240,7 +240,6 @@ class KdaBpropSummary(WarpSpecialized):
         self.precision = precision if precision is not None else operand_dtypes(io, "bf16")
         self.tf32_decay = self.precision.decay_dtype == "tf32"
         self.tf32_solve = self.precision.solve_dtype == "tf32"
-        self.split_scale = io == "fp16"  # as in ``kda_bprop``
         self.solve_t = Float32 if self.tf32_solve else io_t
         self.solve_stage_bytes = TF32_TILE_BYTES if self.tf32_solve else B_T * B_T * 2
         self.g_solve32 = solve_mma_desc(d_v, Float32)
@@ -622,12 +621,11 @@ class KdaBpropSummary(WarpSpecialized):
                 st_shared_v4(params.s_kdecay + off, kd_pack[4 * half : 4 * half + 4])
 
         # ---- Q decay = Q exp2(g) (scale applies to the output) ---------------------------------
-        q_factor, _ = q_state_scales(params.scale, self.split_scale)
         qd_pack = []
         qd32 = []
         for i in cutlass.range_constexpr(dk_halves * 4):
             qd0, qd1 = fmul2(raw_q[2 * i], raw_q[2 * i + 1], exp_g[2 * i], exp_g[2 * i + 1])
-            qd_pack.append(scale_packed(fp32_to_fp16(qd0, qd1, dtype=io), q_factor))
+            qd_pack.append(fp32_to_fp16(qd0, qd1, dtype=io))
             qd32 += [qd0, qd1]
         with qk.produce() as qh:
             qh.access("Qdecay", write=True, by="threads")
@@ -951,10 +949,9 @@ class KdaBpropSummary(WarpSpecialized):
                     du_hi = scale_du(du_hi, params.scale, cols["dy"] + hi, have)
                 # Scale dO between the unscaled dU read and the Q-term read; trip orders both.
                 addr = params.s_do + ((base + r) & 1) * self.do_stage_bytes
-                _, do_scale = q_state_scales(params.scale, self.split_scale)
-                stage_scaled_do(addr, addr, ov_lo, do_scale, io)
+                stage_scaled_do(addr, addr, ov_lo, params.scale, io)
                 if cutlass.const_expr(self.d_v == 128):
-                    stage_scaled_do(addr, addr, ov_hi, do_scale, io)
+                    stage_scaled_do(addr, addr, ov_hi, params.scale, io)
                 cute.arch.fence_view_async_shared()
                 cute.arch.fence_view_async_tmem_load()
                 store_solve_operand(((cols["du_in"], du_lo),), self.solve_t)

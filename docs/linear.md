@@ -636,6 +636,11 @@ was accurate), but that per-element limit is not a safe loss-scaling bound: prod
 `dS` are also cast to FP16 before later factors shrink them. `dU = dS K_restore` is cast before
 `beta` scales it, so one token with zero gate, a normalized key of 64 components `1/8`, `beta =
 1/8` and a `dS` row of 8192 on those components gave dv = inf where the exact value is 8192.
+As in BF16, the query term of the entry-state gradient reads the forward's unscaled `Q_decay`
+and `scale * dO` cast to FP16. With the default `scale = 1 / sqrt(K)` or any `scale <= 1` that
+cast cannot exceed `|dO|`; with `scale > 1`, each element of `scale * dO` must round within
+65504: `q = e0 / 2`, `scale = 2` and `dO = 32768 e0` make the entry-state gradient non-finite
+where the exact value is 32768.
 `K_restore = k 2^(g_last - g)` falls below the smallest FP16 subnormal, `2^-24`, once
 `g_last - g < -24 - log2|k|`, and then rounds up to `2^-24` or down to zero even when its product
 with `dS` is FP16-normal, so the gradients lose or misstate that term: a key `2^-11 e0` followed

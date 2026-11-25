@@ -122,7 +122,8 @@ def chunk_kda(
             callers must sanitize outputs with ``mask_inactive_tokens`` and protect
             parameterized input producers with ``mask_inactive_token_gradients``.
         scale: Query scale, applied inside the kernels in FP32. Defaults to
-            ``1 / sqrt(K)``.
+            ``1 / sqrt(K)``. With FP16 and ``scale > 1``, warpdrive backward casts
+            ``scale * dO`` to FP16, so its elements must stay within 65504.
         output_final_state: Return the final recurrent state with the output.
         fastmath: ``True`` is the default because it’s faster, and turning it off usually
             didn’t improve accuracy in our tests. If you’re seeing unexpected outputs or
