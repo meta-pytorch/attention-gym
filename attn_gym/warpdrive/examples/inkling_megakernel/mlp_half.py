@@ -227,7 +227,7 @@ class MlpHalf:
                         )
                 w = self.load_stages(
                     w, p.tma_mlp[1 + kind], p.gmem_mlp[1 + kind], tile, 0,
-                    self.expert_stages[kind], buffer,
+                    self.expert_stages[kind], buffer, pad_k=True,
                 )  # fmt: skip
         return w, meta
 

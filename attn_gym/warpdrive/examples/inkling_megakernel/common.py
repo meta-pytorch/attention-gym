@@ -235,8 +235,8 @@ class InklingKernel(WarpSpecialized):
 
     @cute.jit
     def load_stages(self, w, atom, tiles, row, k0, count: cutlass.Constexpr,
-                    buffer: cutlass.Constexpr):  # fmt: skip
-        """The load warp's ``count`` GEMV weight stages (``load_tiles``)."""
+                    buffer: cutlass.Constexpr, *, pad_k: cutlass.Constexpr = False):  # fmt: skip
+        """Load whole TMA stages: a partial last stage is already a valid tile for pad_k."""
         return load_tiles(w, atom, tiles, row, k0, count, buffer)
 
     @cute.jit
