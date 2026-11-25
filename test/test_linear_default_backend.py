@@ -157,6 +157,7 @@ def _run_paged_gdn(prefix=0, kernel_options=None, checkpoints=False):
 
 SERVED = {
     "chunk_kda bf16": lambda: _run_kda(),
+    "chunk_kda fp16": lambda: _run_kda(dtype=torch.float16),
     "chunk_kda fp32 (runs in bf16)": lambda: _run_kda(dtype=torch.float32),
     "chunk_kda with states": lambda: _run_kda(
         initial_state=torch.zeros(1, 2, 128, 128, device="cuda"), output_final_state=True
@@ -166,14 +167,13 @@ SERVED = {
     "chunk_gdn d128": lambda: _run_gdn(),
     "chunk_gdn d64": lambda: _run_gdn(dim=64),
     "paged_chunk_kda aligned pool": lambda: _run_paged_kda(),
+    "paged_chunk_kda fp16": lambda: _run_paged_kda(dtype=torch.float16),
     "paged_chunk_gdn aligned pool": lambda: _run_paged_gdn(),
     "paged_chunk_kda replay_state": lambda: _run_paged_kda(replay=True),
     "paged_chunk_kda misaligned pool": lambda: _run_paged_kda(prefix=1),
     "paged_chunk_gdn misaligned pool": lambda: _run_paged_gdn(prefix=1),
 }
 ROUTED_TO_FUSED = {
-    "chunk_kda fp16": lambda: _run_kda(dtype=torch.float16),
-    "paged_chunk_kda fp16": lambda: _run_paged_kda(dtype=torch.float16),
     "paged_chunk_kda state_checkpoints": lambda: _run_paged_kda(checkpoints=True),
     "paged_chunk_kda replay_state state_checkpoints": lambda: _run_paged_kda(
         replay=True, checkpoints=True
@@ -228,13 +228,13 @@ def test_default_runs_fused_on_rubin_without_a_cutedsl_that_targets_it(
 
 @pytest.mark.parametrize("capability", (*BLACKWELL, (9, 0)))
 def test_explicit_backends_are_never_rerouted(monkeypatch, dispatched, capability):
-    """Explicit choices hold on every device and for calls that ``"auto"`` would route;
-    explicit warpdrive with checkpoints raises rather than running fused."""
+    """Explicit choices hold on every device and route; explicit warpdrive with checkpoints
+    raises rather than running fused."""
     _simulate_capability(monkeypatch, capability)
     fused, warpdrive = {"backend": "fused"}, {"backend": "warpdrive"}
     _run_kda(kernel_options=fused)
     _run_gdn(kernel_options=fused)
-    _run_kda(dtype=torch.float16, kernel_options=warpdrive)
+    _run_paged_kda(prefix=1, kernel_options=warpdrive)
     _run_gdn(kernel_options=warpdrive)
     _run_paged_kda(replay=True, kernel_options=fused)
     _run_paged_kda(replay=True, kernel_options=warpdrive)
@@ -270,17 +270,10 @@ def _two_sequences():
 
 @needs_warpdrive
 @pytest.mark.parametrize(
-    ("name", "expected"),
-    [
-        ("kda bf16", "warpdrive"),
-        ("kda fp16", "fused"),
-        ("kda fastmath=False", "warpdrive"),
-        ("gdn bf16", "warpdrive"),
-        ("gdn fp16", "warpdrive"),
-    ],
+    "name", ["kda bf16", "kda fp16", "kda fastmath=False", "gdn bf16", "gdn fp16"]
 )
-def test_default_reproduces_the_selected_backend(name, expected):
-    """The default call's outputs and gradients are bitwise those of the backend it selects."""
+def test_default_reproduces_the_selected_backend(name):
+    """The default matches explicit warpdrive for outputs, final state and every gradient."""
     family, variant = name.split(" ")
     dtype = torch.float16 if variant == "fp16" else torch.bfloat16
     kwargs = {"fastmath": False} if variant == "fastmath=False" else {}
@@ -297,17 +290,14 @@ def test_default_reproduces_the_selected_backend(name, expected):
             kernel_options=options,
             **kwargs,
         )
-        for options in ({"autotune": False}, {"backend": expected, "autotune": False})
+        for options in ({"autotune": False}, {"backend": "warpdrive", "autotune": False})
     )
     _assert_bitwise(default, selected)
 
 
 @needs_warpdrive
-@pytest.mark.parametrize(
-    ("name", "warpdrive"),
-    [("kda bf16", True), ("kda fp16", False), ("kda fastmath=False", True), ("gdn bf16", True)],
-)
-def test_default_stages_select_like_the_public_op(name, warpdrive):
+@pytest.mark.parametrize("name", ["kda bf16", "kda fp16", "kda fastmath=False", "gdn bf16"])
+def test_default_stages_select_like_the_public_op(name):
     """The staged entry points behind context parallelism resolve the default as the ops do."""
     from attn_gym.linear.gdn.stages import ChunkGDNWarpdrivePrepared, chunk_gdn_prepare
     from attn_gym.linear.kda.stages import ChunkKDAWarpdrivePrepared, chunk_kda_prepare
@@ -320,10 +310,10 @@ def test_default_stages_select_like_the_public_op(name, warpdrive):
             cu_seqlens=_two_sequences(),
             fastmath=variant != "fastmath=False",
         )
-        assert isinstance(prepared, ChunkKDAWarpdrivePrepared) is warpdrive
+        assert isinstance(prepared, ChunkKDAWarpdrivePrepared)
     else:
         prepared = chunk_gdn_prepare(*_gdn_inputs(dtype), cu_seqlens=_two_sequences())
-        assert isinstance(prepared, ChunkGDNWarpdrivePrepared) is warpdrive
+        assert isinstance(prepared, ChunkGDNWarpdrivePrepared)
 
 
 def _relative_rms(actual: torch.Tensor, expected: torch.Tensor) -> float:

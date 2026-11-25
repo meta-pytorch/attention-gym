@@ -132,10 +132,9 @@ def resolve_chunk_kernel_options(
 # NOTE [Default chunk backend]
 # With CuTeDSL installed, auto selects warpdrive on SM100 and SM103, and on SM107 with
 # CuTeDSL 4.8+. Other supported GPUs use Triton. Callers set fused_only for paged checkpoint
-# writes and for KDA with FP16 Q/K/V. Selection reads only the device, the Q/K/V dtypes and
-# whether the call writes checkpoints, never sizes, though warpdrive's plan still follows the
-# packed shape. Explicit backend requests are never rerouted. See "Chunk backend selection" in
-# docs/linear.md.
+# writes. Selection reads only the device and whether the call writes checkpoints, never sizes
+# or the Q/K/V dtype, though warpdrive's plan still follows the packed shape. Explicit backend
+# requests are never rerouted. See "Chunk backend selection" in docs/linear.md.
 def resolve_chunk_backend(
     backend: str, q: torch.Tensor, *, fused_only: bool = False
 ) -> Literal["fused", "warpdrive"]:

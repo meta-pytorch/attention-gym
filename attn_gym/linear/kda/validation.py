@@ -20,7 +20,6 @@ import torch
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.validation import (
-    resolve_chunk_backend,
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
@@ -120,14 +119,6 @@ def cast_to_kernel_dtypes(
     return (*(tensor.to(dtype) for tensor in (q, k, v)), gate.float(), beta.float())
 
 
-def resolve_kda_backend(
-    backend: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, fused_only: bool = False
-) -> Literal["fused", "warpdrive"]:
-    """Auto selects Triton for native FP16 KDA; other dtypes use the common backend rule."""
-    fused_only = fused_only or kernel_dtype(q, k, v) == torch.float16
-    return resolve_chunk_backend(backend, q, fused_only=fused_only)
-
-
 def validate_kda_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -216,7 +207,6 @@ __all__ = [
     "cast_to_kernel_dtypes",
     "kernel_dtype",
     "resolve_intra_chunk_dtypes",
-    "resolve_kda_backend",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_replay_state",
