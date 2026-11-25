@@ -96,6 +96,15 @@ def test_radix_launches_only_active_pairs(radix_impl, monkeypatch, batch, tokens
     )
 
 
+def test_radix_rejects_multi_cta_cluster(radix_impl):
+    from attn_gym.sparse.indexer.impl.cute_topk import IndexerTopKKernel
+    from attn_gym.warpdrive import Cluster
+
+    op = IndexerTopKKernel(17, False, cluster=Cluster(2, 1))
+    with pytest.raises(ValueError, match="one CTA per row"):
+        radix_impl._compile_topk_kernel.__wrapped__(op, False)
+
+
 @pytest.mark.parametrize("use_int64_offsets", [False, True])
 @pytest.mark.parametrize("contiguous_weight_heads", [False, True])
 def test_radix_fake_tensor_abi(monkeypatch, use_int64_offsets, contiguous_weight_heads):
@@ -105,9 +114,10 @@ def test_radix_fake_tensor_abi(monkeypatch, use_int64_offsets, contiguous_weight
     q, k, weights, scores, *_ = impl._compile_scores.__wrapped__(
         torch.bfloat16, 32, 128, True, 1, use_int64_offsets, contiguous_weight_heads, False
     )
-    topk_scores, output, *_ = impl._compile_topk.__wrapped__(
-        37, True, 1, use_int64_offsets, False, False
-    )
+    from attn_gym.sparse.indexer.impl.cute_topk import IndexerTopKKernel
+
+    operation = IndexerTopKKernel(37, True, use_int64_offsets)
+    topk_scores, output, *_ = impl._compile_topk_kernel.__wrapped__(operation, False)
     width = 64 if use_int64_offsets else 32
     assert q._assumed_align == k._assumed_align == 16
     assert weights._assumed_align == 2

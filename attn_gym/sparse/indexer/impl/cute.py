@@ -130,7 +130,6 @@ def _fake_candidate_bounds(enabled: bool, tokens, use_int64_offsets: bool):
     )
 
 
-@jit_cache
 def _compile_topk(
     topk: int,
     causal: bool,
@@ -139,12 +138,25 @@ def _compile_topk(
     deterministic: bool,
     has_candidate_bounds: bool,
 ) -> Callable[..., None]:
-    """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
+    from .cute_topk import IndexerTopKKernel
+
+    operation = IndexerTopKKernel.get_or_build(
+        topk,
+        causal,
+        use_int64_offsets,
+        compress_ratio=compress_ratio,
+        deterministic=deterministic,
+    )
+    return _compile_topk_kernel(operation, has_candidate_bounds)
+
+
+@jit_cache
+def _compile_topk_kernel(operation, has_candidate_bounds: bool) -> Callable[..., None]:
+    """Compile the constructor-keyed selector with symbolic B, T, S and slab capacity."""
     import cutlass
     from cutlass import cute
 
-    from .cute_topk import IndexerTopKKernel
-
+    use_int64_offsets = operation.use_int64_offsets
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
@@ -157,17 +169,10 @@ def _compile_topk(
     )
     output = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (batch, tokens, topk),
+        (batch, tokens, operation.topk),
         stride_order=(2, 1, 0),
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
-    )
-    operation = IndexerTopKKernel(
-        topk,
-        causal,
-        use_int64_offsets,
-        compress_ratio=compress_ratio,
-        deterministic=deterministic,
     )
     return compile_tvm_ffi(
         operation,
