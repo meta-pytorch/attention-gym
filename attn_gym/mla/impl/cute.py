@@ -10,7 +10,8 @@ per call to save inputs for a backward that decode never runs.
 
 By default FA4 picks the kernel and split count. ``autotune=True`` benchmarks FA4's pick
 against explicit ``MlaFwdConfig`` candidates (2CTA, 1CTA, and 1CTA with 64-key blocks, over
-split counts and schedulers) and launches the fastest. Winners are cached per workload bucket
+split counts and schedulers) and launches the fastest. Neither runs the 2CTA kernel where its
+output store can fault (``_fa4_2cta_stores_ragged_o``). Winners are cached per workload bucket
 (``PagedMLADecodeFA4.tuning_key``), so changing decode batches reuse a winner while longer
 contexts re-tune.
 
@@ -22,10 +23,13 @@ Constraints
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import math
+import os
 import statistics
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from itertools import product
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -49,6 +53,41 @@ def _validate_inputs(q_latent: torch.Tensor, q_rope: torch.Tensor) -> None:
         raise ValueError(
             f"CuTe paged MLA decode supports at most 128 query heads, got {q_latent.shape[1]}."
         )
+
+
+def _fa4_2cta_stores_ragged_o(num_heads: int) -> bool:
+    """Whether FA4's 2CTA MLA kernel stores this decode's output through a faulting descriptor.
+
+    flash-attn-4 4.0.0b40 stores varlen O for unpadded (power-of-two) head counts below 128
+    through a ragged TMA descriptor whose base sits 2**30 tokens before O: 16 TiB at 16 heads,
+    64 TiB at 64. x86 B200 hosts place allocations below 64 TiB, so the base can wrap below
+    address 0, and a store preempted by another context's exception then faults with Xid 13
+    "Out Of Range Address". FA4's 1CTA route stores O without that descriptor.
+    TODO: drop once flash-attn-4 bases this descriptor at most one output before O.
+    """
+    return num_heads < 128 and num_heads & (num_heads - 1) == 0
+
+
+_FA4_MLA_1CTA_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _fa4_mla_1cta_route() -> Iterator[None]:
+    """Route FA4's default pick to its 1CTA MLA kernel; FA4 reads this variable per call.
+
+    The lock keeps concurrent decodes from restoring each other's value mid-call. Another FA4
+    caller in the process that reads the variable meanwhile also gets the 1CTA kernel.
+    """
+    with _FA4_MLA_1CTA_LOCK:
+        previous = os.environ.get("FLASH_ATTENTION_MLA_1CTA")
+        os.environ["FLASH_ATTENTION_MLA_1CTA"] = "1"
+        try:
+            yield
+        finally:
+            if previous is None:
+                del os.environ["FLASH_ATTENTION_MLA_1CTA"]
+            else:
+                os.environ["FLASH_ATTENTION_MLA_1CTA"] = previous
 
 
 def _fa4_forward(*_static_args: Any) -> Any:
@@ -193,10 +232,9 @@ class PagedMLADecodeFA4:
         max_tokens = (1 << (args.cu_seqlens_q.shape[0] - 2).bit_length()) * (
             1 << (args.max_seqlen_q - 1).bit_length()
         )
-        candidates: list[Any] = [
-            "auto",
-            MlaFwdConfig("2cta", 128, 128, q_stage, 1, True, True, False),
-        ]
+        candidates: list[Any] = ["auto"]
+        if not _fa4_2cta_stores_ragged_o(heads):
+            candidates.append(MlaFwdConfig("2cta", 128, 128, q_stage, 1, True, True, False))
         candidates.extend(
             MlaFwdConfig(
                 kernel=kernel,
@@ -228,22 +266,28 @@ class PagedMLADecodeFA4:
     def launch(
         flash_attn_fwd: Any, config: Any, args: Args
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        out, lse, *_ = flash_attn_fwd(
-            args.q_rope,
-            args.rope_cache.unsqueeze(2),
-            args.latent_cache.unsqueeze(2),
-            qv=args.q_latent,
-            cu_seqlens_q=args.cu_seqlens_q,
-            max_seqlen_q=args.max_seqlen_q,
-            seqused_k=args.seqused_k,
-            page_table=args.block_table,
-            softmax_scale=args.scale,
-            causal=True,
-            pack_gqa=True,
-            num_splits=0,
-            return_lse=args.return_lse,
-            config=None if config == "auto" else config,
+        route = (
+            _fa4_mla_1cta_route()
+            if config == "auto" and _fa4_2cta_stores_ragged_o(args.q_latent.shape[1])
+            else contextlib.nullcontext()
         )
+        with route:
+            out, lse, *_ = flash_attn_fwd(
+                args.q_rope,
+                args.rope_cache.unsqueeze(2),
+                args.latent_cache.unsqueeze(2),
+                qv=args.q_latent,
+                cu_seqlens_q=args.cu_seqlens_q,
+                max_seqlen_q=args.max_seqlen_q,
+                seqused_k=args.seqused_k,
+                page_table=args.block_table,
+                softmax_scale=args.scale,
+                causal=True,
+                pack_gqa=True,
+                num_splits=0,
+                return_lse=args.return_lse,
+                config=None if config == "auto" else config,
+            )
         return out, lse
 
 
