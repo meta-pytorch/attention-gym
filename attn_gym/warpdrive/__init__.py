@@ -73,6 +73,8 @@ skipped synchronization and math. Keep state explicit; raw CuTeDSL remains avail
   ``TmemView.skip_teardown_drain`` drops teardown waits with nothing left to complete.
 * ``unchecked(check, reason=...)`` disables one trace-time check at one site.
   ``describe()`` records the reason, line and suppressed checks.
+* ``checked=True`` on any kernel builds it with every tensor index compared with its extent
+  (``bounds.py``); ``unchecked("bounds", reason=...)`` keeps a deliberate one.
 * Copies using barrier pointers the layer did not supply stay legal and mark TMA checks
   unverified.
 

@@ -131,11 +131,18 @@ def compile_tvm_ffi(
     if opt_level is not None:
         options += (cute.OptLevel(opt_level),)
     compile_fn = cute.compile[options]
-    return compile_fn(
-        entrypoint,
-        *compile_args,
-        stream,
-    )
+    from attn_gym.warpdrive.bounds import indexing
+    from attn_gym.warpdrive.protocol import compile_scope
+
+    # The opt-outs and index checks of what is traced belong to this compile; a kernel
+    # entrypoint also scopes its own trace (__cute_trace_scope__).
+    scope = getattr(entrypoint, "__cute_trace_scope__", None)
+    with compile_scope(), indexing(False) if scope is None else scope():
+        return compile_fn(
+            entrypoint,
+            *compile_args,
+            stream,
+        )
 
 
 __all__ = ["compile_tvm_ffi", "make_fake_compact_tensor", "make_fake_strided_tensor"]

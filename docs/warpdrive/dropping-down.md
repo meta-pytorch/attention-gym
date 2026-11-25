@@ -305,8 +305,44 @@ body instead.
 Use `with unchecked(check, reason=...):` only when you can justify skipping that check.
 See [raw code and opt-outs](guarantees.md#opt-outs) for accepted kinds and scope.
 `unchecked("liveness")` leaves the protocol unverified; the other checks stay active.
+`unchecked("bounds")` keeps an index or view offset that is outside its tensor on purpose out
+of a [checked build](#checked-builds)'s checks.
 A [span](channels.md#spans), a [carried token](channels.md#try-tokens) or raw barriers may
 express the protocol without suppressing a check.
+
+### Checked builds
+
+A CuTe layout maps any coordinate to an offset, inside its shape or not, so a wrong index
+addresses other memory without an error. `MyKernel(..., checked=True)` compiles a separate,
+slower build of a kernel for tests and debugging, with no change to its code:
+
+- every read or write `tensor[...]` of a `cute.Tensor` is checked: each integer coordinate against the extent of
+  its mode (the integer modes of a slice too), a single index against the tensor's size. A
+  launch that runs one outside aborts with `CUDA_ERROR_ASSERT`, printing the source line
+  (`gemm.py:113: index of mode 1 out of range`). An index known while tracing needs no
+  comparison, but still aborts only the launch that runs it: a kernel traces branches that a
+  given model or shape never takes;
+- a `cute.domain_offset` by a negative constant coordinate is treated the same: the view
+  starts before its tensor.
+
+The launch function (`__call__`) always runs and cannot assert. There a mistake known while
+tracing fails the compile, and so does an index that is not known, or whose extent is not:
+index in the kernel instead.
+
+Not checked: a `None` mode, a nested coordinate, a coordinate of another rank than the tensor,
+an index into loaded values (`t.load()[i]`), a nonconstant offset, pointer arithmetic, or a
+hand-computed TMEM column. Call `cute.domain_offset` by its qualified name: a saved reference
+retains whichever implementation was installed when it was bound, checked or unchecked.
+Wrap a deliberate out-of-bounds access (a tile TMA clips or a ragged view's shifted base)
+in `with unchecked("bounds", reason=...):`.
+
+The setting belongs to the compile. `compile_tvm_ffi` (every `@jit_cache` compile function)
+traces the kernel it is given, launch function included, with that kernel's setting, and the
+role code of any other kernel traced inside (a kernel launched by a host function, as in the
+linear bundles) with that kernel's own; such a kernel's launch function follows the
+entrypoint. A kernel without the setting is traced by the unmodified CuTeDSL. A checked kernel
+does not compile through a direct `cute.compile`. The device assert poisons the CUDA context,
+so a test of a failing launch runs it in its own process.
 
 ## Compiler pitfall: saved indices across loops
 
