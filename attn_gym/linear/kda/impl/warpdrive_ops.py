@@ -21,24 +21,26 @@ from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tenso
 # and exported programs that reference them still load. Append new arguments so old positional
 # calls still bind. Defaults keep the original operand precision for the Q/K/V dtype and the
 # shape-dependent work plans, not the historical rounding of backward intermediates.
+# ``exact_recompute=False`` lets small packs share the prep, as those graphs did.
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor cu_seqlens, "
     'bool split, float scale, bool fastmath=True, str intra_chunk_dtypes="bf16", '
-    "bool batch_invariant=False) -> Tensor",
+    "bool batch_invariant=False, bool exact_recompute=False) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_with_initial_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
     "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True, "
-    'str intra_chunk_dtypes="bf16", bool batch_invariant=False) -> Tensor',
+    'str intra_chunk_dtypes="bf16", bool batch_invariant=False, bool exact_recompute=False) '
+    "-> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, "
     "Tensor initial_state, Tensor cu_seqlens, float scale, bool fastmath=True, "
-    'bool nonempty=False, str intra_chunk_dtypes="bf16", bool batch_invariant=False) '
-    "-> (Tensor, Tensor)",
+    'bool nonempty=False, str intra_chunk_dtypes="bf16", bool batch_invariant=False, '
+    "bool exact_recompute=False) -> (Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_paged",
@@ -137,6 +139,7 @@ def _packed_fwd_cuda(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    exact_recompute=False,
 ):
     template = value
     q, k, value, gate, beta, cu_seqlens = _normalize_operands(q, k, value, gate, beta, cu_seqlens)
@@ -154,6 +157,7 @@ def _packed_fwd_cuda(
         fastmath=fastmath,
         intra_chunk_dtypes=intra_chunk_dtypes,
         batch_invariant=batch_invariant,
+        exact_recompute=exact_recompute,
     )
     return _restore_layout(output, value, template)
 
@@ -170,6 +174,7 @@ def _packed_fwd_with_initial_state_cuda(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    exact_recompute=False,
 ):
     template = value
     q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
@@ -188,6 +193,7 @@ def _packed_fwd_with_initial_state_cuda(
         fastmath=fastmath,
         intra_chunk_dtypes=intra_chunk_dtypes,
         batch_invariant=batch_invariant,
+        exact_recompute=exact_recompute,
     )
     return _restore_layout(output, value, template)
 
@@ -205,6 +211,7 @@ def _packed_fwd_with_state_cuda(
     nonempty=False,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    exact_recompute=False,
 ):
     template, state_template = value, initial_state
     q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
@@ -224,6 +231,7 @@ def _packed_fwd_with_state_cuda(
         intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,
         batch_invariant=batch_invariant,
+        exact_recompute=exact_recompute,
     )
     assert final_state is not None
     return (
@@ -454,8 +462,10 @@ def _packed_fwd_fake(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    exact_recompute=False,
 ):
     del q, k, gate, beta, cu_seqlens, split, scale, intra_chunk_dtypes, fastmath, batch_invariant
+    del exact_recompute
     return _empty_like_token_operand(value)
 
 
@@ -472,9 +482,10 @@ def _packed_fwd_with_initial_state_fake(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    exact_recompute=False,
 ):
     del q, k, gate, beta, initial_state, cu_seqlens, scale, intra_chunk_dtypes, fastmath
-    del batch_invariant
+    del batch_invariant, exact_recompute
     return _empty_like_token_operand(value)
 
 
@@ -492,9 +503,10 @@ def _packed_fwd_with_state_fake(
     nonempty=False,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    exact_recompute=False,
 ):
     del q, k, gate, beta, cu_seqlens, scale, intra_chunk_dtypes, fastmath, nonempty
-    del batch_invariant
+    del batch_invariant, exact_recompute
     return _empty_like_token_operand(value), torch.empty_like(initial_state)
 
 

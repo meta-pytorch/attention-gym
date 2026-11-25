@@ -143,6 +143,22 @@ class KernelOptions(SplitOptions, total=False):
     implementation validate the option but do not use it.
     See "Operand precision" in ``docs/linear.md``."""
 
+    exact_recompute: bool
+    """Keep the forward off the shared-prep plan, whose states the backward's recompute does not
+    reproduce. Omit to infer from grad mode: ``True`` when autograd records the forward (under
+    ``torch.compile``, while tracing).
+
+    With ``True`` the warpdrive KDA forward runs the per-tile kernels its backward recomputes.
+    The recomputed states match the forward's bit for bit only when the backward runs the
+    forward's piece plan: a chain backward after an uncut forward composes FP32 piece summaries
+    and can round them differently.
+    With ``False`` a small pack may share one prep pass between its two value tiles even under
+    autograd: faster, but that forward rounds its chunk states apart from the recompute, so its
+    gradients are not exactly those of its output. ``chunk_kda_prepare`` infers the option at
+    ``prepare``; a caller that differentiates ``run`` inside its own autograd function, where
+    grad mode is off, passes ``True`` (as ``context_parallel_kda`` does). Paged KDA has no
+    backward, and other backends ignore it. See "Operand precision" in ``docs/linear.md``."""
+
 
 class RecurrentKernelOptions(TuningOptions, total=False):
     """Options shared by the fused ``recurrent_gdn`` and ``recurrent_kda`` scans."""
@@ -169,6 +185,8 @@ KERNEL_OPTION_SPEC: KernelOptionSpec = {
     "schedule": (("auto", "static", "persistent"), "auto"),
     # ``None``: the default by input dtype (``resolve_intra_chunk_dtypes``, ``kda/validation.py``).
     "intra_chunk_dtypes": (get_args(IntraChunkDtypes), None),
+    # ``None``: inferred from grad mode at the call (``chunk_forward``, ``chunk_kda_prepare``).
+    "exact_recompute": (bool, None),
 }
 RECURRENT_OPTION_SPEC: KernelOptionSpec = {**TUNING_OPTION_SPEC, "batch_invariant": (bool, False)}
 

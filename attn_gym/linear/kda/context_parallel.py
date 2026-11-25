@@ -41,20 +41,15 @@ def context_parallel_kda(
     ``scale``, ``fastmath``, and ``kernel_options`` follow ``chunk_kda``.
     Forward, backward, and their summaries share the same math policy.
     ``"backend"`` selects the kernels of the local pass and summaries as in
-    ``chunk_kda_prepare``.
+    ``chunk_kda_prepare``. ``"exact_recompute"`` defaults to ``True``: grad mode is off inside
+    the autograd function that runs the stages, so ``prepare`` cannot infer it.
     """
-    stages = _kda_stages(scale, fastmath, kernel_options)
-    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
-
-
-def _kda_stages(
-    scale: float | None, fastmath: bool, kernel_options: KernelOptions | None
-) -> StagedOp:
-    """Bind ``chunk_kda``'s options to its staged entry points."""
-    return StagedOp(
-        partial(chunk_kda_prepare, scale=scale, fastmath=fastmath, kernel_options=kernel_options),
+    forward_options = {"exact_recompute": True, **(kernel_options or {})}
+    stages = StagedOp(
+        partial(chunk_kda_prepare, scale=scale, fastmath=fastmath, kernel_options=forward_options),
         partial(chunk_kda_prepare_backward, fastmath=fastmath, kernel_options=kernel_options),
     )
+    return context_parallel_chunk(stages, q, k, v, gate, beta, routing=routing, group=group)
 
 
 __all__ = ["context_parallel_kda"]

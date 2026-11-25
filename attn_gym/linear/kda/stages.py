@@ -47,7 +47,7 @@ from attn_gym.linear._delta_rule.span import (
     zero_state,
 )
 from attn_gym.linear._delta_rule.summaries import build_state_grad_summaries, build_state_summaries
-from attn_gym.linear._delta_rule.validation import resolve_chunk_backend
+from attn_gym.linear._delta_rule.validation import resolve_chunk_backend, tracks_grad
 from attn_gym.linear.kda.impl.chunk import (
     ChunkKDABwdPrepared,
     ChunkKDAFactors,
@@ -244,6 +244,8 @@ class ChunkKDAWarpdrivePrepared:
     fastmath: bool
     # ``kernel_options["intra_chunk_dtypes"]`` of every forward launch (summaries and ``run``).
     intra_chunk_dtypes: str
+    # ``kernel_options["exact_recompute"]`` of ``run``'s uncut forward, resolved at ``prepare``.
+    exact_recompute: bool
     # Set when the summaries split (NOTE [Staged piece plans] in
     # ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``).
     pieces: ForwardPieces | None = None
@@ -321,6 +323,7 @@ class ChunkKDAWarpdrivePrepared:
         options = {
             "intra_chunk_dtypes": self.intra_chunk_dtypes,
             "batch_invariant": self.batch_invariant,
+            "exact_recompute": self.exact_recompute,
         }
         if output_final_state:
             return chunk_warpdrive_packed_fwd_with_state_op(*args, **options)
@@ -350,6 +353,9 @@ def chunk_kda_prepare(
     operand precision follow ``chunk_kda`` for both the local pass and summaries. The staged API
     does not accept split schedules. With an explicit warpdrive backend, ``batch_invariant`` keeps
     a sequence's summaries and local ``run`` bitwise independent of its neighbors.
+    ``exact_recompute`` is inferred from grad mode here, at ``prepare``. A caller that
+    differentiates ``run`` inside its own autograd function, where grad mode is off, passes
+    ``"exact_recompute": True`` so the backward's recompute reproduces exactly what ``run`` ran.
     """
     options = resolve_kernel_options(kernel_options, op_name="chunk_kda_prepare")
     backend, autotune, schedule = options.backend, options.autotune, options.schedule
@@ -358,6 +364,9 @@ def chunk_kda_prepare(
     validate_kda_inputs(
         q, k, v, gate, beta, None, cu_seqlens, op_name="chunk_kda_prepare", gate_name="gate"
     )
+    exact_recompute = options.exact_recompute
+    if exact_recompute is None:
+        exact_recompute = tracks_grad((q, k, v, gate, beta))
     intra_chunk_dtypes = resolve_intra_chunk_dtypes(
         options.intra_chunk_dtypes, kernel_dtype(q, k, v), op_name="chunk_kda_prepare"
     )
@@ -396,7 +405,7 @@ def chunk_kda_prepare(
             intra_chunk_dtypes=intra_chunk_dtypes,
         )  # fmt: skip
         return ChunkKDAWarpdrivePrepared(
-            saved, metadata, scale, fastmath, intra_chunk_dtypes, pieces
+            saved, metadata, scale, fastmath, intra_chunk_dtypes, exact_recompute, pieces
         )
     factors = _prepare_chunk_kda_fwd(
         q,

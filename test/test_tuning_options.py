@@ -117,7 +117,11 @@ def kda_inputs() -> tuple[torch.Tensor, ...]:
 
 
 REFERENCE_OPTIONS = {
-    "chunk_kda": (linear.chunk_kda, kda_inputs, {"autotune": False, "backend": "warpdrive"}),
+    "chunk_kda": (
+        linear.chunk_kda,
+        kda_inputs,
+        {"autotune": False, "backend": "warpdrive", "exact_recompute": True},
+    ),
     "recurrent_kda": (
         linear.recurrent_kda,
         kda_inputs,
@@ -145,6 +149,16 @@ def test_reference_validates_and_ignores_kernel_options(operation, make_inputs, 
     expected, _ = operation(*inputs, impl="reference")
     actual, _ = operation(*inputs, impl="reference", kernel_options=options)
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.parametrize("value", [0, "True", None])
+@pytest.mark.parametrize("name", ["chunk_kda", "chunk_kda_prepare"])
+def test_kda_validates_exact_recompute(name, value):
+    """``exact_recompute`` is a bool; omitting it, not ``None``, asks for the inference."""
+    pytest.importorskip("triton")
+    operation = getattr(kda, name)
+    with pytest.raises(TypeError, match=r"kernel_options\['exact_recompute'\] must be a bool"):
+        operation(*kda_inputs(), kernel_options={"exact_recompute": value})
 
 
 def test_paged_mla_decode_validates_its_kernel_options():

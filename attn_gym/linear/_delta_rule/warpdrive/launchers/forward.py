@@ -42,6 +42,7 @@ def run_forward_on_current_device(
     intra_chunk_dtypes: str,
     nonempty: bool = False,
     batch_invariant: bool = False,
+    exact_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one packed forward invocation.
 
@@ -52,6 +53,7 @@ def run_forward_on_current_device(
     (``KernelOptions``). ``nonempty`` promises that every sequence holds a token (dense
     batches), so the final state needs no seeding for empty sequences. ``batch_invariant`` skips
     piece chains and shared KDA prep; it does not forbid splitting the value dimension.
+    ``exact_recompute`` keeps the plan to the kernels the backward recomputes (``kda_forward``).
     """
     paged_state = state if isinstance(state, PagedState) else None
     if split and (state is not None or output_final_state):
@@ -125,6 +127,7 @@ def run_forward_on_current_device(
         intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,
         batch_invariant=batch_invariant,
+        exact_recompute=exact_recompute,
     )
     return output.unsqueeze(0), final_state
 
@@ -145,6 +148,7 @@ def run_forward(
     intra_chunk_dtypes: str,
     nonempty: bool = False,
     batch_invariant: bool = False,
+    exact_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -165,6 +169,7 @@ def run_forward(
             intra_chunk_dtypes=intra_chunk_dtypes,
             nonempty=nonempty,
             batch_invariant=batch_invariant,
+            exact_recompute=exact_recompute,
         )
 
 

@@ -44,6 +44,8 @@ class ResolvedKernelOptions(NamedTuple):
     schedule: ScheduleRequest
     # ``None`` when omitted; ``resolve_intra_chunk_dtypes`` picks the default by input dtype.
     intra_chunk_dtypes: IntraChunkDtypes | None
+    # ``None`` when omitted: inferred from grad mode where the forward runs.
+    exact_recompute: bool | None
 
 
 def resolve_kernel_options(
