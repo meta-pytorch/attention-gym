@@ -81,7 +81,9 @@ def load_boxes(w, atom, tiles, row, k0, count: cutlass.Constexpr, buffer: cutlas
     stage up with TMA zero fill."""
     boxes = TILE_K // BOX
     if cutlass.const_expr(pad_k):
-        assert k0 == 0 and count == -(-tiles.shape[2] // boxes)
+        expected = -(-tiles.shape[2] // boxes)
+        if cutlass.const_expr(k0 != 0 or count != expected):
+            raise ValueError(f"pad_k needs {expected} stages from zero, got {count} from {k0}")
         row_tiles = tiles[None, row, None]
     for k in cutlass.range_constexpr(count):
         with w.produce() as h:
