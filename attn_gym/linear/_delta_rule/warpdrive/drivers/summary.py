@@ -451,8 +451,10 @@ def _forward_summary(
     launch: _Launch,
     *,
     fastmath: bool,
+    intra_chunk_dtypes: str,
 ) -> None:
-    """Write H into ``state`` and stored-domain M into ``transition`` for every work item."""
+    """Write each item's bias H to ``state`` and its transition M to ``transition``, using
+    the requested forward precision."""
     launch.reset()
     kda_summary.kda_summary(
         k,
@@ -465,6 +467,7 @@ def _forward_summary(
         launch.work_count,
         launch.counters,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
 
 
@@ -481,6 +484,7 @@ def _reverse_summary(
     launch: _Launch,
     *,
     fastmath: bool,
+    intra_chunk_dtypes: str,
 ) -> None:
     """Write the entry cotangent for every work item; ``d_final_state`` None seeds zero."""
     kda_bprop_summary.kda_bprop_summary(
@@ -495,6 +499,7 @@ def _reverse_summary(
         scale=scale,
         d_final_state=d_final_state,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
     )
 
 
@@ -715,6 +720,7 @@ def build_state_summaries(
     bounds: torch.Tensor | None = None,
     fastmath: bool = True,
     batch_invariant: bool = False,
+    intra_chunk_dtypes: str,
 ) -> torch.Tensor:
     """Return FP32 ``[R, H, V + K, K]`` maps packed as ``[B; A]`` for whole packed sequences.
 
@@ -723,8 +729,9 @@ def build_state_summaries(
     consecutive ``cu_seqlens`` pairs; without bounds one row per sequence is returned. Empty
     intervals yield ``[0; I]``, nonempty rows that are not a sequence yield NaN, and zero rows
     yield no maps. Bounds values stay on device and may change during CUDA Graph replay.
-    ``fastmath=False`` selects the non-flushing gate exponentials. ``batch_invariant`` scans
-    every sequence uncut, so a sequence's bits do not depend on the other sequences.
+    ``fastmath=False`` selects the non-flushing gate exponentials; ``intra_chunk_dtypes``
+    follows ``chunk_kda``'s ``kernel_options``. ``batch_invariant`` scans every sequence uncut,
+    so a sequence's bits do not depend on the other sequences.
     """
     _validate({"k": k, "v": v, "gate": gate, "beta": beta}, cu_seqlens, bounds)
     with initialized_cuda_device(k):
@@ -740,7 +747,7 @@ def build_state_summaries(
         )
         _forward_summary(
             k[0], v[0], gate[0], beta[0], forward.bias, forward.transition, launch,
-            fastmath=fastmath,
+            fastmath=fastmath, intra_chunk_dtypes=intra_chunk_dtypes,
         )  # fmt: skip
         forward.compose(launch)
         maps = forward.maps
@@ -761,6 +768,7 @@ def build_state_grad_summaries(
     bounds: torch.Tensor | None = None,
     fastmath: bool = True,
     batch_invariant: bool = False,
+    intra_chunk_dtypes: str,
 ) -> torch.Tensor:
     """Return FP32 ``[R, H, V + K, K]`` maps packed as ``[C; R]`` for whole packed sequences.
 
@@ -769,7 +777,8 @@ def build_state_grad_summaries(
     right-multiplication by A), so the reverse runs the forward's plan; with
     ``transpose_forward_transition=False`` R is instead a second reverse launch seeded with the
     identity exit cotangent and zero ``d_output`` (requires ``V == K``; never split). Inputs,
-    bounds, ``fastmath`` and ``batch_invariant`` follow :func:`build_state_summaries`.
+    bounds and options follow :func:`build_state_summaries`. Use the forward's precision for
+    both the reverse launches and any recomputed forward transitions.
     """
     _validate(
         {"q": q, "k": k, "v": v, "gate": gate, "beta": beta, "d_output": d_output},
@@ -799,6 +808,7 @@ def build_state_grad_summaries(
                 exit_cotangent,
                 launch,
                 fastmath=fastmath,
+                intra_chunk_dtypes=intra_chunk_dtypes,
             )
 
         if transpose_forward_transition:
@@ -808,8 +818,9 @@ def build_state_grad_summaries(
 
             def forward_summary(bias: torch.Tensor, transition: torch.Tensor) -> None:
                 _forward_summary(
-                    k[0], v[0], gate[0], beta[0], bias, transition, launch, fastmath=fastmath
-                )
+                    k[0], v[0], gate[0], beta[0], bias, transition, launch, fastmath=fastmath,
+                    intra_chunk_dtypes=intra_chunk_dtypes,
+                )  # fmt: skip
 
             maps, _ = _reverse_maps(
                 launch, forward, forward_summary, lambda entry: reverse(entry, d_output[0])

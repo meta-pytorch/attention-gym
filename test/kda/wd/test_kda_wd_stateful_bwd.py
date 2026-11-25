@@ -25,12 +25,19 @@ from attn_gym.linear.kda.stages import (
     chunk_kda_prepare,
     chunk_kda_prepare_backward,
 )
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     cumulative_sequence_offsets,
     kda_reference,
     make_kda_test_inputs,
 )
+
+# The warpdrive ops' arguments after ``scale``: ``fastmath`` and the default operand precision
+# for BF16 inputs (``KernelOptions``).
+PRECISION = (True, DEFAULT_INTRA_CHUNK_DTYPES)
+# The stateful forward schema keeps nonempty ahead of intra_chunk_dtypes.
+FORWARD_PRECISION = {"fastmath": True, "intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
 
 pytestmark = pytest.mark.skipif(
     not cuda_runs_sm100_kernels(),
@@ -109,7 +116,7 @@ def test_stateful_backward_op_registration(outer_strided: bool) -> None:
         assert not initial_state.is_contiguous()
     operands = (q, k, value, gate, beta, d_output, cumulative_sequence_offsets([65, 0, 63]))
     for exit_cotangent in (d_final_state, None):
-        with_state = (*operands, initial_state, exit_cotangent, SCALE)
+        with_state = (*operands, initial_state, exit_cotangent, SCALE, *PRECISION)
         grads = chunk_warpdrive_packed_bwd_with_state_op(*with_state)
         assert len(grads) == 6
         assert grads[5].shape == initial_state.shape and grads[5].is_contiguous()
@@ -118,7 +125,7 @@ def test_stateful_backward_op_registration(outer_strided: bool) -> None:
             chunk_warpdrive_packed_bwd_with_state_op, with_state, test_utils=OPCHECK_UTILITIES
         )
         # Without an entry state the fixed-arity sibling returns the five token gradients.
-        without_state = (*operands, exit_cotangent, SCALE)
+        without_state = (*operands, exit_cotangent, SCALE, *PRECISION)
         assert len(chunk_warpdrive_packed_bwd_with_exit_cotangent_op(*without_state)) == 5
         torch.library.opcheck(
             chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
@@ -164,8 +171,8 @@ def test_stateful_backward_without_state_is_the_local_backward() -> None:
     )
     operands = (q, k, value, gate, beta, d_output, cumulative_sequence_offsets([65, 0, 63]))
     _assert_gradients_equal(
-        chunk_warpdrive_packed_bwd_with_exit_cotangent_op(*operands, None, SCALE),
-        chunk_warpdrive_packed_local_bwd_op(*operands, False, SCALE),
+        chunk_warpdrive_packed_bwd_with_exit_cotangent_op(*operands, None, SCALE, *PRECISION),
+        chunk_warpdrive_packed_local_bwd_op(*operands, False, SCALE, *PRECISION),
     )
 
 
@@ -212,30 +219,30 @@ def test_two_aligned_fragments_with_state_handoff_match_one_native_call(
 
     operands = (q, k, value, gate, beta, d_output)
     output, final_state = chunk_warpdrive_packed_fwd_with_state_op(
-        *operands[:5], initial_state, offsets, SCALE
+        *operands[:5], initial_state, offsets, SCALE, **FORWARD_PRECISION
     )
     expected = chunk_warpdrive_packed_bwd_with_state_op(
-        *operands, offsets, initial_state, d_final_state, SCALE
+        *operands, offsets, initial_state, d_final_state, SCALE, *PRECISION
     )
 
     head, tail = _slice(operands, 0, cut), _slice(operands, cut, cu_seqlens[-1])
     head_output, head_states = chunk_warpdrive_packed_fwd_with_state_op(
-        *head[:5], initial_state[: document + 1], first_offsets, SCALE
+        *head[:5], initial_state[: document + 1], first_offsets, SCALE, **FORWARD_PRECISION
     )
     tail_entry = torch.cat((head_states[document:], initial_state[document + 1 :]))
     tail_output, tail_states = chunk_warpdrive_packed_fwd_with_state_op(
-        *tail[:5], tail_entry, second_offsets, SCALE
+        *tail[:5], tail_entry, second_offsets, SCALE, **FORWARD_PRECISION
     )
     kda_plan_comparison(torch.cat((head_output, tail_output), 1), output, "output")
     kda_plan_comparison(head_states[:document], final_state[:document], "head final state")
     kda_plan_comparison(tail_states, final_state[document:], "tail final state")
 
     tail_grads = chunk_warpdrive_packed_bwd_with_state_op(
-        *tail, second_offsets, tail_entry, d_final_state[document:], SCALE
+        *tail, second_offsets, tail_entry, d_final_state[document:], SCALE, *PRECISION
     )
     head_exit = torch.cat((d_final_state[:document], tail_grads[5][:1]))
     head_grads = chunk_warpdrive_packed_bwd_with_state_op(
-        *head, first_offsets, initial_state[: document + 1], head_exit, SCALE
+        *head, first_offsets, initial_state[: document + 1], head_exit, SCALE, *PRECISION
     )
     joined = [
         *(torch.cat(pair, 1) for pair in zip(head_grads[:5], tail_grads[:5], strict=True)),
@@ -265,7 +272,9 @@ def test_staged_warpdrive_backward_is_the_native_op() -> None:
     assert isinstance(grads, ChunkKDAWarpdriveBackward)
     _assert_gradients_equal(
         grads.run(d_final_state),
-        chunk_warpdrive_packed_bwd_with_state_op(*operands, initial_state, d_final_state, SCALE),
+        chunk_warpdrive_packed_bwd_with_state_op(
+            *operands, initial_state, d_final_state, SCALE, *PRECISION
+        ),
     )
 
     # Reverse maps are warpdrive's own probes (test_kda_wd_native_summary covers their contents).
@@ -276,7 +285,7 @@ def test_staged_warpdrive_backward_is_the_native_op() -> None:
     *no_state_grads, d_initial_state = no_state.run(None)
     assert d_initial_state is None
     _assert_gradients_equal(
-        no_state_grads, chunk_warpdrive_packed_local_bwd_op(*operands, False, SCALE)
+        no_state_grads, chunk_warpdrive_packed_local_bwd_op(*operands, False, SCALE, *PRECISION)
     )
 
 
@@ -290,7 +299,7 @@ def test_stateful_backward_matches_fp64_reference_including_d_initial_state(
     )
     offsets = cumulative_sequence_offsets(lengths)
     actual = chunk_warpdrive_packed_bwd_with_state_op(
-        q, k, value, gate, beta, d_output, offsets, initial_state, d_final_state, SCALE
+        q, k, value, gate, beta, d_output, offsets, initial_state, d_final_state, SCALE, *PRECISION
     )
     references = []
     for precision in (torch.float64, torch.float32):

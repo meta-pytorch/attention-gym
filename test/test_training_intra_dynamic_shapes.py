@@ -26,10 +26,14 @@ from attn_gym.testing.kda import (
     make_kda_test_inputs,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="KDA intra requires CUDA capability >= 8.0",
-)
+# Exercise the Triton kernels even where auto would select warpdrive.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="KDA intra requires CUDA capability >= 8.0",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 
 def intra_inputs(tokens: int, dtype: torch.dtype, *, strided: bool = False):

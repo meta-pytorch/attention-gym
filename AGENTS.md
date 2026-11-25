@@ -248,6 +248,8 @@ before changing the covered subsystem:
   typed config generation, cached TVM-FFI compilation, parallel compile, and sequential tuning.
 - [`authoring-warpdrive`](.agents/skills/authoring-warpdrive/SKILL.md) —
   every new CuTeDSL kernel, warp-specialized or one uniform role, and ports to warpdrive.
+- [`adding-megakernel-model`](.agents/skills/adding-megakernel-model/SKILL.md) —
+  a new model on the shared decode megakernel package (`attn_gym/warpdrive/examples/megakernel/`).
 
 ## Agent Scratch Space
 

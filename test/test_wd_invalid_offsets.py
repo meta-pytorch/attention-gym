@@ -47,6 +47,8 @@ if direction == "forward":
 else:
     op = ops.kda_chunk_cudnn_packed_local_bwd if family == "kda" else ops.gdn_chunk_cudnn_packed_bwd
     args = (q, k, v, gate, beta, torch.randn_like(v), cu, split, 128**-0.5)
+if family == "kda":
+    args += (True, "tf32")  # fastmath, intra_chunk_dtypes
 op(*args)
 torch.cuda.synchronize()
 print("valid offsets completed", flush=True)
@@ -124,15 +126,18 @@ def run():
     if route == "split_forward":
         return build_warpdrive_state_summaries(
             saved.k, saved.v, saved.gate, saved.beta, saved.cu_seqlens, bounds=bounds,
+            intra_chunk_dtypes="tf32",
         )
     if route == "split_reverse":
         return build_warpdrive_state_grad_summaries(
             saved.q, saved.k, saved.v, saved.gate, saved.beta, backward.d_output,
             saved.cu_seqlens, prepared.scale, transpose_forward_transition=True, bounds=bounds,
+            intra_chunk_dtypes="tf32",
         )
     return build_warpdrive_state_grad_summaries(
         saved.q, saved.k, saved.v, saved.gate, saved.beta, backward.d_output, saved.cu_seqlens,
         prepared.scale, transpose_forward_transition=False, bounds=bounds,
+        intra_chunk_dtypes="tf32",
     )
 
 

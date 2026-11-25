@@ -22,6 +22,8 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import (
     random_weights,
 )
 
+pytestmark = pytest.mark.usefixtures("release_cuda_memory")
+
 MAX_LEN = 512
 SMALL = QwenConfig(
     hidden_size=1024, num_layers=2, num_q_heads=16, num_kv_heads=8, intermediate_size=3072,
@@ -32,13 +34,6 @@ SMALL_MOE = QwenConfig(
     hidden_size=1024, num_layers=2, num_q_heads=32, num_kv_heads=4, intermediate_size=1024,
     vocab_size=4096, num_experts=128, experts_per_token=8, moe_intermediate_size=256,
 )  # fmt: skip
-
-
-@pytest.fixture(autouse=True)
-def release_cuda_memory():
-    yield
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def require_sm100():
@@ -392,7 +387,7 @@ def test_streamed_inputs_free_the_ring():
     """Streaming admits a batch-64 configuration that resident inputs cannot fit while retaining
     at least eight weight-ring stages; it requires the tcgen05 engine."""
     model = dataclasses.replace(SMALL, hidden_size=5120, num_q_heads=40, num_kv_heads=8)
-    with pytest.raises(ValueError, match="stages must be in"):
+    with pytest.raises(ValueError, match="bytes of shared memory"):
         mk.QwenDecodeMegakernelTc(model=model, batch=64)
     op = mk.QwenDecodeMegakernelTcStream(model=model, batch=64)
     assert op.stages >= 8

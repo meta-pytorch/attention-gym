@@ -16,6 +16,8 @@ from attn_gym.linear._delta_rule.validation import validate_paged_state
 from attn_gym.linear.kda.utils import is_sm100_kda_target
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="KDA ops require CUDA")
+# ``"autotune"`` selects among the fused backend's kernels; warpdrive ignores it.
+FUSED: KernelOptions = {"backend": "fused"}
 
 FUSED_CHUNK = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0)
 
@@ -248,7 +250,13 @@ def test_chunk_autotune_flag_is_deterministic_and_accurate():
 
     def run():
         output, state = chunk_kda(
-            q, k, v, gate, beta, output_final_state=True, kernel_options={"autotune": False}
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            output_final_state=True,
+            kernel_options={**FUSED, "autotune": False},
         )
         grads = torch.autograd.grad(output.float().square().mean() + state.square().mean(), (q, v))
         return output, state, *grads
@@ -259,7 +267,7 @@ def test_chunk_autotune_flag_is_deterministic_and_accurate():
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
     tuned_output, tuned_state = chunk_kda(
-        q.detach(), k, v.detach(), gate, beta, output_final_state=True
+        q.detach(), k, v.detach(), gate, beta, output_final_state=True, kernel_options=FUSED
     )
     torch.testing.assert_close(first[0], tuned_output, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(first[1], tuned_state, rtol=2e-2, atol=2e-2)

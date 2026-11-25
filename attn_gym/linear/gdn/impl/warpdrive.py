@@ -35,7 +35,11 @@ def validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
 
 
 class ChunkGdnWarpdrivePacked(torch.autograd.Function):
-    """Attach autograd to packed scalar-GDN warpdrive calls with optional recurrent state."""
+    """Attach autograd to packed scalar-GDN warpdrive calls with optional recurrent state.
+
+    Forward and backward normally choose their own plans from the packed shape. When forward
+    sets ``batch_invariant``, both run unchained.
+    """
 
     @staticmethod
     def forward(
@@ -51,13 +55,15 @@ class ChunkGdnWarpdrivePacked(torch.autograd.Function):
         output_final_state: bool,
         split_backward: bool,
         split_forward: bool,
+        batch_invariant: bool,
     ) -> Tensor | tuple[Tensor, Tensor]:
         ctx.has_initial_state = initial_state is not None
         ctx.scale = scale
         ctx.split_backward = split_backward
+        ctx.batch_invariant = batch_invariant
         if initial_state is None:
             output = chunk_gdn_warpdrive_packed_fwd_op(
-                q, k, value, gate, beta, cu_seqlens, split_forward, scale
+                q, k, value, gate, beta, cu_seqlens, split_forward, scale, batch_invariant
             )
             ctx.save_for_backward(q, k, value, gate, beta, cu_seqlens)
         elif output_final_state:
@@ -70,6 +76,7 @@ class ChunkGdnWarpdrivePacked(torch.autograd.Function):
                 initial_state,
                 cu_seqlens,
                 scale,
+                batch_invariant,
             )
             ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
         else:
@@ -82,6 +89,7 @@ class ChunkGdnWarpdrivePacked(torch.autograd.Function):
                 initial_state,
                 cu_seqlens,
                 scale,
+                batch_invariant,
             )
             ctx.save_for_backward(q, k, value, gate, beta, initial_state, cu_seqlens)
         ctx.set_materialize_grads(False)
@@ -109,8 +117,9 @@ class ChunkGdnWarpdrivePacked(torch.autograd.Function):
                 cu_seqlens,
                 ctx.split_backward,
                 ctx.scale,
+                ctx.batch_invariant,
             )
-            return *gradients, None, None, None, None, None, None
+            return *gradients, *(None,) * 7
 
         q, k, value, gate, beta, initial_state, cu_seqlens = ctx.saved_tensors
         return (
@@ -125,12 +134,9 @@ class ChunkGdnWarpdrivePacked(torch.autograd.Function):
                 d_final_state,
                 cu_seqlens,
                 ctx.scale,
+                ctx.batch_invariant,
             ),
-            None,
-            None,
-            None,
-            None,
-            None,
+            *(None,) * 6,
         )
 
 
@@ -147,6 +153,7 @@ def chunk_forward(
     output_final_state: bool = False,
     split_backward: bool = False,
     split_forward: bool = False,
+    batch_invariant: bool,
 ) -> tuple[Tensor, Tensor | None]:
     """Run scalar GDN through the warpdrive backend behind the shared chunk contract.
 
@@ -190,6 +197,7 @@ def chunk_forward(
         output_final_state,
         split_backward,
         split_forward,
+        batch_invariant,
     )
     if output_final_state:
         output, final_state = result
@@ -209,6 +217,7 @@ def paged_chunk_forward(
     cu_seqlens: Tensor | None,
     has_initial_state: Tensor | None,
     scale: float,
+    batch_invariant: bool,
 ) -> Tensor:
     """Advance selected ``state_cache`` slots in place with the warpdrive chunk kernel."""
     if not q.is_cuda:
@@ -239,6 +248,7 @@ def paged_chunk_forward(
         has_initial_state,
         cu_seqlens,
         scale,
+        batch_invariant,
     )
     return output.reshape(output_shape)
 

@@ -31,8 +31,9 @@ Then read the closest complete example, including its host wrapper, launch and c
   `SharedKVDecode` (`shared_kv=True` in the wrappers) exclusive consumers plus a named-barrier
   rendezvous; not a persistent template.
 - [Packed work](../../../attn_gym/warpdrive/examples/packed_work.py): mapping a device-built list, not a complete kernel.
-- [Qwen3 decode megakernel](../../../attn_gym/warpdrive/examples/qwen_megakernel.py): a whole decode step as one
-  persistent launch; host instruction table, static schedule and raw cross-CTA dependencies.
+- [Qwen3 decode megakernel](../../../attn_gym/warpdrive/examples/qwen_megakernel/core.py): a decode step as one
+  persistent launch per layer on the shared [megakernel package](../../../attn_gym/warpdrive/examples/megakernel/AGENTS.md);
+  host instruction table, static schedule and raw cross-CTA dependencies.
 
 Read the linked topic guide when using that feature. If investigating a fuzz report, resolve
 its labels in `test/warpdrive_fuzz/static.py` and `mutate.py`, where each case states the
@@ -82,6 +83,11 @@ Follow the guide's lifecycle, prologue and launch sections. In particular:
   redundant managed fence only with `skip_fence=..., reason=...`
   ([skip a fence](../../../docs/warpdrive/dropping-down.md#skip-a-redundant-thread-sync-fence)),
   and rerun that check over every configuration the skip depends on.
+- A role that TMA-stores shared memory it wrote needs the proxy fence before the store and a
+  commit and wait before it returns
+  ([hand-written TMA stores](../../../docs/warpdrive/dropping-down.md#hand-written-tma-stores));
+  run `ptx_check.check_bulk_copies` on the kernel's PTX to find a missing one. A TMEM ring
+  whose stage is reused declares `release_fence="tmem_load"` when its consumer loads from it.
 
 ## Validate and hand back
 

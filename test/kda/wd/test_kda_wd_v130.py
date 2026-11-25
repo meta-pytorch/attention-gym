@@ -4,12 +4,16 @@ import pytest
 import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     cumulative_sequence_offsets,
     kda_reference,
     make_kda_test_inputs,
 )
+
+# Direct kernel calls use the same precision as public calls with BF16 Q/K/V.
+PRECISION = {"intra_chunk_dtypes": DEFAULT_INTRA_CHUNK_DTYPES}
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 pytestmark = pytest.mark.skipif(
@@ -48,6 +52,7 @@ def test_v130_plans_match_reference(monkeypatch, scheme):
         initial_state=state,
         output_final_state=not split,
         split=split,
+        **PRECISION,
     )
     grads = driver.kda_backward(
         *packed,
@@ -57,6 +62,7 @@ def test_v130_plans_match_reference(monkeypatch, scheme):
         initial_state=state,
         d_final_state=dstate,
         split=split,
+        **PRECISION,
     )
     references = []
     for precision in (torch.float64, torch.float32):
@@ -227,7 +233,15 @@ def test_v130_forward_plans_keep_delta_residual_in_fp32(monkeypatch, scheme, wit
     state = torch.zeros(1, 1, 128, 128, device="cuda") if with_state else None
 
     out, _ = driver.kda_forward(
-        q, k, v, gate, beta, cumulative_sequence_offsets([tokens]), scale=1.0, initial_state=state
+        q,
+        k,
+        v,
+        gate,
+        beta,
+        cumulative_sequence_offsets([tokens]),
+        scale=1.0,
+        initial_state=state,
+        **PRECISION,
     )
 
     assert (out[16, 0, 0].item(), out[32, 0, 0].item()) == (1.5, 1.5)
@@ -261,10 +275,10 @@ def test_warpdrive_compaction_keeps_empty_state_cotangents(monkeypatch, with_exi
         seed = state if padded else state[keep].contiguous()
         exit_grad = dstate if padded or dstate is None else dstate[keep].contiguous()
         out, final = driver.kda_forward(
-            *inputs, cu, scale=1.0, initial_state=seed, output_final_state=True
+            *inputs, cu, scale=1.0, initial_state=seed, output_final_state=True, **PRECISION
         )
         grads = driver.kda_backward(
-            *inputs, do, cu, scale=1.0, initial_state=seed, d_final_state=exit_grad
+            *inputs, do, cu, scale=1.0, initial_state=seed, d_final_state=exit_grad, **PRECISION
         )
         results.append((out, final, grads))
     compact, padded = results

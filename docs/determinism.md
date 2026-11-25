@@ -137,8 +137,9 @@ not across GPU architectures.
 
 ## KDA determinism
 
-The KDA operations contain no atomics, so every kernel is bitwise-deterministic
-given a fixed configuration. The guarantees, strongest first:
+The Triton fused KDA kernels contain no atomics and are bitwise deterministic for a fixed
+configuration. For warpdrive, see [warpdrive chunk kernels](#warpdrive-chunk-kernels). The
+following guarantees apply to Triton:
 
 - **Same selected configurations, run to run: bitwise.** Repeating a call
   that resolves to the same kernel configurations — across runs and processes —
@@ -167,13 +168,6 @@ given a fixed configuration. The guarantees, strongest first:
   (GB300). The fused decode ops (`recurrent_kda_decode`, `recurrent_gdn_decode`)
   do not support it. For batch-invariant decode, apply `gate_transform`, the beta
   sigmoid and `l2norm` yourself, then call the scan with one token per sequence.
-- **Warpdrive context-parallel summaries with `kernel_options={"backend": "warpdrive",
-  "batch_invariant": True}` on `chunk_kda_prepare` / `chunk_gdn_prepare` (and their backward
-  handles): bitwise across packs.** By default a long sequence's `state_summaries` and
-  `state_grad_summaries` split into pieces whose length follows the packed stream's shape, so
-  its bits change with the other sequences. The option scans every sequence uncut in both
-  directions. It does not cover the handles' `run`, whose plan still follows the stream's
-  shape; the fused stages reject it.
 - **CUDA-graph replay: bitwise** by construction, and the intended serving mode
   for decode.
 - **Across lowerings: never bitwise.** Dense versus packed, chunked versus
@@ -184,6 +178,35 @@ given a fixed configuration. The guarantees, strongest first:
   compile with different schedules.
 
 The reference implementations compute in FP32 even inside an autocast region.
+
+## warpdrive chunk kernels
+
+These guarantees apply when a KDA or GDN chunk call selects warpdrive, including paged, staged
+and context-parallel execution. See [Chunk backend selection](linear.md#chunk-backend-selection)
+for the selection rule. Set `kernel_options={"backend": "fused"}` to use Triton instead.
+
+- **Run to run: bitwise.** Warpdrive does not autotune. Its atomics assign work and populate
+  work tables; they do not determine the order of a numerical reduction. Repeating a call with
+  the same inputs, shape, GPU and software reproduces its outputs, final states and gradients.
+- **Across batch compositions: not guaranteed by default.** The packed shape and SM count can
+  change whether warpdrive chains pieces of a sequence, shares KDA prep or splits staged
+  summaries. A staged `run` reuses the summaries' pieces, so its results can also differ from
+  an ordinary chunk call on the same stream.
+- **Across batch compositions with `batch_invariant`: bitwise.** Set
+  `kernel_options={"backend": "warpdrive", "batch_invariant": True}`. For fixed inputs to a
+  sequence, changing its neighbors preserves output, final-state and gradient bits. This also
+  covers paged updates (including replay), staged `run` and summaries, and unchanged rank-local
+  fragments in context parallelism. It does not cover repartitioning a document across ranks.
+  A few long sequences lose parallelism; see [Batch invariance](linear.md#batch-invariance)
+  for the plan details and measurements.
+- **Across operand precisions: not guaranteed.** For BF16 KDA, `"bf16"` and the default `"tf32+bf16"`
+  round decay operands differently in both directions. Native FP16 KDA has a single precision
+  ([Operand precision](linear.md#operand-precision)).
+- **Across backends: not guaranteed.** Warpdrive and Triton KDA use 16- and 64-token chunks,
+  respectively. GDN uses 64-token chunks on both but rounds differently in the two kernels.
+- **CUDA-graph replay: bitwise** for the same inputs. A graph captured at a larger capacity
+  keeps the plan of its captured shape, so its replays need not match an eager call at the
+  replayed size bit for bit.
 
 
 ## References

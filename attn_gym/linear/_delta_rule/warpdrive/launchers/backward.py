@@ -29,6 +29,8 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     initial_state: torch.Tensor | None = None,
     d_final_state: torch.Tensor | None = None,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
+    batch_invariant: bool = False,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -45,13 +47,17 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     d_initial_state)``; the last is ``None`` unless ``initial_state`` was given. ``dgate`` is zero
     past ``cu_seqlens[-1]``; the other token gradients are unspecified there.
     The approximate forgetting-horizon ``split`` schedule requires a no-state call.
-    ``fastmath=False`` selects the non-flushing gate exponentials.
+    ``fastmath=False`` selects the non-flushing gate exponentials. Recompute, summaries and
+    gradients all use the forward's ``intra_chunk_dtypes``. With ``batch_invariant``, the
+    backward scans whole sequences rather than chaining pieces.
     """
     scale = resolve_scale(scale, q.shape[-1])
     if not q.is_cuda:
         raise ValueError("q must be a CUDA tensor")
     if split and (initial_state is not None or d_final_state is not None):
         raise ValueError("the split backward schedule requires a no-state call")
+    if split and batch_invariant:
+        raise ValueError("batch_invariant excludes the split schedules")
     with initialized_cuda_device(q):
         if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] != 128:
             raise ValueError("q must have shape [1, T, H, 128]")
@@ -107,6 +113,8 @@ def chunk_delta_rule_bwd_warpdrive_packed(
             initial_state=initial_state,
             d_final_state=d_final_state,
             fastmath=fastmath,
+            intra_chunk_dtypes=intra_chunk_dtypes,
+            batch_invariant=batch_invariant,
         )
         return (*(grad.unsqueeze(0) for grad in gradients), d_initial_state)
 

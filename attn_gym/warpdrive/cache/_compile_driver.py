@@ -1,7 +1,9 @@
 """Compiler process that ``precompile_many`` starts in a fresh interpreter.
 
-It installs the caller's import paths and compile target, loads the pickled compile calls,
-then forks workers. A worker receives only an index into the calls it inherited.
+It installs the caller's import paths and compile target, resolves the compile functions and
+loads the pickled compile calls (each ``(function index, args)``), then forks workers. A worker
+receives only an index into the calls it inherited. It leads the process group its workers join,
+and kills that group if its caller dies, which signals sent to the caller's group no longer reach.
 """
 
 from __future__ import annotations
@@ -10,14 +12,17 @@ import importlib
 import json
 import os
 import pickle
+import signal
 import sys
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, wait
 from multiprocessing import get_context
 from pathlib import Path
 from typing import Any
 
-_compile_fn: Any | None = None
-_compile_calls: list[tuple[Any, ...]] = []
+CALLER_POLL_SECONDS = 0.5
+
+_compile_fns: list[Any] = []
+_compile_calls: list[tuple[int, tuple[Any, ...]]] = []
 
 
 def _resolve(module_name: str, qualname: str) -> Any:
@@ -28,13 +33,16 @@ def _resolve(module_name: str, qualname: str) -> Any:
 
 
 def _precompile_call(index: int) -> None:
-    if _compile_fn is None:
-        raise RuntimeError("compiler worker was forked without a compile function")
-    _compile_fn.precompile(*_compile_calls[index])
+    if not _compile_fns:
+        raise RuntimeError("compiler worker was forked without compile functions")
+    fn_index, args = _compile_calls[index]
+    _compile_fns[fn_index].precompile(*args)
 
 
 def main(request_path: Path, calls_path: Path) -> int:
-    global _compile_calls, _compile_fn
+    global _compile_calls, _compile_fns
+    if os.getpgrp() != os.getpid():
+        raise SystemExit("the compiler process must lead its own process group")
     request = json.loads(request_path.read_text(encoding="utf-8"))
     inherited_paths = request["sys_path"]
     sys.path[:] = inherited_paths + [path for path in sys.path if path not in inherited_paths]
@@ -57,14 +65,15 @@ def main(request_path: Path, calls_path: Path) -> int:
         suffix = "a" if major >= 9 else ""
         os.environ["CUTE_DSL_ARCH"] = f"sm_{major}{minor}{suffix}"
 
-    from attn_gym.warpdrive.cache.jit import set_cache_path
+    from attn_gym.warpdrive.cache.compile import CACHE_STORAGE_EXIT
+    from attn_gym.warpdrive.cache.jit import CacheStorageError, set_cache_path
     from attn_gym.warpdrive.cache.target import CompileTarget, set_compile_target
 
     set_compile_target(CompileTarget(**target_fields))
     set_cache_path(request["cache_path"])
 
-    _compile_fn = _resolve(request["module"], request["qualname"])
-    if not callable(getattr(_compile_fn, "precompile", None)):
+    _compile_fns = [_resolve(module, qualname) for module, qualname in request["functions"]]
+    if not all(callable(getattr(fn, "precompile", None)) for fn in _compile_fns):
         raise TypeError("compile function is not decorated with jit_cache")
 
     # Safe to unpickle: the parent wrote this file in its private TemporaryDirectory. It never
@@ -73,9 +82,8 @@ def main(request_path: Path, calls_path: Path) -> int:
 
     # Import and hash sources once, before forking, so workers inherit the result. The target
     # is already set, so this does no CUDA device discovery.
-    prepare_cache = getattr(_compile_fn, "prepare_cache", None)
-    if callable(prepare_cache):
-        prepare_cache()
+    for fn in _compile_fns:
+        fn.prepare_cache()
 
     context = get_context("fork")
     with ProcessPoolExecutor(
@@ -83,8 +91,17 @@ def main(request_path: Path, calls_path: Path) -> int:
         mp_context=context,
     ) as pool:
         futures = [pool.submit(_precompile_call, index) for index in range(len(_compile_calls))]
-        for future in futures:
-            future.result()
+        running = set(futures)
+        while running:
+            _, running = wait(running, timeout=CALLER_POLL_SECONDS)
+            if os.getppid() != request["caller_pid"]:  # orphaned: stop the workers too
+                os.killpg(0, signal.SIGKILL)
+    errors = [error for future in futures if (error := future.exception()) is not None]
+    if compile_errors := [e for e in errors if not isinstance(e, CacheStorageError)]:
+        raise compile_errors[0]
+    if errors:
+        print("\n".join(map(str, errors)), file=sys.stderr)
+        return CACHE_STORAGE_EXIT
     return 0
 
 

@@ -33,7 +33,10 @@ def bound_gate(
         raw_gate: Floating-point projection output shaped ``[B, T, H, D]``.
         A_log: FP32 per-head log scale shaped ``[H]``.
         dt_bias: FP32 per-channel bias shaped ``[H, D]``.
-        lower_bound: Finite nonpositive gate floor.
+        lower_bound: Finite nonpositive gate floor. For ``chunk_kda`` training, keep it at or
+            above about ``-5.25`` on warpdrive (``-WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE``)
+            or ``-5.914`` on Triton (``-MAX_GATE_LOWER_BOUND_MAGNITUDE``). The default ``-5``
+            fits both.
         fastmath: Allow approximate gating exponentials (default ``True``). ``False`` selects
             non-fast forward and backward math. Reference execution uses normal PyTorch math
             for either value; ``chunk_kda`` has its own flag.

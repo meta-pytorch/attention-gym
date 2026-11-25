@@ -33,6 +33,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _WARPDRIVE_KERNEL_OPTIONS = {"backend": "warpdrive"}
+_FUSED_KERNEL_OPTIONS = {"backend": "fused"}
 
 
 def chunk_gdn(*args, **kwargs):
@@ -816,7 +817,7 @@ def test_gdn_wd_padding_is_bitwise_and_emits_no_empty_work(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("split", [False, True])
-def test_gdn_wd_changing_batch_shape_in_one_process_matches_default(split: bool) -> None:
+def test_gdn_wd_changing_batch_shape_in_one_process_matches_fused(split: bool) -> None:
     """Launch plans depend on the batch shape: a later call with a new shape must not replay the
     previous plan (a stale split table once left the second sequence unwritten)."""
     options = {"backend": "warpdrive", "split_forward": split, "split_backward": split}
@@ -827,7 +828,7 @@ def test_gdn_wd_changing_batch_shape_in_one_process_matches_default(split: bool)
         inputs = tuple(t.requires_grad_() for t in (q, k, value, gate, beta))
         d_output = torch.randn_like(value)
         results = []
-        for kernel_options in (None, options):
+        for kernel_options in (_FUSED_KERNEL_OPTIONS, options):
             output, _ = public_chunk_gdn(
                 *inputs, cu_seqlens=cu_seqlens, kernel_options=kernel_options
             )
@@ -874,7 +875,7 @@ def test_gdn_wd_token_count_across_scan_buckets_reuses_uncut_compiles(monkeypatc
         inputs = tuple(t.requires_grad_() for t in (q, k, value, gate, beta))
         d_output = torch.randn_like(value)
         results = []
-        for kernel_options in (None, _WARPDRIVE_KERNEL_OPTIONS):
+        for kernel_options in (_FUSED_KERNEL_OPTIONS, _WARPDRIVE_KERNEL_OPTIONS):
             output, _ = public_chunk_gdn(
                 *inputs, cu_seqlens=cu_seqlens, kernel_options=kernel_options
             )

@@ -39,19 +39,27 @@ def run_forward_on_current_device(
     output_final_state: bool,
     split: bool = False,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
     nonempty: bool = False,
+    batch_invariant: bool = False,
+    exact_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one packed forward invocation.
 
     ``split`` enables the forgetting-horizon work table: long sequences are cut where the gate has
     saturated and each cut item rebuilds its entry state from zero over a warmup window, so it is
     approximate and only offered for calls without recurrent state. ``fastmath=False`` selects
-    the non-flushing gate exponentials. ``nonempty`` promises that every sequence holds a token
-    (dense batches), so the final state needs no seeding for empty sequences.
+    the non-flushing gate exponentials. ``intra_chunk_dtypes`` selects the operand precision
+    (``KernelOptions``). ``nonempty`` promises that every sequence holds a token (dense
+    batches), so the final state needs no seeding for empty sequences. ``batch_invariant`` skips
+    piece chains and shared KDA prep; it does not forbid splitting the value dimension.
+    ``exact_recompute`` keeps the plan to the kernels the backward recomputes (``kda_forward``).
     """
     paged_state = state if isinstance(state, PagedState) else None
     if split and (state is not None or output_final_state):
         raise ValueError("the split forward schedule requires a no-state call")
+    if split and batch_invariant:
+        raise ValueError("batch_invariant excludes the split schedules")
     initial_state = paged_state.cache if paged_state is not None else state
     scale = resolve_scale(scale, q.shape[-1])
     validate_available(q)
@@ -116,7 +124,10 @@ def run_forward_on_current_device(
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
         fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,
+        batch_invariant=batch_invariant,
+        exact_recompute=exact_recompute,
     )
     return output.unsqueeze(0), final_state
 
@@ -134,7 +145,10 @@ def run_forward(
     output_final_state: bool,
     split: bool = False,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
     nonempty: bool = False,
+    batch_invariant: bool = False,
+    exact_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -152,7 +166,10 @@ def run_forward(
             output_final_state=output_final_state,
             split=split,
             fastmath=fastmath,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             nonempty=nonempty,
+            batch_invariant=batch_invariant,
+            exact_recompute=exact_recompute,
         )
 
 

@@ -25,6 +25,8 @@ from attn_gym.testing import (
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 OPTIONS = {"schedule": "static", "autotune": False}
+# Checkpointed calls run the fused kernels, so their chunk references must too.
+pytestmark = pytest.mark.usefixtures("fused_chunk_default")
 
 
 @pytest.fixture

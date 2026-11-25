@@ -63,19 +63,19 @@ records every CTA's work items and ``trace_region``s with the table row as paylo
 """
 
 import dataclasses
+import functools
 import math
 
 import torch
 
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM
+from attn_gym.warpdrive.examples.megakernel.launch import device_smem_bytes, tagged_values
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
     ATTN,
     ATTN_SCALE,
-    BLOCK,
-    COMPUTE_WARPS,
     DOWN,
     GATEUP,
-    HEAD_DIM,
     LMHEAD,
     NORM,
     OP_NAMES,
@@ -84,7 +84,6 @@ from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     QWEN3_0_6B,
     REDUCE,
     ROUTER,
-    ROWS,
     TRACE_EVENTS,
     TRACE_EVENTS_PER_ROW,
     QwenDecodeMegakernel,
@@ -117,13 +116,10 @@ __all__ = [
     "ALL_OPS",
     "ATTN",
     "ATTN_SCALE",
-    "BLOCK",
-    "COMPUTE_WARPS",
     "CONTEXT",
     "DEPENDENCY_LATENCY",
     "DOWN",
     "GATEUP",
-    "HEAD_DIM",
     "LMHEAD",
     "NORM",
     "OPROJ",
@@ -133,7 +129,6 @@ __all__ = [
     "REDUCE",
     "REUSED_INPUT",
     "ROUTER",
-    "ROWS",
     "ROW_COST_MODELS",
     "TRACE_EVENTS",
     "TRACE_EVENTS_PER_ROW",
@@ -178,7 +173,9 @@ def kernel_class(engine: str, stream_inputs: bool = False) -> type[QwenDecodeMeg
 
 
 class QwenMegakernel:
-    """Packed weights, scratch and the compiled kernel for one cache capacity ``max_len``."""
+    """Packed weights, scratch and the kernel for one cache capacity ``max_len``, compiled at
+    the first launch (``fn``), for the compile target current then. A compile cannot run
+    inside CUDA-graph capture: launch once, or read ``fn``, before capturing."""
 
     def __init__(
         self,
@@ -199,7 +196,8 @@ class QwenMegakernel:
         inputs from global memory through an activation ring (``QwenDecodeMegakernelTcStream``).
         QKV and LM-head inputs, plus dense MLP inputs, are shared across CTAs; other inputs
         use per-CTA scratch. See that class for the dataflow. ``config``: ``QwenDecodeMegakernel``
-        constructor arguments; the model shape comes from ``weights.config``."""
+        constructor arguments except the shared-memory budget, which comes from the weights'
+        device. The model shape comes from ``weights.config``."""
         kernel = kernel_class(engine, stream_inputs)
         if max_len % BLOCK:
             raise ValueError(f"max_len must be a multiple of {BLOCK}, got {max_len}")
@@ -207,7 +205,9 @@ class QwenMegakernel:
         self.max_len = max_len
         # The kernel reads RoPE from ``self.rope``: its scaling stays out of the compile key.
         model = dataclasses.replace(weights.config, rope_scaling=None)
-        self.op = op = kernel(model=model, **config)
+        if "smem_bytes" in config:
+            raise ValueError("smem_bytes is determined by the weights' device; set stages instead")
+        self.op = op = kernel(model=model, smem_bytes=device_smem_bytes(device), **config)
         self.max_ctas = op.work.launch_args(device)[1]
         self.wqkv = torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1).reshape(
             -1, op.hidden
@@ -215,7 +215,14 @@ class QwenMegakernel:
         self.wo = weights.o_proj.reshape(-1, op.q_heads * HEAD_DIM).contiguous()
         # Gate and up rows interleaved, so a 32-row tile holds 16 (gate, up) pairs; MoE weights
         # carry an expert axis after the layer axis.
-        self.wgu = torch.stack((weights.gate, weights.up), dim=-2).reshape(-1, op.hidden)
+        gate_up = weights.packed_gate_up
+        if (
+            gate_up is None
+            or not gate_up.select(-2, 0).is_set_to(weights.gate)
+            or not gate_up.select(-2, 1).is_set_to(weights.up)
+        ):
+            gate_up = torch.stack((weights.gate, weights.up), dim=-2)
+        self.wgu = gate_up.view(-1, op.hidden)
         self.wd = weights.down.reshape(-1, weights.down.shape[-1]).contiguous()
         if op.moe:
             self.router = weights.router.reshape(-1, op.hidden).contiguous()
@@ -253,7 +260,16 @@ class QwenMegakernel:
         # Placeholder; trace_session swaps in the real globaltimer buffer for a traced launch.
         self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
         self.trace_buffers: list[torch.Tensor] | None = None  # per launch, inside trace_session
-        self.fn = compile_megakernel(self.op)
+
+    @functools.cached_property
+    def fn(self):
+        """The compiled kernel (``compile_megakernel``), built on first use."""
+        return compile_megakernel(self.op)
+
+    def kernels(self) -> list[tuple]:
+        """The compile calls ``(compile_fn, kernel)`` of ``launch``
+        (``attn_gym.warpdrive.cache.precompile_calls``' items)."""
+        return [(compile_megakernel, self.op)]
 
     def tagged(self, name: str) -> torch.Tensor:
         """The int64 words of a tagged buffer, shaped as ``ScratchLayout.shapes``."""
@@ -267,7 +283,7 @@ class QwenMegakernel:
 
     def values(self, name: str) -> torch.Tensor:
         """A tagged buffer's fp32 values, ignoring the tags."""
-        return self.tagged(name).view(torch.int32)[..., 0::2].view(torch.float32)
+        return tagged_values(self.tagged(name))
 
     def routed_experts(self) -> torch.Tensor:
         """MoE: the (layers, batch, experts_per_token) experts the last launch routed to, by rank:

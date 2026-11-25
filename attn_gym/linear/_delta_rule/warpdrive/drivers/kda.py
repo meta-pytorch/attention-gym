@@ -19,7 +19,7 @@ from ..bundles.kda_chain_backward import build_chain_backward, run_chain_backwar
 from ..bundles.kda_chain_forward import build_chain_forward, run_chain_forward
 from ..bundles.kda_warmup_backward import build_warmup_backward, run_warmup_backward
 from ..bundles.kda_warmup_forward import build_warmup_forward, run_warmup_forward
-from ..kda_common import B_T
+from ..kda_common import B_T, TORCH_NAMES, a_record_words, operand_dtypes
 from ..piece_chain import chain_rows_per_cta
 from ..work_tables import WORK_ITEM_FIELDS
 from .plan import BackwardPlan as _BackwardPlan
@@ -70,10 +70,18 @@ def kda_forward(
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
     nonempty: bool = False,
+    batch_invariant: bool = False,
+    exact_recompute: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
-    ``fastmath=False`` selects the non-flushing gate exponentials.
+    ``fastmath=False`` selects the non-flushing gate exponentials. ``intra_chunk_dtypes`` is
+    the public operand-precision option (NOTE [KDA operand precision] in ``kda_common``).
+    ``batch_invariant`` pins the plan (``ForwardPlan``) so a sequence's bits do not depend on
+    the rest of the pack. ``exact_recompute`` keeps small packs off the shared prep, whose
+    states the backward's per-tile recompute does not reproduce: set it for a forward that
+    ``kda_backward`` will differentiate.
 
     With ``state_indices`` the call is paged: ``initial_state`` is a ``[P,H,V,K]`` pool updated in
     place through the routes (non-positive routes are null; the optional uint8
@@ -94,7 +102,10 @@ def kda_forward(
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    if batch_invariant:
+        plan = ForwardPlan.invariant(num_seqs, heads_out, dim_v, device)
+    else:
+        plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0, tiles_per_head=1)
     if paged and plan.chain:
@@ -152,6 +163,7 @@ def kda_forward(
             scale=scale,
             chain_rows=chain_rows_per_cta(dim_v, dim_k, num_seqs, heads_out, plan.num_sm),
             num_sm=plan.num_sm,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
         )
         run_chain_forward(
@@ -164,8 +176,12 @@ def kda_forward(
         )
         return o, final_state
 
-    prep = plan.tiles_per_head > 1 and num_seqs * heads_out <= int(
-        PREP_TILE_FRACTION * plan.num_sm
+    # The shared prep rounds differently from per-tile prep, and the pack selects it.
+    prep = (
+        plan.tiles_per_head > 1
+        and not batch_invariant
+        and not exact_recompute
+        and num_seqs * heads_out <= int(PREP_TILE_FRACTION * plan.num_sm)
     )
     n_tiles = num_seqs * heads_out * plan.tiles_per_head
     ideal, rows, item_scratch, chunk_scratch = split_scratch(
@@ -182,7 +198,16 @@ def kda_forward(
         item_scratch=item_scratch,
         chunk_scratch=chunk_scratch,
         scheduler=int32(2, device),
-        **_prep_buffers(tokens, num_seqs, heads_out, dim_k, q.dtype, device, prep),
+        **_prep_buffers(
+            tokens,
+            num_seqs,
+            heads_out,
+            dim_k,
+            q.dtype,
+            device,
+            prep,
+            a_record_words(operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes)),
+        ),
     )
     launch = build_warmup_forward(
         **buffers,
@@ -196,6 +221,7 @@ def kda_forward(
         **_GATE_FLAGS,
         checkpoint_every_n_tokens=0,
         scale=scale,
+        intra_chunk_dtypes=intra_chunk_dtypes,
         fastmath=fastmath,
     )
     run_warmup_forward(*launch, **buffers, scale=scale)
@@ -203,9 +229,17 @@ def kda_forward(
 
 
 def _prep_buffers(
-    tokens: int, num_seqs: int, heads_out: int, dim_k: int, dtype, device, prep: bool
+    tokens: int,
+    num_seqs: int,
+    heads_out: int,
+    dim_k: int,
+    dtype,
+    device,
+    prep: bool,
+    a_words: int,
 ) -> dict:
-    """The d_v split shares its decay/factor prep across the two value tiles."""
+    """The d_v split shares its decay/factor prep across the two value tiles (``a_words``
+    int32 words per ``a`` record)."""
     names = (
         "prep_k_decay",
         "prep_q_decay",
@@ -224,7 +258,7 @@ def _prep_buffers(
     }
     return dict(
         buffers,
-        prep_a=torch.empty(rows, heads_out, B_T * B_T // 2, dtype=torch.int32, device=device),
+        prep_a=torch.empty(rows, heads_out, a_words, dtype=torch.int32, device=device),
         prep_diag=torch.empty(rows, heads_out, dim_k, dtype=torch.float32, device=device),
         prep_rows=torch.empty(rows, 4, dtype=torch.int32, device=device),
         prep_row_count=int32(1, device),
@@ -258,10 +292,14 @@ def kda_backward(
     d_final_state: torch.Tensor | None = None,
     split: bool = False,
     fastmath: bool = True,
+    intra_chunk_dtypes: str,
+    batch_invariant: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
 ]:
     """Recompute checkpoint series and differentiate KDA, with optional state/cotangent.
+    ``intra_chunk_dtypes`` is the forward's option, reused by recompute, summaries and
+    gradient kernels. ``batch_invariant`` pins the plan as in ``kda_forward``.
 
     Native bprop returns natural-log dgate directly; neither the safe-gate sigmoid
     derivative nor the composed BT64 cumulative-gate reverse scan is needed here. The bprop
@@ -277,7 +315,10 @@ def kda_backward(
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    if batch_invariant:
+        plan = BackwardPlan.invariant(device)
+    else:
+        plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs
@@ -347,6 +388,7 @@ def kda_backward(
                 dim_v, dim_k, num_seqs, heads_out, plan.num_sm, chains=2
             ),
             num_sm=plan.num_sm,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
         )
         run_chain_backward(launch, **buffers, **schedule)
@@ -379,6 +421,7 @@ def kda_backward(
             ideal_chunks=ideal,
             num_sm=plan.num_sm,
             **_GATE_FLAGS,
+            intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
         )
         run_warmup_backward(*launch, **buffers, scale=scale)

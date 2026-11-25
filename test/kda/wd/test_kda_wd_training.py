@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
+from attn_gym.linear.kda.validation import DEFAULT_INTRA_CHUNK_DTYPES
 from attn_gym.testing.kda import (
     assert_matches_low_precision_reference,
     clone_kda_inputs,
@@ -18,6 +19,10 @@ from attn_gym.testing.kda import (
     kda_reference,
     make_kda_test_inputs,
 )
+
+# The warpdrive ops' arguments after ``scale``: ``fastmath`` and the default operand precision
+# for BF16 inputs (``KernelOptions``).
+PRECISION = (True, DEFAULT_INTRA_CHUNK_DTYPES)
 
 pytest.importorskip("cutlass.cute", reason="the warpdrive backend requires CuTeDSL")
 
@@ -507,6 +512,7 @@ def test_warpdrive_local_backward_split_matches_exact_gradients() -> None:
             cumulative_sequence_offsets([tokens]),
             True,
             SCALE,
+            *PRECISION,
         )
         for index, (actual_grad, high_grad, low_grad) in enumerate(
             zip(actual, high_grads, low_grads, strict=True)
@@ -542,6 +548,7 @@ def test_warpdrive_packed_local_backward_matches_exact_gradients(
         actual_inputs[-1],
         True,
         SCALE,
+        *PRECISION,
     )
     # TODO: investigate dk (gradient 1). With 64 heads in FP16 it exceeds the shared pointwise
     # budget for ~4/200 global RNG states, by up to 1.44x; the other gradients and head counts
@@ -639,24 +646,32 @@ def test_warpdrive_document_aligned_spans_are_bitwise_equal(kda_plan_comparison)
 
 
 def test_warpdrive_kernel_options_are_strict() -> None:
+    from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
     from attn_gym.linear.kda.validation import ResolvedKernelOptions, resolve_kernel_options
 
-    fused = ResolvedKernelOptions(
-        "fused", split_backward=False, split_forward=False, autotune=True
+    default = ResolvedKernelOptions(
+        "auto",
+        split_backward=False,
+        split_forward=False,
+        batch_invariant=False,
+        autotune=True,
+        schedule=ScheduleRequest.AUTO,
+        intra_chunk_dtypes=None,
+        exact_recompute=None,
     )
-    assert resolve_kernel_options(None) == fused
-    assert resolve_kernel_options({}) == fused
+    assert resolve_kernel_options(None) == default
+    assert resolve_kernel_options({}) == default
     assert resolve_kernel_options({"backend": "warpdrive", "split_backward": True}) == (
-        ResolvedKernelOptions("warpdrive", split_backward=True, split_forward=False, autotune=True)
+        default._replace(backend="warpdrive", split_backward=True)
     )
     assert resolve_kernel_options({"backend": "warpdrive", "split_forward": True}) == (
-        ResolvedKernelOptions("warpdrive", split_backward=False, split_forward=True, autotune=True)
+        default._replace(backend="warpdrive", split_forward=True)
     )
     with pytest.raises(ValueError, match="unsupported chunk_kda kernel options"):
         resolve_kernel_options({"unknown": True})
-    with pytest.raises(ValueError, match="must be 'fused' or 'warpdrive'"):
+    with pytest.raises(ValueError, match="must be 'auto', 'fused', 'warpdrive', or 'cudnn'"):
         resolve_kernel_options({"backend": "triton"})
-    for name in ("split_backward", "split_forward"):
+    for name in ("split_backward", "split_forward", "batch_invariant"):
         with pytest.raises(TypeError, match="must be a bool"):
             resolve_kernel_options({name: 1})
         with pytest.raises(ValueError, match="requires.*warpdrive"):
@@ -1025,7 +1040,17 @@ def test_warpdrive_backward_past_sort_capacity_runs_empty_work_items() -> None:
 
     def run(cu_seqlens, initial_state, exit_cotangent):
         return chunk_warpdrive_packed_bwd_with_state_op(
-            q, k, value, gate, beta, d_output, cu_seqlens, initial_state, exit_cotangent, 1.0
+            q,
+            k,
+            value,
+            gate,
+            beta,
+            d_output,
+            cu_seqlens,
+            initial_state,
+            exit_cotangent,
+            1.0,
+            *PRECISION,
         )
 
     expected = run(
@@ -1124,7 +1149,7 @@ def test_warpdrive_packed_tail_isolated_from_next_sequence() -> None:
         value[:, :1],
         gate[:, :1],
         beta[:, :1],
-        kernel_options={"autotune": False},
+        kernel_options={"backend": "fused", "autotune": False},
     )
     actual, _ = chunk_kda(
         q,
@@ -1168,14 +1193,14 @@ def test_warpdrive_forward_op_registration(dtype: torch.dtype, outer_strided: bo
     test_utils = ("test_schema", "test_faketensor", "test_aot_dispatch_dynamic")
     torch.library.opcheck(
         chunk_warpdrive_packed_fwd_op,
-        (*inputs[:5], inputs[-1], False, SCALE),
+        (*inputs[:5], inputs[-1], False, SCALE, *PRECISION),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
     )
     d_output = torch.randn_like(inputs[2])
     local_gradients = chunk_warpdrive_packed_local_bwd_op(
-        *inputs[:5], d_output, inputs[-1], False, SCALE
+        *inputs[:5], d_output, inputs[-1], False, SCALE, *PRECISION
     )
     expected_strides = tuple(
         torch.empty_like(tensor[0]).unsqueeze(0).stride() for tensor in inputs[:5]
@@ -1183,21 +1208,22 @@ def test_warpdrive_forward_op_registration(dtype: torch.dtype, outer_strided: bo
     assert tuple(gradient.stride() for gradient in local_gradients) == expected_strides
     torch.library.opcheck(
         chunk_warpdrive_packed_local_bwd_op,
-        (*inputs[:5], d_output, inputs[-1], False, SCALE),
+        (*inputs[:5], d_output, inputs[-1], False, SCALE, *PRECISION),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
     )
     torch.library.opcheck(
         chunk_warpdrive_packed_fwd_with_initial_state_op,
-        (*inputs, SCALE),
+        (*inputs, SCALE, *PRECISION),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
     )
+    fastmath, intra_chunk_dtypes = PRECISION
     torch.library.opcheck(
         chunk_warpdrive_packed_fwd_with_state_op,
-        (*inputs, SCALE),
+        (*inputs, SCALE, fastmath, False, intra_chunk_dtypes),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
@@ -1207,10 +1233,10 @@ def test_warpdrive_forward_op_registration(dtype: torch.dtype, outer_strided: bo
     if outer_strided:
         state = _swap_state_head_value_storage(state)
     cu_seqlens = inputs[6][[0, 1, 3]]
+    # Positional, as graphs recorded before intra_chunk_dtypes existed pass it.
     torch.library.opcheck(
         chunk_warpdrive_packed_fwd_with_state_op,
-        (*inputs[:5], state, cu_seqlens, SCALE),
-        {"nonempty": True},
+        (*inputs[:5], state, cu_seqlens, SCALE, fastmath, True),
         test_utils=test_utils,
         rtol=2e-2,
         atol=2e-2,
@@ -1256,7 +1282,7 @@ def test_warpdrive_initial_state_forward_op_fullgraph() -> None:
     )
 
     inputs = _make_inputs(requires_grad=False)
-    args = (*inputs, SCALE)
+    args = (*inputs, SCALE, *PRECISION)
     expected = chunk_warpdrive_packed_fwd_with_initial_state_op(*args)
     actual = torch.compile(
         chunk_warpdrive_packed_fwd_with_initial_state_op,

@@ -20,7 +20,9 @@ HEADS = 2
 HEAD_DIM = 128  # Required by fused paged_chunk_kda.
 TOKENS = 200  # Each request's prompt length.
 SLOT_A, SLOT_B, SLOT_REFERENCE = 1, 2, 3  # Slot 0 is the null slot.
-OPTIONS = {"autotune": False}  # Fixed heuristics keep kernel selection repeatable.
+# Checkpoint writes require Triton. Pin the backend and its launch configurations on every
+# call so the bitwise comparison does not mix kernels.
+OPTIONS = {"backend": "fused", "autotune": False}
 
 
 def make_prompt(seed: int, tokens: int) -> tuple[torch.Tensor, ...]:

@@ -37,7 +37,12 @@ from attn_gym.warpdrive import (
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.named import TMEM_TEARDOWN_BARRIER_ID
 from attn_gym.warpdrive.protocol import fence_skip, teardown_skip
-from attn_gym.warpdrive.ptx_check import capture_ptx, check_tcgen05_sync, read_ptx
+from attn_gym.warpdrive.ptx_check import (
+    capture_ptx,
+    check_bulk_copies,
+    check_tcgen05_sync,
+    read_ptx,
+)
 
 # ---- the checker on hand-written PTX ----------------------------------------------------
 
@@ -95,6 +100,8 @@ def _rules(*lines: str, **kwargs) -> list[str]:
         # does not fence it.
         (("\ttcgen05.future.b32 [%r1];", ARRIVE), ["before"]),
         (("\ttcgen05.future.b32 [%r1];", COMMIT, ARRIVE), ["before"]),
+        ((WAIT, "\tret.uni;", MMA), []),  # nothing follows a return
+        ((WAIT, "\t@ %p1 " + LD.strip()), ["after"]),  # a guard apart from its predicate
     ],
     ids=[
         "fenced-handoff",
@@ -117,6 +124,8 @@ def _rules(*lines: str, **kwargs) -> list[str]:
         "guarded-ld-fenced",
         "unknown-tcgen05",
         "unknown-tcgen05-commit",
+        "uniform-return",
+        "spaced-guard",
     ],
 )
 def test_checker_rules(lines, rules):
@@ -311,7 +320,8 @@ def _ptx_findings(build, op, tmp_path):
         build.__wrapped__(op)
     (path,) = out.glob("*.ptx")
     text = read_ptx(path)
-    return text, check_tcgen05_sync(text, teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
+    sync = check_tcgen05_sync(text, teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)
+    return text, sync + check_bulk_copies(text)
 
 
 def test_toy_hands_tmem_back_and_forth(requires_blackwell):
@@ -401,6 +411,29 @@ def test_persistent_gemm_ptx_is_fenced(requires_blackwell, tmp_path, pair):
     op = PersistentGemm(cluster=CtaPair() if pair else None)
     _, found = _ptx_findings(compile_persistent_gemm, op, tmp_path)
     assert not found, "\n".join(f.describe() for f in found)
+
+
+@pytest.mark.parametrize("kernel", ["grouped", "persistent", "persistent_late"])
+def test_gemm_epilogue_completes_its_loads_before_releasing_the_accumulator(
+    requires_blackwell, tmp_path, kernel
+):
+    """The MMA role overwrites a released accumulator stage for the next tile, so the epilogue's
+    release follows ``tcgen05.wait::ld`` (ISA 9.7.18.6.4.4): its registers holding the loaded
+    values do not order the memory (9.7.18.6.4.5), and the teardown's wait comes too late."""
+    if kernel == "grouped":
+        from attn_gym.warpdrive.examples.grouped_gemm import GroupedGemm, compile_grouped_gemm
+
+        build, op = compile_grouped_gemm, GroupedGemm()
+    else:
+        from attn_gym.warpdrive.examples.persistent_gemm import (
+            PersistentGemm,
+            compile_persistent_gemm,
+        )
+
+        build, op = compile_persistent_gemm, PersistentGemm(early_release=kernel == "persistent")
+    text, found = _ptx_findings(build, op, tmp_path)
+    assert not found, "\n".join(f.describe() for f in found)
+    assert re.search(r"tcgen05\.wait::ld[^;]*;(?:[^;]*;){0,3}?[^;]*mbarrier\.arrive", text)
 
 
 @pytest.mark.parametrize("pair", [False, True], ids=["cta", "pair"])

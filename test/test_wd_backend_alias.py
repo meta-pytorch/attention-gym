@@ -1,9 +1,5 @@
-"""``kernel_options={"backend": "cudnn"}`` stays a deprecated alias of ``"warpdrive"``."""
+"""``kernel_options={"backend": "cudnn"}`` is a supported alias of ``"warpdrive"``."""
 
-import json
-import subprocess
-import sys
-import textwrap
 import warnings
 
 import pytest
@@ -12,41 +8,39 @@ import torch.nn.functional as F
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, chunk_kda
+from attn_gym.linear._delta_rule.validation import resolve_chunk_kernel_options
+from attn_gym.linear.kda.validation import resolve_kernel_options
+from attn_gym.linear.types import SPLIT_OPTION_SPEC
 
-DEPRECATED = {"backend": "cudnn"}
+ALIAS = {"backend": "cudnn"}
+RESOLVERS = {
+    "chunk_kda": lambda options: resolve_kernel_options(options)._asdict(),
+    "chunk_kda_prepare_backward": lambda options: resolve_kernel_options(
+        options, tape_backend="warpdrive"
+    )._asdict(),
+    "chunk_gdn": lambda options: resolve_chunk_kernel_options(
+        options, SPLIT_OPTION_SPEC, op_name="chunk_gdn"
+    ),
+    "chunk_gdn_prepare_backward": lambda options: resolve_chunk_kernel_options(
+        options, SPLIT_OPTION_SPEC, op_name="chunk_gdn_prepare_backward", tape_backend="warpdrive"
+    ),
+}
 
 
-def test_cudnn_backend_warns_once_per_process():
-    """Every chunk op resolves ``"cudnn"`` to ``"warpdrive"``; only the first call warns."""
-    probe = textwrap.dedent(
-        """
-        import json
-        import warnings
-
-        from attn_gym.linear._delta_rule.validation import resolve_chunk_kernel_options
-        from attn_gym.linear.kda.validation import resolve_kernel_options
-        from attn_gym.linear.types import SPLIT_OPTION_SPEC
-
-        warnings.simplefilter("always")
-        with warnings.catch_warnings(record=True) as caught:
-            backends = [
-                resolve_kernel_options({"backend": "cudnn"}).backend,
-                resolve_kernel_options({"backend": "cudnn", "split_forward": True}).backend,
-                resolve_chunk_kernel_options(
-                    {"backend": "cudnn"}, SPLIT_OPTION_SPEC, op_name="chunk_gdn"
-                )["backend"],
-            ]
-        print(json.dumps([backends, [[w.category.__name__, str(w.message)] for w in caught]]))
-        """
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", probe], check=True, capture_output=True, text=True
-    )
-    backends, caught = json.loads(result.stdout)
-    assert backends == ["warpdrive"] * 3
-    assert len(caught) == 1
-    category, message = caught[0]
-    assert category == "FutureWarning" and "'warpdrive'" in message
+@pytest.mark.parametrize(
+    "extra",
+    [{}, {"split_forward": True}, {"split_backward": True}, {"batch_invariant": True}],
+    ids=["plain", "split_forward", "split_backward", "batch_invariant"],
+)
+@pytest.mark.parametrize("op_name", RESOLVERS)
+def test_cudnn_backend_resolves_like_warpdrive_without_warning(op_name, extra):
+    """Either spelling resolves to the same options, including the warpdrive-only ones."""
+    resolve = RESOLVERS[op_name]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        resolved = resolve({**ALIAS, **extra})
+    assert resolved == resolve({"backend": "warpdrive", **extra})
+    assert resolved["backend"] == "warpdrive"
 
 
 def test_cudnn_backend_dispatches_to_warpdrive_on_cpu():
@@ -55,20 +49,20 @@ def test_cudnn_backend_dispatches_to_warpdrive_on_cpu():
     k = F.normalize(torch.randn_like(q), dim=-1)
     gate = F.logsigmoid(torch.randn(1, 4, 1))
     beta = torch.sigmoid(torch.randn(1, 4, 1))
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        with pytest.raises(ValueError, match="warpdrive GDN backend requires CUDA"):
-            chunk_gdn(q, k, q, gate, beta, kernel_options=DEPRECATED)
-        with pytest.raises(ValueError, match="warpdrive KDA backend requires CUDA"):
-            chunk_kda(q, k, q, gate[..., None].expand_as(q), beta, kernel_options=DEPRECATED)
+    with pytest.raises(ValueError, match="warpdrive GDN backend requires CUDA"):
+        chunk_gdn(q, k, q, gate, beta, kernel_options=ALIAS)
+    with pytest.raises(ValueError, match="warpdrive KDA backend requires CUDA"):
+        chunk_kda(q, k, q, gate[..., None].expand_as(q), beta, kernel_options=ALIAS)
 
 
 def test_cudnn_backend_compiles_fullgraph():
-    """Dynamo cannot trace ``warnings.warn``: the alias must resolve without warning there."""
-    from attn_gym.linear.kda.validation import resolve_kernel_options
+    """The alias resolves inside a full graph exactly as outside it."""
+
+    split = {"split_forward": True}
 
     def uses_alias(x):
-        return x + (resolve_kernel_options(DEPRECATED).backend == "warpdrive")
+        options = resolve_kernel_options({**ALIAS, **split})
+        return x + (options == resolve_kernel_options({"backend": "warpdrive", **split}))
 
     torch._dynamo.reset()
     compiled = torch.compile(uses_alias, fullgraph=True, backend="eager")
@@ -98,19 +92,9 @@ def test_cudnn_backend_matches_warpdrive_bitwise():
     )
     cu_seqlens = cumulative_sequence_offsets((33, 63))
     scalar_gate = gate[..., 0].contiguous()
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", FutureWarning)
-        for op, op_gate in ((chunk_kda, gate), (chunk_gdn, scalar_gate)):
-            expected, _ = op(
-                q,
-                k,
-                v,
-                op_gate,
-                beta,
-                cu_seqlens=cu_seqlens,
-                kernel_options={"backend": "warpdrive"},
-            )
-            actual, _ = op(
-                q, k, v, op_gate, beta, cu_seqlens=cu_seqlens, kernel_options=DEPRECATED
-            )
-            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+    for op, op_gate in ((chunk_kda, gate), (chunk_gdn, scalar_gate)):
+        expected, _ = op(
+            q, k, v, op_gate, beta, cu_seqlens=cu_seqlens, kernel_options={"backend": "warpdrive"}
+        )
+        actual, _ = op(q, k, v, op_gate, beta, cu_seqlens=cu_seqlens, kernel_options=ALIAS)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)

@@ -69,7 +69,8 @@ def test_decode_matches_hf_and_writes_only_current_cache_position(checkpoint: Pa
         assert torch.isnan(cache[:, :, pos + 1]).all()
 
 
-def test_moe_decode_matches_hf(tmp_path: Path) -> None:
+@pytest.mark.parametrize("interleave_gate_up", [False, True])
+def test_moe_decode_matches_hf(tmp_path: Path, interleave_gate_up: bool) -> None:
     """A small random Qwen3-MoE, saved by HF and read back by load_qwen3_weights (per-expert
     tensors, router, untied head, transformers 5 config names): prefill and decode logits agree
     with Qwen3MoeForCausalLM to bf16 noise."""
@@ -85,7 +86,12 @@ def test_moe_decode_matches_hf(tmp_path: Path) -> None:
     )  # fmt: skip
     model = transformers.Qwen3MoeForCausalLM(config).to(torch.bfloat16).cuda().eval()
     model.save_pretrained(tmp_path)
-    weights = load_qwen3_weights(str(tmp_path))
+    weights = load_qwen3_weights(str(tmp_path), interleave_gate_up=interleave_gate_up)
+    if interleave_gate_up:
+        packed = weights.packed_gate_up
+        assert packed.is_contiguous()
+        for lane, logical in enumerate((weights.gate, weights.up)):
+            assert packed.select(-2, lane).is_set_to(logical)
     assert weights.config.num_experts == 16 and weights.router.shape == (3, 16, 512)
     assert weights.gate.shape == (3, 16, 256, 512) and weights.down.shape == (3, 16, 512, 256)
     ctx = 40

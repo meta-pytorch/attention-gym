@@ -22,7 +22,10 @@ from attn_gym.linear.kda.api import (
     recurrent_kda,
     recurrent_kda_decode,
 )
-from attn_gym.linear.kda.constants import MAX_GATE_LOWER_BOUND_MAGNITUDE
+from attn_gym.linear.kda.constants import (
+    MAX_GATE_LOWER_BOUND_MAGNITUDE,
+    WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE,
+)
 from attn_gym.linear.kda.gate import bound_gate
 from attn_gym.linear.kda.masking import (
     active_token_mask,
@@ -58,6 +61,7 @@ __all__ = sorted(  # noqa: PLE0605 -- backend exports resolve lazily
         "KernelOptions",
         "ReplayState",
         "MAX_GATE_LOWER_BOUND_MAGNITUDE",
+        "WARPDRIVE_MAX_GATE_LOWER_BOUND_MAGNITUDE",
         "active_token_mask",
         "bound_gate",
         "chunk_kda",

@@ -1,5 +1,6 @@
 """Shared pytest fixtures."""
 
+import gc
 import importlib
 import importlib.util
 import os
@@ -120,6 +121,48 @@ def requires_blackwell() -> None:
 
 
 @pytest.fixture
+def fp32_bf16_matmul_reductions() -> Iterator[None]:
+    """Match bf16-input kernels that accumulate in fp32 before rounding their output."""
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    split_k = getattr(matmul, "allow_bf16_reduced_precision_reduction_split_k", None)
+    if split_k is not None:
+        previous = (previous, split_k)
+    matmul.allow_bf16_reduced_precision_reduction = False if split_k is None else (False, split_k)
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
+@pytest.fixture
+def requires_sm100_or_sm121() -> None:
+    if not torch.cuda.is_available() or not (
+        cuda_runs_sm100_kernels() or torch.cuda.get_device_capability() == (12, 1)
+    ):
+        pytest.skip("requires an SM100-family GPU or SM121")
+
+
+@pytest.fixture
+def release_cuda_memory() -> Iterator[None]:
+    """Return the test's device memory (runners, checkpoints) to the device before the next
+    test, which may load another checkpoint on this worker."""
+    yield
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+@pytest.fixture
+def fused_chunk_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep chunk tests that omit the backend on Triton, even when auto would select warpdrive."""
+    from attn_gym.linear import types
+
+    for spec in (types.SPLIT_OPTION_SPEC, types.KERNEL_OPTION_SPEC):
+        accepted, _ = spec["backend"]
+        monkeypatch.setitem(spec, "backend", (accepted, "fused"))
+
+
+@pytest.fixture
 def traced_compiles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep this test's compiles out of the jit_cache disk cache (``CUTE_DSL_NO_CACHE``).
 
@@ -130,6 +173,29 @@ def traced_compiles(monkeypatch: pytest.MonkeyPatch) -> None:
     the same key.
     """
     monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
+
+
+@pytest.fixture
+def record_compiles(monkeypatch: pytest.MonkeyPatch) -> Callable[..., set[tuple]]:
+    """``record(*modules)``: a set that, for the rest of the test, collects the calls each module
+    makes to its ``jit_cache`` compile functions as ``(compile_fn, *args)``, the items of the
+    chat backends' ``kernels()``. The modules then name recording wrappers: take a ``kernels()``
+    list to compare with before recording."""
+
+    def record(*modules) -> set[tuple]:
+        calls = set()
+        for module in modules:
+            for name, fn in list(vars(module).items()):
+                if callable(getattr(fn, "is_cached", None)):
+
+                    def recorded(*args, fn=fn):
+                        calls.add((fn, *args))
+                        return fn(*args)
+
+                    monkeypatch.setattr(module, name, recorded)
+        return calls
+
+    return record
 
 
 @pytest.fixture

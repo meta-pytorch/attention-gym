@@ -1,4 +1,4 @@
-"""Static check of the tcgen05 thread-sync fences and teardown drain in a kernel's PTX.
+"""Static checks of a kernel's PTX: tcgen05 thread-sync fences, the teardown drain, bulk copies.
 
 Besides the standard memory-consistency mechanisms, PTX orders an asynchronous tcgen05
 operation (``mma``, ``cp``, ``shift``, ``ld``, ``st``) of one thread against another thread's
@@ -27,8 +27,30 @@ or no ``.entry`` with a body. Kernels are found independent of line layout.
 Acquire loads (flag spins) are not waits here, and only the teardown's completion of TMEM loads
 and stores is checked, not an in-loop handoff's (the alias and fence diagnostics own those).
 ``bar.warp.sync`` (a warp's lanes converge) and ``griddepcontrol.wait`` (an earlier grid
-finished) are neither signals nor waits here. ``capture_ptx`` dumps the PTX of the CuTeDSL
-compiles inside a block.
+finished) are neither signals nor waits here.
+
+``check_bulk_copies`` checks the bulk copies whose source is the CTA's shared memory (a TMA
+store, a ``cp.async.bulk`` or ``cp.reduce.async.bulk`` out of it), which a role body issues by
+hand, and reports:
+
+- ``proxy``: such a copy reachable from the same thread's shared-memory store (a shared ``st``,
+  ``atom`` or ``red``, ``stmatrix``) without a ``fence.proxy.async`` in between. The copy reads
+  through the async proxy, which a generic store is not ordered before. The stored and the
+  copied buffers are not compared, and neither a store by another thread nor one through a
+  generic address (``st`` with no state space) is seen;
+- ``exit``: a return reachable from such a copy that completes through a bulk group, without
+  its ``cp.async.bulk.commit_group`` and a later ``cp.async.bulk.wait_group[.read] 0``: the copy
+  may still read shared memory when the thread returns, and PTX states no drain there. The
+  entry's return is the only boundary seen: a role inlined before it is not one.
+
+These rules leave out the paths that a branch or guard on the thread ID rules out (see
+``_threads``): a kernel dispatches its roles on the warp index, and a role tests one condition
+twice (a store under ``if warp == 0``, its wait under another), so a path through every branch
+crosses roles and pairs a store with a skipped wait. A condition on anything else (data,
+``elect.sync``, a predicate register written twice) is taken both ways. A kernel without a
+one-dimensional ``.reqntid`` is checked on every path.
+
+``capture_ptx`` dumps the PTX of the CuTeDSL compiles inside a block.
 """
 
 from __future__ import annotations
@@ -37,9 +59,10 @@ import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
-RULES = ("after", "before", "drain")
+RULES = ("after", "before", "drain", "proxy", "exit")
 
 _SYNCHRONOUS = tuple(
     f"tcgen05.{name}"
@@ -94,6 +117,10 @@ class Finding:
             "tcgen05.fence::after_thread_sync",
             "before": "signal after a tcgen05 operation without tcgen05.fence::before_thread_sync",
             "drain": "TMEM teardown rendezvous with an uncompleted tcgen05.ld/st",
+            "proxy": "bulk copy reads shared memory after this thread's store without "
+            "fence.proxy.async",
+            "exit": "return while a bulk copy may still read shared memory (no commit_group "
+            "and wait_group 0)",
         }[self.rule]
         here = f" ({self.source})" if self.source else ""
         there = f" ({self.origin_source})" if self.origin_source else ""
@@ -108,7 +135,8 @@ class _Instr:
     line: int
     text: str  # the instruction without its guard predicate
     opcode: str
-    guarded: bool
+    operands: tuple[str, ...]
+    guard: tuple[str, bool] | None  # the predicate and the value it runs the instruction on
     scopes: tuple[int, ...]  # enclosing brace scopes, innermost last
     source: str = ""  # file:line of the latest .loc directive
 
@@ -160,8 +188,9 @@ _BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
 _BRACES = re.compile(r"[{};]")
 
 
-def _kernels(ptx: str) -> Iterator[tuple[str, int, list[str]]]:
-    """(name, first line number, body lines) of each ``.entry``/``.func`` with a body.
+def _kernels(ptx: str) -> Iterator[tuple[str, int, list[str], str]]:
+    """(name, first line number, body lines, directives between the header and the body) of
+    each ``.entry``/``.func`` with a body.
 
     Module-level statements end at ``;`` or a body's closing brace, wherever lines break: a
     header may span lines and a body may share its braces' lines. A function header that does
@@ -177,7 +206,8 @@ def _kernels(ptx: str) -> Iterator[tuple[str, int, list[str]]]:
             depth += {"{": 1, "}": -1}.get(char, 0)
             if depth == 0 and head:  # a body closes; after an initializer the statement goes on
                 has_entry = has_entry or head.group(1) == "entry"
-                yield head.group(2), _line(text, opened), text[opened + 1 : at].split("\n")
+                body = text[opened + 1 : at].split("\n")
+                yield head.group(2), _line(text, opened), body, text[head.end() : opened]
                 start = at + 1
         elif char == ";":
             start = at + 1
@@ -206,7 +236,37 @@ def _line(text: str, index: int) -> int:
     return text.count("\n", 0, index) + 1
 
 
+_GUARD = re.compile(r"@\s*(!?)\s*(\S+)\s+(.*)")
+_RETURNS = ("ret", "ret.uni", "exit")
+_INTEGER = re.compile(r"(-?)(0[xX][0-9a-fA-F]+|0[bB][01]+|0[0-7]*|[1-9]\d*)U?$")
+
+
+def _integer(text: str) -> int | None:
+    """The value of a PTX integer literal (decimal, hexadecimal, octal or binary), else None."""
+    literal = _INTEGER.match(text)
+    if not literal:
+        return None
+    digits = literal.group(2)
+    prefixed = {"0x": 16, "0b": 2}.get(digits[:2].lower())
+    value = int(digits[2:], prefixed) if prefixed else int(digits, 8 if digits[0] == "0" else 10)
+    return -value if literal.group(1) else value
+
+
+def _operands(text: str) -> tuple[str, ...]:
+    """An instruction's operands, split at the commas outside vectors and addresses."""
+    out, depth, current = [], 0, ""
+    for ch in text.partition(" ")[2]:
+        depth += (ch in "{[(") - (ch in "}])")
+        if ch == "," and depth == 0:
+            out.append(current.strip())
+            current = ""
+        else:
+            current += ch
+    return (*out, current.strip()) if current.strip() else tuple(out)
+
+
 def _parse(body: list[str], first: int, files: dict[str, str]):
+    """The instructions and labels of a kernel body. Raises for a call or an indirect branch."""
     instrs, labels, source = [], {}, ""
     for number, kind, text, scopes in _statements(body, first):
         if kind == "label":
@@ -219,37 +279,44 @@ def _parse(body: list[str], first: int, files: dict[str, str]):
             continue
         if text.startswith("."):  # a declaration (.reg, .shared, .pragma, ...)
             continue
-        guarded = text.startswith("@")
-        if guarded:
-            text = text.split(None, 1)[1] if " " in text or "\t" in text else ""
+        guard = None
+        if text.startswith("@"):
+            negated, predicate, text = _GUARD.match(text + " ").groups()
+            guard, text = (predicate, not negated), text.strip()
         opcode = text.split(None, 1)[0] if text else ""
-        instrs.append(_Instr(number, text, opcode, guarded, scopes, source))
+        instrs.append(_Instr(number, text, opcode, _operands(text), guard, scopes, source))
+    last = instrs[-1] if instrs else None
+    falls = last and (last.guard or last.opcode not in (*_RETURNS, "trap", "bra", "bra.uni"))
+    if falls or len(instrs) in labels.values():
+        # Control that runs off the end of the body, or branches to a label there, returns.
+        line, source = (last.line, last.source) if last else (first, "")
+        instrs.append(_Instr(line, "ret", "ret", (), None, (0,), source))
+    for i in range(len(instrs)):
+        _next(instrs, labels, i, None)
     return instrs, labels
 
 
-def _successors(instrs, labels) -> list[list[int]]:
-    succ = []
-    for i, ins in enumerate(instrs):
-        nxt = [i + 1] if i + 1 < len(instrs) else []
-        op = ins.opcode
-        if op in ("bra", "bra.uni"):
-            target = ins.text.split(None, 1)[1].strip()
-            index = next(
-                (labels[(s, target)] for s in reversed(ins.scopes) if (s, target) in labels),
-                None,
-            )
-            if index is None:
-                raise ValueError(f"PTX line {ins.line}: branch to unknown label {target!r}")
-            succ.append([index, *nxt] if ins.guarded else [index])
-        elif op.startswith("call") and _callee(ins) not in _NORETURN:
-            raise ValueError(f"PTX line {ins.line}: calls are not supported (no call summaries)")
-        elif op in ("ret", "exit", "trap") or op.startswith("call"):
-            succ.append(nxt if ins.guarded else [])
-        elif op.startswith("brx"):
-            raise ValueError(f"PTX line {ins.line}: indirect branches are not supported")
-        else:
-            succ.append(nxt)
-    return succ
+def _next(instrs, labels, i: int, runs: bool | None) -> list[int]:
+    """The instructions that can follow instruction ``i``, which runs, is skipped by its guard
+    (``runs=False``) or either (``None``)."""
+    ins, op = instrs[i], instrs[i].opcode
+    nxt = [i + 1] if i + 1 < len(instrs) else []
+    if op in ("bra", "bra.uni"):
+        target = ins.text.split(None, 1)[1].strip()
+        index = next(
+            (labels[(s, target)] for s in reversed(ins.scopes) if (s, target) in labels),
+            None,
+        )
+        if index is None:
+            raise ValueError(f"PTX line {ins.line}: branch to unknown label {target!r}")
+        return nxt if runs is False else [index] if runs else [index, *nxt]
+    if op.startswith("call") and _callee(ins) not in _NORETURN:
+        raise ValueError(f"PTX line {ins.line}: calls are not supported (no call summaries)")
+    if op.startswith("brx"):
+        raise ValueError(f"PTX line {ins.line}: indirect branches are not supported")
+    if op in (*_RETURNS, "trap") or op.startswith("call"):
+        return [] if runs else nxt
+    return nxt
 
 
 def _callee(ins: _Instr) -> str:
@@ -258,10 +325,9 @@ def _callee(ins: _Instr) -> str:
     return next((name for name in (o.strip() for o in operands.split(",")) if name), "")
 
 
-def _barrier_id(text: str) -> int | None:
-    operands = text.split(None, 1)[1] if " " in text or "\t" in text else ""
-    first = operands.split(",", 1)[0].strip()
-    return int(first) if first.isdigit() else None
+def _first_int(ins: _Instr) -> int | None:
+    """An instruction's first operand when it is a literal (a barrier ID, a group count)."""
+    return _integer(ins.operands[0]) if ins.operands else None
 
 
 # Flags of the dataflow state, each with the index of the instruction that set it (or None). _PENDING_MMA holds
@@ -269,7 +335,7 @@ def _barrier_id(text: str) -> int | None:
 _SYNCED, _PENDING_LDST, _PENDING_MMA, _LOADED, _STORED = range(5)
 
 
-def _transfer(ins: _Instr, index: int, state: tuple, teardown_barrier) -> tuple[tuple, list]:
+def _transfer(ins: _Instr, index: int, state: tuple, *, teardown_barrier) -> tuple[tuple, list]:
     """The state after ``ins`` (instruction ``index``), and the (rule, origin index) of each rule
     ``ins`` breaks."""
     state, broken = list(state), []
@@ -289,7 +355,7 @@ def _transfer(ins: _Instr, index: int, state: tuple, teardown_barrier) -> tuple[
     if signals and pending:
         broken.append(("before", min(pending)))
     outstanding = [i for i in (state[_LOADED], state[_STORED]) if i is not None]
-    teardown = teardown_barrier is not None and _barrier_id(ins.text) == teardown_barrier
+    teardown = teardown_barrier is not None and _first_int(ins) == teardown_barrier
     if is_sync and teardown and outstanding:
         broken.append(("drain", min(outstanding)))
     if op == "tcgen05.fence::after_thread_sync":
@@ -321,32 +387,31 @@ def _join(a: tuple | None, b: tuple) -> tuple:
     )
 
 
-def _check_kernel(
-    name: str, body: list[str], first: int, teardown_barrier, files: dict[str, str]
-) -> list[Finding]:
-    """A forward may-analysis to a fixed point: each flag holds the earliest instruction that
-    set it on some path reaching the instruction."""
-    instrs, labels = _parse(body, first, files)
-    if not instrs:
-        return []
-    succ = _successors(instrs, labels)
+def _may_analysis(instrs, labels, decided: dict[int, bool], transfer, flags: int) -> dict:
+    """A forward may-analysis to a fixed point: each of ``flags`` flags holds the earliest
+    instruction that set it on some path reaching the instruction. ``decided``: whether each
+    guarded instruction runs, where that is known. Returns the earliest origin of each
+    (instruction, rule) that ``transfer`` reports broken."""
     states: list[tuple | None] = [None] * len(instrs)
-    states[0] = (None,) * 5
+    states[0] = (None,) * flags
     work, found = [0], {}
     while work:
         i = work.pop()
-        out, broken = _transfer(instrs[i], i, states[i], teardown_barrier)
-        if instrs[i].guarded:  # its predicate may be false: the state also passes unchanged
+        runs = decided.get(i) if instrs[i].guard else True
+        out, broken = (states[i], []) if runs is False else transfer(instrs[i], i, states[i])
+        if runs is None:  # its predicate may be false: the state also passes unchanged
             out = _join(out, states[i])
-        for rule, origin in broken:  # keep the earliest origin of each (instruction, rule)
+        for rule, origin in broken:
             found[i, rule] = min(origin, found.get((i, rule), origin))
-        for j in succ[i]:
-            if j == len(instrs):  # a label after the last instruction
-                continue
+        for j in _next(instrs, labels, i, runs):
             joined = _join(states[j], out)
             if joined != states[j]:
                 states[j] = joined
                 work.append(j)
+    return found
+
+
+def _findings(name: str, instrs, found: dict) -> list[Finding]:
     findings = []
     for (i, rule), origin in sorted(found.items()):
         ins, src = instrs[i], instrs[origin]
@@ -356,17 +421,230 @@ def _check_kernel(
     return findings
 
 
+def _files(ptx: str) -> dict[str, str]:
+    return dict(re.findall(r'^\s*\.file\s+(\d+)\s+"([^"]+)"', ptx, flags=re.MULTILINE))
+
+
 def check_tcgen05_sync(ptx: str, *, teardown_barrier: int | None = None) -> list[Finding]:
-    """Findings of every kernel in the PTX module ``ptx`` (see the module docstring).
-    ``teardown_barrier``: the named-barrier ID of the TMEM teardown rendezvous, to check that
-    every path reaching it completed its TMEM loads and stores. A module without an ``.entry``
-    body, or one whose functions do not parse, raises ``ValueError``."""
-    files = dict(re.findall(r'^\s*\.file\s+(\d+)\s+"([^"]+)"', ptx, flags=re.MULTILINE))
-    return [
-        finding
-        for name, first, body in _kernels(ptx)
-        for finding in _check_kernel(name, body, first, teardown_barrier, files)
-    ]
+    """Thread-sync and drain findings of every kernel in the PTX module ``ptx`` (see the module
+    docstring). ``teardown_barrier``: the named-barrier ID of the TMEM teardown rendezvous, to
+    check that every path reaching it completed its TMEM loads and stores. A module without an
+    ``.entry`` body, or one whose functions do not parse, raises ``ValueError``."""
+    files, findings = _files(ptx), []
+    transfer = partial(_transfer, teardown_barrier=teardown_barrier)
+    for name, first, body, _ in _kernels(ptx):
+        instrs, labels = _parse(body, first, files)
+        if instrs:
+            findings += _findings(name, instrs, _may_analysis(instrs, labels, {}, transfer, 5))
+    return findings
+
+
+# ---- the paths of one thread -----------------------------------------------------------
+#
+# A register whose value follows from the thread ID alone (the warp index, a lane test, a
+# role's warp range) is a constant of each thread, so a branch or guard on it is decided.
+
+_LANES = range(32)
+_BLOCK = re.compile(r"\.reqntid\s+([^\n]*)")
+_TYPE = re.compile(r"\.(?:([bus])(8|16|32|64)|pred)$")
+_REGISTER = re.compile(r"(?<![\w$.%])[%A-Za-z_$][\w$.]*")
+_COMPARE = {
+    "eq": lambda a, b: a == b,
+    "ne": lambda a, b: a != b,
+    "lt": lambda a, b: a < b,
+    "le": lambda a, b: a <= b,
+    "gt": lambda a, b: a > b,
+    "ge": lambda a, b: a >= b,
+    "lo": lambda a, b: a < b,
+    "ls": lambda a, b: a <= b,
+    "hi": lambda a, b: a > b,
+    "hs": lambda a, b: a >= b,
+}
+_BINARY = {
+    "add": lambda a, b: a + b,
+    "sub": lambda a, b: a - b,
+    "mul.lo": lambda a, b: a * b,
+    "and": lambda a, b: a & b,
+    "or": lambda a, b: a | b,
+    "xor": lambda a, b: a ^ b,
+    "min": min,
+    "max": max,
+}
+
+
+def _results(ins: _Instr) -> list[str]:
+    """The registers ``ins`` may write: those of its operands before the first address, or of its
+    first operand (a vector's elements, the ``d|p`` pair of a sync op). A component (``%v.x``)
+    stands for its vector register. For an instruction that writes none, this only leaves a
+    register it reads unknown."""
+    address = next((n for n, o in enumerate(ins.operands) if o.startswith("[")), 1)
+    names = (r for o in ins.operands[:address] for r in _REGISTER.findall(o))
+    return [r.partition(".")[0] for r in names]
+
+
+def _evaluate(ins: _Instr, values: dict, special: dict) -> tuple[int, ...] | None:
+    """The value in each lane that ``ins`` writes, when it follows from the thread ID: integer
+    moves, arithmetic, comparisons and selects of such values, and a shuffle of one lane's."""
+    typed = _TYPE.search(ins.opcode)
+
+    def operand(o: str) -> tuple[int, ...] | None:
+        literal = _integer(o)  # a vector component (a dotted name) is never a known value
+        known = None if "." in o else values.get(o)
+        return special.get(o) or (known if literal is None else (literal,) * 32)
+
+    args = [operand(o) for o in ins.operands[1:]]
+    if not typed or not args or any(a is None for a in args):
+        return None
+    bits = int(typed.group(2) or 1)
+    mask, signed = (1 << bits) - 1, typed.group(1) == "s"
+
+    def number(v: int) -> int:
+        v &= mask
+        return v - (1 << bits) if signed and v >> (bits - 1) else v
+
+    def lanes(fn) -> tuple[int, ...]:
+        return tuple(int(fn(*(number(a[lane]) for a in args))) & mask for lane in _LANES)
+
+    name = ins.opcode[: typed.start()]
+    match name.split(".", 1)[0], len(args):
+        case "mov", 1:
+            return lanes(lambda a: a)
+        case "not", 1:
+            return lanes(lambda a: ~a)
+        case "shl" | "shr", 2:  # the count is unsigned 32-bit whatever the type, and clamped
+            counts = [min(bits, b & 0xFFFFFFFF) for b in args[1]]
+            shift = int.__lshift__ if name == "shl" else int.__rshift__  # arithmetic if signed
+            return tuple(shift(number(a), b) & mask for a, b in zip(args[0], counts, strict=True))
+        case "setp", 2 if name[5:] in _COMPARE:
+            return lanes(_COMPARE[name[5:]])
+        case "selp", 3:
+            return tuple((a if p else b) & mask for a, b, p in zip(*args, strict=True))
+        case "shfl", 4 if name == "shfl.sync.idx":
+            source, index, clamp, members = args
+            if len(set(index)) == 1 and 0 <= index[0] < 32 and set(clamp) == {31}:
+                if set(members) <= {-1, 0xFFFFFFFF}:  # every lane reads lane ``index``
+                    return (source[index[0]],) * 32
+        case _, 2 if name in _BINARY:
+            return lanes(_BINARY[name])
+    return None
+
+
+def _lane_values(instrs, labels, warp: int) -> dict[str, tuple[int, ...] | None]:
+    """The 32 lane values of each register that ``warp`` writes, None where they do not follow
+    from the thread ID. A register holds one value if every instruction that the warp can run
+    and that writes it gives that value, so the walk repeats until the values, and with them
+    the instructions the warp can run, stop changing."""
+    special = {"%tid.x": tuple(warp * 32 + lane for lane in _LANES), "%laneid": tuple(_LANES)}
+    values: dict[str, tuple[int, ...] | None] = {}
+
+    def runs(ins: _Instr) -> bool | None:
+        if ins.guard is None:
+            return True
+        lanes = values.get(ins.guard[0])
+        decisions = {bool(v) == ins.guard[1] for v in lanes} if lanes else {True, False}
+        return decisions.pop() if len(decisions) == 1 else None
+
+    while True:
+        before = dict(values)
+        seen, work = set(), [0]
+        while work:
+            i = work.pop()
+            if i in seen:
+                continue
+            seen.add(i)
+            ins, ran = instrs[i], runs(instrs[i])
+            if ran is not False:
+                results = _results(ins)
+                # A second result (the complement in setp's p|q, shfl's in-range predicate) and
+                # a vector's elements hold other values than the one modelled.
+                single = results == list(ins.operands[:1])
+                value = _evaluate(ins, values, special) if single else None
+                for register in results:
+                    same = register not in values or values[register] == value
+                    values[register] = value if same else None
+            work += _next(instrs, labels, i, ran)
+        if values == before:
+            return values
+
+
+def _threads(instrs, labels, directives: str) -> Iterator[dict[int, bool]]:
+    """Which guarded instructions run, for each thread of the kernel that differs in it: the
+    ``decided`` of ``_may_analysis``. ``%tid.x`` gives the warp and lane only in the
+    one-dimensional block of a ``.reqntid`` (``.maxntid`` bounds the thread count, not each
+    dimension); any other kernel, and a last partial warp, get one thread with nothing decided."""
+    block = _BLOCK.search(directives)
+    dims = [_integer(d.strip()) for d in block.group(1).split(",")] if block else []
+    if not dims or None in dims or any(d != 1 for d in dims[1:]):
+        yield {}
+        return
+    warps, rest = divmod(dims[0], 32)
+    if rest:
+        yield {}
+    seen = set()
+    for warp in range(warps):
+        values = _lane_values(instrs, labels, warp)
+        guards = [
+            (i, values[ins.guard[0]], ins.guard[1])
+            for i, ins in enumerate(instrs)
+            if ins.guard and values.get(ins.guard[0])
+        ]
+        for lane in _LANES:
+            decided = tuple((i, bool(v[lane]) == runs_on) for i, v, runs_on in guards)
+            if decided not in seen:
+                seen.add(decided)
+                yield dict(decided)
+
+
+# ---- bulk copies out of shared memory --------------------------------------------------
+
+# The CTA's shared memory is the second, source, state space of the copy.
+_READS_SHARED = re.compile(
+    r"cp(?:\.reduce)?\.async\.bulk\..*(?:global|shared::cluster)\.shared::cta"
+)
+_SHARED_STORE = re.compile(
+    r"stmatrix\.|(?:st|atom|red)\.(?:(?!async\.)[\w:]+\.)*?shared(?:::\w+)?(?:\.|$)"
+)
+# The earliest shared store since a proxy fence, bulk read since a commit, and committed bulk
+# read since a wait for every group.
+_WRITTEN, _ISSUED, _GROUPED = range(3)
+
+
+def _bulk_transfer(ins: _Instr, index: int, state: tuple) -> tuple[tuple, list]:
+    state, broken = list(state), []
+    op = ins.opcode
+    if _READS_SHARED.match(op):
+        if state[_WRITTEN] is not None:
+            broken.append(("proxy", state[_WRITTEN]))
+        if "bulk_group" in op and state[_ISSUED] is None:  # else it completes on an mbarrier
+            state[_ISSUED] = index
+    elif op == "cp.async.bulk.commit_group":
+        reading = [i for i in (state[_ISSUED], state[_GROUPED]) if i is not None]
+        state[_ISSUED], state[_GROUPED] = None, min(reading, default=None)
+    elif op.startswith("cp.async.bulk.wait_group") and _first_int(ins) == 0:
+        state[_GROUPED] = None
+    elif op == "fence.proxy.async" or op.startswith("fence.proxy.async.shared::"):
+        state[_WRITTEN] = None
+    elif _SHARED_STORE.match(op):
+        state[_WRITTEN] = index if state[_WRITTEN] is None else state[_WRITTEN]
+    elif op in _RETURNS:
+        reading = [i for i in (state[_ISSUED], state[_GROUPED]) if i is not None]
+        if reading:
+            broken.append(("exit", min(reading)))
+    return tuple(state), broken
+
+
+def check_bulk_copies(ptx: str) -> list[Finding]:
+    """``proxy`` and ``exit`` findings of every kernel in the PTX module ``ptx`` (see the module
+    docstring), on the paths each of its threads can take. Raises like ``check_tcgen05_sync``."""
+    files, findings = _files(ptx), []
+    for name, first, body, directives in _kernels(ptx):
+        instrs, labels = _parse(body, first, files)
+        found: dict = {}
+        for decided in _threads(instrs, labels, directives) if instrs else ():
+            for key, origin in _may_analysis(instrs, labels, decided, _bulk_transfer, 3).items():
+                found[key] = min(origin, found.get(key, origin))
+        findings += _findings(name, instrs, found)
+    return findings
 
 
 @contextmanager

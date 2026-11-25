@@ -2,20 +2,22 @@
 
 from __future__ import annotations
 
-import functools
+import importlib.util
 import sys
-import warnings
 from collections.abc import Iterable, Mapping
 from numbers import Real
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
+from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._cu_seqlens import validate_cu_seqlens
 from attn_gym.linear._delta_rule.paged_state import PagedState, validate_has_initial_state
 from attn_gym.types import KernelOptionSpec, validate_kernel_options
 
 SUPPORTED_ACTIVATION_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+# Probed without importing, so selecting a backend never loads the optional CuTeDSL kernels.
+_CUTEDSL_INSTALLED = importlib.util.find_spec("cutlass") is not None
 
 
 def validate_delta_rule_inputs(
@@ -73,11 +75,16 @@ def validate_delta_rule_inputs(
         raise ValueError("all inputs must be on the same device")
 
 
+def tracks_grad(tensors: Iterable[torch.Tensor | None]) -> bool:
+    """Whether autograd would record an operation on any given tensor."""
+    return torch.is_grad_enabled() and any(
+        tensor is not None and tensor.requires_grad for tensor in tensors
+    )
+
+
 def require_inference_only(tensors: Iterable[torch.Tensor | None], message: str) -> None:
     """Raise ``RuntimeError(message)`` if autograd would track any given tensor."""
-    if torch.is_grad_enabled() and any(
-        tensor is not None and tensor.requires_grad for tensor in tensors
-    ):
+    if tracks_grad(tensors):
         raise RuntimeError(message)
 
 
@@ -95,17 +102,6 @@ def validate_packed_offsets_tensor(cu_seqlens: torch.Tensor, device) -> None:
         raise TypeError("cu_seqlens must be a contiguous int32 vector on q.device")
 
 
-@functools.cache
-def warn_cudnn_backend_renamed() -> None:
-    """Warn once per process that ``backend="cudnn"`` is the deprecated name of ``"warpdrive"``."""
-    warnings.warn(
-        "kernel_options['backend']='cudnn' is deprecated and runs the same kernels as "
-        "'warpdrive'; pass 'backend': 'warpdrive'",
-        FutureWarning,
-        stacklevel=4,
-    )
-
-
 def resolve_chunk_kernel_options(
     kernel_options: Mapping[str, object] | None,
     spec: KernelOptionSpec,
@@ -115,31 +111,48 @@ def resolve_chunk_kernel_options(
 ) -> dict[str, Any]:
     """Resolve chunk options using ``SPLIT_OPTION_SPEC`` or an extension of it.
 
-    Split schedules and the staged handles' ``batch_invariant`` require
-    ``backend="warpdrive"``. The backend's former name, ``"cudnn"``, still
-    selects it and warns once per process, outside ``torch.compile`` tracing (Dynamo cannot trace
-    ``warnings.warn`` in a full graph).
+    ``"cudnn"``, the backend's former name, resolves to ``"warpdrive"`` here, so every later
+    check sees one spelling. Split schedules and ``batch_invariant`` require an explicit
+    ``backend="warpdrive"`` and exclude each other: the split work tables follow the stream's
+    shape.
 
-    A staged backward passes its saved tape's backend as ``tape_backend``: the tape fixes the
-    backend, so an omitted ``"backend"`` resolves to it, an explicit one must name it, and the
-    backend-dependent options are checked against it.
+    A staged backward inherits its saved forward's backend when the caller omits the backend
+    or requests ``"auto"``. An explicit backend must match the saved one.
     """
-    if kernel_options is not None and kernel_options.get("backend") == "cudnn":
-        if not torch.compiler.is_compiling():
-            warn_cudnn_backend_renamed()
-        kernel_options = {**kernel_options, "backend": "warpdrive"}
-    if tape_backend is not None:
-        kernel_options = {"backend": tape_backend, **(kernel_options or {})}
     options = validate_kernel_options(kernel_options, spec, op_name=op_name)
-    if tape_backend is not None and options["backend"] != tape_backend:
-        raise ValueError(
-            f"kernel_options['backend']={options['backend']!r} does not match the saved "
-            f"{tape_backend!r} tape"
-        )
+    if options["backend"] == "cudnn":
+        options["backend"] = "warpdrive"
+    if tape_backend is not None:
+        if options["backend"] not in ("auto", tape_backend):
+            raise ValueError(
+                f"kernel_options['backend']={options['backend']!r} does not match the saved "
+                f"{tape_backend!r} tape"
+            )
+        options["backend"] = tape_backend
     for name in ("split_backward", "split_forward", "batch_invariant"):
         if options.get(name) and options["backend"] != "warpdrive":
             raise ValueError(f"{name} requires kernel_options['backend']='warpdrive'")
+    if options["batch_invariant"] and (options["split_backward"] or options["split_forward"]):
+        raise ValueError("batch_invariant excludes the split schedules")
     return options
+
+
+# NOTE [Default chunk backend]
+# With CuTeDSL installed, auto selects warpdrive on SM100 and SM103, and on SM107 with
+# CuTeDSL 4.8+. Other supported GPUs use Triton. Callers set fused_only for paged checkpoint
+# writes. Selection reads only the device and whether the call writes checkpoints, never sizes
+# or the Q/K/V dtype, though warpdrive's plan still follows the packed shape. Explicit backend
+# requests are never rerouted. See "Chunk backend selection" in docs/linear.md.
+def resolve_chunk_backend(
+    backend: str, q: torch.Tensor, *, fused_only: bool = False
+) -> Literal["fused", "warpdrive"]:
+    """Leave explicit requests unchanged; resolve ``"auto"`` as in NOTE [Default chunk backend]."""
+    if backend != "auto":
+        return backend
+    warpdrive = (
+        not fused_only and _CUTEDSL_INSTALLED and q.is_cuda and cuda_runs_sm100_kernels(q.device)
+    )
+    return "warpdrive" if warpdrive else "fused"
 
 
 def resolve_scale(scale: float | None, key_dim: int) -> float:
@@ -261,6 +274,7 @@ def validate_paged_state(
 __all__ = [
     "SUPPORTED_ACTIVATION_DTYPES",
     "require_inference_only",
+    "resolve_chunk_backend",
     "resolve_chunk_kernel_options",
     "resolve_decode_out",
     "resolve_scale",
