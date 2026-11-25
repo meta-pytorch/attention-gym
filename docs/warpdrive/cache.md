@@ -271,6 +271,21 @@ that takes one configuration. The arguments must be picklable, and configuration
 be defined at module scope so workers can import them. Warpdrive kernels are pickled as their
 constructor call.
 
+To compile kernels of several compile functions in one batch (a model's visit, head and draft
+kernels), use `precompile_calls(calls)`, each item `(compile_fn, *args)`. Its
+`progress(done, total)` callback reports the calls that were not on disk as they land there,
+and is never called when every call is cached; `compile_fn.is_cached(*args)` tells the same
+without compiling.
+
+Every batch with a cold call, even a single one, compiles in the compiler process for the
+batch's target. That process leads its own process group, which its workers join. A timeout,
+an interruption such as Ctrl-C, or an exception from `progress` kills the group, which releases
+the workers' entry locks; the process also kills the group when its caller dies. A batch whose
+calls failed only to lock or write their entries, for example because the cache directory is
+not writable, raises `CacheStorageError` (the base of `CacheLockError`). The caller can then
+compile those calls through the ordinary lookup, which works without the disk cache. Compiler
+failures raise `RuntimeError` with the compiler process's output.
+
 ## CuTeDSL versions
 
 Warpdrive supports `nvidia-cutlass-dsl` 4.6.2 through 4.8. Use the compatibility helpers in

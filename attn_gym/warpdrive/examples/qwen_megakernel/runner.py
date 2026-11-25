@@ -63,6 +63,7 @@ records every CTA's work items and ``trace_region``s with the table row as paylo
 """
 
 import dataclasses
+import functools
 import math
 
 import torch
@@ -172,7 +173,9 @@ def kernel_class(engine: str, stream_inputs: bool = False) -> type[QwenDecodeMeg
 
 
 class QwenMegakernel:
-    """Packed weights, scratch and the compiled kernel for one cache capacity ``max_len``."""
+    """Packed weights, scratch and the kernel for one cache capacity ``max_len``, compiled at
+    the first launch (``fn``), for the compile target current then. A compile cannot run
+    inside CUDA-graph capture: launch once, or read ``fn``, before capturing."""
 
     def __init__(
         self,
@@ -258,7 +261,16 @@ class QwenMegakernel:
         # Placeholder; trace_session swaps in the real globaltimer buffer for a traced launch.
         self.trace_buffer = torch.zeros(1, device=device, dtype=torch.int64)
         self.trace_buffers: list[torch.Tensor] | None = None  # per launch, inside trace_session
-        self.fn = compile_megakernel(self.op)
+
+    @functools.cached_property
+    def fn(self):
+        """The compiled kernel (``compile_megakernel``), built on first use."""
+        return compile_megakernel(self.op)
+
+    def kernels(self) -> list[tuple]:
+        """The compile calls ``(compile_fn, kernel)`` of ``launch``
+        (``attn_gym.warpdrive.cache.precompile_calls``' items)."""
+        return [(compile_megakernel, self.op)]
 
     def tagged(self, name: str) -> torch.Tensor:
         """The int64 words of a tagged buffer, shaped as ``ScratchLayout.shapes``."""

@@ -20,7 +20,7 @@ from test_warpdrive_inkling_megakernel_visit import (
     restore,
 )
 
-from attn_gym.warpdrive.examples.inkling_megakernel import quant, ref
+from attn_gym.warpdrive.examples.inkling_megakernel import megakernel, quant, ref
 from attn_gym.warpdrive.examples.inkling_megakernel.head_kernel import compile_head_kernel
 from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import (
     InklingDecoder,
@@ -91,14 +91,15 @@ def prompt_ids(path) -> list[int]:
 
 @pytest.mark.xdist_group("inkling-checkpoint")
 @torch.no_grad()
-def test_checkpoint_greedy_decode():
+def test_checkpoint_greedy_decode(record_compiles):
     """``STEPS`` greedy steps after a chat prompt's prefill on Inkling 2 Mini with its experts as
     stored (NVFP4 layers 0-19, MXFP8 20-23), the decoder fed the oracle's token (``ref`` on their
     bf16 dequantization, the declared numerics) into its own cache: it picks the oracle's
     token every step, unless the oracle's best two logits nearly tie (``TIE``) and it picks the
-    other, with close logits (``STEP_ATOL``); positions compile nothing after the first step; one
-    step captured in a CUDA graph replays bit-identically to the same step's eager launches,
-    logits and caches. Skips unless the checkpoint is cached; never downloads."""
+    other, with close logits (``STEP_ATOL``); the steps launch the kernels ``decoder.kernels()``
+    lists (what the chat compiles before its first turn), and positions compile nothing after the
+    first step; one step captured in a CUDA graph replays bit-identically to the same step's
+    eager launches, logits and caches. Skips unless the checkpoint is cached; never downloads."""
     path = checkpoint_path(WEIGHTS + TOKENIZER)
     weights = quant.load_quantized_inkling_weights(path)
     assert [experts_format(w) for w in weights.layers] == [NVFP4] * 20 + [MXFP8] * 4
@@ -110,6 +111,8 @@ def test_checkpoint_greedy_decode():
     decoder = InklingDecoder(weights)
     pos = torch.tensor([ids.numel()], device="cuda", dtype=torch.int32)
     counts = None
+    kernels = set(decoder.kernels())
+    launched = record_compiles(megakernel)
     for step in range(STEPS):
         expected = ref.forward_tokens(dense, token, ids.numel() + step, theirs)
         logits = decoder(token, pos, mine)
@@ -123,6 +126,7 @@ def test_checkpoint_greedy_decode():
         token = first.reshape(1)
         pos += 1
     assert [f.cache_info().currsize for f in COMPILES] == counts
+    assert launched == kernels
 
     initial = clone(mine)
     graph, logits = capture(lambda: decoder(token, pos, mine))

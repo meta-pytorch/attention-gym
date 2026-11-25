@@ -62,6 +62,7 @@ def trace_session(runner, *, trace_path=None, device=None):
     # One profile unit per (launch, CTA): each launch records into its slice of the session
     # buffer.
     ctas, launches = runner.max_ctas, runner.op.launches
+    _ = runner.fn  # compile now: the session reads range names from the compile
     with kernel_session(runner.op, ctas * launches, device=device) as session:
         runner.trace_buffers = list(session.prof.tensor.view(launches, -1))
         try:

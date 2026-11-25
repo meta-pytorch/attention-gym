@@ -138,12 +138,15 @@ class StubChatModel:
         return {"role": "assistant", "ids": list(ids)}
 
 
-def assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop):
+def assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop, after_reply=None):
     """The chat's reply over ``backend`` is ``host_loop(prompt, max_new)``'s tokens (for the same
     target cache length) cut as ``reply_of``, and the drafter is accepted (a broken feature,
-    commit or accept wiring drafts ~nothing)."""
+    commit or accept wiring drafts ~nothing). ``after_reply()`` runs between the reply and the
+    host loop."""
     chat = Chat(StubChatModel(backend, ids, stops, max_len))
     chat.reply("", None, 0.0, lambda *_: None)
+    if after_reply is not None:
+        after_reply()
     max_new = max_len - len(ids) - (backend.tokens_per_step - 1)
     expected = host_loop(torch.tensor(ids, device="cuda"), max_new)
     room = max_len - len(ids) - SYNC_EVERY - 1
@@ -191,13 +194,14 @@ def test_checkpoint_spec_chat_decodes_the_host_loop(checkpoint):
 @pytest.mark.xdist_group("inkling-checkpoint")
 @pytest.mark.usefixtures("requires_blackwell")
 @torch.no_grad()
-def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint):
+def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint, record_compiles):
     """The chat's ``megakernel-spec`` backend (k = 4, CUDA graphs of two steps per replay)
     replies with ``speculative_generate``'s tokens for the same prefill (``prefill_blocks``),
     verify block (``InklingDecoder.decode_block``) and draft launches, run eagerly, cut as
-    ``reply_of``; its block rows are causal (the prefill's padding moves no earlier row) and
-    the drafter is accepted."""
+    ``reply_of``; its block rows are causal (the prefill's padding moves no earlier row), the
+    drafter is accepted, and the launches are the backend's ``kernels()``."""
     pytest.importorskip("cutlass")
+    from attn_gym.warpdrive.examples.inkling_megakernel import draft, megakernel
     from attn_gym.warpdrive.examples.inkling_megakernel.draft import MegakernelDrafter
     from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import InklingDecoder
 
@@ -231,4 +235,10 @@ def test_checkpoint_megakernel_spec_chat_decodes_the_host_loop(checkpoint):
             target, drafter, prompt, max_new, stops, verify=verify, prefill=prefill
         )
 
-    assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop)
+    kernels = set(backend.kernels())
+    launched = record_compiles(megakernel, draft)
+
+    def launched_kernels():  # before the host loop's own launches
+        assert launched == kernels
+
+    assert_chat_runs_the_loop(backend, ids, stops, max_len, host_loop, launched_kernels)

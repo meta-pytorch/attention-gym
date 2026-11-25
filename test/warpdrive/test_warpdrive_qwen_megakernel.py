@@ -404,9 +404,9 @@ def test_cache_capacity_reuses_the_kernel():
         intermediate_size=2048, vocab_size=4096,
     )  # fmt: skip
     weights = random_weights(config)
-    mk.QwenMegakernel(weights, MAX_LEN)
+    mk.compile_megakernel(mk.QwenMegakernel(weights, MAX_LEN).op)
     compiled = mk.compile_megakernel.cache_info().currsize
-    mk.QwenMegakernel(weights, 6 * MAX_LEN)
+    mk.compile_megakernel(mk.QwenMegakernel(weights, 6 * MAX_LEN).op)
     assert mk.compile_megakernel.cache_info().currsize == compiled
 
 
@@ -422,9 +422,10 @@ def test_yarn_rope_random_weights():
     )  # fmt: skip
     weights = random_weights(config)
     plain = dataclasses.replace(weights, config=dataclasses.replace(config, rope_scaling=None))
-    mk.QwenMegakernel(plain, MAX_LEN)
+    mk.compile_megakernel(mk.QwenMegakernel(plain, MAX_LEN).op)
     compiled = mk.compile_megakernel.cache_info().currsize
     runner = mk.QwenMegakernel(weights, MAX_LEN)
+    mk.compile_megakernel(runner.op)
     assert mk.compile_megakernel.cache_info().currsize == compiled  # the plain config's kernel
     caches, token, pos = make_decode_state(weights, 200, MAX_LEN, seed=5)
     ours, theirs, exact = ([c.clone() for c in caches] for _ in range(3))

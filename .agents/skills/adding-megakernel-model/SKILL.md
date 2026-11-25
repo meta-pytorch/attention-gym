@@ -57,9 +57,11 @@ Climb in order; each rung is tested against the previous ones before the next st
 5. **Chat family.** `<model>/chat.py` provides `DEFAULT_BACKEND`, `OPTIONS`, `check_options`,
    `checkpoint_dir` and `load_chat_model`; register its `model_type` in `megakernel/chat.py`'s
    `FAMILIES`. A new flag also goes into `ChatOptions` (default None: family-specific), into
-   `main()`'s options and its `ChatOptions(...)` call, and into the family's `OPTIONS`. Gate: a
-   real prompt answers coherently through `python -m
-   attn_gym.warpdrive.examples.megakernel.chat --model <repo>`.
+   `main()`'s options and its `ChatOptions(...)` call, and into the family's `OPTIONS`. Each
+   backend's `kernels()` lists the `(compile_fn, kernel)` calls its steps and prefill launch,
+   which the chat compiles in parallel before the first prompt; test the list against the calls
+   a step makes (the `record_compiles` fixture). Gate: a real prompt answers coherently through
+   `python -m attn_gym.warpdrive.examples.megakernel.chat --model <repo>`.
 6. **Bench.** `<model>/bench.py` on `examples/bench_support.py` (`capture`, `time_graphs`,
    `provenance`): CUDA-graph replay of the torch step and the megakernel at fixed contexts.
    Record the bandwidth floor next to the measurement.

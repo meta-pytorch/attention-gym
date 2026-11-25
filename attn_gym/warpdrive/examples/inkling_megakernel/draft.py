@@ -157,6 +157,15 @@ class DSparkMegakernel:
         # commit's default ``last`` for each row count, made before any capture.
         self.last_rows = torch.arange(TOKENS, device=device).view(TOKENS, 1)
 
+    def kernels(self) -> list[tuple]:
+        """The compile calls ``(compile_fn, kernel)`` of ``commit``, ``block_states`` and ``markov``
+        (``attn_gym.warpdrive.cache.precompile_calls``' items)."""
+        return [
+            (compile_draft_ctx_kernel, self.ctx.op),
+            (compile_draft_backbone_kernel, self.backbone.op),
+            (compile_draft_head_kernel, self.head.op),
+        ]
+
     def commit(
         self, features: torch.Tensor, positions: torch.Tensor, last: torch.Tensor | None = None
     ) -> None:

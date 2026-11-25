@@ -1,11 +1,12 @@
 """The shared chat driver with a fake model: stop tokens, incremental prefill, the cache
 rebuild after a new CUDA graph's warm-up overwrote cached positions, streaming, multi-token
 steps, the rejected temperatures, options of another model family, and the CLI's family
-selection on a local checkpoint."""
+selection on a local checkpoint or its error for a model it cannot read."""
 
 import importlib
 import importlib.util
 import json
+import re
 from dataclasses import fields
 from types import SimpleNamespace
 
@@ -15,13 +16,18 @@ import torch.nn.functional as F
 import typer
 from typer.testing import CliRunner
 
+from attn_gym.warpdrive.cache import CacheStorageError
+from attn_gym.warpdrive.examples.megakernel import chat as chat_module
 from attn_gym.warpdrive.examples.megakernel.chat import (
     FAMILIES,
     SYNC_EVERY,
+    CacheFull,
     Chat,
     ChatOptions,
     app,
     check_options,
+    compile_kernels,
+    prepare,
 )
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
@@ -41,6 +47,9 @@ class CountingBackend:
 
     def __init__(self, stop_at: int):
         self.stop_at = torch.tensor(stop_at, device="cuda")
+
+    def kernels(self):
+        return []
 
     def step(self, token, pos):
         nxt = torch.where(pos >= self.stop_at, STOP, (pos.long() + 1) % STOP)
@@ -170,6 +179,121 @@ def test_multi_token_steps_commit_variable_counts():
     assert chat.messages == history, "a rejected turn must leave the history unchanged"
 
 
+class StubCompile:
+    """A ``jit_cache`` compile function of kernel names: the kernels on disk (``cached``) and
+    those this process compiled (``compiled_here``), which a disk cache keeps."""
+
+    def __init__(self, cached: set[str], disk: bool = True):
+        self.cached, self.disk, self.compiled_here = set(cached), disk, []
+
+    def __call__(self, kernel: str):
+        self.compiled_here.append(kernel)
+        if self.disk:
+            self.cached.add(kernel)
+
+    def is_cached(self, kernel: str) -> bool:
+        return kernel in self.cached
+
+    def disk_cache_enabled(self) -> bool:
+        return self.disk
+
+
+def batch_compiler(monkeypatch, compile_fn: StubCompile, error: Exception | None = None):
+    """The kernels the chat hands ``precompile_calls``, which stores them, or with ``error``
+    stores the first and raises it."""
+    batched = []
+
+    def precompile_calls(calls, workers, progress):
+        kernels = [kernel for _, kernel in calls]
+        batched.extend(kernels)
+        compile_fn.cached |= set(kernels[:1] if error else kernels)
+        if error:
+            raise error
+
+    monkeypatch.setattr(chat_module, "precompile_calls", precompile_calls)
+    return batched
+
+
+@pytest.mark.parametrize(
+    ("cached", "disk", "batched", "here"),
+    [
+        ({"c"}, True, ["a", "b"], []),  # several cold kernels compile in parallel
+        ({"b", "c"}, True, [], ["a"]),  # one compiles here: no compiler process to start
+        ({"c"}, False, [], ["a", "b", "c"]),  # without the disk cache all compile here
+    ],
+)
+def test_compile_kernels_compiles_what_the_disk_cache_lacks(
+    monkeypatch, cached, disk, batched, here
+):
+    compile_fn = StubCompile(cached, disk)
+    sent = batch_compiler(monkeypatch, compile_fn)
+    compile_kernels([(compile_fn, kernel) for kernel in "abc"])
+    assert (sent, compile_fn.compiled_here) == (batched, here)
+
+
+def test_compile_kernels_compiles_here_what_a_failed_disk_cache_left(monkeypatch):
+    """A batch that could not use the disk cache leaves its other kernels to this process."""
+    compile_fn = StubCompile(set())
+    batch_compiler(monkeypatch, compile_fn, CacheStorageError("unwritable"))
+    compile_kernels([(compile_fn, "a"), (compile_fn, "b")])
+    assert compile_fn.compiled_here == ["b"]
+
+
+def test_compile_kernels_raises_a_compile_failure(monkeypatch):
+    compile_fn = StubCompile(set())
+    batch_compiler(monkeypatch, compile_fn, RuntimeError("bad kernel"))
+    with pytest.raises(RuntimeError, match="bad kernel"):
+        compile_kernels([(compile_fn, "a"), (compile_fn, "b")])
+    assert compile_fn.compiled_here == []
+
+
+@needs_cuda
+def test_prepare_compiles_cold_kernels_then_captures(capsys):
+    """Before the first turn, ``prepare`` compiles only the backend's kernels missing from the
+    disk cache, saying nothing when every one is cached, then captures the decode: the first
+    reply prefills from position 0 and captures nothing more."""
+    compile_fn = StubCompile({"cached"})
+    model = FakeModel(stop_at=12)
+    model.backend.kernels = lambda: [(compile_fn, "cached"), (compile_fn, "cold")]
+    chat = Chat(model)
+    prepare(chat, 0.0)
+    assert compile_fn.compiled_here == ["cold"]
+    assert "compiled 1 kernel " in capsys.readouterr().out
+    assert list(chat.graphs) == [0.0]
+
+    prepare(Chat(model), 0.0)
+    assert compile_fn.compiled_here == ["cold"] and capsys.readouterr().out == ""
+    graph = chat.graphs[0.0]
+    chat.reply("hi", None, 0.0, lambda *_: None)
+    assert model.prefills == [(0, 3)] and chat.graphs == {0.0: graph}
+
+
+class RecordingBackend(CountingBackend):
+    """``CountingBackend`` marking the positions its steps write."""
+
+    def __init__(self, stop_at: int):
+        super().__init__(stop_at)
+        self.written = torch.zeros(1024, device="cuda", dtype=torch.bool)
+
+    def step(self, token, pos):
+        self.written[pos.long()] = True
+        return super().step(token, pos)
+
+
+@needs_cuda
+def test_chat_caches_must_hold_the_warm_up_run():
+    """The warm-up run writes positions 1 .. SYNC_EVERY: a chat whose caches end before that is
+    rejected before any step; one whose caches hold just that writes nothing past them."""
+    model = FakeModel(stop_at=100)
+    model.backend = backend = RecordingBackend(100)
+    model.max_len = SYNC_EVERY
+    with pytest.raises(CacheFull):
+        Chat(model)
+    model.max_len = SYNC_EVERY + 1
+    prepare(Chat(model), 0.0)
+    assert backend.written.nonzero().flatten().tolist() == list(range(1, SYNC_EVERY + 1))
+
+
 @needs_cuda
 def test_reply_rejects_nonfinite_temperature():
     model = FakeModel(stop_at=12)
@@ -249,3 +373,56 @@ def test_cli_rejects_an_unknown_qwen_backend_before_loading(tmp_path):
     (tmp_path / "config.json").write_text(json.dumps({"model_type": "qwen3"}))
     result = CliRunner().invoke(app, ["--model", str(tmp_path), "--backend", "nope"])
     assert result.exit_code == 2 and "Qwen backends" in result.output
+
+
+def cli_error(args: list[str]) -> str:
+    """The CLI's usage error for ``args``, its panel's borders and line wraps removed."""
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 2, result.output
+    return " ".join(re.sub("[│╭╮╰╯─]", " ", result.output).split())
+
+
+def assert_names_supported_models(message: str):
+    assert "Invalid value for --model" in message
+    for repo in ("Qwen/Qwen3-0.6B", "Qwen/Qwen3-30B-A3B", "thinkingmachines/Inkling-2-Mini"):
+        assert repo in message
+    assert "local checkpoint directory" in message
+
+
+@pytest.mark.parametrize("error", ["RemoteEntryNotFoundError", "LocalEntryNotFoundError"])
+def test_cli_rejects_a_model_the_hub_cannot_serve(monkeypatch, error):
+    """A Hub failure fetching config.json is a usage error naming the supported models, not a
+    traceback: a missing repo or file (``--model help``) says so, any other failure (offline)
+    keeps the Hub's message."""
+    huggingface_hub = pytest.importorskip("huggingface_hub")
+    exception = getattr(importlib.import_module("huggingface_hub.errors"), error)
+
+    def hf_hub_download(repo_id, filename):
+        message = f"{repo_id}/{filename}"
+        if issubclass(exception, huggingface_hub.errors.HfHubHTTPError):
+            httpx = pytest.importorskip("httpx2")
+            request = httpx.Request("GET", f"https://huggingface.co/{message}")
+            raise exception(message, response=httpx.Response(404, request=request))
+        raise exception(message)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", hf_hub_download)
+    message = cli_error(["--model", "help"])
+    if error == "RemoteEntryNotFoundError":
+        expected = (
+            f"'help' is neither a checkpoint directory nor a Hub repo with a config.json ({error})"
+        )
+    else:
+        expected = "could not fetch 'help''s config.json: help/config.json"
+    assert expected in message
+    assert_names_supported_models(message)
+
+
+@pytest.mark.parametrize(
+    "config", [None, "{not json", "[]", "null", '{"model_type": []}', '{"model_type": "llama"}']
+)
+def test_cli_rejects_a_checkpoint_directory_it_cannot_read(tmp_path, config):
+    """A directory without a config.json, with an unreadable one, one that is not an object with
+    a model_type string, or of an unsupported model type."""
+    if config is not None:
+        (tmp_path / "config.json").write_text(config)
+    assert_names_supported_models(cli_error(["--model", str(tmp_path)]))

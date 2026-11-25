@@ -4,10 +4,11 @@ Importing this package does not import cutlass, so torch-only code can use it.
 """
 
 from ._key import canonical_key, function_cache_key, module_source_digest
-from .compile import compile_many, precompile_many
+from .compile import compile_many, precompile_calls, precompile_many
 from .jit import (
     CacheInfo,
     CacheLockError,
+    CacheStorageError,
     cache_enabled,
     get_cache_path,
     jit_cache,
@@ -28,6 +29,7 @@ from .tvm_ffi import (
 __all__ = [
     "CacheInfo",
     "CacheLockError",
+    "CacheStorageError",
     "CompileTarget",
     "cache_enabled",
     "canonical_key",
@@ -41,6 +43,7 @@ __all__ = [
     "make_fake_compact_tensor",
     "make_fake_strided_tensor",
     "module_source_digest",
+    "precompile_calls",
     "precompile_many",
     "set_cache_path",
     "set_compile_target",
