@@ -130,27 +130,27 @@ def check_block_visit(
     return errors, out_errors
 
 
-# (tokens, layer, blocks, positions): a sliding NVFP4 layer at the chat's default block of 4
+# (tokens, layer, blocks, positions, checked): a sliding NVFP4 layer at the chat's default block of 4
 # tokens from position 0 (convolutions and keys only inside the block), across a 64-key block
 # edge and past the sliding window; a full MXFP8 block-boundary layer at 8 tokens (two 16-row MMA
 # tiles of query rows, o_proj split in quarters) reading 4 blocks, also past
 # ``log_scaling_floor`` (each token's own log scale).
 CASES = [
-    (4, 1, 1, (0, 60, 1100)),
-    (4, 23, 4, (130, 8990)),
-    (8, 23, 4, (130, 8990)),
+    (4, 1, 1, (0, 60, 1100), True),
+    (4, 23, 4, (130, 8990), True),
+    (8, 23, 4, (130, 8990), False),
 ]
 
 
-@pytest.mark.parametrize("tokens,layer,blocks,positions", CASES)
+@pytest.mark.parametrize("tokens,layer,blocks,positions,checked", CASES)
 @torch.no_grad()
-def test_block_visit_random_weights(tokens, layer, blocks, positions):
+def test_block_visit_random_weights(tokens, layer, blocks, positions, checked):
     if tokens == 8 and torch.cuda.get_device_capability() == (12, 1):
         pytest.skip("8 tokens' input rows exceed GB10 shared memory on full layers")
     w = random_layer(CONFIG, layer, seed=layer)
     quantized, dense = with_quantized_experts(w, activation_format(layer), seed=10)
     # Check both packed weight formats at four tokens; keep the eight-token production build.
-    runner = InklingVisitMegakernel(CONFIG, (quantized,), tokens=tokens, checked=tokens == 4)
+    runner = InklingVisitMegakernel(CONFIG, (quantized,), tokens=tokens, checked=checked)
     cache = random_cache(CONFIG, visits=2, max_len=9024, seed=layer)
     for case, pos in enumerate(positions):
         h, states = block_inputs(CONFIG, tokens, blocks, seed=100 * layer + case)

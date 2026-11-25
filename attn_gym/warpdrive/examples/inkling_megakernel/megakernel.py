@@ -446,7 +446,8 @@ class InklingVisitMegakernel:
     for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (``traced``) or
     ``"iket"``; ``trace_events``: per-role capacity (see ``Launch``; raise it for long contexts).
     ``tokens``: consecutive tokens of one sequence per launch (``multi_kernel`` when more than
-    one); ``args``: another runner's kernel-form layer arguments to share (same layers)."""
+    one); ``args``: another runner's kernel-form layer arguments to share (same layers).
+    ``checked=True`` builds the visit kernels with bounds checks."""
 
     def __init__(
         self,
