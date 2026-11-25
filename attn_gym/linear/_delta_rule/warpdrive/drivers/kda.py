@@ -72,10 +72,13 @@ def kda_forward(
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     nonempty: bool = False,
+    batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
     ``fastmath=False`` selects the non-flushing gate exponentials. ``intra_chunk_dtypes`` is
     the public operand-precision option (NOTE [KDA operand precision] in ``kda_common``).
+    ``batch_invariant`` pins the plan (``ForwardPlan``) so a sequence's bits do not depend on
+    the rest of the pack.
 
     With ``state_indices`` the call is paged: ``initial_state`` is a ``[P,H,V,K]`` pool updated in
     place through the routes (non-positive routes are null; the optional uint8
@@ -96,7 +99,10 @@ def kda_forward(
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    if batch_invariant:
+        plan = ForwardPlan.invariant(num_seqs, heads_out, dim_v, device)
+    else:
+        plan = ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0, tiles_per_head=1)
     if paged and plan.chain:
@@ -167,8 +173,11 @@ def kda_forward(
         )
         return o, final_state
 
-    prep = plan.tiles_per_head > 1 and num_seqs * heads_out <= int(
-        PREP_TILE_FRACTION * plan.num_sm
+    # The shared prep rounds differently from per-tile prep, and the pack selects it.
+    prep = (
+        plan.tiles_per_head > 1
+        and not batch_invariant
+        and num_seqs * heads_out <= int(PREP_TILE_FRACTION * plan.num_sm)
     )
     n_tiles = num_seqs * heads_out * plan.tiles_per_head
     ideal, rows, item_scratch, chunk_scratch = split_scratch(
@@ -280,12 +289,13 @@ def kda_backward(
     split: bool = False,
     fastmath: bool = True,
     intra_chunk_dtypes: str,
+    batch_invariant: bool = False,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
 ]:
     """Recompute checkpoint series and differentiate KDA, with optional state/cotangent.
     ``intra_chunk_dtypes`` is the forward's option, reused by recompute, summaries and
-    gradient kernels.
+    gradient kernels. ``batch_invariant`` pins the plan as in ``kda_forward``.
 
     Native bprop returns natural-log dgate directly; neither the safe-gate sigmoid
     derivative nor the composed BT64 cumulative-gate reverse scan is needed here. The bprop
@@ -301,7 +311,10 @@ def kda_backward(
     dim_v = v.shape[-1]
     num_seqs = cu_seqlens.shape[0] - 1
     device = q.device
-    plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
+    if batch_invariant:
+        plan = BackwardPlan.invariant(device)
+    else:
+        plan = BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device)
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs

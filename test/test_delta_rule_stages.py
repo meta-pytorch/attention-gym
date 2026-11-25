@@ -694,13 +694,19 @@ def test_prepare_backward_rejects_split_schedules(op):
 @requires_kda_target
 @pytest.mark.parametrize("op", TAPE_OPS)
 def test_prepare_backward_takes_the_backend_from_the_tape(op):
-    """A staged backward inherits its forward's backend and rejects an explicit mismatch."""
+    """The backward inherits its tape's backend and rejects a conflicting backend or plan."""
     q, k, v, gate, beta = op.make_inputs(128, seed=8)
     prepared = op.prepare(q, k, v, gate, beta)
     backward = partial(op.prepare_backward, prepared.saved, None, None, scale=prepared.scale)
     assert type(backward(kernel_options={"backend": "auto"})) is type(backward())
     if op.warpdrive:
-        assert backward(kernel_options={"batch_invariant": True}).batch_invariant
+        invariant = {"backend": "warpdrive", "batch_invariant": True}
+        pinned = op.prepare(q, k, v, gate, beta, kernel_options=invariant)
+        assert op.prepare_backward(
+            pinned.saved, None, None, scale=pinned.scale, kernel_options={"batch_invariant": True}
+        ).batch_invariant
+        with pytest.raises(ValueError, match="does not match the saved"):
+            backward(kernel_options={"batch_invariant": True})
         mismatch = {"backend": "fused"}
     else:
         mismatch = {"backend": "warpdrive", "batch_invariant": True}

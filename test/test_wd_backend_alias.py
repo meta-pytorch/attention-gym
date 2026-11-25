@@ -10,20 +10,19 @@ from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym.linear import chunk_gdn, chunk_kda
 from attn_gym.linear._delta_rule.validation import resolve_chunk_kernel_options
 from attn_gym.linear.kda.validation import resolve_kernel_options
-from attn_gym.linear.types import GDN_STAGE_OPTION_SPEC, SPLIT_OPTION_SPEC
+from attn_gym.linear.types import SPLIT_OPTION_SPEC
 
 ALIAS = {"backend": "cudnn"}
 RESOLVERS = {
     "chunk_kda": lambda options: resolve_kernel_options(options)._asdict(),
-    "chunk_kda_prepare": lambda options: resolve_kernel_options(options, staged=True)._asdict(),
     "chunk_kda_prepare_backward": lambda options: resolve_kernel_options(
-        options, staged=True, tape_backend="warpdrive"
+        options, tape_backend="warpdrive"
     )._asdict(),
     "chunk_gdn": lambda options: resolve_chunk_kernel_options(
         options, SPLIT_OPTION_SPEC, op_name="chunk_gdn"
     ),
-    "chunk_gdn_prepare": lambda options: resolve_chunk_kernel_options(
-        options, GDN_STAGE_OPTION_SPEC, op_name="chunk_gdn_prepare"
+    "chunk_gdn_prepare_backward": lambda options: resolve_chunk_kernel_options(
+        options, SPLIT_OPTION_SPEC, op_name="chunk_gdn_prepare_backward", tape_backend="warpdrive"
     ),
 }
 
@@ -36,8 +35,6 @@ RESOLVERS = {
 @pytest.mark.parametrize("op_name", RESOLVERS)
 def test_cudnn_backend_resolves_like_warpdrive_without_warning(op_name, extra):
     """Either spelling resolves to the same options, including the warpdrive-only ones."""
-    if "batch_invariant" in extra and "prepare" not in op_name:
-        pytest.skip("only the staged handles take batch_invariant")
     resolve = RESOLVERS[op_name]
     with warnings.catch_warnings():
         warnings.simplefilter("error")
