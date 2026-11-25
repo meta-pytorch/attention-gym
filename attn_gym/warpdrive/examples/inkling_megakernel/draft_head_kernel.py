@@ -162,7 +162,11 @@ class DraftHeadKernel(DraftKernel):
     @property
     def scratch_shapes(self) -> dict[str, int]:
         return {
-            **({"base_words": self.row_tiles * ROWS * self.drafts // 4} if self.global_base else {}),
+            **(
+                {"base_words": self.row_tiles * ROWS * self.drafts // 4}
+                if self.global_base
+                else {}
+            ),
             "ctxr": 2 * TOKENS * 3 * self.rank,
             "raw": self.drafts * 3 * self.rank,
             "best": self.drafts * MAX_CTAS * 2,
