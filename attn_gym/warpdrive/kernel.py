@@ -70,7 +70,6 @@ from attn_gym.warpdrive.protocol import (
     RoleTrace,
     compiling,
     current_trace,
-    drop_stale_opt_outs,
     take_opt_outs,
     tracing_role,
     user_site,
@@ -1423,16 +1422,17 @@ class WarpSpecialized(metaclass=_KernelType):
         self._reset_trace()
         # Trace state outside this kernel: process-wide recorders and flags on its declarations.
         # Collection may run inside another kernel's trace, so _reset_trace leaves these alone.
-        drop_stale_opt_outs()
         # The kernel's role code has its own checked setting inside any compile_tvm_ffi, whose
         # exit restores the setting if this trace fails.
         if compiling():
             self._ws_checking_outside = set_checking(self.checked)
-        elif self.checked:
-            raise ProtocolError(
-                f"{type(self).__name__}: a checked=True kernel compiles through compile_tvm_ffi "
-                "(a @jit_cache compile function), which scopes its checks"
-            )
+        else:
+            take_opt_outs()  # a direct compile may follow an earlier failed trace
+            if self.checked:
+                raise ProtocolError(
+                    f"{type(self).__name__}: a checked=True kernel compiles through "
+                    "compile_tvm_ffi (a @jit_cache compile function), which scopes its checks"
+                )
         for nb in self._ws_named_bars.values():  # count only this trace's native ID reads
             nb._native_outside_roles = False
         clear_multicast_masks()

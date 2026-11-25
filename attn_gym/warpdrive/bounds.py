@@ -1,31 +1,10 @@
-"""Checked builds: ``Kernel(checked=True)`` compiles a kernel whose tensor indices are checked.
+"""Bounds checks for warpdrive's opt-in checked builds.
 
-A CuTe layout maps any coordinate to an offset, inside its shape or not, so a wrong index
-addresses other memory without an error. While a kernel with ``checked`` is traced, each
-``tensor[...]`` read or write is checked: every integer coordinate against the extent of its
-mode (the integer modes of a slice too), a single index against the tensor's size. A launch
-that runs an index outside aborts with a device assert naming the source line. An index known
-at trace time needs no comparison, but still aborts only the launch that runs it: a kernel
-traces branches that a given model or shape never takes.
-
-``cute.domain_offset`` by a negative constant coordinate is treated the same: the view starts
-before its tensor. A launch function (``__call__``) always runs and cannot assert, so there a
-mistake known at trace time fails the compile, and an index that is not known, or whose
-extent is not, cannot be checked and fails it too.
-
-The setting belongs to the compile: ``compile_tvm_ffi`` (every ``@jit_cache`` compile function)
-traces the kernel it is given, launch function included, with that kernel's setting, and the
-role code of any other kernel traced inside with that kernel's own. Outside it a checked
-kernel does not compile.
-
-Not checked: a ``None`` mode, a nested coordinate, a coordinate of another rank than the
-tensor, an index into loaded values (``t.load()[i]``, a ``TensorSSA``), an offset that is not a constant, pointer arithmetic, and ``domain_offset`` reached
-through a name imported from ``cutlass.cute`` before the first checked compile. A kernel that
-indexes outside on purpose (a tile past a ragged edge, which TMA clips) wraps that index in
-``unchecked("bounds", reason=...)``.
-
-The checks are installed in CuTeDSL only while a checked kernel is traced, so every other
-kernel is traced by the unmodified library.
+CuTe maps even out-of-range coordinates to offsets. During a checked trace, intercept
+CuTe tensor indexing and constant negative view offsets. Report errors where the access
+executes: raise in host launch code, emit a device assertion in kernel code (even a
+statically invalid access can be in an untaken branch). See docs/warpdrive/dropping-down.md
+for the checked-build contract and exclusions.
 """
 
 from __future__ import annotations
@@ -101,13 +80,7 @@ def _constant(value) -> int | None:
 def _extent(shape):
     """The number of coordinates of a mode (or of a whole shape): an int when every extent is
     known, else their product in 64 bits, which a 32-bit product can overflow."""
-    leaves, pending = [], [shape]
-    while pending:
-        item = pending.pop()
-        if isinstance(item, tuple):
-            pending += item
-        else:
-            leaves.append(item)
+    leaves = cute.flatten_to_tuple(shape)
     known = [_constant(leaf) for leaf in leaves]
     if None not in known:
         return reduce(mul, known, 1)

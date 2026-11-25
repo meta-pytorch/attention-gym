@@ -330,11 +330,11 @@ tracing fails the compile, and so does an index that is not known, or whose exte
 index in the kernel instead.
 
 Not checked: a `None` mode, a nested coordinate, a coordinate of another rank than the tensor,
-an index into loaded values (`t.load()[i]`),
-an offset that is not a constant, pointer arithmetic, a hand-computed TMEM column, and
-`domain_offset` called through a name imported from `cutlass.cute` before the first checked
-compile. An index that is outside on purpose (an MMA tile past a ragged edge, which TMA clips;
-a ragged view's shifted base) goes inside `with unchecked("bounds", reason=...):`.
+an index into loaded values (`t.load()[i]`), a nonconstant offset, pointer arithmetic, or a
+hand-computed TMEM column. Call `cute.domain_offset` by its qualified name: a saved reference
+retains whichever implementation was installed when it was bound, checked or unchecked.
+Wrap a deliberate out-of-bounds access (a tile TMA clips or a ragged view's shifted base)
+in `with unchecked("bounds", reason=...):`.
 
 The setting belongs to the compile. `compile_tvm_ffi` (every `@jit_cache` compile function)
 traces the kernel it is given, launch function included, with that kernel's setting, and the
