@@ -48,6 +48,9 @@ from attn_gym.warpdrive.examples.qwen_megakernel.ref import QwenConfig
 
 TC_MIN_N = 16  # MMA N >= 16 at M = 128; batch one uses column 0 (the others: shifted x)
 TC_ROWS, TC_TILE_K = 128, 64  # a stage: one 128 x 64 SW128 K-major MMA operand (16 KB)
+# Long MMA chains can lose contributions that affect bf16 rounding. Combine 1024-column
+# partials in fp32 on the CUDA cores; shorter dots still have a single MMA accumulator.
+ACC_PART_TILES = 1024 // TC_TILE_K
 COMPUTE_TMEM_DRAINED = (
     "the compute warps issue no tcgen05.st and complete each acc load at its release"
 )
@@ -76,7 +79,7 @@ class TcGen05Gemv:
     s (hardware warp index % 4) loads rows 32s .. 32s + 31, lane l holding row 32s + l.
 
     Channels ``(w, xin, acc)``: ``xin`` hands each GEMV row's input to the mma warp, ``acc`` each
-    tile's accumulator back. The compute warps release the weight stages without reading them."""
+    K partial back. The compute warps release the weight stages without reading them."""
 
     def __init__(self, n: int):
         self.n = n  # MMA N: column t of D is token t
@@ -91,25 +94,29 @@ class TcGen05Gemv:
     def tile(self, p: MegakernelParams, chans, env, xbuf, k_tiles, warp, lane):
         w, acc = chans[0], chans[2]
         (t_acc,) = env
-        for _ in cutlass.range(k_tiles, unroll=1):
-            with w.consume(skip_fence="both", reason=COMPUTE_TMEM_FENCED):
-                pass
         vals = cute.make_rmem_tensor((self.n,), Float32)
         vals.fill(0.0)
         # A warp reaches TMEM lanes 32 * (its hardware warp % 4) ..: role-local warps 0-3 are
         # four consecutive warps, so they cover the four subpartitions wherever the role sits.
         row = 32 * (cute.arch.warp_idx() % 4) + lane
-        with acc.consume() as h:
-            if warp < 4:
-                t2r = tcgen05.make_tmem_copy(
-                    cute.make_copy_atom(tcgen05.Ld32x32bOp(tcgen05.Repetition(self.n)), Float32),
-                    p.acc_fake,
-                ).get_slice(row)
-                src = t2r.partition_S(t_acc[None, None, None, h.index])
-                loaded = cute.make_rmem_tensor(t2r.partition_D(p.acc_fake).shape, Float32)
-                cute.copy(t2r, src, loaded)
-                for c in cutlass.range_constexpr(self.n):
-                    vals[c] = loaded[c]
+        for first in cutlass.range(0, k_tiles, ACC_PART_TILES, unroll=1):
+            end = cutlass.min(first + ACC_PART_TILES, k_tiles)
+            for _ in cutlass.range(first, end, unroll=1):
+                with w.consume(skip_fence="both", reason=COMPUTE_TMEM_FENCED):
+                    pass
+            with acc.consume() as h:
+                if warp < 4:
+                    t2r = tcgen05.make_tmem_copy(
+                        cute.make_copy_atom(
+                            tcgen05.Ld32x32bOp(tcgen05.Repetition(self.n)), Float32
+                        ),
+                        p.acc_fake,
+                    ).get_slice(row)
+                    src = t2r.partition_S(t_acc[None, None, None, h.index])
+                    loaded = cute.make_rmem_tensor(t2r.partition_D(p.acc_fake).shape, Float32)
+                    cute.copy(t2r, src, loaded)
+                    for c in cutlass.range_constexpr(self.n):
+                        vals[c] = vals[c] + loaded[c]
         return vals, row, (w, chans[1], acc, *chans[3:])
 
     def owns_row(self, warp, lane):
@@ -235,13 +242,12 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
 
     @cute.jit
     def mma_loop(self, p: MegakernelParams, w, xin, acc, xa, work: WorkCursor, tmem: Tmem):
-        """Per GEMV row: wait for its input, then per tile accumulate its weight stages into a
-        TMEM stage; attention rows' KV stages are released untouched. B is the K tile of the SMEM
-        input ``xs[xbuf]``, or with streamed inputs the activation chunk ``xload`` copied into ``xa``."""
+        """Per GEMV row: wait for its input and publish each tile's K partials in order. B is
+        the SMEM input ``xs[xbuf]``, or the activation chunk ``xload`` copied into ``xa``. Attention
+        rows' KV stages are released untouched."""
         tiled_mma = p.tiled_mma
         t_acc = cute.make_tensor(tmem.ptr("acc"), p.acc_layout)
         tmem.skip_teardown_drain(reason="the MMA warp issues no tcgen05.ld or tcgen05.st")
-        w_base = self.buffer("W").iterator
         s_rows = self.x_rows
         # B row n, column k at element (k // 8) * S * 8 + 8n + k % 8 (``x_index``). With one stored
         # row (S = 1) the core matrices overlap and row n is the input shifted by 8n elements.
@@ -266,31 +272,33 @@ class QwenDecodeMegakernelTc(QwenDecodeMegakernel):
                 k_tiles, row_tiles = self.gemv_tiles(op, b)
                 with xin.consume():
                     for _t in cutlass.range(row_tiles, unroll=1):
-                        with acc.produce() as d:
-                            dst = t_acc[None, None, None, d.index]
-                            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for kt in cutlass.range(k_tiles, unroll=1):
-                                # Streamed inputs: the xa wait fences the MMAs.
-                                skip = None if xa is None else "after"
-                                with w.consume(skip_fence=skip, reason=AFTER_FENCE_COVERED) as h:
-                                    a_stage = w_base + h.index * (STAGE_BYTES // 2)
-                                    if cutlass.const_expr(xa is None):
-                                        col = (xbuf % self.x_buffers) * self.x_stride
-                                        x0 = p.xs.iterator + col + kt * self.tile_k * s_rows
-                                        tiled_mma = self.stage_mmas(
-                                            p, tiled_mma, dst, a_stage, x0, b_layout
-                                        )
-                                    else:
-                                        with xa.consume() as hx:
-                                            x0 = (
-                                                self.buffer("XA").iterator
-                                                + hx.index * self.xa_stage
-                                            )
-                                            tiled_mma = self.stage_mmas(
-                                                p, tiled_mma, dst, a_stage, x0, b_layout
-                                            )
+                        for first in cutlass.range(0, k_tiles, ACC_PART_TILES, unroll=1):
+                            end = cutlass.min(first + ACC_PART_TILES, k_tiles)
+                            with acc.produce() as d:
+                                dst = t_acc[None, None, None, d.index]
+                                w, xa = self.mma_partial(
+                                    p, w, xa, tiled_mma, dst, b_layout, xbuf, first, end
+                                )
             work.advance()
         return w, xin, acc, xa, work
+
+    @cute.jit
+    def mma_partial(self, p: MegakernelParams, w, xa, tiled_mma, dst, b_layout, xbuf, first, end):
+        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        for kt in cutlass.range(first, end, unroll=1):
+            # Streamed inputs: the xa wait fences the MMAs.
+            skip = None if xa is None else "after"
+            with w.consume(skip_fence=skip, reason=AFTER_FENCE_COVERED) as h:
+                a_stage = self.buffer("W").iterator + h.index * (STAGE_BYTES // 2)
+                if cutlass.const_expr(xa is None):
+                    col = (xbuf % self.x_buffers) * self.x_stride
+                    x0 = p.xs.iterator + col + kt * self.tile_k * self.x_rows
+                    tiled_mma = self.stage_mmas(p, tiled_mma, dst, a_stage, x0, b_layout)
+                else:
+                    with xa.consume() as hx:
+                        x0 = self.buffer("XA").iterator + hx.index * self.xa_stage
+                        tiled_mma = self.stage_mmas(p, tiled_mma, dst, a_stage, x0, b_layout)
+        return w, xa
 
     @cute.jit
     def stage_mmas(self, p: MegakernelParams, tiled_mma, dst, a_stage, x0, b_layout):

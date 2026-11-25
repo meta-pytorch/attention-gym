@@ -90,7 +90,10 @@ def test_batch_steps_atomic_schedule(stream_inputs):
     the budget, only row pos changes, and the next step reads the reference's K/V rows. Streamed
     inputs: each launch's NORM and act flags must be its own."""
     require_sm100()
-    weights = random_weights(SMALL)
+    # A streamed projection spans two K partials; the resident case fits in one.
+    weights = random_weights(
+        dataclasses.replace(SMALL, hidden_size=2048) if stream_inputs else SMALL
+    )
     batch = 17
     states = [make_decode_state(weights, 125 + b % 3, MAX_LEN, seed=b) for b in range(batch)]
     ours_k = torch.stack([s[0][0] for s in states])
@@ -135,6 +138,9 @@ def test_batch_caches_past_2_to_the_31_elements():
     offset of the new K/V row overflows. The last sequence's logits and new rows must equal a
     batch-one run of it (same split count, so bit for bit)."""
     require_sm100()
+    # pytest releases the previous checkpoint's failure traceback only when this call begins.
+    gc.collect()
+    torch.cuda.empty_cache()
     weights = random_weights(SMALL)
     batch, max_len, pos = 64, 16448, 16400
     shape = (batch, SMALL.num_layers, SMALL.num_kv_heads, max_len, SMALL.head_dim)

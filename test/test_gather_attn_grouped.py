@@ -108,7 +108,10 @@ def _assert_matches_reference(inputs, mode, *, grad_output=None, **options):
     triton_options = {**options, "kernel_options": {"backend": "triton"}}
     with _deterministic_algorithms(mode == "deterministic"):
         actual = _run(inputs, leaves, grad_output, **triton_options)
-        repeat = _run(inputs, leaves, grad_output, **triton_options)[2]
+        if mode != "atomic":
+            repeat = _run(inputs, leaves, grad_output, **triton_options)[2]
+            for first, second in zip(actual[2], repeat, strict=True):
+                assert torch.equal(first, second)
 
     heads, tokens, head_dim = inputs["query"].shape[1:]
     keys_per_query = inputs["kv_indices"].shape[-1] + options["sliding_window_size"]
@@ -144,9 +147,6 @@ def _assert_matches_reference(inputs, mode, *, grad_output=None, **options):
             gradient_reductions,
             quantized_intermediates=2 if name == "attention_sink" else 0,
         )
-    if mode != "atomic":
-        for first, second in zip(actual[2], repeat, strict=True):
-            assert torch.equal(first, second)
 
 
 @pytest.mark.usefixtures("nan_filled_empty")
