@@ -13,6 +13,7 @@ import torch.nn.functional as F
 pytest.importorskip("cutlass.cute")
 
 from attn_gym.testing.kda import assert_relative_rms_within
+from attn_gym.warpdrive.examples.inkling_megakernel import draft
 from attn_gym.warpdrive.examples.inkling_megakernel.draft import DSparkMegakernel
 from attn_gym.warpdrive.examples.inkling_megakernel.draft_head_kernel import DraftHeadKernel
 from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
@@ -185,10 +186,9 @@ def test_spark_checkpoint_shape_drafts(monkeypatch):
     """Check production-shape backbone states and drafts under Spark's shared-memory limit."""
     if torch.cuda.get_device_capability() != (12, 1):
         # Also exercise the low-memory path in B200 CI; leave native Spark discovery intact.
-        monkeypatch.setattr(
-            "attn_gym.warpdrive.examples.inkling_megakernel.draft.device_smem_bytes",
-            lambda device: 99 * 1024,
-        )
+        # Patch the imported module, not a dotted path: a test on the same worker that reimports
+        # attn_gym.warpdrive leaves the fresh package without this subpackage attribute.
+        monkeypatch.setattr(draft, "device_smem_bytes", lambda device: 99 * 1024)
         # B200 has more CTAs and therefore fewer vocabulary tiles per CTA. Reserve at
         # least Spark's 131 slots to exercise the global BASE path with the real B200 grid.
         build = DraftHeadKernel.get_or_build
