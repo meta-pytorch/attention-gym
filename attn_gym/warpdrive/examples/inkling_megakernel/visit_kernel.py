@@ -107,6 +107,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     HEAD_DIM,
     RED_VALUES,
     ROWS,
+    SMEM_BYTES,
     STAGE_BYTES,
     TILE_K,
 )
@@ -251,6 +252,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
         experts_format: str = BF16,
         activation_format: str = NVFP4,
         stages: int | None = None,
+        smem_bytes: int = SMEM_BYTES,
     ):
         self.init_hidden(hidden, rms_eps)
         self.conv_kernel = conv_kernel
@@ -277,7 +279,7 @@ class InklingVisitKernel(AttentionHalf, MlpHalf, InklingKernel):
             + self.extra_smem_bytes
             + (META_STAGES * self.meta_stage_bytes if self.quantized else 0)
         )
-        self.stages = ring_stages(fixed, stages)
+        self.stages = ring_stages(fixed, stages, smem_bytes=smem_bytes, min_stages=1)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         kv = self.smem_plan.buffer("KV", BFloat16, align=1024, overlaps=w)

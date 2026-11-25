@@ -36,6 +36,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     COMPUTE_WARPS,
     MMA_N,
     ROWS,
+    SMEM_BYTES,
 )
 from attn_gym.warpdrive.examples.megakernel.gemv import gemv_tile, owns_row
 from attn_gym.warpdrive.examples.megakernel.multi_gemv import finish, gemv_bf16
@@ -75,10 +76,11 @@ class InklingHeadKernel(MatrixRowsKernel):
         softcap: float,
         stages: int | None = None,
         tokens: int = 1,
+        smem_bytes: int = SMEM_BYTES,
     ):
         if not 1 <= tokens <= MMA_N:  # an LM-head MMA's tokens
             raise ValueError(f"tokens must be in [1, {MMA_N}], got {tokens}")
-        self.init_matrix_rows(hidden, rms_eps, stages, tokens)
+        self.init_matrix_rows(hidden, rms_eps, stages, tokens, smem_bytes)
         self.vocab, self.softcap = vocab, softcap
         self.row_tiles = -(-vocab // ROWS)
 

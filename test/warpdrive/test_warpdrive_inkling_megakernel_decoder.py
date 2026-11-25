@@ -31,7 +31,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.msg_kernel import compile_ms
 from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import compile_visit_kernel
 from attn_gym.warpdrive.examples.megakernel.formats import MXFP8, NVFP4
 
-pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
+pytestmark = pytest.mark.usefixtures(
+    "requires_sm100_or_sm121", "fp32_bf16_matmul_reductions", "release_cuda_memory"
+)
 
 COMPILES = (compile_visit_kernel, compile_msg_kernel, compile_head_kernel)
 PROMPT = "What is the capital of France? One sentence."

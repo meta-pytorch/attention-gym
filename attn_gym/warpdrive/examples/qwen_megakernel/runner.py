@@ -68,8 +68,8 @@ import math
 
 import torch
 
-from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM, SMEM_BYTES
-from attn_gym.warpdrive.examples.megakernel.launch import tagged_values
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM
+from attn_gym.warpdrive.examples.megakernel.launch import device_smem_bytes, tagged_values
 from attn_gym.warpdrive.examples.qwen_megakernel.core import (
     ALL_OPS,
     ATTN,
@@ -207,8 +207,7 @@ class QwenMegakernel:
         model = dataclasses.replace(weights.config, rope_scaling=None)
         if "smem_bytes" in config:
             raise ValueError("smem_bytes is determined by the weights' device; set stages instead")
-        smem_bytes = torch.cuda.get_device_properties(device).shared_memory_per_block_optin
-        self.op = op = kernel(model=model, smem_bytes=min(smem_bytes, SMEM_BYTES), **config)
+        self.op = op = kernel(model=model, smem_bytes=device_smem_bytes(device), **config)
         self.max_ctas = op.work.launch_args(device)[1]
         self.wqkv = torch.cat((weights.q_proj, weights.k_proj, weights.v_proj), dim=1).reshape(
             -1, op.hidden

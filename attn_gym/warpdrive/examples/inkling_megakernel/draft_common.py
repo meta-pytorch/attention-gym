@@ -38,6 +38,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     DBUF_FLOATS,
     MMA_N,
     RED_VALUES,
+    SMEM_BYTES,
     STAGE_BYTES,
     TILE_K,
     X_PAD,
@@ -61,6 +62,13 @@ TOKENS = MMA_N  # token columns of every draft GEMV: one mma n8 tile
 WORDS = 4  # table words: op, a, b, table row
 TOKEN_ROWS = tuple(range(TOKENS))  # the X rows of the GEMV's tokens
 GRED_FLOATS = 2 * DBUF_FLOATS  # two buffers of ``multi_gemv``'s quarter partial tiles
+
+
+def engine_bytes(x_width: int, reductions: int) -> int:
+    """Shared bytes for the draft engine's X, RED and GRED buffers, excluding the weight ring."""
+    return 2 * TOKENS * (x_width + X_PAD) + 4 * (
+        reductions * COMPUTE_WARPS * RED_VALUES + GRED_FLOATS
+    )
 
 
 def x_layout(width: int) -> cute.Layout:
@@ -104,6 +112,9 @@ class DraftKernel(WarpSpecialized):
         stages: int | None,
         reductions: int,
         ring_views: tuple[str, ...] = (),
+        *,
+        smem_bytes: int = SMEM_BYTES,
+        min_stages: int = 2,
     ):
         """Declares the SMEM every draft launch has, in this order: the weight ring of
         ``stages`` 16 KB stages (default: as many as fit beside the other buffers and the
@@ -113,12 +124,8 @@ class DraftKernel(WarpSpecialized):
         ``reductions`` ``cta_sum`` slots, if any) and ``GRED``; and the ring, the compute warps'
         barrier ``csync`` and the table's work stream."""
         self.x_width, self.reductions = x_width, reductions
-        fixed = (
-            2 * TOKENS * (x_width + X_PAD)
-            + 4 * (reductions * COMPUTE_WARPS * RED_VALUES + GRED_FLOATS)
-            + other_bytes
-        )
-        self.stages = ring_stages(fixed, stages)
+        fixed = engine_bytes(x_width, reductions) + other_bytes
+        self.stages = ring_stages(fixed, stages, smem_bytes=smem_bytes, min_stages=min_stages)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         ring = {"W": w}

@@ -64,6 +64,7 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     HEAD_DIM,
     LOG2E,
     ROWS,
+    SMEM_BYTES,
     TILE_K,
 )
 from attn_gym.warpdrive.examples.megakernel.multi_gemv import mma_bf16
@@ -165,6 +166,7 @@ class DraftBackboneKernel(DraftKernel):
         down_splits: int = 4,
         qkv_splits: int = QKV_SPLITS,
         stages: int | None = None,
+        smem_bytes: int = SMEM_BYTES,
     ):
         check_draft_sizes(hidden)
         if down_splits < 1 or qkv_splits < 1:
@@ -197,7 +199,16 @@ class DraftBackboneKernel(DraftKernel):
             + 4 * ATTN_ROWS * COMPUTE_WARPS  # RMAX
         )
         x_width = max(hidden, self.q_dim, self.down_width)
-        self.declare_engine(x_width, attention_bytes, stages, reductions=2, ring_views=("KV",))
+        # GEMV consumes one weight at a time; attention releases K before consuming V.
+        self.declare_engine(
+            x_width,
+            attention_bytes,
+            stages,
+            reductions=2,
+            ring_views=("KV",),
+            smem_bytes=smem_bytes,
+            min_stages=1,
+        )
         for name in ("Q", "KB", "VB", "P"):
             self.smem_plan.buffer(name, BFloat16, align=16)
         self.smem_plan.buffer("RMAX", Float32, align=16)

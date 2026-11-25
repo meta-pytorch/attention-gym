@@ -4,8 +4,9 @@ Markov head's sequential greedy drafts (``dspark.DSparkDrafter.markov_drafts``);
 holds the host side.
 
 Exact restructuring: the vocabulary's 32-row tiles are dealt to CTAs once, and each CTA keeps
-its tiles for the base logits and for every Markov step, so the base logits stay in its SMEM
-(``BASE``) and each step's argmax is a per-CTA best plus a reduction over the CTAs' bests::
+its tiles for every Markov step. The base logits stay in SMEM when they fit beside the weight
+ring; otherwise each CTA retains the same tiles in global scratch. Each step's argmax is a
+per-CTA best plus a reduction over the CTAs' bests::
 
     CTXR     32 rnn_proj rows x [h_i] (split 0: the 7 mask states) or x [f_rnn] (split 1)
              -> fp32 partials of the head's context (tagged)
@@ -13,8 +14,8 @@ its tiles for the base logits and for every Markov step, so the base logits stay
              (the anchor at s = 0; the CTAs' bests of step s - 1 reduced), its state update
              from step s - 1's raw gate and candidate (kept in SMEM), then 32 rows x
              [state, w1[prev]] -> raw = context + dot, fp32 (tagged); tile 0 writes draft s - 1
-    LMH      32 LM-head rows x the mask states -> bf16 base logits (SMEM; the rows' fold bias
-             too), then the tile's step-0 fold rows (as FOLD)
+    LMH      32 LM-head rows x the mask states -> bf16 base logits; cache each row's fold bias
+             in SMEM, then process the tile's step-0 fold rows (as FOLD)
     ARGMAX   after a CTA's LMH rows: its step-0 best (value, then lowest index) -> tagged
     FOLD s   every tile of the CTA (s >= 1), one item: 32 fold rows x bf16 tanh(bf16(out_s))
              -> bias = bf16(dot + fold_bias), softcap(bf16(base + bias)) rounded to bf16 ->
@@ -46,6 +47,7 @@ from attn_gym.warpdrive.examples.inkling_megakernel.draft_common import (
     DraftKernel,
     check_draft_sizes,
     compile_draft,
+    engine_bytes,
 )
 from attn_gym.warpdrive.examples.megakernel.constants import (
     BACKOFF_NS,
@@ -55,6 +57,9 @@ from attn_gym.warpdrive.examples.megakernel.constants import (
     EVICT_LAST,
     ROWS,
     ROWS_PER_WARP,
+    SMEM_BYTES,
+    SMEM_HEADROOM,
+    STAGE_BYTES,
     TILE_K,
 )
 from attn_gym.warpdrive.examples.megakernel.gemv import owns_row, reduce_tile
@@ -97,7 +102,7 @@ class HeadParams:
     xs: cute.Tensor  # (TOKENS, hidden) bf16 GEMV inputs
     xr: cute.Tensor  # (1, 2 rank) bf16 the RNN's input row [state, w1[prev]], overlapping xs
     gred: cute.Tensor
-    base: cute.Tensor  # (slots, ROWS, TOKENS) bf16 this CTA's base logits
+    base: cute.Tensor  # (slots or row_tiles, ROWS, TOKENS) bf16 base logits
     fbias: cute.Tensor  # (slots, ROWS) bf16 the fold bias of its rows
     rnn_state: cute.Tensor  # (rank,) fp32 the Markov state (bf16 values), RNN CTAs
     arg: cute.Tensor  # (ARG_FLOATS,) fp32 argmax reduction scratch
@@ -128,6 +133,7 @@ class DraftHeadKernel(DraftKernel):
         softcap: float,
         slots: int,
         stages: int | None = None,
+        smem_bytes: int = SMEM_BYTES,
     ):
         check_draft_sizes(hidden)
         if rank != COMPUTE_THREADS or not 1 <= drafts < TOKENS:
@@ -136,18 +142,27 @@ class DraftHeadKernel(DraftKernel):
         self.softcap, self.slots = softcap, slots
         self.row_tiles = -(-vocab // ROWS)
         self.rnn_tiles = 3 * rank // ROWS
-        # STATE and ARG (fp32), BASE and FBIAS (bf16)
-        other_bytes = 4 * (rank + ARG_FLOATS) + 2 * slots * ROWS * (TOKENS + 1)
-        self.declare_engine(hidden, other_bytes, stages, reductions=0)
+        other_bytes = 4 * (rank + ARG_FLOATS) + 2 * slots * ROWS  # STATE, ARG, FBIAS
+        base_bytes = 2 * slots * ROWS * TOKENS
+        # fold_tiles needs two live weights. Spill BASE if both stages would not fit.
+        self.global_base = (
+            engine_bytes(hidden, 0) + other_bytes + base_bytes + 2 * STAGE_BYTES + SMEM_HEADROOM
+            > smem_bytes
+        )
+        if not self.global_base:
+            other_bytes += base_bytes
+        self.declare_engine(hidden, other_bytes, stages, reductions=0, smem_bytes=smem_bytes)
         self.smem_plan.buffer("XR", BFloat16, align=16, overlaps="X")
         for name in ("STATE", "ARG"):
             self.smem_plan.buffer(name, Float32, align=16)
-        self.smem_plan.buffer("BASE", BFloat16, align=16)
+        if not self.global_base:
+            self.smem_plan.buffer("BASE", BFloat16, align=16)
         self.smem_plan.buffer("FBIAS", BFloat16, align=16)
 
     @property
     def scratch_shapes(self) -> dict[str, int]:
         return {
+            **({"base_words": self.row_tiles * ROWS * TOKENS // 4} if self.global_base else {}),
             "ctxr": 2 * TOKENS * 3 * self.rank,
             "raw": self.drafts * 3 * self.rank,
             "best": self.drafts * MAX_CTAS * 2,
@@ -258,7 +273,8 @@ class DraftHeadKernel(DraftKernel):
                     xkey = X_HIDDEN
                 value, w = self.gemv(p, w, p.xs, self.hidden // TILE_K, gbuf, tid, warp, lane)
                 gbuf = 1 - gbuf
-                p.base[b, row, n] = BFloat16(value)
+                base_tile = a if cutlass.const_expr(self.global_base) else b
+                p.base[base_tile, row, n] = BFloat16(value)
                 if n == 0:
                     v = cutlass.min(a * ROWS + row, self.vocab - 1)
                     p.fbias[b, row] = p.fold_bias[v]
@@ -343,7 +359,8 @@ class DraftHeadKernel(DraftKernel):
         v = tile * ROWS + row
         if owns_row(lane) & (v < self.vocab):
             bias = bf16_round(value + Float32(p.fbias[slot, row]))
-            logit = bf16_round(Float32(p.base[slot, row, step]) + bias)
+            base_tile = tile if cutlass.const_expr(self.global_base) else slot
+            logit = bf16_round(Float32(p.base[base_tile, row, step]) + bias)
             # The softcap is monotone and a later row must beat the best strictly, so only a
             # logit above the best's (pre-softcap) can win: skip the tanh otherwise. NaN never
             # wins (nan_to_num(-inf) in the oracle).
@@ -481,19 +498,28 @@ class DraftHeadKernel(DraftKernel):
             "XR": cute.make_layout((1, 2 * self.rank), stride=(2 * self.rank, 1)),
             "STATE": cute.make_layout((self.rank,)),
             "ARG": cute.make_layout((ARG_FLOATS,)),
-            "BASE": cute.make_layout(
-                (self.slots, ROWS, TOKENS), stride=(ROWS * TOKENS, TOKENS, 1)
-            ),
             "FBIAS": cute.make_layout((self.slots, ROWS), stride=(ROWS, 1)),
         }
+        base_layout = cute.make_layout(
+            (self.row_tiles if self.global_base else self.slots, ROWS, TOKENS),
+            stride=(ROWS * TOKENS, TOKENS, 1),
+        )
+        if cutlass.const_expr(not self.global_base):
+            layouts["BASE"] = base_layout
         boxes = [("WS", (ROWS, BOX))] * 2 + [("W", (ROWS, TILE_K))]
         trace_buffer, fields, smem = self.begin_draft(
             bound, layouts, TENSOR_ARGS, tensors, scratch, tma, gtensors, boxes
         )
+        if cutlass.const_expr(self.global_base):
+            base = cute.make_tensor(
+                cute.recast_ptr(fields.pop("base_words").iterator, dtype=BFloat16), base_layout
+            )
+        else:
+            base = self.buffer("BASE")
         params = HeadParams(
             sW=StageView(smem[2], axis=1),
             xr=self.buffer("XR"),
-            base=self.buffer("BASE"),
+            base=base,
             fbias=self.buffer("FBIAS"),
             rnn_state=self.buffer("STATE"),
             arg=self.buffer("ARG"),

@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
+from attn_gym.testing.kda import assert_relative_rms_within
 from attn_gym.warpdrive.examples.inkling_megakernel.draft import DSparkMegakernel
 from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     DSparkConfig,
@@ -20,9 +21,11 @@ from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     head_norm_rope,
     random_weights,
 )
-from attn_gym.warpdrive.examples.inkling_megakernel.ref import rms_norm
+from attn_gym.warpdrive.examples.inkling_megakernel.ref import InklingConfig, rms_norm
 
-pytestmark = pytest.mark.usefixtures("requires_blackwell", "release_cuda_memory")
+pytestmark = pytest.mark.usefixtures(
+    "requires_sm100_or_sm121", "fp32_bf16_matmul_reductions", "release_cuda_memory"
+)
 
 CONFIG = DSparkConfig(
     hidden_size=768,
@@ -174,3 +177,28 @@ def test_head_matches_torch(weights):
         kernels.hidden[:7] = hidden
         actual = kernels.markov(device_int(anchor))
         assert torch.equal(actual, expected), (trial, actual.tolist(), expected.tolist())
+
+
+@torch.no_grad()
+def test_spark_checkpoint_shape_drafts(monkeypatch):
+    """Check production-shape backbone states and drafts under Spark's shared-memory limit."""
+    if torch.cuda.get_device_capability() != (12, 1):
+        # Also exercise the low-memory path in B200 CI; leave native Spark discovery intact.
+        monkeypatch.setattr(
+            "attn_gym.warpdrive.examples.inkling_megakernel.draft.device_smem_bytes",
+            lambda device: 99 * 1024,
+        )
+    c, vocab = DSparkConfig(), InklingConfig().vocab_size
+    weights = random_weights(c, vocab, vocab)
+    rows = features(8, 31, c)
+    reference = DSparkDrafter(weights, 64)
+    reference.commit(rows, torch.arange(8, device="cuda"))
+    kernels = DSparkMegakernel(weights, 64, num_drafts=3)
+    kernels.commit_rows(rows, 0)
+    actual = kernels.propose(device_int(17), device_int(8))
+    # Across three rounded decoder layers, compare each mask state at its row's bf16 scale.
+    states = reference.block_states(17, 8)[1:]
+    assert row_ulps(kernels.hidden[:7], states, c.hidden_size).max() <= 2
+    assert_relative_rms_within(kernels.hidden[:7], states, "backbone states", max_eps=1)
+    expected = reference.markov_drafts(kernels.hidden[:7], 17)[:3]
+    assert torch.equal(actual, expected)

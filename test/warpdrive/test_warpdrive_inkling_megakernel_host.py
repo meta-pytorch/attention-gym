@@ -100,6 +100,18 @@ def test_unsupported_block_geometry_is_rejected(change, match):
             visit_kernel_for(config, full, tokens=8)
 
 
+def test_verify_block_fits_gb10_shared_memory():
+    pytest.importorskip("cutlass.cute")
+    from attn_gym.warpdrive.examples.inkling_megakernel.megakernel import visit_kernel_for
+    from attn_gym.warpdrive.examples.megakernel.formats import NVFP4
+
+    # A full, gated NVFP4 visit has three input streams and the largest scale tables.
+    kwargs = {"full": True, "messages": True, "experts_format": NVFP4, "smem_bytes": 99 * 1024}
+    visit_kernel_for(CONFIG, tokens=4, **kwargs)
+    with pytest.raises(ValueError, match="shared memory"):
+        visit_kernel_for(CONFIG, tokens=8, **kwargs)
+
+
 @pytest.mark.parametrize("tokens", [1, 3])
 def test_decoder_rejects_unsupported_block_sizes(tokens):
     """The block step runs the tested blocks of 2, 4 and 8 tokens; a one-token block would

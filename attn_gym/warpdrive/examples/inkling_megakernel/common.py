@@ -525,7 +525,9 @@ class MatrixRowsKernel(InklingKernel):
     (its ``load`` role). Their params carry ``tma``/``gmem`` (the matrix's atom and tile
     partition), ``sW``, ``xs`` (a row per token) and ``red`` (``matrix_params``)."""
 
-    def init_matrix_rows(self, hidden: int, rms_eps: float, stages: int | None, tokens: int = 1):
+    def init_matrix_rows(
+        self, hidden: int, rms_eps: float, stages: int | None, tokens: int, smem_bytes: int
+    ):
         """``stages``: weight ring depth in 16 KB stages; ``tokens``: GEMV input rows (one per
         token of a multi-token launch)."""
         self.init_hidden(hidden, rms_eps)
@@ -534,7 +536,7 @@ class MatrixRowsKernel(InklingKernel):
             self.x_pad = X_PAD
         fixed = 2 * tokens * (hidden + self.x_pad) + 4 * REDUCTIONS * COMPUTE_WARPS * RED_VALUES
         fixed += 4 * DBUF_FLOATS if tokens > 1 else 0
-        self.stages = ring_stages(fixed, stages)
+        self.stages = ring_stages(fixed, stages, smem_bytes=smem_bytes)
         self.smem_plan = SmemPlan()
         w = self.smem_plan.buffer("W", BFloat16, align=1024)
         stage_buffers = {"W": w}

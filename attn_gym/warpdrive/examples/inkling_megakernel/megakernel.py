@@ -92,9 +92,9 @@ from attn_gym.warpdrive.examples.inkling_megakernel.visit_kernel import (
     compile_visit_kernel,
     visit_kernel_class,
 )
-from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM, ROWS
+from attn_gym.warpdrive.examples.megakernel.constants import BLOCK, HEAD_DIM, ROWS, SMEM_BYTES
 from attn_gym.warpdrive.examples.megakernel.formats import BF16, NVFP4
-from attn_gym.warpdrive.examples.megakernel.launch import Launch, deal, table_of
+from attn_gym.warpdrive.examples.megakernel.launch import Launch, deal, device_smem_bytes, table_of
 from attn_gym.warpdrive.profiler.host import ProfileSession
 from attn_gym.warpdrive.trace_session import trace_session
 
@@ -130,6 +130,8 @@ def visit_kernel_for(
     experts_format: str = BF16,
     activation_format: str = NVFP4,
     tokens: int = 1,
+    *,
+    smem_bytes: int = SMEM_BYTES,
 ) -> InklingVisitKernel:
     """The visit kernel for ``config``'s full (``full``) or sliding layers, with message gates
     (``messages``) or without, streaming experts in ``experts_format`` and quantizing their
@@ -145,6 +147,7 @@ def visit_kernel_for(
         cls, extra = multi_visit_kernel_class(experts_format), {"tokens": tokens}
     return cls.get_or_build(
         **extra,
+        smem_bytes=smem_bytes,
         hidden=config.hidden_size,
         q_heads=config.num_q_heads,
         kv_heads=config.num_kv_heads,
@@ -457,9 +460,10 @@ class InklingVisitMegakernel:
         self.args = args or {id(w): VisitLayer.of(config, w) for w in layers}
         self.layers = layers  # keeps the ids of ``args`` valid
         formats = sorted({(a.experts_format, a.activation_format) for a in self.args.values()})
+        smem_bytes = device_smem_bytes(device)
         self.launches = {
             (full, messages, *fmt): Launch(
-                visit_kernel_for(config, full, messages, *fmt, tokens),
+                visit_kernel_for(config, full, messages, *fmt, tokens, smem_bytes=smem_bytes),
                 build_visit_table,
                 device,
                 trace,
@@ -665,7 +669,10 @@ class InklingMsgMegakernel:
     def __init__(self, config: InklingConfig, gates: MessageGates, device="cuda"):
         extra = {} if gates.tokens == 1 else {"tokens": gates.tokens}
         op = InklingMsgKernel.get_or_build(
-            hidden=config.hidden_size, rms_eps=config.rms_eps, **extra
+            hidden=config.hidden_size,
+            rms_eps=config.rms_eps,
+            smem_bytes=device_smem_bytes(device),
+            **extra,
         )
         tiles = gates.queries.shape[0] * GATE_TILES
 
@@ -702,6 +709,7 @@ class InklingHeadMegakernel:
         op = InklingHeadKernel.get_or_build(
             hidden=config.hidden_size,
             vocab=config.vocab_size,
+            smem_bytes=device_smem_bytes(device),
             rms_eps=config.rms_eps,
             softcap=config.logit_softcap,
             **({} if tokens == 1 else {"tokens": tokens}),

@@ -121,6 +121,29 @@ def requires_blackwell() -> None:
 
 
 @pytest.fixture
+def fp32_bf16_matmul_reductions() -> Iterator[None]:
+    """Match bf16-input kernels that accumulate in fp32 before rounding their output."""
+    matmul = torch.backends.cuda.matmul
+    previous = matmul.allow_bf16_reduced_precision_reduction
+    split_k = getattr(matmul, "allow_bf16_reduced_precision_reduction_split_k", None)
+    if split_k is not None:
+        previous = (previous, split_k)
+    matmul.allow_bf16_reduced_precision_reduction = False if split_k is None else (False, split_k)
+    try:
+        yield
+    finally:
+        matmul.allow_bf16_reduced_precision_reduction = previous
+
+
+@pytest.fixture
+def requires_sm100_or_sm121() -> None:
+    if not torch.cuda.is_available() or not (
+        cuda_runs_sm100_kernels() or torch.cuda.get_device_capability() == (12, 1)
+    ):
+        pytest.skip("requires an SM100-family GPU or SM121")
+
+
+@pytest.fixture
 def release_cuda_memory() -> Iterator[None]:
     """Return the test's device memory (runners, checkpoints) to the device before the next
     test, which may load another checkpoint on this worker."""

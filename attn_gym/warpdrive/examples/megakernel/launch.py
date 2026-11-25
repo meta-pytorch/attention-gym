@@ -3,8 +3,14 @@ dependency chain's state (``Launch``), and reading tagged scratch."""
 
 import torch
 
+from attn_gym.warpdrive.examples.megakernel.constants import SMEM_BYTES
 from attn_gym.warpdrive.examples.megakernel.table import layout_static
 from attn_gym.warpdrive.examples.megakernel.tagged import scratch_offsets
+
+
+def device_smem_bytes(device: torch.device | str) -> int:
+    """Per-block opt-in shared memory, capped at the budget used to size the kernels."""
+    return min(torch.cuda.get_device_properties(device).shared_memory_per_block_optin, SMEM_BYTES)
 
 
 def deal(rows: list[list[int]], ctas: int) -> list[list[list[int]]]:
