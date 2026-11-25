@@ -148,10 +148,9 @@ class KernelOptions(SplitOptions, total=False):
     reproduce. Omit to infer from grad mode: ``True`` when autograd records the forward (under
     ``torch.compile``, while tracing).
 
-    With ``True`` the warpdrive KDA forward runs the per-tile kernels its backward recomputes.
-    The recomputed states match the forward's bit for bit only when the backward runs the
-    forward's piece plan: a chain backward after an uncut forward composes FP32 piece summaries
-    and can round them differently.
+    With ``True`` the warpdrive KDA forward runs the per-tile kernels its backward recomputes,
+    and an uncut forward hands a chain backward its FP32 states at the backward's piece starts,
+    so the recomputed states match the forward's bit for bit.
     With ``False`` a small pack may share one prep pass between its two value tiles even under
     autograd: faster, but that forward rounds its chunk states apart from the recompute, so its
     gradients are not exactly those of its output. ``chunk_kda_prepare`` infers the option at

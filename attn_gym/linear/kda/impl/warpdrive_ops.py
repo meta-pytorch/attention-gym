@@ -9,7 +9,7 @@ from collections.abc import Callable
 
 import torch
 
-from attn_gym._backends.cute import normalize_tma_tensor
+from attn_gym._backends.cute import normalize_compact_tensor, normalize_tma_tensor
 from attn_gym.linear._delta_rule.operand_layout import (
     normalize_cu_seqlens,
     normalize_scalar_rows,
@@ -42,6 +42,15 @@ torch.library.define(
     'bool nonempty=False, str intra_chunk_dtypes="bf16", bool batch_invariant=False, '
     "bool exact_recompute=False) -> (Tensor, Tensor)",
 )
+# The exact-recompute forward of a backward that reads its piece entry states (NOTE [Piece entry
+# states] in the warpdrive KDA driver): ``entry_rows`` sizes them (``entry_state_rows``); an
+# absent ``initial_state`` is zero, and without ``output_final_state`` the final state is empty.
+torch.library.define(
+    "attn_gym::kda_chunk_warpdrive_packed_fwd_entry_states",
+    "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor? initial_state, "
+    "Tensor cu_seqlens, float scale, bool fastmath, bool nonempty, bool output_final_state, "
+    "str intra_chunk_dtypes, SymInt entry_rows) -> (Tensor, Tensor, Tensor)",
+)
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
@@ -52,7 +61,7 @@ torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_local_bwd",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
     "Tensor cu_seqlens, bool split, float scale, bool fastmath=True, "
-    'str intra_chunk_dtypes="bf16", bool batch_invariant=False) '
+    'str intra_chunk_dtypes="bf16", bool batch_invariant=False, Tensor? entry_states=None) '
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 # Fixed-arity pair over one launcher: only the with-state backward returns the entry cotangent.
@@ -60,14 +69,14 @@ torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_bwd_with_state",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
     "Tensor cu_seqlens, Tensor initial_state, Tensor? d_final_state, float scale, "
-    'bool fastmath=True, str intra_chunk_dtypes="bf16", bool batch_invariant=False) '
-    "-> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
+    'bool fastmath=True, str intra_chunk_dtypes="bf16", bool batch_invariant=False, '
+    "Tensor? entry_states=None) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_bwd_with_exit_cotangent",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor d_output, "
     "Tensor cu_seqlens, Tensor? d_final_state, float scale, bool fastmath=True, "
-    'str intra_chunk_dtypes="bf16", bool batch_invariant=False) '
+    'str intra_chunk_dtypes="bf16", bool batch_invariant=False, Tensor? entry_states=None) '
     "-> (Tensor, Tensor, Tensor, Tensor, Tensor)",
 )
 
@@ -240,6 +249,61 @@ def _packed_fwd_with_state_cuda(
     )
 
 
+def _entry_state_shape(q, value, rows):
+    # Lazy like the launchers: ``import attn_gym.linear`` loads no warpdrive module. This one
+    # imports nothing else, so fake implementations work without CuTeDSL.
+    from attn_gym.linear._delta_rule.warpdrive.drivers.entry_states import entry_state_shape
+
+    return entry_state_shape(rows, value.shape[2], value.shape[3], q.shape[3])
+
+
+def _packed_fwd_entry_states_cuda(
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    initial_state,
+    cu_seqlens,
+    scale,
+    fastmath,
+    nonempty,
+    output_final_state,
+    intra_chunk_dtypes,
+    entry_rows,
+):
+    if output_final_state and initial_state is None:
+        shape = (cu_seqlens.shape[0] - 1, value.shape[2], value.shape[3], q.shape[3])
+        initial_state = torch.zeros(shape, dtype=torch.float32, device=q.device)
+    template, state_template = value, initial_state
+    q, k, value, gate, beta, cu_seqlens, initial_state = _normalize_operands(
+        q, k, value, gate, beta, cu_seqlens, initial_state
+    )
+    shape = _entry_state_shape(q, value, entry_rows)
+    entry_states = torch.empty(shape, dtype=torch.float32, device=q.device)
+    output, final_state = _backend(q).run_forward(
+        q,
+        k,
+        value,
+        gate,
+        beta,
+        cu_seqlens,
+        initial_state,
+        scale=scale,
+        output_final_state=output_final_state,
+        fastmath=fastmath,
+        intra_chunk_dtypes=intra_chunk_dtypes,
+        nonempty=nonempty,
+        exact_recompute=True,
+        entry_states=entry_states,
+    )
+    if final_state is None:
+        final_state = q.new_empty((0,), dtype=torch.float32)
+    else:
+        final_state = _restore_layout(final_state, initial_state, state_template, torch.empty_like)
+    return _restore_layout(output, value, template), final_state, entry_states
+
+
 def _packed_fwd_paged_cuda(
     q,
     k,
@@ -301,6 +365,7 @@ def _packed_bwd_cuda(
     fastmath,
     intra_chunk_dtypes,
     batch_invariant,
+    entry_states=None,
 ):
     from attn_gym.linear._delta_rule.warpdrive.launchers.backward import (
         chunk_delta_rule_bwd_warpdrive_packed,
@@ -310,6 +375,9 @@ def _packed_bwd_cuda(
     *normalized, cu_seqlens, d_output, initial_state, d_final_state = _normalize_operands(
         q, k, value, gate, beta, cu_seqlens, d_output, initial_state, d_final_state
     )
+    if entry_states is not None:
+        # The kernels read compact rows; a saved-tensor hook may restore other strides.
+        entry_states = normalize_compact_tensor(entry_states, alignment_bytes=16)
     *gradients, d_initial_state = chunk_delta_rule_bwd_warpdrive_packed(
         *normalized,
         d_output,
@@ -321,6 +389,7 @@ def _packed_bwd_cuda(
         fastmath=fastmath,
         intra_chunk_dtypes=intra_chunk_dtypes,
         batch_invariant=batch_invariant,
+        entry_states=entry_states,
     )
     return (
         *(
@@ -344,6 +413,7 @@ def _packed_local_bwd_cuda(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    entry_states=None,
 ):
     return _packed_bwd_cuda(
         q,
@@ -360,6 +430,7 @@ def _packed_local_bwd_cuda(
         fastmath,
         intra_chunk_dtypes,
         batch_invariant,
+        entry_states,
     )[:5]
 
 
@@ -377,6 +448,7 @@ def _packed_bwd_with_state_cuda(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    entry_states=None,
 ):
     return _packed_bwd_cuda(
         q,
@@ -393,6 +465,7 @@ def _packed_bwd_with_state_cuda(
         fastmath,
         intra_chunk_dtypes,
         batch_invariant,
+        entry_states,
     )
 
 
@@ -409,6 +482,7 @@ def _packed_bwd_with_exit_cotangent_cuda(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    entry_states=None,
 ):
     return _packed_bwd_cuda(
         q,
@@ -425,6 +499,7 @@ def _packed_bwd_with_exit_cotangent_cuda(
         fastmath,
         intra_chunk_dtypes,
         batch_invariant,
+        entry_states,
     )[:5]
 
 
@@ -436,6 +511,9 @@ torch.library.impl(
 )
 torch.library.impl(
     "attn_gym::kda_chunk_cudnn_packed_fwd_with_state", "CUDA", _packed_fwd_with_state_cuda
+)
+torch.library.impl(
+    "attn_gym::kda_chunk_warpdrive_packed_fwd_entry_states", "CUDA", _packed_fwd_entry_states_cuda
 )
 torch.library.impl("attn_gym::kda_chunk_cudnn_packed_fwd_paged", "CUDA", _packed_fwd_paged_cuda)
 torch.library.impl("attn_gym::kda_chunk_cudnn_packed_local_bwd", "CUDA", _packed_local_bwd_cuda)
@@ -510,6 +588,34 @@ def _packed_fwd_with_state_fake(
     return _empty_like_token_operand(value), torch.empty_like(initial_state)
 
 
+@torch.library.register_fake("attn_gym::kda_chunk_warpdrive_packed_fwd_entry_states")
+def _packed_fwd_entry_states_fake(
+    q,
+    k,
+    value,
+    gate,
+    beta,
+    initial_state,
+    cu_seqlens,
+    scale,
+    fastmath,
+    nonempty,
+    output_final_state,
+    intra_chunk_dtypes,
+    entry_rows,
+):
+    final_state = q.new_empty((0,), dtype=torch.float32)
+    if output_final_state:
+        state = (cu_seqlens.shape[0] - 1, value.shape[2], value.shape[3], q.shape[3])
+        final_state = (
+            q.new_empty(state, dtype=torch.float32)
+            if initial_state is None
+            else torch.empty_like(initial_state)
+        )
+    entry_states = q.new_empty(_entry_state_shape(q, value, entry_rows), dtype=torch.float32)
+    return _empty_like_token_operand(value), final_state, entry_states
+
+
 @torch.library.register_fake("attn_gym::kda_chunk_cudnn_packed_fwd_paged")
 def _packed_fwd_paged_fake(
     q,
@@ -547,6 +653,7 @@ def _packed_local_bwd_fake(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    entry_states=None,
 ):
     return _token_gradients_fake(q, k, value, gate, beta)
 
@@ -566,6 +673,7 @@ def _packed_bwd_with_state_fake(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    entry_states=None,
 ):
     # The launcher allocates a compact FP32 cotangent whatever the entry state's outer strides.
     return (
@@ -588,12 +696,16 @@ def _packed_bwd_with_exit_cotangent_fake(
     fastmath=True,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    entry_states=None,
 ):
     return _token_gradients_fake(q, k, value, gate, beta)
 
 
 chunk_warpdrive_packed_fwd_op = torch.ops.attn_gym.kda_chunk_cudnn_packed_fwd.default
 chunk_warpdrive_packed_fwd_paged_op = torch.ops.attn_gym.kda_chunk_cudnn_packed_fwd_paged.default
+chunk_warpdrive_packed_fwd_entry_states_op = (
+    torch.ops.attn_gym.kda_chunk_warpdrive_packed_fwd_entry_states.default
+)
 chunk_warpdrive_packed_fwd_with_initial_state_op = (
     torch.ops.attn_gym.kda_chunk_cudnn_packed_fwd_with_initial_state.default
 )
@@ -612,6 +724,7 @@ chunk_warpdrive_packed_bwd_with_exit_cotangent_op = (
 __all__ = [
     "chunk_warpdrive_packed_bwd_with_exit_cotangent_op",
     "chunk_warpdrive_packed_bwd_with_state_op",
+    "chunk_warpdrive_packed_fwd_entry_states_op",
     "chunk_warpdrive_packed_fwd_op",
     "chunk_warpdrive_packed_fwd_paged_op",
     "chunk_warpdrive_packed_fwd_with_initial_state_op",

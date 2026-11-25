@@ -101,12 +101,14 @@ from .kda_common import (
     TORCH_NAMES,
     WORK_ITEM_FIELDS,
     OperandDtypes,
+    as_f32,
     beta_residual,
     box128,
     check_operand_dtypes,
     decay_fragment_offsets,
     decay_stage_addresses,
     invert_solve,
+    ldg_v4,
     lds_16_f32,
     lds_f32,
     lds_v4,
@@ -230,7 +232,9 @@ class KdaRecompute(WarpSpecialized):
     ``fastmath=False`` exponentiates the gates with the non-flushing ``exp2`` and reciprocal.
     Use the forward's operand dtypes to rebuild ``KdaPrefill`` states bit for bit on uncut
     and piece-chain plans. The shared-prep forward (``kda_prep_prefill``) groups its state
-    update differently, so its states can differ even at the same precision."""
+    update differently, so its states can differ even at the same precision. ``entry_states``
+    reads the initial states in the forward's piece entry state layout (NOTE [Entry state
+    layout] in ``kda_prefill``) instead of ``[N, H, V, K]``."""
 
     def __init__(
         self,
@@ -245,9 +249,13 @@ class KdaRecompute(WarpSpecialized):
         precision: OperandDtypes,
         beta_dtype: str | None = None,
         state_dtype: str | None = None,
+        entry_states: bool = False,
     ):
         if d_k not in HEAD_DIMS or d_v not in HEAD_DIMS:
             raise ValueError(f"the KDA recompute serves d_k, d_v in {HEAD_DIMS}, got {d_k}, {d_v}")
+        if entry_states and not use_initial_state:
+            raise ValueError("entry states are initial states")
+        self.entry_states = entry_states
         if gate not in ("fp32", io):
             raise ValueError(f"the gate must be fp32 or the io dtype, got {gate}")
         check_operand_dtypes(io, precision)
@@ -381,7 +389,7 @@ class KdaRecompute(WarpSpecialized):
         return tma_slot_rows(3, B_T, heads)
 
     def get_name(self) -> str:
-        init = "_init" if self.use_initial_state else ""
+        init = ("_entry" if self.entry_states else "_init") if self.use_initial_state else ""
         name = f"wd_kda_recompute_{self.io}_g{self.gate}_k{self.d_k}_v{self.d_v}{init}"
         name += precision_suffix(self.io, self.precision)
         return name if self.fastmath else f"{name}_nofm"
@@ -1064,11 +1072,20 @@ class KdaRecompute(WarpSpecialized):
         words."""
         _l, lane_base, cols, _lo, _hi, value_dim, row_valid = geo
         io = self.io_dtype
-        src = params.state_in[batch, head, value_dim, None]
+        if cutlass.const_expr(not self.entry_states):
+            src = params.state_in[batch, head, value_dim, None]
         half_blocks = self.d_k // 32
         for half in cutlass.range_constexpr(2):
             blocks = range(half * half_blocks, (half + 1) * half_blocks)
-            vals = load_state(cute.local_tile(src, (self.d_k // 2,), (half,)))
+            if cutlass.const_expr(self.entry_states):
+                vals = []
+                for q in cutlass.range_constexpr(self.d_k // 8):
+                    quad = params.state_in[
+                        batch, head, half * (self.d_k // 8) + q, value_dim, None
+                    ]
+                    vals += [as_f32(w) for w in ldg_v4(quad.iterator.toint())]
+            else:
+                vals = load_state(cute.local_tile(src, (self.d_k // 2,), (half,)))
             vecs = [vals[16 * j : 16 * j + 16] for j in range(half_blocks)]
             packed = []
             for j, i in enumerate(blocks):
