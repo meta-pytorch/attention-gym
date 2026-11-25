@@ -20,6 +20,7 @@ import torch
 from attn_gym.linear._delta_rule.chunk_schedule import ScheduleRequest
 from attn_gym.linear._delta_rule.constants import DEFAULT_CHUNK_SIZE as _CHUNK_SIZE
 from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_backend,
     resolve_chunk_kernel_options,
     validate_delta_rule_inputs,
 )
@@ -40,7 +41,7 @@ class ResolvedKernelOptions(NamedTuple):
     """Validated ``chunk_kda`` backend selection, warpdrive switches, tuning request, and ragged
     launch schedule."""
 
-    backend: Literal["fused", "warpdrive"]
+    backend: Literal["auto", "fused", "warpdrive"]
     split_backward: bool
     split_forward: bool
     autotune: bool
@@ -97,8 +98,10 @@ def resolve_intra_chunk_dtypes(
 
 
 def kernel_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.dtype:
-    """The dtype the KDA chunk kernels compute Q/K/V in: theirs when all three share FP16 or
-    BF16, else BF16 (FP32 or mixed inputs)."""
+    """Return the Q/K/V dtype the KDA chunk kernels compute in.
+
+    Q/K/V that share FP16 or BF16 run as given; FP32 or mixed Q/K/V run in BF16.
+    """
     if q.dtype in (torch.float16, torch.bfloat16) and k.dtype == v.dtype == q.dtype:
         return q.dtype
     return torch.bfloat16
@@ -109,16 +112,20 @@ def cast_to_kernel_dtypes(
 ) -> tuple[torch.Tensor, ...]:
     """Cast chunk operands to the dtypes the KDA chunk kernels compute in.
 
-    Q/K/V run in ``kernel_dtype``; gate and beta run in FP32. Callers return the output in the
+    Q/K/V follow ``kernel_dtype``; gate and beta run in FP32. Callers return the output in the
     original ``q.dtype``. Each cast is an autograd op, so gradients come back in the caller's
     dtypes.
     """
     dtype = kernel_dtype(q, k, v)
-    return (
-        *(tensor.to(dtype) for tensor in (q, k, v)),
-        gate.float(),
-        beta.float(),
-    )
+    return (*(tensor.to(dtype) for tensor in (q, k, v)), gate.float(), beta.float())
+
+
+def resolve_kda_backend(
+    backend: str, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, *, fused_only: bool = False
+) -> Literal["fused", "warpdrive"]:
+    """Auto selects Triton for native FP16 KDA; other dtypes use the common backend rule."""
+    fused_only = fused_only or kernel_dtype(q, k, v) == torch.float16
+    return resolve_chunk_backend(backend, q, fused_only=fused_only)
 
 
 def validate_kda_inputs(
@@ -209,6 +216,7 @@ __all__ = [
     "cast_to_kernel_dtypes",
     "kernel_dtype",
     "resolve_intra_chunk_dtypes",
+    "resolve_kda_backend",
     "resolve_kernel_options",
     "validate_kda_inputs",
     "validate_replay_state",

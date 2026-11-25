@@ -23,6 +23,8 @@ from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 Rule = Literal["gdn", "kda"]
+# Checkpointed calls run the fused kernels, so their chunk references must too.
+pytestmark = pytest.mark.usefixtures("fused_chunk_default")
 
 
 @pytest.fixture(params=["gdn", "kda"])

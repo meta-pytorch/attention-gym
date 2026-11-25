@@ -32,7 +32,10 @@ from attn_gym.linear._delta_rule.span import (
     zero_state,
 )
 from attn_gym.linear._delta_rule.summaries import build_state_grad_summaries, build_state_summaries
-from attn_gym.linear._delta_rule.validation import resolve_chunk_kernel_options
+from attn_gym.linear._delta_rule.validation import (
+    resolve_chunk_backend,
+    resolve_chunk_kernel_options,
+)
 from attn_gym.linear.gdn.bwd.triton.chunk_gdn_bwd_recompute import (
     chunk_gdn_recompute_aqk_dense,
     chunk_gdn_recompute_aqk_packed,
@@ -268,10 +271,10 @@ def chunk_gdn_prepare(
     """Run the factor half of ``chunk_gdn`` and return a handle for summaries and output.
 
     Arguments follow ``chunk_gdn`` with the batch dimension fixed to one so token offsets index
-    one packed stream. ``kernel_options={"backend": "warpdrive"}`` runs the local pass and both
-    summaries with warpdrive's kernels; split schedules are not available with entry states.
-    ``"autotune"`` follows ``chunk_gdn``; ``"batch_invariant"`` (warpdrive only) keeps each
-    sequence's summary bits independent of the rest of the stream
+    one packed stream. The local pass and summaries use the backend and autotuning policy of
+    ``chunk_gdn``. The staged API does not accept split schedules. With an explicit warpdrive
+    backend, ``batch_invariant``
+    keeps each sequence's summary bits independent of the rest of the stream
     (:class:`attn_gym.linear.types.GDNStageKernelOptions`).
     """
     options = resolve_chunk_kernel_options(
@@ -279,8 +282,9 @@ def chunk_gdn_prepare(
     )
     if options["split_backward"] or options["split_forward"]:
         raise ValueError("split schedules are not supported by chunk_gdn_prepare")
-    autotune, warpdrive = options["autotune"], options["backend"] == "warpdrive"
     validate_gdn_inputs(q, k, v, gate, beta, None, cu_seqlens)
+    autotune = options["autotune"]
+    warpdrive = resolve_chunk_backend(options["backend"], q) == "warpdrive"
     _validate_fused_chunk_qkv(q, k, v)
     if q.shape[-1] != 128:
         raise ValueError("staged/context-parallel chunk_gdn currently requires K=V=128")
@@ -510,9 +514,9 @@ def chunk_gdn_prepare_backward(
     handle's resolved ``prepared.scale``; see ``chunk_kda_prepare_backward``.
     ``kernel_options`` accepts the forward's options; ``"autotune"`` follows ``chunk_gdn``. The
     tape selects the backend: a warpdrive tape (:class:`ChunkGDNWarpdriveSaved`) returns
-    :class:`ChunkGDNWarpdriveBackward`. ``"backend"`` may be omitted; an explicit one must name
-    the tape's backend. ``d_output``, ``scale`` and the summary plan (``"batch_invariant"``)
-    follow ``chunk_kda_prepare_backward``.
+    :class:`ChunkGDNWarpdriveBackward`. ``"backend"`` may be omitted or ``"auto"``; ``"fused"`` or
+    ``"warpdrive"`` must name the tape's backend. ``d_output``, ``scale`` and the summary plan
+    (``"batch_invariant"``) follow ``chunk_kda_prepare_backward``.
     """
     warpdrive = isinstance(saved, ChunkGDNWarpdriveSaved)
     options = resolve_chunk_kernel_options(

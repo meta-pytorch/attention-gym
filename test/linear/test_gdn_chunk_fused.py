@@ -37,10 +37,14 @@ from attn_gym.testing.kda import (
     cumulative_sequence_offsets,
 )
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
-    reason="fused chunk GDN requires CUDA capability 8.0 or newer",
-)
+# Exercise the Triton kernels even where auto would select warpdrive.
+pytestmark = [
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0),
+        reason="fused chunk GDN requires CUDA capability 8.0 or newer",
+    ),
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 
 def make_inputs(

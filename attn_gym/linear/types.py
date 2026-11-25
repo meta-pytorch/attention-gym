@@ -35,6 +35,9 @@ class StateCheckpoints(NamedTuple):
     slots must be in bounds, distinct among writers and, if sharing the cache, not routed by
     this call. Neither request vector may overlap storage the call modifies (including replay
     counts). These are caller guarantees, not host-side checks of device values.
+
+    Runs on the fused backend; the default ``backend="auto"`` selects it for checkpointed
+    chunk calls, and an explicit ``"warpdrive"`` raises.
     """
 
     state_pool: torch.Tensor
@@ -82,17 +85,20 @@ class ReplayState(NamedTuple):
 class BackendOptions(TuningOptions, total=False):
     """Backend selection and tuning shared by optimized linear-attention operations."""
 
-    backend: Literal["fused", "warpdrive"]
-    """Select the chunk kernels. ``"fused"`` (default) runs the portable Triton kernels on every
-    CUDA architecture; ``"warpdrive"`` runs the CuTeDSL warpdrive kernels (SM100-family GPUs,
-    ``[linear]`` extra)."""
+    backend: Literal["auto", "fused", "warpdrive", "cudnn"]
+    """Choose the optimized chunk backend. With CuTeDSL installed, ``"auto"`` prefers warpdrive on
+    SM100 and SM103, and on SM107 with CuTeDSL 4.8+. Native FP16 KDA and paged checkpoint writes
+    use Triton. Set ``"warpdrive"`` or ``"fused"`` (Triton) to require that backend;
+    ``"cudnn"``, warpdrive's former name, is an alias of ``"warpdrive"``.
+    See "Chunk backend selection" in ``docs/linear.md``."""
 
 
 class SplitOptions(BackendOptions, total=False):
     """Approximate warpdrive forgetting-horizon split schedules for chunk KDA and chunk GDN.
 
-    Both default to ``False``, require ``backend="warpdrive"``, and reject calls with recurrent
-    state. They help only when ``B * H`` does not fill the GPU and every head forgets quickly.
+    Both default to ``False``, require an explicit ``backend="warpdrive"``, and reject calls with
+    recurrent state. They help only when ``B * H`` does not fill the GPU and every head forgets
+    quickly.
     """
 
     split_backward: bool
@@ -134,8 +140,9 @@ class _StageOptions(TypedDict, total=False):
     ``state_grad_summaries``) independent of the rest of the packed stream: the other sequences,
     their count and lengths. Defaults to ``False``, where a long sequence's summaries split into
     pieces by a plan of the stream's shape. ``True`` scans every sequence uncut in both
-    directions. Only the warpdrive backend's summaries split, so the fused backend rejects it;
-    the handles' local ``run`` keeps its own shape-dependent plan."""
+    directions. Only the warpdrive backend's summaries split, so like the split schedules it
+    requires an explicit ``backend="warpdrive"``; the handles' local ``run`` keeps its own
+    shape-dependent plan."""
 
 
 class StageKernelOptions(KernelOptions, _StageOptions, total=False):
@@ -163,7 +170,7 @@ class RecurrentKernelOptions(TuningOptions, total=False):
 # Accepted values and defaults of the option dicts above; see ``KernelOptionSpec``.
 SPLIT_OPTION_SPEC: KernelOptionSpec = {
     **TUNING_OPTION_SPEC,
-    "backend": (("fused", "warpdrive"), "fused"),
+    "backend": (("auto", "fused", "warpdrive", "cudnn"), "auto"),
     "split_backward": (bool, False),
     "split_forward": (bool, False),
 }

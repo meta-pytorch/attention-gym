@@ -38,7 +38,7 @@ def context_parallel_gdn(
 
     See ``attn_gym.linear.context_parallel.context_parallel_chunk`` for the argument contract;
     ``scale`` and ``kernel_options`` follow ``chunk_gdn``, without the split schedules.
-    ``kernel_options={"backend": "warpdrive"}`` selects warpdrive for the local pass and summaries.
+    ``"backend"`` selects the kernels of the local pass and summaries as in ``chunk_gdn``.
     """
     stages = StagedOp(
         partial(chunk_gdn_prepare, scale=scale, kernel_options=kernel_options),

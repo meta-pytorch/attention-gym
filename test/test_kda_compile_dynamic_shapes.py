@@ -8,7 +8,11 @@ import torch
 from attn_gym.linear import chunk_kda
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = [
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
+    # Exercise the Triton kernels even where auto would select warpdrive.
+    pytest.mark.usefixtures("fused_chunk_default"),
+]
 
 TOKENS = 128
 

@@ -10,6 +10,9 @@ from attn_gym._backends.triton.utils import requires_int64_offsets
 
 FUSED_CAPABLE = torch.cuda.is_available() and torch.cuda.get_device_capability() >= (8, 0)
 
+# Exercise the Triton kernels even where auto would select warpdrive.
+pytestmark = pytest.mark.usefixtures("fused_chunk_default")
+
 
 def test_requires_int64_abi_covers_oversized_singleton_strides():
     """Reject the i32 signature for every inventoried ABI boundary case.
