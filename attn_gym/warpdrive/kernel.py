@@ -20,6 +20,7 @@ from cutlass._mlir.dialects import llvm, nvvm
 
 from attn_gym.warpdrive import alias, fences, liveness, named, ownership, tracing
 from attn_gym.warpdrive.alias import RoleEvents
+from attn_gym.warpdrive.bounds import indexing, set_checking
 from attn_gym.warpdrive.cache._key import canonical_key, module_source_digest
 from attn_gym.warpdrive.cache.jit import fast_key
 from attn_gym.warpdrive.channels import (
@@ -67,7 +68,9 @@ from attn_gym.warpdrive.protocol import (
     ProtocolError,
     ProtocolLog,
     RoleTrace,
+    compiling,
     current_trace,
+    drop_stale_opt_outs,
     take_opt_outs,
     tracing_role,
     user_site,
@@ -439,6 +442,7 @@ SETTINGS = (
     "cluster",
     "alias_check",
     "liveness_check",
+    "checked",
     "trace_protocol",
     "trace_backend",
     "trace_waits",
@@ -480,6 +484,8 @@ def _check_settings(settings: dict) -> None:
         raise ValueError(
             f"trace_backend must be one of {tracing.BACKENDS} or None, got {backend!r}"
         )
+    if type(settings.get("checked", False)) is not bool:
+        raise ValueError(f"checked must be a bool, got {settings['checked']!r}")
     events = settings.get("trace_events_per_role", 1024)
     if type(events) is not int or events < 1:
         raise ValueError(f"trace_events_per_role must be a positive int, got {events!r}")
@@ -550,6 +556,10 @@ class WarpSpecialized(metaclass=_KernelType):
     # Host-only: it never changes generated code.
     alias_check: str = "warn"
     liveness_check: str = "strict"
+    # Build the kernel with its runtime checks (bounds.py): every tensor index is compared
+    # with its extent, on the device where it is not known at trace time, and a failure aborts
+    # the launch. A separate, slower build, for tests and debugging.
+    checked: bool = False
     trace_protocol: bool = False
     # Ranges named after roles and channels (tracing.py): "iket" records IKET ranges for
     # run-iket; "globaltimer" writes profiler records into the buffer passed to
@@ -1190,7 +1200,18 @@ class WarpSpecialized(metaclass=_KernelType):
             self.cluster,
             tuple((s.schedule, s.mapping, s.ready, s.scheduler_warp) for s in streams),
             (self.alias_check, self.liveness_check, self.trace_protocol, self._trace_settings()),
+            self.checked,
         )
+
+    @contextmanager
+    def __cute_trace_scope__(self):
+        """Entered by ``compile_tvm_ffi`` around this kernel's compile. Its launch function runs
+        before its ``begin_roles()``: the trace starts here, so a failure there leaves no reports,
+        and that function is traced with the kernel's ``checked`` setting."""
+        self._reset_trace()
+        with indexing(self.checked):
+            yield
+        self._ws_opt_outs += take_opt_outs()  # its launch function's, entered after the launch
 
     def __cute_trace_record__(self) -> dict:
         """What a trace left for ``describe()``, pipeline plans and the trace-time warnings, as
@@ -1402,7 +1423,16 @@ class WarpSpecialized(metaclass=_KernelType):
         self._reset_trace()
         # Trace state outside this kernel: process-wide recorders and flags on its declarations.
         # Collection may run inside another kernel's trace, so _reset_trace leaves these alone.
-        take_opt_outs()  # drop opt-outs left over from an earlier, failed trace
+        drop_stale_opt_outs()
+        # The kernel's role code has its own checked setting inside any compile_tvm_ffi, whose
+        # exit restores the setting if this trace fails.
+        if compiling():
+            self._ws_checking_outside = set_checking(self.checked)
+        elif self.checked:
+            raise ProtocolError(
+                f"{type(self).__name__}: a checked=True kernel compiles through compile_tvm_ffi "
+                "(a @jit_cache compile function), which scopes its checks"
+            )
         for nb in self._ws_named_bars.values():  # count only this trace's native ID reads
             nb._native_outside_roles = False
         clear_multicast_masks()
@@ -1636,6 +1666,8 @@ class WarpSpecialized(metaclass=_KernelType):
 
     def _finish_trace(self):
         """Collect opt-outs and check reports, then report findings."""
+        if compiling():
+            set_checking(self._ws_checking_outside)
         self._ws_opt_outs = take_opt_outs()
         self._ws_named_users = named.check(self, self._ws_role_events)
         self._ws_ownership = ownership.check(self, self._ws_epoch_seqs)

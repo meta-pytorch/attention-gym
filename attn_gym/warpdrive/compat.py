@@ -9,6 +9,7 @@ from importlib.metadata import version
 from cutlass import Int32, cute
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm, nvvm
+from cutlass.cute.tensor import _Tensor as TENSOR_CLASS  # indexes every tensor (bounds.py)
 from cutlass.cutlass_dsl import T, dsl_user_op
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
@@ -154,12 +155,14 @@ __all__ = [
     "CUTEDSL_VERSION",
     "MIN_CUTEDSL_VERSION",
     "NATIVE_MULTI_ADVANCE",
+    "TENSOR_CLASS",
     "Arch",
     "FastDivmodDivisor",
     "LayoutEnum",
     "SmemAllocator",
     "TmemAllocator",
     "cutedsl_version_matches",
+    "dsl_user_op",
     "get_num_tmem_alloc_cols",
     "mbarrier_arrive",
     "store_async_dsmem",

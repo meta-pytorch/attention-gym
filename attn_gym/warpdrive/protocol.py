@@ -30,9 +30,10 @@ class ProtocolError(Exception):
 #   fence     accesses annotated inside the block are left out of the fence check (fences.py)
 #   liveness  channel and barrier ops inside the block are invisible to the liveness check,
 #             which reports the kernel unverified instead of checking them
+#   bounds    tensor indices inside the block are not checked in a checked=True build
 # Use a span across a counted loop. ``signal=False`` omits the signal, not the handle close.
 # Leave alias accesses unannotated, carry a Token, or use raw barriers.
-CHECKS = ("tma", "fence", "liveness")
+CHECKS = ("tma", "fence", "liveness", "bounds")
 
 
 @dataclass
@@ -46,7 +47,10 @@ class OptOut:
     suppressed: list = field(default_factory=list)
 
     def describe(self) -> str:
-        what = "; ".join(sorted(set(self.suppressed))) or "nothing (stale opt-out?)"
+        nothing = "nothing (stale opt-out?)"
+        if self.check == "bounds":  # a build without the checks has none to suppress
+            nothing = "index checks of a checked build"
+        what = "; ".join(sorted(set(self.suppressed))) or nothing
         who = f"{self.role}: " if self.role else ""
         return f"unchecked {self.check} @ {self.site}: {who}{self.reason!r} -> {what}"
 
@@ -162,6 +166,36 @@ def take_opt_outs() -> list[OptOut | FenceSkip]:
     seen = list(_SEEN)
     _SEEN.clear()
     return seen
+
+
+_compiles = 0  # compile_scope() blocks in progress
+
+
+@contextmanager
+def compile_scope():
+    """The opt-outs entered inside belong to the kernel compiled there, including those of its
+    launch function, which runs before its roles are traced. An enclosing compile's are set
+    aside, the blocks it is inside of too: they are about its code, not this kernel's."""
+    global _compiles
+    outer, active = take_opt_outs(), list(_ACTIVE)
+    _ACTIVE.clear()
+    _compiles += 1
+    try:
+        yield
+    finally:
+        _compiles -= 1
+        _SEEN[:], _ACTIVE[:] = outer, active
+
+
+def compiling() -> bool:
+    """Whether a compile_scope() is open, which restores trace state if the trace fails."""
+    return _compiles > 0
+
+
+def drop_stale_opt_outs() -> None:
+    """Drop what an earlier, failed trace left, unless a compile_scope() already did."""
+    if not _compiles:
+        _SEEN.clear()
 
 
 def _user_frame(frame: FrameType | None = None) -> FrameType | None:
