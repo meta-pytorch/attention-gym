@@ -135,6 +135,9 @@ def test_batch_caches_past_2_to_the_31_elements():
     offset of the new K/V row overflows. The last sequence's logits and new rows must equal a
     batch-one run of it (same split count, so bit for bit)."""
     require_sm100()
+    # pytest releases the previous checkpoint's failure traceback only when this call begins.
+    gc.collect()
+    torch.cuda.empty_cache()
     weights = random_weights(SMALL)
     batch, max_len, pos = 64, 16448, 16400
     shape = (batch, SMALL.num_layers, SMALL.num_kv_heads, max_len, SMALL.head_dim)

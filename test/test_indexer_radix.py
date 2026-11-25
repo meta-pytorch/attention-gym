@@ -240,19 +240,20 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, de
             scores = 1 + scores.abs() * 1e-5
         case "signed_zero":
             scores = torch.copysign(torch.zeros_like(scores), scores)
-    output = torch.empty((1, tokens, topk), device="cuda", dtype=torch.int32)
+    # Four query rows rank all candidates; only the score slab needs the long dimension.
+    rows = scores.view(4, tokens)
+    output = torch.empty((1, rows.size(0), topk), device="cuda", dtype=torch.int32)
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(torch.cuda.current_device()))
         kernel = radix_impl._compile_topk(topk, False, 1, False, deterministic, False)
     finally:
         set_compile_target(previous)
-    rows = scores.view(4, tokens)
     expected = _lowest_index_topk(rows, topk)
     for _ in range(3 if deterministic else 1):
         # The deterministic kernel may overwrite its score slab, so use fresh scores.
         kernel(scores.clone(), output, cutlass.Int32(0), None)
-        actual = output[0, :4].long()
+        actual = output[0].long()
         if deterministic:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:

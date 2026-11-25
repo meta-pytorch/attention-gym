@@ -171,6 +171,27 @@ def test_single_instruction(weights, op, engine):
         torch.testing.assert_close(runner.logits, expected, atol=2e-2, rtol=1e-2)
 
 
+def test_tcgen05_qkv_retains_small_terms_past_a_bf16_midpoint():
+    require_decode_engine("tcgen05")
+    config = QwenConfig(
+        hidden_size=2048, num_layers=1, num_q_heads=8, num_kv_heads=8,
+        intermediate_size=1024, vocab_size=1024,
+    )  # fmt: skip
+    weights = random_weights(config)
+    weights.embed[0].fill_(1)
+    weights.input_ln[0].fill_(1)  # the normalized GEMV input rounds to all ones
+    row = weights.q_proj[0, 0]
+    row.fill_(2**-30)
+    row[0], row[1] = 1, 2**-8
+    # 1 + 2^-8 is the bf16 midpoint. Each K=16 MMA contributes less than one fp32 ulp
+    # there, but the tail moves the exact dot strictly above the midpoint.
+    runner = mk.QwenMegakernel(weights, MAX_LEN, ops=(mk.QKV,), engine="tcgen05")
+    runner.step_info[1] = 1
+    caches = [torch.empty(cache_shape(config), dtype=torch.bfloat16, device="cuda") for _ in "kv"]
+    runner.launch(*caches)
+    assert runner.values("qkv")[0, 0].item() == 1 + 2**-7
+
+
 @pytest.mark.parametrize("engine", ["cuda_core", "tcgen05"])
 def test_gateup_sums_a_residual_wider_than_registers(engine):
     """Batch-one gate/up sums h_in and o_proj's partials itself. Past 8192 hidden columns a

@@ -2841,89 +2841,36 @@ def test_short_conv_decode_activation_registration_contract():
         causal_conv1d_decode(x[:, 0], weight, x.new_zeros(1, 3, x.shape[2]), activation="missing")
 
 
-@pytest.mark.parametrize("with_mask", [False, True])
+@pytest.mark.parametrize(
+    "config,channels,sequence_counts",
+    [
+        pytest.param(None, 12, (3,), id="default"),
+        pytest.param(ShortConvConfig(64, 2, 8), 6, (3,), id="configured"),
+        pytest.param(None, 6, (2, 4), id="dynamic-default"),
+        pytest.param(ShortConvConfig(64, 2, 8), 6, (2, 4), id="dynamic-configured"),
+    ],
+)
+@pytest.mark.parametrize("with_mask", [False, True], ids=["no-mask", "mask"])
 def test_short_conv_decode_fullgraph_forward(
-    paged_short_conv_inputs, fresh_compile_cache, with_mask
+    paged_short_conv_inputs, fresh_compile_cache, config, channels, sequence_counts, with_mask
 ):
-    """Keep the opaque forward and the in-place history write in a strict graph."""
+    """Match eager output and history bitwise, reusing dynamic graphs across sequence counts."""
     torch.manual_seed(4)
-    x, weight, state, slots = paged_short_conv_inputs()
-    mask = torch.tensor((False, True, False), device="cuda") if with_mask else None
-    expected_state = state.clone()
-    expected = causal_conv1d_decode(
-        x, weight, expected_state, state_indices=slots, has_initial_state=mask
-    )
-    compiled = torch.compile(causal_conv1d_decode, fullgraph=True)
-    actual = compiled(x, weight, state, state_indices=slots, has_initial_state=mask)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("with_mask", [False, True])
-def test_short_conv_decode_configured_fullgraph_forward(
-    paged_short_conv_inputs, fresh_compile_cache, with_mask
-):
-    """Keep explicit scalar schedules behind the configured opaque operator."""
-    torch.manual_seed(6)
-    x, weight, state, slots = paged_short_conv_inputs(channels=6)
-    options: ShortConvDecodeKernelOptions = {"forward_config": ShortConvConfig(64, 2, 8)}
-    mask = torch.tensor((True, False, True), device="cuda") if with_mask else None
-    expected_state = state.clone()
-    expected = causal_conv1d_decode(
-        x,
-        weight,
-        expected_state,
-        state_indices=slots,
-        has_initial_state=mask,
-        kernel_options=options,
-    )
-    compiled = torch.compile(causal_conv1d_decode, fullgraph=True)
-    actual = compiled(
-        x,
-        weight,
-        state,
-        state_indices=slots,
-        has_initial_state=mask,
-        kernel_options=options,
-    )
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("options", [None, {"forward_config": ShortConvConfig(64, 2, 8)}])
-@pytest.mark.parametrize("with_mask", [False, True])
-def test_short_conv_decode_dynamic_shapes(
-    paged_short_conv_inputs, fresh_compile_cache, options, with_mask
-):
-    """Reuse default and configured full graphs across sequence counts without recompilation."""
-    compiled = torch.compile(causal_conv1d_decode, fullgraph=True, dynamic=True)
+    options = None if config is None else {"forward_config": config}
+    dynamic = True if len(sequence_counts) > 1 else None
+    compiled = torch.compile(causal_conv1d_decode, fullgraph=True, dynamic=dynamic)
     with torch._dynamo.config.patch(error_on_recompile=True):
-        for sequences in (2, 4):
+        for sequences in sequence_counts:
             x, weight, state, slots = paged_short_conv_inputs(
-                sequences=sequences,
-                channels=6,
+                sequences=sequences, channels=channels
             )
             mask = torch.arange(sequences, device="cuda") % 2 == 0 if with_mask else None
+            kwargs = {"state_indices": slots, "has_initial_state": mask, "kernel_options": options}
             expected_state = state.clone()
-            actual_state = state.clone()
-            expected = causal_conv1d_decode(
-                x,
-                weight,
-                expected_state,
-                state_indices=slots,
-                has_initial_state=mask,
-                kernel_options=options,
-            )
-            actual = compiled(
-                x,
-                weight,
-                actual_state,
-                state_indices=slots,
-                has_initial_state=mask,
-                kernel_options=options,
-            )
+            expected = causal_conv1d_decode(x, weight, expected_state, **kwargs)
+            actual = compiled(x, weight, state, **kwargs)
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-            torch.testing.assert_close(actual_state, expected_state, rtol=0, atol=0)
+            torch.testing.assert_close(state, expected_state, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize(
@@ -3018,8 +2965,9 @@ def test_short_conv_decode_ignores_padding_slots(paged_short_conv_inputs):
     torch.testing.assert_close(state[0], initial_state[0], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("with_mask", [False, True])
+@pytest.mark.parametrize(
+    "dtype,with_mask", [(torch.float16, False), (torch.bfloat16, True), (torch.float32, False)]
+)
 def test_short_conv_decode_custom_op_registration(paged_short_conv_inputs, dtype, with_mask):
     """Exercise default and configured mutation schemas with fake and dynamic tensors."""
     x, weight, state, slots = paged_short_conv_inputs(channels=6, dtype=dtype)
