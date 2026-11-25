@@ -110,6 +110,11 @@ What the layer supplies, checks and leaves to you:
     group-TWO/multicast G2S atoms; it neither walks nested objects nor obeys `unchecked("tma")`.
     See [TMA checks](tracing.md#tma-checks) for pointer/atom spellings.
 
+    TMA stores are yours: fence the shared-memory writes they read and wait for them before the
+    role returns. `ptx_check.check_bulk_copies` checks both on a compiled kernel's PTX
+    ([dropping down](dropping-down.md#hand-written-tma-stores)); nothing runs it at compile
+    time.
+
 7. <a id="fences"></a>**Fences.** Managed signals emit the declared fences, except the release
     of `consume_unread()`, which follows its wait with nothing in between and so has no access
     to order ([storage and fences](channels.md#storage-and-fences)). Defaults order

@@ -158,6 +158,23 @@ waits when it issues no access of that kind or completes the last one on every p
 `check_tcgen05_sync` on every configuration the skips depend on: the layer records them in
 `describe()` but does not prove them ([thread-sync](guarantees.md#thread-sync)).
 
+### Hand-written TMA stores
+
+A role that stores to shared memory and TMA-stores it by hand needs
+`cute.arch.fence_view_async_shared()` between the two and, before it returns, a
+`cp_async_bulk_commit_group()` and `cp_async_bulk_wait_group(0, read=True)`.
+`ptx_check.check_bulk_copies(ptx)` reports a thread that can reach a bulk copy out of its CTA's
+shared memory (a TMA store, a `cp.async.bulk` or `cp.reduce.async.bulk`) from its own
+shared-memory store without the fence, or can return without the commit and wait.
+
+The check leaves out the paths that a test of the thread ID rules out, so a store in one role
+and a copy in another are not paired, and a store under `if warp == 0` meets its wait under a
+second `if warp == 0`. That needs a one-dimensional `.reqntid` block; a condition on data or
+`elect.sync` is taken both ways, so a copy and its wait under two tests of such a condition are
+reported. It does not compare the stored and the copied buffers, does not see another thread's
+store or one through a generic address, and treats only the kernel's return as the end of a
+role.
+
 ### Override counts, bytes or masks
 
 ```python
