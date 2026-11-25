@@ -68,7 +68,8 @@ FAMILIES = {
 }
 SUPPORTED_MODELS = (
     "Qwen3 dense and MoE (e.g. Qwen/Qwen3-0.6B, Qwen/Qwen3-30B-A3B) or Inkling 2 Mini "
-    "(thinkingmachines/Inkling-2-Mini), as a Hub repo or a local checkpoint directory"
+    "(thinkingmachines/Inkling-2-Mini or thinkingmachines/TML-d24-varloop-research), "
+    "as a Hub repo or a local checkpoint directory"
 )
 
 app = typer.Typer(add_completion=False, help=__doc__.splitlines()[0])
@@ -143,6 +144,7 @@ class ChatOptions:
     yarn_factor: float | None = None  # Qwen3 YaRN
     reasoning_effort: str | None = None  # Inkling
     verify_tokens: int | None = None  # Inkling speculative verify block
+    loops: int | None = None  # Inkling target core passes
 
 
 def quiet_libraries():
@@ -546,6 +548,11 @@ def main(
         help="Inkling thinking effort: none, minimal, low (default), medium, high, xhigh, max "
         "or 0-0.99",
     ),
+    loops: int | None = typer.Option(
+        None,
+        min=1,
+        help="Inkling target core passes (checkpoint default; Varloop trained with 1–5)",
+    ),
     verify_tokens: int | None = typer.Option(
         None, help="Inkling speculative backends' verify block k (default 4)"
     ),
@@ -564,6 +571,7 @@ def main(
         yarn_factor=yarn_factor,
         reasoning_effort=reasoning_effort,
         verify_tokens=verify_tokens,
+        loops=loops,
     )
     check_options(family, options)
     # Before the spinner (it garbles bars); the backend chooses the checkpoint files.

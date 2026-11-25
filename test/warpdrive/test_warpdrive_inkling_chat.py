@@ -1,10 +1,14 @@
 """Inkling chat options and history: the files, cache capacities and decoding modes a backend
 takes, and a parsed reply re-rendering to the tokens the model generated."""
 
+from dataclasses import dataclass
+from unittest.mock import Mock
+
 import pytest
 import typer
 from inkling_checkpoint import MODEL
 
+from attn_gym.warpdrive.examples.inkling_megakernel import chat
 from attn_gym.warpdrive.examples.inkling_megakernel.chat import (
     SPEC_TOKENS,
     assistant_message,
@@ -118,3 +122,27 @@ def test_verify_tokens_pick_the_block(backend, given, k):
 def test_verify_tokens_rejects_other_blocks_and_backends(backend, given):
     with pytest.raises(typer.BadParameter, match="--verify-tokens"):
         check_options(ChatOptions(backend, verify_tokens=given))
+
+
+def test_target_core_loop_override():
+    check_options(ChatOptions("megakernel", loops=2))
+    with pytest.raises(typer.BadParameter, match="positive"):
+        check_options(ChatOptions("megakernel", loops=0))
+    with pytest.raises(typer.BadParameter, match="fixed feature visits"):
+        check_options(ChatOptions("megakernel-spec", loops=2))
+
+
+@pytest.mark.parametrize(("loops", "visits"), [(None, 48), (2, 36), (50, 612)])
+def test_target_cache_and_backend_share_loop_schedule(tmp_path, monkeypatch, loops, visits):
+    transformers = pytest.importorskip("transformers")
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", Mock(return_value=Mock()))
+
+    @dataclass(frozen=True)
+    class Weights:
+        config: chat.ref.InklingConfig
+
+    monkeypatch.setattr(chat, "load_inkling_weights", lambda _: Weights(chat.ref.InklingConfig()))
+    allocate = chat.InklingCache.empty
+    monkeypatch.setattr(chat.InklingCache, "empty", lambda c, n: allocate(c, n, device="meta"))
+    model = chat.InklingChatModel(tmp_path, ChatOptions("reference", loops=loops))
+    assert model.backend.weights.config.num_visits == model.backend.cache.k.shape[0] == visits
