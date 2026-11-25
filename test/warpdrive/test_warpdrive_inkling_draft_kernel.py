@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("cutlass.cute")
 
+from attn_gym.testing.kda import assert_relative_rms_within
 from attn_gym.warpdrive.examples.inkling_megakernel.draft import DSparkMegakernel
 from attn_gym.warpdrive.examples.inkling_megakernel.dspark import (
     DSparkConfig,
@@ -198,5 +199,6 @@ def test_spark_checkpoint_shape_drafts(monkeypatch):
     # Across three rounded decoder layers, compare each mask state at its row's bf16 scale.
     states = reference.block_states(17, 8)[1:]
     assert row_ulps(kernels.hidden[:7], states, c.hidden_size).max() <= 2
+    assert_relative_rms_within(kernels.hidden[:7], states, "backbone states", max_eps=1)
     expected = reference.markov_drafts(kernels.hidden[:7], 17)[:3]
     assert torch.equal(actual, expected)
