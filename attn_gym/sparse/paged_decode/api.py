@@ -114,13 +114,15 @@ def _validate_inputs(
     topk_length: Tensor | None,
     window_kv: PagedKV | None,
     attention_sink: Tensor | None,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None,
     index_block_size: int,
     window_size: int,
 ) -> None:
     """Validate metadata only: reading tensor contents would synchronize CUDA execution."""
-    if type(max_seqlen_q) is not int or max_seqlen_q < 1:
-        raise ValueError(f"max_seqlen_q must be a positive Python int, got {max_seqlen_q!r}.")
+    if max_seqlen_q is not None and (type(max_seqlen_q) is not int or max_seqlen_q < 1):
+        raise ValueError(
+            f"max_seqlen_q must be None or a positive Python int, got {max_seqlen_q!r}."
+        )
     if type(index_block_size) is not int or index_block_size < 1:
         raise ValueError(
             f"index_block_size must be a positive Python int, got {index_block_size!r}."
@@ -192,13 +194,14 @@ def paged_sparse_decode(
     cu_seqlens_q: Tensor,
     seqused_k: Tensor,
     *,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None = None,
     topk_length: Tensor | None = None,
     index_block_size: int = 1,
     window_size: int = 0,
     window_kv: PagedKV | None = None,
     attention_sink: Tensor | None = None,
     scale: float | None = None,
+    causal_topk: bool = False,
     impl: Impl | str = Impl.FUSED,
     return_aux: None = ...,
 ) -> Tensor: ...
@@ -212,13 +215,14 @@ def paged_sparse_decode(
     cu_seqlens_q: Tensor,
     seqused_k: Tensor,
     *,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None = None,
     topk_length: Tensor | None = None,
     index_block_size: int = 1,
     window_size: int = 0,
     window_kv: PagedKV | None = None,
     attention_sink: Tensor | None = None,
     scale: float | None = None,
+    causal_topk: bool = False,
     impl: Impl | str = Impl.FUSED,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, PagedSparseDecodeAux]: ...
@@ -231,13 +235,14 @@ def paged_sparse_decode(
     cu_seqlens_q: Tensor,
     seqused_k: Tensor,
     *,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None = None,
     topk_length: Tensor | None = None,
     index_block_size: int = 1,
     window_size: int = 0,
     window_kv: PagedKV | None = None,
     attention_sink: Tensor | None = None,
     scale: float | None = None,
+    causal_topk: bool = False,
     impl: Impl | str = Impl.FUSED,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, PagedSparseDecodeAux]:
@@ -280,8 +285,11 @@ def paged_sparse_decode(
         cu_seqlens_q: Contiguous int32 ``[num_sequences + 1]`` packed query offsets.
         seqused_k: Contiguous int32 ``[num_sequences]`` key count per sequence within the
             window source, including the current queries; it determines their positions.
-        max_seqlen_q: Host-side upper bound on any sequence's query count, such as
-            ``1 + num_speculative_tokens``. Queries past it produce undefined output.
+        max_seqlen_q: Optional host-side upper bound on any sequence's query count, such as
+            ``1 + num_speculative_tokens``. Queries past it produce undefined output. None
+            (default) launches one program per packed row, which finds its sequence in
+            ``cu_seqlens_q`` on the device, so any mix of query counts (for example packed
+            prefill and decode rows) needs no host bound or per-row metadata.
         topk_length: Optional contiguous int32 ``[tokens]`` prefix lengths, clamped to
             ``[0, topk]``. Only this prefix of each row is read, so short rows can skip trailing
             padding. Defaults to all ``topk`` columns.
@@ -295,6 +303,19 @@ def paged_sparse_decode(
             ``exp(sink)`` to the softmax denominator and contributes no value. It is not
             scaled.
         scale: Positive logit multiplier. Defaults to ``1 / sqrt(head_dim)``.
+        causal_topk: Promise that each row's selection is a top-k of its complete blocks, as
+            a paged lightning indexer returns: distinct ids of blocks ending at or before
+            the query position, and every complete block when a row has at most ``topk``
+            complete blocks (``(p + 1) // index_block_size <= topk``). Requires a shared
+            window source. The fused path then attends each sequence with more than four
+            queries in tiles of consecutive rows that load each K/V chunk once per tile, instead
+            of once per row, and reads no indices for rows with at most ``topk`` complete blocks.
+            Sequences of at most four queries (decode, speculative suffixes), and rows at
+            positions of at least ``4 * topk * index_block_size``, keep one program per row.
+            ``max_seqlen_q`` is not needed. Head dims above 256 are not supported by this
+            schedule.
+            Results match the default schedule up to floating-point summation order when the
+            promise holds and are unspecified otherwise; the reference ignores this flag.
         impl: ``Impl.FUSED`` (default) runs the Triton kernel on CUDA. ``Impl.REFERENCE`` runs
             eager PyTorch on CPU or CUDA.
         return_aux: If None (default), return only the output. If an AuxRequest, return
@@ -318,6 +339,10 @@ def paged_sparse_decode(
         index_block_size,
         window_size,
     )
+    if type(causal_topk) is not bool:
+        raise TypeError(f"causal_topk must be a bool, got {causal_topk!r}.")
+    if causal_topk and window_kv is not None:
+        raise ValueError("causal_topk requires a shared window source (window_kv=None).")
     if scale is None:
         scale = query.shape[-1] ** -0.5
     if not scale > 0:
@@ -355,6 +380,7 @@ def paged_sparse_decode(
                 index_block_size,
                 window_size,
                 scale,
+                causal_topk,
             )
             if return_lse:
                 out, lse = decode_with_lse_op(*args)

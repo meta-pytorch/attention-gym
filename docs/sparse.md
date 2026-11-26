@@ -448,4 +448,78 @@ python benchmarks/sparse/paged_sparse_decode_benchmark.py \
   --json agent_space/paged_decode_cold.json
 ```
 
+### Packed prefill and decode steps
+
+A serving engine that replays mixed steps in CUDA graphs pads the packed rows to a capture size
+and cannot read query counts back to the host. Pass the per-request metadata unchanged and
+`max_seqlen_q=None`: the grid then depends only on static sizes and each program finds its row's
+sequence in `cu_seqlens_q`, as `paged_lightning_indexer` does. Rows past `cu_seqlens_q[-1]`
+are left unspecified.
+
+```python
+block_ids = paged_lightning_indexer(..., cu_seqlens_q, seqused_k, topk=512, compress_ratio=4)
+out = paged_sparse_decode(
+    query,              # [padded_tokens, heads, head_dim]: decode rows and prompt rows
+    PagedKV(key_cache, value_cache, kv_table),  # per-request table, no per-row copy
+    block_ids,
+    cu_seqlens_q,       # int32 [requests + 1]; padding requests are empty
+    seqused_k,
+    max_seqlen_q=None,
+    index_block_size=4,
+    causal_topk=True,   # block_ids are a top-k of complete blocks
+)
+```
+
+Rows of one prompt share most of their keys, yet per-row programs load every key once per row.
+`causal_topk=True` promises the indexer's contract (distinct complete blocks; every complete block
+when a row has at most `topk`) and switches the fused path to a schedule that reuses K/V:
+
+```text
+request with n > 4 queries           request with n <= 4 queries (decode)
+rows r0 r1 ... r9 | r10 ... r19 | .. row r
+     query tile   |  query tile         per-row program (+ split merge)
+     128 lanes = 10 rows x 12 heads
+     walks entries 0..p_last in 64-entry chunks, one K/V load per chunk:
+       dense row  ((p+1)//4 <= topk): entries 0..p
+       sparse row: window + bitmap of selected blocks
+rows at p >= 4 * topk * index_block_size: per-row programs (one split)
+```
+
+- Query tiles cover multi-query sequences up to position `4 * topk * index_block_size`
+  (8192 for QSA). Dense rows read no indices. Sparse rows attend every entry before their
+  position under a bitmap of their selected blocks, built by a small pre-pass, so their work
+  grows with the context; past the limit, per-row programs that read only the selected entries
+  are faster.
+- Sequences of at most four queries (decode rows, speculative suffixes) keep per-row programs
+  with split selection; on Hopper and Blackwell they run concurrently with the tiles through
+  programmatic dependent launch.
+- Chunk boundaries are fixed multiples of 64 entries, and a chunk a row cannot see leaves its
+  softmax state unchanged, so a row's output does not depend on its tile neighbors. Results
+  differ from the per-row schedule only in summation order.
+- Only shared window sources and head dims up to 256 are supported; other inputs raise.
+
+On GB300 with Qwen3.8-Flash-Next QSA shapes (24/2 heads, head dim 256, 512 x 4-token blocks,
+page 1568), per-layer CUDA-graph replay times for packed steps padded to capture sizes are
+(decode rows at context 2100; `gather` gathers each prompt's K/V for `gather_attn`, needs host
+counts, and reports eager kernel time):
+
+| Layout | Per-row sequences | `causal_topk` | `gather` |
+|---|---:|---:|---:|
+| 16 decode + 2 x 137 | 51.6 us | 46.3 us | 143.5 us |
+| 64 decode + 8 x 210 | 139.1 us | 119.3 us | 271.2 us |
+| 32 x 256 | 406.0 us | 262.1 us | 663.3 us |
+| 64 decode + 8 x 1000 | 954.5 us | 438.3 us | 827.6 us |
+| 2 x 4096 | 2395.3 us | 1034.2 us | 1360.0 us |
+| 1 x 8192 | 2744.6 us | 1924.5 us | 1970.6 us |
+| 16384-token prompt, second 8192-row chunk | 3095.8 us | 3153.8 us | 5258.3 us |
+| 8 x 3-query suffixes at 16k | 20.3 us | 34.7 us | 946.7 us |
+| 64 x 3-query suffixes at 8k | 128.4 us | 147.3 us | 3555.5 us |
+| 64-row chunk at 16k | 37.4 us | 75.6 us | 242.3 us |
+
+"Per-row sequences" passes each row as a one-query sequence with a copied block-table row.
+Requests are padded to 128 as a serving engine's capture metadata is. `max_seqlen_q=None` alone is
+within 4% of per-row sequences. Steps of only short sequences (decode, speculative suffixes) should
+keep the host-bound call: `causal_topk` adds 3-9 us of mostly empty bitmap, tile, and long-row
+launches, and sizes splits for up to four queries per request.
+
 ::: attn_gym.sparse.paged_decode.paged_sparse_decode

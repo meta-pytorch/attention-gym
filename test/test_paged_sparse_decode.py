@@ -256,20 +256,146 @@ SCENARIOS = {
 
 
 @requires_cuda
+@pytest.mark.parametrize("row_grid", [False, True])
 @pytest.mark.parametrize("name", SCENARIOS)
-def test_fused_matches_reference(name):
-    _assert_matches_reference(make_paged_sparse_decode_inputs(**SCENARIOS[name]))
+def test_fused_matches_reference(name, row_grid):
+    inputs = make_paged_sparse_decode_inputs(**SCENARIOS[name])
+    if row_grid:
+        inputs["max_seqlen_q"] = None
+    _assert_matches_reference(inputs)
+
+
+# Selections from make_paged_sparse_decode_inputs are distinct complete blocks and include all of
+# them when a row has at most topk, as causal_topk requires.
+CAUSAL_TOPK_SCENARIOS = {
+    "dense_prefill_and_decode": {"seqlens": [300, 2100, 50, 0], "query_lens": [137, 1, 50, 0]},
+    "sparse_prefill_rows": {"seqlens": [2600, 2100], "query_lens": [700, 1]},
+    "qsa_mtp": SCENARIOS["qsa_mtp"],
+    "shared_window_sink": {
+        "seqlens": [2600, 3000, 40],
+        "query_lens": [700, 13, 1],
+        "window_size": 100,
+        "attention_sink": True,
+    },
+    "scattered_padding_page_6": {
+        "seqlens": [2600, 30],
+        "query_lens": [700, 3],
+        "topk_length": False,
+        "page_size": 6,
+    },
+    "token_topk": {
+        "seqlens": [900, 200, 1000],
+        "query_lens": [300, 20, 1],
+        "index_block_size": 1,
+        "topk": 256,
+        "heads": 16,
+        "kv_heads": 1,
+        "head_dim": 128,
+    },
+    "more_queries_than_keys": SCENARIOS["more_queries_than_keys"],
+    "fp16": {"seqlens": [2000, 30], "query_lens": [40, 1], "dtype": torch.float16},
+    "large_head_group": SCENARIOS["large_head_group"],
+    # Speculative suffixes (at most 4 queries) keep split per-row programs, even past the limit.
+    "short_suffix_past_tile_limit": {
+        "seqlens": [600],
+        "query_lens": [2],
+        "topk": 16,
+        "heads": 6,
+        "kv_heads": 1,
+    },
+    "few_rows_past_tile_limit": {
+        "seqlens": [600],
+        "query_lens": [6],
+        "topk": 16,
+        "heads": 6,
+        "kv_heads": 1,
+    },
+    # topk=16 puts the tile limit at position 256: later prompt rows use per-row programs.
+    "rows_past_tile_limit": {
+        "seqlens": [600, 300, 900],
+        "query_lens": [600, 50, 1],
+        "topk": 16,
+        "attention_sink": True,
+    },
+}
+
+
+@requires_cuda
+@pytest.mark.parametrize("name", CAUSAL_TOPK_SCENARIOS)
+def test_causal_topk_matches_reference(name):
+    inputs = make_paged_sparse_decode_inputs(**CAUSAL_TOPK_SCENARIOS[name])
+    _assert_matches_reference({**inputs, "max_seqlen_q": None}, causal_topk=True)
+
+
+@requires_cuda
+def test_causal_topk_rows_start_at_different_chunks():
+    """A sparse row may see nothing in a key chunk that its tile neighbors see.
+
+    Alternate rows select blocks 0..511 and 16..527, so odd rows see no entry of the first
+    64-entry chunk while even rows do; their softmax state must stay finite and exact.
+    """
+    inputs = make_paged_sparse_decode_inputs([2600], [30])
+    blocks = torch.arange(512, dtype=torch.int32, device="cuda")
+    inputs["indices"] = torch.stack([blocks + 16 * (row % 2) for row in range(30)])
+    inputs["topk_length"] = torch.full((30,), 512, dtype=torch.int32, device="cuda")
+    _assert_matches_reference({**inputs, "max_seqlen_q": None}, causal_topk=True)
+
+
+@requires_cuda
+def test_causal_topk_rows_ignore_tile_neighbors():
+    """A query tile row's output depends only on its own keys, not on which rows share the tile.
+
+    Shortening a prompt's query suffix regroups its remaining rows into different tiles that end
+    at different positions; both dense and sparse rows must stay bitwise identical.
+    """
+    inputs = make_paged_sparse_decode_inputs([2600], [700])
+    full = paged_sparse_decode(**inputs, causal_topk=True)
+    for kept in (699, 13, 5):
+        suffix = {
+            **inputs,
+            "query": inputs["query"][-kept:],
+            "indices": inputs["indices"][-kept:],
+            "topk_length": inputs["topk_length"][-kept:],
+            "cu_seqlens_q": torch.tensor([0, kept], dtype=torch.int32, device="cuda"),
+        }
+        assert torch.equal(paged_sparse_decode(**suffix, causal_topk=True), full[-kept:])
+
+
+@requires_cuda
+def test_causal_topk_reuses_kernels(triton_compiles):
+    """Row, sequence, and capacity changes must reuse one tile and one bitmap kernel.
+
+    Every case's cache can hold more than topk complete blocks; smaller caches compile a tile
+    variant without the bitmap.
+    """
+    compiled = torch.compile(paged_sparse_decode, fullgraph=True, dynamic=True)
+    for seqlens, query_lens in (
+        ([2600, 2100], [700, 1]),
+        ([300, 50, 2100, 2100], [16, 50, 1, 1]),
+        ([5000, 17], [33, 17]),
+        ([3000, 64], [1, 64]),
+    ):
+        inputs = make_paged_sparse_decode_inputs(seqlens, query_lens)
+        out = compiled(**{**inputs, "max_seqlen_q": None}, causal_topk=True)
+        expected = paged_sparse_decode(**inputs, impl="reference")
+        assert_relative_rms_within(out, expected.double(), f"{query_lens}", max_eps=2.0)
+    assert triton_compiles["_paged_query_tile_kernel"] == 1
+    assert triton_compiles["_selection_bitmap_kernel"] == 1
 
 
 @requires_cuda
 @pytest.mark.parametrize("splits", [1, 2, 7, 64])
-def test_split_counts_agree(splits, monkeypatch):
-    """Changing the split count preserves attention; empty splits contribute nothing."""
+@pytest.mark.parametrize("causal_topk", [False, True])
+def test_split_counts_agree(splits, causal_topk, monkeypatch):
+    """Changing the split count preserves attention; empty splits contribute nothing.
+
+    With causal_topk, partials of the single-query sequences are indexed by sequence.
+    """
     from attn_gym.sparse.paged_decode.impl import triton
 
-    inputs = make_paged_sparse_decode_inputs([3000, 300], [1, 2], attention_sink=True)
+    inputs = make_paged_sparse_decode_inputs([3000, 300, 2500], [1, 2, 1], attention_sink=True)
     monkeypatch.setattr(triton, "_choose_splits", lambda *args: splits)
-    _assert_matches_reference(inputs)
+    _assert_matches_reference(inputs, causal_topk=causal_topk)
 
 
 @requires_cuda
@@ -305,6 +431,41 @@ def test_cuda_graph_replay_tracks_new_inputs(small):
     graph.replay()
     expected = paged_sparse_decode(**inputs, impl="reference")
     assert_relative_rms_within(out, expected.double(), "graph replay", max_eps=2.0)
+
+
+@requires_cuda
+@pytest.mark.parametrize("causal_topk", [False, True])
+def test_row_grid_tracks_packed_layout_changes(causal_topk):
+    """One captured launch sequence serves any split of its rows into sequences.
+
+    Like a serving engine's padded batch, both layouts end in an empty sequence and leave
+    capacity-tail rows past ``cu_seqlens_q[-1]``; those rows are unspecified and not compared.
+    """
+    layouts = (([3003, 900, 64, 0], [1, 5, 9, 0]), ([17, 3003, 5, 0], [1, 12, 2, 0]))
+    inputs, fresh = (
+        make_paged_sparse_decode_inputs(seqlens, query_lens, seed=seed)
+        for seed, (seqlens, query_lens) in enumerate(layouts)
+    )
+    capacity = inputs["query"].shape[0] + 3
+    for args in (inputs, fresh):
+        rows = args["query"].shape[0]
+        for name in ("query", "indices", "topk_length"):
+            args[name] = torch.cat(
+                (args[name], args[name][:1].expand(capacity - rows, *args[name].shape[1:]))
+            )
+        args["max_seqlen_q"] = None
+    paged_sparse_decode(**inputs, causal_topk=causal_topk)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = paged_sparse_decode(**inputs, causal_topk=causal_topk)
+    for name in ("query", "indices", "topk_length", "cu_seqlens_q", "seqused_k"):
+        inputs[name].copy_(fresh[name])
+    for field in ("key_cache", "value_cache", "block_table"):
+        getattr(inputs["kv"], field).copy_(getattr(fresh["kv"], field))
+    graph.replay()
+    expected = paged_sparse_decode(**fresh, impl="reference")
+    rows = int(fresh["cu_seqlens_q"][-1])
+    assert_relative_rms_within(out[:rows], expected[:rows].double(), "row grid", max_eps=2.0)
 
 
 @requires_cuda
@@ -504,7 +665,9 @@ def test_oversized_block_ids_are_ignored(separate_window):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("permuted", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
-def test_opcheck(dtype, permuted, return_lse):
+@pytest.mark.parametrize("row_grid", [False, True])
+@pytest.mark.parametrize("causal_topk", [False, True])
+def test_opcheck(dtype, permuted, return_lse, row_grid, causal_topk):
     inputs = make_paged_sparse_decode_inputs(
         [40, 23], [1, 2], heads=6, kv_heads=1, head_dim=32, topk=16, dtype=dtype
     )
@@ -530,10 +693,11 @@ def test_opcheck(dtype, permuted, return_lse):
             None,
             None,
             None,
-            inputs["max_seqlen_q"],
+            None if row_grid else inputs["max_seqlen_q"],
             inputs["index_block_size"],
             inputs["window_size"],
             query.shape[-1] ** -0.5,
+            causal_topk,
         ),
     )
 
@@ -548,6 +712,12 @@ def test_opcheck(dtype, permuted, return_lse):
         (lambda i: {"window_size": -1}, ValueError, "window_size"),
         (lambda i: {"attention_sink": torch.zeros(3)}, ValueError, "attention_sink"),
         (lambda i: {"topk_length": i["topk_length"][:1]}, ValueError, "topk_length"),
+        (lambda i: {"causal_topk": 1}, TypeError, "causal_topk must be a bool"),
+        (
+            lambda i: {"causal_topk": True, "window_kv": i["kv"]},
+            ValueError,
+            "shared window source",
+        ),
         (lambda i: {"query": i["query"].requires_grad_()}, ValueError, "forward-only"),
         (
             lambda i: {"attention_sink": torch.zeros(i["query"].shape[1], requires_grad=True)},
@@ -572,3 +742,6 @@ def test_fused_rejects_unsupported_head_dims():
     inputs = make_paged_sparse_decode_inputs([100], [1], heads=2, kv_heads=1, head_dim=96)
     with pytest.raises(ValueError, match="power of two"):
         paged_sparse_decode(**inputs)
+    wide = make_paged_sparse_decode_inputs([100], [2], heads=8, kv_heads=1, head_dim=512)
+    with pytest.raises(ValueError, match="causal_topk only for head dims up to 256"):
+        paged_sparse_decode(**wide, causal_topk=True)

@@ -12,7 +12,8 @@ _SCHEMA_ARGS = (
     "(Tensor query, Tensor key_cache, Tensor value_cache, Tensor block_table, Tensor indices,"
     " Tensor cu_seqlens_q, Tensor seqused_k, Tensor? topk_length, Tensor? window_key_cache,"
     " Tensor? window_value_cache, Tensor? window_block_table, Tensor? attention_sink,"
-    " SymInt max_seqlen_q, int index_block_size, int window_size, float scale)"
+    " SymInt? max_seqlen_q, int index_block_size, int window_size, float scale,"
+    " bool causal_topk)"
 )
 # Separate schemas let tracing know the output structure without an optional Tensor result.
 torch.library.define("attn_gym::paged_sparse_decode", _SCHEMA_ARGS + " -> Tensor")

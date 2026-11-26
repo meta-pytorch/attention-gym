@@ -1,9 +1,11 @@
 """Paged sparse decode without materializing expanded entries or physical addresses.
 
-The producer grid is ``(num_sequences, max_seqlen_q * kv_heads, num_splits)``. Its middle axis
-packs ``query_within_sequence * kv_heads + kv_head``. Each program serves one query row and one
-KV head's consecutive query-head group. Programs beyond a sequence's query count read metadata
-but write no results.
+With a host ``max_seqlen_q``, the producer grid is ``(num_sequences, max_seqlen_q * kv_heads,
+num_splits)``. Its middle axis packs ``query_within_sequence * kv_heads + kv_head``. Programs
+beyond a sequence's query count read metadata but write no results. Without it, the grid is
+``(rows, kv_heads, num_splits)`` and each program binary-searches ``cu_seqlens_q`` for its row's
+sequence. Either way, each program serves one query row and one KV head's consecutive query-head
+group.
 
 A row's key tiles are ordered sparse first, window second. Split ``s`` takes tiles
 ``s, s + num_splits, ...``. Sparse columns expand block ids into logical entries; window columns
@@ -28,7 +30,14 @@ import triton
 import triton.language as tl
 from torch import Tensor
 
-from attn_gym._backends.triton.utils import offset_strides, ptr_offset, requires_int64_offsets
+from attn_gym._backends.triton.utils import (
+    _document_ids,
+    offset_strides,
+    ptr_offset,
+    requires_int64_offsets,
+)
+
+from . import triton_tiles
 
 # log2(e) and ln(2) stay literals: Triton rechecks every module global a kernel reads on each
 # launch, and reading the shared LOG2_E/LN_2 constexprs added about 5 us of host time per call
@@ -129,7 +138,9 @@ def _natural_lse(m, l):
 @triton.jit(
     do_not_specialize=[
         "num_rows",
+        "num_sequences",
         "num_splits",
+        "min_position",
         "topk",
         "stride_table",
         "table_width",
@@ -156,7 +167,9 @@ def _paged_sparse_decode_kernel(
     PartialOut,
     PartialStats,
     num_rows,
+    num_sequences,
     num_splits,
+    min_position,
     stride_q_row,
     stride_q_head,
     stride_k_page,
@@ -197,22 +210,45 @@ def _paged_sparse_decode_kernel(
     BLOCK_N: tl.constexpr,
     K_ROWS: tl.constexpr,
     SINGLE_TILE: tl.constexpr,
+    ROW_GRID: tl.constexpr,
+    SHORT_QUERIES: tl.constexpr,
+    LONG_ROWS: tl.constexpr,
     USE_PDL: tl.constexpr,
     USE_INT64_OFFSETS: tl.constexpr,
 ):
-    # A sequence-based grid avoids searching cu_seqlens_q to map a packed row to its sequence.
-    sequence = tl.program_id(0)
-    query = tl.program_id(1) // KV_HEADS
     kv_head = tl.program_id(1) % KV_HEADS
     split = tl.program_id(2)
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
 
-    query_start = tl.load(CuQ + sequence)
-    query_end = tl.load(CuQ + sequence + 1)
-    row = query_start + query
+    if ROW_GRID:
+        # Without a host bound on queries per sequence, each program owns one packed row and
+        # searches cu_seqlens_q for its sequence. Capacity-tail rows find num_sequences.
+        row = tl.program_id(0)
+        sequence = _document_ids(CuQ, row, num_sequences, False)
+        has_row = sequence < num_sequences
+        sequence = tl.where(has_row, sequence, 0)
+        query_end = tl.load(CuQ + sequence + 1)
+        if LONG_ROWS:
+            # Query tiles own multi-query rows before min_position and short-sequence rows.
+            multi_query = query_end - tl.load(CuQ + sequence) > SHORT_QUERIES
+            long_row = tl.load(SeqUsed + sequence) - (query_end - row) >= min_position
+            has_row &= multi_query & long_row
+            # Most rows of this launch belong to tiles or short-sequence programs.
+            if not has_row:
+                return
+    else:
+        # A sequence-based grid avoids searching cu_seqlens_q to map a packed row to its
+        # sequence.
+        sequence = tl.program_id(0)
+        query_start = tl.load(CuQ + sequence)
+        query_end = tl.load(CuQ + sequence + 1)
+        row = query_start + tl.program_id(1) // KV_HEADS
+        has_row = row < query_end
+        if SHORT_QUERIES:
+            # Query tiles own the rows of sequences with more queries.
+            has_row &= query_end - query_start <= SHORT_QUERIES
     position = tl.load(SeqUsed + sequence) - (query_end - row)
-    has_row = row < query_end
     active = has_row & (position >= 0)
     row = tl.where(has_row, row, 0)
     if USE_INT64_OFFSETS:
@@ -407,7 +443,14 @@ def _paged_sparse_decode_kernel(
             lse = _natural_lse(m_i, l_i)
             tl.store(Lse + row.to(tl.int64) * NUM_HEADS + first_head + heads, lse, mask=head_mask)
     else:
-        partial_row = (split.to(tl.int64) * num_rows + row) * NUM_HEADS + first_head + heads
+        # Short-sequence launches index partials by (sequence, query); num_rows counts those.
+        if SHORT_QUERIES and not ROW_GRID:
+            partial_index = sequence * SHORT_QUERIES + tl.program_id(1) // KV_HEADS
+        else:
+            partial_index = row
+        partial_row = (
+            (split.to(tl.int64) * num_rows + partial_index) * NUM_HEADS + first_head + heads
+        )
         # The merge reads every split for each real row/head, so empty splits must write
         # (acc=0, max=-inf, sum=0). Unnormalized sums avoid a division and log2 per split
         # followed by exp2 to reconstruct merge weights.
@@ -420,19 +463,25 @@ def _paged_sparse_decode_kernel(
         tl.store(PartialStats + 2 * partial_row + 1, l_i, mask=head_mask)
 
 
-@triton.jit(do_not_specialize=["num_rows", "num_splits"])
+@triton.jit(do_not_specialize=["num_rows", "num_sequences", "num_splits", "min_position"])
 def _merge_splits_kernel(
     PartialOut,
     PartialStats,
     Sink,
+    CuQ,
+    SeqUsed,
     Out,
     Lse,
     num_rows,
+    num_sequences,
     num_splits,
+    min_position,
     stride_out_row,
     stride_out_head,
     HAS_SINK: tl.constexpr,
     RETURN_LSE: tl.constexpr,
+    SHORT_QUERIES: tl.constexpr,
+    LONG_ROWS: tl.constexpr,
     NUM_HEADS: tl.constexpr,
     HEAD_DIM_V: tl.constexpr,
     BLOCK_SPLITS: tl.constexpr,
@@ -441,14 +490,34 @@ def _merge_splits_kernel(
 ):
     # Disjoint value tiles bound each 2-warp program's register use: merging the whole
     # [splits, head_dim_v] tile spilled and serialized small batches at high split counts.
-    row = tl.program_id(0)
+    partial_index = tl.program_id(0)
     head = tl.program_id(1)
+    if LONG_ROWS:
+        # Only long rows produced partials; other rows' outputs belong to other launches.
+        row = partial_index
+        sequence = _document_ids(CuQ, row, num_sequences, False)
+        if sequence >= num_sequences:
+            return
+        query_start = tl.load(CuQ + sequence)
+        query_end = tl.load(CuQ + sequence + 1)
+        position = tl.load(SeqUsed + sequence) - (query_end - row)
+        if (query_end - query_start <= SHORT_QUERIES) | (position < min_position):
+            return
+    elif SHORT_QUERIES:
+        # One program per (sequence, query); only short sequences produced partials.
+        sequence = partial_index // SHORT_QUERIES
+        row = tl.load(CuQ + sequence) + partial_index % SHORT_QUERIES
+        end = tl.load(CuQ + sequence + 1)
+        if (row >= end) | (end - tl.load(CuQ + sequence) > SHORT_QUERIES):
+            return
+    else:
+        row = partial_index
     if USE_PDL:
         # Programmatic dependent launch can start this kernel before the partials are ready.
         tl.extra.cuda.gdc_wait()
     splits = tl.arange(0, BLOCK_SPLITS)
     dims = tl.program_id(2) * BLOCK_D + tl.arange(0, BLOCK_D)
-    partial_row = (splits.to(tl.int64) * num_rows + row) * NUM_HEADS + head
+    partial_row = (splits.to(tl.int64) * num_rows + partial_index) * NUM_HEADS + head
     maxima = tl.load(PartialStats + 2 * partial_row, mask=splits < num_splits, other=float("-inf"))
     sums = tl.load(PartialStats + 2 * partial_row + 1, mask=splits < num_splits, other=0.0)
     m = tl.max(maxima, axis=0)
@@ -556,10 +625,11 @@ def paged_sparse_decode(
     window_value_cache: Tensor | None,
     window_block_table: Tensor | None,
     attention_sink: Tensor | None,
-    max_seqlen_q: int,
+    max_seqlen_q: int | None,
     index_block_size: int,
     window_size: int,
     scale: float,
+    causal_topk: bool,
     *,
     return_lse: bool,
 ) -> tuple[Tensor, Tensor | None]:
@@ -584,6 +654,16 @@ def paged_sparse_decode(
         raise ValueError(
             f"The fused paged_sparse_decode needs float16 or bfloat16 inputs, got {query.dtype}."
         )
+    if causal_topk and block_table.shape[1] * key_cache.shape[1] > 2**31 - 1:
+        raise ValueError(
+            "The fused paged_sparse_decode supports causal_topk only for block-table capacities "
+            "below 2^31 entries; use causal_topk=False."
+        )
+    if causal_topk and max(head_dim, head_dim_v) > 256:
+        raise ValueError(
+            "The fused paged_sparse_decode supports causal_topk only for head dims up to 256, "
+            f"got {head_dim} and {head_dim_v}; use causal_topk=False or impl='reference'."
+        )
     shared_window = window_key_cache is None
     if shared_window:
         window_key_cache, window_value_cache, window_block_table = (
@@ -601,8 +681,129 @@ def paged_sparse_decode(
     )
     if num_rows == 0 or seqused_k.shape[0] == 0:
         return out, lse
+    # Compile-time flags suppress all accesses through placeholders for absent sink/LSE tensors.
+    sink_arg = attention_sink if attention_sink is not None else query
+    lse_arg = lse if lse is not None else out
+    has_pdl = torch.cuda.get_device_capability(query.device)[0] >= 9
+    launch_rows = functools.partial(
+        _launch_rows,
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        indices,
+        cu_seqlens_q,
+        seqused_k,
+        topk_length,
+        window_key_cache,
+        window_value_cache,
+        window_block_table,
+        sink_arg,
+        out,
+        lse_arg,
+        index_block_size=index_block_size,
+        window_size=window_size,
+        scale=scale,
+        shared_window=shared_window,
+        has_sink=attention_sink is not None,
+        return_lse=return_lse,
+        has_pdl=has_pdl,
+    )
+    if not causal_topk:
+        launch_rows(max_seqlen_q)
+        return out, lse
 
-    num_programs = num_rows * kv_heads
+    capacity = block_table.shape[1] * key_cache.shape[1]
+    tile_limit = triton_tiles.tile_position_limit(indices.shape[1], index_block_size)
+    bitmap = triton_tiles.selection_bitmap(
+        indices,
+        cu_seqlens_q,
+        seqused_k,
+        topk_length,
+        min(capacity, tile_limit),
+        index_block_size,
+        window_size,
+    )
+    # Short-sequence sequences keep per-row programs; query tiles run concurrently with them.
+    launch_rows(
+        "short",
+        before_merge=functools.partial(
+            triton_tiles.launch,
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            cu_seqlens_q,
+            seqused_k,
+            bitmap,
+            attention_sink,
+            sink_arg,
+            out,
+            lse_arg,
+            index_block_size,
+            window_size,
+            scale,
+            indices.shape[1],
+            tile_limit,
+            return_lse,
+            has_pdl,
+        ),
+    )
+    if capacity > tile_limit:
+        launch_rows("long_rows", min_position=tile_limit)
+    return out, lse
+
+
+def _launch_rows(
+    query: Tensor,
+    key_cache: Tensor,
+    value_cache: Tensor,
+    block_table: Tensor,
+    indices: Tensor,
+    cu_seqlens_q: Tensor,
+    seqused_k: Tensor,
+    topk_length: Tensor | None,
+    window_key_cache: Tensor,
+    window_value_cache: Tensor,
+    window_block_table: Tensor,
+    sink_arg: Tensor,
+    out: Tensor,
+    lse_arg: Tensor,
+    rows: int | None | str,
+    *,
+    index_block_size: int,
+    window_size: int,
+    scale: float,
+    shared_window: bool,
+    has_sink: bool,
+    return_lse: bool,
+    has_pdl: bool,
+    min_position: int = 0,
+    before_merge=None,
+) -> None:
+    """Launch per-row programs and, when splitting, their merge.
+
+    ``rows`` is the host ``max_seqlen_q`` (sequence grid), None (row grid over every row),
+    ``"short"`` (sequence grid over sequences of at most ``SHORT_QUERIES`` queries, partials
+    indexed by (sequence, query)),
+    or ``"long_rows"`` (row grid over rows of multi-query sequences at or after
+    ``min_position``, one split). ``before_merge`` launches between the producer and the merge.
+    """
+    num_rows, num_heads, head_dim = query.shape
+    kv_heads = key_cache.shape[2]
+    group = num_heads // kv_heads
+    head_dim_v = value_cache.shape[-1]
+    block_m = max(16, triton.next_power_of_2(group))
+    short = rows == "short"
+    short_queries = triton_tiles.SHORT_QUERIES if short else 0
+    long_rows = rows == "long_rows"
+    row_grid = rows is None or long_rows
+    num_partial_rows = seqused_k.shape[0] * short_queries if short else num_rows
+    # Short-sequence launches size splits for one query per request, the common decode case;
+    # sizing for SHORT_QUERIES queries per padded request measured 25% slower decode rows in a
+    # 16-decode + 2 x 137 step padded to 128 requests.
+    num_programs = (seqused_k.shape[0] if short else num_rows) * kv_heads
+
     topk = indices.shape[1]
     sparse_entries = topk * index_block_size
     block_n, num_warps, num_stages, k_rows = _tile_config(
@@ -611,9 +812,13 @@ def paged_sparse_decode(
     smem_per_cta = query.element_size() * (block_m * head_dim + block_n * (head_dim + head_dim_v))
     max_window = window_size + (index_block_size - 1 if shared_window else 0)
     num_tiles = triton.cdiv(sparse_entries, block_n) + triton.cdiv(max_window, block_n)
-    single_tile = shared_window and k_rows and num_tiles <= _MAX_SPLITS
+    # Long rows arrive in prefill chunks of many rows, and with splits their merge would visit
+    # every packed row; one split measured faster except for short chunks late in long prompts.
+    single_tile = shared_window and k_rows and num_tiles <= _MAX_SPLITS and not long_rows
     num_tiles = max(num_tiles, 1)
-    if k_rows:
+    if long_rows:
+        num_splits = 1
+    elif k_rows:
         # A 512-block QSA budget already fills 128 sparse tiles; the incomplete block adds
         # one window tile. Capping at 128 splits gave one CTA two tiles and delayed the merge.
         num_splits = num_tiles if single_tile else min(num_tiles, 128)
@@ -621,21 +826,31 @@ def paged_sparse_decode(
         num_splits = _choose_splits(
             num_programs, num_tiles, _cta_slots(query.device.index, smem_per_cta)
         )
-    use_pdl = num_splits > 1 and torch.cuda.get_device_capability(query.device)[0] >= 9
+    use_pdl = has_pdl and num_splits > 1
+    # Query tiles do not read short-sequence results, so they may start once every short-sequence
+    # program is resident; see triton_tiles.launch for the completion ordering.
+    trigger_dependents = has_pdl and (num_splits > 1 or before_merge is not None)
     if num_splits > 1:
         partial_out = torch.empty(
-            num_splits, num_rows, num_heads, head_dim_v, dtype=torch.float32, device=query.device
+            num_splits,
+            num_partial_rows,
+            num_heads,
+            head_dim_v,
+            dtype=torch.float32,
+            device=query.device,
         )
         partial_stats = torch.empty(
-            num_splits, num_rows, num_heads, 2, dtype=torch.float32, device=query.device
+            num_splits, num_partial_rows, num_heads, 2, dtype=torch.float32, device=query.device
         )
     else:
         partial_out = partial_stats = out
-    # Compile-time flags suppress all accesses through placeholders for absent sink/LSE tensors.
-    sink_arg = attention_sink if attention_sink is not None else query
-    lse_arg = lse if lse is not None else out
 
-    _paged_sparse_decode_kernel[(seqused_k.shape[0], max_seqlen_q * kv_heads, num_splits)](
+    if row_grid:
+        grid = (num_rows, kv_heads, num_splits)
+    else:
+        queries = short_queries if short else rows
+        grid = (seqused_k.shape[0], queries * kv_heads, num_splits)
+    _paged_sparse_decode_kernel[grid](
         query,
         key_cache,
         value_cache,
@@ -652,8 +867,10 @@ def paged_sparse_decode(
         lse_arg,
         partial_out,
         partial_stats,
-        num_rows,
+        num_partial_rows,
+        seqused_k.shape[0],
         num_splits,
+        min_position,
         *query.stride()[:2],
         *key_cache.stride()[:3],
         *value_cache.stride()[:3],
@@ -673,7 +890,7 @@ def paged_sparse_decode(
         WINDOW=window_size,
         SHARED_WINDOW=shared_window,
         HAS_TOPK_LENGTH=topk_length is not None,
-        HAS_SINK=attention_sink is not None,
+        HAS_SINK=has_sink,
         RETURN_LSE=return_lse,
         GROUP=group,
         HEAD_DIM=head_dim,
@@ -684,27 +901,38 @@ def paged_sparse_decode(
         BLOCK_N=block_n,
         K_ROWS=k_rows,
         SINGLE_TILE=single_tile,
-        USE_PDL=use_pdl,
+        ROW_GRID=row_grid,
+        SHORT_QUERIES=triton_tiles.SHORT_QUERIES if short or long_rows else 0,
+        LONG_ROWS=long_rows,
+        USE_PDL=trigger_dependents,
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    if before_merge is not None:
+        before_merge()
     if num_splits > 1:
         block_splits = triton.next_power_of_2(num_splits)
         # A 2-warp merge can hold 8K elements (32 x 256); larger tiles spilled, so cap each
         # value tile at 4K elements. _MAX_SPLITS keeps tiles at least 16 features wide, and
         # power-of-two dimensions leave no partial value tile.
         block_d = head_dim_v if block_splits * head_dim_v <= 8192 else 4096 // block_splits
-        _merge_splits_kernel[(num_rows, num_heads, head_dim_v // block_d)](
+        _merge_splits_kernel[(num_partial_rows, num_heads, head_dim_v // block_d)](
             partial_out,
             partial_stats,
             sink_arg,
+            cu_seqlens_q,
+            seqused_k,
             out,
             lse_arg,
-            num_rows,
+            num_partial_rows,
+            seqused_k.shape[0],
             num_splits,
+            min_position,
             *out.stride()[:2],
-            HAS_SINK=attention_sink is not None,
+            HAS_SINK=has_sink,
             RETURN_LSE=return_lse,
+            SHORT_QUERIES=triton_tiles.SHORT_QUERIES if short or long_rows else 0,
+            LONG_ROWS=long_rows,
             NUM_HEADS=num_heads,
             HEAD_DIM_V=head_dim_v,
             BLOCK_SPLITS=block_splits,
@@ -713,4 +941,3 @@ def paged_sparse_decode(
             num_warps=2,
             launch_pdl=use_pdl,
         )
-    return out, lse
