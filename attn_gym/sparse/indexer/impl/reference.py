@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 
+@torch.no_grad()
 def score_and_select(
     q: Tensor,
     k: Tensor,
@@ -21,7 +22,9 @@ def score_and_select(
     dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
     with torch.autocast(device_type=q.device.type, enabled=False):
         dots = torch.einsum("...thd,...sd->...ths", q.to(dtype), k.to(dtype))
-        scores = (dots.relu() * weights.to(dtype).unsqueeze(-1)).sum(dim=-2)
+        dots.relu_().mul_(weights.to(dtype).unsqueeze(-1))
+        scores = dots.sum(dim=-2)
+        del dots
         scores *= 1.0 / math.sqrt(q.shape[-2] * q.shape[-1])
     scores.masked_fill_(~valid, -torch.inf)
     width = min(topk, k.shape[-2])
@@ -86,6 +89,15 @@ def launch(
     else:
         ends = torch.full_like(starts, candidates)
     key_positions = torch.arange(candidates, device=q.device)[None, :]
-    valid = (key_positions >= starts) & (key_positions < ends)
-    indices = score_and_select(q, k, weights, topk, valid, starts)
-    return torch.nn.functional.pad(indices, (0, max(0, topk - candidates)), value=-1)
+    # Keep the per-head dot products and reduced scores within 64 MiB, or one query row.
+    dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+    k = k.to(dtype)
+    bytes_per_query = max(1, batch * (q.shape[-2] + 1) * candidates * dtype.itemsize)
+    tile_queries = max(1, (64 * 1024 * 1024) // bytes_per_query)
+    output = torch.full((batch, queries, topk), -1, dtype=torch.int32, device=q.device)
+    for begin in range(0, queries, tile_queries):
+        rows = slice(begin, begin + tile_queries)
+        valid = (key_positions >= starts[rows]) & (key_positions < ends[rows])
+        indices = score_and_select(q[:, rows], k, weights[:, rows], topk, valid, starts[rows])
+        output[:, rows, : indices.shape[-1]] = indices
+    return output
