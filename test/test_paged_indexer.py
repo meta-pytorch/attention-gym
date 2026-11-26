@@ -146,18 +146,28 @@ def test_raw_kv_decode_integration():
 def test_shape_specialization_reuse(backend, permuted, triton_compiles):
     from attn_gym.sparse.indexer.impl.cute import _compile_topk_kernel
 
+    warpdrive_scoring = backend == "cute" and not permuted
     if backend == "cute":
         _compile_topk_kernel.cache_clear()
+        if warpdrive_scoring:
+            from attn_gym.sparse.indexer.impl.paged_score_warpdrive import compile_paged_score
+
+            compile_paged_score.cache_clear()
     # Cross ==1, multiple-of-16 and odd classes for batch, queries, and page
     # table capacity. Keep the portable selector's clamped BLOCK bucket fixed.
-    for batch, candidates in [(1, 4160), (16, 4224), (17, 4288)]:
+    first_capacity = 32832 if warpdrive_scoring else 4160
+    for batch, extra in [(1, 0), (16, 64), (17, 128)]:
+        candidates = first_capacity + extra
         args = list(make_paged_indexer_test_inputs((1,) * batch, (4 * candidates,) * batch))
         if permuted:
             for i in range(4):
                 args[i] = args[i].transpose(0, -1).contiguous().transpose(0, -1)
         output = paged_lightning_indexer(*args, topk=512, kernel_options={"backend": backend})
         assert_paged_indexer_selection(args, output, 512)
-    if not permuted and torch.cuda.get_device_capability()[0] >= 9:
+    if warpdrive_scoring:
+        info = compile_paged_score.cache_info()
+        assert info.currsize == 1 and info.hits + info.misses == 3
+    elif not permuted and torch.cuda.get_device_capability()[0] >= 9:
         # One low-fill and one medium-fill TMA schedule; runtime sizes within
         # each schedule, including divisible/odd classes, do not specialize.
         assert triton_compiles["paged_score_tma_kernel"] == 2
