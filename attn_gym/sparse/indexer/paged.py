@@ -66,13 +66,13 @@ def paged_lightning_indexer(
             zero-based sequence positions, replacing the appended-query rule.
             Negative positions select nothing.
         impl: ``"reference"`` runs eager PyTorch on CPU or CUDA; ``"fused"``
-            runs Triton on NVIDIA CUDA devices (SM80+), supporting FP16/BF16,
+            runs on NVIDIA CUDA devices (SM80+), supporting FP16/BF16,
             heads <= 128 and head_dim <= 256. Arbitrary nonnegative strides
             are supported.
-        kernel_options: ``backend="cute"`` uses the cached CuTe radix selector
-            on SM100-family GPUs (default there); ``"triton"`` uses Triton
-            throughout (default on other GPUs). Both score paged keys with
-            Triton. Reference validates and ignores these choices.
+        kernel_options: ``backend="cute"`` (default on SM100-family GPUs) uses the
+            Warpdrive radix selector, with Warpdrive scoring for eligible decode
+            inputs and Triton scoring otherwise. ``"triton"`` uses Triton for both
+            stages (default on other GPUs). Reference validates and ignores these choices.
 
     Offset values, nonnegative sequence lengths, cache capacity for completed
     blocks, and referenced page IDs are caller invariants, never read on the host

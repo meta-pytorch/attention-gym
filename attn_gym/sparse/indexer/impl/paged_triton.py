@@ -1,9 +1,8 @@
 """Paged scoring parallel across candidates, followed by exact radix selection.
 
-Both backends score in Triton: aligned pages can use Hopper+ TMA, other
-layouts use strided pointer loads on SM80+. The selector is a separate stage:
-Triton radix selection is portable, and SM100-family GPUs can use the CuTe
-selector. Both consume the same FP32 scores, reusing at most 32 MiB across query slabs.
+Triton covers general layouts on SM80+. The SM100-family route can use a Warpdrive
+scorer for compact decode inputs. Both scorers write the same bounded FP32 slab;
+the radix selector returns sequence-local IDs without materializing a dense KV pool.
 """
 
 import torch
@@ -294,6 +293,37 @@ def paged_radix_topk_kernel(
         ties_seen += tl.sum(ties.to(tl.int32), 0)
 
 
+def can_use_warpdrive_score(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    weights: torch.Tensor,
+    block_table: torch.Tensor,
+    seqused_k: torch.Tensor,
+    query_positions: torch.Tensor | None,
+    score_wide: bool,
+) -> bool:
+    """Select the compact small-head scorer when there is enough work to fill its CTAs."""
+    return (
+        not score_wide
+        and query.shape[1:] == (4, 128)
+        and key_cache.shape[1] == 64
+        # Below this grid size, the Triton register dot avoids TMEM/pipeline setup.
+        and query.shape[0] * block_table.shape[1] * 64 > 32768
+        # TVM-FFI checks even the stride of a singleton dimension. is_contiguous()
+        # alone would admit an unrepresentable stride for a one-query decode.
+        and query.stride() == (4 * 128, 128, 1)
+        and key_cache.stride() == (64 * 128, 128, 1)
+        and weights.stride() == (4, 1)
+        and block_table.stride() == (block_table.shape[1], 1)
+        and seqused_k.stride(0) == 1
+        and (query_positions is None or query_positions.stride(0) == 1)
+        # Leave int32 headroom when rounding a search interval to 32 warp probes.
+        and seqused_k.numel() <= 2**31 - 32
+        and query.data_ptr() % 16 == 0
+        and key_cache.data_ptr() % 16 == 0
+    )
+
+
 def launch(
     query,
     key_cache,
@@ -322,6 +352,9 @@ def launch(
         return output.fill_(-1)
     if capacity > 2**22:
         raise ValueError("candidate capacity must be <= 2**22 (bounded score workspace).")
+    # Raw lengths are int32: a larger ratio can never form even one completed block.
+    if compress_ratio > 2**31 - 1:
+        return output.fill_(-1)
     # Pair-shaped scratch shares the existing cached CuTe radix kernel's ABI.
     pairs = min(triton.cdiv(tokens, 2), (32 * 1024 * 1024) // (8 * capacity))
     slab = 2 * pairs
@@ -337,6 +370,7 @@ def launch(
     score_wide = capacity > topk and (
         shared_wide or requires_int64_offsets(query, key_cache, weights, block_table, bounds)
     )
+    warpdrive_score = None
     if use_cute:
         import cutlass
 
@@ -360,11 +394,30 @@ def launch(
                 True,
                 paged=True,
             )
+            if can_use_warpdrive_score(
+                query, key_cache, weights, block_table, seqused_k, query_positions, score_wide
+            ):
+                from .paged_score_warpdrive import get_paged_score_runner
+
+                warpdrive_score = get_paged_score_runner(
+                    query,
+                    key_cache,
+                    weights,
+                    block_table,
+                    cu_seqlens_q,
+                    seqused_k,
+                    query_positions,
+                    scores,
+                    bounds,
+                    topk,
+                    compress_ratio,
+                )
         integer = cutlass.Int64 if select_wide else cutlass.Int32
     else:
         select_wide = shared_wide or requires_int64_offsets(output)
     tma = (
-        capacity > topk
+        warpdrive_score is None
+        and capacity > topk
         and key_cache.shape[1] % 32 == 0
         and can_use_tma(query)
         and can_use_tma(key_cache)
@@ -383,7 +436,9 @@ def launch(
     with torch.cuda.device(query.device):
         for start in range(0, tokens, slab):
             rows = min(slab, tokens - start)
-            if tma:
+            if warpdrive_score is not None:
+                warpdrive_score(start, rows)
+            elif tma:
                 paged_score_tma_kernel[(rows, triton.cdiv(capacity, bn * tiles))](
                     query_desc,
                     key_desc,

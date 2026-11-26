@@ -210,13 +210,27 @@ completed blocks must have valid pages. Device metadata values are caller invari
 The fused operation supports FP16/BF16 on SM80+ NVIDIA GPUs, arbitrary nonnegative
 tensor strides, `torch.compile(fullgraph=True)`, and CUDA Graph replay with updated
 query offsets, lengths, positions, and page tables. `impl="reference"` supplies an eager
-CPU/CUDA oracle. On SM100-family GPUs the default combines paged Triton scoring with
-the existing cached CuTe radix selector; other GPUs use Triton selection. Override with
-`kernel_options={"backend": "triton"}` or `{"backend": "cute"}`. Order and ties are
-unspecified unless deterministic algorithms are enabled. No benchmarking occurs in the
-launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
+CPU/CUDA oracle. The fused indexer has two stages: first score visible cached keys, then
+select Top-K from the FP32 scores. `kernel_options={"backend": "triton"}` uses Triton
+for both stages and covers general strides on SM80+. `{"backend": "cute"}` (the
+SM100-family default) uses the Warpdrive radix selector. It also uses a specialized
+Warpdrive scorer for compact FP16/BF16 decode with 4 heads, head dimension 128,
+64-candidate pages and int32 addressing. Q and the key cache must be 16-byte aligned.
+The scorer is used only when `tokens × reserved candidates per sequence > 32768`;
+smaller grids use Triton to avoid the fixed pipeline setup cost. Unsupported layouts
+also use Triton scoring, without copying the cache or changing the selector. Both routes
+use the same visibility rules. Order and ties are unspecified unless deterministic
+algorithms are enabled. No benchmarking occurs in the launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
 bounds buffer; query slabs reuse that allocation. Candidate capacity
 per sequence is limited to `2**22`.
+
+On a GB300, BF16 decode with 16 queries in 16 sequences, 32,768 live candidates each and
+K=512 took 68.66 µs with the Triton scorer and 57.51 µs with Warpdrive. Both timings
+include the same CuTe Top-K selector (warm CUDA Graph medians, shuffled physical pages).
+At 64 sequences and the same pool size, the difference was small: 153.32 vs. 151.98 µs.
+The scorer bounds the number of CTAs per query and reads page IDs only for visible
+tiles, so reserving a large table does not require a scoring CTA per reserved tile.
+The 32 MiB scratch limit still determines how many query slabs are launched.
 
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 
