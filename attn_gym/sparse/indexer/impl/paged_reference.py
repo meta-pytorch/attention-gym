@@ -15,6 +15,8 @@ def launch(
     topk: int,
     compress_ratio: int,
     query_positions: torch.Tensor | None,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score visible candidates in logical block order, independently of physical pages."""
     output = torch.full((query.shape[0], topk), -1, device=query.device, dtype=torch.int32)
@@ -29,7 +31,7 @@ def launch(
             continue
         logical = torch.arange(candidates, device=query.device)
         pages = block_table[sequence, logical // page_size].long()
-        keys = key_cache[pages, logical % page_size]
+        physical = (pages, logical % page_size)
         positions = (
             torch.arange(length - (end - start), length, device=query.device)
             if query_positions is None
@@ -39,11 +41,13 @@ def launch(
         valid = logical[None, :] < visible[:, None]
         selected = score_and_select(
             query[start:end],
-            keys,
+            key_cache[physical],
             weights[start:end],
             topk,
             valid,
             deterministic=torch.are_deterministic_algorithms_enabled(),
+            q_scale=None if q_scale is None else q_scale[start:end],
+            k_scale=None if k_scale is None else k_scale[physical],
         )
         output[start:end, : selected.shape[1]] = selected
     return output

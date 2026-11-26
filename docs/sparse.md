@@ -51,7 +51,7 @@ Output order and tie-breaking are unspecified, including between repeated calls.
 | Restriction | CuTe | Triton |
 |---|---|---|
 | GPU | SM100, SM103, or SM107 | SM90 or newer |
-| Input dtype | FP16 or BF16, shared by all inputs | FP16 or BF16, shared by all inputs |
+| Input dtype | FP16 or BF16, shared by all inputs; [MXFP8](#explicit-scale-mxfp8-scoring) on SM100/SM103 | FP16 or BF16, shared by all inputs |
 | Heads `H` | Positive and even | `1..256` |
 | Head dimension `D` | Positive, divisible by 16 | `8..256`, divisible by 8 |
 | Sequence length `T` | `1..2**20` | `1..2**20` |
@@ -67,6 +67,34 @@ materializing contiguous copies. Weights need only element alignment, not TMA al
 CuTe additionally requires the optional `linear` dependencies. It supports the SM100 family
 (SM100, SM103 including GB300, and Rubin SM107 with CuTeDSL 4.8+), not every Blackwell variant;
 other supported devices use Triton by default.
+
+### Explicit-scale MXFP8 scoring
+
+For prequantized `torch.float8_e4m3fn` Q/K, supply `torch.float8_e8m0fnu` scales for
+32-channel groups and BF16 or FP32 head weights:
+
+```python
+indices = lightning_indexer(
+    q8, k8, weights, topk=512, causal=True, compress_ratio=4,
+    q_scale=q_scale, k_scale=k_scale,
+)
+# q8: [B,T,H,128], k8: [B,T//4,128]
+# q_scale: [B,T,H,4], k_scale: [B,T//4,4], weights: [B,T,H]
+```
+
+Each pair of scales multiplies its 32-element dot product before groups are summed
+and ReLU is applied. Scales cannot generally be folded into the head weights. The caller
+owns quantization: to represent an all-zero group, pass zero data with a positive scale
+(E8M0 has no zero). Scale values and FP32 scoring intermediates, including the head sum
+before normalization, must be finite. The operation does not check values on device.
+
+The only fused dense MXFP8 scorer is Warpdrive on SM100/SM103, with `H` in `{32, 64}`
+and `D=128`. Q/K have the same alignment requirements as the CuTe FP16/BF16 path; scale
+tensors may have arbitrary nonnegative strides. The MMA warp consumes both the TMA-loaded
+Q/K and the packed scale blocks; the existing radix Top-K reads the resulting FP32 scores.
+Deterministic mode changes selection, not scoring. Triton does not support MXFP8.
+`impl="reference"` evaluates scaled scores in PyTorch on CPU or CUDA for any `D` divisible
+by 32. MXFP8 rejects packed `cu_seqlens` in both implementations.
 
 ### Compilation and training scope
 
@@ -85,7 +113,7 @@ indices = compiled_indexer(q, k, weights, 128, causal=True)
 **Selection is nondifferentiable.** Inputs may require gradients, but the integer result
 has no gradient function. Gather attention can train its own Q/K/V computation with
 these indices held fixed. It does **not** propagate gradients through the selection step
-into the indexer's queries, keys, or scoring weights. This API supplies no surrogate gradient
+into the indexer's queries, keys, scoring weights, or scales. This API supplies no surrogate gradient
 or indexer-training loss.
 
 Selection with NaN/Inf scores is unspecified and may differ across backends.
@@ -189,6 +217,31 @@ chooses the lowest IDs at the cutoff and returns ascending IDs.
 The portable Triton selector can finish its radix search early at an exact zero cutoff or
 when a prefix contains exactly `topk` candidates. Reserved capacity still determines score
 strides and slab sizes, so a large reservation can require more launches.
+
+### Paged MXFP8 scoring
+
+The caller can supply prequantized E4M3FN queries and cached keys with two E8M0 scale tensors:
+`q_scale[t, h, g]` and `k_scale[physical_page, slot, g]`, where `g` is a 32-channel group.
+Pass both as keyword arguments to `paged_lightning_indexer`; weights are BF16 or FP32.
+The cache owner quantizes each finished key and stores its scales in the same page and slot.
+The operation neither quantizes inputs nor changes the cache. Live scale values and FP32
+scoring intermediates must be finite; the launcher does not read them back to check.
+Each pair of scale factors applies inside its group's dot product, before ReLU. Top-K still consumes FP32 scores
+and returns the same sequence-local ID format as the BF16 path.
+
+The fused MXFP8 implementation targets compact H4/D128 decode with 64-candidate pages on
+SM100/SM103. It requires narrow scorer addressing, 16-byte-aligned payloads, and compact
+scale rows with a 4-byte-aligned base. There is no implicit BF16 conversion or Triton MXFP8
+scorer. Use `impl="reference"` for general scale layouts and head counts.
+
+In the GB300 prototype (`e089c881`, 2026-11-26), the complete paged indexer took
+55.75 µs with BF16 and 39.69 µs with MXFP8 for 16 one-token queries in 16 sequences,
+32,768 live candidates per sequence and K=512. At one query and 1,024 candidates it
+took 7.22 vs. 7.78 µs. These are medians from seven interleaved rounds of 31 fixed-pointer
+CUDA Graph replays, eight calls per replay, with H4/D128, shuffled 64-candidate pages,
+BF16 weights and the same CuTe Top-K selector. BF16 inputs were the exact dequantization
+of the prequantized MXFP8 data; the timings exclude quantization and do not measure the
+effect of quantizing a model's original activations.
 
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 

@@ -334,22 +334,18 @@ def paged_radix_topk_kernel(
         ties_seen += tl.sum(ties.to(tl.int32), 0)
 
 
-def can_use_warpdrive_score(
+def compact_warpdrive_layout(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     weights: torch.Tensor,
     block_table: torch.Tensor,
     seqused_k: torch.Tensor,
     query_positions: torch.Tensor | None,
-    score_wide: bool,
 ) -> bool:
-    """Select the compact small-head scorer when there is enough work to fill its CTAs."""
+    """Shared compact H4/D128/P64 payload ABI of the paged Warpdrive scorers."""
     return (
-        not score_wide
-        and query.shape[1:] == (4, 128)
+        query.shape[1:] == (4, 128)
         and key_cache.shape[1] == 64
-        # Below this grid size, the Triton register dot avoids TMEM/pipeline setup.
-        and query.shape[0] * block_table.shape[1] * 64 > 32768
         # TVM-FFI checks even the stride of a singleton dimension. is_contiguous()
         # alone would admit an unrepresentable stride for a one-query decode.
         and query.stride() == (4 * 128, 128, 1)
@@ -366,6 +362,19 @@ def can_use_warpdrive_score(
     )
 
 
+def can_use_warpdrive_score(
+    query, key_cache, weights, block_table, seqused_k, query_positions, score_wide: bool
+) -> bool:
+    # Below this grid size, the FP16/BF16 Triton dot avoids TMEM/pipeline setup.
+    return (
+        not score_wide
+        and query.shape[0] * block_table.shape[1] * key_cache.shape[1] > 32768
+        and compact_warpdrive_layout(
+            query, key_cache, weights, block_table, seqused_k, query_positions
+        )
+    )
+
+
 def launch(
     query,
     key_cache,
@@ -377,12 +386,39 @@ def launch(
     compress_ratio,
     query_positions,
     backend,
+    q_scale=None,
+    k_scale=None,
 ):
     """Score paged keys in slabs and return sequence-local Top-K IDs with -1 padding."""
-    if torch.version.hip or torch.cuda.get_device_capability(query.device)[0] < 8:
+    capability = torch.cuda.get_device_capability(query.device)
+    if torch.version.hip or capability[0] < 8:
         raise ValueError("paged_lightning_indexer requires an SM80+ NVIDIA GPU.")
-    if query.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError("the fused paged indexer requires FP16 or BF16 inputs.")
+    mxfp8 = query.dtype == torch.float8_e4m3fn
+    if mxfp8 or q_scale is not None or k_scale is not None:
+        from ..validation import validate_precision
+
+        validate_precision(query, key_cache, weights, q_scale, k_scale)
+    if mxfp8:
+        if backend != "cute" or capability not in ((10, 0), (10, 3)):
+            raise ValueError(
+                "fused paged MXFP8 scoring requires the CuTe backend on SM100 or SM103."
+            )
+        if not compact_warpdrive_layout(
+            query, key_cache, weights, block_table, seqused_k, query_positions
+        ):
+            raise ValueError(
+                "fused paged MXFP8 requires compact H4/D128 inputs, aligned Q/K, and 64-candidate pages."
+            )
+        if (
+            q_scale.stride() != (16, 4, 1)
+            or k_scale.stride() != (256, 4, 1)
+            or (q_scale.data_ptr() | k_scale.data_ptr()) % 4
+        ):
+            raise ValueError("fused paged MXFP8 requires compact, four-byte-aligned E8M0 scales.")
+    elif query.dtype not in (torch.float16, torch.bfloat16):
+        raise TypeError(
+            "the fused paged indexer requires FP16, BF16 or explicit-scale MXFP8 inputs."
+        )
     tokens, heads, dim = query.shape
     if heads > 128 or dim > 256:
         raise ValueError("the fused paged indexer requires heads <= 128 and head_dim <= 256.")
@@ -411,6 +447,8 @@ def launch(
     score_wide = capacity > topk and (
         shared_wide or requires_int64_offsets(query, key_cache, weights, block_table, *metadata)
     )
+    if mxfp8 and score_wide:
+        raise ValueError("fused paged MXFP8 scoring requires int32 input offsets.")
     warpdrive_score = None
     if use_cute:
         import cutlass
@@ -421,7 +459,7 @@ def launch(
 
         from .cute import _compile_topk
 
-        if not runs_sm100_kernels(torch.cuda.get_device_capability(query.device)):
+        if not runs_sm100_kernels(capability):
             raise ValueError("the CuTe paged selector requires an SM100-family GPU.")
         cute_output = output.unsqueeze(0)
         select_wide = requires_int64_abi(scores, cute_output, bounds)
@@ -435,12 +473,18 @@ def launch(
                 True,
                 paged=True,
             )
-            if can_use_warpdrive_score(
+            if mxfp8 or can_use_warpdrive_score(
                 query, key_cache, weights, block_table, seqused_k, query_positions, score_wide
             ):
-                from .paged_score_warpdrive import get_paged_score_runner
+                if mxfp8:
+                    from .paged_score_mxfp8 import get_paged_mxfp8_score_runner as prepare_score
 
-                warpdrive_score = get_paged_score_runner(
+                    scales = (q_scale, k_scale)
+                else:
+                    from .paged_score_warpdrive import get_paged_score_runner as prepare_score
+
+                    scales = ()
+                warpdrive_score = prepare_score(
                     query,
                     key_cache,
                     weights,
@@ -452,6 +496,7 @@ def launch(
                     bounds,
                     topk,
                     compress_ratio,
+                    *scales,
                 )
         integer = cutlass.Int64 if select_wide else cutlass.Int32
     else:

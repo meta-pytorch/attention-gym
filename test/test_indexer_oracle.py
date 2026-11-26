@@ -37,7 +37,7 @@ def unchunked_errors(
     causal: bool,
     compress_ratio: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    batch, tokens, heads, dim = q.shape
+    _, tokens, heads, dim = q.shape
     q64, k64, w64 = q.double(), k.double(), weights.double()
     dots = q64.permute(0, 2, 1, 3) @ k64.transpose(-1, -2).unsqueeze(1)
     scores = (dots.relu() * w64.transpose(1, 2).unsqueeze(-1)).sum(1)
@@ -46,24 +46,20 @@ def unchunked_errors(
     magnitude = (absolute_dots * w64.abs().transpose(1, 2).unsqueeze(-1)).sum(1)
     magnitude /= math.sqrt(heads * dim)
     visible = (torch.arange(tokens, device=q.device).view(1, tokens, 1) + 1) // compress_ratio
-    counts = visible.clamp_max(topk) if causal else torch.full_like(visible, topk)
     if causal:
         future = torch.arange(k.shape[1], device=q.device).view(1, 1, -1) >= visible
         scores.masked_fill_(future, -torch.inf)
         magnitude.masked_fill_(future, 0)
-    boundary = scores.sort(-1, descending=True).values.gather(
-        -1, (counts - 1).clamp_min(0).expand(batch, -1, -1)
-    )
+    best = scores.sort(-1, descending=True).values[..., :topk]
     eager = lightning_indexer(
         q, k, weights, topk, causal=causal, compress_ratio=compress_ratio, impl="reference"
     )
-    actual_scores = scores.gather(-1, actual.long().clamp_min(0))
-    eager_scores = scores.gather(-1, eager.long().clamp_min(0))
-    return (
-        (boundary - actual_scores).clamp_min(0).masked_fill(actual < 0, 0),
-        (boundary - eager_scores).clamp_min(0).masked_fill(eager < 0, 0),
-        magnitude.amax(-1, keepdim=True),
-    )
+
+    def sorted_gaps(ids: torch.Tensor) -> torch.Tensor:
+        chosen = scores.gather(-1, ids.long().clamp_min(0)).masked_fill(ids < 0, -torch.inf)
+        return (best - chosen.sort(descending=True).values).masked_fill(best == -torch.inf, 0)
+
+    return sorted_gaps(actual), sorted_gaps(eager), magnitude.amax(-1, keepdim=True)
 
 
 DEVICES = [
