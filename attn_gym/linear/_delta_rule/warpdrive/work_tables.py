@@ -65,10 +65,8 @@ import cutlass
 import torch
 from cuda.bindings import driver as cuda
 from cutlass import Float32, Int32, Int64, cute
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import llvm
-from cutlass.cute.ffi import ffi, mangle
 
+from attn_gym.warpdrive.bounds import assert_fail
 from attn_gym.warpdrive.cache import (
     compile_tvm_ffi,
     jit_cache,
@@ -281,40 +279,6 @@ def chunks_of(b_t: cutlass.Constexpr[int], cu_seqlens, b):
     return cute.ceil_div(cu_at(cu_seqlens, b + 1) - cu_at(cu_seqlens, b), b_t)
 
 
-def _string_constant(text: str) -> ir.Value:
-    """Pointer to ``text`` as a NUL-terminated constant of the enclosing ``gpu.module``."""
-    module = ir.InsertionPoint.current.block.owner
-    while module.name != "gpu.module":
-        module = module.parent
-    data = text + "\0"
-    symbol = "wd_str_" + mangle(text)
-    if symbol not in ir.SymbolTable(module.operation):
-        with ir.InsertionPoint(module.regions[0].blocks[0]):
-            llvm.GlobalOp(
-                sym_name=symbol,
-                global_type=ir.Type.parse(f"!llvm.array<{len(data)} x i8>"),
-                linkage=ir.Attribute.parse("#llvm.linkage<internal>"),
-                constant=True,
-                value=ir.StringAttr.get(data),
-            )
-    return llvm.AddressOfOp(llvm.PointerType.get(), symbol).result
-
-
-def assert_fail(message: str, function: str) -> None:
-    """CUDA's failed ``assert``: print ``message`` to stderr and abort the context with
-    ``CUDA_ERROR_ASSERT``. CuTeDSL drops its own device asserts unless the whole module is
-    compiled with assertions enabled, so this calls the driver's ``__assertfail`` directly."""
-    ptr = llvm.PointerType.get()
-    fail = ffi(name="__assertfail", params_types=[ptr, ptr, Int32, ptr, Int64], inline=False)
-    fail(
-        _string_constant(message),
-        _string_constant(__name__),
-        Int32(0),
-        _string_constant(function),
-        Int64(1),
-    )
-
-
 @cute.jit
 def check_packed_offsets(cu_seqlens, tokens: Int32, tidx, n_threads: cutlass.Constexpr[int]):
     """Abort the launch (``invalid packed cu_seqlens``) unless ``cu_seqlens`` starts at 0, never
@@ -333,7 +297,7 @@ def check_packed_offsets(cu_seqlens, tokens: Int32, tidx, n_threads: cutlass.Con
         if b == n_batch - Int32(1):
             invalid = invalid or end > tokens
         if invalid:
-            assert_fail("invalid packed cu_seqlens", "check_packed_offsets")
+            assert_fail("invalid packed cu_seqlens", "check_packed_offsets", __name__)
     cute.arch.barrier()
 
 

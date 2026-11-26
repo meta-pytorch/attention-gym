@@ -13,15 +13,18 @@ from dataclasses import replace
 
 import torch
 
+from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.triton.group_sum import group_sum
+from attn_gym.linear.types import StateCheckpoints
 
 from ..bundles.kda_chain_backward import build_chain_backward, run_chain_backward
 from ..bundles.kda_chain_forward import build_chain_forward, run_chain_forward
 from ..bundles.kda_warmup_backward import build_warmup_backward, run_warmup_backward
 from ..bundles.kda_warmup_forward import build_warmup_forward, run_warmup_forward
 from ..kda_common import B_T, TORCH_NAMES, a_record_words, operand_dtypes
-from ..piece_chain import chain_rows_per_cta
+from ..piece_chain import CHAIN_MAX_PIECES, CHAIN_MIN_PIECES_REVERSE, chain_rows_per_cta
 from ..work_tables import WORK_ITEM_FIELDS
+from .entry_states import entry_state_shape
 from .plan import BackwardPlan as _BackwardPlan
 from .plan import ChainCost, aligned, chain_buffers, int32, split_scratch, tma_slots
 from .plan import ForwardPlan as _ForwardPlan
@@ -69,11 +72,13 @@ def kda_forward(
     split: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     nonempty: bool = False,
     batch_invariant: bool = False,
     exact_recompute: bool = False,
+    entry_states: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed [T,H,D] KDA; gate is a natural-log channel decay, state is [N,H,V,K].
     ``fastmath=False`` selects the non-flushing gate exponentials. ``intra_chunk_dtypes`` is
@@ -87,6 +92,13 @@ def kda_forward(
     place through the routes (non-positive routes are null; the optional uint8
     ``has_initial_state`` marks resumed slots, zero marks fresh ones) and no final state is
     returned. Paged calls use the unchunked plans (uncut or value-dimension split).
+
+    NOTE [Piece entry states]: an uncut forward differentiated by a chain backward hands it the
+    FP32 state entering each backward piece, so the backward recomputes every piece from the
+    forward's own state instead of composing piece summaries, whose rounding differs. With
+    ``entry_states`` (``entry_state_shape``, at least ``N * entry_state_pieces(...)`` rows) an
+    uncut, per-tile forward stores them there when ``entry_state_pieces`` is nonzero;
+    ``kda_backward`` then reads them. Otherwise the buffer is left untouched.
     """
     paged = state_indices is not None
     q, k, v, gate, beta, cu_seqlens = (
@@ -97,6 +109,8 @@ def kda_forward(
             raise ValueError("paged KDA needs a state pool and no final state or split schedule")
         initial_state = initial_state.detach()
     else:
+        if state_checkpoints is not None:
+            raise ValueError("state_checkpoints requires paged state_indices")
         initial_state = None if initial_state is None else aligned(initial_state.detach())
     tokens, heads_out, dim_k = q.shape
     dim_v = v.shape[-1]
@@ -135,7 +149,7 @@ def kda_forward(
         "cu_seqlens": cu_seqlens,
         "seed_indices": None,
         "final_indices": None,
-        "checkpoints": None,
+        "checkpoints": state_checkpoints,
         "tma_slots": tma_slots(
             tensors=5,
             b_t=B_T,
@@ -143,6 +157,8 @@ def kda_forward(
             device=device,
         ),
     }
+    if entry_states is not None and (paged or split or batch_invariant or not exact_recompute):
+        raise ValueError("only an exact-recompute, unsplit, unpaged forward stores entry states")
     if plan.chain:
         buffers = dict(
             common,
@@ -187,6 +203,12 @@ def kda_forward(
     ideal, rows, item_scratch, chunk_scratch = split_scratch(
         split, tokens, num_seqs, heads_out, plan.num_sm, n_tiles, B_T, device
     )
+    entries, pieces = {}, 0
+    if entry_states is not None:
+        pieces = entry_state_pieces(tokens, num_seqs, heads_out, dim_v, device)
+    if pieces:
+        _check_entry_states(entry_states, num_seqs * pieces, heads_out, dim_v, dim_k, device)
+        entries = {"pieces": pieces, "entry_states": entry_states}
     buffers = dict(
         common,
         state_in=initial_state,
@@ -208,6 +230,7 @@ def kda_forward(
             prep,
             a_record_words(operand_dtypes(TORCH_NAMES[q.dtype], intra_chunk_dtypes)),
         ),
+        **entries,
     )
     launch = build_warmup_forward(
         **buffers,
@@ -278,6 +301,44 @@ class BackwardPlan(_BackwardPlan):
         )
 
 
+def entry_state_pieces(tokens: int, num_seqs: int, heads_out: int, dim_v: int, device) -> int:
+    """Pieces per sequence of the chain backward an uncut forward of this shape hands its piece
+    entry states (NOTE [Piece entry states]), 0 when the plans do not pair that way."""
+    if ForwardPlan.build(tokens, num_seqs, heads_out, dim_v, device).chain:
+        return 0
+    return BackwardPlan.build(tokens, num_seqs, heads_out, dim_v, device).pieces
+
+
+def entry_state_rows_bound(num_seqs, heads_out: int, device):
+    """Rows that hold any shape's piece entry states, from the sequence count alone (a
+    symbolic size under ``torch.compile``): every piece table is one wave of at most
+    ``CHAIN_MAX_PIECES`` slots per sequence, and no backward chains below
+    ``CHAIN_MIN_PIECES_REVERSE`` slots (0 rows). Above it the buffer is allocated even for
+    token counts whose plans do not pair (the forward chains too, or the backward runs uncut):
+    sizing it from the token count would guard the graph on it. PyTorch's tensor metadata guards
+    on whether the buffer is empty, so packs without a chain compile their own graph."""
+    num_sm = get_device_properties(device).multi_processor_count
+    slots = num_sm // (num_seqs * heads_out)
+    chains = torch.sym_min(1, slots // CHAIN_MIN_PIECES_REVERSE)  # 0 or 1, without a guard
+    return num_seqs * torch.sym_min(CHAIN_MAX_PIECES, slots) * chains
+
+
+def _check_entry_states(entry_states, rows, heads_out, dim_v, dim_k, device) -> None:
+    shape = entry_state_shape(rows, heads_out, dim_v, dim_k)
+    if (
+        entry_states.device != device
+        or entry_states.ndim != len(shape)
+        or entry_states.dtype != torch.float32
+        or entry_states.shape[0] < rows
+        or tuple(entry_states.shape[1:]) != shape[1:]
+        or not entry_states.is_contiguous()
+        or entry_states.data_ptr() % 16
+    ):
+        raise ValueError(
+            f"entry_states must be contiguous fp32 {shape} on {device} with >= {rows} rows"
+        )
+
+
 def kda_backward(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -294,12 +355,15 @@ def kda_backward(
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     batch_invariant: bool = False,
+    entry_states: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None
 ]:
     """Recompute checkpoint series and differentiate KDA, with optional state/cotangent.
     ``intra_chunk_dtypes`` is the forward's option, reused by recompute, summaries and
-    gradient kernels. ``batch_invariant`` pins the plan as in ``kda_forward``.
+    gradient kernels. ``batch_invariant`` pins the plan as in ``kda_forward``. Pass the
+    forward's ``entry_states`` buffer (NOTE [Piece entry states]); the chain plan reads it
+    when the forward stored into it.
 
     Native bprop returns natural-log dgate directly; neither the safe-gate sigmoid
     derivative nor the composed BT64 cumulative-gate reverse scan is needed here. The bprop
@@ -322,6 +386,14 @@ def kda_backward(
     if split:
         plan = replace(plan, pieces=0)
     num_pieces = num_seqs * plan.pieces if plan.chain else num_seqs
+    seeded = (
+        entry_states is not None
+        and plan.chain
+        and not batch_invariant
+        and entry_state_pieces(tokens, num_seqs, heads_out, dim_v, device) == plan.pieces
+    )
+    if seeded:
+        _check_entry_states(entry_states, num_pieces, heads_out, dim_v, dim_k, device)
 
     def empty(*shape, dtype=torch.int32):
         return torch.empty(shape, dtype=dtype, device=device)
@@ -369,8 +441,18 @@ def kda_backward(
     if plan.chain:
         buffers = dict(
             common,
-            **chain_buffers(num_seqs, plan.pieces, heads_out, dim_v, dim_k, device, backward=True),
-            seed=initial_state,
+            **chain_buffers(
+                num_seqs,
+                plan.pieces,
+                heads_out,
+                dim_v,
+                dim_k,
+                device,
+                backward=True,
+                entry_states=entry_states if seeded else None,
+            ),
+            # The seeded chain reads the entry states, not the seed: keep it out of the key.
+            seed=None if seeded else initial_state,
             dseed=d_final_state,
         )
         schedule = {
@@ -390,6 +472,7 @@ def kda_backward(
             num_sm=plan.num_sm,
             intra_chunk_dtypes=intra_chunk_dtypes,
             fastmath=fastmath,
+            seeded=seeded,
         )
         run_chain_backward(launch, **buffers, **schedule)
     else:

@@ -8,6 +8,7 @@ import torch
 from torch import Tensor
 
 from attn_gym.linear._delta_rule.span import pack_dense_batch
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
 from attn_gym.linear._delta_rule.validation import require_inference_only
 from attn_gym.linear._delta_rule.wd_support import HEAD_DIMS, IO_DTYPE_NAMES
 from attn_gym.linear.gdn.impl.warpdrive_ops import (
@@ -19,6 +20,7 @@ from attn_gym.linear.gdn.impl.warpdrive_ops import (
     chunk_gdn_warpdrive_packed_fwd_with_state_op,
     validate_warpdrive_available,
 )
+from attn_gym.linear.types import StateCheckpoints
 
 
 def validate_warpdrive_constraints(q: Tensor, k: Tensor, value: Tensor) -> None:
@@ -218,6 +220,7 @@ def paged_chunk_forward(
     has_initial_state: Tensor | None,
     scale: float,
     batch_invariant: bool,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> Tensor:
     """Advance selected ``state_cache`` slots in place with the warpdrive chunk kernel."""
     if not q.is_cuda:
@@ -249,6 +252,7 @@ def paged_chunk_forward(
         cu_seqlens,
         scale,
         batch_invariant,
+        *state_checkpoint_op_args(state_checkpoints),
     )
     return output.reshape(output_shape)
 

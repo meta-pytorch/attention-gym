@@ -57,10 +57,11 @@ from attn_gym.linear.kda.impl.chunk import (
     _prepare_chunk_kda_fwd,
 )
 from attn_gym.linear.kda.impl.fused import _validate_fused_constraints
-from attn_gym.linear.kda.impl.warpdrive import validate_warpdrive_constraints
+from attn_gym.linear.kda.impl.warpdrive import entry_state_rows, validate_warpdrive_constraints
 from attn_gym.linear.kda.impl.warpdrive_ops import (
     chunk_warpdrive_packed_bwd_with_exit_cotangent_op,
     chunk_warpdrive_packed_bwd_with_state_op,
+    chunk_warpdrive_packed_fwd_entry_states_op,
     chunk_warpdrive_packed_fwd_with_initial_state_op,
     chunk_warpdrive_packed_fwd_with_state_op,
     validate_warpdrive_available,
@@ -107,9 +108,13 @@ class ChunkKDAWarpdriveSaved(NamedTuple):
     arbitrary-range summaries. warpdrive always runs packed, so the offsets are never ``None``.
     The ``plan_*`` tables are the forward's split summary plan, ``None`` when its summaries ran
     uncut: the backward runs the same pieces (NOTE [Staged piece plans] in
-    ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``). A pinned forward returns a
-    :class:`ChunkKDAWarpdriveInvariantSaved`. Encoding the flag in the type preserves it when
-    context parallelism reconstructs the tape from saved tensors with ``type(saved)._make``.
+    ``attn_gym.linear._delta_rule.warpdrive.drivers.staged``). ``entry_states`` holds the piece
+    entry states a chain backward reads (NOTE [Piece entry states] in the warpdrive KDA driver),
+    recorded by the handle's ``run``; ``None`` when no such pair of plans runs. A pinned forward
+    returns a :class:`ChunkKDAWarpdriveInvariantSaved`, and an ``exact_recompute`` one whose
+    ``run`` takes the public op's plan a :class:`ChunkKDAWarpdriveExactSaved`. Encoding the flags
+    in the type preserves them when context parallelism reconstructs the tape from saved tensors
+    with ``type(saved)._make``.
     """
 
     q: torch.Tensor
@@ -124,8 +129,10 @@ class ChunkKDAWarpdriveSaved(NamedTuple):
     plan_work_count: torch.Tensor | None = None
     plan_cu_pieces: torch.Tensor | None = None
     plan_main_rows: torch.Tensor | None = None
+    entry_states: torch.Tensor | None = None
 
     batch_invariant = False
+    exact_recompute = False
 
 
 class ChunkKDAWarpdriveInvariantSaved(ChunkKDAWarpdriveSaved):
@@ -133,6 +140,27 @@ class ChunkKDAWarpdriveInvariantSaved(ChunkKDAWarpdriveSaved):
 
     __slots__ = ()
     batch_invariant = True
+
+
+class ChunkKDAWarpdriveExactSaved(ChunkKDAWarpdriveSaved):
+    """The tape of an unpinned ``exact_recompute`` warpdrive forward whose ``run`` takes the
+    public op's plan rather than staged pieces (:class:`ChunkKDAWarpdriveSaved`): its summaries
+    ran uncut, or their pieces cannot launch. A backward reads the piece entry states the
+    handle's ``run`` recorded, and rejects the tape without them rather than composing them from
+    piece summaries (NOTE [Staged entry states])."""
+
+    __slots__ = ()
+    exact_recompute = True
+
+
+def _entry_state_rows(saved: ChunkKDAWarpdriveSaved):
+    """Rows of the piece entry states ``run`` records into ``saved``, None when it records none:
+    only an exact-recompute run of the public op's plan runs the uncut forward that stores them.
+    The tape's type says whether ``run`` takes that plan; its summary tables do not, since the
+    staged pieces fall back to it when they cannot launch."""
+    if not saved.exact_recompute:
+        return None
+    return entry_state_rows(saved.gate, saved.v, saved.cu_seqlens)
 
 
 # NOTE [Summary ranges are subsequences]
@@ -236,6 +264,13 @@ class ChunkKDAWarpdrivePrepared:
     the public op's plan. Its bits then follow the piece length, and its maps are those of
     ``prepare``'s inputs, which must not change before the handle's last use (NOTE [Staged piece
     plans]). The backward handle is :class:`ChunkKDAWarpdriveBackward`.
+
+    NOTE [Staged entry states]: under ``exact_recompute``, each ``run`` that takes the public
+    op's plan (uncut summaries, or pieces that cannot launch) replaces ``saved`` with a tape
+    holding that run's piece entry states (NOTE [Piece entry states] in the warpdrive KDA
+    driver), which depend on its ``initial_state``. Read ``saved`` after the ``run`` the
+    backward differentiates: an earlier tape keeps the earlier run's states, and one read before
+    any ``run`` holds none, which ``chunk_kda_prepare_backward`` rejects.
     """
 
     saved: ChunkKDAWarpdriveSaved
@@ -289,7 +324,9 @@ class ChunkKDAWarpdrivePrepared:
         *,
         output_final_state: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Finish the local forward from an FP32 ``[N, HV, V, K]`` entry state per sequence."""
+        """Finish the local forward from an FP32 ``[N, HV, V, K]`` entry state per sequence.
+        Under ``exact_recompute`` a run without staged pieces rebinds ``saved`` to a tape holding
+        its chain backward's piece entry states (NOTE [Staged entry states])."""
         saved = self.saved
         if self.pieces is not None:
             from attn_gym.linear._delta_rule.warpdrive.drivers import staged
@@ -325,6 +362,14 @@ class ChunkKDAWarpdrivePrepared:
             "batch_invariant": self.batch_invariant,
             "exact_recompute": self.exact_recompute,
         }
+        rows = _entry_state_rows(saved)
+        if rows is not None:
+            output, final_state, entry_states = chunk_warpdrive_packed_fwd_entry_states_op(
+                *args[:7], self.scale, self.fastmath, False, output_final_state,
+                self.intra_chunk_dtypes, rows,
+            )  # fmt: skip
+            self.saved = saved._replace(entry_states=entry_states)
+            return output, final_state if output_final_state else None
         if output_final_state:
             return chunk_warpdrive_packed_fwd_with_state_op(*args, **options)
         return chunk_warpdrive_packed_fwd_with_initial_state_op(*args, **options), None
@@ -395,14 +440,18 @@ def chunk_kda_prepare(
 
         invariant = options.batch_invariant
         launch = None if invariant else staged.plan(staged.KDA, v[0], cu_seqlens)
-        tape = ChunkKDAWarpdriveInvariantSaved if invariant else ChunkKDAWarpdriveSaved
-        saved = tape(
-            q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets,
-            *staged.plan_tables(launch),
-        )  # fmt: skip
         pieces = staged.forward_pieces(
             *(t[0] for t in (q, k, v, gate, beta)), cu_seqlens, launch, fastmath=fastmath,
             intra_chunk_dtypes=intra_chunk_dtypes,
+        )  # fmt: skip
+        tape = ChunkKDAWarpdriveSaved
+        if invariant:
+            tape = ChunkKDAWarpdriveInvariantSaved
+        elif exact_recompute and pieces is None:
+            tape = ChunkKDAWarpdriveExactSaved
+        saved = tape(
+            q, k, v, gate, cumulative_gate, beta, cu_seqlens, chunk_offsets,
+            *staged.plan_tables(launch),
         )  # fmt: skip
         return ChunkKDAWarpdrivePrepared(
             saved, metadata, scale, fastmath, intra_chunk_dtypes, exact_recompute, pieces
@@ -600,6 +649,7 @@ class ChunkKDAWarpdriveBackward:
                 self.fastmath,
                 self.intra_chunk_dtypes,
                 self.batch_invariant,
+                saved.entry_states,
             )
             return (*grads, None)
         return chunk_warpdrive_packed_bwd_with_state_op(
@@ -611,6 +661,7 @@ class ChunkKDAWarpdriveBackward:
             self.fastmath,
             self.intra_chunk_dtypes,
             self.batch_invariant,
+            saved.entry_states,
         )
 
 
@@ -635,7 +686,10 @@ def chunk_kda_prepare_backward(
     (:class:`ChunkKDAWarpdriveSaved`) returns :class:`ChunkKDAWarpdriveBackward`.
     ``"backend"`` may be omitted or ``"auto"``; ``"fused"`` or ``"warpdrive"`` must name the tape's
     backend. A warpdrive backward reuses the forward's summary pieces and inherits its
-    ``batch_invariant`` setting. Requesting ``True`` after an unpinned forward raises.
+    ``batch_invariant`` setting. Requesting ``True`` after an unpinned forward raises. Pass a
+    warpdrive ``exact_recompute`` tape read after the ``run`` being differentiated (NOTE
+    [Staged entry states]); one read before any ``run`` raises when that run records piece
+    entry states.
     """
     d_output, scale = normalize_backward_span(saved.v, saved.q.shape[-1], d_output, scale)
     warpdrive = isinstance(saved, ChunkKDAWarpdriveSaved)
@@ -655,6 +709,12 @@ def chunk_kda_prepare_backward(
         from attn_gym.linear._delta_rule.warpdrive.drivers import staged
 
         launch = staged.restore_plan(saved, batch_invariant=options.batch_invariant)
+        if saved.entry_states is None and _entry_state_rows(saved) is not None:
+            raise ValueError(
+                "this exact_recompute tape holds no piece entry states: pass the prepared "
+                "handle's `saved` read after the `run` being differentiated (NOTE [Staged "
+                "entry states])"
+            )
         initial_state = _normalize_warpdrive_state(initial_state)
         pieces = staged.backward_pieces(
             *(t[0] for t in (saved.q, saved.k, saved.v, saved.gate, saved.beta, d_output)),
@@ -716,6 +776,7 @@ __all__ = [
     "ChunkKDAPrepared",
     "ChunkKDASaved",
     "ChunkKDAWarpdriveBackward",
+    "ChunkKDAWarpdriveExactSaved",
     "ChunkKDAWarpdriveInvariantSaved",
     "ChunkKDAWarpdrivePrepared",
     "ChunkKDAWarpdriveSaved",

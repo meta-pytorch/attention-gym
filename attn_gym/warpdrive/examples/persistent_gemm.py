@@ -65,6 +65,7 @@ from attn_gym.warpdrive import (
     WorkMap,
     WorkStream,
     role,
+    unchecked,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
@@ -74,6 +75,10 @@ from attn_gym.warpdrive.examples.tma_tiles import tma_partition_tiles
 CTA_TILE_M, TILE_K = 128, 64  # per-CTA output rows and K step; tile N is a constructor argument
 EPI_TILE_NS = (16, 32, 64)  # TMA store box widths: 32 B to 128 B bf16 rows, up to the SW128 atom
 MAX_C_STAGES = 8  # bounds the cp.async.bulk.wait_group immediate and epilogue SMEM
+PAST_EDGE = (
+    "a ragged last cluster tile's extra MMA tiles fall past the edge, where TMA loads zeros "
+    "and clips the stores"
+)
 
 
 def default_tile_n(cluster) -> int:
@@ -211,8 +216,9 @@ class PersistentGemm(WarpSpecialized):
         mcast_b = {} if params.mcast_b is None else {"mcast_mask": params.mcast_b}
         while work.valid:
             m, n = self.mma_tile_mn(params, work.item)
-            tAgA = params.tAgA[None, m, None]
-            tBgB = params.tBgB[None, n, None]
+            with unchecked("bounds", reason=PAST_EDGE):
+                tAgA = params.tAgA[None, m, None]
+                tBgB = params.tBgB[None, n, None]
             for k in cutlass.range(params.num_k_tiles, unroll=1):
                 with ab.produce() as s:
                     a, b = s.view("A"), s.view("B")
@@ -306,7 +312,8 @@ class PersistentGemm(WarpSpecialized):
         first = Int32(0)  # the buffer of this tile's first subtile
         while work.valid:
             m, n = self.mma_tile_mn(params, work.item)
-            dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
+            with unchecked("bounds", reason=PAST_EDGE):
+                dst = cute.group_modes(bSG_gC[None, None, None, m, n], 1, 3)  # (TMA, SUB)
             a = acc.wait()
             for i in cutlass.range_constexpr(subtiles):
                 buf = (first + i) % self.c_stages if rotate else i % self.c_stages

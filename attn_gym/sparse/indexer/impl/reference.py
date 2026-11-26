@@ -6,6 +6,34 @@ import torch
 from torch import Tensor
 
 
+def score_and_select(
+    q: Tensor,
+    k: Tensor,
+    weights: Tensor,
+    topk: int,
+    valid: Tensor,
+    start: Tensor | int = 0,
+    *,
+    deterministic: bool = False,
+) -> Tensor:
+    """Rank visible keys for each query, returning indices relative to its document start."""
+    # Autocast can downcast even explicitly promoted einsum operands before the head sum.
+    dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        dots = torch.einsum("...thd,...sd->...ths", q.to(dtype), k.to(dtype))
+        scores = (dots.relu() * weights.to(dtype).unsqueeze(-1)).sum(dim=-2)
+        scores *= 1.0 / math.sqrt(q.shape[-2] * q.shape[-1])
+    scores.masked_fill_(~valid, -torch.inf)
+    width = min(topk, k.shape[-2])
+    if deterministic:
+        ranked = scores.argsort(dim=-1, descending=True, stable=True)
+        indices = ranked[..., :width].sort(dim=-1).values
+    else:
+        indices = scores.topk(width, dim=-1).indices
+    selected = valid.expand_as(scores).gather(-1, indices)
+    return torch.where(selected, indices.int() - start, -1)
+
+
 def launch(
     q: Tensor,
     k: Tensor,
@@ -37,26 +65,10 @@ def launch(
     Returns:
         [B, T, topk] INT32 tensor of selected candidate indices.
     """
-    batch, queries, heads, head_dim = q.shape
+    batch, queries = q.shape[:2]
     candidates = k.shape[1]
     if topk == 0 or candidates == 0:
         return torch.full((batch, queries, topk), -1, dtype=torch.int32, device=q.device)
-    scale = 1.0 / math.sqrt(heads * head_dim)
-
-    # Accumulate scoring in FP32 to match the CuTe backend's accumulation
-    # contract, regardless of the input storage dtype (e.g. FP16/BF16 can
-    # overflow the dot product or produce NaNs from mixed-sign weights before
-    # scaling). FP64 inputs are left at FP64 rather than downcast.
-    accum_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
-    q = q.to(accum_dtype)
-    k = k.to(accum_dtype)
-    weights = weights.to(accum_dtype)
-
-    # dots: [B, T, H, S]
-    dots = torch.einsum("bthd,bsd->bths", q, k)
-    # score: [B, T, S]
-    scores = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2) * scale
-
     starts = torch.zeros((queries, 1), dtype=torch.int32, device=q.device)
     if cu_seqlens is not None:
         positions = torch.arange(queries, device=q.device, dtype=torch.int32)
@@ -75,9 +87,5 @@ def launch(
         ends = torch.full_like(starts, candidates)
     key_positions = torch.arange(candidates, device=q.device)[None, :]
     valid = (key_positions >= starts) & (key_positions < ends)
-    scores.masked_fill_(~valid, float("-inf"))
-
-    indices = scores.topk(min(topk, candidates), dim=-1).indices.to(torch.int32)
-    selected_valid = (indices >= starts) & (indices < ends)
-    indices = torch.where(selected_valid, indices - starts, -1)
+    indices = score_and_select(q, k, weights, topk, valid, starts)
     return torch.nn.functional.pad(indices, (0, max(0, topk - candidates)), value=-1)

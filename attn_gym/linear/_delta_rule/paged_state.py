@@ -8,6 +8,8 @@ from dataclasses import dataclass
 
 import torch
 
+from attn_gym.linear.types import StateCheckpoints
+
 
 def validate_has_initial_state(
     has_initial_state: torch.Tensor | None,
@@ -75,11 +77,13 @@ class PagedState:
         has_initial_state: Optional bool mask with one value per sequence.
             ``True`` resumes the selected slot. ``False`` starts from zero and
             overwrites the slot; if omitted, every active route resumes.
+        checkpoints: Optional validated prefix-cache destinations for a paged chunk forward.
     """
 
     cache: torch.Tensor
     indices: torch.Tensor
     has_initial_state: torch.Tensor | None
+    checkpoints: StateCheckpoints | None = None
 
     @classmethod
     def validate(
@@ -94,6 +98,7 @@ class PagedState:
         key_dim: int,
         device: torch.device,
         read_only_inputs: tuple[torch.Tensor, ...] = (),
+        checkpoints: StateCheckpoints | None = None,
     ) -> PagedState:
         """Validate the common pool ABI and return its routing metadata."""
         validate_state_pool(
@@ -115,7 +120,7 @@ class PagedState:
                 read_only_inputs += (has_initial_state,)
             if any(torch._C._overlaps(cache, tensor) for tensor in read_only_inputs):
                 raise ValueError("the paged state pool must not alias read-only inputs")
-        return cls(cache, indices, has_initial_state)
+        return cls(cache, indices, has_initial_state, checkpoints)
 
     @property
     def byte_mask(self) -> torch.Tensor | None:

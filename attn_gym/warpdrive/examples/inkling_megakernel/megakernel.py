@@ -132,6 +132,7 @@ def visit_kernel_for(
     tokens: int = 1,
     *,
     smem_bytes: int = SMEM_BYTES,
+    checked: bool = False,
 ) -> InklingVisitKernel:
     """The visit kernel for ``config``'s full (``full``) or sliding layers, with message gates
     (``messages``) or without, streaming experts in ``experts_format`` and quantizing their
@@ -147,6 +148,7 @@ def visit_kernel_for(
         cls, extra = multi_visit_kernel_class(experts_format), {"tokens": tokens}
     return cls.get_or_build(
         **extra,
+        checked=checked,
         smem_bytes=smem_bytes,
         hidden=config.hidden_size,
         q_heads=config.num_q_heads,
@@ -444,7 +446,8 @@ class InklingVisitMegakernel:
     for the work items and ``trace_region``s, recorded by ``"globaltimer"`` (``traced``) or
     ``"iket"``; ``trace_events``: per-role capacity (see ``Launch``; raise it for long contexts).
     ``tokens``: consecutive tokens of one sequence per launch (``multi_kernel`` when more than
-    one); ``args``: another runner's kernel-form layer arguments to share (same layers)."""
+    one); ``args``: another runner's kernel-form layer arguments to share (same layers).
+    ``checked=True`` builds the visit kernels with bounds checks."""
 
     def __init__(
         self,
@@ -455,6 +458,8 @@ class InklingVisitMegakernel:
         trace_events: int | None = None,
         tokens: int = 1,
         args: dict | None = None,
+        *,
+        checked: bool = False,
     ):
         self.config, self.tokens = config, tokens
         self.args = args or {id(w): VisitLayer.of(config, w) for w in layers}
@@ -463,7 +468,9 @@ class InklingVisitMegakernel:
         smem_bytes = device_smem_bytes(device)
         self.launches = {
             (full, messages, *fmt): Launch(
-                visit_kernel_for(config, full, messages, *fmt, tokens, smem_bytes=smem_bytes),
+                visit_kernel_for(
+                    config, full, messages, *fmt, tokens, smem_bytes=smem_bytes, checked=checked
+                ),
                 build_visit_table,
                 device,
                 trace,

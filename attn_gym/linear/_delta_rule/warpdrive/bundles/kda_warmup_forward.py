@@ -60,6 +60,7 @@ from ..kda_common import (
     operand_dtypes,
     state_align_suffix,
 )
+from ..state_checkpoints import CheckpointTensors, make_checkpoint_signature
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
     make_compact_signature_tensor,
@@ -109,11 +110,16 @@ def warmup_forward_host(
     prep_rows: cute.Tensor | None,
     prep_row_count: cute.Tensor | None,
     tma_slots: cute.Tensor,
+    pieces: cutlass.Int32,
+    entry_states: cute.Tensor | None,
+    checkpoints: CheckpointTensors | None,
     stream: cuda.CUstream,
 ) -> None:
     """``split`` is the split table's :class:`~work_tables.SplitStatic` (None: the uncut
     table); the eight scalars after ``num_sms`` are its runtime values (zeros when uncut).
-    ``prep_op`` (None without the shared prep) runs the prep ahead of the prep-fed prefill."""
+    ``prep_op`` (None without the shared prep) runs the prep ahead of the prep-fed prefill.
+    With ``entry_states`` the prefill stores the state entering each piece of a
+    ``pieces``-piece chain backward."""
     if cutlass.const_expr(split is not None):
         work_tables.launch_split_table(
             split,
@@ -132,6 +138,9 @@ def warmup_forward_host(
             work_count,
             stream,
         )
+    entries = None
+    if cutlass.const_expr(entry_states is not None):
+        entries = (entry_states, cu_seqlens, pieces)
     # Up to one item per CTA runs unsorted (num_ctas): the prefills claim one item per CTA there.
     work_tables.launch_work_table(
         B_T,
@@ -184,6 +193,7 @@ def warmup_forward_host(
             tma_slots,
             scale,
             stream,
+            checkpoints=checkpoints,
         )
     else:
         prefill_op.launch(
@@ -203,6 +213,8 @@ def warmup_forward_host(
             tma_slots,
             scale,
             stream,
+            entries=entries,
+            checkpoints=checkpoints,
         )
 
 
@@ -249,12 +261,17 @@ def _compile_warmup_forward(
     paged_state: int = 0,
     fastmath: bool = True,
     state_align: int = 16,
+    entry_states: bool = False,
+    checkpoint_dtype=None,
 ):
     """Compile the warmup / uncut forward host for one static config over fake tensors that repeat
     the standalone builds' placeholders; absent tensors have a None dtype. ``paged_state`` is 0
     without paged routing, 1 with per-sequence routes and 2 with routes plus the fresh-slot byte
     mask; ``state_align`` is the state rows' byte alignment (``paged_state_align``).
-    ``precision`` holds the resolved operand dtypes (``kda_common.operand_dtypes``)."""
+    ``precision`` holds the resolved operand dtypes (``kda_common.operand_dtypes``).
+    ``entry_states`` stores a chain backward's piece entry states (per-tile prefill only)."""
+    if entry_states and (prep or split is not None or paged_state):
+        raise ValueError("only the uncut per-tile prefill stores piece entry states")
     i64 = use_int64_offsets
     io, gate_name = op_dtype_name(io_dtype), op_dtype_name(gate_dtype)
     states = (state_in_dtype is not None, state_out_dtype is not None, paged_state, num_sms)
@@ -290,6 +307,7 @@ def _compile_warmup_forward(
             fastmath,
             state_align=state_align,
             precision=precision,
+            entry_states=entry_states,
         )
     if prep:
         prep_signatures = [
@@ -336,7 +354,10 @@ def _compile_warmup_forward(
         + f"_split_{split_tag}_{dtype_names}{state_align_suffix(state_align)}"
         + f"_{precision.decay_dtype}_{precision.solve_dtype}"
         + ("" if fastmath else "_nofm")
+        + ("_entry" if entry_states else "")
     )
+    if checkpoint_dtype is not None:
+        name += f"_ckpt_{checkpoint_dtype.__name__.lower()}"
     return compile_tvm_ffi(
         warmup_forward_host,
         split,
@@ -371,6 +392,9 @@ def _compile_warmup_forward(
         _dynamic(cutlass.Int32, 1, 4, i64),  # scheduler
         *prep_signatures,
         _compact(cutlass.Int64, (16,), 128, i64),  # tma_slots
+        cutlass.Int32(0),  # pieces
+        _dynamic(cutlass.Float32, 5, 16, i64) if entry_states else None,  # entry_states
+        make_checkpoint_signature(checkpoint_dtype, i64),
         name=name,
         opt_level=2,
     )
@@ -558,6 +582,8 @@ def build_warmup_forward(
     has_initial_state=None,
     intra_chunk_dtypes,
     fastmath=True,
+    entry_states=None,
+    pieces=0,
 ):
     """Compile (persisted per static config: dtypes, dims, the split-K
     geometry, the d_v split, state presence, the int64 ABI) the warmup or uncut forward launch over
@@ -565,15 +591,18 @@ def build_warmup_forward(
     :class:`~work_tables.SplitTableFacts` (None for the uncut table). It launches on the
     current Torch stream. ``state_indices`` (int32 per sequence) and the optional uint8
     ``has_initial_state`` select paged state: ``state_in`` and ``state_out`` are then one pool
-    routed per sequence (null, fresh and resumed slots). The warpdrive KDA prefills route state
-    through ``state_indices`` only and write no checkpoints. ``fastmath=False`` selects the
-    non-flushing gate exponentials. The requested operand precision selects the kernel variant."""
+    routed per sequence (null, fresh and resumed slots). ``checkpoints`` optionally publishes
+    the state at one selected prefix per sequence. ``fastmath=False`` selects the non-flushing
+    gate exponentials. The requested operand precision selects the kernel variant.
+    ``entry_states`` stores the state entering each piece of a ``pieces``-piece chain backward
+    (``pieces`` is a launch argument)."""
+    del pieces
     if not log_gate:
         raise ValueError("the warpdrive KDA prefills take natural-log gates")
     if seed_indices is not None or final_indices is not None:
         raise ValueError("the warpdrive KDA prefills route state through state_indices only")
     if int(checkpoint_every_n_tokens) > 0:
-        raise ValueError("the warpdrive KDA prefills write no checkpoints")
+        raise ValueError("the warpdrive KDA prefills do not write periodic checkpoints")
     # Attention Gym modification: validate the launch contract before selecting a compiled ABI.
     _validate_launch(
         q=q,
@@ -648,7 +677,8 @@ def build_warmup_forward(
         raise ValueError("has_initial_state requires state_indices")
     paged_state = 0 if state_indices is None else 1 + (has_initial_state is not None)
     state_align = 16 if state_indices is None else paged_state_align(state_in)
-    use_int64_offsets = requires_int64_abi(*tensors)
+    pool = None if checkpoints is None else checkpoints.state_pool
+    use_int64_offsets = requires_int64_abi(*tensors, pool)
     compiled = _compile_warmup_forward.by_args(
         None if facts is None else facts.static,
         int(num_sm),
@@ -667,6 +697,8 @@ def build_warmup_forward(
         paged_state,
         bool(fastmath),
         state_align,
+        entry_states is not None,
+        _dtype_or_none(pool),
     )
     return compiled, facts
 
@@ -704,11 +736,12 @@ def run_warmup_forward(
     final_indices=None,
     checkpoints=None,
     checkpoint_every_n_tokens=0,
+    pieces=0,
+    entry_states=None,
 ) -> None:
     """Replay the warmup or uncut forward: one crossing into the DSL for the table, prologue,
     prep and prefill launches, on the current Torch stream. The plan validated the contract at
-    build, so nothing here raises. The trailing keywords only shape the build; they are accepted
-    so a caller replays with the build's buffers."""
+    build; replay uses the same buffers."""
     split = facts is not None
     compiled(
         *(facts.scalars() if split else (0, 0, 0, 0, 0.0, 0, 0, 0)),
@@ -737,4 +770,7 @@ def run_warmup_forward(
         prep_rows,
         prep_row_count,
         tma_slots,
+        int(pieces),
+        entry_states,
+        checkpoints,
     )

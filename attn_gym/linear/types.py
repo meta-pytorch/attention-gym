@@ -36,8 +36,7 @@ class StateCheckpoints(NamedTuple):
     this call. Neither request vector may overlap storage the call modifies (including replay
     counts). These are caller guarantees, not host-side checks of device values.
 
-    Runs on the fused backend; the default ``backend="auto"`` selects it for checkpointed
-    chunk calls, and an explicit ``"warpdrive"`` raises.
+    Paged chunk calls use the same backend with or without checkpoints.
     """
 
     state_pool: torch.Tensor
@@ -87,7 +86,7 @@ class BackendOptions(TuningOptions, total=False):
 
     backend: Literal["auto", "fused", "warpdrive", "cudnn"]
     """Choose the optimized chunk backend. With CuTeDSL installed, ``"auto"`` prefers warpdrive on
-    SM100 and SM103, and on SM107 with CuTeDSL 4.8+. Paged checkpoint writes use Triton.
+    SM100 and SM103, and on SM107 with CuTeDSL 4.8+.
     Set ``"warpdrive"`` or ``"fused"`` (Triton) to require that backend; ``"cudnn"``,
     warpdrive's former name, is an alias of ``"warpdrive"``.
     See "Chunk backend selection" in ``docs/linear.md``."""
@@ -148,10 +147,9 @@ class KernelOptions(SplitOptions, total=False):
     reproduce. Omit to infer from grad mode: ``True`` when autograd records the forward (under
     ``torch.compile``, while tracing).
 
-    With ``True`` the warpdrive KDA forward runs the per-tile kernels its backward recomputes.
-    The recomputed states match the forward's bit for bit only when the backward runs the
-    forward's piece plan: a chain backward after an uncut forward composes FP32 piece summaries
-    and can round them differently.
+    With ``True`` the warpdrive KDA forward runs the per-tile kernels its backward recomputes,
+    and an uncut forward hands a chain backward its FP32 states at the backward's piece starts,
+    so the recomputed states match the forward's bit for bit.
     With ``False`` a small pack may share one prep pass between its two value tiles even under
     autograd: faster, but that forward rounds its chunk states apart from the recompute, so its
     gradients are not exactly those of its output. ``chunk_kda_prepare`` infers the option at

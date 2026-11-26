@@ -56,6 +56,7 @@ from attn_gym.warpdrive import (
     WorkMap,
     WorkStream,
     role,
+    unchecked,
 )
 from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache, make_fake_compact_tensor
 from attn_gym.warpdrive.compat import LayoutEnum
@@ -499,8 +500,10 @@ class GroupedGemm(WarpSpecialized):
         # The ragged output view (see the module docstring); its base lies EDGE_ROWS rows
         # before C.
         row_stride = c.stride[0]
+        with unchecked("bounds", reason="the ragged view's base is EDGE_ROWS rows before C"):
+            base = cute.domain_offset((-EDGE_ROWS, 0), c).iterator
         c_ragged = cute.make_tensor(
-            cute.domain_offset((-EDGE_ROWS, 0), c).iterator,
+            base,
             cute.make_layout(
                 (EDGE_ROWS, c.shape[1], RAGGED_SELECT), stride=(row_stride, 1, row_stride)
             ),

@@ -136,6 +136,42 @@ compiled kernel's PTX where one is missing, counting a guarded fence, commit or 
 skipped and rejecting calls; `capture_ptx(dir)` dumps the PTX of an uncached compile. It does
 not check that an in-loop handoff completed its TMEM loads and stores before the signal.
 
+### TMEM copy completion at teardown
+
+Run `ptx_check.check_tcgen05_sync(ptx, teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)` on PTX
+captured from a fresh compile (`TMEM_TEARDOWN_BARRIER_ID` is in `attn_gym.warpdrive.named`).
+Its `copy-drain` finding names an S-to-T copy and a reachable teardown (or an issuing path
+that returns without joining it). For example, a copy
+issued before a possibly empty loop cannot rely on an accumulator publish/wait *inside* that
+loop. Gate the copy on having a tile, without skipping any required channel epochs. Neither
+issuing an MMA nor `tcgen05.wait::ld/st` completes an orphaned copy.
+
+A single-CTA [`tcgen05.commit`](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit)
+tracks previous async operations issued by **that thread**. The check follows both the leader
+and the other lanes through full-mask [`elect.sync`](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-elect-sync):
+repeating the same mask elects the same leader, but its commit does not cover other lanes' copies.
+A later commit on the issuer's path needs a possible observer: the issuer subsequently spin-waits
+on that unchanged barrier pointer, or another participant can spin-wait on the same barrier
+family on its way to teardown. A restricted commit that signals only MMA operand reads does
+not track a copy. For a peer the wait must start at parity zero on forward control-flow paths: a producer can
+acquire an initially EMPTY stage (parity one) *before* the copy, then return without a tail.
+It recognizes PTX parity wait/test spin loops, not mere probes. It follows loops without a
+chosen trip count and remembers repeated guard predicates until redefinition. It uses the thread-ID analysis described under [bulk copies](#hand-written-tma-stores)
+to identify separate participants.
+
+This is a missing-handoff diagnostic, **not a proof of completion**. For a peer it recognizes
+direct addresses and ring addresses with a common base register, constant displacement and
+8-byte stage indexing. It does **not** prove equal runtime addresses across lanes, dynamic
+slots/phases, or that the peer waits for *this* commit rather than an earlier one. A wait on
+the wrong epoch or on an untaken peer path can leave a real race unreported. A peer's thread-ID
+class must be distinct from every possible issuer and able to observe the commit regardless
+of which lane is elected. This conservative rule can miss a legal elected-only peer handoff.
+Unsupported pointer
+arithmetic, multicast commits, indirect handoffs (e.g. a waiter signals a third warp), and
+conditions computed differently on equivalent paths can leave valid handoffs unrecognized.
+Always inspect the named copy, commit and wait. Passing `checked=True` enables index bounds
+checks; it does not run this PTX analysis.
+
 ### Skip a redundant thread-sync fence
 
 Each fence costs a stall, and the layer fences every managed synchronization of a `tcgen05`
@@ -305,8 +341,44 @@ body instead.
 Use `with unchecked(check, reason=...):` only when you can justify skipping that check.
 See [raw code and opt-outs](guarantees.md#opt-outs) for accepted kinds and scope.
 `unchecked("liveness")` leaves the protocol unverified; the other checks stay active.
+`unchecked("bounds")` keeps an index or view offset that is outside its tensor on purpose out
+of a [checked build](#checked-builds)'s checks.
 A [span](channels.md#spans), a [carried token](channels.md#try-tokens) or raw barriers may
 express the protocol without suppressing a check.
+
+### Checked builds
+
+A CuTe layout maps any coordinate to an offset, inside its shape or not, so a wrong index
+addresses other memory without an error. `MyKernel(..., checked=True)` compiles a separate,
+slower build of a kernel for tests and debugging, with no change to its code:
+
+- every read or write `tensor[...]` of a `cute.Tensor` is checked: each integer coordinate against the extent of
+  its mode (the integer modes of a slice too), a single index against the tensor's size. A
+  launch that runs one outside aborts with `CUDA_ERROR_ASSERT`, printing the source line
+  (`gemm.py:113: index of mode 1 out of range`). An index known while tracing needs no
+  comparison, but still aborts only the launch that runs it: a kernel traces branches that a
+  given model or shape never takes;
+- a `cute.domain_offset` by a negative constant coordinate is treated the same: the view
+  starts before its tensor.
+
+The launch function (`__call__`) always runs and cannot assert. There a mistake known while
+tracing fails the compile, and so does an index that is not known, or whose extent is not:
+index in the kernel instead.
+
+Not checked: a `None` mode, a nested coordinate, a coordinate of another rank than the tensor,
+an index into loaded values (`t.load()[i]`), a nonconstant offset, pointer arithmetic, or a
+hand-computed TMEM column. Call `cute.domain_offset` by its qualified name: a saved reference
+retains whichever implementation was installed when it was bound, checked or unchecked.
+Wrap a deliberate out-of-bounds access (a tile TMA clips or a ragged view's shifted base)
+in `with unchecked("bounds", reason=...):`.
+
+The setting belongs to the compile. `compile_tvm_ffi` (every `@jit_cache` compile function)
+traces the kernel it is given, launch function included, with that kernel's setting, and the
+role code of any other kernel traced inside (a kernel launched by a host function, as in the
+linear bundles) with that kernel's own; such a kernel's launch function follows the
+entrypoint. A kernel without the setting is traced by the unmodified CuTeDSL. A checked kernel
+does not compile through a direct `cute.compile`. The device assert poisons the CUDA context,
+so a test of a failing launch runs it in its own process.
 
 ## Compiler pitfall: saved indices across loops
 

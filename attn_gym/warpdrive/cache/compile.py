@@ -25,7 +25,13 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .jit import CacheStorageError, get_cache_path
-from .target import CompileTarget, get_compile_target, set_compile_target
+from .target import (
+    CompileTarget,
+    _scoped_target,
+    compile_target_scope,
+    get_compile_target,
+    set_compile_target,
+)
 
 T = TypeVar("T")
 DEFAULT_COMPILE_TIMEOUT_SECONDS = 15 * 60
@@ -175,6 +181,16 @@ def precompile_calls(
     call_args = _materialize_calls(calls)
     if not call_args:
         return
+    _precompile_calls(call_args, target, workers, timeout, progress)
+
+
+def _precompile_calls(
+    call_args: list[tuple[Any, ...]],
+    target: CompileTarget | None,
+    workers: int | None,
+    timeout: float | None,
+    progress: Callable[[int, int], None] | None,
+) -> CompileTarget:
     if sys.platform == "win32":  # pragma: no cover - CuTeDSL currently targets Linux.
         raise RuntimeError("parallel CuTeDSL precompilation requires fork support")
 
@@ -183,20 +199,25 @@ def precompile_calls(
     if not all(fn.disk_cache_enabled() for fn in fns):
         raise RuntimeError("parallel CuTeDSL precompilation requires the disk cache")
 
-    target = target or get_compile_target()
-    set_compile_target(target)
-    pending = [(fn, args) for fn, *args in call_args if not fn.is_cached(*args)]
+    if target is None:
+        target = get_compile_target()
+    elif _scoped_target.get() is None:
+        set_compile_target(target)
+    with compile_target_scope(target):
+        pending = [(fn, args) for fn, *args in call_args if not fn.is_cached(*args)]
     if not pending:
-        return
+        return target
 
     def report() -> None:
         if progress is not None:
-            progress(sum(fn.is_cached(*args) for fn, args in pending), len(pending))
+            with compile_target_scope(target):
+                progress(sum(fn.is_cached(*args) for fn, args in pending), len(pending))
 
     request = {
         "functions": references,
         "workers": _worker_count(workers, len(pending)),
         "target": asdict(target),
+        "gpu_arch": target.gpu_arch,
         # The driver fills the cache this process reads, including one set by set_cache_path().
         "cache_path": os.fspath(get_cache_path()),
         "sys_path": _import_paths(fns),
@@ -231,6 +252,7 @@ def precompile_calls(
             "parallel CuTeDSL precompilation failed:\n" + _driver_error(returncode, stdout, stderr)
         )
     report()
+    return target
 
 
 def compile_many(
@@ -243,11 +265,8 @@ def compile_many(
 ) -> list[T]:
     """Compile ``calls`` in parallel, then load them one at a time in the caller."""
     call_args = _materialize_calls(calls)
-    precompile_many(
-        fn,
-        call_args,
-        workers=workers,
-        target=target,
-        timeout=timeout,
-    )
-    return [fn(*args) for args in call_args]
+    if not call_args:
+        return []
+    target = _precompile_calls([(fn, *args) for args in call_args], target, workers, timeout, None)
+    with compile_target_scope(target):
+        return [fn(*args) for args in call_args]

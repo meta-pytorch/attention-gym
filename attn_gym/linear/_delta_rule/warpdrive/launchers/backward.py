@@ -31,6 +31,7 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     batch_invariant: bool = False,
+    entry_states: torch.Tensor | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -49,7 +50,8 @@ def chunk_delta_rule_bwd_warpdrive_packed(
     The approximate forgetting-horizon ``split`` schedule requires a no-state call.
     ``fastmath=False`` selects the non-flushing gate exponentials. Recompute, summaries and
     gradients all use the forward's ``intra_chunk_dtypes``. With ``batch_invariant``, the
-    backward scans whole sequences rather than chaining pieces.
+    backward scans whole sequences rather than chaining pieces. ``entry_states`` is the buffer
+    the forward was given (NOTE [Piece entry states] in ``drivers.kda``).
     """
     scale = resolve_scale(scale, q.shape[-1])
     if not q.is_cuda:
@@ -115,6 +117,7 @@ def chunk_delta_rule_bwd_warpdrive_packed(
             fastmath=fastmath,
             intra_chunk_dtypes=intra_chunk_dtypes,
             batch_invariant=batch_invariant,
+            entry_states=entry_states,
         )
         return (*(grad.unsqueeze(0) for grad in gradients), d_initial_state)
 

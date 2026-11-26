@@ -30,6 +30,7 @@ from .ptx import (
     st_shared_v4,
     stmatrix,
     tf32_round,
+    tmem_ld,
     tmem_st,
 )
 from .ragged import RaggedTma, ragged_load
@@ -240,10 +241,8 @@ def state_align_suffix(state_align: int) -> str:
 # (measured up to 2.6x the aligned prefill time on state-bound GB300 calls). Instead the row
 # keeps its 16-byte vector accesses on the enclosing aligned blocks and realigns in registers:
 # words move by ``m // 4`` through two levels of selects and, for an odd BF16 offset, by one
-# more half word through a funnel shift (measured 1.0-1.2x the aligned time). Loads read only
-# blocks that hold a byte of the row, so they never leave its allocation. Stores write the
-# interior blocks whole and the two partial end blocks element by element, so no byte outside
-# the row is written.
+# more half word through a funnel shift. Only interior blocks may be loaded or stored whole:
+# bytes beyond the row may be unmapped, or belong to a concurrently updated cache slot.
 
 
 def _shift_word(words, j: int, odd, high):
@@ -292,14 +291,19 @@ def load_state(tile, align: cutlass.Constexpr[int] = 16):
     if cutlass.const_expr(align < 16):
         misalignment = addr & 15
         base = addr - misalignment
-        for g in cutlass.range_constexpr(blocks):
+        # Join the two partial blocks into one register block: wrap would-be reads before
+        # the tile to its tail. The same block then supplies both ends of the realignment.
+        elem_bytes = dtype.width // 8
+        edge = cute.make_rmem_tensor((16 // elem_bytes,), dtype)
+        for e in cutlass.range_constexpr(16 // elem_bytes):
+            idx = cute.size(tile) + e - misalignment // elem_bytes
+            edge[e] = tile[idx % cute.size(tile)]
+        packed = cute.recast_tensor(edge, Int32)
+        edge_words = [packed[j] for j in range(4)]
+        words = list(edge_words)
+        for g in cutlass.range_constexpr(1, blocks):
             words += ldg_v4(base + g * 16)
-        # The values spill into one more block unless the tile is aligned; reread the last one
-        # then, so the load stays on blocks of the row.
-        words += ldg_v4(
-            base + blocks * 16 - cutlass.select_(misalignment == 0, Int64(16), Int64(0))
-        )
-        words = realign_words(words, misalignment, 4 * blocks)
+        words = realign_words(words + edge_words, misalignment, 4 * blocks)
     else:
         for g in cutlass.range_constexpr(blocks):
             words += ldg_v4(addr + g * 16)
@@ -310,6 +314,15 @@ def load_state(tile, align: cutlass.Constexpr[int] = 16):
         else:
             lo, hi = f16x2_to_f32(w, dtype=dtype)
             vals += [lo, hi]
+    return vals
+
+
+@cute.jit
+def load_seed(tile, align: cutlass.Constexpr[int], load_initial):
+    # A null route may have no backing pool at all. Zero the operand, not the seed handshake.
+    vals = [Float32(0.0)] * cute.size(tile)
+    if load_initial:
+        vals = load_state(tile, align)
     return vals
 
 
@@ -366,6 +379,25 @@ def store_state_32(tile, vals, align: cutlass.Constexpr[int] = 16):
                     for t in range(4)
                 ]
                 stg_v4(addr + g * 16, words)
+
+
+@cute.jit
+def store_tmem_state(
+    dst,
+    taddr,
+    row_valid,
+    first: cutlass.Constexpr[int],
+    width: cutlass.Constexpr[int],
+    align: cutlass.Constexpr[int],
+):
+    """Store a key slice of this lane's FP32 TMEM state row as the destination dtype.
+
+    The load is warp-wide even for a 64-row value tile, where only half the lanes own rows.
+    """
+    for block in cutlass.range_constexpr(first // 32, (first + width) // 32):
+        vals = tmem_ld("32x32b", 32, taddr + block * 32)
+        if row_valid:
+            store_state_32(cute.local_tile(dst, (32,), (block,)), vals, align)
 
 
 @cute.jit

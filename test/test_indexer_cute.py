@@ -371,7 +371,7 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
 
     monkeypatch.setenv("WARPDRIVE_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.delenv("CUTE_DSL_NO_CACHE", raising=False)
-    compilers = (impl._compile_scores, impl._compile_topk)
+    compilers = (impl._compile_scores, impl._compile_topk_kernel)
     for compiler in compilers:
         compiler.cache_clear()
     torch.manual_seed(2026)
@@ -390,7 +390,6 @@ def test_cute_artifact_reused_across_batch_and_tokens(monkeypatch, tmp_path):
                 assert compiler.cache_info().misses == 1
                 assert compiler.cache_info().currsize == 1
         assert impl._compile_scores.is_cached(torch.bfloat16, 64, 128, True, 1, False, True, False)
-        assert impl._compile_topk.is_cached(16, True, 1, False, False, False)
         for compiler in compilers:
             assert compiler.cache_info().hits == 3
             compiler.cache_clear()

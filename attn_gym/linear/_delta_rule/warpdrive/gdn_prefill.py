@@ -4,8 +4,8 @@
 # Derived from cudnn-frontend v1.30.0 (python/cudnn/linear_attention/frost/kernel/gdn_prefill_f16.py),
 # rewritten by Attention Gym in 2026 on attn_gym.warpdrive roles and channels with CuTeDSL 4.6.2
 # APIs: one TMA descriptor per tensor replaces the per-sequence descriptor arrays (a ragged view
-# clips the O stores), and the checkpoint, linear-gate, 16-bit-beta and final-index paths are
-# gone.
+# clips the O stores), and the upstream periodic checkpoints, linear gates, 16-bit beta and final indices
+# are omitted.
 
 """Chunked scalar-gate GDN prefill (forward) for the SM100 family.
 
@@ -114,7 +114,7 @@ from .blockwise_inverse import (
     blockwise_32x32_to_64x64,
     invert_diagonal_8x8,
 )
-from .kda_common import load_state, state_align_suffix, store_state_32
+from .kda_common import load_state, state_align_suffix, store_tmem_state
 from .ptx import (
     cp_async_4b_zfill,
     f16x2_to_f32,
@@ -142,6 +142,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
+from .state_checkpoints import CheckpointTensors, checkpoint_row, store_checkpoint
 
 B_T = 64
 BOX_ELEMS = B_T * 64  # one 64-row x 128-byte swizzled TMA box of 16-bit values
@@ -177,6 +178,7 @@ class PrefillParams:
     beta: object  # compute: (token, gate head) fp32
     state_in: object  # (d_v, d_k, gate head, sequence or pool slot)
     state_out: object
+    checkpoints: CheckpointTensors | None
     seed_indices: object  # paged: per-sequence pool route
     has_initial_state: object  # paged: uint8 per sequence
     work_items: cute.Tensor  # (rows, 10) int32
@@ -950,8 +952,16 @@ class GdnPrefill(WarpSpecialized):
         total = params.work_count[0]
         tile = unit
         while tile < total:
-            batch_idx, head_idx, _ws, write_end, compute_start, _bs, _be = self.item(params, tile)
+            batch_idx, head_idx, _ws, write_end, compute_start, bs, be = self.item(params, tile)
             head_o, v_offset = self.head(head_idx)
+            checkpoint = checkpoint_row(
+                params.checkpoints,
+                params.seed_indices,
+                batch_idx,
+                be - bs,
+                head_o,
+                state_gmem_row + v_offset,
+            )
             seed_row = batch_idx
             state_active = cutlass.Boolean(True)
             load_initial = cutlass.Boolean(True)
@@ -990,16 +1000,33 @@ class GdnPrefill(WarpSpecialized):
                     self.use_initial_state,
                     False,
                 )
-                for _local in cutlass.range(1, n_local, 1, unroll=1):
+                for local in cutlass.range(1, n_local, 1, unroll=1):
                     gate, v, state, qs, cg1, o = self.cg1_chunk(
-                        params, gate, v, state, qs, cg1, o, tmem, me, state_active, True, True
+                        params,
+                        gate,
+                        v,
+                        state,
+                        qs,
+                        cg1,
+                        o,
+                        tmem,
+                        me,
+                        state_active,
+                        True,
+                        True,
+                        checkpoint,
+                        (compute_start + local) * B_T,
+                        state_row_valid,
                     )
                 # The last KV GEMM's state: the final state. The next item's KV GEMMs follow
                 # this item's last loads in compute1's order (§7 items 5-7).
-                # Without a final state store no TMEM load follows before the next fenced wait.
+                # Paged calls store final state, so checkpoint reads also retain this fence.
                 skip = None if self.store_final_state else "after"
                 sh = state.wait(skip_fence=skip, reason=AFTER_FENCE_COVERED)
                 tmem.access("state", read=True)
+                store_checkpoint(
+                    checkpoint, write_end * B_T, lane0 + state_col, state_row_valid, 0, self.d_k
+                )
                 if cutlass.const_expr(self.store_final_state):
                     store_final = state_active
                     final_row = seed_row
@@ -1007,13 +1034,9 @@ class GdnPrefill(WarpSpecialized):
                         final_row = params.work_items[tile, _FINAL_DST]
                         store_final = final_row >= 0
                     if store_final:
-                        self.store_state(
-                            params,
-                            state_row_valid,
-                            state_gmem_row + v_offset,
-                            head_o,
-                            final_row,
-                            lane0 + state_col,
+                        dst = params.state_out[state_gmem_row + v_offset, None, head_o, final_row]
+                        store_tmem_state(
+                            dst, lane0 + state_col, state_row_valid, 0, self.d_k, self.state_align
                         )
                 sh.release(signal=False)
             else:
@@ -1054,16 +1077,6 @@ class GdnPrefill(WarpSpecialized):
             for i in cutlass.range_constexpr(self.d_k // 32):
                 tmem_st("32x32b", taddr + i * 32, [zero for _ in range(32)])
             cute.arch.fence_view_async_tmem_store()
-
-    @cute.jit
-    def store_state(self, params: PrefillParams, row_valid, row, head_o, seq, taddr):
-        """Final S^T row ``row`` from TMEM to ``state_out`` (16-byte vectors, realigned in
-        registers below 16-byte ``state_align``)."""
-        dst = params.state_out[row, None, head_o, seq]
-        for i in cutlass.range_constexpr(self.d_k // 32):
-            vals = tmem_ld("32x32b", 32, taddr + i * 32)
-            if row_valid:
-                store_state_32(cute.local_tile(dst, (32,), (i,)), vals, self.state_align)
 
     @cute.jit
     def empty_state(
@@ -1112,6 +1125,9 @@ class GdnPrefill(WarpSpecialized):
         state_active,
         valid_state: cutlass.Constexpr[bool],
         wait_state: cutlass.Constexpr[bool],
+        checkpoint=None,
+        boundary=0,
+        row_valid=True,
     ):
         """One chunk of compute group 1: restage and rescale S, Y = V - KS, rescale QS, publish
         U and decayed U, and stage O. Returns the endpoints."""
@@ -1147,6 +1163,7 @@ class GdnPrefill(WarpSpecialized):
             if cutlass.const_expr(wait_state):
                 sh = state.wait()
             tmem.access("state", read=True, write=True)
+            store_checkpoint(checkpoint, boundary, lane0 + state_col, row_valid, 0, self.d_k)
             tmem.access("state_in", write=True)  # KS/QS(c - 1) read it before KV(c - 1) (§7 7)
             state_halves = []
             state_regs = [[Float32(0.0) for _ in range(n_ld)] for _ in range(32)]
@@ -1397,6 +1414,7 @@ class GdnPrefill(WarpSpecialized):
         state_out,
         seed_indices,
         has_initial_state,
+        checkpoints,
         work_items,
         work_count,
         scheduler,
@@ -1444,6 +1462,7 @@ class GdnPrefill(WarpSpecialized):
             beta=beta,
             state_in=state_in,
             state_out=state_out,
+            checkpoints=checkpoints,
             seed_indices=seed_indices,
             has_initial_state=has_initial_state,
             work_items=work_items,
@@ -1526,6 +1545,7 @@ class GdnPrefill(WarpSpecialized):
         scale: Float32,
         max_ctas: Int32,
         stream: cuda.CUstream,
+        checkpoints: CheckpointTensors | None = None,
     ):
         """Launch on ``max_ctas`` CTAs after the item-table prologue; callable from another
         ``@cute.jit`` host, such as a fused launch bundle."""
@@ -1573,6 +1593,7 @@ class GdnPrefill(WarpSpecialized):
             state_view(state_out),
             seed_indices,
             has_initial_state,
+            checkpoints,
             work_items,
             work_count,
             scheduler,
@@ -2047,11 +2068,11 @@ def bundle_hook(
 ) -> tuple[GdnPrefill, int]:
     """``(op, num_sm)`` constexpr for the launch bundles: ``op.launch(..., Int32(num_sm),
     stream)`` inside their ``@cute.jit`` host. Rejects what this kernel does not implement:
-    checkpoints, linear gates, final-state index remapping and, with ``tinv_source="compute"``,
-    16-bit beta."""
+    periodic checkpoints, linear gates, final-state index remapping and, with
+    ``tinv_source="compute"``, 16-bit beta."""
     if enable_checkpoints or not log_gate or has_final_indices:
         raise ValueError(
-            "the GDN prefill takes natural-log gates, no checkpoints or final_indices"
+            "the GDN prefill takes natural-log gates, no periodic checkpoints or final_indices"
         )
     if tinv_source not in TINV_SOURCES:
         raise ValueError(f"tinv_source must be one of {TINV_SOURCES}, got {tinv_source!r}")

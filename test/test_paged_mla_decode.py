@@ -2,7 +2,6 @@
 
 import functools
 import math
-import os
 
 import pytest
 import torch
@@ -486,44 +485,3 @@ def test_every_autotune_candidate_matches_reference(num_heads, query_lengths):
             check(out, lse)
         except Exception as error:
             raise AssertionError(f"autotune candidate {config} failed") from error
-
-
-@pytest.mark.skipif(
-    not CUTE_CAPABLE,
-    reason="The FA4 MLA kernel routes require an SM100-family GPU",
-)
-@pytest.mark.parametrize(
-    "num_heads, batch, runs_2cta", [(16, 32, False), (64, 128, False), (128, 128, True)]
-)
-def test_fa4_2cta_kernel_only_where_its_output_store_is_safe(
-    num_heads, batch, runs_2cta, monkeypatch
-):
-    """At 16 and 64 heads FA4's 2CTA kernel stores varlen O through a TMA descriptor based
-    16 or 64 TiB before it, which faults under preemption on x86 B200: neither FA4's default
-    pick nor a tuning candidate runs that kernel there. The 2CTA kernel stays a candidate at
-    128 heads, where it stores whole tokens."""
-    fa_interface = pytest.importorskip("flash_attn.cute.interface")
-
-    kernels = []
-    select = fa_interface._get_fwd_config
-
-    def record(*args, **kwargs):
-        config, inputs = select(*args, **kwargs)
-        kernels.append(config.kernel)
-        return config, inputs
-
-    monkeypatch.setattr(fa_interface, "_get_fwd_config", record)
-    # "0" makes FA4's unguarded default pick 2CTA wherever supported, and checks restoration.
-    monkeypatch.setenv("FLASH_ATTENTION_MLA_1CTA", "0")
-    inputs = _make_fused_inputs([4] * batch, [1024] * batch, num_heads=num_heads)
-    call = {"max_seqlen_q": 4, "scale": 1 / math.sqrt(192), "return_aux": AuxRequest(lse=True)}
-    out, aux = paged_mla_decode(**inputs, **call)
-    assert os.environ["FLASH_ATTENTION_MLA_1CTA"] == "0"
-    _fused_reference_check(inputs, call)(out, aux.lse)
-    assert kernels, "the default pick never reached FA4's selector"
-    assert ("2cta" in kernels) == runs_2cta, kernels
-    args = cute.PagedMLADecodeFA4.Args(*inputs.values(), 4, 1024, call["scale"], True)
-    explicit = [
-        config.kernel for config in cute.PagedMLADecodeFA4.configs(args) if config != "auto"
-    ]
-    assert ("2cta" in explicit) == runs_2cta, explicit

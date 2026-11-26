@@ -152,6 +152,15 @@ def release_cuda_memory() -> Iterator[None]:
     torch.cuda.empty_cache()
 
 
+@pytest.fixture(params=["fused", "warpdrive"])
+def checkpoint_backend(request: pytest.FixtureRequest) -> str:
+    """Run the paged checkpoint contract on both chunk backends where available."""
+    if request.param == "warpdrive":
+        request.getfixturevalue("requires_blackwell")
+        pytest.importorskip("cutlass")
+    return request.param
+
+
 @pytest.fixture
 def fused_chunk_default(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep chunk tests that omit the backend on Triton, even when auto would select warpdrive."""
