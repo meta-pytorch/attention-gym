@@ -8,6 +8,7 @@ from torch import Tensor
 from attn_gym.types import Impl, KernelOptionSpec, resolve_impl, validate_kernel_options
 
 from .ops import _paged_indexer_op
+from .validation import validate_precision
 
 
 class PagedIndexerKernelOptions(TypedDict, total=False):
@@ -30,6 +31,8 @@ def paged_lightning_indexer(
     topk: int,
     compress_ratio: int = 4,
     query_positions: Tensor | None = None,
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
     impl: Impl | str = Impl.FUSED,
     kernel_options: PagedIndexerKernelOptions | None = None,
 ) -> Tensor:
@@ -48,8 +51,8 @@ def paged_lightning_indexer(
             across heads, in the query dtype. Logical candidate ``b`` is at
             ``key_cache[block_table[s, b // candidate_page_size],
             b % candidate_page_size]``. Pages count *candidates*, not raw tokens.
-        weights: ``[tokens, heads]`` per-query weights, in the query dtype.
-            Negative weights are supported.
+        weights: ``[tokens, heads]`` per-query weights, in the query dtype (BF16 or
+            FP32 for MXFP8). Negative weights are supported.
         block_table: int32 ``[num_sequences, max_candidate_pages]`` page mapping.
             Referenced pages must be valid; unused entries may contain -1.
         cu_seqlens_q: Contiguous int32 ``[num_sequences + 1]`` packed query
@@ -65,10 +68,16 @@ def paged_lightning_indexer(
         query_positions: Optional contiguous int32 ``[tokens]`` absolute,
             zero-based sequence positions, replacing the appended-query rule.
             Negative positions select nothing.
+        q_scale: For prequantized E4M3FN queries, E8M0 scales of shape
+            ``[tokens, heads, head_dim // 32]``. Each factor scales its 32-channel
+            group inside the dot, before per-head ReLU. No implicit quantization.
+        k_scale: Corresponding E8M0 scales ``[pages, candidate_page_size, head_dim // 32]``
+            for the key cache, using the same physical pages and slots as its FP8 data.
         impl: ``"reference"`` runs eager PyTorch on CPU or CUDA; ``"fused"``
             runs on NVIDIA CUDA devices (SM80+), supporting FP16/BF16,
             heads <= 128 and head_dim <= 256. Arbitrary nonnegative strides
-            are supported.
+            are supported for FP16/BF16. The native MXFP8 scorer requires SM100/103,
+            compact H4/D128 inputs and 64-candidate pages. Its selector uses FP32 scores.
         kernel_options: ``backend="cute"`` (default on SM100-family GPUs) uses the
             Warpdrive radix selector, with Warpdrive scoring for eligible decode
             inputs and Triton scoring otherwise. ``"triton"`` uses Triton for both
@@ -122,9 +131,11 @@ def paged_lightning_indexer(
         raise ValueError("key_cache must have shape [pages, candidate_page_size > 0, head_dim].")
     if weights.shape != (tokens, heads):
         raise ValueError("weights must have shape [tokens, heads].")
-    if not query.is_floating_point():
+    if query.dtype == torch.float8_e4m3fn or q_scale is not None or k_scale is not None:
+        validate_precision(query, key_cache, weights, q_scale, k_scale)
+    elif not query.is_floating_point():
         raise TypeError("query must have a floating-point dtype.")
-    if key_cache.dtype != query.dtype or weights.dtype != query.dtype:
+    elif key_cache.dtype != query.dtype or weights.dtype != query.dtype:
         raise TypeError("query, key_cache, and weights must have the same dtype.")
     if seqused_k.ndim != 1:
         raise ValueError("seqused_k must have shape [num_sequences].")
@@ -156,6 +167,8 @@ def paged_lightning_indexer(
             topk,
             compress_ratio,
             query_positions,
+            q_scale,
+            k_scale,
         )
     if not query.is_cuda:
         raise ValueError("the fused paged_lightning_indexer requires CUDA tensors.")
@@ -170,4 +183,6 @@ def paged_lightning_indexer(
         compress_ratio,
         query_positions,
         backend or "auto",
+        q_scale,
+        k_scale,
     )

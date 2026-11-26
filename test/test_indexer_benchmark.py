@@ -68,7 +68,7 @@ def test_benchmark_prints_median_ms_for_supported_routes(monkeypatch, capsys):
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "mock CUDA GPU")
-    monkeypatch.setattr(indexer_benchmark, "make_inputs", lambda args: (None,) * 3)
+    monkeypatch.setattr(indexer_benchmark, "make_inputs", lambda args: (None,) * 5)
     monkeypatch.setattr(indexer_benchmark, "benchmark_graph", lambda *args, **kwargs: samples)
     indexer_benchmark.main()
     output = capsys.readouterr().out
@@ -150,3 +150,48 @@ def test_timing_events_are_inside_capture(monkeypatch, warmup):
         "replays": warmup + 3,
         "records": 2,
     }
+
+
+@pytest.mark.parametrize("backends", [["triton"], ["cute", "triton"]])
+def test_mxfp8_benchmark_rejects_triton_before_running(monkeypatch, capsys, backends):
+    monkeypatch.setattr(sys, "argv", ["bench", "--dtype", "mxfp8", "--backend", *backends])
+    with pytest.raises(SystemExit) as exc:
+        indexer_benchmark.parse_args()
+    assert exc.value.code == 2
+    assert "fused MXFP8 scoring requires CuTe" in capsys.readouterr().err
+
+
+def test_mxfp8_benchmark_defaults_to_supported_shape(monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["bench", "--dtype", "mxfp8"])
+    args = indexer_benchmark.parse_args()
+    assert args.heads in (32, 64) and args.head_dim == 128
+
+
+def test_mxfp8_benchmark_shape_depends_on_implementation(monkeypatch, capsys):
+    argv = ["bench", "--dtype", "mxfp8", "--heads", "3", "--head-dim", "64"]
+    monkeypatch.setattr(sys, "argv", argv)
+    with pytest.raises(SystemExit) as exc:
+        indexer_benchmark.parse_args()
+    assert exc.value.code == 2
+    assert "--heads 32 or 64 and --head-dim 128" in capsys.readouterr().err
+    monkeypatch.setattr(sys, "argv", [*argv, "--impl", "reference"])
+    args = indexer_benchmark.parse_args()
+    assert (args.heads, args.head_dim) == (3, 64)
+
+
+def test_mxfp8_benchmark_quantization():
+    generator = torch.Generator().manual_seed(17)
+    original = torch.randn(2, 3, 128, generator=generator)
+    original[0, :, :32] = 0
+    original[1, :, 32:64] *= 16
+    data, scales = indexer_benchmark.quantize_mxfp8(original)
+    assert data.dtype == torch.float8_e4m3fn
+    assert scales.dtype == torch.float8_e8m0fnu
+    assert scales.shape == (2, 3, 4)
+    dequant = (data.float().unflatten(-1, (4, 32)) * scales.float().unsqueeze(-1)).flatten(-2)
+    assert torch.isfinite(dequant).all()
+    assert torch.equal(dequant[0, :, :32], original[0, :, :32])
+    # E4M3 rounding: half an ULP for normals, half the subnormal quantum otherwise.
+    allowance = 0.5 * torch.finfo(torch.float8_e4m3fn).eps * original.abs()
+    allowance += scales.float().repeat_interleave(32, dim=-1) * 2**-10
+    assert ((dequant - original).abs() <= allowance).all()

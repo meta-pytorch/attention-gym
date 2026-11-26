@@ -242,6 +242,21 @@ class PagedWarpdriveScore(IndexerScoreKernelBase):
             tiles = cute.ceil_div(total_tiles - c, params.ctas_per_row)
         return RowWork(row, sequence, visible, Int32(c), params.ctas_per_row, tiles)
 
+    @cute.jit
+    def batch_pages(self, params: PagedScoreParams, share: RowWork, i: Int32, lane: Int32, page):
+        """Look up the physical pages of tiles ``i .. i + 32 // pages_per_tile`` of a share.
+
+        Lane ``l`` returns page slot ``l % pages_per_tile`` of tile ``i + l // pages_per_tile``;
+        a slot past the visible prefix takes the tile's last visible page, so no unreferenced
+        table entry or page is read, and a lane past the share's tiles keeps ``page``.
+        """
+        tile = share.first + (i + lane // self.pages_per_tile) * share.stride
+        candidate = tile * _TILE_CANDIDATES + (lane % self.pages_per_tile) * self.page_size
+        candidate = cutlass.min(candidate, share.visible - 1)
+        if i + lane // self.pages_per_tile < share.tiles:
+            page = params.table[share.sequence, candidate // self.page_size]
+        return page
+
     # ------------------------------------------------------------------ roles
 
     @role(warps=5)
@@ -282,16 +297,7 @@ class PagedWarpdriveScore(IndexerScoreKernelBase):
                 for i in cutlass.range(share.tiles, unroll=0):
                     slot = i % tiles_per_batch
                     if slot == 0:
-                        # Lane l looks up page slot l % pages_per_tile of the batch's tile
-                        # l // pages_per_tile; a slot past the visible prefix takes the tile's
-                        # last visible page, so no unreferenced table entry or page is read.
-                        tile = share.first + (i + lane // self.pages_per_tile) * share.stride
-                        candidate = tile * _TILE_CANDIDATES + (lane % self.pages_per_tile) * (
-                            self.page_size
-                        )
-                        candidate = cutlass.min(candidate, share.visible - 1)
-                        if i + lane // self.pages_per_tile < share.tiles:
-                            page = params.table[share.sequence, candidate // self.page_size]
+                        page = self.batch_pages(params, share, i, lane, page)
                     with k.produce() as h:
                         for slot_page in cutlass.range_constexpr(self.pages_per_tile):
                             physical = cute.arch.shuffle_sync(

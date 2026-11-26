@@ -9,11 +9,17 @@ The registered operator calls this launcher; there is no backend fallback.
 
 import math
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import torch
 
 from attn_gym._backends.arch import SM100_KERNELS_REQUIREMENT, runs_sm100_kernels
-from attn_gym._backends.cute import TMA_ALIGNMENT_BYTES, get_device_properties, tensor_supports_tma
+from attn_gym._backends.cute import (
+    TMA_ALIGNMENT_BYTES,
+    get_device_properties,
+    tensor_supports_contiguous_dim,
+    tensor_supports_tma,
+)
 from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int64_abi
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive.cache import (
@@ -23,6 +29,9 @@ from attn_gym.warpdrive.cache import (
     make_fake_strided_tensor,
 )
 from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
+
+if TYPE_CHECKING:
+    from cutlass.cute.runtime import _FakeTensor
 
 _HEAD_DIM_GRANULARITY = 16
 _MAX_SEQUENCE = 1 << 20
@@ -36,6 +45,48 @@ def score_workspace_pairs(batch: int, tokens: int, candidates: int) -> int:
     return min(
         _MAX_SCORE_PAIRS, batch * cdiv(tokens, 2), _SCORE_WORKSPACE_BYTES // (8 * candidates)
     )
+
+
+def _fake_score_operands(
+    io_dtype: type,
+    weight_dtype: type,
+    heads: int,
+    head_dim: int,
+    use_int64_offsets: bool,
+    contiguous_weight_heads: bool,
+) -> tuple["_FakeTensor", "_FakeTensor", "_FakeTensor", "_FakeTensor"]:
+    """Share symbolic B/T/S and stride contracts across the two scoring ABIs."""
+    import cutlass
+    from cutlass import cute
+
+    sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
+    batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
+    q = make_fake_strided_tensor(
+        io_dtype,
+        (batch, tokens, heads, head_dim),
+        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
+        use_int64_strides=use_int64_offsets,
+    )
+    k = make_fake_strided_tensor(
+        io_dtype,
+        (batch, candidates, head_dim),
+        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
+        use_int64_strides=use_int64_offsets,
+    )
+    weights = make_fake_strided_tensor(
+        weight_dtype,
+        (batch, tokens, heads),
+        contiguous_dim=-1 if contiguous_weight_heads else None,
+        use_int64_strides=use_int64_offsets,
+    )
+    scores = cute.runtime.make_fake_compact_tensor(
+        cutlass.Float32,
+        (pairs, 2, candidates),
+        stride_order=(2, 1, 0),
+        assumed_align=TMA_ALIGNMENT_BYTES,
+        use_32bit_stride=not use_int64_offsets,
+    )
+    return q, k, weights, scores
 
 
 @jit_cache
@@ -55,7 +106,6 @@ def _compile_scores(
     otherwise the compiled kernel takes None for ``candidate_bounds``.
     """
     import cutlass
-    from cutlass import cute
 
     from .cute_score import IndexerScoreKernel
     from .cute_score_generic import IndexerGenericScoreKernel
@@ -72,33 +122,9 @@ def _compile_scores(
         contiguous_weight_heads=contiguous_weight_heads,
         dtype=io_dtype,
     )
-    sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
-    batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
-    q = make_fake_strided_tensor(
-        io_dtype,
-        (batch, tokens, heads, head_dim),
-        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
-        use_int64_strides=use_int64_offsets,
-    )
-    k = make_fake_strided_tensor(
-        io_dtype,
-        (batch, candidates, head_dim),
-        stride_divisibility=TMA_ALIGNMENT_BYTES // (io_dtype.width // 8),
-        use_int64_strides=use_int64_offsets,
-    )
-    weights = make_fake_strided_tensor(
-        io_dtype,
-        (batch, tokens, heads),
-        contiguous_dim=-1 if contiguous_weight_heads else None,
-        use_int64_strides=use_int64_offsets,
-    )
-    scores = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32,
-        (pairs, 2, candidates),
-        stride_order=(2, 1, 0),
-        assumed_align=TMA_ALIGNMENT_BYTES,
-        use_32bit_stride=not use_int64_offsets,
+    q, k, weights, scores = _fake_score_operands(
+        io_dtype, io_dtype, heads, head_dim, use_int64_offsets, contiguous_weight_heads
     )
     return compile_tvm_ffi(
         operation,
@@ -108,7 +134,7 @@ def _compile_scores(
         scores,
         integer(0),
         cutlass.Float32(1.0),
-        _fake_candidate_bounds(has_candidate_bounds, tokens, use_int64_offsets),
+        _fake_candidate_bounds(has_candidate_bounds, q.shape[1], use_int64_offsets),
         gpu_arch=get_compile_target().gpu_arch,
         name=operation.get_name() + ("_packed" if has_candidate_bounds else ""),
     )
@@ -127,6 +153,79 @@ def _fake_candidate_bounds(enabled: bool, tokens, use_int64_offsets: bool):
         stride_order=(1, 0),
         assumed_align=4,
         use_32bit_stride=not use_int64_offsets,
+    )
+
+
+def _compile_mxfp8_scores(
+    weights_dtype: torch.dtype,
+    heads: int,
+    head_dim: int,
+    causal: bool,
+    compress_ratio: int,
+    use_int64_offsets: bool,
+    contiguous_weight_heads: bool,
+    contiguous_q_scales: bool,
+    contiguous_k_scales: bool,
+) -> Callable[..., None]:
+    """Compile MXFP8 storage with logical E8M0 scales for 32-element groups."""
+    import cutlass
+
+    from .cute_score_mxfp8 import IndexerMXFP8ScoreKernel
+
+    weight_type = cutlass.BFloat16 if weights_dtype == torch.bfloat16 else cutlass.Float32
+    operation = IndexerMXFP8ScoreKernel.get_or_build(
+        heads,
+        head_dim,
+        causal,
+        use_int64_offsets,
+        compress_ratio=compress_ratio,
+        contiguous_weight_heads=contiguous_weight_heads,
+        contiguous_q_scales=contiguous_q_scales,
+        contiguous_k_scales=contiguous_k_scales,
+        weight_dtype=weight_type,
+    )
+    return _compile_mxfp8_kernel(operation)
+
+
+@jit_cache
+def _compile_mxfp8_kernel(operation) -> Callable[..., None]:
+    import cutlass
+
+    use_int64_offsets = operation.use_int64_offsets
+    integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
+    q, k, weights, scores = _fake_score_operands(
+        cutlass.Float8E4M3FN,
+        operation.weight_dtype,
+        operation.heads,
+        operation.head_dim,
+        use_int64_offsets,
+        operation.contiguous_weight_heads,
+    )
+    q_scale = make_fake_strided_tensor(
+        cutlass.Float8E8M0FNU,
+        (*q.shape[:-1], operation.head_dim // 32),
+        contiguous_dim=-1 if operation.contiguous_q_scales else None,
+        stride_divisibility=4 if operation.contiguous_q_scales else 1,
+        use_int64_strides=use_int64_offsets,
+    )
+    k_scale = make_fake_strided_tensor(
+        cutlass.Float8E8M0FNU,
+        (*k.shape[:-1], operation.head_dim // 32),
+        contiguous_dim=-1 if operation.contiguous_k_scales else None,
+        stride_divisibility=4 if operation.contiguous_k_scales else 1,
+        use_int64_strides=use_int64_offsets,
+    )
+    return compile_tvm_ffi(
+        operation,
+        q,
+        k,
+        weights,
+        q_scale,
+        k_scale,
+        scores,
+        integer(0),
+        cutlass.Float32(1.0),
+        gpu_arch=get_compile_target().gpu_arch,
     )
 
 
@@ -212,8 +311,10 @@ def _validate(q: torch.Tensor, k: torch.Tensor) -> tuple[int, int]:
             "head dimension must be positive and divisible by "
             f"{_HEAD_DIM_GRANULARITY}, got {head_dim}"
         )
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        raise TypeError(f"q must be float16 or bfloat16, got {q.dtype}")
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float8_e4m3fn):
+        raise TypeError(f"q must be float16, bfloat16 or float8_e4m3fn, got {q.dtype}")
+    if q.dtype == torch.float8_e4m3fn and (heads not in (32, 64) or head_dim != 128):
+        raise ValueError("MXFP8 CuTe indexing requires H in {32, 64} and D=128")
     # Singleton strides do not address another slice; TVM-FFI normalizes them for TMA.
     if any(tensor.numel() and not tensor_supports_tma(tensor.squeeze()) for tensor in (q, k)):
         raise ValueError(
@@ -257,6 +358,8 @@ def launch(
     deterministic: bool = False,
     candidate_bounds: torch.Tensor | None = None,
     selector: str = "default",
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Compute weighted-ReLU Top-K with bounded per-call score storage.
 
@@ -269,7 +372,15 @@ def launch(
     """
     import cutlass
 
+    from ..validation import validate_precision
+
+    validate_precision(q, k, weights, q_scale, k_scale)
+    scaled = q.dtype == torch.float8_e4m3fn
+    if scaled and candidate_bounds is not None:
+        raise ValueError("MXFP8 indexing does not support packed cu_seqlens.")
     capability = _validate(q, k)
+    if scaled and capability not in ((10, 0), (10, 3)):
+        raise RuntimeError("MXFP8 CuTe indexing requires an SM100 or SM103 GPU")
     packed = candidate_bounds is not None
     selector = resolve_selector(
         selector,
@@ -290,23 +401,32 @@ def launch(
     if pairs == 0:
         raise ValueError("CuTe candidate capacity is too large for the 32 MiB score workspace")
     scores = torch.empty((pairs, 2, candidates), dtype=torch.float32, device=q.device)
-    use_int64_offsets = requires_int64_abi(q, k, weights, scores, output, candidate_bounds)
+    use_int64_offsets = requires_int64_abi(
+        q, k, weights, scores, output, candidate_bounds, q_scale, k_scale
+    )
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     with compile_target_scope(detect_compile_target(q.device.index)):
         # Packed bounds already contain both mask decisions; neither kernel reads these flags.
         if packed:
             causal, compress_ratio = False, 1
-        score_kernel = _compile_scores(
-            q.dtype,
+        score_args = (
+            weights.dtype,
             heads,
             head_dim,
             causal,
             compress_ratio,
             use_int64_offsets,
-            # A unit head stride avoids the generic reducer's measured strided-load overhead.
             weights.stride(-1) == 1,
-            packed,
         )
+        if scaled:
+            assert q_scale is not None and k_scale is not None
+            score_kernel = _compile_mxfp8_scores(
+                *score_args,
+                tensor_supports_contiguous_dim(q_scale, alignment_bytes=4),
+                tensor_supports_contiguous_dim(k_scale, alignment_bytes=4),
+            )
+        else:
+            score_kernel = _compile_scores(*score_args, packed)
         topk_kernel = _compile_topk(
             topk,
             causal,
@@ -320,10 +440,12 @@ def launch(
     q, k, weights = q.detach(), k.detach(), weights.detach()
     scale = cutlass.Float32(1.0 / math.sqrt(heads * head_dim))
     total_pairs = batch * cdiv(tokens, 2)
+    operands = (q, k, weights, q_scale, k_scale) if scaled else (q, k, weights)
+    bounds = () if scaled else (candidate_bounds,)
     with initialized_cuda_device(q):
         for start in range(0, total_pairs, pairs):
             active_scores = scores[: min(pairs, total_pairs - start)]
-            score_kernel(q, k, weights, active_scores, integer(start), scale, candidate_bounds)
+            score_kernel(*operands, active_scores, integer(start), scale, *bounds)
             topk_kernel(active_scores, output, integer(start), candidate_bounds)
     return output
 
