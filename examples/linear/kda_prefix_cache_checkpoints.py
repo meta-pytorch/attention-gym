@@ -20,8 +20,8 @@ HEADS = 2
 HEAD_DIM = 128  # Required by fused paged_chunk_kda.
 TOKENS = 200  # Each request's prompt length.
 SLOT_A, SLOT_B, SLOT_REFERENCE = 1, 2, 3  # Slot 0 is the null slot.
-# Checkpoint writes require Triton. Pin the backend and its launch configurations on every
-# call so the bitwise comparison does not mix kernels.
+# Pin the backend and its launch configurations on every call so the bitwise comparison
+# does not mix numerical plans.
 OPTIONS = {"backend": "fused", "autotune": False}
 
 

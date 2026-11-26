@@ -13,9 +13,13 @@ intraprocedural control-flow path of each kernel in a PTX module and reports:
   from a tcgen05 operation without a ``before_thread_sync`` in between. A ``tcgen05.commit``
   performs the fence for the MMAs, copies and shifts it tracks, not for loads and stores;
 - ``drain`` (with ``teardown_barrier``): the TMEM teardown rendezvous reachable from a
-  ``tcgen05.ld``/``st`` without its ``tcgen05.wait::ld``/``wait::st``.
+  ``tcgen05.ld``/``st`` without its ``tcgen05.wait::ld``/``wait::st``;
+- ``copy-drain`` (with ``teardown_barrier``): a possible issuer path from an S-to-T
+  ``tcgen05.cp`` to teardown (or an exit bypassing it) without a commit with an identifiable
+  completion handoff.
+  See ``_copy_drains`` for the recognized waits and the limits of this diagnostic.
 
-The check is path-insensitive: it does not evaluate branch conditions or guard predicates, so a
+The ``after``, ``before`` and ``drain`` checks do not evaluate branch conditions or guards, so a
 path through code that never runs on one thread (for example from one role's body into
 another's) counts too, and a guarded instruction may or may not run: a guarded fence, commit or
 wait completes nothing. A ``tcgen05`` instruction other than the fences, ``commit``, the waits
@@ -62,7 +66,7 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 
-RULES = ("after", "before", "drain", "proxy", "exit")
+RULES = ("after", "before", "drain", "copy-drain", "proxy", "exit")
 
 _SYNCHRONOUS = tuple(
     f"tcgen05.{name}"
@@ -98,7 +102,7 @@ _LINE_END = re.compile(r"^(?:[A-Za-z_$][\w$]*:(?!:)\s*$|\.(?:loc|file)\b)")
 
 @dataclass(frozen=True)
 class Finding:
-    """``rule`` (one of ``RULES``) broken at PTX line ``line`` (``text``), reached from the
+    """``rule`` (one of ``RULES``) reported at PTX line ``line`` (``text``), reached from the
     operation at ``origin`` (``origin_text``). ``source``/``origin_source``: the ``file:line``
     of each from the PTX ``.loc`` directives (compile with ``CUTE_DSL_LINEINFO=1``), else ""."""
 
@@ -117,6 +121,8 @@ class Finding:
             "tcgen05.fence::after_thread_sync",
             "before": "signal after a tcgen05 operation without tcgen05.fence::before_thread_sync",
             "drain": "TMEM teardown rendezvous with an uncompleted tcgen05.ld/st",
+            "copy-drain": "TMEM teardown or exit reachable from tcgen05.cp without a recognized "
+            "completion handoff; check the copy's commit and who waits before deallocation",
             "proxy": "bulk copy reads shared memory after this thread's store without "
             "fence.proxy.async",
             "exit": "return while a bulk copy may still read shared memory (no commit_group "
@@ -428,14 +434,20 @@ def _files(ptx: str) -> dict[str, str]:
 def check_tcgen05_sync(ptx: str, *, teardown_barrier: int | None = None) -> list[Finding]:
     """Thread-sync and drain findings of every kernel in the PTX module ``ptx`` (see the module
     docstring). ``teardown_barrier``: the named-barrier ID of the TMEM teardown rendezvous, to
-    check that every path reaching it completed its TMEM loads and stores. A module without an
-    ``.entry`` body, or one whose functions do not parse, raises ``ValueError``."""
+    check for undrained TMEM loads/stores and possible orphaned S-to-T copies. An empty result
+    is not proof of cross-warp copy completion. A module without an ``.entry`` body, or one
+    whose functions do not parse, raises ``ValueError``."""
     files, findings = _files(ptx), []
     transfer = partial(_transfer, teardown_barrier=teardown_barrier)
-    for name, first, body, _ in _kernels(ptx):
+    for name, first, body, directives in _kernels(ptx):
         instrs, labels = _parse(body, first, files)
         if instrs:
-            findings += _findings(name, instrs, _may_analysis(instrs, labels, {}, transfer, 5))
+            found = _may_analysis(instrs, labels, {}, transfer, 5)
+            if teardown_barrier is not None and any(
+                i.opcode.startswith("tcgen05.cp.") for i in instrs
+            ):
+                found.update(_copy_drains(instrs, labels, directives, teardown_barrier))
+            findings += _findings(name, instrs, found)
     return findings
 
 
@@ -593,6 +605,296 @@ def _threads(instrs, labels, directives: str) -> Iterator[dict[int, bool]]:
             if decided not in seen:
                 seen.add(decided)
                 yield dict(decided)
+
+
+# ---- S-to-T copies at TMEM teardown ----------------------------------------------------
+
+
+def _blocking_wait(instrs, labels, i: int) -> bool:
+    """A parity wait/test in a spin that cannot fall through until its predicate is true.
+
+    A probe by itself (or a timed try_wait whose result is discarded) witnesses nothing.
+    Recognize `wait; @!ready bra wait` and CuTeDSL's `wait; @ready bra done; bra wait; done:`.
+    """
+    ins = instrs[i]
+    if ins.guard or not ins.opcode.startswith(("mbarrier.try_wait.", "mbarrier.test_wait.")):
+        return False
+    if i + 1 == len(instrs):
+        return False
+    branch = instrs[i + 1]
+    if not branch.opcode.startswith("bra") or not branch.guard:
+        return False
+    pred, sense = branch.guard
+    if pred != ins.operands[0]:
+        return False
+    target = _next(instrs, labels, i + 1, True)
+    if not sense:
+        return target == [i]
+    return (
+        target == [i + 3]
+        and i + 2 < len(instrs)
+        and instrs[i + 2].opcode in ("bra", "bra.uni")
+        and not instrs[i + 2].guard
+        and _next(instrs, labels, i + 2, True) == [i]
+    )
+
+
+@dataclass(frozen=True)
+class _BarrierAddress:
+    # An issuer's wait must use this pointer unchanged. A peer often constructs its own
+    # pointer into the same ring (the SMEM base, literal displacement and indexed mode).
+    pointer: str
+    offset: int
+    family: tuple[str, int, bool] | None
+
+
+def _barrier_addresses(instrs, accesses: dict[int, str]) -> dict[int, _BarrierAddress]:
+    """Match direct addresses and the same SMEM ring base + literal offset + 8*stage.
+
+    A ring family can identify a *possible* peer handoff, not a matching stage or phase.
+    Only look through single-definition registers; don't guess an alias for an unknown index.
+    """
+    definitions = {}
+    for ins in instrs:
+        for reg in _results(ins):
+            definitions[reg] = None if reg in definitions or ins.guard else ins
+
+    def parts(reg, seen):
+        op = definitions.get(reg)
+        if not op or reg in seen:
+            return reg, 0, ""
+        if op.opcode in ("add.s32", "add.u32", "add.s64", "add.u64"):
+            a, b = op.operands[1:]
+            for base, displacement in ((a, b), (b, a)):
+                delta = _integer(displacement)
+                stage = definitions.get(displacement)
+                indexed = stage and stage.opcode == "shl.b32" and stage.operands[-1] == "3"
+                if delta is not None or indexed:
+                    root, offset, index = parts(base, seen | {reg})
+                    if delta is not None:
+                        return root, offset + delta, index
+                    if not index:
+                        return root, offset, stage.operands[1]
+        return reg, 0, ""
+
+    addresses = {}
+    for i, operand in accesses.items():
+        address = re.fullmatch(r"\[(%r(?:d)?\d+|\d+)(?:\s*\+\s*(\d+))?\]", operand)
+        if address:
+            base, offset, stage = parts(address[1], set())
+            displacement = int(address[2] or 0)
+            # Without reaching definitions a register assigned in two roles is not a common
+            # base. Leave other address spellings (e.g. inline-asm locals) unrecognized.
+            stable = base not in definitions or definitions[base] is not None
+            family = (base, offset + displacement, bool(stage)) if stable else None
+            addresses[i] = _BarrierAddress(address[1], displacement, family)
+    return addresses
+
+
+def _publication_waits(instrs, labels, waits: dict) -> set[int]:
+    """Peer waits whose parity starts at zero, the freshly initialized barrier's phase.
+
+    A producer's EMPTY acquire starts at one: it can succeed *before* the first commit
+    and need never observe the final release. Don't count that loop as a peer handoff. On
+    forward CFG edges (before a loop's back edge), intersect known zero-valued registers;
+    only literals and unguarded moves establish zero. Unknown initial parity gets no credit.
+    This identifies candidate FULL waits, not the epoch they consume on every iteration.
+    """
+    incoming = {0: frozenset()}
+    publications = set()
+    for i, ins in enumerate(instrs):
+        if i not in incoming:
+            continue
+        zeros = incoming.pop(i)
+        if i in waits and ".parity." in ins.opcode:
+            parity = ins.operands[2]
+            if _integer(parity) == 0 or parity in zeros:
+                publications.add(i)
+        written = _results(ins)
+        out = zeros.difference(written)
+        if not ins.guard and ins.opcode.startswith("mov.") and len(ins.operands) == 2:
+            dst, src = ins.operands
+            if _integer(src) == 0 or src in zeros:
+                out = out | {dst}
+        for j in _next(instrs, labels, i, None if ins.guard else True):
+            if j > i:
+                incoming[j] = out if j not in incoming else incoming[j] & out
+    return publications
+
+
+def _copy_predicate(ins: _Instr, facts: frozenset, leader: bool) -> tuple[str, bool] | None:
+    """A predicate set by this thread's full-warp election or by negating a known predicate."""
+    if ins.opcode == "elect.sync" and _integer(ins.operands[-1]) in (-1, 0xFFFFFFFF):
+        predicate = ins.operands[0].partition("|")[2]
+        if predicate.startswith("%"):
+            return predicate, leader
+    if ins.opcode == "not.pred":
+        dst, src = ins.operands
+        if dst.startswith("%"):
+            if (src, True) in facts:
+                return dst, False
+            if (src, False) in facts:
+                return dst, True
+    return None
+
+
+def _copy_paths(
+    instrs,
+    labels,
+    decided,
+    stops,
+    leader: bool,
+    *,
+    start=0,
+    known=frozenset(),
+    commits=None,
+    waits=None,
+    peer_waits=(),
+    predecessors=None,
+):
+    """Reachable instructions and facts true on *every* arriving path. In the walk from an
+    issue, stop at a possible completion witness. Remember a branch's predicate until it is
+    rewritten, e.g. the same zero-trip test guarding the copy and the consuming loop."""
+    states, work, arrivals = {start: known}, [start], set()
+    while work:
+        i = work.pop()
+        ins, facts = instrs[i], states[i]
+        runs = (True,)
+        if ins.guard:
+            pred, value = ins.guard
+            if i in decided:
+                runs = (decided[i],)
+            elif (pred, value) in facts:
+                runs = (True,)
+            elif (pred, not value) in facts:
+                runs = (False,)
+            else:
+                runs = (False, True)
+        for run in runs:
+            out = facts
+            if ins.guard and ins.guard[0].startswith("%"):
+                out = out | {(ins.guard[0], ins.guard[1] == run)}
+            if run:
+                if i in stops:
+                    arrivals.add(i)
+                    continue
+                # A redefinition (including the next iteration of a loop) invalidates a fact.
+                predicate = _copy_predicate(ins, out, leader)
+                written = _results(ins)
+                out = frozenset(f for f in out if f[0] not in written)
+                if predicate is not None:
+                    out = out | {predicate}
+                if commits is not None and i in commits:
+                    addr = commits[i]
+                    if addr.family in peer_waits:
+                        continue
+                    out = out | {(addr.pointer, "barrier", addr.offset)}
+                if waits is not None and i in waits:
+                    addr = waits[i]
+                    if (addr.pointer, "barrier", addr.offset) in out:
+                        continue
+            for j in _next(instrs, labels, i, run):
+                if predecessors is not None:
+                    predecessors.setdefault(j, set()).add(i)
+                joined = out if j not in states else states[j] & out
+                if j not in states or joined != states[j]:
+                    states[j] = joined
+                    work.append(j)
+    return states, arrivals
+
+
+def _copy_drains(instrs, labels, directives, teardown):
+    """Look for a thread path from `tcgen05.cp` to teardown that can bypass every witnessed
+    commit. A later MMA, fence, unrelated wait, or wait::ld/st is not a completion witness.
+
+    A commit is a candidate when the issuer subsequently spin-waits on its barrier or another
+    participant can wait on its ring before teardown. This is a diagnostic, not proof of a
+    matched epoch: peer path feasibility, dynamic slots, parity and indirect handoffs are not
+    proved. The check does not depend on a copy atom, scale layout or loop trip count.
+    """
+    ends = {
+        i
+        for i, ins in enumerate(instrs)
+        if _BARRIER_SYNC.match(ins.opcode) and _first_int(ins) == teardown
+    }
+    if not ends:
+        return {}
+    waits = _barrier_addresses(
+        instrs,
+        {i: ins.operands[1] for i, ins in enumerate(instrs) if _blocking_wait(instrs, labels, i)},
+    )
+    commits = _barrier_addresses(
+        instrs,
+        {
+            i: ins.operands[0]
+            for i, ins in enumerate(instrs)
+            if ins.opcode
+            in (
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.b64",
+                "tcgen05.commit.cta_group::1.mbarrier::arrive::one.shared::cluster.b64",
+            )
+        },
+    )
+    publications = _publication_waits(instrs, labels, waits)
+    copies = {i for i, ins in enumerate(instrs) if ins.opcode.startswith("tcgen05.cp.")}
+    stops = ends.union(i for i, ins in enumerate(instrs) if ins.opcode in _RETURNS)
+    # A commit tracks only its issuing thread's operations. Repeated full-mask elect.sync
+    # picks the same leader; neither lane zero nor any other lane is specified by PTX.
+    leaders = (True, False) if any(ins.opcode == "elect.sync" for ins in instrs) else (False,)
+    participants, peer_groups = [], []
+    for decided in _threads(instrs, labels, directives):
+        possible_issues, possible_waits = set(), []
+        for leader in leaders:
+            predecessors = {}
+            paths, arrivals = _copy_paths(
+                instrs, labels, decided, stops, leader, predecessors=predecessors
+            )
+            # A peer which returns without reaching teardown cannot order deallocation.
+            toward = ends.intersection(arrivals)
+            work = list(toward)
+            while work:
+                earlier = predecessors.get(work.pop(), set()) - toward
+                toward.update(earlier)
+                work.extend(earlier)
+            possible_issues.update(copies.intersection(paths))
+            possible_waits.append(
+                {waits[i].family for i in toward & publications if waits[i].family is not None}
+            )
+            participants.append((decided, leader, paths))
+        # The two election alternatives need not represent distinct threads. Require that
+        # a peer class cannot issue the copy and can observe the commit in either alternative.
+        peer_groups.append((possible_issues, set.intersection(*possible_waits)))
+    findings = {}
+    for decided, leader, paths in participants:
+        for origin in copies.intersection(paths):
+            if decided.get(origin) is False:
+                continue
+            # Only a distinct participant can be the peer witness: a wait by the issuer
+            # *before* this copy (e.g. its acquire of an initially empty stage) cannot count.
+            peers = {
+                a for issues, observers in peer_groups if origin not in issues for a in observers
+            }
+            known = paths[origin]
+            if guard := instrs[origin].guard:
+                if (guard[0], not guard[1]) in known:
+                    continue
+                known = known | {guard}
+            _, arrivals = _copy_paths(
+                instrs,
+                labels,
+                decided,
+                stops,
+                leader,
+                start=origin + 1,
+                known=known,
+                commits=commits,
+                waits=waits,
+                peer_waits=peers,
+            )
+            for end in arrivals:
+                key = end, "copy-drain"
+                findings[key] = min(origin, findings.get(key, origin))
+    return findings
 
 
 # ---- bulk copies out of shared memory --------------------------------------------------

@@ -119,6 +119,7 @@ def run_forward_on_current_device(
         split=split,
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
+        state_checkpoints=None if paged_state is None else paged_state.checkpoints,
         batch_invariant=batch_invariant,
     )
     return output.unsqueeze(0), final_state

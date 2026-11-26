@@ -24,9 +24,8 @@ including paged, staged and context-parallel calls, choose the kernels with
 - `"warpdrive"` selects the CuTeDSL kernels. Install the `[linear]` extra; unsupported calls raise
   rather than switching to Triton. `"cudnn"`, the backend's former name, is an alias.
 
-FP16 KDA follows the same rule as BF16. Paged calls that write
-[state checkpoints](#paged-state-checkpoints-gdn-and-kda) are the exception: `"auto"` uses
-Triton, and an explicit `"warpdrive"` raises because warpdrive cannot write checkpoints.
+FP16 KDA follows the same rule as BF16, including paged calls that write
+[state checkpoints](#paged-state-checkpoints-gdn-and-kda).
 
 Selection does not depend on batch size or sequence lengths. A staged backward uses the backend
 saved by its forward. Select `"warpdrive"` explicitly on forward calls to use `split_forward`,
@@ -283,9 +282,8 @@ elementwise kernels run per decode step.
 `state_checkpoints=StateCheckpoints(...)`. While advancing the running state cache, they write
 selected post-update states directly into caller-chosen slots of a state pool. These checkpoints
 let a serving engine publish prefix-cache entries without a follow-up state copy. Checkpointing
-is inference-only, runs on the repo-local fused backend, and leaves return types unchanged.
-The default `backend="auto"` runs checkpointed chunk calls on the fused backend even on
-SM100-family GPUs; an explicit `"warpdrive"` raises.
+is inference-only and leaves return types and chunk backend selection unchanged. On supported
+SM100-family GPUs, `backend="auto"` uses warpdrive for both checkpointed and ordinary prefills.
 
 For each sequence, pass the number of **new tokens in this call** before the selected prefix
 and the pool slot that should receive its state. A non-positive destination skips the sequence.
@@ -337,8 +335,8 @@ alone produces a complete replay checkpoint. Resume with `has_initial_state=True
 See the
 [prefix-cache example](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
 for a bitwise comparison against a full prefill. It pins `{"backend": "fused"}` on every
-call: on SM100-family GPUs the default runs calls without checkpoints on warpdrive, whose
-rounding differs from the fused calls that wrote the checkpoints.
+call to keep the same numerical plan when saving and resuming. To use warpdrive, pin
+`{"backend": "warpdrive", "batch_invariant": True}` when bitwise resume across batch shapes matters.
 
 ::: attn_gym.linear.StateCheckpoints
 
@@ -636,6 +634,11 @@ was accurate), but that per-element limit is not a safe loss-scaling bound: prod
 `dS` are also cast to FP16 before later factors shrink them. `dU = dS K_restore` is cast before
 `beta` scales it, so one token with zero gate, a normalized key of 64 components `1/8`, `beta =
 1/8` and a `dS` row of 8192 on those components gave dv = inf where the exact value is 8192.
+As in BF16, the query term of the entry-state gradient reads the forward's unscaled `Q_decay`
+and `scale * dO` cast to FP16. With the default `scale = 1 / sqrt(K)` or any `scale <= 1` that
+cast cannot exceed `|dO|`; with `scale > 1`, each element of `scale * dO` must round within
+65504: `q = e0 / 2`, `scale = 2` and `dO = 32768 e0` make the entry-state gradient non-finite
+where the exact value is 32768.
 `K_restore = k 2^(g_last - g)` falls below the smallest FP16 subnormal, `2^-24`, once
 `g_last - g < -24 - log2|k|`, and then rounds up to `2^-24` or down to zero even when its product
 with `dS` is FP16-normal, so the gradients lose or misstate that term: a key `2^-11 e0` followed
@@ -792,11 +795,23 @@ autograd; `False` keeps the shared prep under autograd, trading exact gradients 
 `chunk_kda_prepare` infers the option at `prepare`. A caller that differentiates `run` inside
 its own autograd function, where grad mode is off, passes `True` to keep its staged forward
 off the shared prep; `context_parallel_kda` does.
-Forward and backward may also choose their piece-chain plans independently. The recompute
-matches the forward's states bit for bit only when both run the same piece plan: a chain
-backward after an uncut forward composes FP32 piece summaries, which round differently from
-the forward's sequential state updates. Strong decay hides that difference; with weak gates the
-last chunk's gradients differed by up to about 4e-3 relative in BF16.
+Forward and backward may also choose their piece-chain plans independently. When an uncut
+forward meets a chain backward, the forward stores its FP32 state at each backward piece start
+(one `[H, V, K]` state per piece, 64 KiB per head: 8 MiB at 1 x 2048 tokens and eight heads)
+and the backward recomputes every piece from it. `chunk_kda` stores them only when autograd
+records the call, so `True` under `no_grad` changes the forward's math but not its memory.
+Composing the pieces' entry states from FP32 summaries instead rounded them apart from the
+forward's sequential updates, by up to about 4e-3 relative in the last chunk's BF16 gradients
+under weak gates. The backward then needs only the
+pieces' transitions for its reverse state chain. On a GB300 (CUDA graphs, BF16 and FP16, 1-4
+sequences of 512-4096 tokens) the backward ran 6-43 µs faster and the forward 2-11 µs slower,
+so forward + backward took 0-9% less time; peak memory fell by the 4-9 MiB of summary states the
+backward no longer builds. Under `torch.compile` the buffer is sized from the sequence count alone,
+so the graph does not guard on the token count. It holds `min(16, num_sm // (N·H))` states per
+sequence whenever that is at least two (a chain backward is possible), even for token counts
+whose plans do not pair: 9 MiB at 1 x 8192 tokens and 16 heads, where both plans chain, on a GB300.
+Packs with fewer slots get an empty buffer, and PyTorch's tensor metadata guards on emptiness, so
+they share a second graph.
 
 ² Triton uses 64-token chunks and its own factorization. It builds diagonal inverse blocks in
 FP32 and stores the assembled inverse and attention scores in the Q/K/V kernel dtype. Its
@@ -963,6 +978,13 @@ grad_summaries = grads.state_grad_summaries(bounds)  # reverse maps [bias; trans
 # ...exchange and compose each subsequence's exit cotangent...
 dq, dk, dv, dgate, dbeta, _ = grads.run(d_final_state)
 ```
+
+Read `prepared.saved` after the `run` that the backward differentiates. Under
+`exact_recompute`, a warpdrive `run` that takes the public op's plan (uncut summaries, or split
+ones whose staged pieces cannot launch with 32-bit offsets) rebinds it to a tape that holds that
+run's piece entry states, which a chain backward reads (see the KDA `exact_recompute` note
+above). An earlier tape keeps an earlier run's states, and `chunk_kda_prepare_backward` rejects a
+tape read before any `run`.
 
 Each `bounds` row names one local `cu_seqlens` segment (or a whole-chunk run inside one), and
 one call returns every row's map; the context-parallel routing supplies the rows. Both backends

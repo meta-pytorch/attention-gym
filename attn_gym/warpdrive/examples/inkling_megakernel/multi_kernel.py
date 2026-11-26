@@ -426,10 +426,11 @@ class InklingMultiVisitKernel(InklingVisitKernel):
 
     @cute.jit
     def load_stages(self, w, atom, tiles, row, k0, count: cutlass.Constexpr,
-                    buffer: cutlass.Constexpr):  # fmt: skip
+                    buffer: cutlass.Constexpr, *, pad_k: cutlass.Constexpr = False):  # fmt: skip
         """GEMV weight stages as swizzled boxes into ``buffer``'s swizzled view (``W`` -> ``WS``,
         ``QW`` -> ``QWS``; ``examples.megakernel.ring.load_boxes``)."""
-        return load_boxes(w, atom, tiles, row, k0, count, {"W": "WS", "QW": "QWS"}[buffer])
+        return load_boxes(w, atom, tiles, row, k0, count, {"W": "WS", "QW": "QWS"}[buffer],
+                          pad_k=pad_k)  # fmt: skip
 
     @cute.jit
     def compute_rows(self, p, w, meta, work, me):

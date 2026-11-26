@@ -579,6 +579,10 @@ BUNDLES = [
     ("kda_warmup_forward", _kda_paged(2, 1, BF16)),
     ("kda_warmup_forward", _kda_paged(1, 2, BF16)),
     ("kda_warmup_forward", _kda_paged(2, 2, BF16)),
+    # Exercise the checkpoint TMEM read after each prefill variant's state handoff.
+    ("gdn_warmup_forward", _gdn_paged(True, 1), {"checkpoint_dtype": BF16}),
+    ("kda_warmup_forward", _kda_paged(2, 1), {"checkpoint_dtype": FP32}),
+    ("kda_warmup_forward", _kda_paged(2, 2), {"checkpoint_dtype": BF16}),
     # Pools with unaligned rows (NOTE [Unaligned state rows]): realigned state row access.
     ("gdn_warmup_forward", _gdn_paged(True, 1), {"state_align": 4}),
     ("gdn_warmup_forward", _gdn_paged(False, 2, BF16), {"state_align": 2}),

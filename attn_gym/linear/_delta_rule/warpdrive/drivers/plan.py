@@ -279,8 +279,11 @@ def chain_buffers(
     device,
     *,
     backward: bool,
+    entry_states: torch.Tensor | None = None,
 ) -> dict:
-    """Piece table, work-item tables, scheduler rings and FP32 piece states of an exact chain."""
+    """Piece table, work-item tables, scheduler rings and FP32 piece states of an exact chain.
+    A backward handed the forward's piece ``entry_states`` reads them as ``state_x`` and builds
+    no ``H`` (NOTE [Piece entry states] in ``drivers.kda``)."""
     num_pieces = num_seqs * pieces
     table = piece_table_layout(num_seqs, pieces, heads_out)
     piece_table = torch.zeros(table.nbytes // 4, dtype=torch.int32, device=device)
@@ -303,9 +306,9 @@ def chain_buffers(
         "work_items_summary": torch.empty(
             table.item_rows, WORK_ITEM_FIELDS, dtype=torch.int32, device=device
         ),
-        "state_h": state(),
+        "state_h": state() if entry_states is None else None,
         "state_m": state(dim_k),
-        "state_x": state(),
+        "state_x": state() if entry_states is None else entry_states,
     }
     if not backward:
         schedulers = int32(6, device)

@@ -43,6 +43,7 @@ def run_forward_on_current_device(
     nonempty: bool = False,
     batch_invariant: bool = False,
     exact_recompute: bool = False,
+    entry_states: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Validate and launch one packed forward invocation.
 
@@ -54,6 +55,8 @@ def run_forward_on_current_device(
     batches), so the final state needs no seeding for empty sequences. ``batch_invariant`` skips
     piece chains and shared KDA prep; it does not forbid splitting the value dimension.
     ``exact_recompute`` keeps the plan to the kernels the backward recomputes (``kda_forward``).
+    ``entry_states`` receives the piece entry states a chain backward reads (NOTE [Piece entry
+    states] in ``drivers.kda``).
     """
     paged_state = state if isinstance(state, PagedState) else None
     if split and (state is not None or output_final_state):
@@ -123,11 +126,13 @@ def run_forward_on_current_device(
         split=split,
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
+        state_checkpoints=None if paged_state is None else paged_state.checkpoints,
         fastmath=fastmath,
         intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,
         batch_invariant=batch_invariant,
         exact_recompute=exact_recompute,
+        entry_states=entry_states,
     )
     return output.unsqueeze(0), final_state
 
@@ -149,6 +154,7 @@ def run_forward(
     nonempty: bool = False,
     batch_invariant: bool = False,
     exact_recompute: bool = False,
+    entry_states: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Launch under the input tensor's CUDA device guard."""
     if not q.is_cuda:
@@ -170,6 +176,7 @@ def run_forward(
             nonempty=nonempty,
             batch_invariant=batch_invariant,
             exact_recompute=exact_recompute,
+            entry_states=entry_states,
         )
 
 

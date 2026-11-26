@@ -22,7 +22,9 @@ What the layer supplies, checks and leaves to you:
     and `run_roles()` convergently, initialize `Barriers(counts=None)` before dispatch, and
     respect CUDA resource limits. User indices, pointer arithmetic, layouts, numerical results
     and arbitrary async work at exit are not validated, except TMEM: every TMEM user completes
-    its `tcgen05.ld`/`st` at role exit ([teardown](#thread-sync)).
+    its `tcgen05.ld`/`st` at role exit ([teardown](#thread-sync)). A
+    [checked build](dropping-down.md#checked-builds) (`checked=True`) does compare each tensor
+    index with its extent, and rejects a `cute.domain_offset` by a negative constant.
 
 2. <a id="lifetimes"></a>**Ends and lifetimes.** Return every managed end, work cursor and
     turnstile seat. Helpers return updated state; callers reassign it. The lineage check
@@ -181,10 +183,11 @@ What the layer supplies, checks and leaves to you:
     `skip_fence=...` and `skip_teardown_drain(...)` drop redundant `tcgen05` thread-sync work
     ([thread-sync](#thread-sync)); they need a reason and change no check.
 
-    `unchecked(check, reason=...)` accepts exactly `"tma"`, `"fence"` and `"liveness"`.
-    Respectively, it excludes copies through barrier pointers obtained inside the block,
-    annotated accesses from the fence check, or channel/barrier ops from liveness (making the
-    kernel unverified). It records the reason, site and suppressed findings in `describe()`.
+    `unchecked(check, reason=...)` accepts exactly `"tma"`, `"fence"`, `"liveness"` and
+    `"bounds"`. Respectively, it excludes copies through barrier pointers obtained inside the
+    block, annotated accesses from the fence check, channel/barrier ops from liveness (making
+    the kernel unverified), or the indices and view offsets inside the block from a checked
+    build's checks. It records the reason, site and suppressed findings in `describe()`.
     Other checks stay active. Leave an access unannotated to exclude it from alias analysis;
     use a span, carried token or raw protocol where the managed form does not fit. None of
     these adds ordering. Trace bookkeeping is process-global: compile in isolated processes,
@@ -230,7 +233,11 @@ What the layer supplies, checks and leaves to you:
     `ptx_check.check_tcgen05_sync` checks every
     intraprocedural PTX path of a compiled kernel for both fences and the teardown drain; it
     counts a guarded instruction as possibly skipped, rejects calls, and does not check in-loop
-    TMEM completion between threads.
+    TMEM completion between threads. With `teardown_barrier=TMEM_TEARDOWN_BARRIER_ID` it also
+    reports a `copy-drain` finding if a `tcgen05.cp` (SMEM to TMEM) has an issuer path to that
+    rendezvous with no identifiable completion handoff. A `tcgen05.commit` by itself is not
+    an observation of completion. See [what the PTX check recognizes](dropping-down.md#tmem-copy-completion-at-teardown);
+    a clean result is not a proof of matched epochs across warps.
 
     Historical cost ([PR #883](https://github.com/meta-pytorch/attention-gym/pull/883)): making
     `tcgen05` ordering across managed thread synchronization explicit constrains compiler

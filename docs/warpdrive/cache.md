@@ -70,9 +70,9 @@ def gemm(a, b, out, ab_stages=4):
   different streams need kernels of their own (`Kernel(...)`).
 - `compile_fn(op)` remembers the build it served on `op`, so the next call with that kernel
   costs about 0.6 µs on a GB300 host. The key is derived from the call, never written by hand;
-  `cache_clear()`, a fork or a new compile target retire every entry and remove it from the
-  memos of kernels still alive, so a kernel kept by `get_or_build` holds no build the cache
-  dropped.
+  `cache_clear()` and a fork remove this function's entries from the memos of all live kernels,
+  including those kept by `get_or_build`. Switching targets refreshes only the calling
+  instance's memo for this function.
 - A memo hit restores no trace record: the instance already holds the record its first call
   restored or traced, so `describe()` and the reports are unaffected.
 

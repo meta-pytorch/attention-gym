@@ -325,7 +325,7 @@ def compile_kernel(op: MyKernel):
 - Cluster and each work stream's schedule, mapping, readiness and scheduler warp.
 - The settings: `cluster`, the trace settings that change the code (`trace_backend`, and
   `trace_waits` and `trace_events_per_role` where they apply), `trace_protocol`, `alias_check`,
-  `liveness_check`, and the resolved roles.
+  `liveness_check`, `checked`, and the resolved roles.
 - Source of the modules defining the kernel, cluster and stream-component classes, including
   their base classes.
 
@@ -337,8 +337,8 @@ Editing a kernel subclass in your own source file recompiles it, even when the c
 does not import that file.
 
 Every compile-time choice is a constructor argument. The settings every kernel shares
-(`SETTINGS`: `cluster`, `alias_check`, `liveness_check`, `trace_protocol`, `trace_backend`,
-`trace_waits`, `trace_events_per_role`) are keywords of every constructor unless its `__init__`
+(`SETTINGS`: `cluster`, `alias_check`, `liveness_check`, `checked`, `trace_protocol`,
+`trace_backend`, `trace_waits`, `trace_events_per_role`) are keywords of every constructor unless its `__init__`
 declares the name itself:
 
 | Change | Contract |

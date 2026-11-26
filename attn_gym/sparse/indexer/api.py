@@ -158,8 +158,9 @@ def lightning_indexer(
             contiguous ``int32`` on ``q.device``; they start at zero, never
             decrease, may repeat for empty sequences, and may end before ``T``.
             Query rows beyond the endpoint return only -1. This API processes whole
-            documents, not query chunks with cached history. Must be supplied together
-            with cu_seqlens_k. Offset values are caller invariants, not host-validated.
+            documents, not query chunks with cached history; use
+            :func:`paged_lightning_indexer` for cached candidate pools. Must be supplied
+            together with cu_seqlens_k. Offset values are caller invariants, not host-validated.
 
         cu_seqlens_k: Packed candidate offsets shaped ``[N + 1]``, contiguous
             ``int32`` on ``q.device``. They start at zero, never decrease, and end

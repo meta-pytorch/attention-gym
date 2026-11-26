@@ -872,11 +872,13 @@ ROPE_REQUIREMENTS = (
 )
 
 # Preferred first; later entries fit smaller shared memory (e.g. SM86 at D=256). On Blackwell,
-# FP32 D=256 skips the middle tile: it fits shared memory but needs 576 tensor-memory columns.
+# FP32 D=256 skips the 64x64 tile: it fits shared memory but needs 576 tensor-memory columns.
+# FP32 heads padded to 512 need the 16x16 fallback on 99 KiB devices.
 GENERIC_FORWARD_TILES = (
     TileConfig(64, 128, 8, 3, shared_rows=256, tmem_cols=512),
     TileConfig(64, 64, 8, 3, shared_rows=192, tmem_cols=576),
     TileConfig(32, 32, 4, 1, shared_rows=96),
+    TileConfig(16, 16, 4, 1),
 )
 
 
@@ -1241,7 +1243,7 @@ def _launch_forward(
 
     # D=512 must also fit the generic path (FP16/FP32, unshared KV, or under 16 heads).
     block_m, block_n, num_warps, num_stages, *_ = (
-        TileConfig(16, 16, 4, 1)
+        GENERIC_FORWARD_TILES[-1]
         if head_dim == 512
         else select_tiles(GENERIC_FORWARD_TILES, block_d, query.element_size(), query.device)
     )

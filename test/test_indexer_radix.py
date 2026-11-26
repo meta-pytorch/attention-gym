@@ -8,9 +8,13 @@ import torch
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
 from attn_gym._backends.cute.utils import requires_int64_abi
-from attn_gym.sparse.indexer import lightning_indexer
+from attn_gym.sparse.indexer import lightning_indexer, paged_lightning_indexer
 from attn_gym.sparse.indexer.impl import cute as impl
-from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
+from attn_gym.testing.indexer import (
+    assert_indexer_selection,
+    make_indexer_test_inputs,
+    make_paged_indexer_test_inputs,
+)
 
 CUTE_SUPPORTED = cuda_runs_sm100_kernels()
 
@@ -96,18 +100,28 @@ def test_radix_launches_only_active_pairs(radix_impl, monkeypatch, batch, tokens
     )
 
 
+def test_radix_rejects_multi_cta_cluster(radix_impl):
+    from attn_gym.sparse.indexer.impl.cute_topk import IndexerTopKKernel
+    from attn_gym.warpdrive import Cluster
+
+    op = IndexerTopKKernel(17, False, cluster=Cluster(2, 1))
+    with pytest.raises(ValueError, match="one CTA per row"):
+        radix_impl._compile_topk_kernel.__wrapped__(op, False)
+
+
 @pytest.mark.parametrize("use_int64_offsets", [False, True])
 @pytest.mark.parametrize("contiguous_weight_heads", [False, True])
 def test_radix_fake_tensor_abi(monkeypatch, use_int64_offsets, contiguous_weight_heads):
     """Only Q/K's D stride and an available unit weight-head stride are static."""
     pytest.importorskip("cutlass.cute")
-    monkeypatch.setattr(impl, "compile_tvm_ffi", lambda operation, *args, name: args)
+    monkeypatch.setattr(impl, "compile_tvm_ffi", lambda operation, *args, **kwargs: args)
     q, k, weights, scores, *_ = impl._compile_scores.__wrapped__(
         torch.bfloat16, 32, 128, True, 1, use_int64_offsets, contiguous_weight_heads, False
     )
-    topk_scores, output, *_ = impl._compile_topk.__wrapped__(
-        37, True, 1, use_int64_offsets, False, False
-    )
+    from attn_gym.sparse.indexer.impl.cute_topk import IndexerTopKKernel
+
+    operation = IndexerTopKKernel(37, True, use_int64_offsets)
+    topk_scores, output, *_ = impl._compile_topk_kernel.__wrapped__(operation, False)
     width = 64 if use_int64_offsets else 32
     assert q._assumed_align == k._assumed_align == 16
     assert weights._assumed_align == 2
@@ -240,19 +254,20 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, de
             scores = 1 + scores.abs() * 1e-5
         case "signed_zero":
             scores = torch.copysign(torch.zeros_like(scores), scores)
-    output = torch.empty((1, tokens, topk), device="cuda", dtype=torch.int32)
+    # Four query rows rank all candidates; only the score slab needs the long dimension.
+    rows = scores.view(4, tokens)
+    output = torch.empty((1, rows.size(0), topk), device="cuda", dtype=torch.int32)
     previous = get_compile_target()
     try:
         set_compile_target(detect_compile_target(torch.cuda.current_device()))
         kernel = radix_impl._compile_topk(topk, False, 1, False, deterministic, False)
     finally:
         set_compile_target(previous)
-    rows = scores.view(4, tokens)
     expected = _lowest_index_topk(rows, topk)
     for _ in range(3 if deterministic else 1):
         # The deterministic kernel may overwrite its score slab, so use fresh scores.
         kernel(scores.clone(), output, cutlass.Int32(0), None)
-        actual = output[0, :4].long()
+        actual = output[0].long()
         if deterministic:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         else:
@@ -265,6 +280,25 @@ def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, de
                 rtol=0,
                 atol=0,
             )
+
+
+@pytest.mark.parametrize("page_size", [13, 64])
+def test_paged_signed_zero_ties(radix_impl, deterministic_algorithms, page_size):
+    """Underflow in the paged scorer must not break ties between -0 and +0."""
+    q, k, w, table, cu, lengths = make_paged_indexer_test_inputs(
+        (1,), (page_size,), page_size=page_size, compress_ratio=1, heads=16, head_dim=16
+    )
+    q.zero_()
+    k.zero_()
+    w.zero_()
+    q[0, 0, 0] = q[0, 1, 1] = 1
+    # Even IDs score -2**-149 / 16, rounding to -0; odd IDs score +0.
+    w[0, 0], k[0, ::2, 0] = -(2**-75), 2**-74
+    w[0, 1] = k[0, -1, 1] = 1  # Last ID is the one strict winner.
+    actual = paged_lightning_indexer(
+        q, k, w, table, cu, lengths, topk=4, compress_ratio=1, kernel_options={"backend": "cute"}
+    )
+    torch.testing.assert_close(actual, actual.new_tensor([[0, 1, 2, page_size - 1]]))
 
 
 @pytest.mark.parametrize("distribution", ["ties", "few_values"])
