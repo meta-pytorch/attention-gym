@@ -14,6 +14,7 @@ from attn_gym.sparse import Impl, paged_lightning_indexer
 from attn_gym.sparse.indexer import lightning_indexer, ops
 from attn_gym.testing.indexer import (
     assert_indexer_selection,
+    make_indexer_mxfp8_test_inputs,
     make_indexer_test_inputs,
     make_paged_indexer_test_inputs,
 )
@@ -84,13 +85,27 @@ def test_backend_dispatch_uses_input_device(
         assert exc.value is failure
     else:
         assert ops._indexer_cuda(q, k, weights, 1, True, 1, backend) is launch.return_value
-    metadata = (deterministic, None) if expected == "cute" else (None, None)
+    metadata = (deterministic, None, None, None) if expected == "cute" else (None, None)
     launch.assert_called_once_with(q, k, weights, 1, True, 1, *metadata)
     other.assert_not_called()
     if backend == "auto":
         device_capability.assert_called_once_with(q.device)
     else:
         device_capability.assert_not_called()
+
+
+@pytest.mark.parametrize("backend", ["auto", "triton"])
+def test_mxfp8_dispatch_rejects_triton_before_launch(monkeypatch, backend):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    q, k, w, qs, ks = make_indexer_mxfp8_test_inputs(1, 32, 128, torch.bfloat16, device="cpu")
+    with pytest.raises(ValueError, match="Triton does not support MXFP8"):
+        ops._indexer_cuda(q, k, w, 1, False, 1, backend, q_scale=qs, k_scale=ks)
+
+
+def test_private_triton_dispatch_does_not_discard_scales_on_bf16():
+    q, k, w = make_indexer_test_inputs(1, 32, 128, torch.bfloat16, device="cpu")
+    with pytest.raises(ValueError, match="q_scale and k_scale are only supported for MXFP8"):
+        ops._indexer_cuda(q, k, w, 0, False, 1, "triton", q_scale=torch.ones(1))
 
 
 @pytest.mark.parametrize(

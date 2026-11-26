@@ -1,8 +1,11 @@
 """Shared operands and score-selection error checks for lightning indexers."""
 
 import math
+from typing import NamedTuple
 
 import torch
+
+from attn_gym.sparse.indexer.impl.reference import score_rows
 
 # Bound each [B, H, query_tile, S] FP64 temporary, not the logical test shape.
 _SCORE_TILE_BYTES = 64 * 1024 * 1024
@@ -51,16 +54,14 @@ def indexer_reference_scores(
     the much larger [B, T, H, S] dot/ReLU/product buffers. Keep the full head and
     channel reductions and their original scaling order.
     """
-    batch, queries, heads, head_dim = q.shape
+    batch, queries, heads = q.shape[:3]
     candidates = k.shape[1]
     bytes_per_row = max(1, batch * heads * candidates * q.element_size())
     tile_rows = max(1, _SCORE_TILE_BYTES // bytes_per_row)
     scores = q.new_empty(batch, queries, candidates)
-    scale = 1.0 / math.sqrt(heads * head_dim)
     for start in range(0, queries, tile_rows):
         rows = slice(start, start + tile_rows)
-        dots = torch.einsum("bthd,bsd->bths", q[:, rows], k)
-        scores[:, rows] = (dots.relu() * weights[:, rows].unsqueeze(-1)).sum(2) * scale
+        scores[:, rows] = score_rows(q[:, rows], k, weights[:, rows])
     return scores
 
 
@@ -87,6 +88,90 @@ def make_indexer_test_inputs(
     if heads > 1:
         weights[..., 1] = -weights[..., 1].abs() - 0.25
     return q, k, weights
+
+
+class ScaledIndexerInputs(NamedTuple):
+    q: torch.Tensor
+    k: torch.Tensor
+    weights: torch.Tensor
+    q_scale: torch.Tensor
+    k_scale: torch.Tensor
+
+
+def make_indexer_mxfp8_test_inputs(
+    tokens: int,
+    heads: int,
+    head_dim: int,
+    weights_dtype: torch.dtype,
+    *,
+    batch: int = 2,
+    compress_ratio: int = 1,
+    device: str | torch.device = "cuda",
+    seed: int = 77,
+) -> ScaledIndexerInputs:
+    """E4M3 data and E8M0 scales varying across queries, heads, keys and D groups."""
+    q, k, weights = make_indexer_test_inputs(
+        tokens,
+        heads,
+        head_dim,
+        torch.bfloat16,
+        batch=batch,
+        compress_ratio=compress_ratio,
+        device=device,
+        seed=seed,
+    )
+    generator = torch.Generator(device=device).manual_seed(seed + 1)
+    if weights_dtype == torch.float32:
+        weights = torch.randn(
+            weights.shape, device=device, dtype=weights_dtype, generator=generator
+        )
+    q_exponents = torch.randint(
+        -3, 3, (*q.shape[:-1], head_dim // 32), device=device, generator=generator
+    )
+    k_exponents = torch.randint(
+        -3, 3, (*k.shape[:-1], head_dim // 32), device=device, generator=generator
+    )
+    q_scale = torch.pow(2.0, q_exponents).to(torch.float8_e8m0fnu)
+    k_scale = torch.pow(2.0, k_exponents).to(torch.float8_e8m0fnu)
+    # MX scales have no zero encoding; zero data groups retain positive scales.
+    q[:, 0, :, :32] = 0
+    k[:, :1, :32] = 0
+    return ScaledIndexerInputs(
+        q.to(torch.float8_e4m3fn), k.to(torch.float8_e4m3fn), weights, q_scale, k_scale
+    )
+
+
+def assert_mxfp8_score_row(
+    actual: torch.Tensor,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    weights: torch.Tensor,
+    q_scale: torch.Tensor,
+    k_scale: torch.Tensor,
+) -> None:
+    """Compare one live score row to independent FP64 dequantization and block-scaled eager."""
+    heads, dim = q.shape
+    q64 = q.double() * q_scale.double().repeat_interleave(32, -1)
+    k64 = k.double() * k_scale.double().repeat_interleave(32, -1)
+    w64 = weights.double()[:, None]
+    norm = math.sqrt(heads * dim)
+    expected = ((q64 @ k64.T).relu() * w64).sum(0) / norm
+    magnitude = ((q64.abs() @ k64.abs().T) * w64.abs()).sum(0) / norm
+    eager = score_rows(q[None].float(), k.float(), weights[None].float(), q_scale[None], k_scale)[
+        0
+    ]
+    assert torch.isfinite(eager).all(), "nonfinite FP32 score baseline"
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+    error = (actual.double() - expected).abs()
+    # D dot terms, H/4 head-reduction chain, scale updates and epilogue rounding.
+    eps = torch.finfo(torch.float32).eps
+    n_eps = (dim + heads // 4 + 8) * eps
+    assert (error <= n_eps / (1 - n_eps) * magnitude).all(), (error.max(), magnitude.max())
+    # Relative RMS versus eager plus an FP32 reduction/rounding allowance. Compare
+    # norms before dividing by the common denominator, which can be zero for empty signal.
+    eager_error = eager.double() - expected
+    allowance = (math.sqrt(dim) + math.sqrt(heads) + 4) * eps
+    assert error.norm() <= eager_error.norm() + allowance * expected.norm()
 
 
 def assert_selection_regret_within(
@@ -126,13 +211,18 @@ def _selection_errors(
     q: torch.Tensor,
     k: torch.Tensor,
     weights: torch.Tensor,
-    counts: torch.Tensor,
     visible: torch.Tensor,
     causal: bool,
+    q_scale: torch.Tensor | None,
+    k_scale: torch.Tensor | None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Score one query tile while keeping the full candidate and head reductions."""
     _, _, heads, dim = q.shape
     q64, k64, w64 = q.double(), k.double(), weights.double()
+    if q_scale is not None:
+        q64 = (q64.unflatten(-1, (dim // 32, 32)) * q_scale.double().unsqueeze(-1)).flatten(-2)
+    if k_scale is not None:
+        k64 = (k64.unflatten(-1, (dim // 32, 32)) * k_scale.double().unsqueeze(-1)).flatten(-2)
     dots = q64.permute(0, 2, 1, 3) @ k64.transpose(-1, -2).unsqueeze(1)
     scores = (dots.relu() * w64.transpose(1, 2).unsqueeze(-1)).sum(1)
     scores /= math.sqrt(heads * dim)
@@ -141,28 +231,26 @@ def _selection_errors(
     magnitude = (w64.abs().unsqueeze(-1) * q64.abs()).sum(2) @ k64.abs().transpose(-1, -2)
     magnitude /= math.sqrt(heads * dim)
 
-    # Match impl/reference.py's eager scoring, including its reduction layout and
-    # accumulation dtype. Its launcher has no query-offset argument or score helper:
-    # tiling the public API would violate S == T // compress_ratio and reset causality.
+    # Compare eager and fused rounding errors against the independent FP64 scores above.
     accum_dtype = torch.float64 if q.dtype == torch.float64 else torch.float32
-    eager_scores = indexer_reference_scores(
-        q.to(accum_dtype), k.to(accum_dtype), weights.to(accum_dtype)
+    eager_scores = score_rows(
+        q.to(accum_dtype), k.to(accum_dtype), weights.to(accum_dtype), q_scale, k_scale
     )
     if causal:
         future = torch.arange(k.shape[1], device=q.device).view(1, 1, -1) >= visible
         scores.masked_fill_(future, -torch.inf)
         magnitude.masked_fill_(future, 0)
         eager_scores.masked_fill_(future, -torch.inf)
-    boundary = scores.sort(-1, descending=True).values.gather(
-        -1, (counts - 1).clamp_min(0).expand(q.shape[0], -1, -1)
-    )
-    eager = eager_scores.topk(actual.shape[-1], dim=-1).indices
-    eager_valid = eager < visible if causal else torch.ones_like(eager, dtype=torch.bool)
-    actual_scores = scores.gather(-1, actual.long().clamp_min(0))
-    reference_scores = scores.gather(-1, eager)
-    actual_error = (boundary - actual_scores).clamp_min(0).masked_fill(actual < 0, 0)
-    eager_error = (boundary - reference_scores).clamp_min(0).masked_fill(~eager_valid, 0)
-    return actual_error, eager_error, magnitude.amax(-1, keepdim=True)
+    width = min(actual.shape[-1], k.shape[1])
+    best = scores.topk(width).values
+    eager = eager_scores.topk(width).indices
+
+    def regret(ids: torch.Tensor) -> torch.Tensor:
+        selected = scores.gather(-1, ids.long().clamp_min(0)).masked_fill(ids < 0, -torch.inf)
+        chosen = selected.sort(descending=True).values[..., :width]
+        return (best - chosen).masked_fill(best == -torch.inf, 0)
+
+    return regret(actual), regret(eager), magnitude.amax(-1, keepdim=True)
 
 
 @torch.no_grad()
@@ -174,8 +262,11 @@ def assert_indexer_selection(
     topk: int,
     causal: bool,
     compress_ratio: int = 1,
+    *,
+    q_scale: torch.Tensor | None = None,
+    k_scale: torch.Tensor | None = None,
 ) -> None:
-    """Check index invariants and FP64 boundary regret against eager's regret.
+    """Check index invariants and sorted FP64 Top-K score gaps against eager's gaps.
 
     Absolute products bound FP32 dot, weighting, head reduction and scaling
     errors without cancellation shrinking the budget. Twice that score error
@@ -193,17 +284,18 @@ def assert_indexer_selection(
     assert not ((actual < -1) | (actual >= candidates)).any()
     row = torch.arange(tokens, device=q.device).view(1, tokens, 1)
     visible = (row + 1) // compress_ratio
-    counts = visible.clamp_max(topk) if causal else torch.full_like(row, topk)
+    width = min(topk, candidates)
+    counts = visible.clamp_max(width) if causal else torch.full_like(row, width)
     assert torch.equal(valid.sum(-1, keepdim=True), counts.expand(batch, -1, -1))
     if causal:
         assert not (valid & (actual >= visible)).any()
     ordered = actual.sort(-1).values
     assert not ((ordered[..., 1:] == ordered[..., :-1]) & (ordered[..., 1:] >= 0)).any()
-    if topk == 0:
+    if width == 0:
         return
 
     tile_rows = max(1, _SCORE_TILE_BYTES // (batch * heads * candidates * 8))
-    actual_error = torch.empty_like(actual, dtype=torch.float64)
+    actual_error = torch.empty_like(actual[..., :width], dtype=torch.float64)
     eager_error = torch.empty_like(actual_error)
     magnitude = torch.empty((batch, tokens, 1), device=q.device, dtype=torch.float64)
     for start in range(0, tokens, tile_rows):
@@ -213,11 +305,13 @@ def assert_indexer_selection(
             q[:, rows],
             k,
             weights[:, rows],
-            counts[:, rows],
             visible[:, rows],
             causal,
+            None if q_scale is None else q_scale[:, rows],
+            k_scale,
         )
-    reduction_eps = (dim + heads + 2) * torch.finfo(torch.float32).eps
+    scale_ops = int(q_scale is not None) + int(k_scale is not None)
+    reduction_eps = (dim + heads + 2 + scale_ops) * torch.finfo(torch.float32).eps
     # Retain only O(B*T*topk) regrets, not O(B*H*T*S) scores. Check once over all
     # rows: per-tile mean/RMS budgets would change acceptance, especially at the tail.
     assert_selection_regret_within(
