@@ -57,16 +57,16 @@ def paged_lightning_indexer(
     Offset values, nonnegative sequence lengths, cache capacity for completed
     blocks, and referenced page IDs are caller invariants.
 
-    The caller owns cache updates: retain raw keys for the incomplete block,
-    average a block in FP32 once complete, apply the model's post-pooling
-    transforms (e.g. Qwen's layer norm and RoPE), and store the resulting key once.
-    Do not average already-transformed keys or expose a partial block as complete.
-    Selection neither changes nor repools this cache.
+    The caller owns cache updates: apply the model's pooling and transforms, then
+    store one finished key per completed block before selection. Never expose a
+    partial block as complete. Selection neither changes nor repools this cache.
 
     Feed these IDs directly to ``paged_sparse_decode`` with
     ``index_block_size=compress_ratio`` for raw-token KV, or 1 for pooled KV.
     A shared raw-token KV source supplies the incomplete causal tail even with
-    ``window_size=0``. The KV page table is independent of this candidate page table.
+    ``window_size=0``. With pooled sparse KV and raw lengths, pass a separate raw
+    ``window_kv`` and request the desired tail via ``window_size``. The KV page
+    table is independent of this candidate page table.
     ``paged_sparse_decode`` infers suffix positions from its own metadata; the
     caller must ensure they match the positions used here. ``query_positions``
     overrides this indexer only.

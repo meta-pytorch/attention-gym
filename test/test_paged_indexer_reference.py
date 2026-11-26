@@ -1,9 +1,9 @@
-"""Cached-pool selection and the public decode contract on CPU."""
+"""Cached-pool selection and reference scoring semantics."""
 
 import pytest
 import torch
 
-from attn_gym.sparse import paged_lightning_indexer
+from attn_gym.sparse import lightning_indexer, paged_lightning_indexer
 from attn_gym.testing.indexer import (
     assert_paged_indexer_selection,
     make_paged_indexer_test_inputs,
@@ -35,6 +35,38 @@ def test_positions_layouts_and_nondifferentiability(permuted):
     positions = torch.tensor([2**31 - 1, -1, 3, 11, 23, 511], dtype=torch.int32)
     actual = paged_lightning_indexer(*args, topk=3, query_positions=positions, impl="reference")
     assert_paged_indexer_selection(args, actual, 3, positions=positions)
+
+
+@pytest.mark.parametrize("paged", [True, False], ids=["paged", "dense"])
+@pytest.mark.parametrize(
+    "device,dtype",
+    [
+        ("cpu", torch.bfloat16),
+        pytest.param(
+            "cuda",
+            torch.float16,
+            marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
+        ),
+    ],
+)
+def test_autocast_preserves_strict_winner(paged, device, dtype):
+    q = torch.tensor([[[1, 1], [0, 1]]], dtype=dtype, device=device)
+    keys = q.new_tensor([[0.25, 1024], [0.125, 1]])
+    w = q.new_tensor([[1, -1]])
+    # In FP32 the first key wins by 0.25 to 0.125 (before scaling). A low-precision
+    # dot loses the 0.25 before the heads subtract, incorrectly selecting key 1.
+    if paged:
+        table = torch.tensor([[0]], dtype=torch.int32, device=device)
+        cu, lengths = table.new_tensor([0, 1]), table.new_tensor([2])
+        fn = paged_lightning_indexer
+        args = q, keys[None], w, table, cu, lengths
+    else:
+        fn = lightning_indexer
+        args = q.expand(2, -1, -1)[None], keys[None], w.expand(2, -1)[None]
+    for enabled in (False, True):
+        with torch.autocast(device, dtype=dtype, enabled=enabled):
+            ids = fn(*args, topk=1, compress_ratio=1, impl="reference")
+        assert (ids == 0).all()
 
 
 def test_completed_block_boundaries():

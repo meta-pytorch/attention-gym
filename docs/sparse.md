@@ -96,7 +96,7 @@ Selection with NaN/Inf scores is unspecified and may differ across backends.
 ## Indexer selection during paged decode
 
 `paged_lightning_indexer` scores new queries against cached completed-block keys.
-It accepts the same packed query offsets and raw-token lengths as `paged_sparse_decode`:
+With a raw-token KV window, both operations use the same packed query offsets and raw-token lengths:
 
 ```python
 from attn_gym.sparse import PagedKV, paged_lightning_indexer, paged_sparse_decode
@@ -136,22 +136,25 @@ Candidate pages and KV pages have independent layouts and page tables. Candidate
 `b` is read from
 `index_key_cache[candidate_table[s, b // candidate_page_size], b % candidate_page_size]`.
 Returned IDs are **logical sequence-local blocks**, never physical page IDs. For a
-raw KV source, use `index_block_size=compress_ratio`; for a pooled KV source, use 1.
-When supplying a separate window source, the caller must supply the incomplete raw
-tail through that source.
+raw KV source, use `index_block_size=compress_ratio`. For pooled sparse KV, use
+`index_block_size=1` and pass a separate raw-token `window_kv` when reusing the
+indexer’s raw `seqused_k`. With separate sources, `window_size` must explicitly
+cover the raw tail the model needs; decode does not add the incomplete block for you.
+Without `window_kv`, decode interprets lengths and window positions in pooled entries,
+not raw tokens.
 
 The caller owns the persistent cache and partial-block state:
 
-1. Retain projected raw indexer keys for the incomplete block (at most
-   `compress_ratio - 1` keys per sequence).
-2. When a block completes, compute its mean in FP32, cast as required by the model,
-   then apply the model's post-pooling transforms. Qwen applies key layer norm and
-   RoPE at the block's first position **after** pooling.
-3. Write that transformed completed key to its candidate slot once. Discard the
-   completed partial state and retain the new incomplete tail. Populate every
-   completed candidate needed by the current query suffix before selection.
-4. Run selection for every query, including when all indexer parameters are frozen.
+1. Keep the state that the model’s pooling rule needs, including any history for
+   overlapping blocks. Do not publish partial candidates.
+2. When a block completes, compute its key with the model’s pooling and transforms.
+   Write the finished key to its candidate slot before any query can select it.
+3. Run selection for every query, including when all indexer parameters are frozen.
    The integer selection result is nondifferentiable.
+
+For example, the DeepSeek `compress` function in `examples/sparse/compressed_sparse_attention.py`
+weights projections from the current and previous blocks together. Keeping only the
+incomplete block would lose inputs needed for the next candidate.
 
 The selector never repools or mutates the cache and never exposes an incomplete
 candidate. Page allocation, prefix sharing, copy-on-write, and rolling back speculative
