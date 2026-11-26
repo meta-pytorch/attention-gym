@@ -14,6 +14,7 @@ from dataclasses import replace
 import torch
 
 from attn_gym.linear._delta_rule.triton.group_sum import group_sum
+from attn_gym.linear.types import StateCheckpoints
 
 from .. import gdn_bprop, gdn_prefill, gdn_tinv
 from ..bundles.gdn_chain_backward import build_chain_backward, run_chain_backward
@@ -80,6 +81,7 @@ def gdn_forward(
     split: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
     batch_invariant: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Packed ``[T, H, D]`` scalar-GDN forward. ``gate`` is the natural-log decay ``[T, HO]``.
@@ -105,6 +107,8 @@ def gdn_forward(
             )
     elif has_initial_state is not None:
         raise ValueError("has_initial_state requires state_indices")
+    elif state_checkpoints is not None:
+        raise ValueError("state_checkpoints requires paged state_indices")
     tokens, _, dim_k = q.shape
     dim_v = v.shape[-1]
     heads_out = gate.shape[1]
@@ -140,7 +144,7 @@ def gdn_forward(
         "cu_seqlens": cu_seqlens,
         "seed_indices": None,
         "final_indices": None,
-        "checkpoints": None,
+        "checkpoints": state_checkpoints,
         "tma_slots": tma_slots(
             tensors=4,
             b_t=B_T,

@@ -41,6 +41,7 @@ from ..contract import get_dtype, paged_state_align
 from ..kda_common import state_align_suffix
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
+    make_checkpoint_signatures,
     make_compact_signature_tensor,
     make_counter_signature,
     make_cu_seqlens_signature,
@@ -81,6 +82,9 @@ def warmup_forward_host(
     chunk_scratch: cute.Tensor | None,
     scheduler: cute.Tensor,
     tma_slots: cute.Tensor,
+    checkpoint_pool: cute.Tensor | None,
+    checkpoint_positions: cute.Tensor | None,
+    checkpoint_slots: cute.Tensor | None,
     stream: cuda.CUstream,
 ) -> None:
     """``split`` is the split table's :class:`~work_tables.SplitStatic` (None: the uncut
@@ -136,6 +140,9 @@ def warmup_forward_host(
         scale,
         cutlass.Int32(prefill_sms),
         stream,
+        checkpoints=(checkpoint_pool, checkpoint_positions, checkpoint_slots)
+        if cutlass.const_expr(checkpoint_pool is not None)
+        else None,
     )
 
 
@@ -160,6 +167,7 @@ def _compile_warmup_forward(
     tiles_per_head,
     use_int64_offsets,
     state_align=16,
+    checkpoint_dtype=None,
 ):
     """Compile the warmup or uncut forward launch for one static configuration (dtypes, gate and
     state flags, split-table geometry, d_v split, device target); every extent is symbolic.
@@ -224,6 +232,8 @@ def _compile_warmup_forward(
     name += "_split_" + ("none" if split is None else "_".join(str(v) for v in split))
     name += "_" + "_".join("none" if dtype is None else dtype.__name__.lower() for dtype in dtypes)
     name += state_align_suffix(state_align)
+    if checkpoint_dtype is not None:
+        name += f"_ckpt_{checkpoint_dtype.__name__.lower()}"
     return compile_tvm_ffi(
         warmup_forward_host,
         split,
@@ -252,6 +262,7 @@ def _compile_warmup_forward(
         tensor(cutlass.Float32, 2, 4) if split is not None else None,
         make_counter_signature(sym_int()),
         make_compact_signature_tensor(cutlass.Int64, (sym_int(), 16), assumed_align=128),
+        *make_checkpoint_signatures(checkpoint_dtype, use_int64_offsets),
         name=name,
         opt_level=OPT_LEVEL,
     )
@@ -303,8 +314,9 @@ def build_warmup_forward(
     state_src = state_in if state_in is not None else state_out
     state_dtype = get_dtype(state_src.dtype) if state_src is not None else cutlass.Float32
     # Every tensor the launch addresses; bounded int32 routing arrays and counters excepted.
+    pool = None if checkpoints is None else checkpoints.state_pool
     use_int64_offsets = requires_int64_abi(
-        q, k, v, gate, beta, o, state_in, state_out, checkpoints, chunk_scratch
+        q, k, v, gate, beta, o, state_in, state_out, pool, chunk_scratch
     )
     compiled = _compile_warmup_forward.by_args(
         get_dtype(q.dtype),
@@ -326,6 +338,7 @@ def build_warmup_forward(
         int(tiles_per_head),
         use_int64_offsets,
         paged_state_align(state_in) if paged_state else 16,
+        None if pool is None else get_dtype(pool.dtype),
     )
     return compiled, facts
 
@@ -358,7 +371,7 @@ def run_warmup_forward(
 ) -> None:
     """Replay the warmup or uncut forward on the current stream: one crossing into the DSL for the
     table, prologue and prefill launches.  The plan validated the contract at build, so nothing
-    here raises. ``final_indices``, ``checkpoints`` and the cadence only shape the build; they are
+    here raises. ``final_indices`` and the cadence only shape the build; they are
     accepted so a caller replays with the build's buffers."""
     split = facts is not None
     compiled(
@@ -381,4 +394,5 @@ def run_warmup_forward(
         chunk_scratch if split else None,
         scheduler,
         tma_slots,
+        *(checkpoints if checkpoints is not None else (None, None, None)),
     )

@@ -178,6 +178,17 @@ def make_paged_route_signatures(sequences: Any, *, has_initial_state: bool):
     return indices, mask
 
 
+def make_checkpoint_signatures(dtype, use_int64_offsets: bool):
+    """Optional [slots, H, V, K] pool (only element-aligned) and two int32 request vectors."""
+    if dtype is None:
+        return None, None, None
+    pool = make_dynamic_signature_tensor(
+        dtype, 4, assumed_align=dtype.width // 8, use_int64_offsets=use_int64_offsets
+    )
+    sequences = cute.sym_int()
+    return pool, make_counter_signature(sequences), make_counter_signature(sequences)
+
+
 def make_counter_signature(entries: Any = 1):
     """Create a compact int32 work-count or scheduler-counter signature."""
     return make_compact_signature_tensor(

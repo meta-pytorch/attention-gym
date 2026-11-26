@@ -4,8 +4,8 @@
 # Derived from cudnn-frontend v1.30.0 (python/cudnn/linear_attention/frost/kernel/
 # kda_prefill_f16.py), rewritten by Attention Gym in 2026 on attn_gym.warpdrive roles and
 # channels with CuTeDSL 4.6.2 APIs: one TMA descriptor per tensor replaces the per-sequence
-# descriptor arrays, the natural-log gate is the only gate form, and the state checkpoints the
-# drivers never request are gone.
+# descriptor arrays, the natural-log gate is the only gate form, and the upstream periodic
+# checkpoints are omitted.
 
 """KDA chunked prefill forward (BT = 16, per-key-channel decay) for SM100.
 
@@ -115,6 +115,7 @@ from .kda_common import (
     lds_v4,
     lds_v4_f32,
     load_rows,
+    load_seed,
     load_state,
     mask_pair,
     mma_decay_16x16,
@@ -135,7 +136,7 @@ from .kda_common import (
     state_align_suffix,
     store_solve_operand,
     store_solve_tile,
-    store_state_32,
+    store_tmem_state,
     sts_f32,
     sts_tf32x8,
     swz32,
@@ -166,6 +167,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
+from .state_checkpoints import checkpoint_row, store_checkpoint
 from .umma import (
     SWIZZLE_128B,
     MmaDesc,
@@ -225,6 +227,7 @@ class KdaPrefillParams:
     beta: cute.Tensor  # (token, head)
     state_in: cute.Tensor | None  # (row, head, d_v, d_k)
     state_out: cute.Tensor | None
+    checkpoints: tuple | None
     state_indices: cute.Tensor | None
     has_initial_state: cute.Tensor | None
     entry_states: cute.Tensor | None  # (slot, head, d_k // 4, d_v, 4) fp32, see entry_quad
@@ -740,6 +743,10 @@ class KdaPrefill(WarpSpecialized):
                     params, tile
                 )
                 entry = self.item_entry(params, batch, head_o, v_offset, entry_row)
+                row = (warp % 4) * (self.d_v // 4) + lane % (self.d_v // 4)
+                checkpoint = checkpoint_row(
+                    params.checkpoints, params.state_indices, batch, seqlen, head_o, row + v_offset
+                )
                 next_start, piece, starts = Int32(0), Int32(0), cutlass.Boolean(False)
                 n_local = write_end - compute_start
                 for local in cutlass.range((stage + cum_base) & 1, n_local, 2, unroll=1):
@@ -775,6 +782,7 @@ class KdaPrefill(WarpSpecialized):
                         state_col,
                         sin_col,
                         (entry, starts, piece),
+                        checkpoint,
                     )
                 cum_base += n_local
                 sched, tile = self.next_tile(sched, skip_fence="before")
@@ -807,6 +815,7 @@ class KdaPrefill(WarpSpecialized):
         state_col,
         sin_col,
         entry,
+        checkpoint,
     ):
         """One chunk; ``entry = (item entry, starts, piece)`` stores the left key half of the
         state entering the chunk when piece ``piece`` starts there."""
@@ -982,6 +991,7 @@ class KdaPrefill(WarpSpecialized):
             with self.trace_region("sacc_l.wait"):
                 spin_wait(tstate + SACC_L + ((c - 1) & 1), ((c - 1) >> 1) & 1)
         if local > 0:
+            store_checkpoint(checkpoint, chunk_start, state_col, lane < self.d_v // 4, 0, d_k // 2)
             state = cute.make_rmem_tensor((d_k // 2,), Float32)
             # Ordered before the state update (UIN) by the SIN store below and its wait::st.
             if cutlass.const_expr(self.d_v == 128):
@@ -1110,6 +1120,14 @@ class KdaPrefill(WarpSpecialized):
                 if cutlass.const_expr(self.paged_state > 0):
                     seed_row = slot
                 entry = self.item_entry(params, batch, head_o, v_offset, entry_row)
+                checkpoint = checkpoint_row(
+                    params.checkpoints,
+                    params.state_indices,
+                    batch,
+                    seqlen,
+                    head_o,
+                    value_dim + v_offset,
+                )
                 next_start, piece, starts = Int32(0), Int32(0), cutlass.Boolean(False)
                 if cutlass.const_expr(params.entry_states is not None):  # noqa: SIM102 (static, then dynamic)
                     if n_local > 0:
@@ -1155,6 +1173,7 @@ class KdaPrefill(WarpSpecialized):
                         (compute_start + local) * B_T,
                         seqlen,
                         (entry, starts, piece),
+                        checkpoint,
                     )
                 n_raw += n_local
                 if n_local > 0:
@@ -1163,6 +1182,14 @@ class KdaPrefill(WarpSpecialized):
                         spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1, fence=False)
                     n_upd += 1
                     o_acc, o_smem = self.drain_o(params, o_acc, o_smem, geo, active)
+                    store_checkpoint(
+                        checkpoint,
+                        write_end * B_T,
+                        lane_base + cols["state"],
+                        row_valid,
+                        0,
+                        self.d_k,
+                    )
                 final_dst = params.work_items[tile, FINAL_DST]
                 if cutlass.const_expr(self.store_final_state):
                     self.final_state(
@@ -1264,9 +1291,8 @@ class KdaPrefill(WarpSpecialized):
         src = params.state_in[seed_row, head_o, value_dim + v_offset, None]
         for half in cutlass.range_constexpr(2):
             blocks = range(half * (self.d_k // 32), (half + 1) * (self.d_k // 32))
-            vals = load_state(cute.local_tile(src, (self.d_k // 2,), (half,)), self.state_align)
-            if cutlass.const_expr(self.paged_state > 0):
-                vals = [Float32(cutlass.select_(load_initial, v, Float32(0.0))) for v in vals]
+            tile = cute.local_tile(src, (self.d_k // 2,), (half,))
+            vals = load_seed(tile, self.state_align, load_initial)
             vecs = [vals[16 * j : 16 * j + 16] for j in range(len(blocks))]
             for j, i in enumerate(blocks):
                 words = [
@@ -1378,10 +1404,11 @@ class KdaPrefill(WarpSpecialized):
         chunk_start,
         seqlen,
         entry,
+        checkpoint,
     ):
         """A chunk after the first: right state half, the previous chunk's O, Y, U; ``entry`` as
         in ``cg0_chunk`` for the right key half."""
-        lane, lane_base, cols, ov_lo, ov_hi, pack_col, pack_col_x, _vd, _rv = geo
+        lane, lane_base, cols, ov_lo, ov_hi, pack_col, pack_col_x, _vd, row_valid = geo
         io = self.io_dtype
         d_k = self.d_k
         half_blocks = d_k // 32
@@ -1389,6 +1416,9 @@ class KdaPrefill(WarpSpecialized):
         with self.trace_region("sacc_r.wait"):
             spin_wait(tstate + SACC_R + (n_upd & 1), (n_upd >> 1) & 1)
         n_upd += 1
+        store_checkpoint(
+            checkpoint, chunk_start, lane_base + cols["state"], row_valid, d_k // 2, d_k // 2
+        )
         state = cute.make_rmem_tensor((d_k // 2,), Float32)
         # Ordered before the state update (UIN) by the SIN store below and its wait::st.
         if cutlass.const_expr(self.d_v == 128):
@@ -1530,7 +1560,7 @@ class KdaPrefill(WarpSpecialized):
         _l, _lb, _c, ov_lo, ov_hi, _pc, _pcx, _vd, _rv = geo
         oa = o_acc.wait()
         o_lo, o_hi = self.load_o(geo, oa.index)
-        # Without a final state store, no TMEM access follows before the next fenced wait.
+        # Paged calls store final state, so checkpoint reads also retain this fence.
         skip = None if self.store_final_state else "after"
         with o_smem.produce(skip_fence=skip, reason=AFTER_FENCE_COVERED) as oh:
             self.stage_o(params, oh, o_lo, o_hi, ov_lo, ov_hi, active)
@@ -1556,10 +1586,9 @@ class KdaPrefill(WarpSpecialized):
                 if cutlass.const_expr(self.paged_state > 0):
                     row = slot
                 dst = out[row, head_o, value_dim + v_offset, None]
-                for i in cutlass.range_constexpr(self.d_k // 32):
-                    vals = tmem_ld("32x32b", 32, lane_base + cols["state"] + i * 32)
-                    if row_valid:
-                        store_state_32(cute.local_tile(dst, (32,), (i,)), vals, self.state_align)
+                store_tmem_state(
+                    dst, lane_base + cols["state"], row_valid, 0, self.d_k, self.state_align
+                )
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:
@@ -1942,6 +1971,7 @@ class KdaPrefill(WarpSpecialized):
         state_out,
         state_indices,
         has_initial_state,
+        checkpoints,
         entry_states,
         cu_seqlens,
         pieces,
@@ -1969,6 +1999,7 @@ class KdaPrefill(WarpSpecialized):
             beta=beta,
             state_in=state_in,
             state_out=state_out,
+            checkpoints=checkpoints,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
             entry_states=entry_states,
@@ -2018,6 +2049,7 @@ class KdaPrefill(WarpSpecialized):
         stream: cuda.CUstream,
         trace_buffer: cute.Tensor | None = None,
         entries: tuple | None = None,
+        checkpoints: tuple | None = None,
     ):
         """Launch on ``num_ctas`` CTAs (PDL); callable from another ``@cute.jit`` host such as
         a launch bundle, after a kernel that wrote ``work_items``/``work_count`` and zeroed
@@ -2089,6 +2121,7 @@ class KdaPrefill(WarpSpecialized):
             state_out,
             state_indices,
             has_initial_state,
+            checkpoints,
             entry_states,
             cu_seqlens,
             pieces,

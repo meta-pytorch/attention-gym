@@ -24,9 +24,8 @@ including paged, staged and context-parallel calls, choose the kernels with
 - `"warpdrive"` selects the CuTeDSL kernels. Install the `[linear]` extra; unsupported calls raise
   rather than switching to Triton. `"cudnn"`, the backend's former name, is an alias.
 
-FP16 KDA follows the same rule as BF16. Paged calls that write
-[state checkpoints](#paged-state-checkpoints-gdn-and-kda) are the exception: `"auto"` uses
-Triton, and an explicit `"warpdrive"` raises because warpdrive cannot write checkpoints.
+FP16 KDA follows the same rule as BF16, including paged calls that write
+[state checkpoints](#paged-state-checkpoints-gdn-and-kda).
 
 Selection does not depend on batch size or sequence lengths. A staged backward uses the backend
 saved by its forward. Select `"warpdrive"` explicitly on forward calls to use `split_forward`,
@@ -283,9 +282,8 @@ elementwise kernels run per decode step.
 `state_checkpoints=StateCheckpoints(...)`. While advancing the running state cache, they write
 selected post-update states directly into caller-chosen slots of a state pool. These checkpoints
 let a serving engine publish prefix-cache entries without a follow-up state copy. Checkpointing
-is inference-only, runs on the repo-local fused backend, and leaves return types unchanged.
-The default `backend="auto"` runs checkpointed chunk calls on the fused backend even on
-SM100-family GPUs; an explicit `"warpdrive"` raises.
+is inference-only and leaves return types and chunk backend selection unchanged. On supported
+SM100-family GPUs, `backend="auto"` uses warpdrive for both checkpointed and ordinary prefills.
 
 For each sequence, pass the number of **new tokens in this call** before the selected prefix
 and the pool slot that should receive its state. A non-positive destination skips the sequence.
@@ -337,8 +335,8 @@ alone produces a complete replay checkpoint. Resume with `has_initial_state=True
 See the
 [prefix-cache example](https://github.com/meta-pytorch/attention-gym/blob/main/examples/linear/kda_prefix_cache_checkpoints.py)
 for a bitwise comparison against a full prefill. It pins `{"backend": "fused"}` on every
-call: on SM100-family GPUs the default runs calls without checkpoints on warpdrive, whose
-rounding differs from the fused calls that wrote the checkpoints.
+call to keep the same numerical plan when saving and resuming. To use warpdrive, pin
+`{"backend": "warpdrive", "batch_invariant": True}` when bitwise resume across batch shapes matters.
 
 ::: attn_gym.linear.StateCheckpoints
 

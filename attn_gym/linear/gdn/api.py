@@ -189,8 +189,7 @@ def paged_chunk_gdn(
 
         state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
             state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
-            semantics. Runs on the fused backend: ``"auto"`` selects it, and ``"warpdrive"``
-            raises.
+            semantics.
 
     Returns:
         The output in ``q.dtype``. ``state_cache`` is advanced in place.
@@ -210,11 +209,7 @@ def paged_chunk_gdn(
         has_initial_state,
     )
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    backend = resolve_chunk_backend(
-        options["backend"], q, fused_only=state_checkpoints is not None
-    )
-    if state_checkpoints is not None and backend != "fused":
-        raise ValueError("state_checkpoints requires the fused backend")
+    backend = resolve_chunk_backend(options["backend"], q)
     scale = resolve_scale(scale, q.shape[-1])
     gate, beta, _ = cast_to_kernel_dtypes(gate, beta, None)
     if backend == "warpdrive":
@@ -230,6 +225,7 @@ def paged_chunk_gdn(
             has_initial_state=has_initial_state,
             scale=scale,
             batch_invariant=options["batch_invariant"],
+            state_checkpoints=state_checkpoints,
         )
     return fused_paged_chunk_forward(
         q,

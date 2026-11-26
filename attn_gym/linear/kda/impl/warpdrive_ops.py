@@ -15,6 +15,10 @@ from attn_gym.linear._delta_rule.operand_layout import (
     normalize_scalar_rows,
 )
 from attn_gym.linear._delta_rule.paged_state import PagedState
+from attn_gym.linear._delta_rule.state_checkpoints import (
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints,
+)
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
@@ -55,7 +59,8 @@ torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_fwd_paged",
     "(Tensor q, Tensor k, Tensor v, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale, "
-    'str intra_chunk_dtypes="bf16", bool batch_invariant=False) -> Tensor',
+    'str intra_chunk_dtypes="bf16", bool batch_invariant=False, Tensor(b!)? checkpoint_states=None, '
+    "Tensor? checkpoint_positions=None, Tensor? checkpoint_slots=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::kda_chunk_cudnn_packed_local_bwd",
@@ -317,12 +322,19 @@ def _packed_fwd_paged_cuda(
     scale,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    checkpoint_states=None,
+    checkpoint_positions=None,
+    checkpoint_slots=None,
 ):
     template = value
     # The pool is advanced in place, so it is validated rather than copied.
     q, k, value, gate, beta, cu_seqlens = _normalize_operands(q, k, value, gate, beta, cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     backend = _backend(q)
+    checkpoints = state_checkpoints_from_op_args(
+        checkpoint_states, checkpoint_positions, checkpoint_slots
+    )
+    validate_state_checkpoints(checkpoints, q, value, cu_seqlens)
     paged_state = PagedState.validate(
         state_cache,
         state_indices,
@@ -333,6 +345,7 @@ def _packed_fwd_paged_cuda(
         key_dim=q.shape[3],
         device=q.device,
         read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
+        checkpoints=checkpoints,
     )
     output, _ = backend.run_forward(
         q,
@@ -630,6 +643,9 @@ def _packed_fwd_paged_fake(
     scale,
     intra_chunk_dtypes="bf16",
     batch_invariant=False,
+    checkpoint_states=None,
+    checkpoint_positions=None,
+    checkpoint_slots=None,
 ):
     return _empty_like_token_operand(value)
 

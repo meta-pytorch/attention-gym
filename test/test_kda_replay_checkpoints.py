@@ -24,9 +24,12 @@ from attn_gym.testing import (
 )
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
-OPTIONS = {"schedule": "static", "autotune": False}
-# Checkpointed calls run the fused kernels, so their chunk references must too.
-pytestmark = pytest.mark.usefixtures("fused_chunk_default")
+
+def options(backend: str) -> dict[str, object]:
+    if backend == "warpdrive":
+        # Compare packed replay against an independent single-sequence chunk.
+        return {"backend": backend, "batch_invariant": True}
+    return {"backend": backend, "schedule": "static", "autotune": False}
 
 
 @pytest.fixture
@@ -66,6 +69,7 @@ def expected_checkpoints(
     boundaries: list[int],
     *,
     packed: bool,
+    backend: str,
 ) -> torch.Tensor:
     """Stop independent, replay-prepended chunk calls at the expected boundaries."""
     expected = torch.full_like(saved.state_pool, CHECKPOINT_SENTINEL)
@@ -91,7 +95,7 @@ def expected_checkpoints(
                 initial if has_state else torch.zeros_like(initial),
                 cu_seqlens=cumulative_sequence_offsets([stop]),
                 output_final_state=True,
-                kernel_options=OPTIONS,
+                kernel_options=options(backend),
             )
             assert state is not None
             expected[saved.checkpoint_slots[sequence]].copy_(state[0])
@@ -110,7 +114,7 @@ def expected_checkpoints(
 )
 @torch.no_grad()
 def test_replay_checkpoints_match_chunk_boundaries(
-    cuda: None, mode: str, state_dtype: torch.dtype, no_benchmarking: None
+    cuda: None, mode: str, state_dtype: torch.dtype, no_benchmarking: None, checkpoint_backend: str
 ) -> None:
     packed = mode == "packed"
     if mode != "decode":
@@ -140,12 +144,22 @@ def test_replay_checkpoints_match_chunk_boundaries(
         tensor[1].fill_(float("nan"))
     saved = sentinel_state_checkpoints(positions, (1, 128, 128))
     expected_states = expected_checkpoints(
-        tensors, cache, replay, saved, lengths, routes, flags, counts, boundaries, packed=packed
+        tensors,
+        cache,
+        replay,
+        saved,
+        lengths,
+        routes,
+        flags,
+        counts,
+        boundaries,
+        packed=packed,
+        backend=checkpoint_backend,
     )
     kwargs = {
         "cu_seqlens": cumulative_sequence_offsets(lengths) if packed else None,
         "has_initial_state": torch.tensor(flags, device="cuda"),
-        "kernel_options": OPTIONS,
+        "kernel_options": options(checkpoint_backend),
     }
     slots = int32(routes)
     expected_cache, expected_replay = cache.clone(), clone_replay(replay)
@@ -164,7 +178,7 @@ def test_replay_checkpoints_match_chunk_boundaries(
 @pytest.mark.parametrize("mode", ["packed", "decode"])
 @torch.no_grad()
 def test_replay_checkpoints_written_into_the_state_cache_match_a_separate_pool(
-    cuda: None, mode: str, no_benchmarking: None
+    cuda: None, mode: str, no_benchmarking: None, checkpoint_backend: str
 ) -> None:
     decode = mode == "decode"
     lengths = [1, 1, 1] if decode else [45, 173, 70]
@@ -185,7 +199,7 @@ def test_replay_checkpoints_written_into_the_state_cache_match_a_separate_pool(
             cu_seqlens=cu_seqlens,
             replay_state=clone_replay(initial_replay),
             state_checkpoints=saved,
-            kernel_options=OPTIONS,
+            kernel_options=options(checkpoint_backend),
         )
 
     reference = sentinel_state_checkpoints(positions, (1, 128, 128))
@@ -198,7 +212,7 @@ def test_replay_checkpoints_written_into_the_state_cache_match_a_separate_pool(
 @pytest.mark.parametrize("execution", ["fullgraph", "cuda_graph"])
 @torch.no_grad()
 def test_replay_checkpoints_read_changed_graph_metadata(
-    cuda: None, mode: str, execution: str, no_benchmarking: None
+    cuda: None, mode: str, execution: str, no_benchmarking: None, checkpoint_backend: str
 ) -> None:
     from torch._dynamo.testing import CompileCounterWithBackend
 
@@ -224,7 +238,7 @@ def test_replay_checkpoints_read_changed_graph_metadata(
             state_checkpoints=StateCheckpoints(
                 pool, saved.checkpoint_positions, saved.checkpoint_slots
             ),
-            kernel_options=OPTIONS,
+            kernel_options=options(checkpoint_backend),
         )
 
     run(state_cache, replay_state, saved.state_pool)
@@ -281,6 +295,7 @@ def test_replay_checkpoints_read_changed_graph_metadata(
             counts,
             boundaries,
             packed=not decode,
+            backend=checkpoint_backend,
         )
         expected_output = run(expected_cache, expected_replay, torch.empty_like(saved.state_pool))
         if execution == "fullgraph":
@@ -668,7 +683,10 @@ def test_copy_replay_tails_reuses_binary_across_packed_shapes(cuda: None, triton
 
 @pytest.mark.parametrize("prefix", [150, 128], ids=["mid-chunk", "chunk-boundary"])
 @torch.no_grad()
-def test_prefix_cache_example_restores_checkpoint_and_replay_tail(cuda: None, prefix: int) -> None:
-    from examples.linear.kda_prefix_cache_checkpoints import restore_shared_prefix
+def test_prefix_cache_example_restores_checkpoint_and_replay_tail(
+    cuda: None, prefix: int, monkeypatch, checkpoint_backend: str
+) -> None:
+    from examples.linear import kda_prefix_cache_checkpoints as example
 
-    assert restore_shared_prefix(prefix) == 128
+    monkeypatch.setitem(example.OPTIONS, "backend", checkpoint_backend)
+    assert example.restore_shared_prefix(prefix) == 128
