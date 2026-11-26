@@ -105,7 +105,7 @@ def test_mxfp8_reference_query_group_scales_choose_different_keys():
         impl="reference",
         q_scale=qs,
         k_scale=ks,
-        kernel_options={"backend": "triton"},
+        kernel_options={"backend": "triton", "batch_invariant": True},
     )
     assert indices.flatten().tolist() == [1, 0]
 
@@ -182,6 +182,13 @@ def test_mxfp8_public_matches_reference(weights_dtype, heads, ratio):
         kernel_options={"backend": "cute"},
     )
     check_result(actual, inputs, 7, True, ratio)
+
+
+def test_fused_mxfp8_rejects_batch_invariant():
+    require_mxfp8_cuda()
+    inputs = make_indexer_mxfp8_test_inputs(17, 32, 128, torch.float32)
+    with pytest.raises(ValueError, match="MXFP8.*batch_invariant=False"):
+        lightning_indexer(**inputs._asdict(), topk=3, kernel_options={"batch_invariant": True})
 
 
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
@@ -477,8 +484,10 @@ def test_mxfp8_private_op_fake_signature():
 
     from attn_gym.sparse.indexer import ops
 
-    names = [argument.name for argument in _indexer_op._schema.arguments]
-    assert names[-4:] == ["cu_seqlens", "cu_seqlens_k", "q_scale", "k_scale"]
+    arguments = _indexer_op._schema.arguments
+    names = [argument.name for argument in arguments]
+    positional = [argument.name for argument in arguments if not argument.kwarg_only]
+    assert positional[-4:] == ["cu_seqlens", "cu_seqlens_k", "q_scale", "k_scale"]
     assert list(inspect.signature(ops._indexer_fake).parameters) == names
     assert list(inspect.signature(ops._indexer_cuda).parameters) == names
     q = torch.empty(1, 17, 32, 128, device="meta", dtype=torch.float8_e4m3fn)

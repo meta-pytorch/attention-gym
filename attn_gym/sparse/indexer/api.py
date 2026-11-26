@@ -18,8 +18,14 @@ class IndexerKernelOptions(TypedDict, total=False):
     backend: Literal["cute", "triton"]
     """See :func:`lightning_indexer` for default selection and backend requirements."""
 
+    batch_invariant: bool
+    """Use fixed FP16/BF16 scoring and deterministic selection shared with the paged API."""
 
-KERNEL_OPTION_SPEC: KernelOptionSpec = {"backend": (("cute", "triton"), None)}
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {
+    "backend": (("cute", "triton"), None),
+    "batch_invariant": (bool, False),
+}
 
 
 def _validate_inputs(
@@ -186,6 +192,14 @@ def lightning_indexer(
             ``{"backend": "cute"}`` or ``{"backend": "triton"}``. Omit options to select CuTe
             on SM100-family GPUs and Triton on other Hopper-or-newer NVIDIA GPUs. There is
             no fallback when the selected backend rejects a shape or layout.
+            ``batch_invariant=True`` uses the paged API's fixed Triton scoring (FP16/BF16,
+            SM80+, H <= 128, D <= 256, candidate capacity <= 2**22) and deterministic radix
+            selection. For nonzero ``topk``, the uncompressed token count of each unpacked
+            document must fit in int32, not necessarily the batch total. For packed documents
+            the capacity limit applies to the entire candidate pool (``k.shape[1]``).
+            The backend chooses only the selector in this mode. Fused MXFP8 scoring does not
+            support this mode. Matching IDs requires identical queries, weights and transformed
+            candidate keys on one GPU model and software stack.
 
     Returns:
         Contiguous [B, T, topk] INT32 indices. Order and tie-breaking are unspecified, and
@@ -227,9 +241,9 @@ def lightning_indexer(
     _validate_inputs(
         q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k, q_scale, k_scale
     )
-    backend = validate_kernel_options(
+    options = validate_kernel_options(
         kernel_options, KERNEL_OPTION_SPEC, op_name="lightning_indexer"
-    )["backend"]
+    )
     match selected_impl:
         case Impl.REFERENCE:
             from .impl import reference
@@ -256,9 +270,10 @@ def lightning_indexer(
                 topk,
                 causal,
                 compress_ratio,
-                backend or "auto",
+                options["backend"] or "auto",
                 cu_seqlens,
                 cu_seqlens_k,
                 q_scale,
                 k_scale,
+                batch_invariant=options["batch_invariant"],
             )

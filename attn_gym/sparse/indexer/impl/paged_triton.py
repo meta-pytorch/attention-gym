@@ -122,6 +122,8 @@ def paged_score_kernel(
     BD: tl.constexpr,
     Q_UNIT_D: tl.constexpr,
     K_UNIT_D: tl.constexpr,
+    KeyOffsets=None,
+    WHOLE: tl.constexpr = False,
 ):
     """Gather and score visible candidate tiles from arbitrary strided pages."""
     local = tl.program_id(0).to(tl.int64 if WIDE else tl.int32)
@@ -150,16 +152,25 @@ def paged_score_kernel(
         (heads[:, None] < H) & (dims[None, :] < D),
         0,
     )
+    if WHOLE:
+        # Whole-document pools use one physical page per batch element. A packed
+        # document starts at its key offset in the sole batch element's pool.
+        page = tl.load(Table + ptr_offset((sequence, 0), table_strides))
+        key_start = 0 if KeyOffsets is None else tl.load(KeyOffsets + sequence)
     for begin in range(tile * BN, visible, tl.num_programs(1) * BN):
         candidates = begin + tl.arange(0, BN)
-        pages = tl.load(
-            Table + ptr_offset((sequence, candidates // PAGE), table_strides),
-            candidates < visible,
-            0,
-        )
+        if WHOLE:
+            slots = candidates + key_start
+        else:
+            pages = tl.load(
+                Table + ptr_offset((sequence, candidates // PAGE), table_strides),
+                candidates < visible,
+                0,
+            )
+            page = pages[:, None]
+            slots = candidates % PAGE
         keys = tl.load(
-            K
-            + ptr_offset((pages[:, None], (candidates % PAGE)[:, None], dims[None, :]), k_strides),
+            K + ptr_offset((page, slots[:, None], dims[None, :]), k_strides),
             (candidates[:, None] < visible) & (dims[None, :] < D),
             0,
         )
@@ -388,6 +399,10 @@ def launch(
     backend,
     q_scale=None,
     k_scale=None,
+    *,
+    batch_invariant=False,
+    key_offsets=None,
+    whole_pool=False,
 ):
     """Score paged keys in slabs and return sequence-local Top-K IDs with -1 padding."""
     capability = torch.cuda.get_device_capability(query.device)
@@ -397,7 +412,9 @@ def launch(
     if mxfp8 or q_scale is not None or k_scale is not None:
         from ..validation import validate_precision
 
-        validate_precision(query, key_cache, weights, q_scale, k_scale)
+        validate_precision(
+            query, key_cache, weights, q_scale, k_scale, batch_invariant=batch_invariant
+        )
     if mxfp8:
         if backend != "cute" or capability not in ((10, 0), (10, 3)):
             raise ValueError(
@@ -445,7 +462,8 @@ def launch(
     # The absolute row index can exceed int32 even when query and weights are broadcast.
     shared_wide = tokens > 2**31 or requires_int64_offsets(scores, bounds)
     score_wide = capacity > topk and (
-        shared_wide or requires_int64_offsets(query, key_cache, weights, block_table, *metadata)
+        shared_wide
+        or requires_int64_offsets(query, key_cache, weights, block_table, key_offsets, *metadata)
     )
     if mxfp8 and score_wide:
         raise ValueError("fused paged MXFP8 scoring requires int32 input offsets.")
@@ -469,12 +487,15 @@ def launch(
                 False,
                 1,
                 select_wide,
-                torch.are_deterministic_algorithms_enabled(),
+                batch_invariant or torch.are_deterministic_algorithms_enabled(),
                 True,
                 paged=True,
             )
-            if mxfp8 or can_use_warpdrive_score(
-                query, key_cache, weights, block_table, seqused_k, query_positions, score_wide
+            if mxfp8 or (
+                not batch_invariant
+                and can_use_warpdrive_score(
+                    query, key_cache, weights, block_table, seqused_k, query_positions, score_wide
+                )
             ):
                 if mxfp8:
                     from .paged_score_mxfp8 import get_paged_mxfp8_score_runner as prepare_score
@@ -513,7 +534,12 @@ def launch(
         bh, bd = max(16, triton.next_power_of_2(heads)), max(16, triton.next_power_of_2(dim))
         grid_capacity = min(capacity, 32768)
         workers = 32 * properties.multi_processor_count
-        if key_cache.shape[1] % 32 == 0 and can_use_tma(query) and can_use_tma(key_cache):
+        if (
+            not batch_invariant
+            and key_cache.shape[1] % 32 == 0
+            and can_use_tma(query)
+            and can_use_tma(key_cache)
+        ):
             from triton.tools.tensor_descriptor import TensorDescriptor
 
             # Measured on B200 with full pools: split short pools to fill the GPU;
@@ -535,7 +561,11 @@ def launch(
             # With H128, D256 and BN128 they exceed the 99 KiB SM86/89/120 limit.
             budget = properties.shared_memory_per_block_optin
             element_size = query.element_size()
-            bn = next((n for n in (128, 64, 32) if (n + bh) * bd * element_size <= budget), 16)
+            bn = (
+                32
+                if batch_invariant
+                else next((n for n in (128, 64, 32) if (n + bh) * bd * element_size <= budget), 16)
+            )
             tiles = 1
             score_kernel = paged_score_kernel
             score_query, score_keys = query, key_cache
@@ -544,6 +574,10 @@ def launch(
                 "Q_UNIT_D": query.stride(-1) == 1,
                 "K_UNIT_D": key_cache.stride(-1) == 1,
             }
+            if batch_invariant:
+                score_options.update(
+                    KeyOffsets=key_offsets, WHOLE=whole_pool, enable_fp_fusion=False
+                )
         tiles_per_row = triton.cdiv(grid_capacity, bn * tiles)
     with torch.cuda.device(query.device):
         for start in range(0, tokens, slab):
@@ -572,7 +606,7 @@ def launch(
                     *block_table.stride(),
                     heads,
                     dim,
-                    key_cache.shape[1],
+                    1 if whole_pool else key_cache.shape[1],
                     topk,
                     compress_ratio,
                     query_positions is not None,
