@@ -131,7 +131,7 @@ def test_packed_mask_flags_reuse_score_and_topk_compiles(monkeypatch, heads, dim
     from attn_gym.sparse.indexer.impl.triton import prepare_candidate_bounds
 
     monkeypatch.setattr(impl, "requires_int64_abi", lambda *args: wide)
-    compilers = (impl._compile_scores, impl._compile_topk)
+    compilers = (impl._compile_scores, impl._compile_topk_kernel)
     for compiler in compilers:
         compiler.cache_clear()
     deterministic = torch.are_deterministic_algorithms_enabled()
