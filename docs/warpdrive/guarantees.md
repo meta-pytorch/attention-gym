@@ -233,7 +233,11 @@ What the layer supplies, checks and leaves to you:
     `ptx_check.check_tcgen05_sync` checks every
     intraprocedural PTX path of a compiled kernel for both fences and the teardown drain; it
     counts a guarded instruction as possibly skipped, rejects calls, and does not check in-loop
-    TMEM completion between threads.
+    TMEM completion between threads. With `teardown_barrier=TMEM_TEARDOWN_BARRIER_ID` it also
+    reports a `copy-drain` finding if a `tcgen05.cp` (SMEM to TMEM) has an issuer path to that
+    rendezvous with no identifiable completion handoff. A `tcgen05.commit` by itself is not
+    an observation of completion. See [what the PTX check recognizes](dropping-down.md#tmem-copy-completion-at-teardown);
+    a clean result is not a proof of matched epochs across warps.
 
     Historical cost ([PR #883](https://github.com/meta-pytorch/attention-gym/pull/883)): making
     `tcgen05` ordering across managed thread synchronization explicit constrains compiler

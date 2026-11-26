@@ -217,8 +217,23 @@ Warpdrive kernels compile through `jit_cache` with two extra rules:
 
 ### warpdrive Testing Tiers
 
-Pick the smallest tier that covers the change; run bigger tiers only when asked or before
-landing core synchronization/scheduling changes.
+For every new or ported warpdrive kernel:
+
+- Run a separate `checked=True` build against the numerical oracle on representative inputs:
+  zero inner-loop trips where legal, one trip, and enough trips to wrap the pipeline,
+  including a ragged tail where supported. Bounds checks only cover executed accesses.
+  Inspect `op.checks()` after compilation; use strict alias and liveness checks when applicable.
+- Capture fresh **production** PTX for each distinct memory/synchronization protocol. Run
+  the applicable [repo PTX checks](docs/warpdrive/dropping-down.md) and `cutracer lint`
+  from the `drisspg/CUTracer` fork. For TMEM, pass `teardown_barrier=TMEM_TEARDOWN_BARRIER_ID`
+  to `check_tcgen05_sync`. Inspect findings and coverage gaps; a clean lint is not a runtime verdict.
+- For new or changed async handoffs or TMEM lifetimes, trace those boundary cases with
+  `cutracer races-run` using a matching fork CLI and native library, then inspect
+  `cutracer races-coverage`. Record the revision, inputs and uncovered rules. If the tool
+  or hardware is unavailable, report a validation gap rather than a pass.
+
+Pick the smallest suite below that covers the change; run bigger tiers only when asked or
+before landing core synchronization/scheduling changes.
 
 - Every change (~45 s cold, ~22 s with a warm compile cache on a GB300):
   `pytest -n 12 test/warpdrive test/profiler test/warpdrive_fuzz`. Tests marked `fuzz` are
@@ -228,7 +243,8 @@ landing core synchronization/scheduling changes.
   `pytest -n 12 -m fuzz test/warpdrive test/warpdrive_fuzz`. It includes the mutant check:
   each synthetic layer bug in `test/warpdrive_fuzz/runtime_mutants.py` must fail or hang its
   listed test (four hang by design, 90 s each).
-- Long campaigns, sanitizer and CUTracer runs, SASS/perf A/Bs: only when the user asks.
+- Beyond the targeted checks above, long campaigns, sanitizer or CUTracer runs, and
+  SASS/perf A/Bs are request-only.
   Use `tools/warpdrive/fuzz_warpdrive.py {static,mutate}` (compile-only).
   `CUTE_DSL_ARCH=sm_100a python tools/warpdrive/warpdrive_sass.py dump OUTDIR` records the
   seven standard configs; `compare BEFORE AFTER` gates on PTX and compiler identity and prints
