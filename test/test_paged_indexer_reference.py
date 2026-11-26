@@ -69,6 +69,19 @@ def test_autocast_preserves_strict_winner(paged, device, dtype):
         assert (ids == 0).all()
 
 
+def test_deterministic_selection_prefers_lower_ties_and_orders_ids(deterministic_algorithms):
+    args = make_paged_indexer_test_inputs(
+        (1,), (8,), heads=1, head_dim=1, page_size=8, compress_ratio=1, device="cpu"
+    )
+    query, cache, weights = args[:3]
+    query.fill_(1)
+    weights.fill_(1)
+    cache.zero_()
+    cache[0, 7] = 1
+    selected = paged_lightning_indexer(*args, topk=3, compress_ratio=1, impl="reference")
+    assert selected.tolist() == [[0, 1, 7]]
+
+
 def test_completed_block_boundaries():
     args = make_paged_indexer_test_inputs((3,), (10,), device="cpu")
     for length, expected_counts in [(9, [1, 2, 2]), (10, [2, 2, 2])]:
@@ -88,6 +101,21 @@ def test_validation_and_empty_cpu():
     ]:
         with pytest.raises(error):
             paged_lightning_indexer(*args, impl="reference", **kwargs)
+
+
+def test_metadata_layout_and_operand_types():
+    args = list(make_paged_indexer_test_inputs(device="cpu"))
+    cu = args[4]
+    args[4] = cu.to(torch.int64)
+    with pytest.raises(TypeError, match="cu_seqlens_q must have dtype int32"):
+        paged_lightning_indexer(*args, topk=3, impl="reference")
+    args[4] = torch.stack((cu, cu), dim=1)[:, 0]
+    with pytest.raises(ValueError, match="cu_seqlens_q must be contiguous"):
+        paged_lightning_indexer(*args, topk=3, impl="reference")
+    args[4] = cu
+    args[1] = args[1].float()
+    with pytest.raises(TypeError, match="same dtype"):
+        paged_lightning_indexer(*args, topk=3, impl="reference")
 
 
 def test_zero_sequences_and_capacity_tail():

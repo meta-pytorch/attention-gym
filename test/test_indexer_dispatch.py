@@ -10,9 +10,13 @@ from torch._dynamo.testing import CompileCounterWithBackend
 
 from attn_gym._backends import arch
 from attn_gym._backends.arch import runs_sm100_kernels
-from attn_gym.sparse import Impl
+from attn_gym.sparse import Impl, paged_lightning_indexer
 from attn_gym.sparse.indexer import lightning_indexer, ops
-from attn_gym.testing.indexer import assert_indexer_selection, make_indexer_test_inputs
+from attn_gym.testing.indexer import (
+    assert_indexer_selection,
+    make_indexer_test_inputs,
+    make_paged_indexer_test_inputs,
+)
 
 
 def require_backend(backend: str | None = None) -> str:
@@ -94,20 +98,25 @@ def test_backend_dispatch_uses_input_device(
     [
         ({"backend": "auto"}, "'backend'. must be 'cute' or 'triton'"),
         ({"backend": None}, "'backend'. must be 'cute' or 'triton'"),
-        ({"other": "triton"}, "unsupported lightning_indexer kernel options: other"),
+        ({"other": "triton"}, "unsupported {op} kernel options: other"),
         (
             {"backend": "triton", "other": "x"},
-            "unsupported lightning_indexer kernel options: other",
+            "unsupported {op} kernel options: other",
         ),
+        ({"autotune": False}, "unsupported {op} kernel options: autotune"),
     ],
 )
-def test_invalid_backend_options(options, message):
+@pytest.mark.parametrize("operation", [lightning_indexer, paged_lightning_indexer])
+@pytest.mark.parametrize("impl", ["fused", "reference"])
+def test_invalid_backend_options(options, message, operation, impl):
     """Reject unknown options before launching a backend."""
-    q, k, weights = torch.zeros(1, 2, 2, 16), torch.zeros(1, 2, 16), torch.zeros(1, 2, 2)
-    with pytest.raises(ValueError, match=message):
-        lightning_indexer(q, k, weights, 1, kernel_options=options)
-    with pytest.raises(ValueError, match=message):
-        lightning_indexer(q, k, weights, 1, impl="reference", kernel_options=options)
+    args = (
+        make_paged_indexer_test_inputs((0,), (0,), device="cpu")
+        if operation is paged_lightning_indexer
+        else (torch.zeros(1, 2, 2, 16), torch.zeros(1, 2, 16), torch.zeros(1, 2, 2))
+    )
+    with pytest.raises(ValueError, match=message.format(op=operation.__name__)):
+        operation(*args, topk=1, impl=impl, kernel_options=options)
 
 
 def test_fused_cpu_rejected():

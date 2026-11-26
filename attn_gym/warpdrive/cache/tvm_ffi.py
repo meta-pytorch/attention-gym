@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import re
+import tempfile
+from pathlib import Path
 from typing import Any
 
 import torch
+
+from .jit import EXPORT_FUNCTION_NAME, _load_compiled
 
 _VALID_NAME = re.compile(r"[a-z][a-z0-9_]*\Z")
 
@@ -89,11 +93,31 @@ def make_fake_compact_tensor(
     )
 
 
+class CrossCompiledKernel:
+    """Load a cross-compiled object for launch without relying on the persistent cache.
+
+    When the requested architecture is incompatible with ordinal 0, CuTeDSL produces an
+    exportable object but no execution engine. Load its TVM-FFI entry point for calls on the
+    target GPU and retain the original exporter so ``jit_cache`` can still persist the build.
+    """
+
+    def __init__(self, compiled: Any) -> None:
+        self.export_to_c = compiled.export_to_c
+        with tempfile.TemporaryDirectory() as directory:
+            obj = Path(directory) / "kernel.o"
+            self.export_to_c(object_file_path=str(obj), function_name=EXPORT_FUNCTION_NAME)
+            self._launch = _load_compiled(obj)
+
+    def __call__(self, *args: Any) -> Any:
+        return self._launch(*args)
+
+
 def compile_tvm_ffi(
     entrypoint: Any,
     *compile_args: Any,
     name: str | None = None,
     opt_level: int | None = None,
+    gpu_arch: str | None = None,
 ) -> Any:
     """Compile a fake-tensor signature with the TVM-FFI environment-stream ABI.
 
@@ -105,6 +129,7 @@ def compile_tvm_ffi(
     ``opt_level`` is the CuTeDSL optimization level (``None`` is the compiler default). It
     changes the generated code, so a caller that needs a specific level must pass it. Every
     compile also passes ``compat.COMPILE_OPTIONS``, which pins C semantics for signed ``%``.
+    ``gpu_arch`` overrides CuTeDSL's default target, which otherwise comes from ordinal 0.
     """
     if name is None:
         get_name = getattr(entrypoint, "get_name", None)
@@ -128,6 +153,8 @@ def compile_tvm_ffi(
     jit_wrapper.set_name_prefix(name)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     options = (cute.EnableTVMFFI, *COMPILE_OPTIONS)
+    if gpu_arch is not None:
+        options += (cute.GPUArch(gpu_arch),)
     if opt_level is not None:
         options += (cute.OptLevel(opt_level),)
     compile_fn = cute.compile[options]
@@ -138,11 +165,15 @@ def compile_tvm_ffi(
     # entrypoint also scopes its own trace (__cute_trace_scope__).
     scope = getattr(entrypoint, "__cute_trace_scope__", None)
     with compile_scope(), indexing(False) if scope is None else scope():
-        return compile_fn(
-            entrypoint,
-            *compile_args,
-            stream,
-        )
+        compiled = compile_fn(entrypoint, *compile_args, stream)
+    if gpu_arch is not None and compiled.engine is None:
+        return CrossCompiledKernel(compiled)
+    return compiled
 
 
-__all__ = ["compile_tvm_ffi", "make_fake_compact_tensor", "make_fake_strided_tensor"]
+__all__ = [
+    "CrossCompiledKernel",
+    "compile_tvm_ffi",
+    "make_fake_compact_tensor",
+    "make_fake_strided_tensor",
+]

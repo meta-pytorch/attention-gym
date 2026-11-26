@@ -13,6 +13,8 @@ def score_and_select(
     topk: int,
     valid: Tensor,
     start: Tensor | int = 0,
+    *,
+    deterministic: bool = False,
 ) -> Tensor:
     """Rank visible keys for each query, returning indices relative to its document start."""
     # Autocast can downcast even explicitly promoted einsum operands before the head sum.
@@ -22,7 +24,12 @@ def score_and_select(
         scores = (dots.relu() * weights.to(dtype).unsqueeze(-1)).sum(dim=-2)
         scores *= 1.0 / math.sqrt(q.shape[-2] * q.shape[-1])
     scores.masked_fill_(~valid, -torch.inf)
-    indices = scores.topk(min(topk, k.shape[-2]), dim=-1).indices
+    width = min(topk, k.shape[-2])
+    if deterministic:
+        ranked = scores.argsort(dim=-1, descending=True, stable=True)
+        indices = ranked[..., :width].sort(dim=-1).values
+    else:
+        indices = scores.topk(width, dim=-1).indices
     selected = valid.expand_as(scores).gather(-1, indices)
     return torch.where(selected, indices.int() - start, -1)
 

@@ -87,6 +87,14 @@ performance:
   them in `do_not_specialize`: a plain int still compiles separate variants for `== 1` and for
   multiples of 16. In CuTeDSL keep them `cute.sym_int` in fake signatures and out of `jit_cache`
   arguments.
+- When reviewing Triton pointer arithmetic, group each strided operand's axes in a stride
+  tuple. Use `offset_strides` to select the width before multiplication and `ptr_offset`
+  for multidimensional addressing (both in `attn_gym/_backends/triton/utils.py`). Prefer a
+  tuple argument when its members can specialize. Triton 3.9 does not apply `do_not_specialize`
+  to tuple members: pass layout-dependent strides as separate runtime scalars at the launch
+  boundary when needed for compile reuse, then group them inside the kernel. A TMA descriptor
+  already carries its strides; a contiguous workspace allocated by the launcher needs no
+  caller-supplied strides.
 - Specialize what changes generated code and measurably pays: head/feature dims, tiles, dtypes,
   mode flags, int32 versus int64 offsets, and strides fixed by the model. Element-count bounds on
   vectorized masked loads may keep Triton's default divisibility hint (dropping it measured
