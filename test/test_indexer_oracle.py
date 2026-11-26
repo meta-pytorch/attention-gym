@@ -11,6 +11,23 @@ from attn_gym.sparse.indexer import lightning_indexer
 from attn_gym.testing import indexer
 
 
+def test_paged_oracle_requires_strict_winners_among_cutoff_ties():
+    args = indexer.make_paged_indexer_test_inputs(
+        (1,), (3,), heads=1, head_dim=1, page_size=3, compress_ratio=1, device="cpu"
+    )
+    q, k, w = args[:3]
+    q.fill_(1)
+    w.fill_(1)
+    k[:, :, 0] = k.new_tensor([10, 0, 0])
+    for tied_id in (1, 2):
+        ids = torch.tensor([[tied_id, 0]], dtype=torch.int32)
+        indexer.assert_paged_indexer_selection(args, ids, topk=2, ratio=1)
+    with pytest.raises(AssertionError, match="selection regret"):
+        indexer.assert_paged_indexer_selection(
+            args, torch.tensor([[1, 2]], dtype=torch.int32), topk=2, ratio=1
+        )
+
+
 def unchunked_errors(
     actual: torch.Tensor,
     q: torch.Tensor,

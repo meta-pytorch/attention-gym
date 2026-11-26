@@ -21,8 +21,9 @@ from attn_gym.warpdrive import (
     RoleConfig,
     SingleCta,
 )
-from attn_gym.warpdrive.cache import CacheInfo, CompileTarget, compile_many
+from attn_gym.warpdrive.cache import CacheInfo, CompileTarget, compile_many, get_compile_target
 from attn_gym.warpdrive.cache import _key as cute_key
+from attn_gym.warpdrive.cache.target import compile_target_scope
 from attn_gym.warpdrive.examples.gemm import Gemm, compile_gemm, gemm
 from attn_gym.warpdrive.examples.persistent_gemm import (
     PersistentGemm,
@@ -198,10 +199,9 @@ def test_cached_launch_of_a_fresh_kernel_restores_without_collecting(
 
 def test_reused_kernel_is_served_from_its_memo(requires_blackwell, monkeypatch):
     """The second call with one instance is a lookup on the instance, with no key built (the
-    kernel is immutable, so the memo stays valid); cache_clear() and a new compile target each
-    send the next call back through the full lookup."""
+    kernel is immutable, so the memo stays valid). Clearing the cache invalidates all memos;
+    switching targets invalidates only the instance making the call."""
     from attn_gym.warpdrive import WarpSpecialized
-    from attn_gym.warpdrive.cache import jit
 
     keys = []
     runtime_key = WarpSpecialized.__cute_runtime_key__
@@ -215,12 +215,16 @@ def test_reused_kernel_is_served_from_its_memo(requires_blackwell, monkeypatch):
     assert compile_gemm(op) is fn and len(keys) == 1
     assert compile_gemm.cache_info().hits == hits + 1  # counted like any other hit
     compile_gemm.cache_clear()
-    compile_gemm(op)
+    fn = compile_gemm(op)
     assert len(keys) == 2
-    target = dataclasses.replace(jit.get_compile_target())  # another target object
-    monkeypatch.setattr(jit, "get_compile_target", lambda: target)
-    compile_gemm(op)
-    assert len(keys) == 3
+    other = Gemm()
+    target = dataclasses.replace(get_compile_target(), sm_count=1)
+    with compile_target_scope(target):
+        other_fn = compile_gemm(other)
+    assert compile_gemm(op) is fn and len(keys) == 3  # the other call did not retire op's memo
+    with compile_target_scope(target):
+        assert compile_gemm(op) is other_fn
+    assert compile_gemm(op) is fn and len(keys) == 5
 
 
 def test_get_or_build_reuses_one_kernel_per_constructor_call():
@@ -416,7 +420,9 @@ def test_compile_many_builds_kernels_in_a_fresh_process(requires_blackwell, isol
     b = torch.randn(520, 136, device="cuda", dtype=torch.bfloat16)
     ops = [Gemm(ab_stages=2), Gemm(ab_stages=4)]
     compile_gemm.cache_clear()
-    fns = compile_many(compile_gemm, [(op,) for op in ops], workers=2)
+    target = get_compile_target()
+    with compile_target_scope(dataclasses.replace(target, sm_count=1)):
+        fns = compile_many(compile_gemm, [(op,) for op in ops], workers=2, target=target)
     assert compile_gemm.cache_info() == CacheInfo(hits=2, misses=0, currsize=2)
     assert len(list(isolated_cache.rglob("*.o"))) == 2
     ref = torch.nn.functional.linear(a.float(), b.float())

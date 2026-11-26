@@ -6,6 +6,7 @@ from collections.abc import Sequence
 import torch
 import triton
 import triton.language as tl
+from torch._subclasses.fake_tensor import is_fake
 from triton.language.extra import libdevice
 
 # Kernels fold natural-log inputs into the faster exp2 with ``exp(x) == exp2(x * LOG2_E)``.
@@ -167,29 +168,40 @@ def requires_int64_offsets(*tensors: torch.Tensor | None) -> bool:
     return False
 
 
-def can_use_tensor_descriptor(tensor: torch.Tensor) -> bool:
-    """Return whether a tensor satisfies Triton tensor-descriptor layout constraints."""
-    if not tensor.is_cuda:
+def can_use_tensor_descriptor(tensor: torch.Tensor, *, require_address: bool = False) -> bool:
+    """Check descriptor layout, optionally requiring a verifiably aligned runtime address."""
+    if not tensor.is_cuda or not 1 <= tensor.ndim <= 5:
         return False
 
     element_size = tensor.element_size()
-    storage_is_aligned = (
-        torch.compiler.is_compiling() or tensor.storage_offset() * element_size % 16 == 0
-    )
-    return (
-        tensor.shape[-1] <= 256
-        and tensor.stride(-1) == 1
-        and storage_is_aligned
-        and all(stride * element_size % 16 == 0 for stride in tensor.stride()[:-1])
-    )
+    if (
+        tensor.shape[-1] > 256
+        or tensor.stride(-1) != 1
+        or any(size == 0 for size in tensor.shape)
+        or any(stride * element_size % 16 for stride in tensor.stride()[:-1])
+    ):
+        return False
+
+    # Dynamo preflights descriptor metadata; the address is only known at launch.
+    if torch.compiler.is_compiling():
+        return not require_address
+    if is_fake(tensor):
+        return not require_address and tensor.storage_offset() * element_size % 16 == 0
+    # A DLPack import may start at a misaligned address even with zero storage_offset.
+    return tensor.data_ptr() % 16 == 0
 
 
 def can_use_tma(tensor: torch.Tensor) -> bool:
-    """Return whether a compatible descriptor can use hardware TMA."""
+    """Return whether a real tensor can be passed to Triton's hardware TMA path."""
+    if not can_use_tensor_descriptor(tensor, require_address=True):
+        return False
+    # Triton passes global extents to the kernel as signed i32. cuTensorMapEncodeTiled
+    # needs outer byte strides < 2**40, even for singletons. Zero broadcasts are legal.
+    element_size = tensor.element_size()
     return (
-        tensor.is_cuda
-        and torch.cuda.get_device_capability(tensor.device)[0] >= 9
-        and can_use_tensor_descriptor(tensor)
+        torch.cuda.get_device_capability(tensor.device)[0] >= 9
+        and all(size < 2**31 for size in tensor.shape)
+        and all(stride * element_size < 2**40 for stride in tensor.stride()[:-1])
     )
 
 

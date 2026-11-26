@@ -259,6 +259,7 @@ def test_fp32_window_training_matches_reference(head_dim):
         (256, 64, torch.bfloat16),
         (128, 64, torch.bfloat16),
         (256, 64, torch.float32),
+        (384, 64, torch.float32),
         (512, 64, torch.float32),
     ],
 )

@@ -90,7 +90,10 @@ def test_batch_steps_atomic_schedule(stream_inputs):
     the budget, only row pos changes, and the next step reads the reference's K/V rows. Streamed
     inputs: each launch's NORM and act flags must be its own."""
     require_sm100()
-    weights = random_weights(SMALL)
+    # A streamed projection spans two K partials; the resident case fits in one.
+    weights = random_weights(
+        dataclasses.replace(SMALL, hidden_size=2048) if stream_inputs else SMALL
+    )
     batch = 17
     states = [make_decode_state(weights, 125 + b % 3, MAX_LEN, seed=b) for b in range(batch)]
     ours_k = torch.stack([s[0][0] for s in states])
@@ -135,6 +138,9 @@ def test_batch_caches_past_2_to_the_31_elements():
     offset of the new K/V row overflows. The last sequence's logits and new rows must equal a
     batch-one run of it (same split count, so bit for bit)."""
     require_sm100()
+    # pytest releases the previous checkpoint's failure traceback only when this call begins.
+    gc.collect()
+    torch.cuda.empty_cache()
     weights = random_weights(SMALL)
     batch, max_len, pos = 64, 16448, 16400
     shape = (batch, SMALL.num_layers, SMALL.num_kv_heads, max_len, SMALL.head_dim)
@@ -348,12 +354,18 @@ def test_input_waits_count_reduce_rows():
     assert mk_trace.input_waits(events, table) == {"REDUCE": 0.06}
 
 
-def streamed_matches_batch_one(weights, batch):
+def streamed_matches_batch_one(weights, batch, *, checked=False):
     """Check that streamed logits and K/V cache prefixes are bit-identical to separate batch-one
     tcgen05 runs, using one KV split for both."""
     k, v, tokens, positions = batch_state(weights, batch)
     streamed = mk.QwenMegakernel(
-        weights, MAX_LEN, engine="tcgen05", batch=batch, splits=1, stream_inputs=True
+        weights,
+        MAX_LEN,
+        engine="tcgen05",
+        batch=batch,
+        splits=1,
+        stream_inputs=True,
+        checked=checked,
     )
     ours_k, ours_v = k.clone(), v.clone()
     if batch == 1:  # the single-sequence call
@@ -369,11 +381,13 @@ def streamed_matches_batch_one(weights, batch):
         assert torch.equal(ours_v[b][:, :, : pos + 1], theirs_v[:, :, : pos + 1])
 
 
-@pytest.mark.parametrize("batch", [1, 17])
-def test_streamed_inputs_match_batch_one(batch):
+@pytest.mark.parametrize(
+    ("batch", "checked"), [(1, False), (17, False), pytest.param(1, True, id="checked-final-norm")]
+)
+def test_streamed_inputs_match_batch_one(batch, checked):
     """Streamed dense decoding matches batch-one tcgen05 logits and K/V cache prefixes bitwise."""
     require_sm100()
-    streamed_matches_batch_one(random_weights(SMALL), batch)
+    streamed_matches_batch_one(random_weights(SMALL), batch, checked=checked)
 
 
 def test_streamed_inputs_moe():

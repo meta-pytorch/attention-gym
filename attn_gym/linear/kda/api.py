@@ -122,7 +122,8 @@ def chunk_kda(
             callers must sanitize outputs with ``mask_inactive_tokens`` and protect
             parameterized input producers with ``mask_inactive_token_gradients``.
         scale: Query scale, applied inside the kernels in FP32. Defaults to
-            ``1 / sqrt(K)``.
+            ``1 / sqrt(K)``. With FP16 and ``scale > 1``, warpdrive backward casts
+            ``scale * dO`` to FP16, so its elements must stay within 65504.
         output_final_state: Return the final recurrent state with the output.
         fastmath: ``True`` is the default because it’s faster, and turning it off usually
             didn’t improve accuracy in our tests. If you’re seeing unexpected outputs or
@@ -292,8 +293,7 @@ def paged_chunk_kda(
 
         state_checkpoints: Optional per-sequence checkpoints written into caller-chosen slots of a
             state pool. See :class:`attn_gym.linear.StateCheckpoints` for layout and boundary
-            semantics. Runs on the fused backend: ``"auto"`` selects it, and ``"warpdrive"``
-            raises. With replay, only the completed boundary state is saved. The caller must
+            semantics. With replay, only the completed boundary state is saved. The caller must
             separately preserve any replay tail needed to resume.
 
     Returns:
@@ -327,9 +327,7 @@ def paged_chunk_kda(
     if options.split_backward or options.split_forward:
         raise ValueError("split schedules are not supported by paged_chunk_kda")
     validate_state_checkpoints(state_checkpoints, q, v, cu_seqlens)
-    backend = resolve_chunk_backend(options.backend, q, fused_only=state_checkpoints is not None)
-    if state_checkpoints is not None and backend != "fused":
-        raise ValueError("state_checkpoints requires the fused backend")
+    backend = resolve_chunk_backend(options.backend, q)
     if replay_state is not None:
         replay_state = ReplayState(*replay_state)
         validate_replay_state(replay_state, q, v, state_cache.shape[0])
@@ -346,6 +344,7 @@ def paged_chunk_kda(
             has_initial_state=has_initial_state,
             scale=resolve_scale(None, q.shape[-1]),
             replay_state=replay_state,
+            state_checkpoints=state_checkpoints,
             intra_chunk_dtypes=intra_chunk_dtypes,
             batch_invariant=options.batch_invariant,
         )

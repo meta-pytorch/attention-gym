@@ -17,7 +17,12 @@ import pytest
 
 from attn_gym.warpdrive.cache import _key as cute_key
 from attn_gym.warpdrive.cache import compile as cute_compile
-from attn_gym.warpdrive.cache import compile_many, compile_tvm_ffi, precompile_calls
+from attn_gym.warpdrive.cache import (
+    compile_many,
+    compile_tvm_ffi,
+    precompile_calls,
+    precompile_many,
+)
 from attn_gym.warpdrive.cache import jit as cute_cache
 from attn_gym.warpdrive.cache import target as cute_target
 
@@ -381,7 +386,7 @@ def test_retired_builds_leave_the_memos_of_live_arguments(isolated_cache, monkey
     def compile_other(owner: MemoOwner) -> FakeCompiled:
         return FakeCompiled("other")
 
-    target = cute_target.CompileTarget("first")
+    first_target = target = cute_target.CompileTarget("first")
     monkeypatch.setattr(cute_cache, "get_compile_target", lambda: target)
     owner = MemoOwner()
     other = compile_other(owner)
@@ -397,7 +402,9 @@ def test_retired_builds_leave_the_memos_of_live_arguments(isolated_cache, monkey
     compile_kernel.cache_clear()
     gc.collect()
     assert current() is None
-    assert list(owner.__cute_memo__.values()) == [other]
+    assert len(owner.__cute_memo__) == 1
+    target = first_target
+    assert compile_other(owner) is other
 
 
 def test_runtime_cache_includes_compile_target(isolated_cache, monkeypatch):
@@ -633,6 +640,45 @@ def test_compile_target_effective_capability(configured_arch, physical, expected
         assert target.effective_capability == expected
 
 
+def test_concurrent_compile_scopes_isolate_cache_keys_and_restore_target():
+    default, first, second = map(cute_target.CompileTarget, ("default", "first", "second"))
+    cute_target.set_compile_target(default)
+    barrier = threading.Barrier(2, timeout=10)
+
+    config = TracedConfig("shared")
+    config.__cute_memo__ = {}
+
+    @cute_cache.jit_cache(persistent=False)
+    def compile_kernel(op: TracedConfig) -> str:
+        op.found = cute_target.get_compile_target().device_type
+        return op.found
+
+    # Warm both builds on separate instances; only their lookups share mutable trace state.
+    for target in (first, second):
+        with cute_target.compile_target_scope(target):
+            assert compile_kernel(TracedConfig("shared")) == target.device_type
+
+    def scoped_compile(target: cute_target.CompileTarget) -> str:
+        with cute_target.compile_target_scope(target):
+            barrier.wait()
+            result = compile_kernel(config)
+            barrier.wait()
+            return result
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        assert list(pool.map(scoped_compile, (first, second))) == ["first", "second"]
+    assert cute_target.get_compile_target() == default
+    with cute_target.compile_target_scope(first):
+        with (
+            pytest.raises(RuntimeError, match="compile failed"),
+            cute_target.compile_target_scope(second),
+        ):
+            assert compile_kernel(config) == "second"
+            raise RuntimeError("compile failed")
+        assert compile_kernel(config) == config.found == "first"
+    assert compile_kernel(config) == config.found == "default"
+
+
 def test_explicit_target_avoids_device_discovery(monkeypatch):
     target = cute_target.CompileTarget(
         device_type="cuda",
@@ -678,6 +724,7 @@ def test_compile_many_forks_parallel_workers_once_per_cold_variant(tmp_path, mon
     compiled = compile_many(compile_test_variant, calls, workers=len(configs), target=target)
 
     assert [fn() for fn in compiled] == [config.variant for config in configs]
+    assert cute_target.get_compile_target() == target  # unscoped explicit target is the default
     records = [line.split(",") for line in log_path.read_text().splitlines()]
     assert sorted(record[2] for record in records) == sorted(c.variant for c in configs)
     assert len({record[0] for record in records}) == len(configs)
@@ -691,8 +738,31 @@ def test_compile_many_forks_parallel_workers_once_per_cold_variant(tmp_path, mon
 
     compile_test_variant.cache_clear()
     monkeypatch.setattr(cute_compile.subprocess, "Popen", unexpected_driver)
-    compiled = compile_many(compile_test_variant, calls, workers=len(configs), target=target)
+    default, other = map(cute_target.CompileTarget, ("default", "other"))
+    cute_target.set_compile_target(default)
+    with cute_target.compile_target_scope(target):
+        precompile_many(compile_test_variant, calls)
+    assert cute_target.get_compile_target() == default
+    with cute_target.compile_target_scope(other):
+        compiled = compile_many(compile_test_variant, calls, workers=len(configs), target=target)
+        assert cute_target.get_compile_target() == other
+    assert cute_target.get_compile_target() == default
     assert [fn() for fn in compiled] == [config.variant for config in configs]
+    assert compile_test_variant.cache_info() == cute_cache.CacheInfo(hits=2, misses=0, currsize=2)
+
+
+@pytest.mark.parametrize("bulk", [compile_many, precompile_many])
+def test_rejected_bulk_compile_keeps_default_target(monkeypatch, bulk):
+    default = cute_target.CompileTarget("default")
+    cute_target.set_compile_target(default)
+    monkeypatch.setenv("CUTE_DSL_NO_CACHE", "1")
+    with pytest.raises(RuntimeError, match="requires the disk cache"):
+        bulk(
+            compile_test_variant,
+            [(CompileConfig("one", 0.0),)],
+            target=cute_target.CompileTarget("B"),
+        )
+    assert cute_target.get_compile_target() is default
 
 
 @pytest.fixture

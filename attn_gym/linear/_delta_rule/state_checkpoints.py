@@ -1,7 +1,6 @@
 """Host side of :class:`~attn_gym.linear.StateCheckpoints`: validation, op arguments, kernel view.
 
-Kept free of Triton so public APIs validate checkpoints without it; the kernels' store lives in
-``_delta_rule/triton/state_checkpoints.py``.
+Kept free of Triton and CuTeDSL so public APIs can validate checkpoint metadata without them.
 """
 
 from __future__ import annotations

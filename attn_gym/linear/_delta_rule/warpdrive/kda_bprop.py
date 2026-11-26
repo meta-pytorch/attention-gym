@@ -24,8 +24,9 @@ and ``io`` the Q/K/V dtype, the state and solve products are::
     dY       = T^T @ solve_dtype(dU)
     dS_entry = 2^g_last dS + Q_decay^T @ io(scale dO) + K_decay^T @ io(-beta dY)
 
-FP16 stages the Q state term as ``(2^p Q_decay)^T @ io(2^-p scale dO)``, with the smallest
-``p >= 0`` that keeps the dO operand finite (``q_state_scales``); both factors are exact.
+FP16 stages the same operands, so with ``scale > 1`` the dO operand ``io(scale dO)`` overflows
+once ``|scale dO|`` exceeds 65504, a documented FP16 range limit that is not checked; with
+``scale <= 1`` (the default ``1 / sqrt(K)``) it cannot exceed ``|dO|``.
 
 Using K_restore avoids shrinking dS before a large inverse decay cancels the shrinkage. Its
 key-gradient contribution uses the same ``2^(g_last - g)`` factor. With ``"bf16"`` or native
@@ -430,8 +431,6 @@ class KdaBprop(WarpSpecialized):
         # TF32 keeps FP16's ten fraction bits, so only a BF16 solve needs beta dM rounded to the
         # io dtype before the TF32 multiply; an FP16 cast would only lose range.
         self.round_dm = self.tf32_decay and not self.tf32_solve and io == "bf16"
-        # FP16 moves the scale's power of two from dO to Q_decay in the Q state term.
-        self.split_scale = io == "fp16"
         self.decay_t = Float32 if self.tf32_decay else io_t
         self.inter_tiles = TF32_INTER_TILES if self.tf32_decay else INTER_TILES
         self.inter32_rows_bytes = TF32_TILE if self.tf32_solve else TF32_ROWS_TILE
@@ -1088,14 +1087,13 @@ class KdaBprop(WarpSpecialized):
         arrive(tsig + KDI + stage)
 
         # Keep the same unscaled Q operand used in forward.
-        q_factor, _ = q_state_scales(params.scale, self.split_scale)
         for half in cutlass.range_constexpr(dk_halves):
             qd = []
             qd32 = []
             for p in cutlass.range_constexpr(4):
                 r0 = half * 8 + 2 * p
                 qd0, qd1 = fmul2(raw_q[r0], raw_q[r0 + 1], exp_g[r0], exp_g[r0 + 1])
-                qd.append(scale_packed(fp32_to_fp16(qd0, qd1, dtype=io), q_factor))
+                qd.append(fp32_to_fp16(qd0, qd1, dtype=io))
                 qd32 += [qd0, qd1]
             off = op_stage + 2 * (
                 half * (B_T * 64) + decay_row * 64 + swz128(decay_row, lane_in_row * 8)
@@ -1395,10 +1393,9 @@ class KdaBprop(WarpSpecialized):
             du_hi = scale_du(du_hi, params.scale, hi_lanes + tmem.cols("dki"), has_dstate)
         # The Q state term reads scaled dO before DY_ACC lets us reuse this tile for dY.
         s_do = params.s_do + (n & 1) * (self.d_v * B_T * 2)
-        _, do_scale = q_state_scales(params.scale, self.split_scale)
-        stage_scaled_do(s_do, params.s_dy, ov_lo, do_scale, io)
+        stage_scaled_do(s_do, params.s_dy, ov_lo, params.scale, io)
         if cutlass.const_expr(wide):
-            stage_scaled_do(s_do, params.s_dy, ov_hi, do_scale, io)
+            stage_scaled_do(s_do, params.s_dy, ov_hi, params.scale, io)
         cute.arch.fence_view_async_shared()
         solve_t = Float32 if cutlass.const_expr(self.tf32_solve) else io
         store_solve_operand(((lane_base + tmem.cols("duin"), du_lo),), solve_t)
@@ -3285,36 +3282,6 @@ def scale_du(out_frag, scale, state_col, have_state):
         for i in cutlass.range_constexpr(8):
             result[i] = _mul_rn(out_frag[i], scale)
     return [result[i] for i in range(8)]
-
-
-def q_state_scales(scale, split: bool):
-    """Factors ``(f, s)`` of the Q state term ``(f Q_decay)^T @ io(s dO)``, with ``f s = scale``.
-
-    Without ``split``, ``(None, scale)``. With it (FP16), ``f = 2^p`` for the smallest
-    ``p >= 0`` that leaves ``s = 2^-p scale <= 1`` (``p <= 15``, so ``f`` stays an FP16
-    value), so ``io(s dO)`` cannot overflow; ``f`` comes as a packed FP16 pair for
-    ``scale_packed``. Both factors are exact powers of two, so the product equals
-    ``io(Q_decay)^T @ io(scale dO)`` wherever that dO operand is finite and normal."""
-    if not split:
-        return None, scale
-    return inline_ptx(
-        "{ .reg .b32 p, i; .reg .f32 s, f, g; mov.b32 s, $2; mov.b32 p, $2;"
-        " add.s32 p, p, 8388607; and.b32 p, p, 2139095040; max.s32 p, p, 1065353216;"
-        " min.s32 p, p, 1191182336; sub.s32 i, 2130706432, p; mov.b32 f, i;"
-        " mul.rn.f32 f, s, f; mov.b32 g, p; cvt.rn.f16x2.f32 $0, g, g; mov.b32 $1, f; }",
-        write_only_types=[Int32, Float32],
-        read_only_args=[scale],
-    )
-
-
-def scale_packed(word, factor):
-    """A packed FP16 pair times the packed power of two ``factor`` (unchanged for ``None``);
-    exact, subnormals included, unless it overflows."""
-    if factor is None:
-        return word
-    return inline_ptx(
-        "mul.rn.f16x2 $0, $1, $2;", write_only_types=[Int32], read_only_args=[word, factor]
-    )
 
 
 @cute.jit

@@ -18,12 +18,11 @@ from attn_gym._backends.cute.utils import initialized_cuda_device, requires_int6
 from attn_gym.utils import cdiv
 from attn_gym.warpdrive.cache import (
     compile_tvm_ffi,
-    detect_compile_target,
     get_compile_target,
     jit_cache,
     make_fake_strided_tensor,
-    set_compile_target,
 )
+from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
 
 _HEAD_DIM_GRANULARITY = 16
 _MAX_SEQUENCE = 1 << 20
@@ -110,6 +109,7 @@ def _compile_scores(
         integer(0),
         cutlass.Float32(1.0),
         _fake_candidate_bounds(has_candidate_bounds, tokens, use_int64_offsets),
+        gpu_arch=get_compile_target().gpu_arch,
         name=operation.get_name() + ("_packed" if has_candidate_bounds else ""),
     )
 
@@ -130,7 +130,6 @@ def _fake_candidate_bounds(enabled: bool, tokens, use_int64_offsets: bool):
     )
 
 
-@jit_cache
 def _compile_topk(
     topk: int,
     causal: bool,
@@ -138,13 +137,28 @@ def _compile_topk(
     use_int64_offsets: bool,
     deterministic: bool,
     has_candidate_bounds: bool,
+    paged: bool = False,
 ) -> Callable[..., None]:
-    """Compile indices-only radix selection with symbolic B, T, S and slab capacity."""
+    from .cute_topk import IndexerTopKKernel
+
+    operation = IndexerTopKKernel.get_or_build(
+        topk,
+        causal,
+        use_int64_offsets,
+        compress_ratio=compress_ratio,
+        deterministic=deterministic,
+        paged=paged,
+    )
+    return _compile_topk_kernel(operation, has_candidate_bounds)
+
+
+@jit_cache
+def _compile_topk_kernel(operation, has_candidate_bounds: bool) -> Callable[..., None]:
+    """Compile the constructor-keyed selector with symbolic B, T, S and slab capacity."""
     import cutlass
     from cutlass import cute
 
-    from .cute_topk import IndexerTopKKernel
-
+    use_int64_offsets = operation.use_int64_offsets
     sym = cute.sym_int64 if use_int64_offsets else cute.sym_int
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     batch, tokens, candidates, pairs = sym(), sym(), sym(), sym()
@@ -157,17 +171,10 @@ def _compile_topk(
     )
     output = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (batch, tokens, topk),
+        (batch, tokens, operation.topk),
         stride_order=(2, 1, 0),
         assumed_align=TMA_ALIGNMENT_BYTES,
         use_32bit_stride=not use_int64_offsets,
-    )
-    operation = IndexerTopKKernel(
-        topk,
-        causal,
-        use_int64_offsets,
-        compress_ratio=compress_ratio,
-        deterministic=deterministic,
     )
     return compile_tvm_ffi(
         operation,
@@ -175,6 +182,7 @@ def _compile_topk(
         output,
         integer(0),
         _fake_candidate_bounds(has_candidate_bounds, tokens, use_int64_offsets),
+        gpu_arch=get_compile_target().gpu_arch,
         name=operation.get_name() + ("_packed" if has_candidate_bounds else ""),
     )
 
@@ -244,9 +252,7 @@ def launch(
     scores = torch.empty((pairs, 2, candidates), dtype=torch.float32, device=q.device)
     use_int64_offsets = requires_int64_abi(q, k, weights, scores, output, candidate_bounds)
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
-    previous = get_compile_target()
-    try:
-        set_compile_target(detect_compile_target(q.device.index))
+    with compile_target_scope(detect_compile_target(q.device.index)):
         packed = candidate_bounds is not None
         # Packed bounds already contain both mask decisions; neither kernel reads these flags.
         if packed:
@@ -265,8 +271,6 @@ def launch(
         topk_kernel = _compile_topk(
             topk, causal, compress_ratio, use_int64_offsets, deterministic, packed
         )
-    finally:
-        set_compile_target(previous)
 
     q, k, weights = q.detach(), k.detach(), weights.detach()
     scale = cutlass.Float32(1.0 / math.sqrt(heads * head_dim))
