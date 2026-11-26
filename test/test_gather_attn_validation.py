@@ -177,7 +177,7 @@ def test_non_tensor_values(inputs, name):
 @pytest.mark.parametrize(
     "corrupt,match",
     [
-        (lambda values: values[..., :-1], "must have the same shape as"),
+        (lambda values: values[:, :, :-1], "must match the batch, heads, and token dimensions"),
         (lambda values: values.double(), "must have the same dtype as query"),
     ],
 )
@@ -210,7 +210,8 @@ def test_cute_rejects_separate_values_and_grouped_heads(inputs, case):
 
 
 @pytest.mark.usefixtures("fresh_compile_cache")
-def test_public_reference_fullgraph_grouped_separate_values(inputs):
+@pytest.mark.parametrize("paired", [False, True])
+def test_public_reference_fullgraph_grouped_separate_values(inputs, paired):
     """Validation of separate values and grouped KV heads traces under fullgraph compile."""
     call = {
         **_grouped(inputs),
@@ -220,6 +221,10 @@ def test_public_reference_fullgraph_grouped_separate_values(inputs):
     differentiable = tuple(tensor for tensor in call.values() if tensor.is_floating_point())
     for tensor in differentiable:
         tensor.requires_grad_()
+    if paired:
+        for name in ("query", "local_kv", "sparse_kv"):
+            call[name] = call[name].split((2, 1), dim=-1)
+        call["scale"] = 3**-0.5
     compiled = torch.compile(gather_attn, backend="eager", fullgraph=True)
     expected, expected_aux = gather_attn(
         **call, impl=Impl.REFERENCE, return_aux=AuxRequest(lse=True)

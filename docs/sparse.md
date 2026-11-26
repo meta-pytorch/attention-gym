@@ -177,7 +177,7 @@ per sequence is limited to `2**22`.
 ## Gather attention and sparse MLA
 
 `gather_attn` takes a query, a local KV pool, a sparse KV pool, and selected sparse indices.
-Each KV tensor serves as both key and value. The local window and sparse selections share one
+Each key pool supplies its own values by default. The local window and sparse selections share one
 softmax. Packed selections are document-local; invalid indices are ignored and duplicates retain
 their multiplicity. The caller is responsible for sparse causality.
 
@@ -195,27 +195,32 @@ For query position `t`, let `M_t` be the **multiset union** of:
   the current position; and
 - valid sparse selections from every slot of `kv_indices[..., t, :]`.
 
-Each occurrence `i` supplies a key and latent value from its own pool. Duplicate sparse slots,
+Each occurrence `i` supplies a key and a value `v_i` from its own pool. Duplicate sparse slots,
 and local/sparse occurrences referring to the same tensor row, contribute separately:
 
 ```text
 z_i    = scale * (query.latent · kv_i.latent + query.rope · kv_i.rope)
 Z      = sum_{i in M_t} exp(z_i) + exp(s_h)
-output = sum_{i in M_t} exp(z_i) * kv_i.latent / Z
+output = sum_{i in M_t} exp(z_i) * v_i / Z
 LSE    = log(Z)
 ```
 
-Bare tensors omit the rotary dot product and use the whole KV tensor as both key and value.
+Bare tensors omit the rotary dot product. Without separate values, `v_i` is the key tensor
+or the latent component of a paired key.
 The optional per-head sink `s_h = attention_sink[h]` is **unscaled**: it adds only to the
 softmax denominator and LSE, never to the value numerator. Without a sink, `s_h = -inf`.
 A row with no real keys returns zero output and its sink logit as LSE, or `-inf` without a
 sink. In particular, when `Z = 0`, output is defined as zero rather than dividing by zero;
 that row's output-loss gradient contributions to all inputs are zero.
 
-The same query pair attends to both pools; each pool provides its own rotary keys. The latent
-KV gradient includes both its key and value contributions. The rotary components have separate
+The same query pair attends to both pools; each pool provides its own rotary keys. A shared latent KV tensor's
+gradient includes both its key and value contributions. The rotary components have separate
 gradients. Tuple construction stores references only; it does not concatenate or copy tensors.
-The output width is the latent width—there is no `value_dim` argument.
+With `impl="reference"`, pass `local_v` and `sparse_v` to use independent values for bare or
+split Q/K inputs. Values share each key pool's batch, KV heads and token count. The two value
+pools share a feature width, which sets the output width. For example, QSA can score a
+192-wide base plus a 64-wide rotary component and return 256-wide values. Fused backends
+require bare Q/K and equal key/value widths for the separate-value path.
 
 ### DeepSeek-V4: bare tensors
 

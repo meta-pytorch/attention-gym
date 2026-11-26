@@ -178,11 +178,16 @@ def _validate_inputs(
         ("local_v", local_v, local_kv, "local_kv"),
         ("sparse_v", sparse_v, sparse_kv, "sparse_kv"),
     ):
-        if values is not None and values.shape != keys.shape:
+        if values is not None and (values.ndim != 4 or values.shape[:-1] != keys.shape[:-1]):
             raise ValueError(
-                f"{name} must have the same shape as {keys_name}, "
+                f"{name} must match the batch, heads, and token dimensions of {keys_name}, "
                 f"got {list(values.shape)} and {list(keys.shape)}."
             )
+
+    if sparse_v is not None and sparse_v.shape[-1] == 0:
+        raise ValueError("sparse_v must have a positive value width.")
+    if local_v is not None and local_v.shape[-1] != sparse_v.shape[-1]:
+        raise ValueError("local_v and sparse_v must have the same value width.")
 
     if (
         kv_indices.ndim != 3
@@ -312,7 +317,7 @@ def gather_attn(
 
     Bare tensors omit the RoPE dot product and use the whole KV tensor as both key
     and value (v_i = kv_i) unless local_v/sparse_v supply separate values. Paired
-    inputs use only the latent component as value; the caller has already rotated
+    inputs default to the latent component as value; the caller has already rotated
     the RoPE components. Query head h reads KV head h // (num_heads // kv_heads), so
     kv_heads = 1 is MQA, kv_heads = num_heads is MHA, and other divisors are GQA. The
     optional sink logit s_h = attention_sink[h] is unscaled and contributes only to the
@@ -409,14 +414,15 @@ def gather_attn(
             the latent width, not the model's attention scale. Sink logits are not
             scaled.
 
-        local_v: Values for the local window, shaped like local_kv, or None to reuse
-            local_kv as the values (shared K = V, as in DeepSeek's MLA latent).
-            Requires bare tensor inputs; supply it exactly when sparse_v is given
-            and local_kv is not None.
+        local_v: Values for the local window, matching the batch, heads and tokens of local_kv
+            and the width of sparse_v. Supply it when both sparse_v and local_kv are given.
 
-        sparse_v: Values for the indexing branch, shaped like sparse_kv, or None to
-            reuse sparse_kv as the values. Separate values and 1 < kv_heads < num_heads
-            run on Impl.REFERENCE, or on the Triton backend with an SM100-family GPU,
+        sparse_v: Values for the indexing branch, matching the batch, heads and tokens of sparse_kv.
+            Omit both values to reuse the keys (latent components for paired inputs).
+            Impl.REFERENCE accepts separate values of any positive width, including with
+            paired inputs. The fused separate-value path requires bare inputs and equal key
+            and value widths. Separate values and 1 < kv_heads < num_heads also run on
+            the Triton backend with an SM100-family GPU,
             bfloat16 inputs, head_dim <= 256 and divisible by 16, unit inner strides,
             and sliding_window_size <= 2048; other inputs raise. The CuTe backend
             requires shared values and one KV head. Passing the key tensor objects
@@ -435,8 +441,8 @@ def gather_attn(
 
     Returns:
         If return_aux is None: output tensor with shape
-        (batch_size, num_heads, sequence_length, latent_dim), in query's dtype and
-        on query.device. In paired form the output contains only latent values.
+        (batch_size, num_heads, sequence_length, value_dim), in query's dtype and
+        on query.device. value_dim is the latent width when values are omitted.
         If return_aux is an AuxRequest: (output, GatherAttnAux), where aux.lse has
         shape (batch_size, num_heads, sequence_length) when requested, otherwise
         None. LSE includes the unscaled sink; fused backends return nondifferentiable
@@ -462,8 +468,6 @@ def gather_attn(
     sparse_latent, sparse_rope = _split_input(sparse_kv, "sparse_kv")
     if (sparse_rope is not None) != paired:
         raise ValueError("sparse_kv must use the same bare/paired form as query.")
-    if paired and sparse_v is not None:
-        raise ValueError("local_v and sparse_v require bare tensor inputs.")
     _validate_inputs(
         query_latent,
         local_latent,
@@ -494,7 +498,7 @@ def gather_attn(
                 raise ValueError(f"{name} rope must match query dtype and device.")
         if scale is None:
             raise ValueError("Paired attention inputs require an explicit model scale.")
-    if sparse_v is sparse_kv and local_v is local_kv:
+    if sparse_v is sparse_latent and local_v is local_latent:
         # Values that are the keys themselves keep the shared-value kernels.
         local_v = sparse_v = None
     if scale is not None and not scale > 0:
@@ -529,6 +533,11 @@ def gather_attn(
             sparse_v=sparse_v,
         )
     else:
+        if sparse_v is not None and (paired or sparse_v.shape[-1] != query_latent.shape[-1]):
+            raise ValueError(
+                "Fused gather_attn requires bare inputs and equal key/value widths for separate "
+                "values; use impl='reference'."
+            )
         if query_latent.device.type != "cuda":
             raise ValueError("fused gather_attn requires CUDA tensors; use impl='reference'")
         if paired and query_rope.shape[-1] > 0 and not share_kv:
