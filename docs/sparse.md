@@ -28,27 +28,30 @@ whose tokens all lie at positions `<= t` (candidates `0..t` with the default rat
 rows with fewer than `topk` candidates contain `-1` padding. `compress_ratio != 1` requires
 `causal=True`. Mask padding before gathering: a raw PyTorch index of `-1` selects the last
 position rather than an invalid position. `topk=0` returns an empty last dimension.
-Output order and tie-breaking are unspecified, including between repeated calls.
+Output order and tie-breaking are unspecified, including between repeated calls, unless
+`torch.use_deterministic_algorithms(True)` is enabled: fused backends are repeatable, and
+CuTe returns ascending indices with equal ordered-FP32 scores resolved toward lower indices.
 
 ### Implementations and device dispatch
 
 - `impl="reference"` evaluates PyTorch scoring and Top-K on CPU or CUDA. FP16/BF16/FP32
-  inputs accumulate in FP32; FP64 inputs retain FP64. It materializes the score intermediates
+  inputs accumulate in FP32; FP64 inputs retain FP64. It chunks queries to bound per-head scoring intermediates
   and is intended for correctness checks and small inputs.
 - `impl="fused"` (the default) selects **CuTe on SM100-family GPUs**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
   keep their selection state on chip. CuTe generates scores with
-  [warpdrive](warpdrive/index.md) TMA/MMA/epilogue kernels, separately from radix Top-K, and
+  [warpdrive](warpdrive/index.md) TMA/MMA/epilogue kernels, separately from Top-K selection, and
   reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
   batch size. Large inputs are processed in slabs rather than an unbounded quadratic score
-  allocation. This scratch is additional to the returned indices; Triton needs no global
-  score scratch.
+  allocation. This scratch is additional to the returned indices. Triton's default
+  FP16/BF16 route needs no global score scratch; its GVR2 route uses a separate
+  scorer and the same 32 MiB / 1024-row bound.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
   Omit options for automatic selection. `impl="reference"` validates options and ignores them.
   Unsupported shapes, missing dependencies, and launch errors propagate;
   there is no retry with another backend.
 
-| Restriction | CuTe | Triton |
+| FP16/BF16 restriction | CuTe | Triton (streaming selector) |
 |---|---|---|
 | GPU | SM100, SM103, or SM107 | SM90 or newer |
 | Input dtype | FP16 or BF16, shared by all inputs | FP16 or BF16, shared by all inputs |
@@ -63,10 +66,63 @@ pair's FP32 scores fit its 32 MiB workspace. This includes inactive packed capac
 
 CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
 materializing contiguous copies. Weights need only element alignment, not TMA alignment.
+Triton's GVR2 route uses a separate scorer that accepts arbitrary nonnegative Q/K/weight
+strides and byte-aligned bases; the table's alignment restrictions apply only to the
+streaming FP16/BF16 path.
 
 CuTe additionally requires the optional `linear` dependencies. It supports the SM100 family
 (SM100, SM103 including GB300, and Rubin SM107 with CuTeDSL 4.8+), not every Blackwell variant;
 other supported devices use Triton by default.
+
+### Selector: GVR2 and `auto`
+
+`kernel_options["selector"]` chooses the exact Top-K algorithm. When omitted (or `"auto"`),
+CuTe uses GVR2 for `topk < 2048` and radix otherwise, and Triton uses its streaming selector.
+`"default"` forces the backend-native selector (CuTe radix, Triton streaming); `"gvr2"` forces
+GVR2 on either backend. CuTe auto stays on radix for deterministic or packed calls and on
+SM107; explicit CuTe GVR2 requires SM100/SM103 and nondeterministic mode. Neither GVR2
+backend supports packed offsets. GVR2 guesses a
+cutoff from a row sample, verifies it over the full row, and refines exactly with radix passes
+when the guess misses, so the result is the exact Top-K of the scorer's finite FP32 values.
+
+```python
+indices = lightning_indexer(
+    q,
+    k,
+    weights,
+    topk=512,
+    causal=True,
+    compress_ratio=4,
+    kernel_options={"backend": "cute", "selector": "gvr2"},
+)
+```
+
+The `auto` boundary comes from the
+[`auto` threshold sweep](indexer_performance.md#auto-threshold-sweep). On Triton, `"gvr2"`
+also switches to a separate tiled scorer, so scores may round differently from the streaming
+path.
+
+Both CuTe selectors run one [warpdrive role](warpdrive/writing-kernels.md#kernels-without-warp-specialization)
+across the CTA: one work item is one physical query row, and CTA barriers separate the
+histogram and refinement passes. To inspect the declaration without launching a kernel:
+
+
+```python
+from attn_gym.sparse.indexer.impl.cute_topk_gvr2 import IndexerGVR2TopKKernel
+
+selector = IndexerGVR2TopKKernel.get_or_build(512, causal=True, compress_ratio=4)
+print(selector.describe())
+```
+
+The benchmark CLI accepts both backend and selector lists. For example:
+
+```bash
+uv run benchmarks/sparse/indexer_benchmark.py --batch 1 --heads 64 --head-dim 128 --sequence-length 65536 --compress-ratio 4 --topk 512 --dtype bfloat16 --backend cute triton --selector default gvr2 --warmup 5 --rep 30
+```
+
+Timing includes scoring and selection, but excludes caller compilation, allocations, and
+graph capture. Force `"selector": "default"` or `"gvr2"` to compare both exact paths against
+the `auto` choice on your own shapes.
 
 ### Compilation and training scope
 
