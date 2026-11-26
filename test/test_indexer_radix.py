@@ -1,4 +1,4 @@
-"""Reference and slab-boundary checks for the bounded-workspace CuTe indexer."""
+"""Exact radix selection and bounded-workspace indexer checks."""
 
 import os
 from unittest.mock import Mock
@@ -17,6 +17,7 @@ from attn_gym.testing.indexer import (
 )
 
 CUTE_SUPPORTED = cuda_runs_sm100_kernels()
+CUDA = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
 
 
 @pytest.mark.parametrize("batch", [1, 3, 64])
@@ -210,76 +211,142 @@ def test_radix_rejects_non_tma_layout(radix_impl, operand, layout):
         lightning_indexer(*inputs, 16, kernel_options={"backend": "cute"})
 
 
-def _lowest_index_topk(rows: torch.Tensor, topk: int) -> torch.Tensor:
-    """Exact CuTe selection contract: highest ordered FP32 keys, lowest index on ties."""
-    bits = rows.view(torch.int32).long()
-    # Same monotonic key as the kernel, so -0.0 ranks below +0.0.
-    keys = torch.where(bits < 0, ~bits & 0xFFFFFFFF, bits + 2**31)
-    ranked = keys.sort(dim=-1, descending=True, stable=True).indices
+def _lowest_index_topk(rows: torch.Tensor, topk: int, *, signed_zero_order=True) -> torch.Tensor:
+    """Stable value sorting, with the document selector's +0-before--0 order if requested."""
+    if signed_zero_order:
+        positive_first = torch.signbit(rows).int().argsort(dim=-1, stable=True)
+        ranked = rows.gather(-1, positive_first).argsort(dim=-1, descending=True, stable=True)
+        ranked = positive_first.gather(-1, ranked)
+    else:
+        ranked = rows.argsort(dim=-1, descending=True, stable=True)
     return ranked[:, :topk].sort(-1).values
 
 
 @pytest.mark.parametrize(
-    "distribution", ["random", "ties", "few_values", "clustered", "signed_zero"]
+    "selector,deterministic",
+    [
+        ("document", False),
+        ("document", True),
+        ("paged_cute", False),
+        ("paged_cute", True),
+        ("paged_triton", True),
+    ],
 )
 @pytest.mark.parametrize("topk", [1, 37, 512, 1024, 4096])
 @pytest.mark.parametrize("tokens", [4097, 65536 + 97])
-@pytest.mark.parametrize("deterministic", [False, True])
-def test_radix_threshold_and_overflow(radix_impl, distribution, topk, tokens, deterministic):
-    """Selection is exact across ties and shrink overflow; deterministic mode is repeatable.
-
-    The deterministic kernel must return the ascending lowest-index selection on every
-    call; the fast kernel must return some valid Top-K set. ``few_values`` leaves
-    ambiguous ties inside the shrink buffer; ``ties`` and ``clustered`` overflow it.
-    Rows above 65536 candidates take the multi-window sort.
-    """
-    import cutlass
-
-    from attn_gym.warpdrive.cache import (
-        detect_compile_target,
-        get_compile_target,
-        set_compile_target,
-    )
-
+@pytest.mark.skipif(not CUDA, reason="SM80+ required")
+def test_radix_threshold_and_overflow(selector, topk, tokens, deterministic):
+    """Batch exact-score regressions across document and paged selector configurations."""
     generator = torch.Generator(device="cuda").manual_seed(32)
-    scores = torch.randn(2, 2, tokens, device="cuda", generator=generator)
-    match distribution:
-        case "ties":
-            scores.fill_(-1)
-        case "few_values":
-            scores = torch.randint(0, 16, scores.shape, device="cuda", generator=generator).float()
-        case "clustered":
-            # Every candidate lands in bin0, overflowing the 2048-entry shrink slab;
-            # tiny spacings also force refinement through the low ten key bits.
-            scores = 1 + scores.abs() * 1e-5
-        case "signed_zero":
-            scores = torch.copysign(torch.zeros_like(scores), scores)
-    # Four query rows rank all candidates; only the score slab needs the long dimension.
-    rows = scores.view(4, tokens)
-    output = torch.empty((1, rows.size(0), topk), device="cuda", dtype=torch.int32)
-    previous = get_compile_target()
-    try:
-        set_compile_target(detect_compile_target(torch.cuda.current_device()))
-        kernel = radix_impl._compile_topk(topk, False, 1, False, deterministic, False)
-    finally:
-        set_compile_target(previous)
-    expected = _lowest_index_topk(rows, topk)
+    random = torch.randn(tokens, device="cuda", generator=generator)
+    ids = torch.arange(tokens, device="cuda")
+    zeros, ones = torch.zeros_like(random), torch.ones_like(random)
+    rows = torch.stack(
+        [
+            random,
+            zeros,
+            3 * ones,
+            -3 * ones,
+            torch.randint(0, 16, (tokens,), device="cuda", generator=generator).float(),
+            1 + random.abs() * 1e-5,  # Same coarse bin, distinct low bits.
+            torch.copysign(zeros, random),
+            torch.where((ids >= 1100) & (ids < 15000), 0, -random.abs()),
+            torch.where(ids < topk // 2, 1, torch.where(ids < 20000, 0, -1)).float(),
+            torch.where(ids < tokens // 2, ones, torch.nextafter(ones, 2 * ones)),
+            # The whole boundary bucket is needed, although it is not homogeneous.
+            torch.where(
+                ids < topk // 2,
+                torch.nextafter(2 * ones, 3 * ones),
+                torch.where(ids < topk, 2, -1),
+            ),
+            random * 1e30,
+            # The tie budget isn't met until the tail, potentially in the next bitmap window.
+            torch.where(ids >= tokens - topk - 1, ones, -ones),
+            # Conversely, satisfying the tie budget early must not lose a later strict winner.
+            torch.where(ids == tokens - 1, 2, torch.where(ids <= topk, 1, -1)).float(),
+        ]
+    )
+    batch = rows.shape[0]
+    bounds = torch.zeros((batch, 2), device="cuda", dtype=torch.int32)
+    bounds[:, 1] = tokens
+    if selector != "document":
+        bounds[1, 1] -= 1  # Unaligned visible tail; every row still has at least K candidates.
+    valid = rows.masked_fill(ids[None] >= bounds[:, 1, None], -torch.inf)
+    expected = _lowest_index_topk(valid, topk, signed_zero_order=selector == "document")
+    expected_scores = valid.topk(topk, dim=-1).values.sort(-1).values
+    output = torch.empty((1, batch, topk), device="cuda", dtype=torch.int32)
+    if selector == "paged_triton":
+        from attn_gym.sparse.indexer.impl.paged_triton import paged_radix_topk_kernel
+
+        cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32)
+        used = bounds[:, 1].contiguous()
+
+        def select():
+            paged_radix_topk_kernel[(batch,)](
+                rows,
+                output,
+                cu,
+                used,
+                None,
+                bounds,
+                batch,
+                tokens,
+                0,
+                topk,
+                1,
+                False,
+                False,
+                4096,
+                num_warps=4,
+            )
+    else:
+        if not CUTE_SUPPORTED:
+            pytest.skip("SM100-family GPU required")
+        pytest.importorskip("cutlass.cute")
+        import cutlass
+
+        from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
+
+        paged = selector == "paged_cute"
+        with compile_target_scope(detect_compile_target(rows.device.index)):
+            kernel = impl._compile_topk(topk, False, 1, False, deterministic, paged, paged=paged)
+
+        def select():
+            # Long deterministic rows reuse the score slab as sorting scratch.
+            kernel(
+                rows.clone().view(-1, 2, tokens),
+                output,
+                cutlass.Int32(0),
+                bounds if paged else None,
+            )
+
     for _ in range(3 if deterministic else 1):
-        # The deterministic kernel may overwrite its score slab, so use fresh scores.
-        kernel(scores.clone(), output, cutlass.Int32(0), None)
+        select()
         actual = output[0].long()
+        ordered = actual.sort(-1).values
+        assert ((ordered >= 0) & (ordered < bounds[:, 1, None])).all()
+        assert (ordered.diff(dim=-1) > 0).all()
+        torch.testing.assert_close(
+            rows.gather(-1, actual).sort(-1).values, expected_scores, rtol=0, atol=0
+        )
         if deterministic:
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-        else:
-            ordered = actual.sort(-1).values
-            assert ((ordered >= 0) & (ordered < tokens)).all()
-            assert not (ordered[:, 1:] == ordered[:, :-1]).any()
-            torch.testing.assert_close(
-                rows.gather(1, ordered).sort(-1).values,
-                rows.gather(1, expected).sort(-1).values,
-                rtol=0,
-                atol=0,
-            )
+
+
+@pytest.mark.skipif(not CUDA, reason="SM80+ required")
+def test_paged_triton_sign_pass_uses_radix_order():
+    """The cutoff shortcut must rank the same FP32 bit patterns as a full radix scan."""
+    from attn_gym.sparse.indexer.impl.paged_triton import paged_radix_topk_kernel
+
+    scores = torch.tensor([0x3F800000, 0x7FC00000], device="cuda", dtype=torch.int32).view(
+        torch.float32
+    )
+    bounds = torch.tensor([[0, 2]], device="cuda", dtype=torch.int32)
+    output = bounds.new_full((1, 1), -1)
+    paged_radix_topk_kernel[(1,)](
+        scores, output, None, None, None, bounds, 1, 2, 0, 1, 1, False, False, 256
+    )
+    assert output.item() == 1  # The positive NaN's unsigned radix key exceeds 1.0's.
 
 
 @pytest.mark.parametrize("page_size", [13, 64])
@@ -310,11 +377,7 @@ def test_radix_deterministic_causal_window_boundary(
     """Causal rows whose visible candidates straddle one 65536-bit bitmap window."""
     import cutlass
 
-    from attn_gym.warpdrive.cache import (
-        detect_compile_target,
-        get_compile_target,
-        set_compile_target,
-    )
+    from attn_gym.warpdrive.cache.target import compile_target_scope, detect_compile_target
 
     candidates = 65538
     tokens = candidates * compress_ratio
@@ -329,14 +392,10 @@ def test_radix_deterministic_causal_window_boundary(
             0, 16, (4, 2, candidates), device="cuda", generator=generator
         ).float()
     output = torch.empty((1, tokens, topk), device="cuda", dtype=torch.int32)
-    previous = get_compile_target()
-    try:
-        set_compile_target(detect_compile_target(torch.cuda.current_device()))
+    with compile_target_scope(detect_compile_target(scores.device.index)):
         kernel = radix_impl._compile_topk(
             topk, True, compress_ratio, use_int64_offsets, True, False
         )
-    finally:
-        set_compile_target(previous)
     integer = cutlass.Int64 if use_int64_offsets else cutlass.Int32
     kernel(scores.clone(), output, integer(first_pair), None)
     visible = []
