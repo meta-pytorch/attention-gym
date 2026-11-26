@@ -76,9 +76,13 @@ def test_plain_tuple_and_named_tuple_are_equivalent():
         torch.testing.assert_close(x, y, atol=0, rtol=0)
 
 
-@pytest.mark.parametrize("backend", ["triton", "cute"])
-def test_components_can_be_views_of_shared_storage(backend):
+@pytest.mark.parametrize(
+    "backend,deterministic", [("triton", False), ("triton", True), ("cute", False)]
+)
+def test_components_can_be_views_of_shared_storage(backend, deterministic, request):
     skip_unsupported(backend)
+    if deterministic:
+        request.getfixturevalue("deterministic_algorithms")
     torch.manual_seed(912)
     q = torch.randn(1, 64, 33, 576, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     kv = torch.randn(1, 1, 33, 576, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -343,9 +347,12 @@ def triton_step(inputs, window=0, operation=gather_attn):
 
 
 @pytest.mark.parametrize("window", [0, 7])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.usefixtures("fresh_compile_cache")
-def test_triton_paired_dynamic_training(window):
+def test_triton_paired_dynamic_training(window, deterministic, request):
     skip_unsupported("triton")
+    if deterministic:
+        request.getfixturevalue("deterministic_algorithms")
     from torch._dynamo.testing import CompileCounterWithBackend
 
     counter = CompileCounterWithBackend("inductor")
@@ -365,8 +372,11 @@ def test_triton_paired_dynamic_training(window):
 
 
 @pytest.mark.parametrize("window", [0, 7])
-def test_triton_paired_forced_int64(window, monkeypatch):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_triton_paired_forced_int64(window, deterministic, monkeypatch, request):
     skip_unsupported("triton")
+    if deterministic:
+        request.getfixturevalue("deterministic_algorithms")
     from attn_gym.sparse.gather_attn.impl.triton import backward, forward
 
     inputs = make_inputs(heads=16, latent_dim=128, rope_dim=64, local=bool(window))
@@ -378,13 +388,18 @@ def test_triton_paired_forced_int64(window, monkeypatch):
 
 
 @pytest.mark.parametrize("window", [0, 7])
-def test_triton_paired_operator_contracts(window):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_triton_paired_operator_contracts(window, deterministic, request):
     skip_unsupported("triton")
+    if deterministic:
+        request.getfixturevalue("deterministic_algorithms")
     from attn_gym.sparse.gather_attn.impl.ops import _gather_attn_bwd_op, _gather_attn_fwd_op
 
     inputs = make_inputs(heads=16, latent_dim=128, rope_dim=64, local=bool(window))
     args = tree_map(lambda t: t.detach() if isinstance(t, torch.Tensor) else t, inputs.kwargs())
     q, qr = args["query"]
+    # Dense permuted query components exercise real/fake normalization of output strides.
+    q, qr = (t.transpose(1, 2).contiguous().transpose(1, 2) for t in (q, qr))
     sp, sr = args["sparse_kv"]
     local, lr = (None, None) if args["local_kv"] is None else args["local_kv"]
     indices, sink, cu, cuk = (
@@ -423,9 +438,30 @@ def test_triton_paired_operator_contracts(window):
 
 @pytest.mark.parametrize("warn_only", [False, True])
 @pytest.mark.parametrize("after_forward", [False, True])
-def test_triton_paired_determinism(warn_only, after_forward):
+@pytest.mark.parametrize(
+    "heads,dim,rope,window,packed,batch",
+    [
+        (16, 128, 32, 7, True, 1),
+        (32, 512, 64, 0, False, 2),
+        (16, 512, 128, 7, True, 1),
+        (17, 96, 16, 0, True, 1),
+    ],
+)
+def test_triton_paired_determinism(
+    warn_only, after_forward, heads, dim, rope, window, packed, batch, no_benchmarking
+):
     skip_unsupported("triton")
-    inputs = make_inputs(heads=16, latent_dim=128, rope_dim=64, local=False)
+    inputs = make_inputs(
+        heads=heads,
+        latent_dim=dim,
+        rope_dim=rope,
+        local=bool(window),
+        with_docs=packed,
+        batch=batch,
+    )
+    reference = as_fp64(inputs)
+    options = {"sliding_window_size": window, "scale": 0.0625}
+    expected = gather_attn(**reference.kwargs(), **options, impl="reference")
     enabled = torch.are_deterministic_algorithms_enabled()
     old_warn = torch.is_deterministic_algorithms_warn_only_enabled()
     try:
@@ -433,20 +469,20 @@ def test_triton_paired_determinism(warn_only, after_forward):
             torch.use_deterministic_algorithms(True, warn_only=warn_only)
         out = gather_attn(
             **inputs.kwargs(),
-            sliding_window_size=0,
-            scale=0.0625,
-            kernel_options={"backend": "triton"},
+            **options,
+            kernel_options={"backend": "triton", **({"autotune": False} if after_forward else {})},
         )
         torch.use_deterministic_algorithms(True, warn_only=warn_only)
-        context = (
-            pytest.warns(UserWarning, match="no deterministic backward")
-            if warn_only
-            else pytest.raises(RuntimeError, match="no deterministic backward")
-        )
-        with context:
-            gs = torch.autograd.grad(out, inputs.differentiable(), torch.randn_like(out))
-        if warn_only:
-            assert all(torch.isfinite(g).all() for g in gs)
+        go = torch.randn_like(out)
+        refs = torch.autograd.grad(expected, reference.differentiable(), go.double())
+        gs = torch.autograd.grad(out, inputs.differentiable(), go, retain_graph=True)
+        assert_numerics(out, expected, "deterministic output")
+        for i, (g, ref) in enumerate(zip(gs, refs, strict=True)):
+            assert_numerics(g, ref, f"deterministic gradient {i}")
+        for _ in range(3):
+            repeated = torch.autograd.grad(out, inputs.differentiable(), go, retain_graph=True)
+            for g, again in zip(gs, repeated, strict=True):
+                assert torch.equal(g, again)
     finally:
         torch.use_deterministic_algorithms(enabled, warn_only=old_warn)
 
@@ -471,6 +507,76 @@ def test_triton_paired_reuses_shape_specializations(triton_compiles):
     plain = counts(0)
     assert plain
     assert counts(64) == plain
+
+
+@pytest.mark.full_autotune
+def test_triton_paired_pinning(no_benchmarking, request):
+    skip_unsupported("triton")
+    inputs = make_inputs(heads=16, local=False)
+    results = []
+    for deterministic in (False, True):
+        if deterministic:
+            request.getfixturevalue("deterministic_algorithms")
+        output, aux = gather_attn(
+            **inputs.kwargs(),
+            sliding_window_size=0,
+            scale=0.0625,
+            return_aux=AuxRequest(lse=True),
+            kernel_options={
+                "backend": "triton",
+                **({} if deterministic else {"autotune": False}),
+            },
+        )
+        torch.autograd.grad(output, inputs.differentiable(), torch.randn_like(output))
+        results.append((output, aux.lse))
+    for pinned, deterministic in zip(*results, strict=True):
+        assert torch.equal(pinned, deterministic)
+
+
+@pytest.mark.parametrize("window", [0, 7])
+def test_triton_paired_deterministic_graph_replay(window, deterministic_algorithms):
+    from dataclasses import replace
+
+    skip_unsupported("triton")
+    inputs = make_inputs(heads=16, latent_dim=128, seq_len=35, local=bool(window), with_docs=True)
+    inputs = replace(
+        inputs,
+        sparse_kv=RopePair(*(t[:, :, :11].detach().requires_grad_() for t in inputs.sparse_kv)),
+        cu_seqlens=torch.tensor([0, 0, 7, 21, 35], device="cuda", dtype=torch.int32),
+        cu_seqlens_k=torch.tensor([0, 0, 3, 7, 11], device="cuda", dtype=torch.int32),
+    )
+    go = torch.randn_like(inputs.query.latent)
+    options = {"sliding_window_size": window, "scale": 0.0625}
+
+    def step():
+        out = gather_attn(**inputs.kwargs(), **options, kernel_options={"backend": "triton"})
+        return out, *torch.autograd.grad(out, inputs.differentiable(), go)
+
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            step()
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        captured = step()
+    for q_bounds, k_bounds in (
+        ([0, 0, 7, 21, 35], [0, 0, 3, 7, 11]),
+        ([0, 0, 5, 19, 35], [0, 0, 0, 6, 11]),
+    ):
+        inputs.cu_seqlens.copy_(torch.tensor(q_bounds, device="cuda", dtype=torch.int32))
+        inputs.cu_seqlens_k.copy_(torch.tensor(k_bounds, device="cuda", dtype=torch.int32))
+        graph.replay()
+        snapshot = [t.clone() for t in captured]
+        graph.replay()
+        for got, previous in zip(captured, snapshot, strict=True):
+            assert torch.equal(got, previous)
+        ref = as_fp64(inputs)
+        expected = gather_attn(**ref.kwargs(), **options, impl="reference")
+        grads = torch.autograd.grad(expected, ref.differentiable(), go.double())
+        for i, (got, want) in enumerate(zip(captured, (expected, *grads), strict=True)):
+            assert_numerics(got, want, f"captured result {i}")
 
 
 def test_fa4_sparse_only_inactive_capacity_replay():

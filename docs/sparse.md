@@ -345,9 +345,11 @@ FA4 sparse backward is not deterministic. Automatic selection uses Triton when d
 algorithms are enabled. The Triton kernels autotune by default, and their candidates differ in
 floating-point order, so the winner picked by timing decides the output bits. Deterministic
 algorithms, or `kernel_options={"autotune": False}`, launch each kernel's pinned configuration
-instead (see [Determinism](determinism.md#autotuned-kernels)). Triton backward with nonempty
-rotary components has no strict deterministic implementation; it raises in strict mode and
-warns and runs in warn-only mode.
+instead (see [Determinism](determinism.md#autotuned-kernels)). Deterministic mode also replaces
+Triton's atomic sparse-gradient accumulation with a fixed-order reduction, including for
+nonempty rotary components. Paired backward builds its reverse query index only in this mode;
+it uses extra workspace for per-head latent and rotary gradients. Setting `autotune=False`
+alone pins configurations but does not make atomic gradient accumulation deterministic.
 PyTorch does not allow changing
 deterministic mode between a compiled forward and its backward.
 
