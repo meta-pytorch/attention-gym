@@ -136,6 +136,42 @@ compiled kernel's PTX where one is missing, counting a guarded fence, commit or 
 skipped and rejecting calls; `capture_ptx(dir)` dumps the PTX of an uncached compile. It does
 not check that an in-loop handoff completed its TMEM loads and stores before the signal.
 
+### TMEM copy completion at teardown
+
+Run `ptx_check.check_tcgen05_sync(ptx, teardown_barrier=TMEM_TEARDOWN_BARRIER_ID)` on PTX
+captured from a fresh compile (`TMEM_TEARDOWN_BARRIER_ID` is in `attn_gym.warpdrive.named`).
+Its `copy-drain` finding names an S-to-T copy and a reachable teardown (or an issuing path
+that returns without joining it). For example, a copy
+issued before a possibly empty loop cannot rely on an accumulator publish/wait *inside* that
+loop. Gate the copy on having a tile, without skipping any required channel epochs. Neither
+issuing an MMA nor `tcgen05.wait::ld/st` completes an orphaned copy.
+
+A single-CTA [`tcgen05.commit`](https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen-async-sync-operations-commit)
+tracks previous async operations issued by **that thread**. The check follows both the leader
+and the other lanes through full-mask [`elect.sync`](https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-elect-sync):
+repeating the same mask elects the same leader, but its commit does not cover other lanes' copies.
+A later commit on the issuer's path needs a possible observer: the issuer subsequently spin-waits
+on that unchanged barrier pointer, or another participant can spin-wait on the same barrier
+family on its way to teardown. A restricted commit that signals only MMA operand reads does
+not track a copy. For a peer the wait must start at parity zero on forward control-flow paths: a producer can
+acquire an initially EMPTY stage (parity one) *before* the copy, then return without a tail.
+It recognizes PTX parity wait/test spin loops, not mere probes. It follows loops without a
+chosen trip count and remembers repeated guard predicates until redefinition. It uses the thread-ID analysis described under [bulk copies](#hand-written-tma-stores)
+to identify separate participants.
+
+This is a missing-handoff diagnostic, **not a proof of completion**. For a peer it recognizes
+direct addresses and ring addresses with a common base register, constant displacement and
+8-byte stage indexing. It does **not** prove equal runtime addresses across lanes, dynamic
+slots/phases, or that the peer waits for *this* commit rather than an earlier one. A wait on
+the wrong epoch or on an untaken peer path can leave a real race unreported. A peer's thread-ID
+class must be distinct from every possible issuer and able to observe the commit regardless
+of which lane is elected. This conservative rule can miss a legal elected-only peer handoff.
+Unsupported pointer
+arithmetic, multicast commits, indirect handoffs (e.g. a waiter signals a third warp), and
+conditions computed differently on equivalent paths can leave valid handoffs unrecognized.
+Always inspect the named copy, commit and wait. Passing `checked=True` enables index bounds
+checks; it does not run this PTX analysis.
+
 ### Skip a redundant thread-sync fence
 
 Each fence costs a stall, and the layer fences every managed synchronization of a `tcgen05`

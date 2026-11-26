@@ -156,6 +156,148 @@ def test_checker_drain_at_the_teardown_barrier():
     assert _rules(LD, guarded, BEFORE, teardown, teardown_barrier=2) == ["drain"]
 
 
+_COPY = "tcgen05.cp.cta_group::1.32x128b.warpx4 [%r7], %rd1;"
+_TEARDOWN = "barrier.sync 2, 64;"
+_FULL_WAIT = WAIT.replace("%r2, 10000000", "0, 10000000")
+
+
+def test_checker_tmem_copy_needs_a_completion_witness_on_the_empty_path():
+    # Warp 0 copies; only a nonempty iteration publishes to the barrier warp 1 waits on.
+    def kernel(guard: str, reader: str = _FULL_WAIT):
+        return f""".entry k() .reqntid 64, 1, 1 {{
+            mov.u32 %r0, %tid.x; setp.ge.u32 %p0, %r0, 32; @%p0 bra READER;
+            {guard}
+            {_COPY}
+        AFTER_COPY:
+            {COMMIT.replace("%r1", "%r2")}
+            @%p1 bra DONE;
+            {MMA}
+            {COMMIT}
+        DONE:
+            {BEFORE} {_TEARDOWN} ret;
+        READER:
+            {reader}
+            {AFTER} {LD} tcgen05.wait::ld.sync.aligned; {BEFORE} {_TEARDOWN} ret;
+        }}"""
+
+    def orphan_copies(ptx):
+        return [f for f in check_tcgen05_sync(ptx, teardown_barrier=2) if f.rule == "copy-drain"]
+
+    # Both paths issue a commit. Only the second commit has a possible observer; the
+    # release of the copy's source buffer need not have a waiter before TMEM is freed.
+    (finding,) = orphan_copies(kernel(""))
+    assert finding.origin_text == _COPY.rstrip(";")
+    assert finding.text == _TEARDOWN.rstrip(";")
+    guard = "@%p1 bra AFTER_COPY;"
+    assert not orphan_copies(kernel(guard))
+    # A peer merely probing, waiting on another barrier, or waiting *after* its rendezvous
+    # cannot be the completion witness. An MMA on the issuer is not sufficient by itself.
+    for not_a_handoff in (
+        "mbarrier.try_wait.parity.shared.b64 P1, [%r1], %r2;",
+        _FULL_WAIT.replace("[%r1]", "[%r8]"),
+        f"{_TEARDOWN}\n{_FULL_WAIT}",
+        f"@%p3 bra NO_WAIT;\n{_FULL_WAIT}\nret;\nNO_WAIT:",
+        # The producer's acquire of an initially EMPTY stage is not a tail. Even if its
+        # parity toggles, it may finish the last item without waiting for the final release.
+        (
+            f"mov.u32 %r2, 1;\nLOOP:\n{WAIT}\nmbarrier.arrive.shared.b64 _, [%r8];\n"
+            "xor.b32 %r2, %r2, 1; @%p8 bra LOOP;"
+        ),
+        _FULL_WAIT.replace("0, 10000000", "1, 10000000"),
+    ):
+        assert orphan_copies(kernel(guard, not_a_handoff))
+
+
+@pytest.mark.parametrize(
+    ("handoff", "unwitnessed"),
+    [
+        (COMMIT + WAIT, False),
+        # PTX 9.4: sync_restrict reports only MMA operand A reads, not the preceding copy.
+        (COMMIT.replace(".shared::cluster", ".sync_restrict::shared::read::mma::a") + WAIT, True),
+        (COMMIT, True),
+        (WAIT, True),  # Even a blocking wait needs a commit for this copy.
+        (MMA + COMMIT, True),  # Issuing an MMA is not observing completion.
+        (COMMIT + "tcgen05.wait::st.sync.aligned;", True),
+        (COMMIT + WAIT.replace("[%r1]", "[%r8]"), True),
+        (COMMIT + "mbarrier.try_wait.parity.shared.b64 P1, [%r1], %r2;", True),
+        (COMMIT + "mov.u32 %r1, %r8;" + WAIT, True),  # Same spelling, new address.
+        ("@%p3 " + COMMIT.strip() + WAIT, True),  # Guarded commit can be skipped.
+    ],
+)
+def test_tmem_copy_completion_by_the_issuer(handoff, unwitnessed):
+    assert (
+        "copy-drain" in _rules(_COPY, handoff, BEFORE, _TEARDOWN, teardown_barrier=2)
+    ) == unwitnessed
+
+
+@pytest.mark.parametrize(
+    "copy_guard,unwitnessed",
+    [("", True), ("@%p0", False), ("@!%p0", True)],
+    ids=["all-issuers", "elected-issuer", "non-elected-issuers"],
+)
+def test_elected_commit_only_tracks_its_own_threads_copies(copy_guard, unwitnessed):
+    # Each warp elects the same leader at both instructions, not necessarily lane zero.
+    # A wait on that leader's commit cannot complete a copy issued by any other lane.
+    findings = _rules(
+        "elect.sync _|%p0, 0xffffffff;",
+        f"{copy_guard} {_COPY}",
+        "elect.sync _|%p1, -1;",
+        "not.pred %p2, %p1;",
+        "@%p2 bra SKIP;",
+        COMMIT,
+        "SKIP:",
+        WAIT,
+        BEFORE,
+        _TEARDOWN,
+        teardown_barrier=2,
+    )
+    assert ("copy-drain" in findings) == unwitnessed
+
+
+@pytest.mark.parametrize(
+    "dispatch",
+    [
+        "@%p1 bra DONE; @!%p0 bra WAITER;",  # Lane 0 either issues or waits, never both.
+        "@!%p0 bra DONE; @%p1 bra WAITER;",  # No two lanes can both be this warp's leader.
+    ],
+)
+def test_alternative_election_cannot_be_a_peer_wait(dispatch):
+    ptx = f""".entry k() .reqntid 32, 1, 1 {{
+        elect.sync _|%p0, -1;
+        mov.u32 %r0, %tid.x; setp.ne.u32 %p1, %r0, 0;
+        {dispatch}
+        {_COPY} {COMMIT} bra DONE;
+    WAITER:
+        {_FULL_WAIT} {AFTER}
+    DONE:
+        {BEFORE} barrier.sync 2, 32; ret;
+    }}"""
+    assert "copy-drain" in [f.rule for f in check_tcgen05_sync(ptx, teardown_barrier=2)]
+
+
+def test_copy_guard_redefinition_does_not_imply_a_completion_wait():
+    assert "copy-drain" in _rules(
+        "@%p1 bra SKIP;",
+        _COPY,
+        "SKIP:",
+        "setp.ne.s32 %p1, %r0, 0;",
+        "@%p1 bra DONE;",
+        COMMIT,
+        WAIT,
+        "DONE:",
+        BEFORE,
+        _TEARDOWN,
+        teardown_barrier=2,
+    )
+
+
+def test_copy_that_skips_the_teardown_rendezvous():
+    # The CTA's allocator still runs its teardown, even if the issuer never joins it.
+    body = f"mov.u32 %r0, %tid.x; setp.lt.u32 %p0, %r0, 32; @%p0 bra ALLOC;\n{_COPY} ret;\nALLOC:\n{_TEARDOWN} ret;"
+    findings = check_tcgen05_sync(f".entry k() .reqntid 64, 1, 1 {{{body}}}", teardown_barrier=2)
+    assert [(f.rule, f.text) for f in findings] == [("copy-drain", "ret")]
+
+
 def test_checker_rejects_calls():
     """Without call summaries a callee's synchronization is invisible: fail, never pass. A
     failed device assert does not return."""
