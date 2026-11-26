@@ -93,6 +93,81 @@ Selection with NaN/Inf scores is unspecified and may differ across backends.
 ::: attn_gym.sparse.indexer.lightning_indexer
 
 
+## Indexer selection during paged decode
+
+`paged_lightning_indexer` scores new queries against cached completed-block keys.
+With a raw-token KV window, both operations use the same packed query offsets and raw-token lengths:
+
+```python
+from attn_gym.sparse import PagedKV, paged_lightning_indexer, paged_sparse_decode
+
+block_ids = paged_lightning_indexer(
+    index_query,         # [tokens, index_heads, index_head_dim]
+    index_key_cache,     # [candidate_pages, candidate_page_size, index_head_dim]
+    index_weights,       # [tokens, index_heads]
+    candidate_table,     # int32 [sequences, max_candidate_pages]
+    cu_seqlens_q,        # int32 [sequences + 1]
+    seqused_k,           # int32 [sequences], RAW tokens including current queries
+    topk=512,
+    compress_ratio=4,
+    impl="reference",
+)
+output = paged_sparse_decode(
+    query,
+    PagedKV(key_cache, value_cache, kv_table),  # raw-token KV pages
+    block_ids,          # int32 [tokens, 512], sequence-local blocks; -1 padding
+    cu_seqlens_q,
+    seqused_k,
+    max_seqlen_q=1,      # increase for speculative query suffixes
+    index_block_size=4,
+    window_size=0,      # shared raw KV still includes the incomplete causal block
+)
+```
+
+For a sequence with `n` new queries and raw length `L`, query `i` has absolute
+position `p = L - n + i`. It can select blocks `0 .. (p + 1) // compress_ratio - 1`.
+Thus a three-query suffix ending at raw length 10, with compression 4, sees
+2, 2, and 2 completed candidates; a suffix ending at length 9 sees 1, 2, and 2.
+Optional `query_positions` (int32 `[tokens]`) overrides these positions for non-suffix
+queries. Visibility remains capped by `seqused_k // compress_ratio`. Query capacity
+rows beyond `cu_seqlens_q[-1]` return only -1.
+
+Candidate pages and KV pages have independent layouts and page tables. Candidate
+`b` is read from
+`index_key_cache[candidate_table[s, b // candidate_page_size], b % candidate_page_size]`.
+Returned IDs are **logical sequence-local blocks**, never physical page IDs. For a
+raw KV source, use `index_block_size=compress_ratio`. For pooled sparse KV, use
+`index_block_size=1` and pass a separate raw-token `window_kv` when reusing the
+indexer’s raw `seqused_k`. With separate sources, `window_size` must explicitly
+cover the raw tail the model needs; decode does not add the incomplete block for you.
+Without `window_kv`, decode interprets lengths and window positions in pooled entries,
+not raw tokens.
+
+The caller owns the persistent cache and partial-block state:
+
+1. Keep the state that the model’s pooling rule needs, including any history for
+   overlapping blocks. Do not publish partial candidates.
+2. When a block completes, compute its key with the model’s pooling and transforms.
+   Write the finished key to its candidate slot before any query can select it.
+3. Run selection for every query, including when all indexer parameters are frozen.
+   The integer selection result is nondifferentiable.
+
+For example, the DeepSeek `compress` function in `examples/sparse/compressed_sparse_attention.py`
+weights projections from the current and previous blocks together. Keeping only the
+incomplete block would lose inputs needed for the next candidate.
+
+The selector never repools or mutates the cache and never exposes an incomplete
+candidate. Page allocation, prefix sharing, copy-on-write, and rolling back speculative
+tokens remain caller responsibilities. Unused page-table entries may be -1; all visible
+completed blocks must have valid pages. Device metadata values are caller invariants.
+
+`impl="reference"` supplies an eager CPU/CUDA implementation and is the default.
+It reads metadata on the host and does not support fullgraph compilation or CUDA
+Graph capture. Selection order and ties are unspecified.
+
+::: attn_gym.sparse.indexer.paged_lightning_indexer
+
+
 ## Gather attention and sparse MLA
 
 `gather_attn` takes a query, a local KV pool, a sparse KV pool, and selected sparse indices.
