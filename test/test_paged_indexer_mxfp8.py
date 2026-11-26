@@ -108,6 +108,22 @@ def test_public_fullgraph_with_explicit_scales():
     assert out.tolist() == [[0], [64], [3], [-1]]
 
 
+def test_mxfp8_batch_invariant_is_reference_only(route):
+    device, impl = route
+    operands = paged_inputs(device=device)
+    kwargs = {
+        "topk": 1,
+        "compress_ratio": 2,
+        "impl": impl,
+        "kernel_options": {"batch_invariant": True},
+    }
+    if impl == "reference":
+        assert paged_lightning_indexer(**operands, **kwargs).tolist() == [[0], [64], [3], [-1]]
+    else:
+        with pytest.raises(ValueError, match="MXFP8.*batch_invariant=False"):
+            paged_lightning_indexer(**operands, **kwargs)
+
+
 def test_fused_rejects_explicit_triton():
     require_native_mxfp8()
     with pytest.raises(ValueError, match="CuTe backend"):

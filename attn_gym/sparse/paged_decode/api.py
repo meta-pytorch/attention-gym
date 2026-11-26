@@ -1,15 +1,29 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import overload
+from typing import TypedDict, overload
 
 import torch
 from torch import Tensor
 
-from attn_gym.types import AuxRequest, Impl, resolve_impl
+from attn_gym.types import (
+    AuxRequest,
+    Impl,
+    KernelOptionSpec,
+    resolve_impl,
+    validate_kernel_options,
+)
 
 from .impl import reference
 from .ops import decode_op, decode_with_lse_op
+
+
+class PagedSparseDecodeKernelOptions(TypedDict, total=False):
+    batch_invariant: bool
+    """Use fixed forward arithmetic shared with batch-invariant gather_attn. Defaults to False."""
+
+
+KERNEL_OPTION_SPEC: KernelOptionSpec = {"batch_invariant": (bool, False)}
 
 
 @dataclass(frozen=True, slots=True)
@@ -200,6 +214,7 @@ def paged_sparse_decode(
     attention_sink: Tensor | None = None,
     scale: float | None = None,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: PagedSparseDecodeKernelOptions | None = None,
     return_aux: None = ...,
 ) -> Tensor: ...
 
@@ -220,6 +235,7 @@ def paged_sparse_decode(
     attention_sink: Tensor | None = None,
     scale: float | None = None,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: PagedSparseDecodeKernelOptions | None = None,
     return_aux: AuxRequest,
 ) -> tuple[Tensor, PagedSparseDecodeAux]: ...
 
@@ -239,6 +255,7 @@ def paged_sparse_decode(
     attention_sink: Tensor | None = None,
     scale: float | None = None,
     impl: Impl | str = Impl.FUSED,
+    kernel_options: PagedSparseDecodeKernelOptions | None = None,
     return_aux: AuxRequest | None = None,
 ) -> Tensor | tuple[Tensor, PagedSparseDecodeAux]:
     """Attend decode queries to selected entries of a paged cache plus a causal window.
@@ -297,6 +314,12 @@ def paged_sparse_decode(
         scale: Positive logit multiplier. Defaults to ``1 / sqrt(head_dim)``.
         impl: ``Impl.FUSED`` (default) runs the Triton kernel on CUDA. ``Impl.REFERENCE`` runs
             eager PyTorch on CPU or CUDA.
+        kernel_options: ``{"batch_invariant": True}`` uses fixed tiles without
+            split reductions, independent of batch size and graph padding. It preserves
+            output/LSE bits and matches batch-invariant ``gather_attn`` for the same
+            ordered selected tokens followed by the window, Q/K/V, scale and sink.
+            Head dimensions must be <= 512. Defaults to False. Reference validates and
+            ignores this option. The guarantee assumes one GPU model and software stack.
         return_aux: If None (default), return only the output. If an AuxRequest, return
             ``(output, PagedSparseDecodeAux)`` with the requested outputs.
 
@@ -305,6 +328,9 @@ def paged_sparse_decode(
         ``PagedSparseDecodeAux`` when ``return_aux`` is given.
     """
     selected_impl = resolve_impl(impl)
+    options = validate_kernel_options(
+        kernel_options, KERNEL_OPTION_SPEC, op_name="paged_sparse_decode"
+    )
     _validate_inputs(
         query,
         kv,
@@ -357,9 +383,9 @@ def paged_sparse_decode(
                 scale,
             )
             if return_lse:
-                out, lse = decode_with_lse_op(*args)
+                out, lse = decode_with_lse_op(*args, batch_invariant=options["batch_invariant"])
             else:
-                out, lse = decode_op(*args), None
+                out, lse = decode_op(*args, batch_invariant=options["batch_invariant"]), None
 
     if return_aux is None:
         return out

@@ -209,6 +209,17 @@ for the selection rule. Set `kernel_options={"backend": "fused"}` to use Triton 
   replayed size bit for bit.
 
 
+## Sparse batch invariance
+
+`gather_attn`, `paged_sparse_decode`, `lightning_indexer`, and
+`paged_lightning_indexer` accept `kernel_options={"batch_invariant": True}`.
+This fixes forward arithmetic across batch sizes and packed offsets, and aligns
+gather/paged attention and whole-document/paged FP16/BF16 index selection for identical logical
+inputs on one GPU model and software stack. Deterministic mode or disabling autotuning
+alone does not provide this guarantee. Gather backward remains supported, without a
+bitwise-gradient guarantee. See [Sparse attention](sparse.md#batch-invariance) for the
+input contract, backend restrictions, and integration example.
+
 ## References
 
 - [FlexAttention API reference](https://docs.pytorch.org/docs/stable/nn.attention.flex_attention.html)

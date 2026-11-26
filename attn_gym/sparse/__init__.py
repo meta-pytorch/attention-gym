@@ -14,7 +14,12 @@ from .indexer import (
     lightning_indexer,
     paged_lightning_indexer,
 )
-from .paged_decode import PagedKV, PagedSparseDecodeAux, paged_sparse_decode
+from .paged_decode import (
+    PagedKV,
+    PagedSparseDecodeAux,
+    PagedSparseDecodeKernelOptions,
+    paged_sparse_decode,
+)
 
 __all__ = [
     "AuxRequest",
@@ -25,6 +30,7 @@ __all__ = [
     "PagedIndexerKernelOptions",
     "PagedKV",
     "PagedSparseDecodeAux",
+    "PagedSparseDecodeKernelOptions",
     "RopePair",
     "gather_attn",
     "lightning_indexer",
