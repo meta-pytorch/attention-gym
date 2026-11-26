@@ -60,9 +60,9 @@ from ..kda_common import (
     operand_dtypes,
     state_align_suffix,
 )
+from ..state_checkpoints import CheckpointTensors, make_checkpoint_signature
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
-    make_checkpoint_signatures,
     make_compact_signature_tensor,
     make_dynamic_signature_tensor,
     make_paged_route_signatures,
@@ -112,9 +112,7 @@ def warmup_forward_host(
     tma_slots: cute.Tensor,
     pieces: cutlass.Int32,
     entry_states: cute.Tensor | None,
-    checkpoint_pool: cute.Tensor | None,
-    checkpoint_positions: cute.Tensor | None,
-    checkpoint_slots: cute.Tensor | None,
+    checkpoints: CheckpointTensors | None,
     stream: cuda.CUstream,
 ) -> None:
     """``split`` is the split table's :class:`~work_tables.SplitStatic` (None: the uncut
@@ -140,11 +138,6 @@ def warmup_forward_host(
             work_count,
             stream,
         )
-    checkpoints = (
-        (checkpoint_pool, checkpoint_positions, checkpoint_slots)
-        if cutlass.const_expr(checkpoint_pool is not None)
-        else None
-    )
     entries = None
     if cutlass.const_expr(entry_states is not None):
         entries = (entry_states, cu_seqlens, pieces)
@@ -401,7 +394,7 @@ def _compile_warmup_forward(
         _compact(cutlass.Int64, (16,), 128, i64),  # tma_slots
         cutlass.Int32(0),  # pieces
         _dynamic(cutlass.Float32, 5, 16, i64) if entry_states else None,  # entry_states
-        *make_checkpoint_signatures(checkpoint_dtype, i64),
+        make_checkpoint_signature(checkpoint_dtype, i64),
         name=name,
         opt_level=2,
     )
@@ -779,5 +772,5 @@ def run_warmup_forward(
         tma_slots,
         int(pieces),
         entry_states,
-        *(checkpoints if checkpoints is not None else (None, None, None)),
+        checkpoints,
     )

@@ -142,7 +142,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
-from .state_checkpoints import checkpoint_row, store_checkpoint
+from .state_checkpoints import CheckpointTensors, checkpoint_row, store_checkpoint
 
 B_T = 64
 BOX_ELEMS = B_T * 64  # one 64-row x 128-byte swizzled TMA box of 16-bit values
@@ -178,7 +178,7 @@ class PrefillParams:
     beta: object  # compute: (token, gate head) fp32
     state_in: object  # (d_v, d_k, gate head, sequence or pool slot)
     state_out: object
-    checkpoints: tuple | None
+    checkpoints: CheckpointTensors | None
     seed_indices: object  # paged: per-sequence pool route
     has_initial_state: object  # paged: uint8 per sequence
     work_items: cute.Tensor  # (rows, 10) int32
@@ -1545,7 +1545,7 @@ class GdnPrefill(WarpSpecialized):
         scale: Float32,
         max_ctas: Int32,
         stream: cuda.CUstream,
-        checkpoints: tuple | None = None,
+        checkpoints: CheckpointTensors | None = None,
     ):
         """Launch on ``max_ctas`` CTAs after the item-table prologue; callable from another
         ``@cute.jit`` host, such as a fused launch bundle."""

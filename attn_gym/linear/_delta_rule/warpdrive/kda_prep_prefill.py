@@ -134,7 +134,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
-from .state_checkpoints import checkpoint_row, store_checkpoint
+from .state_checkpoints import CheckpointTensors, checkpoint_row, store_checkpoint
 from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_op, smem_desc
 
 D_V = 64  # value tile width: the driver only runs the prep scheme under the d_v split
@@ -205,7 +205,7 @@ class KdaPrepPrefillParams:
     box_io: cute.ComposedLayout  # one 16 x 64 16-bit swizzled box
     state_in: cute.Tensor | None  # (row, head, d_v, d_k)
     state_out: cute.Tensor | None
-    checkpoints: tuple | None
+    checkpoints: CheckpointTensors | None
     state_indices: cute.Tensor | None
     has_initial_state: cute.Tensor | None
     work_items: cute.Tensor  # (rows, WORK_ITEM_FIELDS)
@@ -1193,7 +1193,7 @@ class KdaPrepPrefill(WarpSpecialized):
         scale: Float32,
         stream: cuda.CUstream,
         trace_buffer: cute.Tensor | None = None,
-        checkpoints: tuple | None = None,
+        checkpoints: CheckpointTensors | None = None,
     ):
         """Launch on ``num_ctas`` CTAs (PDL); callable from another ``@cute.jit`` host such as
         a launch bundle, after kernels that wrote the records, ``work_items``/``work_count`` and

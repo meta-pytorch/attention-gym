@@ -167,7 +167,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
-from .state_checkpoints import checkpoint_row, store_checkpoint
+from .state_checkpoints import CheckpointTensors, checkpoint_row, store_checkpoint
 from .umma import (
     SWIZZLE_128B,
     MmaDesc,
@@ -227,7 +227,7 @@ class KdaPrefillParams:
     beta: cute.Tensor  # (token, head)
     state_in: cute.Tensor | None  # (row, head, d_v, d_k)
     state_out: cute.Tensor | None
-    checkpoints: tuple | None
+    checkpoints: CheckpointTensors | None
     state_indices: cute.Tensor | None
     has_initial_state: cute.Tensor | None
     entry_states: cute.Tensor | None  # (slot, head, d_k // 4, d_v, 4) fp32, see entry_quad
@@ -2049,7 +2049,7 @@ class KdaPrefill(WarpSpecialized):
         stream: cuda.CUstream,
         trace_buffer: cute.Tensor | None = None,
         entries: tuple | None = None,
-        checkpoints: tuple | None = None,
+        checkpoints: CheckpointTensors | None = None,
     ):
         """Launch on ``num_ctas`` CTAs (PDL); callable from another ``@cute.jit`` host such as
         a launch bundle, after a kernel that wrote ``work_items``/``work_count`` and zeroed

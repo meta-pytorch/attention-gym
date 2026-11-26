@@ -39,9 +39,9 @@ from attn_gym.warpdrive.cache import compile_tvm_ffi, jit_cache
 from .. import gdn_prefill, work_tables
 from ..contract import get_dtype, paged_state_align
 from ..kda_common import state_align_suffix
+from ..state_checkpoints import CheckpointTensors, make_checkpoint_signature
 from ..work_tables import WORK_ITEM_FIELDS
 from .tvm_ffi import (
-    make_checkpoint_signatures,
     make_compact_signature_tensor,
     make_counter_signature,
     make_cu_seqlens_signature,
@@ -82,9 +82,7 @@ def warmup_forward_host(
     chunk_scratch: cute.Tensor | None,
     scheduler: cute.Tensor,
     tma_slots: cute.Tensor,
-    checkpoint_pool: cute.Tensor | None,
-    checkpoint_positions: cute.Tensor | None,
-    checkpoint_slots: cute.Tensor | None,
+    checkpoints: CheckpointTensors | None,
     stream: cuda.CUstream,
 ) -> None:
     """``split`` is the split table's :class:`~work_tables.SplitStatic` (None: the uncut
@@ -140,9 +138,7 @@ def warmup_forward_host(
         scale,
         cutlass.Int32(prefill_sms),
         stream,
-        checkpoints=(checkpoint_pool, checkpoint_positions, checkpoint_slots)
-        if cutlass.const_expr(checkpoint_pool is not None)
-        else None,
+        checkpoints=checkpoints,
     )
 
 
@@ -262,7 +258,7 @@ def _compile_warmup_forward(
         tensor(cutlass.Float32, 2, 4) if split is not None else None,
         make_counter_signature(sym_int()),
         make_compact_signature_tensor(cutlass.Int64, (sym_int(), 16), assumed_align=128),
-        *make_checkpoint_signatures(checkpoint_dtype, use_int64_offsets),
+        make_checkpoint_signature(checkpoint_dtype, use_int64_offsets),
         name=name,
         opt_level=OPT_LEVEL,
     )
@@ -394,5 +390,5 @@ def run_warmup_forward(
         chunk_scratch if split else None,
         scheduler,
         tma_slots,
-        *(checkpoints if checkpoints is not None else (None, None, None)),
+        checkpoints,
     )
