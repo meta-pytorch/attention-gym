@@ -163,13 +163,32 @@ completed blocks must have valid pages. Device metadata values are caller invari
 The fused operation supports FP16/BF16 on SM80+ NVIDIA GPUs, arbitrary nonnegative
 tensor strides, `torch.compile(fullgraph=True)`, and CUDA Graph replay with updated
 query offsets, lengths, positions, and page tables. `impl="reference"` supplies an eager
-CPU/CUDA oracle. On SM100-family GPUs the default combines paged Triton scoring with
-the existing cached CuTe radix selector; other GPUs use Triton selection. Override with
-`kernel_options={"backend": "triton"}` or `{"backend": "cute"}`. Order and ties are
-unspecified unless deterministic algorithms are enabled. No benchmarking occurs in the
-launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
+CPU/CUDA oracle. The fused indexer has two stages: first score visible cached keys, then
+select Top-K from the FP32 scores. `kernel_options={"backend": "triton"}` uses Triton
+for both stages and covers general strides on SM80+. `{"backend": "cute"}` (the
+SM100-family default) uses the Warpdrive radix selector. It also uses a specialized
+Warpdrive scorer for compact FP16/BF16 decode with 4 heads, head dimension 128,
+64-candidate pages and int32 addressing. Q and the key cache must be 16-byte aligned.
+The page table may be padded, strided or broadcast if its strides also fit int32.
+The scorer is used only when `tokens × reserved candidates per sequence > 32768`;
+smaller grids use Triton to avoid the fixed pipeline setup cost. Unsupported layouts
+also use Triton scoring, without copying the cache or changing the selector. Both routes
+use the same visibility rules. Order and ties are unspecified unless deterministic
+algorithms are enabled. No benchmarking occurs in the launch path. Scores use at most 32 MiB of per-call scratch, plus an int32 `[tokens, 2]`
 bounds buffer; query slabs reuse that allocation. Candidate capacity
 per sequence is limited to `2**22`.
+
+Both scorers cap the grid and loop over visible candidates on the GPU. With Triton scoring,
+rows with all-zero head weights return the first visible IDs without reading Q, K or scores.
+Warpdrive scores these rows normally. Use `backend="triton"` to take the zero-weight
+shortcut on otherwise Warpdrive-eligible inputs.
+The Warpdrive radix selector uses 1024 threads per decode query (512 for whole documents).
+It stops refining a boundary bucket when its ordered-key extrema match or every member is
+needed, even if the bucket exceeds the shared shrink buffer. Deterministic selection still
+chooses the lowest IDs at the cutoff and returns ascending IDs.
+The portable Triton selector can finish its radix search early at an exact zero cutoff or
+when a prefix contains exactly `topk` candidates. Reserved capacity still determines score
+strides and slab sizes, so a large reservation can require more launches.
 
 ::: attn_gym.sparse.indexer.paged_lightning_indexer
 

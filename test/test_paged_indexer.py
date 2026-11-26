@@ -96,8 +96,10 @@ def test_graph_replay_observes_metadata(
     )
     if page_size == 13:
         args[0] = args[0].transpose(1, 2).contiguous().transpose(1, 2)
-    positions = torch.tensor(
-        [4 * 32768 - 1, 4 * 33024 - 1, 17, -1], device="cuda", dtype=torch.int32
+    positions = (
+        torch.tensor([4 * 32768 - 1, 4 * 33024 - 1, 17, -1], device="cuda", dtype=torch.int32)
+        if page_size == 64
+        else None
     )
 
     def call():
@@ -114,9 +116,12 @@ def test_graph_replay_observes_metadata(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         output = call()
-    for visible in (100, 8193, 32768, 33024):
+    for visible, split, end in ((100, 1, 3), (8193, 2, 2), (32768, 0, 3), (33024, 2, 3)):
+        args[4][1] = split
+        args[4][2] = end
         args[-1][0] = 4 * visible
-        positions[0] = 4 * visible - 1
+        if positions is not None:
+            positions[0] = 4 * visible - 1
         args[2][1].zero_()
         args[3][:, :2] = args[3][:, :2].flip(1)
         graph.replay()
@@ -142,22 +147,67 @@ def test_raw_kv_decode_integration():
     torch.testing.assert_close(actual, reference, rtol=0.02, atol=0.02)
 
 
+def test_completed_blocks_and_raw_tail_at_decode_boundary():
+    args = make_paged_indexer_test_inputs((3,), (9,), heads=1, head_dim=16)
+    q, cache, weights, _, cu, lengths = args
+    q.fill_(1)
+    cache.zero_()
+    cache[:, 1].fill_(1)  # Prefer block 1 as soon as it is complete.
+    weights.fill_(1)
+    ids = paged_lightning_indexer(*args, topk=1)
+    assert ids.tolist() == [[0], [1], [1]]
+
+    # Uniform attention; each value is its raw token position. At positions
+    # 6, 7, 8 the selected block plus incomplete tail is 0..6, 4..7, 4..8.
+    keys = q.new_zeros((1, 16, 1, 16))
+    values = torch.arange(16, device=q.device, dtype=q.dtype).view(1, 16, 1, 1).expand_as(keys)
+    table = cu.new_zeros((1, 1))
+    result = paged_sparse_decode(
+        q,
+        PagedKV(keys, values.contiguous(), table),
+        ids,
+        cu,
+        lengths,
+        max_seqlen_q=3,
+        index_block_size=4,
+        window_size=0,
+    )
+    expected = q.new_tensor([3.0, 5.5, 6.0]).view(3, 1, 1).expand_as(result)
+    torch.testing.assert_close(result, expected)
+
+
 @pytest.mark.parametrize("permuted", [False, True])
 def test_shape_specialization_reuse(backend, permuted, triton_compiles):
     from attn_gym.sparse.indexer.impl.cute import _compile_topk_kernel
 
+    warpdrive_scoring = backend == "cute" and not permuted
     if backend == "cute":
         _compile_topk_kernel.cache_clear()
+        if warpdrive_scoring:
+            from attn_gym.sparse.indexer.impl.paged_score_warpdrive import compile_paged_score
+
+            compile_paged_score.cache_clear()
     # Cross ==1, multiple-of-16 and odd classes for batch, queries, and page
     # table capacity. Keep the portable selector's clamped BLOCK bucket fixed.
-    for batch, candidates in [(1, 4160), (16, 4224), (17, 4288)]:
+    first_capacity = 32832 if warpdrive_scoring else 4160
+    for batch, extra in [(1, 0), (16, 64), (17, 128)]:
+        candidates = first_capacity + extra
         args = list(make_paged_indexer_test_inputs((1,) * batch, (4 * candidates,) * batch))
         if permuted:
             for i in range(4):
                 args[i] = args[i].transpose(0, -1).contiguous().transpose(0, -1)
+        elif warpdrive_scoring and batch == 16:
+            table = args[3]
+            padded = table.new_full((batch, 2 * table.shape[1] + 1), -1)
+            args[3] = padded[:, :-1:2].copy_(table)
+        elif warpdrive_scoring and batch == 17:
+            args[3] = args[3][:1].expand_as(args[3])
         output = paged_lightning_indexer(*args, topk=512, kernel_options={"backend": backend})
         assert_paged_indexer_selection(args, output, 512)
-    if not permuted and torch.cuda.get_device_capability()[0] >= 9:
+    if warpdrive_scoring:
+        info = compile_paged_score.cache_info()
+        assert info.currsize == 1 and info.hits + info.misses == 3
+    elif not permuted and torch.cuda.get_device_capability()[0] >= 9:
         # One low-fill and one medium-fill TMA schedule; runtime sizes within
         # each schedule, including divisible/odd classes, do not specialize.
         assert triton_compiles["paged_score_tma_kernel"] == 2
@@ -168,6 +218,24 @@ def test_shape_specialization_reuse(backend, permuted, triton_compiles):
     else:
         info = _compile_topk_kernel.cache_info()
         assert info.currsize == 1 and info.hits + info.misses == 3
+
+
+@pytest.mark.parametrize("topk", [7, 512])
+def test_zero_weights_and_pool_growth(backend, topk, deterministic_algorithms):
+    if backend == "cute":
+        from attn_gym.sparse.indexer.impl.paged_score_warpdrive import compile_paged_score
+
+        compile_paged_score.cache_clear()
+    capacity = 4 * 32769 + 1
+    args = make_paged_indexer_test_inputs((1,), (capacity,))
+    args[2].zero_()
+    ids = torch.arange(topk, device="cuda", dtype=torch.int32)[None]
+    for length in (3, 4, 5, 7, 8, 17, 4096, capacity):
+        args[-1].fill_(length)
+        selected = paged_lightning_indexer(*args, topk=topk, kernel_options={"backend": backend})
+        torch.testing.assert_close(selected, torch.where(ids < length // 4, ids, -1))
+    if backend == "cute":
+        assert compile_paged_score.cache_info().currsize == 1
 
 
 def test_zero_sequences_and_empty_gpu():
@@ -203,6 +271,10 @@ def test_workspace_reused_across_slabs():
     assert_paged_indexer_selection(args, actual, 7)
 
 
+@pytest.mark.skipif(
+    os.environ.get("ATTN_GYM_RUN_LARGE_INDEXER_TESTS") != "1",
+    reason="set ATTN_GYM_RUN_LARGE_INDEXER_TESTS=1 for the 4 GiB active-offset test",
+)
 @pytest.mark.parametrize("page_size", [13, 64])
 def test_active_cache_address_above_int32(
     backend, page_size, deterministic_algorithms, triton_compiles
