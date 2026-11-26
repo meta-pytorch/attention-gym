@@ -46,8 +46,7 @@ class ChunkForward(Protocol):
 class PagedChunkForward(Protocol):
     """A state-only paged chunk forward that advances ``state_cache`` in place.
 
-    It writes ``state_checkpoints`` counted from each packed sequence's start; a backend that
-    cannot write them is only called with ``None``.
+    Its optional ``state_checkpoints`` count from each packed sequence's start.
     """
 
     def __call__(

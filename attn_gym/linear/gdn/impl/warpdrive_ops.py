@@ -20,6 +20,10 @@ from attn_gym.linear._delta_rule.operand_layout import (
     normalize_scalar_rows,
 )
 from attn_gym.linear._delta_rule.paged_state import PagedState
+from attn_gym.linear._delta_rule.state_checkpoints import (
+    state_checkpoints_from_op_args,
+    validate_state_checkpoints,
+)
 from attn_gym.linear._delta_rule.validation import validate_packed_offsets_tensor
 
 # The registered op names keep the backend's former ``cudnn`` name so that serialized graphs
@@ -45,7 +49,8 @@ torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_fwd_paged",
     "(Tensor q, Tensor k, Tensor value, Tensor gate, Tensor beta, Tensor(a!) state_cache, "
     "Tensor state_indices, Tensor? has_initial_state, Tensor cu_seqlens, float scale, "
-    "bool batch_invariant=False) -> Tensor",
+    "bool batch_invariant=False, Tensor(b!)? checkpoint_states=None, "
+    "Tensor? checkpoint_positions=None, Tensor? checkpoint_slots=None) -> Tensor",
 )
 torch.library.define(
     "attn_gym::gdn_chunk_cudnn_packed_bwd",
@@ -224,6 +229,9 @@ def _packed_fwd_paged_cuda(
     cu_seqlens: Tensor,
     scale: float,
     batch_invariant: bool = False,
+    checkpoint_states: Tensor | None = None,
+    checkpoint_positions: Tensor | None = None,
+    checkpoint_slots: Tensor | None = None,
 ) -> Tensor:
     """Advance selected pool slots in place; the pool itself is never copied."""
     value_template = value
@@ -232,6 +240,10 @@ def _packed_fwd_paged_cuda(
     cu_seqlens = normalize_cu_seqlens(cu_seqlens)
     validate_packed_offsets_tensor(cu_seqlens, q.device)
     backend = _forward_backend()
+    checkpoints = state_checkpoints_from_op_args(
+        checkpoint_states, checkpoint_positions, checkpoint_slots
+    )
+    validate_state_checkpoints(checkpoints, q, value, cu_seqlens)
     paged_state = PagedState.validate(
         state_cache,
         state_indices,
@@ -242,6 +254,7 @@ def _packed_fwd_paged_cuda(
         key_dim=q.shape[3],
         device=q.device,
         read_only_inputs=(q, k, value, gate, beta, cu_seqlens),
+        checkpoints=checkpoints,
     )
     output, _ = backend.run_forward(
         q,
@@ -417,6 +430,9 @@ def _packed_fwd_paged_fake(
     cu_seqlens: Tensor,
     scale: float,
     batch_invariant: bool = False,
+    checkpoint_states: Tensor | None = None,
+    checkpoint_positions: Tensor | None = None,
+    checkpoint_slots: Tensor | None = None,
 ) -> Tensor:
     """Describe the paged forward launcher; the pool mutation is declared in the schema."""
     return _empty_with_layout(value)

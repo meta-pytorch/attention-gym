@@ -4,8 +4,7 @@
 # Derived from cudnn-frontend v1.30.0 (python/cudnn/linear_attention/frost/kernel/
 # kda_prep_prefill_f16.py), rewritten by Attention Gym in 2026 on attn_gym.warpdrive roles and
 # channels with CuTeDSL 4.6.2 APIs: one TMA descriptor per tensor replaces the per-sequence
-# descriptor arrays, and the state checkpoints and full-width value tiles the driver never
-# requests are gone.
+# descriptor arrays, and the upstream periodic checkpoints and full-width value tiles are omitted.
 
 """Prep-fed KDA chunked prefill forward (BT = 16) for SM100: the state recurrence over the
 per-chunk records of ``kda_prep``.
@@ -91,7 +90,7 @@ from .kda_common import (
     check_operand_dtypes,
     lds_v2_f32,
     lds_v4_f32,
-    load_state,
+    load_seed,
     mask_pair,
     opaque_i32,
     operand_dtypes,
@@ -106,7 +105,7 @@ from .kda_common import (
     spin_wait,
     state_align_suffix,
     store_solve_operand,
-    store_state_32,
+    store_tmem_state,
     umma_commit,
     warp_arrive,
 )
@@ -135,6 +134,7 @@ from .ragged import (
     slot_region,
     tma_slot_rows,
 )
+from .state_checkpoints import CheckpointTensors, checkpoint_row, store_checkpoint
 from .umma import SWIZZLE_128B, MmaDesc, desc_opaque, instr_desc, mma_ts_op, smem_desc
 
 D_V = 64  # value tile width: the driver only runs the prep scheme under the d_v split
@@ -205,6 +205,7 @@ class KdaPrepPrefillParams:
     box_io: cute.ComposedLayout  # one 16 x 64 16-bit swizzled box
     state_in: cute.Tensor | None  # (row, head, d_v, d_k)
     state_out: cute.Tensor | None
+    checkpoints: CheckpointTensors | None
     state_indices: cute.Tensor | None
     has_initial_state: cute.Tensor | None
     work_items: cute.Tensor  # (rows, WORK_ITEM_FIELDS)
@@ -516,7 +517,17 @@ class KdaPrepPrefill(WarpSpecialized):
             total = params.work_count[0]
             tile = Int32(unit)
             while tile < total:
-                _b, _h, _v, _ws, write_end, compute_start, _s, _len, _t = self.item(params, tile)
+                batch, head, v_offset, _ws, write_end, compute_start, _s, seqlen, _t = self.item(
+                    params, tile
+                )
+                checkpoint = checkpoint_row(
+                    params.checkpoints,
+                    params.state_indices,
+                    batch,
+                    seqlen,
+                    head,
+                    v_offset + warp * 16 + lane % 16,
+                )
                 for local in cutlass.range(write_end - compute_start, unroll=1):
                     rh = raw.wait()
                     rh.access("Diag", read=True, by="threads")
@@ -525,6 +536,14 @@ class KdaPrepPrefill(WarpSpecialized):
                         with self.trace_region("sacc_l.wait"):
                             spin_wait(tstate + SACC_L + ((cum - 1) & 3), ((cum - 1) >> 2) & 1)
                     if local > 0:
+                        store_checkpoint(
+                            checkpoint,
+                            (compute_start + local) * B_T,
+                            state_col,
+                            lane < 16,
+                            0,
+                            d_k // 2,
+                        )
                         vals = tmem_ld("16x256b", d_k // 16, state_col)
                         words = []
                         for m in cutlass.range_constexpr(d_k // 16):
@@ -640,6 +659,14 @@ class KdaPrepPrefill(WarpSpecialized):
                     params, tile
                 )
                 n_local = write_end - compute_start
+                checkpoint = checkpoint_row(
+                    params.checkpoints,
+                    params.state_indices,
+                    batch,
+                    seqlen,
+                    head_o,
+                    v_offset + geo[4],
+                )
                 slot, active, load_initial, clear_empty = resolve_paged_state(
                     batch, params.state_indices, params.has_initial_state
                 )
@@ -674,6 +701,7 @@ class KdaPrepPrefill(WarpSpecialized):
                         geo,
                         (compute_start + local) * B_T,
                         seqlen,
+                        checkpoint,
                     )
                 if n_local > 0:
                     with self.trace_region("sacc_r.wait"):
@@ -681,8 +709,11 @@ class KdaPrepPrefill(WarpSpecialized):
                         spin_wait(tstate + SACC_R + (n_upd & 3), (n_upd >> 2) & 1, fence=False)
                     n_upd += 1
                     with self.trace_region("odone.wait"):  # the last O GEMM read the Y operand
-                        # Only the final state store accesses TMEM before the next fenced wait.
+                        # Paged calls store final state, so checkpoint reads also retain this fence.
                         spin_wait(tstate + ODONE, (n_upd - 1) & 1, fence=self.store_final_state)
+                    store_checkpoint(
+                        checkpoint, write_end * B_T, cols["state"], lane < 16, 0, self.d_k
+                    )
                 if cutlass.const_expr(self.store_final_state):
                     self.final_state(
                         params,
@@ -772,9 +803,8 @@ class KdaPrepPrefill(WarpSpecialized):
         src = params.state_in[seed_row, head_o, value_dim + v_offset, None]
         for half in cutlass.range_constexpr(2):
             blocks = range(half * (self.d_k // 32), (half + 1) * (self.d_k // 32))
-            vals = load_state(cute.local_tile(src, (self.d_k // 2,), (half,)), self.state_align)
-            if cutlass.const_expr(self.paged_state > 0):
-                vals = [Float32(cutlass.select_(load_initial, v, Float32(0.0))) for v in vals]
+            tile = cute.local_tile(src, (self.d_k // 2,), (half,))
+            vals = load_seed(tile, self.state_align, load_initial)
             vecs = [vals[16 * j : 16 * j + 16] for j in range(len(blocks))]
             for j, i in enumerate(blocks):
                 words = [
@@ -810,9 +840,9 @@ class KdaPrepPrefill(WarpSpecialized):
         return v
 
     @cute.jit
-    def cg2_chunk(self, params, raw, tstate, n_ks, n_upd, geo, chunk_start, seqlen):
+    def cg2_chunk(self, params, raw, tstate, n_ks, n_upd, geo, chunk_start, seqlen, checkpoint):
         """A chunk after the first: right state half (b16 operand, diag decay), then Y."""
-        _l, cols, _ov, pack_col, _vd = geo
+        lane, cols, _ov, pack_col, _vd = geo
         io = self.io_dtype
         d_k = self.d_k
         rh = raw.wait(skip_fence="both", reason=BOTH_FENCES_COVERED)
@@ -822,6 +852,7 @@ class KdaPrepPrefill(WarpSpecialized):
         with self.trace_region("sacc_r.wait"):
             spin_wait(tstate + SACC_R + (n_upd & 3), (n_upd >> 2) & 1)
         n_upd += 1
+        store_checkpoint(checkpoint, chunk_start, cols["state"], lane < 16, d_k // 2, d_k // 2)
         vals = tmem_ld("16x256b", d_k // 16, cols["state"] + d_k // 2)
         words = []
         for m in cutlass.range_constexpr(d_k // 16):
@@ -868,10 +899,7 @@ class KdaPrepPrefill(WarpSpecialized):
                 if cutlass.const_expr(self.paged_state > 0):
                     row = slot
                 dst = out[row, head_o, value_dim + v_offset, None]
-                for i in cutlass.range_constexpr(self.d_k // 32):
-                    vals = tmem_ld("32x32b", 32, cols["state"] + i * 32)
-                    if row_valid:
-                        store_state_32(cute.local_tile(dst, (32,), (i,)), vals, self.state_align)
+                store_tmem_state(dst, cols["state"], row_valid, 0, self.d_k, self.state_align)
         else:
             if cutlass.const_expr(self.paged_state > 0):
                 if row_valid and owns and clear_empty:
@@ -1098,6 +1126,7 @@ class KdaPrepPrefill(WarpSpecialized):
         state_out,
         state_indices,
         has_initial_state,
+        checkpoints,
         work_items,
         work_count,
         scheduler,
@@ -1125,6 +1154,7 @@ class KdaPrepPrefill(WarpSpecialized):
             box_io=box_io,
             state_in=state_in,
             state_out=state_out,
+            checkpoints=checkpoints,
             state_indices=state_indices,
             has_initial_state=has_initial_state,
             work_items=work_items,
@@ -1163,6 +1193,7 @@ class KdaPrepPrefill(WarpSpecialized):
         scale: Float32,
         stream: cuda.CUstream,
         trace_buffer: cute.Tensor | None = None,
+        checkpoints: CheckpointTensors | None = None,
     ):
         """Launch on ``num_ctas`` CTAs (PDL); callable from another ``@cute.jit`` host such as
         a launch bundle, after kernels that wrote the records, ``work_items``/``work_count`` and
@@ -1230,6 +1261,7 @@ class KdaPrepPrefill(WarpSpecialized):
             state_out,
             state_indices,
             has_initial_state,
+            checkpoints,
             work_items,
             work_count,
             scheduler,

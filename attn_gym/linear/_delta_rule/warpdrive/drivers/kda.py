@@ -15,6 +15,7 @@ import torch
 
 from attn_gym._backends.cute.utils import get_device_properties
 from attn_gym.linear._delta_rule.triton.group_sum import group_sum
+from attn_gym.linear.types import StateCheckpoints
 
 from ..bundles.kda_chain_backward import build_chain_backward, run_chain_backward
 from ..bundles.kda_chain_forward import build_chain_forward, run_chain_forward
@@ -71,6 +72,7 @@ def kda_forward(
     split: bool = False,
     state_indices: torch.Tensor | None = None,
     has_initial_state: torch.Tensor | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
     fastmath: bool = True,
     intra_chunk_dtypes: str,
     nonempty: bool = False,
@@ -107,6 +109,8 @@ def kda_forward(
             raise ValueError("paged KDA needs a state pool and no final state or split schedule")
         initial_state = initial_state.detach()
     else:
+        if state_checkpoints is not None:
+            raise ValueError("state_checkpoints requires paged state_indices")
         initial_state = None if initial_state is None else aligned(initial_state.detach())
     tokens, heads_out, dim_k = q.shape
     dim_v = v.shape[-1]
@@ -145,7 +149,7 @@ def kda_forward(
         "cu_seqlens": cu_seqlens,
         "seed_indices": None,
         "final_indices": None,
-        "checkpoints": None,
+        "checkpoints": state_checkpoints,
         "tma_slots": tma_slots(
             tensors=5,
             b_t=B_T,

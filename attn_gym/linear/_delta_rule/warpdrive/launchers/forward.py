@@ -126,6 +126,7 @@ def run_forward_on_current_device(
         split=split,
         state_indices=None if paged_state is None else paged_state.indices,
         has_initial_state=None if paged_state is None else paged_state.byte_mask,
+        state_checkpoints=None if paged_state is None else paged_state.checkpoints,
         fastmath=fastmath,
         intra_chunk_dtypes=intra_chunk_dtypes,
         nonempty=nonempty,

@@ -36,8 +36,7 @@ class StateCheckpoints(NamedTuple):
     this call. Neither request vector may overlap storage the call modifies (including replay
     counts). These are caller guarantees, not host-side checks of device values.
 
-    Runs on the fused backend; the default ``backend="auto"`` selects it for checkpointed
-    chunk calls, and an explicit ``"warpdrive"`` raises.
+    Paged chunk calls use the same backend with or without checkpoints.
     """
 
     state_pool: torch.Tensor
@@ -87,7 +86,7 @@ class BackendOptions(TuningOptions, total=False):
 
     backend: Literal["auto", "fused", "warpdrive", "cudnn"]
     """Choose the optimized chunk backend. With CuTeDSL installed, ``"auto"`` prefers warpdrive on
-    SM100 and SM103, and on SM107 with CuTeDSL 4.8+. Paged checkpoint writes use Triton.
+    SM100 and SM103, and on SM107 with CuTeDSL 4.8+.
     Set ``"warpdrive"`` or ``"fused"`` (Triton) to require that backend; ``"cudnn"``,
     warpdrive's former name, is an alias of ``"warpdrive"``.
     See "Chunk backend selection" in ``docs/linear.md``."""

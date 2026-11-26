@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable
 from typing import Literal
 
@@ -18,12 +19,12 @@ from attn_gym.linear import (
 )
 from attn_gym.linear._delta_rule.chunk_ops import _plain_gate_scan_op
 from attn_gym.linear._delta_rule.chunk_schedule import prepare_ragged_chunk_metadata
-from attn_gym.testing import CHECKPOINT_SENTINEL, sentinel_state_checkpoints
+from attn_gym.testing import CHECKPOINT_SENTINEL, sentinel_state_checkpoints, strided_state_pool
 from attn_gym.testing.gdn import make_gdn_test_inputs
 from attn_gym.testing.kda import cumulative_sequence_offsets, make_kda_test_inputs
 
 Rule = Literal["gdn", "kda"]
-# Checkpointed calls run the fused kernels, so their chunk references must too.
+# Keep the Triton registration and specialization probes on their intended backend.
 pytestmark = pytest.mark.usefixtures("fused_chunk_default")
 
 
@@ -42,16 +43,25 @@ def operations(rule: Rule) -> tuple[Callable, Callable]:
     return (paged_chunk_gdn, chunk_gdn) if rule == "gdn" else (paged_chunk_kda, chunk_kda)
 
 
-def options(rule: Rule) -> dict[str, object]:
+def options(rule: Rule, backend: str = "fused") -> dict[str, object]:
+    if backend == "warpdrive":
+        # Truncated single-sequence references must round like the original pack.
+        return {"backend": backend, "batch_invariant": True}
     # Disable autotuning and use KDA's static factor/output schedules.
-    return {"autotune": False, **({"schedule": "static"} if rule == "kda" else {})}
+    return {
+        "backend": backend,
+        "autotune": False,
+        **({"schedule": "static"} if rule == "kda" else {}),
+    }
 
 
-def inputs(rule: Rule, tokens: int, *, batch: int = 1) -> tuple[torch.Tensor, ...]:
+def inputs(
+    rule: Rule, tokens: int, *, batch: int = 1, dtype: torch.dtype = torch.bfloat16
+) -> tuple[torch.Tensor, ...]:
     if rule == "kda":
-        return make_kda_test_inputs(tokens, batch=batch, heads=2, gate_scale=0.1)
+        return make_kda_test_inputs(tokens, batch=batch, heads=2, gate_scale=0.1, dtype=dtype)
     return make_gdn_test_inputs(
-        tokens, batch=batch, key_heads=2, value_heads=2, gate_pattern="near_zero"
+        tokens, batch=batch, key_heads=2, value_heads=2, gate_pattern="near_zero", dtype=dtype
     )[:5]
 
 
@@ -71,16 +81,18 @@ def checkpoints(
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
 def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
-    rule: Rule, cuda: None, state_dtype: torch.dtype
+    rule: Rule, cuda: None, state_dtype: torch.dtype, checkpoint_backend: str
 ) -> None:
+    opts = options(rule, checkpoint_backend)
     paged, chunk = operations(rule)
     # Only sequences 2 and 3 qualify. The others cover empty and short sequences, null
     # routes, unaligned and nonpositive positions, and nonpositive checkpoint slots.
-    lengths = [0, 95, 128, 135, 128, 128, 128, 128, 128, 128, 128]
+    lengths = [0, 120, 128, 135, 128, 128, 128, 128, 128, 128, 128]
     routes = [1, 2, 3, 4, 0, -1, 5, 6, 7, 8, 9]
     initial_flags = [True, True, True, False, True, False, True, True, True, True, True]
     saved = checkpoints(
-        [64, 128, 128, 64, 64, 64, 65, 0, -64, 64, 64],
+        # 80 is a warpdrive KDA BT16 step but not a public checkpoint boundary.
+        [64, 128, 128, 64, 64, 64, 80, 0, -64, 64, 64],
         [1, 2, 7, 6, 5, 4, 3, 8, 9, 0, -1],
         pool_size=11,
     )
@@ -96,16 +108,14 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
     expected_states = saved.state_pool.clone()
     kwargs = {"cu_seqlens": cu_seqlens, "has_initial_state": has_initial}
 
-    expected_output = paged(
-        *tensors, expected_cache, slots, **kwargs, kernel_options=options(rule)
-    )
+    expected_output = paged(*tensors, expected_cache, slots, **kwargs, kernel_options=opts)
     actual_output = paged(
         *tensors,
         actual_cache,
         slots,
         **kwargs,
         state_checkpoints=saved,
-        kernel_options=options(rule),
+        kernel_options=opts,
     )
     assert isinstance(actual_output, torch.Tensor)
     torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
@@ -120,7 +130,7 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
             initial if initial_flags[seq] else torch.zeros_like(initial),
             cu_seqlens=cumulative_sequence_offsets([stop]),
             output_final_state=True,
-            kernel_options=options(rule),
+            kernel_options=opts,
         )
         expected_states[target].copy_(final_state[0])
     torch.testing.assert_close(saved.state_pool, expected_states, rtol=0, atol=0)
@@ -129,27 +139,41 @@ def test_checkpoints_match_truncated_chunks_and_preserve_paged_results(
 @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
 @torch.no_grad()
 def test_checkpoints_publish_prefix_states_into_the_cache(
-    rule: Rule, cuda: None, state_dtype: torch.dtype, triton_compiles
+    rule: Rule, cuda: None, state_dtype: torch.dtype, checkpoint_backend: str
 ) -> None:
+    opts = options(rule, checkpoint_backend)
     paged, chunk = operations(rule)
     lengths = [200, 130]
     tensors = inputs(rule, sum(lengths))
     cu_seqlens = cumulative_sequence_offsets(lengths)
     initial_cache = torch.randn(10, 2, 128, 128, device="cuda", dtype=state_dtype) * 0.01
     slots = torch.tensor([1, 2], device="cuda", dtype=torch.int32)
-    # Unrouted slots of the advanced cache can receive checkpoints. Changing the requested
-    # positions and destinations must not specialize the kernels on their values.
-    compiles = []
-    for positions, destinations in (([128, 64], [7, 9]), ([192, 128], [9, 7])):
-        cache = initial_cache.clone()
-        paged(
+
+    def publish(cache, positions, destinations):
+        return paged(
             *tensors,
             cache,
             slots,
             cu_seqlens=cu_seqlens,
-            state_checkpoints=StateCheckpoints(cache, ints(positions), ints(destinations)),
-            kernel_options=options(rule),
+            state_checkpoints=StateCheckpoints(cache, positions, destinations),
+            kernel_options=opts,
         )
+
+    expected_cache = initial_cache.clone()
+    expected_output = paged(
+        *tensors, expected_cache, slots, cu_seqlens=cu_seqlens, kernel_options=opts
+    )
+    # Pass the slot-strided cache only once: the compiled call must preserve both writes.
+    for run, positions, destinations in (
+        (publish, [128, 64], [7, 9]),
+        (torch.compile(publish, fullgraph=True), [192, 128], [9, 7]),
+    ):
+        storage, cache = strided_state_pool(10, 2, 128, 128, dtype=state_dtype)
+        storage.fill_(CHECKPOINT_SENTINEL)
+        cache.copy_(initial_cache)
+        output = run(cache, ints(positions), ints(destinations))
+        torch.testing.assert_close(output, expected_output, rtol=0, atol=0)
+        torch.testing.assert_close(cache[slots], expected_cache[slots], rtol=0, atol=0)
         for seq, (position, slot) in enumerate(zip(positions, destinations, strict=True)):
             start = sum(lengths[:seq])
             stop = start + position
@@ -159,29 +183,34 @@ def test_checkpoints_publish_prefix_states_into_the_cache(
                 initial_cache[route : route + 1].float(),
                 cu_seqlens=cumulative_sequence_offsets([stop - start]),
                 output_final_state=True,
-                kernel_options=options(rule),
+                kernel_options=opts,
             )
             torch.testing.assert_close(cache[slot], expected[0].to(state_dtype), rtol=0, atol=0)
         for slot in set(range(10)) - {1, 2, *destinations}:
             torch.testing.assert_close(cache[slot], initial_cache[slot], rtol=0, atol=0)
-        compiles.append(sum(triton_compiles.values()))
-    assert compiles[0] == compiles[1]
+        assert torch.all(storage[:, :11] == CHECKPOINT_SENTINEL)
+        assert torch.all(storage[:, -17:] == CHECKPOINT_SENTINEL)
 
 
 @torch.no_grad()
-def test_dense_batch_checkpoints_include_aligned_final_state(rule: Rule, cuda: None) -> None:
+def test_dense_batch_checkpoints_include_aligned_final_state(
+    rule: Rule, cuda: None, checkpoint_backend: str
+) -> None:
+    opts = options(rule, checkpoint_backend)
     paged, chunk = operations(rule)
-    tensors = inputs(rule, 128, batch=2)
+    # Fused paged KDA casts Q/K/V to BF16; warpdrive preserves FP16 in both calls.
+    dtype = torch.float16 if checkpoint_backend == "warpdrive" else torch.bfloat16
+    tensors = inputs(rule, 128, batch=2, dtype=dtype)
     slots = torch.tensor([3, 1], device="cuda", dtype=torch.int32)
     initial_cache = torch.randn(5, 2, 128, 128, device="cuda") * 0.01
     state_cache = initial_cache.clone()
     saved = checkpoints([128, 128], [2, 1], pool_size=4)
-    paged(*tensors, state_cache, slots, state_checkpoints=saved, kernel_options=options(rule))
+    paged(*tensors, state_cache, slots, state_checkpoints=saved, kernel_options=opts)
     _, expected = chunk(
         *tensors,
         initial_cache[slots.long()].clone(),
         output_final_state=True,
-        kernel_options=options(rule),
+        kernel_options=opts,
     )
     rows = saved.state_pool[[2, 1]]
     torch.testing.assert_close(rows, expected, rtol=0, atol=0)
@@ -192,8 +221,9 @@ def test_dense_batch_checkpoints_include_aligned_final_state(rule: Rule, cuda: N
 @pytest.mark.parametrize("execution", ["fullgraph", "cuda_graph"])
 @torch.no_grad()
 def test_checkpoint_graph_replay_reads_changed_positions_slots_and_routes(
-    rule: Rule, cuda: None, execution: str
+    rule: Rule, cuda: None, execution: str, checkpoint_backend: str
 ) -> None:
+    opts = options(rule, checkpoint_backend)
     paged, _ = operations(rule)
     tensors = inputs(rule, 256)
     cu_seqlens = cumulative_sequence_offsets([128, 128])
@@ -211,7 +241,7 @@ def test_checkpoint_graph_replay_reads_changed_positions_slots_and_routes(
             cu_seqlens=sequence_offsets,
             has_initial_state=initial_flags,
             state_checkpoints=StateCheckpoints(pool, positions, destinations),
-            kernel_options=options(rule),
+            kernel_options=opts,
         )
 
     args = (state_cache, *saved, cu_seqlens, slots, has_initial)
@@ -259,11 +289,31 @@ def test_checkpoint_graph_replay_reads_changed_positions_slots_and_routes(
         torch.testing.assert_close(saved.state_pool, expected_states, rtol=0, atol=0)
 
 
-def checkpoint_operator_inputs(rule: Rule) -> tuple[torch._ops.OpOverload, tuple]:
+def checkpoint_operator_inputs(
+    rule: Rule, backend: str = "fused"
+) -> tuple[torch._ops.OpOverload, tuple]:
     q, k, v, gate, beta = inputs(rule, 128)
     # A noncontiguous value tensor checks that the fake output matches the real layout.
     v = v.movedim(1, -1).contiguous().movedim(-1, 1)
     cu_seqlens = cumulative_sequence_offsets([64, 64])
+    state_cache = torch.randn(5, 2, 128, 128, device="cuda") * 0.01
+    slots = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
+    has_initial = torch.tensor([True, False], device="cuda")
+    saved = checkpoints([64, 64], [2, 4], pool_size=5)
+    if backend == "warpdrive":
+        args = (q, k, v, gate, beta, state_cache, slots, has_initial, cu_seqlens, 128**-0.5)
+        if rule == "gdn":
+            from attn_gym.linear.gdn.impl.warpdrive_ops import (
+                chunk_gdn_warpdrive_packed_fwd_paged_op as op,
+            )
+        else:
+            from attn_gym.linear.kda.impl.warpdrive_ops import (
+                chunk_warpdrive_packed_fwd_paged_op as op,
+            )
+
+            args += ("bf16",)
+        return op, (*args, False, *saved)
+
     metadata = prepare_ragged_chunk_metadata(cu_seqlens, 128, 64)
     gate = _plain_gate_scan_op(
         gate.unsqueeze(-1) if rule == "gdn" else gate,
@@ -273,9 +323,6 @@ def checkpoint_operator_inputs(rule: Rule) -> tuple[torch._ops.OpOverload, tuple
     )
     if rule == "gdn":
         gate = gate.squeeze(-1)
-    state_cache = torch.randn(5, 2, 128, 128, device="cuda") * 0.01
-    slots = torch.tensor([3, 1], dtype=torch.int32, device="cuda")
-    has_initial = torch.tensor([True, False], device="cuda")
     args = (
         q,
         k,
@@ -298,14 +345,14 @@ def checkpoint_operator_inputs(rule: Rule) -> tuple[torch._ops.OpOverload, tuple
 
         op = chunk_fwd_ragged_paged_op
         args += (False, "static")
-    return op, (*args, *checkpoints([64, 64], [2, 4], pool_size=5))
+    return op, (*args, *saved)
 
 
 @pytest.mark.parametrize("into_state_cache", [False, True])
 def test_checkpoint_paged_operator_registration(
-    rule: Rule, cuda: None, into_state_cache: bool
+    rule: Rule, cuda: None, into_state_cache: bool, checkpoint_backend: str
 ) -> None:
-    op, args = checkpoint_operator_inputs(rule)
+    op, args = checkpoint_operator_inputs(rule, checkpoint_backend)
     if into_state_cache:
         # Destinations 2 and 4 are not routed by this call.
         args = (*args[:-3], args[5], *args[-2:])
@@ -316,9 +363,9 @@ def test_checkpoint_paged_operator_registration(
     "invalid", ["dtype", "checkpoint_states", "checkpoint_positions", "checkpoint_slots"]
 )
 def test_raw_checkpoint_operator_validates_before_launch(
-    rule: Rule, cuda: None, invalid: str
+    rule: Rule, cuda: None, invalid: str, checkpoint_backend: str
 ) -> None:
-    op, args = checkpoint_operator_inputs(rule)
+    op, args = checkpoint_operator_inputs(rule, checkpoint_backend)
     pool, positions, slots = args[-3:]
     kwargs = {
         "checkpoint_states": pool,
@@ -420,14 +467,80 @@ def test_kda_validates_checkpoint_metadata() -> None:
         fake_paged_call("kda", INVALID_METADATA["pool_dtype"], kernel_options=options("kda"))
 
 
-def test_warpdrive_rejects_checkpoints_before_backend_dispatch(rule: Rule) -> None:
-    with pytest.raises(ValueError, match="checkpoint"):
-        fake_paged_call(rule, kernel_options={"backend": "warpdrive"})
+@pytest.mark.parametrize("plan", ["auto_plan", "pinned_plan", "full_width"])
+@torch.no_grad()
+def test_warpdrive_checkpoint_restores_selected_prefix(
+    rule: Rule, requires_blackwell: None, plan: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pytest.importorskip("cutlass")
+    paged, _ = operations(rule)
+    opts = {"backend": "warpdrive", "batch_invariant": plan == "pinned_plan"}
+    if rule == "kda" and plan == "full_width":
+        from attn_gym.linear._delta_rule.warpdrive.bundles import kda_warmup_forward
+
+        monkeypatch.setattr(kda_warmup_forward, "requires_int64_abi", lambda *args: True)
+    length, stop = 197, 128
+    tensors = inputs(rule, length)
+    # With two heads, this many empty sequences fills the grid without extra token work.
+    # Keeping the same pack for the truncated oracle retains the full 128-wide value tile.
+    empty = (
+        [0] * (torch.cuda.get_device_properties().multi_processor_count // 2)
+        if plan == "full_width"
+        else []
+    )
+
+    def run(pool, slot, start, end, saved=None):
+        return paged(
+            *(x[:, start:end] for x in tensors),
+            pool,
+            ints([slot, *empty]),
+            cu_seqlens=cumulative_sequence_offsets([end - start, *empty]),
+            state_checkpoints=saved,
+            kernel_options=opts,
+        )
+
+    # A separate FP32 checkpoint must not be rounded through the BF16 running pool.
+    cache = torch.randn(3, 2, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.01
+    storage, pool = strided_state_pool(4, 2, 128, 128)
+    storage.fill_(CHECKPOINT_SENTINEL)
+    saved = StateCheckpoints(pool, ints([stop, *empty]), ints([2, *empty]))
+    baseline = cache.clone()
+    uninterrupted = run(baseline, 1, 0, length)
+    actual = cache.clone()
+    output = run(actual, 1, 0, length, saved)
+    assert torch.equal(output, uninterrupted)
+    assert torch.equal(actual, baseline)
+    prefix = cache.float()
+    run(prefix, 1, 0, stop)
+    assert torch.equal(saved.state_pool[2], prefix[1])
+    assert torch.all(saved.state_pool[[0, 1, 3]] == CHECKPOINT_SENTINEL)
+    assert torch.all(storage[:, :11] == CHECKPOINT_SENTINEL)
+    assert torch.all(storage[:, -17:] == CHECKPOINT_SENTINEL)
+    suffix = run(saved.state_pool, 2, stop, length)
+    assert torch.equal(suffix, uninterrupted[:, stop:])
+    assert torch.equal(saved.state_pool[2].bfloat16(), baseline[1])
 
 
 @torch.no_grad()
-def test_checkpoint_positions_and_shapes_reuse_recurrence(rule: Rule, cuda: None, triton_compiles):
+def test_checkpoint_positions_and_shapes_reuse_recurrence(
+    rule: Rule,
+    cuda: None,
+    triton_compiles,
+    checkpoint_backend: str,
+    monkeypatch: pytest.MonkeyPatch,
+):
     paged, _ = operations(rule)
+    opts = options(rule, checkpoint_backend)
+    if checkpoint_backend == "warpdrive":
+        from attn_gym.linear._delta_rule.warpdrive.drivers.plan import ForwardPlan
+
+        # Even the batch-invariant plan can split V on an underfilled grid. Count binaries
+        # for one tile width, independently of the SM count of the device under test.
+        monkeypatch.setattr(ForwardPlan, "uncut", lambda _n, _h, _v, sms: ForwardPlan(0, 1, sms))
+        compile_fn = importlib.import_module(
+            f"attn_gym.linear._delta_rule.warpdrive.bundles.{rule}_warmup_forward"
+        )._compile_warmup_forward
+        compile_fn.cache_clear()
     for sequences, length, position, spare in (
         (1, 65, 64, 0),
         (16, 1025, 1024, 16),
@@ -444,24 +557,35 @@ def test_checkpoint_positions_and_shapes_reuse_recurrence(rule: Rule, cuda: None
             slots,
             cu_seqlens=cumulative_sequence_offsets(lengths),
             state_checkpoints=saved,
-            kernel_options=options(rule),
+            kernel_options=opts,
         )
         rows = saved.state_pool[1 : sequences + 1]
         assert torch.isfinite(rows).all()
         assert torch.all(rows != CHECKPOINT_SENTINEL)
         assert torch.all(saved.state_pool[sequences + 1 :] == CHECKPOINT_SENTINEL)
         assert torch.all(saved.state_pool[0] == CHECKPOINT_SENTINEL)
-    assert triton_compiles["chunk_delta_h_kernel"] == 1
+    if checkpoint_backend == "warpdrive":
+        info = compile_fn.cache_info()
+        assert info.currsize == 1
+        assert info.hits + info.misses == 3
+    else:
+        assert triton_compiles["chunk_delta_h_kernel"] == 1
 
 
 @pytest.mark.parametrize("wide_offsets", [False, True])
 @torch.no_grad()
-def test_gdn_d64_grouped_checkpoints(cuda: None, monkeypatch, wide_offsets: bool) -> None:
-    import importlib
-
-    recurrence = importlib.import_module("attn_gym.linear.kda.fwd.triton.chunk_delta_h")
+def test_gdn_d64_grouped_checkpoints(
+    cuda: None, monkeypatch, wide_offsets: bool, checkpoint_backend: str
+) -> None:
+    opts = options("gdn", checkpoint_backend)
     if wide_offsets:
-        monkeypatch.setattr(recurrence, "requires_int64_offsets", lambda *args: True)
+        if checkpoint_backend == "warpdrive":
+            from attn_gym.linear._delta_rule.warpdrive.bundles import gdn_warmup_forward
+
+            monkeypatch.setattr(gdn_warmup_forward, "requires_int64_abi", lambda *args: True)
+        else:
+            recurrence = importlib.import_module("attn_gym.linear.kda.fwd.triton.chunk_delta_h")
+            monkeypatch.setattr(recurrence, "requires_int64_offsets", lambda *args: True)
     tensors = make_gdn_test_inputs(128, key_dim=64, key_heads=1, value_heads=2)[:5]
     cache = torch.zeros(2, 2, 64, 64, device="cuda")
     saved = sentinel_state_checkpoints([64], (2, 64, 64), spare=0)
@@ -470,13 +594,13 @@ def test_gdn_d64_grouped_checkpoints(cuda: None, monkeypatch, wide_offsets: bool
         cache,
         torch.tensor([1], device="cuda", dtype=torch.int32),
         state_checkpoints=saved,
-        kernel_options={"autotune": False},
+        kernel_options=opts,
     )
     _, expected = chunk_gdn(
         *(tensor[:, :64] for tensor in tensors),
         cu_seqlens=cumulative_sequence_offsets([64]),
         output_final_state=True,
-        kernel_options={"autotune": False},
+        kernel_options=opts,
     )
     torch.testing.assert_close(saved.state_pool[1], expected[0], rtol=0, atol=0)
 

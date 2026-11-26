@@ -9,6 +9,7 @@ from functools import partial
 import torch
 
 from attn_gym.linear._delta_rule.span import pack_dense_batch
+from attn_gym.linear._delta_rule.state_checkpoints import state_checkpoint_op_args
 from attn_gym.linear._delta_rule.validation import (
     require_inference_only,
     resolve_scale,
@@ -27,7 +28,7 @@ from attn_gym.linear.kda.impl.warpdrive_ops import (
     validate_warpdrive_available,
 )
 from attn_gym.linear.kda.validation import cast_to_kernel_dtypes
-from attn_gym.linear.types import ReplayState
+from attn_gym.linear.types import ReplayState, StateCheckpoints
 
 
 def normalize_output_grad(d_output: torch.Tensor | None, value: torch.Tensor) -> torch.Tensor:
@@ -328,6 +329,7 @@ def paged_chunk_forward(
     has_initial_state: torch.Tensor | None,
     scale: float,
     replay_state: ReplayState | None = None,
+    state_checkpoints: StateCheckpoints | None = None,
     intra_chunk_dtypes: str,
     batch_invariant: bool,
 ) -> torch.Tensor:
@@ -353,6 +355,7 @@ def paged_chunk_forward(
             state_indices,
             cu_seqlens=cu_seqlens,
             has_initial_state=has_initial_state,
+            state_checkpoints=state_checkpoints,
         )
     return replay_paged_chunk_forward(
         q,
@@ -367,6 +370,7 @@ def paged_chunk_forward(
         has_initial_state=has_initial_state,
         chunk_forward=partial(chunk_forward, scale=scale, **options),
         paged_forward=paged_forward,
+        state_checkpoints=state_checkpoints,
     )
 
 
@@ -384,14 +388,9 @@ def _paged_chunk_state_forward(
     scale: float,
     intra_chunk_dtypes: str,
     batch_invariant: bool,
-    state_checkpoints: None = None,
+    state_checkpoints: StateCheckpoints | None = None,
 ) -> torch.Tensor:
-    """Advance selected state-cache slots with the paged warpdrive KDA forward.
-
-    The kernel writes no ``state_checkpoints``; ``paged_chunk_kda`` keeps checkpointed calls on
-    the fused backend, so replay passes only ``None``.
-    """
-    del state_checkpoints
+    """Advance selected state-cache slots with the paged warpdrive KDA forward."""
     output_dtype, output_shape = q.dtype, value.shape
     q, k, value, gate, beta = cast_to_kernel_dtypes(q, k, value, gate, beta)
     if cu_seqlens is None:
@@ -409,6 +408,7 @@ def _paged_chunk_state_forward(
         scale,
         intra_chunk_dtypes,
         batch_invariant,
+        *state_checkpoint_op_args(state_checkpoints),
     )
     return output.reshape(output_shape).to(output_dtype)
 

@@ -172,8 +172,6 @@ SERVED = {
     "paged_chunk_kda replay_state": lambda: _run_paged_kda(replay=True),
     "paged_chunk_kda misaligned pool": lambda: _run_paged_kda(prefix=1),
     "paged_chunk_gdn misaligned pool": lambda: _run_paged_gdn(prefix=1),
-}
-ROUTED_TO_FUSED = {
     "paged_chunk_kda state_checkpoints": lambda: _run_paged_kda(checkpoints=True),
     "paged_chunk_kda replay_state state_checkpoints": lambda: _run_paged_kda(
         replay=True, checkpoints=True
@@ -189,14 +187,6 @@ def test_default_runs_warpdrive_on_sm100_family(monkeypatch, dispatched, capabil
     monkeypatch.setattr(validation, "_CUTEDSL_INSTALLED", True)
     SERVED[case]()
     assert dispatched == ["warpdrive"]
-
-
-@pytest.mark.parametrize("capability", BLACKWELL)
-@pytest.mark.parametrize("case", ROUTED_TO_FUSED)
-def test_default_routes_unserved_calls_to_fused(monkeypatch, dispatched, capability, case):
-    _simulate_capability(monkeypatch, capability)
-    ROUTED_TO_FUSED[case]()
-    assert dispatched == ["fused"]
 
 
 @pytest.mark.parametrize("capability", OTHER_GPUS)
@@ -228,8 +218,7 @@ def test_default_runs_fused_on_rubin_without_a_cutedsl_that_targets_it(
 
 @pytest.mark.parametrize("capability", (*BLACKWELL, (9, 0)))
 def test_explicit_backends_are_never_rerouted(monkeypatch, dispatched, capability):
-    """Explicit choices hold on every device and route; explicit warpdrive with checkpoints
-    raises rather than running fused."""
+    """Explicit choices hold on every device and route, including checkpointed calls."""
     _simulate_capability(monkeypatch, capability)
     fused, warpdrive = {"backend": "fused"}, {"backend": "warpdrive"}
     _run_kda(kernel_options=fused)
@@ -239,9 +228,17 @@ def test_explicit_backends_are_never_rerouted(monkeypatch, dispatched, capabilit
     _run_paged_kda(replay=True, kernel_options=fused)
     _run_paged_kda(replay=True, kernel_options=warpdrive)
     for run in (_run_paged_kda, _run_paged_gdn):
-        with pytest.raises(ValueError, match="state_checkpoints requires the fused backend"):
-            run(kernel_options=warpdrive, checkpoints=True)
-    assert dispatched == ["fused", "fused", "warpdrive", "warpdrive", "fused", "warpdrive"]
+        run(kernel_options=warpdrive, checkpoints=True)
+    assert dispatched == [
+        "fused",
+        "fused",
+        "warpdrive",
+        "warpdrive",
+        "fused",
+        "warpdrive",
+        "warpdrive",
+        "warpdrive",
+    ]
 
 
 needs_warpdrive = pytest.mark.skipif(
@@ -374,12 +371,10 @@ def test_default_paged_routes_run_warpdrive(family, route, compiled):
 @needs_warpdrive
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "compiled"])
 @pytest.mark.parametrize("family", ["kda", "gdn"])
-def test_default_checkpointed_paged_call_runs_fused(family, compiled):
-    """A paged call that writes ``state_checkpoints``, which warpdrive kernels cannot produce,
-    reproduces explicit fused bit for bit, eager or compiled, state cache and checkpoints
-    included."""
+def test_default_checkpointed_paged_call_runs_warpdrive(family, compiled):
+    """Auto matches explicit warpdrive bit for bit, state cache and checkpoints included."""
     default = _run_paged(family, "auto", compiled=compiled, checkpoint_at=64)
-    _assert_bitwise(default, _run_paged(family, "fused", checkpoint_at=64))
+    _assert_bitwise(default, _run_paged(family, "warpdrive", checkpoint_at=64))
 
 
 @needs_warpdrive

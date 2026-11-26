@@ -15,10 +15,16 @@ import torch
 pytest.importorskip("cutlass.cute")
 
 from attn_gym._backends.arch import cuda_runs_sm100_kernels
-from attn_gym.linear import paged_chunk_gdn, paged_chunk_kda
+from attn_gym.linear import StateCheckpoints, paged_chunk_gdn, paged_chunk_kda
 from attn_gym.linear._delta_rule.warpdrive.contract import paged_state_align
 from attn_gym.linear._delta_rule.warpdrive.drivers.kda import PREP_TILE_FRACTION
-from attn_gym.testing import cumulative_sequence_offsets, make_gdn_test_inputs, strided_state_pool
+from attn_gym.testing import (
+    CHECKPOINT_SENTINEL,
+    cumulative_sequence_offsets,
+    make_gdn_test_inputs,
+    sentinel_state_checkpoints,
+    strided_state_pool,
+)
 from attn_gym.testing.kda import make_kda_test_inputs
 
 pytestmark = pytest.mark.skipif(
@@ -106,6 +112,67 @@ def test_unaligned_pool_matches_aligned_pool(
     padding = slice(0, prefix), slice(storage.shape[1] - suffix, None)
     for columns in padding:
         assert torch.equal(storage[:, columns], original_storage[:, columns])
+
+
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(("variant", "invariant"), [("gdn", False), ("kda", False), ("kda", True)])
+@torch.no_grad()
+def test_checkpoint_and_seed_access_only_their_slots(
+    variant: str, invariant: bool, pool_dtype: torch.dtype
+) -> None:
+    # A one-element gap cycles through every possible row alignment. The final seeded slot
+    # ends exactly at the allocation boundary (run under memcheck with the allocator disabled).
+    storage, pool = strided_state_pool(11, 2, 128, 128, prefix=1, suffix=0, dtype=pool_dtype)
+    pool.mul_(0.01)
+    padding = storage[:, 0].clone()
+    aligned = pool.clone()
+    routes = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 10], device="cuda", dtype=torch.int32)
+    lengths = (64,) * len(routes)
+    inputs = _inputs(variant, lengths)
+    cu_seqlens = cumulative_sequence_offsets(lengths)
+    # Slot 9 is a legal checkpoint destination adjacent to two concurrently resumed slots.
+    positions = torch.full_like(routes, 64)
+    destinations = torch.full_like(routes, -1)
+    destinations[0] = 9
+
+    def run(cache: torch.Tensor) -> torch.Tensor:
+        return PAGED[variant](
+            *inputs,
+            cache,
+            routes,
+            cu_seqlens=cu_seqlens,
+            state_checkpoints=StateCheckpoints(cache, positions, destinations),
+            kernel_options={"backend": "warpdrive", "batch_invariant": invariant},
+        )
+
+    expected = run(aligned)
+    assert torch.equal(run(pool), expected)
+    assert torch.equal(pool, aligned)
+    assert torch.equal(pool[9], aligned[1])
+    assert torch.equal(storage[:, 0], padding)
+
+
+@pytest.mark.parametrize("pool_dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(("variant", "invariant"), [("gdn", False), ("kda", False), ("kda", True)])
+@torch.no_grad()
+def test_null_routes_need_no_running_pool(
+    variant: str, invariant: bool, pool_dtype: torch.dtype
+) -> None:
+    lengths = (65, 64)
+    inputs = _inputs(variant, lengths)
+    empty = torch.empty((0, 2, 128, 128), dtype=pool_dtype, device="cuda")
+    routes = torch.tensor([0, -1], dtype=torch.int32, device="cuda")
+    saved = sentinel_state_checkpoints([64, 64], (2, 128, 128))
+    output = PAGED[variant](
+        *inputs,
+        empty,
+        routes,
+        cu_seqlens=cumulative_sequence_offsets(lengths),
+        state_checkpoints=saved,
+        kernel_options={"backend": "warpdrive", "batch_invariant": invariant},
+    )
+    assert torch.count_nonzero(output) == 0
+    assert torch.all(saved.state_pool == CHECKPOINT_SENTINEL)
 
 
 @pytest.mark.parametrize("variant", ["gdn", "kda"])
