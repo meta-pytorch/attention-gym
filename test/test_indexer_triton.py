@@ -41,6 +41,39 @@ def test_triton_selection(dtype, tokens, heads, dim, topk, causal):
     assert_indexer_selection(actual, q, k, weights, topk, causal)
 
 
+@pytest.mark.parametrize("packed", [False, True])
+def test_triton_huge_k_fills_visible_pool(packed, triton_compiles):
+    inputs = make_indexer_test_inputs(
+        5, 2, 16, torch.float16 if packed else torch.bfloat16, batch=1
+    )
+    offsets = torch.tensor([0, 2, 2, 4], device="cuda", dtype=torch.int32) if packed else None
+    # With packed offsets the last query is inactive and candidate indices are document-local.
+    actual = lightning_indexer(
+        *inputs,
+        524289,
+        causal=True,
+        cu_seqlens=offsets,
+        cu_seqlens_k=offsets,
+        kernel_options={"backend": "triton"},
+    )
+    counts = [1, 2, 1, 2, 0] if packed else [1, 2, 3, 4, 5]
+    for row, count in zip(actual[0], counts, strict=True):
+        assert torch.equal(row[:count], torch.arange(count, device=row.device))
+        assert (row[count:] == -1).all()
+    assert triton_compiles["_index_kernel"] == 0
+
+
+def test_triton_unrepresentable_partial_selection_rejected_before_allocating():
+    # Expanded inputs use only 16 elements; the unrepresentable selection would allocate 1 TiB.
+    topk, tokens = 524289, 524290
+    q = torch.ones(1, 1, 1, 16, dtype=torch.bfloat16, device="cuda").expand(1, tokens, 1, 16)
+    k, weights = q.squeeze(2), q[..., 0]
+    with pytest.raises(ValueError, match="streaming topk exceeds its tile limit"):
+        lightning_indexer(
+            q, k, weights, topk, kernel_options={"backend": "triton", "selector": "default"}
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_triton_selection_across_score_magnitudes(dtype):
     """Exercise relative-RMS budgets when query rows span six orders of magnitude."""

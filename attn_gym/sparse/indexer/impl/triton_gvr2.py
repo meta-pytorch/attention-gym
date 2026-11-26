@@ -14,11 +14,14 @@ from torch import Tensor
 from attn_gym._backends.triton.utils import offset_strides, ptr_offset, requires_int64_offsets
 
 from .cute import score_workspace_pairs
+from .triton import fill_visible
+from .triton_slab import slab_row
 
 
 @triton.jit(
     do_not_specialize=[
-        "PairStart",
+        "FirstBatch",
+        "FirstPair",
         "T",
         "S",
         "QB",
@@ -38,7 +41,8 @@ def _score_kernel(
     K,
     W,
     Scores,
-    PairStart,
+    FirstBatch,
+    FirstPair,
     T,
     S,
     H: tl.constexpr,
@@ -67,10 +71,10 @@ def _score_kernel(
     start = tl.program_id(1) * BN
     if USE_INT64_OFFSETS:
         row = row.to(tl.int64)
-        PairStart = PairStart.to(tl.int64)
-    pair = PairStart + row // 2
-    batch = pair // tl.cdiv(T, 2)
-    query = 2 * (pair % tl.cdiv(T, 2)) + row % 2
+        FirstBatch = FirstBatch.to(tl.int64)
+        T = T.to(tl.int64)
+        S = S.to(tl.int64)
+    batch, query = slab_row(row, FirstBatch, FirstPair, T, USE_INT64_OFFSETS)
     end = (query + 1) // RATIO if CAUSAL else S
     if (query < T) & (start < end):
         h = tl.arange(0, BH)
@@ -82,10 +86,10 @@ def _score_kernel(
             n = n.to(tl.int64)
         # Nonstandard layouts may encode the row length in any stride (e.g. a transpose).
         q_strides = offset_strides(
-            (QB, H * D, D, 1) if Q_DENSE else (QB, QT, QH, QD), USE_INT64_OFFSETS
+            (T * H * D, H * D, D, 1) if Q_DENSE else (QB, QT, QH, QD), USE_INT64_OFFSETS
         )
-        k_strides = offset_strides((KB, D, 1) if K_DENSE else (KB, KS, KD), USE_INT64_OFFSETS)
-        w_strides = offset_strides((WB, H, 1) if W_DENSE else (WB, WT, WH), USE_INT64_OFFSETS)
+        k_strides = offset_strides((S * D, D, 1) if K_DENSE else (KB, KS, KD), USE_INT64_OFFSETS)
+        w_strides = offset_strides((T * H, H, 1) if W_DENSE else (WB, WT, WH), USE_INT64_OFFSETS)
         q = tl.load(
             Q + ptr_offset((batch, query, h[:, None], d[None, :]), q_strides),
             (h[:, None] < H) & (d[None, :] < D),
@@ -109,11 +113,12 @@ def _ordinal(values):
     return bits ^ tl.where((bits >> 31) != 0, 0xFFFFFFFF, 0x80000000).to(tl.uint32)
 
 
-@triton.jit(do_not_specialize=["PairStart", "T", "S"])
+@triton.jit(do_not_specialize=["FirstBatch", "FirstPair", "T", "S"])
 def _gvr2_topk_kernel(
     Scores,
     Out,
-    PairStart,
+    FirstBatch,
+    FirstPair,
     T,
     S,
     TOPK: tl.constexpr,
@@ -126,10 +131,8 @@ def _gvr2_topk_kernel(
     row = tl.program_id(0)
     if USE_INT64_OFFSETS:
         row = row.to(tl.int64)
-        PairStart = PairStart.to(tl.int64)
-    pair = PairStart + row // 2
-    batch = pair // tl.cdiv(T, 2)
-    query = 2 * (pair % tl.cdiv(T, 2)) + row % 2
+        FirstBatch = FirstBatch.to(tl.int64)
+    batch, query = slab_row(row, FirstBatch, FirstPair, T, USE_INT64_OFFSETS)
     if query < T:
         end = tl.cast((query + 1) // RATIO if CAUSAL else S, tl.int32)
         out = Out + (batch * T + query) * TOPK
@@ -203,7 +206,7 @@ def launch_topk(
     _gvr2_topk_kernel[(scores.shape[0] * 2,)](
         scores,
         output,
-        pair_start,
+        *divmod(pair_start, triton.cdiv(output.shape[1], 2)),
         output.shape[1],
         scores.shape[2],
         output.shape[2],
@@ -249,6 +252,8 @@ def launch(
         return output
     if candidates == 0:
         return output.fill_(-1)
+    if topk >= candidates:
+        return fill_visible(output, candidates, causal, compress_ratio)
     pairs = score_workspace_pairs(batch, tokens, candidates)
     scores = torch.empty((pairs, 2, candidates), device=q.device, dtype=torch.float32)
     wide = requires_int64_offsets(q, k, weights, scores, output)
@@ -261,7 +266,7 @@ def launch(
                 k,
                 weights,
                 slab,
-                start,
+                *divmod(start, triton.cdiv(tokens, 2)),
                 tokens,
                 candidates,
                 heads,
@@ -269,9 +274,9 @@ def launch(
                 *q.stride(),
                 *k.stride(),
                 *weights.stride(),
-                q.stride()[1:] == (heads * dim, dim, 1),
-                k.stride()[1:] == (dim, 1),
-                weights.stride()[1:] == (heads, 1),
+                q.is_contiguous(),
+                k.is_contiguous(),
+                weights.is_contiguous(),
                 causal,
                 compress_ratio if causal else 1,
                 max(16, triton.next_power_of_2(heads)),

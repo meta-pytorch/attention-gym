@@ -12,7 +12,8 @@ from attn_gym._backends.arch import runs_sm100_kernels
 torch.library.define(
     "attn_gym::_indexer",
     "(Tensor q, Tensor k, Tensor weights, int topk, bool causal, int compress_ratio, "
-    'str backend, Tensor? cu_seqlens=None, Tensor? cu_seqlens_k=None, str selector="default") -> Tensor',
+    'str backend, Tensor? cu_seqlens=None, Tensor? cu_seqlens_k=None, str selector="default", '
+    "Tensor? q_scale=None, Tensor? k_scale=None) -> Tensor",
 )
 
 
@@ -27,26 +28,46 @@ def _indexer_cuda(
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     selector: str = "default",
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Select a launcher on the input device without tracing device queries.
 
     Deterministic mode is read when this implementation executes, so compiled
     calls see the current setting; CUDA Graph replay keeps the kernel captured.
     """
+    if q.dtype == torch.float8_e4m3fn and (cu_seqlens is not None or cu_seqlens_k is not None):
+        raise ValueError("MXFP8 indexing does not support packed cu_seqlens.")
     if backend == "auto":
         capability = torch.cuda.get_device_capability(q.device)
         backend = "cute" if runs_sm100_kernels(capability) else "triton"
     match backend, selector:
         case "cute", _:
             from .impl.cute import launch
-        case "triton", "gvr2":
+        case "triton", "gvr2" if q.dtype != torch.float8_e4m3fn:
             from .impl.triton_gvr2 import launch
-        case "triton", "auto" | "default":  # Triton auto keeps the streaming selector.
+
+            if q_scale is not None or k_scale is not None:
+                raise ValueError("q_scale and k_scale are only supported for MXFP8 E4M3FN Q/K.")
+            return launch(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
+        case "triton", "auto" | "default" | "gvr2":
             from .impl.triton import launch
+
+            return launch(
+                q,
+                k,
+                weights,
+                topk,
+                causal,
+                compress_ratio,
+                cu_seqlens,
+                cu_seqlens_k,
+                selector=selector,
+                q_scale=q_scale,
+                k_scale=k_scale,
+            )
         case _:
             raise ValueError(f"unknown indexer backend {backend!r} or selector {selector!r}")
-    if backend == "triton":
-        return launch(q, k, weights, topk, causal, compress_ratio, cu_seqlens, cu_seqlens_k)
     candidate_bounds = None
     if cu_seqlens is not None:
         from .impl.triton import prepare_candidate_bounds
@@ -62,9 +83,11 @@ def _indexer_cuda(
         topk,
         causal,
         compress_ratio,
-        deterministic,
-        candidate_bounds,
+        deterministic=deterministic,
+        candidate_bounds=candidate_bounds,
         selector=selector,
+        q_scale=q_scale,
+        k_scale=k_scale,
     )
 
 
@@ -83,6 +106,8 @@ def _indexer_fake(
     cu_seqlens: Tensor | None = None,
     cu_seqlens_k: Tensor | None = None,
     selector: str = "default",
+    q_scale: Tensor | None = None,
+    k_scale: Tensor | None = None,
 ) -> Tensor:
     """Describe the common contiguous, nondifferentiable index output."""
     return q.new_empty((q.shape[0], q.shape[1], topk), dtype=torch.int32)

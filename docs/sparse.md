@@ -35,16 +35,16 @@ CuTe returns ascending indices with equal ordered-FP32 scores resolved toward lo
 ### Implementations and device dispatch
 
 - `impl="reference"` evaluates PyTorch scoring and Top-K on CPU or CUDA. FP16/BF16/FP32
-  inputs accumulate in FP32; FP64 inputs retain FP64. It chunks queries to bound per-head scoring intermediates
-  and is intended for correctness checks and small inputs.
+  inputs accumulate in FP32; FP64 inputs retain FP64. It chunks queries to bound per-head
+  scoring intermediates and is intended for correctness checks and small inputs.
 - `impl="fused"` (the default) selects **CuTe on SM100-family GPUs**, or **Triton on other NVIDIA GPUs
   with compute capability 9.0 or newer**, including Hopper. Both optimized implementations
   keep their selection state on chip. CuTe generates scores with
   [warpdrive](warpdrive/index.md) TMA/MMA/epilogue kernels, separately from Top-K selection, and
   reuses a per-call FP32 score slab capped at **32 MiB and 1024 query rows**, independent of
   batch size. Large inputs are processed in slabs rather than an unbounded quadratic score
-  allocation. This scratch is additional to the returned indices. Triton's default
-  FP16/BF16 route needs no global score scratch; its GVR2 route uses a separate
+  allocation. This scratch is additional to the returned indices. Triton's streaming
+  FP16/BF16 route needs no global score scratch; its MXFP8 and GVR2 routes use a separate
   scorer and the same 32 MiB / 1024-row bound.
 - `kernel_options={"backend": "cute"}` or `{"backend": "triton"}` overrides that choice.
   Omit options for automatic selection. `impl="reference"` validates options and ignores them.
@@ -66,9 +66,9 @@ pair's FP32 scores fit its 32 MiB workspace. This includes inactive packed capac
 
 CuTe accepts independently permuted or padded outer dimensions and broadcast inputs without
 materializing contiguous copies. Weights need only element alignment, not TMA alignment.
-Triton's GVR2 route uses a separate scorer that accepts arbitrary nonnegative Q/K/weight
-strides and byte-aligned bases; the table's alignment restrictions apply only to the
-streaming FP16/BF16 path.
+Triton's GVR2 and MXFP8 routes use separate scorers that accept arbitrary nonnegative
+Q/K/weight strides and byte-aligned bases; the table's alignment restrictions apply only to
+the streaming FP16/BF16 path.
 
 CuTe additionally requires the optional `linear` dependencies. It supports the SM100 family
 (SM100, SM103 including GB300, and Rubin SM107 with CuTeDSL 4.8+), not every Blackwell variant;
@@ -77,35 +77,33 @@ other supported devices use Triton by default.
 ### Selector: GVR2 and `auto`
 
 `kernel_options["selector"]` chooses the exact Top-K algorithm. When omitted (or `"auto"`),
-CuTe uses GVR2 for `topk < 2048` and radix otherwise, and Triton uses its streaming selector.
+CuTe uses GVR2 for `topk < 2048` and radix otherwise. Triton uses its streaming selector,
+except for MXFP8 at `topk > 4096`, where GVR2 avoids a large register-resident merge.
 `"default"` forces the backend-native selector (CuTe radix, Triton streaming); `"gvr2"` forces
 GVR2 on either backend. CuTe auto stays on radix for deterministic or packed calls and on
 SM107; explicit CuTe GVR2 requires SM100/SM103 and nondeterministic mode. Neither GVR2
-backend supports packed offsets. GVR2 guesses a
-cutoff from a row sample, verifies it over the full row, and refines exactly with radix passes
+backend supports packed offsets. GVR2 guesses a cutoff from a row sample, verifies it over
+the full row, and refines exactly with radix passes
 when the guess misses, so the result is the exact Top-K of the scorer's finite FP32 values.
 
 ```python
 indices = lightning_indexer(
-    q,
-    k,
-    weights,
-    topk=512,
-    causal=True,
-    compress_ratio=4,
+    q, k, weights, topk=512, causal=True, compress_ratio=4,
     kernel_options={"backend": "cute", "selector": "gvr2"},
 )
 ```
 
 The `auto` boundary comes from the
-[`auto` threshold sweep](indexer_performance.md#auto-threshold-sweep). On Triton, `"gvr2"`
-also switches to a separate tiled scorer, so scores may round differently from the streaming
-path.
+[`auto` threshold sweep](indexer_performance.md#auto-threshold-sweep). On Triton with
+FP16/BF16, `"gvr2"` switches to a separate tiled scorer, so scores may round differently
+from the streaming path. With MXFP8, both selectors use the same block-scaled scorer.
+When every candidate fits, Triton can emit indices and `-1` padding without scoring.
+Otherwise the forced streaming selector needs a register tile proportional to `topk`
+and can exceed compiler or device limits; use GVR2 for very large dense selections.
 
 Both CuTe selectors run one [warpdrive role](warpdrive/writing-kernels.md#kernels-without-warp-specialization)
 across the CTA: one work item is one physical query row, and CTA barriers separate the
 histogram and refinement passes. To inspect the declaration without launching a kernel:
-
 
 ```python
 from attn_gym.sparse.indexer.impl.cute_topk_gvr2 import IndexerGVR2TopKKernel
@@ -114,15 +112,43 @@ selector = IndexerGVR2TopKKernel.get_or_build(512, causal=True, compress_ratio=4
 print(selector.describe())
 ```
 
-The benchmark CLI accepts both backend and selector lists. For example:
+### Explicit-scale MXFP8 scoring
 
-```bash
-uv run benchmarks/sparse/indexer_benchmark.py --batch 1 --heads 64 --head-dim 128 --sequence-length 65536 --compress-ratio 4 --topk 512 --dtype bfloat16 --backend cute triton --selector default gvr2 --warmup 5 --rep 30
+For prequantized E4M3 Q/K, pass E8M0 scales for **32-element groups** along the head
+dimension. Both fused backends support it on SM100/SM103 for `H` in `{32, 64}` and `D=128`.
+
+```python
+indices = lightning_indexer(
+    q8, k8, weights, topk=512, causal=True, compress_ratio=4,
+    q_scale=q_scale, k_scale=k_scale,
+)
+# q8: E4M3FN [B,T,H,128], k8: E4M3FN [B,T//4,128]
+# q_scale: E8M0 [B,T,H,4], k_scale: E8M0 [B,T//4,4]
+# weights: BF16 or FP32 [B,T,H]
 ```
 
-Timing includes scoring and selection, but excludes caller compilation, allocations, and
-graph capture. Force `"selector": "default"` or `"gvr2"` to compare both exact paths against
-the `auto` choice on your own shapes.
+The storage dtypes are `torch.float8_e4m3fn` and `torch.float8_e8m0fnu`. Each E8M0
+scale multiplies its corresponding 32 Q/K elements **inside the dot product**;
+scales cannot generally be folded into the head weights. Accumulation and the
+weighted ReLU head reduction use FP32. Both scale tensors are required for MXFP8,
+and ordinary FP16/BF16/FP32/FP64 inputs reject scale arguments.
+
+The caller owns quantization: this API does not compute scales or quantize Q/K.
+E8M0 represents positive powers of two, not zero; use zero data with a valid positive
+scale for an all-zero group. Scale values are not checked on device; non-finite scales or
+scores are outside the contract.
+
+On CuTe, a TMA warp streams Q/K data while a separate warp packs and publishes the scale
+blocks. The MMA warp consumes both; two epilogue warpgroups reduce one query each into
+the FP32 score slab. The selector reads that slab unchanged.
+
+MXFP8 rejects packed `cu_seqlens` on both backends; its scorer does not support candidate bounds.
+Deterministic mode is supported; it changes selection only, as above.
+
+CuTe keeps the Q/K layout requirements from the table above. Both backends accept arbitrary
+nonnegative scale strides, including the group dimension; no host-side scale packing is
+required. See [indexer_performance.md](indexer_performance.md) for measurements against
+DeepGEMM and FlashInfer and how to reproduce them.
 
 ### Compilation and training scope
 
@@ -141,7 +167,7 @@ indices = compiled_indexer(q, k, weights, 128, causal=True)
 **Selection is nondifferentiable.** Inputs may require gradients, but the integer result
 has no gradient function. Gather attention can train its own Q/K/V computation with
 these indices held fixed. It does **not** propagate gradients through the selection step
-into the indexer's queries, keys, or scoring weights. This API supplies no surrogate gradient
+into the indexer's queries, keys, scoring weights, or scales. This API supplies no surrogate gradient
 or indexer-training loss.
 
 Selection with NaN/Inf scores is unspecified and may differ across backends.
